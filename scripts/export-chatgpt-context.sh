@@ -33,6 +33,9 @@ files=(
   .github/workflows/ci.yml
   .github/workflows/codeql.yml
   .github/workflows/dependency-review.yml
+  ops/macos/com.ofk.mcp-ozon-runtime.plist.in
+  scripts/ensure-local-runtime.sh
+  scripts/install-local-runtime-agent.sh
   scripts/local-ci.sh
   scripts/sonar-reports.sh
   scripts/sonar-bootstrap.sh
