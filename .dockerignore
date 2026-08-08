@@ -1,0 +1,11 @@
+.git
+.env
+.keycloak.env
+.sonar.env
+.plugin-build
+.scannerwork
+.vscode
+target
+methods.json
+*.md
+.DS_Store

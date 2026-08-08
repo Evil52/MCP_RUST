@@ -1,0 +1,222 @@
+name: Rust CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: "41 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust with quality components
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - name: Reject accidentally committed local secrets
+        run: |
+          prohibited_files='(^|/)(\.env|\.sonar\.env)$'
+          if git ls-files | grep -E "$prohibited_files"; then
+            echo "Local secret files must never be committed." >&2
+            exit 1
+          fi
+
+      - name: Validate workflows with actionlint
+        run: |
+          actionlint_dir="$(mktemp -d)"
+          curl --fail --silent --show-error --location \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$actionlint_dir/actionlint.tar.gz"
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz' \
+            | (cd "$actionlint_dir" && sha256sum --check)
+          tar --extract --gzip --file "$actionlint_dir/actionlint.tar.gz" --directory "$actionlint_dir"
+          "$actionlint_dir/actionlint" -color
+
+      - name: Check shell scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+          shellcheck scripts/*.sh
+          if git grep -n -I -E -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|sqp_[[:alnum:]_-]{20,}'; then
+            echo "A likely private key or Sonar token is committed." >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Build documentation with warnings denied
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
+
+  rust-version:
+    name: Rust 1.97.1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install project Rust version
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Test project Rust version
+        run: cargo +1.97.1 test --locked --all-targets --all-features
+
+  coverage:
+    name: Coverage 100%
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust and cargo-llvm-cov
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+          cargo install cargo-llvm-cov --version 0.8.7 --locked
+
+      - name: Enforce complete line coverage
+        run: >-
+          cargo llvm-cov
+          --locked
+          --all-targets
+          --all-features
+          --ignore-filename-regex 'src/main\.rs$'
+          --fail-under-lines 100
+
+  dependency-security:
+    name: Dependency security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust and security tools
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.19.9 --locked
+
+      - name: Audit Cargo.lock against RustSec
+        run: cargo audit --deny warnings
+
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny check
+
+  container:
+    name: Hardened container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: docker build --pull --tag mcp-ozon:ci .
+
+      - name: Install verified Trivy
+        run: |
+          trivy_dir="$(mktemp -d)"
+          curl --fail --silent --show-error --location \
+            https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-64bit.tar.gz \
+            --output "$trivy_dir/trivy.tar.gz"
+          echo '2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b  trivy.tar.gz' \
+            | (cd "$trivy_dir" && sha256sum --check)
+          tar --extract --gzip --file "$trivy_dir/trivy.tar.gz" --directory "$trivy_dir"
+          sudo install --mode 0755 "$trivy_dir/trivy" /usr/local/bin/trivy
+
+      - name: Scan repository for secrets and misconfiguration
+        run: >-
+          trivy filesystem
+          --scanners secret,misconfig
+          --severity HIGH,CRITICAL
+          --exit-code 1
+          --skip-dirs target
+          .
+
+      - name: Scan image for fixable high and critical vulnerabilities
+        run: >-
+          trivy image
+          --scanners vuln,secret
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --exit-code 1
+          mcp-ozon:ci
+
+      - name: Start hardened container and verify health
+        run: |
+          docker run --detach \
+            --name mcp-ozon-ci \
+            --read-only \
+            --tmpfs /tmp:size=16m,mode=1777 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges=true \
+            --env MCP_ACTOR_ID=rustam_magasumov \
+            --publish 127.0.0.1:8787:8787 \
+            mcp-ozon:ci
+
+          cleanup() {
+            docker logs mcp-ozon-ci || true
+            docker rm --force mcp-ozon-ci >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:8787/health; then
+              break
+            fi
+            if [[ "$attempt" == "30" ]]; then
+              echo "Container did not become healthy." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          test "$(docker inspect --format '{{.Config.User}}' mcp-ozon-ci)" = "mcp"
+          test "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' mcp-ozon-ci)" = "true"
+          test "$(docker inspect --format '{{join .HostConfig.CapDrop ","}}' mcp-ozon-ci)" = "ALL"
+          docker inspect --format '{{join .HostConfig.SecurityOpt ","}}' mcp-ozon-ci \
+            | grep --fixed-strings 'no-new-privileges=true'

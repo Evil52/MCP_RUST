@@ -1,0 +1,93 @@
+name: mcp-ozon-auth
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${KEYCLOAK_DB_NAME:?set in .keycloak.env}
+      POSTGRES_USER: ${KEYCLOAK_DB_USER:?set in .keycloak.env}
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set in .keycloak.env}
+    volumes:
+      - keycloak-db:/var/lib/postgresql/data
+    networks:
+      - identity
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+  keycloak:
+    build:
+      context: .
+      dockerfile: Dockerfile.keycloak
+    command: ["start-dev", "--import-realm", "--health-enabled=true"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL_HOST: postgres
+      KC_DB_URL_DATABASE: ${KEYCLOAK_DB_NAME:?set in .keycloak.env}
+      KC_DB_USERNAME: ${KEYCLOAK_DB_USER:?set in .keycloak.env}
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set in .keycloak.env}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:?set in .keycloak.env}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .keycloak.env}
+    networks:
+      - identity
+    ports:
+      - "127.0.0.1:8180:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ACCESS_CONFIG: config/access.json
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT: http
+      MCP_BIND: 0.0.0.0:8787
+      MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
+      MCP_AUTH_MODE: jwt
+      MCP_JWT_ISSUER: http://localhost:8180/realms/ofk
+      MCP_JWT_AUDIENCE: ozonofk-mcp
+      MCP_JWT_JWKS_URL: http://keycloak:8080/realms/ofk/protocol/openid-connect/certs
+      MCP_PUBLIC_URL: http://localhost:8788/mcp
+      MCP_JWKS_CACHE_TTL_SECONDS: "300"
+    networks:
+      - identity
+      - outbound
+    ports:
+      - "127.0.0.1:8788:8787"
+    depends_on:
+      - keycloak
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  keycloak-db:
+
+networks:
+  identity:
+    internal: true
+  outbound:

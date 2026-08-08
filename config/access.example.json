@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "actors": [
+    {
+      "id": "admin",
+      "name": "Administrator",
+      "role": "admin",
+      "oidc": { "username": "admin" }
+    },
+    {
+      "id": "manager",
+      "name": "Store manager",
+      "role": "manager",
+      "oidc": { "username": "manager" }
+    }
+  ],
+  "accounts": [
+    {
+      "id": "example_ozon",
+      "organization": "Example organization",
+      "marketplace": "ozon",
+      "seller_client_id": "replace-me",
+      "manager_id": "manager",
+      "ozon": {
+        "store_id": "example_store",
+        "client_id_env": "EXAMPLE_OZON_CLIENT_ID",
+        "api_key_env": "EXAMPLE_OZON_API_KEY"
+      }
+    }
+  ]
+}

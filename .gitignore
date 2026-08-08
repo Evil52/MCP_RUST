@@ -1,0 +1,10 @@
+/target
+/.plugin-build
+/.scannerwork
+/.vscode
+.env
+.keycloak.env
+.sonar.env
+sonar.env
+/config/access.json
+.DS_Store

@@ -1,0 +1,49 @@
+{
+  "realm": "ofk",
+  "enabled": true,
+  "displayName": "OFK",
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "bruteForceProtected": true,
+  "clients": [
+    {
+      "clientId": "ozonofk-mcp",
+      "name": "OzonOFK MCP",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost:*/*"],
+      "webOrigins": ["http://localhost:*"],
+      "protocolMappers": [
+        {
+          "name": "ozonofk audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "ozonofk-mcp",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "lightweight.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "rustam_magasumov",
+      "firstName": "Рустам",
+      "lastName": "Магасумов",
+      "enabled": true,
+      "emailVerified": false,
+      "requiredActions": ["UPDATE_PASSWORD"]
+    }
+  ]
+}

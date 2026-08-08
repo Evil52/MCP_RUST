@@ -1,0 +1,32 @@
+name: mcp-ozon
+
+services:
+  server:
+    container_name: mcp-ozon-server
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ACCESS_CONFIG: config/access.json
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSPORT: http
+      MCP_BIND: 0.0.0.0:8787
+      MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
+    ports:
+      - "127.0.0.1:8787:8787"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s

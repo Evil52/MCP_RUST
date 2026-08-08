@@ -1,0 +1,41 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = []
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "simplest-path"
+allow-workspace = true
+deny = [
+    { crate = "native-tls", reason = "The service standardizes on rustls to avoid platform TLS differences" },
+    { crate = "openssl", reason = "The service standardizes on rustls and does not need OpenSSL bindings" },
+    { crate = "openssl-sys", reason = "The service standardizes on rustls and does not need OpenSSL bindings" },
+]
+skip = [
+    { crate = "base64@0.22.1", reason = "reqwest/axum use 0.22 while rmcp currently uses 0.23" },
+    { crate = "syn@2.0.119", reason = "the wider async ecosystem uses syn 2 while rmcp macros currently use syn 3" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
