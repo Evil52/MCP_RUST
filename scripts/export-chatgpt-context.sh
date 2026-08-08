@@ -13,6 +13,7 @@ files=(
   .gitignore
   .keycloak.env.example
   .sonar.env.example
+  .sonar-stack.env.example
   Cargo.lock
   Cargo.toml
   Dockerfile
@@ -27,13 +28,16 @@ files=(
   deny.toml
   methods.json
   sonar-project.properties
+  compose.sonar.yaml
   .github/dependabot.yml
   .github/workflows/ci.yml
   .github/workflows/codeql.yml
   .github/workflows/dependency-review.yml
   scripts/local-ci.sh
   scripts/sonar-reports.sh
+  scripts/sonar-bootstrap.sh
   scripts/sonar-scan.sh
+  scripts/sonar-up.sh
   src/auth.rs
   src/config.rs
   src/lib.rs

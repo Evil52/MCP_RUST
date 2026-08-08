@@ -3,7 +3,7 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-scanner_image="sonarsource/sonar-scanner-cli:12.1.0.3233_8.0.1"
+scanner_image="sonarsource/sonar-scanner-cli:12.1.0.3233_8.0.1@sha256:23ca0f137965d9dff2198074043fd48d386280bc5d0ccac8c8349cea4cf096a9"
 scanner_container="mcp-ozon-sonar-scan-$$"
 sonar_env_file="$project_root/.sonar.env"
 sonar_token_source="environment"
@@ -31,6 +31,19 @@ fi
 
 SONAR_HOST_URL="${SONAR_HOST_URL:-http://127.0.0.1:9000}"
 
+if [[ "$SONAR_HOST_URL" == "http://127.0.0.1:9000" ]] \
+  || [[ "$SONAR_HOST_URL" == "http://localhost:9000" ]]; then
+  "$project_root/scripts/sonar-up.sh"
+  if [[ "$sonar_token_source" == ".sonar.env" ]]; then
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+      value="${value%$'\r'}"
+      if [[ "$key" == "SONAR_TOKEN" ]]; then
+        export SONAR_TOKEN="$value"
+      fi
+    done < "$sonar_env_file"
+  fi
+fi
+
 if [[ ! -s "$project_root/target/sonar/test-executions.xml" ]] \
   || [[ ! -s "$project_root/target/sonar/lcov.info" ]] \
   || [[ ! -s "$project_root/target/sonar/clippy.json" ]]; then
@@ -54,6 +67,9 @@ fi
 
 echo "Using SONAR_TOKEN from $sonar_token_source (value hidden)."
 
+scanner_host_url="${SONAR_HOST_URL/127.0.0.1/host.docker.internal}"
+scanner_host_url="${scanner_host_url/localhost/host.docker.internal}"
+
 token_status="$(
   curl --silent --show-error \
     --output /dev/null \
@@ -74,7 +90,7 @@ trap cleanup EXIT
 docker create \
   --name "$scanner_container" \
   --platform linux/amd64 \
-  --env SONAR_HOST_URL=http://host.docker.internal:9000 \
+  --env SONAR_HOST_URL="$scanner_host_url" \
   --env SONAR_TOKEN \
   --workdir /usr/src \
   "$scanner_image" \

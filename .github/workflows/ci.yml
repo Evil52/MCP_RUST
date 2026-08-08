@@ -39,7 +39,7 @@ jobs:
 
       - name: Reject accidentally committed local secrets
         run: |
-          prohibited_files='(^|/)(\.env|\.sonar\.env)$'
+          prohibited_files='(^|/)(\.env|\.sonar\.env|\.sonar-stack\.env)$'
           if git ls-files | grep -E "$prohibited_files"; then
             echo "Local secret files must never be committed." >&2
             exit 1

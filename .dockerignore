@@ -2,6 +2,7 @@
 .env
 .keycloak.env
 .sonar.env
+.sonar-stack.env
 .plugin-build
 .scannerwork
 .vscode

@@ -179,6 +179,13 @@ impl AccessRegistry {
         if account_ids.len() != self.accounts.len() {
             bail!("идентификаторы accounts должны быть уникальными");
         }
+        self.validate_accounts(&actor_ids)?;
+        self.validate_actor_account_ids(&account_ids)?;
+        self.validate_oidc_identities()?;
+        Ok(())
+    }
+
+    fn validate_accounts(&self, actor_ids: &BTreeSet<&str>) -> Result<()> {
         let mut store_ids = BTreeSet::new();
         for account in &self.accounts {
             if !actor_ids.contains(account.manager_id.as_str()) {
@@ -209,6 +216,10 @@ impl AccessRegistry {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_actor_account_ids(&self, account_ids: &BTreeSet<&str>) -> Result<()> {
         for actor in &self.actors {
             for account_id in &actor.account_ids {
                 if !account_ids.contains(account_id.as_str()) {
@@ -219,6 +230,10 @@ impl AccessRegistry {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_oidc_identities(&self) -> Result<()> {
         let mut subjects = BTreeSet::new();
         let mut usernames = BTreeSet::new();
         let mut emails = BTreeSet::new();
