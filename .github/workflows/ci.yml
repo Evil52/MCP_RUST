@@ -157,6 +157,18 @@ jobs:
       - name: Build image
         run: docker build --pull --tag mcp-ozon:ci .
 
+      - name: Verify minimal static musl runtime
+        run: |
+          test "$(docker image inspect --format '{{.Config.User}}' mcp-ozon:ci)" = "mcp"
+          docker run --rm --entrypoint /bin/sh mcp-ozon:ci -c '
+            test -f /etc/alpine-release
+            test -r /etc/ssl/certs/ca-certificates.crt
+            command -v wget >/dev/null
+            ! command -v curl >/dev/null
+            ldd /usr/local/bin/mcp-ozon 2>&1 \
+              | grep -Eq "statically linked|Not a valid dynamic program"
+          '
+
       - name: Install verified Trivy
         run: |
           trivy_dir="$(mktemp -d)"
@@ -194,7 +206,7 @@ jobs:
             --tmpfs /tmp:size=16m,mode=1777 \
             --cap-drop ALL \
             --security-opt no-new-privileges=true \
-            --env MCP_ACTOR_ID=rustam_magasumov \
+            --env MCP_ACTOR_ID=admin \
             --publish 127.0.0.1:8787:8787 \
             mcp-ozon:ci
 
