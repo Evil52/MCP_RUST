@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use chrono::{NaiveDate, Utc};
 use rmcp::{
@@ -25,7 +25,7 @@ use crate::{
         AuthenticatedActor, JwtAuthenticationFailure, JwtAuthenticator, ProtectedResourceMetadata,
     },
     config::{Actor, Marketplace, RegistrySource, Role, StoreId},
-    ozon::OzonClient,
+    ozon::{OzonClient, is_read_only_endpoint_allowed},
     wb::WbClient,
 };
 
@@ -58,32 +58,6 @@ const FINANCE_ACCRUAL_PREVIEW_TOOLS: &[&str] = &[
     "ozon_finance_accrual_types",
     "ozon_finance_accrual_by_day",
 ];
-
-const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
-    "/v1/analytics/data",
-    "/v1/analytics/turnover/stocks",
-    "/v1/finance/accrual/by-day",
-    "/v1/finance/accrual/postings",
-    "/v1/finance/accrual/types",
-    "/v1/question/list",
-    "/v1/rating/history",
-    "/v1/rating/summary",
-    "/v1/returns/list",
-    "/v1/review/list",
-    "/v2/posting/fbo/list",
-    "/v2/returns/rfbs/list",
-    "/v3/finance/transaction/list",
-    "/v3/finance/transaction/totals",
-    "/v3/posting/fbo/list",
-    "/v3/posting/fbs/list",
-    "/v4/posting/fbs/list",
-    "/v4/product/info/stocks",
-    "/v5/product/info/prices",
-];
-
-fn is_read_only_endpoint_allowed(endpoint: &str) -> bool {
-    READ_ONLY_ENDPOINT_ALLOWLIST.contains(&endpoint)
-}
 
 fn config_error(error: anyhow::Error) -> String {
     let message = error.to_string();
@@ -228,7 +202,7 @@ impl OzonMcp {
     fn access_context(
         &self,
         identity: &RequestIdentity,
-    ) -> Result<(crate::config::AccessRegistry, Actor), String> {
+    ) -> Result<(Arc<crate::config::AccessRegistry>, Actor), String> {
         let registry = self.registry.load().map_err(config_error)?;
         let actor_id = identity
             .actor_id
@@ -2118,6 +2092,7 @@ mod tests {
 
     use super::*;
     use crate::config::{JwtConfig, MarketplaceAccount};
+    use crate::ozon::READ_ONLY_ENDPOINT_ALLOWLIST;
     use crate::test_support::mock_http;
     use axum::Extension;
     use rmcp::transport::{
@@ -2488,7 +2463,7 @@ mod tests {
         );
 
         let source = registry_source();
-        let mut registry = source.load().unwrap();
+        let mut registry = (*source.load().unwrap()).clone();
         let mut second_wb = registry
             .accounts
             .iter()

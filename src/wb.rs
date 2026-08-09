@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use reqwest::{
     Client, Method, Response, StatusCode,
@@ -7,17 +12,40 @@ use reqwest::{
 };
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::sleep,
+};
 use tracing::{info, warn};
 
 const COMMON_API_BASE_URL: &str = "https://common-api.wildberries.ru";
 const ANALYTICS_API_BASE_URL: &str = "https://seller-analytics-api.wildberries.ru";
+const PING_PATH: &str = "/ping";
 const SALES_FUNNEL_PATH: &str = "/api/analytics/v3/sales-funnel/products";
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT_REQUESTS_PER_ACCOUNT: usize = 4;
 const MAX_REQUEST_ID_BYTES: usize = 128;
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(20);
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Every Wildberries request this process is allowed to make, as an exact
+/// `(method, path)` pair.
+///
+/// Mirrors [`crate::ozon::READ_ONLY_ENDPOINT_ALLOWLIST`]: it is enforced inside
+/// [`WbClient::request`], the only place a WB request can leave the process, so
+/// adding a mutating call requires deliberately editing this list.
+const READ_ONLY_ENDPOINT_ALLOWLIST: &[(Method, &str)] =
+    &[(Method::GET, PING_PATH), (Method::POST, SALES_FUNNEL_PATH)];
+
+fn is_read_only_request_allowed(method: &Method, path: &str) -> bool {
+    READ_ONLY_ENDPOINT_ALLOWLIST
+        .iter()
+        .any(|(allowed_method, allowed_path)| allowed_method == method && *allowed_path == path)
+}
 
 #[derive(Clone)]
 pub struct WbCredentials {
@@ -35,6 +63,7 @@ impl fmt::Debug for WbCredentials {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WbErrorKind {
+    EndpointNotAllowed,
     MissingCredentials,
     Unauthorized,
     Forbidden,
@@ -50,6 +79,7 @@ pub enum WbErrorKind {
 impl WbErrorKind {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::EndpointNotAllowed => "endpoint_not_allowed",
             Self::MissingCredentials => "missing_credentials",
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
@@ -66,6 +96,8 @@ impl WbErrorKind {
 
 #[derive(Error)]
 pub enum WbError {
+    #[error("запрос {method} {path} отсутствует в read-only allowlist Wildberries API")]
+    EndpointNotAllowed { method: Method, path: String },
     #[error("для кабинета WB {0} не настроен API token")]
     MissingCredentials(String),
     #[error("WB API отклонил авторизацию (HTTP 401, request-id: {request_id:?})")]
@@ -115,6 +147,7 @@ impl fmt::Debug for WbError {
 impl WbError {
     pub const fn kind(&self) -> WbErrorKind {
         match self {
+            Self::EndpointNotAllowed { .. } => WbErrorKind::EndpointNotAllowed,
             Self::MissingCredentials(_) => WbErrorKind::MissingCredentials,
             Self::Unauthorized { .. } => WbErrorKind::Unauthorized,
             Self::Forbidden { .. } => WbErrorKind::Forbidden,
@@ -136,7 +169,8 @@ impl WbError {
             | Self::Api { request_id, .. }
             | Self::InvalidJson { request_id, .. }
             | Self::ResponseTooLarge { request_id, .. } => request_id.as_deref(),
-            Self::MissingCredentials(_)
+            Self::EndpointNotAllowed { .. }
+            | Self::MissingCredentials(_)
             | Self::Timeout(_)
             | Self::Network(_)
             | Self::Overloaded => None,
@@ -147,15 +181,30 @@ impl WbError {
 #[derive(Debug)]
 struct AccountLimiter {
     in_flight: Semaphore,
-    request_gate: Mutex<()>,
+    next_allowed: Mutex<Instant>,
 }
 
 impl AccountLimiter {
     fn new() -> Self {
         Self {
             in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_ACCOUNT),
-            request_gate: Mutex::new(()),
+            next_allowed: Mutex::new(Instant::now()),
         }
+    }
+
+    /// Spaces successive requests for one account by `MIN_REQUEST_INTERVAL`.
+    ///
+    /// The pacing lock is released before the request is sent — it only orders
+    /// departures — so up to `MAX_IN_FLIGHT_REQUESTS_PER_ACCOUNT` requests stay
+    /// in flight at once instead of being serialised behind each other's
+    /// round-trip.
+    async fn pace(&self) {
+        let mut next_allowed = self.next_allowed.lock().await;
+        let wait = next_allowed.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            sleep(wait).await;
+        }
+        *next_allowed = Instant::now() + MIN_REQUEST_INTERVAL;
     }
 }
 
@@ -199,6 +248,14 @@ impl WbClient {
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
             .redirect(Policy::none())
             .user_agent(concat!("mcp-ozon/", env!("CARGO_PKG_VERSION")))
+            // Keep pooled TLS connections warm across tool calls and let
+            // HTTP/2 multiplex concurrent requests over a single connection.
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(MAX_IN_FLIGHT_REQUESTS_PER_ACCOUNT)
+            .tcp_keepalive(TCP_KEEPALIVE)
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+            .http2_keep_alive_while_idle(true)
             .build()
             .expect("static WB HTTP client configuration must be valid");
         let limiters = accounts
@@ -223,19 +280,46 @@ impl WbClient {
     }
 
     pub async fn ping(&self, account: &str) -> Result<Value, WbError> {
-        let url = format!("{}/ping", self.common_base_url);
-        self.request(account, Method::GET, "common:/ping", url, None)
-            .await
+        self.request(
+            account,
+            Method::GET,
+            "common:/ping",
+            &self.common_base_url,
+            PING_PATH,
+            None,
+        )
+        .await
     }
 
     pub async fn sales_funnel(&self, account: &str, payload: Value) -> Result<Value, WbError> {
-        let url = format!("{}{SALES_FUNNEL_PATH}", self.analytics_base_url);
         self.request(
             account,
             Method::POST,
             "analytics:/api/analytics/v3/sales-funnel/products",
-            url,
+            &self.analytics_base_url,
+            SALES_FUNNEL_PATH,
             Some(payload),
+        )
+        .await
+    }
+
+    /// Drives [`Self::request`] with an arbitrary method and path so the
+    /// read-only guard can be exercised. `ping` and `sales_funnel` are
+    /// allowlisted by construction and cannot reach the denial branch.
+    #[cfg(test)]
+    pub(crate) async fn request_for_test(
+        &self,
+        account: &str,
+        method: Method,
+        path: &'static str,
+    ) -> Result<Value, WbError> {
+        self.request(
+            account,
+            method,
+            "test:endpoint",
+            &self.common_base_url,
+            path,
+            None,
         )
         .await
     }
@@ -245,9 +329,19 @@ impl WbClient {
         account: &str,
         method: Method,
         endpoint: &'static str,
-        url: String,
+        base_url: &str,
+        path: &'static str,
         payload: Option<Value>,
     ) -> Result<Value, WbError> {
+        // Enforced here, at the only point where a WB request can leave the
+        // process, so the read-only guarantee does not depend on callers.
+        if !is_read_only_request_allowed(&method, path) {
+            return Err(WbError::EndpointNotAllowed {
+                method,
+                path: path.to_owned(),
+            });
+        }
+        let url = format!("{base_url}{path}");
         let credentials = self
             .accounts
             .get(account)
@@ -260,7 +354,7 @@ impl WbClient {
             .in_flight
             .try_acquire()
             .map_err(|_| WbError::Overloaded)?;
-        let _request_guard = limiter.request_gate.lock().await;
+        limiter.pace().await;
         let authorization = HeaderValue::from_str(&format!("Bearer {}", credentials.token))
             .map_err(|_| WbError::Unauthorized { request_id: None })?;
         let mut request = self
@@ -346,12 +440,26 @@ async fn read_body(
     Ok(body)
 }
 
+/// Extracts an upstream correlation id, rejecting anything that is not a plain
+/// bounded token.
+///
+/// The value is echoed back to the model inside tool error text, so it is held
+/// to the same strict charset as [`crate::ozon`]'s: no whitespace, quotes or
+/// punctuation an upstream could use to smuggle instructions into a message
+/// that otherwise reads as trusted server output.
 fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
     ["x-request-id", "x-trace-id"]
         .into_iter()
         .find_map(|name| headers.get(name))
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty() && value.len() <= MAX_REQUEST_ID_BYTES)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= MAX_REQUEST_ID_BYTES
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+                })
+        })
         .map(str::to_owned)
 }
 
@@ -576,6 +684,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn requests_for_one_account_overlap_instead_of_queuing_behind_each_other() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        // Accepts every connection before answering any of them, so it can only
+        // reach the full count if the client really keeps requests in flight
+        // together. A limiter that serialises round-trips stalls at one.
+        let task = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let mut streams = Vec::new();
+            while streams.len() < MAX_IN_FLIGHT_REQUESTS_PER_ACCOUNT
+                && std::time::Instant::now() < deadline
+            {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        streams.push(stream);
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            let accepted = streams.len();
+            for mut stream in streams {
+                let mut buffer = [0_u8; 4_096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(&raw_response(200, "", br#"{"Status":"OK"}"#));
+            }
+            accepted
+        });
+
+        let client = WbClient::new_for_test(
+            Duration::from_secs(5),
+            credentials(),
+            &format!("http://{address}"),
+            &format!("http://{address}"),
+        );
+        let mut pending = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_REQUESTS_PER_ACCOUNT {
+            let client = client.clone();
+            pending.push(tokio::spawn(async move { client.ping("account").await }));
+        }
+        for request in pending {
+            assert_eq!(request.await.unwrap().unwrap()["Status"], "OK");
+        }
+        assert_eq!(task.join().unwrap(), MAX_IN_FLIGHT_REQUESTS_PER_ACCOUNT);
+    }
+
+    #[tokio::test]
     async fn account_concurrency_is_bounded_and_fails_fast() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -628,6 +784,34 @@ mod tests {
         assert_eq!(extract_request_id(&headers), None);
         headers.insert("x-request-id", HeaderValue::from_bytes(&[0xff]).unwrap());
         assert_eq!(extract_request_id(&headers), None);
+
+        // The id is echoed into tool error text, so anything an upstream could
+        // use to smuggle instructions past it is dropped rather than trimmed.
+        for hostile in [
+            "id with spaces",
+            "id\"quoted\"",
+            "id;drop",
+            "id\tinjected",
+            "идентификатор",
+            "id\\escaped",
+            "id{brace}",
+            "   ",
+        ] {
+            headers.insert("x-request-id", HeaderValue::from_str(hostile).unwrap());
+            assert_eq!(extract_request_id(&headers), None, "{hostile}");
+        }
+
+        // Surrounding whitespace is stripped from an otherwise safe token.
+        headers.insert("x-request-id", HeaderValue::from_static("  safe-id  "));
+        assert_eq!(extract_request_id(&headers).as_deref(), Some("safe-id"));
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("a1:b2/c3.d4_e5-f6"),
+        );
+        assert_eq!(
+            extract_request_id(&headers).as_deref(),
+            Some("a1:b2/c3.d4_e5-f6")
+        );
     }
 
     #[test]
@@ -651,9 +835,72 @@ mod tests {
         assert_eq!(error.request_id(), Some("safe-id"));
     }
 
+    #[tokio::test]
+    async fn only_allowlisted_read_only_wb_requests_can_reach_the_network() {
+        // Pointed at a port nothing listens on: a denied request must fail as
+        // EndpointNotAllowed, never as a network error, proving nothing was sent.
+        let client = WbClient::new_for_test(
+            Duration::from_secs(1),
+            credentials(),
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
+
+        for (method, path) in [
+            // Writes, including the write counterparts of allowlisted reads.
+            (Method::POST, PING_PATH),
+            (Method::DELETE, PING_PATH),
+            (Method::PUT, SALES_FUNNEL_PATH),
+            (Method::PATCH, SALES_FUNNEL_PATH),
+            // Real WB mutating endpoints.
+            (Method::POST, "/api/v3/orders"),
+            (Method::POST, "/content/v2/cards/update"),
+            (Method::POST, "/public/api/v1/prices"),
+            // Near-misses of allowlisted paths.
+            (Method::GET, "/ping/"),
+            (Method::GET, ""),
+        ] {
+            let error = client
+                .request_for_test("account", method.clone(), path)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                WbErrorKind::EndpointNotAllowed,
+                "{method} {path}"
+            );
+            assert_eq!(error.request_id(), None);
+            let message = error.to_string();
+            assert!(message.contains(method.as_str()) && message.contains(path));
+        }
+
+        // The guard runs before credentials are looked up.
+        assert_eq!(
+            client
+                .request_for_test("unconfigured", Method::POST, "/api/v3/orders")
+                .await
+                .unwrap_err()
+                .kind(),
+            WbErrorKind::EndpointNotAllowed
+        );
+
+        // The two allowlisted reads pass the guard and only then fail on the
+        // network, which is what keeps this test honest.
+        assert!(is_read_only_request_allowed(&Method::GET, PING_PATH));
+        assert!(is_read_only_request_allowed(
+            &Method::POST,
+            SALES_FUNNEL_PATH
+        ));
+        assert_eq!(
+            client.ping("account").await.unwrap_err().kind(),
+            WbErrorKind::Network
+        );
+    }
+
     #[test]
     fn error_kind_codes_are_stable() {
         let pairs = [
+            (WbErrorKind::EndpointNotAllowed, "endpoint_not_allowed"),
             (WbErrorKind::MissingCredentials, "missing_credentials"),
             (WbErrorKind::Unauthorized, "unauthorized"),
             (WbErrorKind::Forbidden, "forbidden"),
@@ -669,6 +916,10 @@ mod tests {
             assert_eq!(kind.code(), code);
         }
         for error in [
+            WbError::EndpointNotAllowed {
+                method: Method::POST,
+                path: "/api/v3/orders".to_owned(),
+            },
             WbError::Unauthorized { request_id: None },
             WbError::Forbidden { request_id: None },
             WbError::RateLimited { request_id: None },

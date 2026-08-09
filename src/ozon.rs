@@ -29,9 +29,46 @@ const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(20);
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_REQUEST_ID_BYTES: usize = 128;
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Every Ozon Seller API path this process is allowed to reach.
+///
+/// This is the single source of truth for the read-only guarantee: it is
+/// enforced by [`OzonClient::post`] itself, at the only place where an HTTP
+/// request can leave the process, so no caller — present or future — can reach
+/// a mutating Ozon endpoint even if a higher layer forgets to check.
+pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
+    "/v1/analytics/data",
+    "/v1/analytics/turnover/stocks",
+    "/v1/finance/accrual/by-day",
+    "/v1/finance/accrual/postings",
+    "/v1/finance/accrual/types",
+    "/v1/question/list",
+    "/v1/rating/history",
+    "/v1/rating/summary",
+    "/v1/returns/list",
+    "/v1/review/list",
+    "/v2/posting/fbo/list",
+    "/v2/returns/rfbs/list",
+    "/v3/finance/transaction/list",
+    "/v3/finance/transaction/totals",
+    "/v3/posting/fbo/list",
+    "/v3/posting/fbs/list",
+    "/v4/posting/fbs/list",
+    "/v4/product/info/stocks",
+    "/v5/product/info/prices",
+];
+
+#[must_use]
+pub fn is_read_only_endpoint_allowed(endpoint: &str) -> bool {
+    READ_ONLY_ENDPOINT_ALLOWLIST.contains(&endpoint)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OzonErrorKind {
+    EndpointNotAllowed,
     MissingCredentials,
     Unauthorized,
     Forbidden,
@@ -49,6 +86,7 @@ pub enum OzonErrorKind {
 impl OzonErrorKind {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::EndpointNotAllowed => "endpoint_not_allowed",
             Self::MissingCredentials => "missing_credentials",
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
@@ -67,6 +105,8 @@ impl OzonErrorKind {
 
 #[derive(Error)]
 pub enum OzonError {
+    #[error("endpoint {0} отсутствует в read-only allowlist Ozon Seller API")]
+    EndpointNotAllowed(String),
     #[error("для магазина {0} не настроены Client-Id и Api-Key")]
     MissingCredentials(StoreId),
     #[error("Ozon API отклонил авторизацию (HTTP 401, request-id: {request_id:?})")]
@@ -137,6 +177,7 @@ impl fmt::Debug for OzonError {
 impl OzonError {
     pub fn kind(&self) -> OzonErrorKind {
         match self {
+            Self::EndpointNotAllowed(_) => OzonErrorKind::EndpointNotAllowed,
             Self::MissingCredentials(_) => OzonErrorKind::MissingCredentials,
             Self::Unauthorized { .. } => OzonErrorKind::Unauthorized,
             Self::Forbidden { .. } => OzonErrorKind::Forbidden,
@@ -154,7 +195,7 @@ impl OzonError {
 
     pub fn request_id(&self) -> Option<&str> {
         match self {
-            Self::MissingCredentials(_) | Self::Overloaded => None,
+            Self::EndpointNotAllowed(_) | Self::MissingCredentials(_) | Self::Overloaded => None,
             Self::Unauthorized { request_id }
             | Self::Forbidden { request_id }
             | Self::NotFound { request_id }
@@ -226,6 +267,15 @@ impl OzonClient {
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
             .redirect(Policy::none())
             .user_agent(user_agent)
+            // Keep pooled TLS connections warm so bursts of tool calls reuse an
+            // established session instead of paying a handshake each time, and
+            // let HTTP/2 multiplex them over a single connection.
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(MAX_IN_FLIGHT_REQUESTS_PER_CLIENT)
+            .tcp_keepalive(TCP_KEEPALIVE)
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+            .http2_keep_alive_while_idle(true)
             .build()?;
         let mut limiters_by_client_id = BTreeMap::new();
         let rate_limiters = stores
@@ -255,6 +305,11 @@ impl OzonClient {
         path: &'static str,
         payload: Value,
     ) -> Result<Value, OzonError> {
+        // Enforced here, at the only point where a request can leave the
+        // process, so the read-only guarantee does not depend on callers.
+        if !is_read_only_endpoint_allowed(path) {
+            return Err(OzonError::EndpointNotAllowed(path.to_owned()));
+        }
         let credentials = self
             .stores
             .get(store)
@@ -777,9 +832,80 @@ mod tests {
         )])
     }
 
+    #[tokio::test]
+    async fn mutating_endpoints_are_refused_by_the_client_before_any_network_access() {
+        // A store with credentials pointed at a port nothing listens on: if the
+        // allowlist did not reject the path first, this would fail as a network
+        // error instead, so the assertion proves nothing was ever sent.
+        let client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            credentials(),
+        )
+        .unwrap();
+
+        for endpoint in [
+            "/v1/product/import",
+            "/v1/product/update",
+            "/v2/posting/fbs/ship",
+            "/v2/posting/fbs/cancel",
+            "/v1/rating/summary/",
+            "",
+        ] {
+            let error = client
+                .post(&StoreId::from("ofk"), endpoint, serde_json::json!({}))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                OzonErrorKind::EndpointNotAllowed,
+                "{endpoint}"
+            );
+            assert_eq!(error.request_id(), None);
+            assert!(error.to_string().contains(endpoint), "{endpoint}");
+            assert!(format!("{error:?}").contains("EndpointNotAllowed"));
+        }
+
+        // The guard runs before credentials are looked up, so an unconfigured
+        // store cannot be used to distinguish allowlisted from denied paths.
+        assert_eq!(
+            client
+                .post(
+                    &StoreId::from("unconfigured"),
+                    "/v1/product/update",
+                    serde_json::json!({})
+                )
+                .await
+                .unwrap_err()
+                .kind(),
+            OzonErrorKind::EndpointNotAllowed
+        );
+    }
+
+    #[test]
+    fn the_read_only_allowlist_is_sorted_unique_and_free_of_mutating_verbs() {
+        let mut sorted = READ_ONLY_ENDPOINT_ALLOWLIST.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, READ_ONLY_ENDPOINT_ALLOWLIST);
+
+        for endpoint in READ_ONLY_ENDPOINT_ALLOWLIST {
+            assert!(endpoint.starts_with('/'), "{endpoint}");
+            assert!(is_read_only_endpoint_allowed(endpoint));
+            for verb in [
+                "cancel", "create", "delete", "import", "set", "ship", "update", "add", "remove",
+                "send", "activate", "archive",
+            ] {
+                assert!(!endpoint.contains(verb), "{endpoint} contains {verb}");
+            }
+        }
+        assert!(!is_read_only_endpoint_allowed("/v1/product/import"));
+    }
+
     #[test]
     fn error_kind_codes_are_stable() {
         for (kind, expected) in [
+            (OzonErrorKind::EndpointNotAllowed, "endpoint_not_allowed"),
             (OzonErrorKind::MissingCredentials, "missing_credentials"),
             (OzonErrorKind::Unauthorized, "unauthorized"),
             (OzonErrorKind::Forbidden, "forbidden"),
@@ -818,7 +944,7 @@ mod tests {
         let response = client
             .post(
                 &StoreId::from("ofk"),
-                "/v1/example",
+                "/v1/rating/summary",
                 serde_json::json!({"limit": 5}),
             )
             .await
@@ -827,7 +953,7 @@ mod tests {
         assert_eq!(response["result"]["items"][0], 1);
         let request = request.recv_timeout(Duration::from_secs(3)).unwrap();
         let request_lowercase = request.to_ascii_lowercase();
-        assert!(request.starts_with("POST /v1/example HTTP/1.1"));
+        assert!(request.starts_with("POST /v1/rating/summary HTTP/1.1"));
         assert!(request_lowercase.contains("client-id: test-client"));
         assert!(request_lowercase.contains("api-key: test-key"));
         assert!(request.contains(r#"{"limit":5}"#));
@@ -847,7 +973,7 @@ mod tests {
         let value = client
             .post(
                 &StoreId::from("ofk"),
-                "/v1/larger-success",
+                "/v1/rating/summary",
                 serde_json::json!({}),
             )
             .await
@@ -865,7 +991,11 @@ mod tests {
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let error = client
-            .post(&StoreId::from("ofk"), "/v1/raw", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::InvalidJson);
@@ -878,7 +1008,11 @@ mod tests {
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let error = client
-            .post(&StoreId::from("ofk"), "/v1/fail", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::Http);
@@ -905,7 +1039,7 @@ mod tests {
         let error = client
             .post(
                 &StoreId::from("ofk"),
-                "/v1/truncated-error",
+                "/v1/rating/summary",
                 serde_json::json!({}),
             )
             .await
@@ -931,7 +1065,7 @@ mod tests {
         let error = client
             .post(
                 &StoreId::from("ofk"),
-                "/v1/truncated-success",
+                "/v1/rating/summary",
                 serde_json::json!({}),
             )
             .await
@@ -957,7 +1091,7 @@ mod tests {
         let error = client
             .post(
                 &StoreId::from("ofk"),
-                "/v1/debug-redaction",
+                "/v1/rating/summary",
                 serde_json::json!({}),
             )
             .await
@@ -985,7 +1119,11 @@ mod tests {
             ]);
             let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
             let error = client
-                .post(&StoreId::from("ofk"), "/v1/status", serde_json::json!({}))
+                .post(
+                    &StoreId::from("ofk"),
+                    "/v1/rating/summary",
+                    serde_json::json!({}),
+                )
                 .await
                 .unwrap_err();
 
@@ -1015,7 +1153,7 @@ mod tests {
             let error = client
                 .post(
                     &StoreId::from("ofk"),
-                    "/v1/oversized-error",
+                    "/v1/rating/summary",
                     serde_json::json!({}),
                 )
                 .await
@@ -1051,7 +1189,11 @@ mod tests {
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let error = client
-            .post(&StoreId::from("ofk"), "/v1/rate", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::RateLimited);
@@ -1075,7 +1217,11 @@ mod tests {
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let value = client
-            .post(&StoreId::from("ofk"), "/v1/retry", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap();
         assert_eq!(value, serde_json::json!({"ok": true}));
@@ -1089,7 +1235,11 @@ mod tests {
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let error = client
-            .post(&StoreId::from("ofk"), "/v1/server", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::Server);
@@ -1110,7 +1260,11 @@ mod tests {
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let error = client
-            .post(&StoreId::from("ofk"), "/v1/redirect", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::Http);
@@ -1132,7 +1286,11 @@ mod tests {
         assert!(!client.is_configured(&StoreId::from("ofk")));
 
         let error = client
-            .post(&StoreId::from("ofk"), "/v1/example", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::MissingCredentials);
@@ -1154,7 +1312,11 @@ mod tests {
         let client = OzonClient::new(base_url, Duration::from_millis(10), credentials()).unwrap();
 
         let error = client
-            .post(&StoreId::from("ofk"), "/v1/slow", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::Timeout);
@@ -1173,7 +1335,7 @@ mod tests {
         let value = client
             .post(
                 &StoreId::from("ofk"),
-                "/v1/timeout-retry",
+                "/v1/rating/summary",
                 serde_json::json!({}),
             )
             .await
@@ -1198,13 +1360,48 @@ mod tests {
         let error = client
             .post(
                 &StoreId::from("ofk"),
-                "/v1/unavailable",
+                "/v1/rating/summary",
                 serde_json::json!({}),
             )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::Network);
         assert_eq!(error.request_id(), None);
+    }
+
+    #[tokio::test]
+    async fn a_compressed_response_cannot_expand_past_the_body_limit() {
+        use flate2::{Compression, write::GzEncoder};
+
+        // Transparent gzip/brotli decoding is enabled for throughput, which
+        // means a compact upstream body can expand enormously. Highly
+        // compressible padding stands in for a decompression bomb: ~8 MiB of
+        // zeros ships as a few KiB but must still be refused after the limit.
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+        encoder
+            .write_all(&vec![b'0'; MAX_RESPONSE_BODY_BYTES + 1])
+            .unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < 64 * 1_024, "{}", compressed.len());
+
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(200, compressed)
+                .header("Content-Encoding", "gzip")
+                .header("X-Request-Id", "gzip-bomb-1"),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(10), credentials()).unwrap();
+
+        let error = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::ResponseTooLarge);
+        assert_eq!(error.request_id(), Some("gzip-bomb-1"));
+        requests.recv().unwrap();
     }
 
     #[tokio::test]
@@ -1216,7 +1413,11 @@ mod tests {
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let error = client
-            .post(&StoreId::from("ofk"), "/v1/large", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::ResponseTooLarge);
@@ -1244,7 +1445,7 @@ mod tests {
         let error = client
             .post(
                 &StoreId::from("ofk"),
-                "/v1/streaming-large",
+                "/v1/rating/summary",
                 serde_json::json!({}),
             )
             .await
@@ -1343,7 +1544,7 @@ mod tests {
         let error = client
             .post(
                 &StoreId::from("second"),
-                "/v1/must-not-reach-network",
+                "/v1/rating/summary",
                 serde_json::json!({}),
             )
             .await
@@ -1517,7 +1718,7 @@ mod tests {
             let store = StoreId::from("ofk");
             let request = RequestTrace {
                 store: &store,
-                endpoint: "/v1/trace",
+                endpoint: "/v1/rating/summary",
                 started_at: Instant::now(),
                 attempt: 1,
             };
@@ -1567,7 +1768,7 @@ mod tests {
             let error = client
                 .post(
                     &StoreId::from("ofk"),
-                    "/v1/status-coverage",
+                    "/v1/rating/summary",
                     serde_json::json!({}),
                 )
                 .await
@@ -1589,7 +1790,7 @@ mod tests {
             let error = client
                 .post(
                     &StoreId::from("ofk"),
-                    "/v1/invalid-retry-after",
+                    "/v1/rating/summary",
                     serde_json::json!({}),
                 )
                 .await
@@ -1617,7 +1818,11 @@ mod tests {
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let error = client
-            .post(&StoreId::from("ofk"), "/v1/rate", serde_json::json!({}))
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
             .await
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::RateLimited);

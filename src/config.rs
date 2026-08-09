@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::Duration,
 };
 
@@ -158,11 +158,18 @@ pub struct AccessRegistry {
     pub accounts: Vec<MarketplaceAccount>,
 }
 
+fn read_registry_bytes(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path)
+        .with_context(|| format!("не удалось прочитать реестр доступа {}", path.display()))
+}
+
 impl AccessRegistry {
     pub fn load(path: &Path) -> Result<Self> {
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("не удалось прочитать реестр доступа {}", path.display()))?;
-        let registry: Self = serde_json::from_str(&contents)
+        Self::from_slice(&read_registry_bytes(path)?, path)
+    }
+
+    fn from_slice(contents: &[u8], path: &Path) -> Result<Self> {
+        let registry: Self = serde_json::from_slice(contents)
             .with_context(|| format!("неверный JSON реестра доступа {}", path.display()))?;
         registry.validate()?;
         Ok(registry)
@@ -446,27 +453,54 @@ impl OzonCredentialBinding {
     }
 }
 
+/// The parsed registry together with the exact bytes it was parsed from.
+///
+/// Keying the cache on the file contents — rather than on a modification
+/// timestamp — keeps hot reload exactly as eager as it was before: any edit
+/// changes the bytes, and any byte change re-parses and re-validates.
+#[derive(Debug)]
+struct CachedRegistry {
+    raw: Vec<u8>,
+    registry: Arc<AccessRegistry>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RegistrySource {
     path: Arc<PathBuf>,
     credential_bindings: Arc<BTreeSet<OzonCredentialBinding>>,
     wb_credential_bindings: Arc<BTreeSet<WbCredentialBinding>>,
+    cache: Arc<RwLock<Option<CachedRegistry>>>,
 }
 
 impl RegistrySource {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
         let path = Arc::new(path.into());
-        let registry = AccessRegistry::load(&path)?;
+        let raw = read_registry_bytes(&path)?;
+        let registry = AccessRegistry::from_slice(&raw, &path)?;
         let source = Self {
             path,
             credential_bindings: Arc::new(OzonCredentialBinding::snapshot(&registry)),
             wb_credential_bindings: Arc::new(WbCredentialBinding::snapshot(&registry)),
+            cache: Arc::new(RwLock::new(Some(CachedRegistry {
+                raw,
+                registry: Arc::new(registry),
+            }))),
         };
         Ok(source)
     }
 
-    pub fn load(&self) -> Result<AccessRegistry> {
-        let registry = AccessRegistry::load(&self.path)?;
+    /// Returns the current access registry, re-parsing it only when the file
+    /// contents actually changed.
+    ///
+    /// Every tool call needs the registry to resolve the caller's identity and
+    /// stores, so the unchanged-file path avoids a full JSON parse, a full
+    /// validation pass and a deep clone per call.
+    pub fn load(&self) -> Result<Arc<AccessRegistry>> {
+        let raw = read_registry_bytes(&self.path)?;
+        if let Some(cached) = self.cached(&raw) {
+            return Ok(cached);
+        }
+        let registry = AccessRegistry::from_slice(&raw, &self.path)?;
         if OzonCredentialBinding::snapshot(&registry) != *self.credential_bindings {
             bail!(
                 "MCP_ACCESS_CONFIG_RESTART_REQUIRED: привязки Ozon credentials изменились; перезапустите MCP, чтобы атомарно перечитать реестр и ключи"
@@ -477,7 +511,28 @@ impl RegistrySource {
                 "MCP_ACCESS_CONFIG_RESTART_REQUIRED: привязки Wildberries credentials изменились; перезапустите MCP, чтобы атомарно перечитать реестр и ключи"
             );
         }
+        let registry = Arc::new(registry);
+        *self.write_cache() = Some(CachedRegistry {
+            raw,
+            registry: Arc::clone(&registry),
+        });
         Ok(registry)
+    }
+
+    fn cached(&self, raw: &[u8]) -> Option<Arc<AccessRegistry>> {
+        let cache = self.read_cache();
+        let cached = cache.as_ref()?;
+        (cached.raw == raw).then(|| Arc::clone(&cached.registry))
+    }
+
+    // Nothing that can panic runs while either guard is held, so a poisoned
+    // lock is unreachable; recovering the value keeps it that way for good.
+    fn read_cache(&self) -> RwLockReadGuard<'_, Option<CachedRegistry>> {
+        self.cache.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write_cache(&self) -> RwLockWriteGuard<'_, Option<CachedRegistry>> {
+        self.cache.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn path(&self) -> &Path {
@@ -895,6 +950,44 @@ mod tests {
                 .unwrap()
                 .id,
             "manager"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_registry_file_is_served_from_cache_and_edits_still_hot_reload() {
+        let path = write_registry(&sample_registry());
+        let source = RegistrySource::new(&path).unwrap();
+
+        // Identical bytes must not be parsed or validated again.
+        let first = source.load().unwrap();
+        let second = source.load().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let mut edited = sample_registry();
+        edited.actors[1].name = "Renamed manager".to_owned();
+        std::fs::write(&path, serde_json::to_vec_pretty(&edited).unwrap()).unwrap();
+        let reloaded = source.load().unwrap();
+        assert!(!Arc::ptr_eq(&first, &reloaded));
+        assert_eq!(reloaded.actor("manager").unwrap().name, "Renamed manager");
+
+        // Rewriting byte-identical content is not an edit.
+        std::fs::write(&path, serde_json::to_vec_pretty(&edited).unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&reloaded, &source.load().unwrap()));
+
+        // A clone shares the cache rather than starting a cold one.
+        assert!(Arc::ptr_eq(&reloaded, &source.clone().load().unwrap()));
+
+        // A file that becomes invalid keeps failing instead of serving the
+        // last good parse out of the cache.
+        std::fs::write(&path, b"{").unwrap();
+        assert!(source.load().is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            source
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("не удалось прочитать реестр доступа")
         );
     }
 

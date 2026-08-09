@@ -989,6 +989,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dotenvy",
+ "flate2",
  "jsonwebtoken",
  "reqwest",
  "rmcp",
