@@ -32,10 +32,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install stable Rust with quality components
+      - name: Install project Rust with quality components
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,rustfmt
-          rustup default stable
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
 
       - name: Reject accidentally committed local secrets
         run: |
@@ -106,10 +105,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install stable Rust and cargo-llvm-cov
+      - name: Install project Rust and cargo-llvm-cov
         run: |
-          rustup toolchain install stable --profile minimal --component llvm-tools-preview
-          rustup default stable
+          rustup toolchain install 1.97.1 --profile minimal --component llvm-tools-preview
           cargo install cargo-llvm-cov --version 0.8.7 --locked
 
       - name: Enforce complete line coverage
@@ -131,10 +129,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install stable Rust and security tools
+      - name: Install project Rust and security tools
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install 1.97.1 --profile minimal
           cargo install cargo-audit --version 0.22.2 --locked
           cargo install cargo-deny --version 0.19.9 --locked
 
