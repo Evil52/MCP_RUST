@@ -1145,10 +1145,13 @@ mod tests {
     #[tokio::test]
     async fn timeout_retries_are_bounded_and_keep_the_error_classification() {
         let responses = (0..MAX_ATTEMPTS)
-            .map(|_| MockResponse::new(200, r#"{"ok":true}"#).delay(Duration::from_millis(200)))
+            .map(|_| MockResponse::new(200, r#"{"ok":true}"#).delay(Duration::from_millis(100)))
             .collect();
         let (base_url, requests) = mock_server(responses);
-        let client = OzonClient::new(base_url, Duration::from_millis(30), credentials()).unwrap();
+        // Keep each server delay longer than the client timeout, but shorter
+        // than the following retry backoff. The single-threaded mock is then
+        // ready to accept every retry before the client starts it.
+        let client = OzonClient::new(base_url, Duration::from_millis(10), credentials()).unwrap();
 
         let error = client
             .post(&StoreId::from("ofk"), "/v1/slow", serde_json::json!({}))
