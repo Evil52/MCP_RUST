@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    fs::File,
+    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
@@ -17,6 +19,9 @@ use crate::wb::WbCredentials;
 pub const DEFAULT_OZON_API_BASE_URL: &str = "https://api-seller.ozon.ru";
 pub const DEFAULT_ACCESS_CONFIG_PATH: &str = "config/access.json";
 pub const DEFAULT_JWT_REQUIRED_SCOPES: &str = "mcp:tools";
+const MAX_ACCESS_REGISTRY_BYTES: u64 = 1_048_576;
+const MAX_ENV_NAME_BYTES: usize = 128;
+const MAX_CREDENTIAL_BYTES: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -159,8 +164,45 @@ pub struct AccessRegistry {
 }
 
 fn read_registry_bytes(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path)
-        .with_context(|| format!("не удалось прочитать реестр доступа {}", path.display()))
+    let file = File::open(path)
+        .with_context(|| format!("не удалось прочитать реестр доступа {}", path.display()))?;
+    let mut contents = Vec::new();
+    file.take(MAX_ACCESS_REGISTRY_BYTES + 1)
+        .read_to_end(&mut contents)
+        .with_context(|| format!("не удалось прочитать реестр доступа {}", path.display()))?;
+    if contents.len() as u64 > MAX_ACCESS_REGISTRY_BYTES {
+        bail!(
+            "реестр доступа {} превышает безопасный лимит {} байт",
+            path.display(),
+            MAX_ACCESS_REGISTRY_BYTES
+        );
+    }
+    Ok(contents)
+}
+
+fn validate_env_name(value: &str, field: &str) -> Result<()> {
+    let mut bytes = value.bytes();
+    let first = bytes.next();
+    let valid = value.len() <= MAX_ENV_NAME_BYTES
+        && matches!(first, Some(b'A'..=b'Z' | b'_'))
+        && bytes.all(|byte| matches!(byte, b'A'..=b'Z' | b'0'..=b'9' | b'_'));
+    if !valid {
+        bail!(
+            "{field} должен быть безопасным именем переменной окружения [A-Z_][A-Z0-9_]{{0,{}}}",
+            MAX_ENV_NAME_BYTES - 1
+        );
+    }
+    Ok(())
+}
+
+fn validate_credential(value: &str, env_name: &str) -> Result<()> {
+    if value.len() > MAX_CREDENTIAL_BYTES || value.bytes().any(|byte| !matches!(byte, 0x21..=0x7e))
+    {
+        bail!(
+            "credential из {env_name} содержит пробельные/управляющие/non-ASCII символы или превышает безопасный лимит"
+        );
+    }
+    Ok(())
 }
 
 impl AccessRegistry {
@@ -266,6 +308,8 @@ impl AccessRegistry {
                 account.id
             );
         }
+        validate_env_name(&ozon.client_id_env, "client_id_env")?;
+        validate_env_name(&ozon.api_key_env, "api_key_env")?;
         if !store_ids.insert(ozon.store_id.clone()) {
             bail!("store_id={} должен быть уникальным", ozon.store_id);
         }
@@ -298,6 +342,7 @@ impl AccessRegistry {
                 account.id
             );
         }
+        validate_env_name(&wildberries.api_token_env, "api_token_env")?;
         Ok(())
     }
 
@@ -769,32 +814,38 @@ impl AppConfig {
                 })
             }
         };
-        let stores = snapshot
-            .accounts
-            .iter()
-            .filter_map(|account| account.ozon.as_ref())
-            .filter_map(|ozon| {
+        let mut stores = BTreeMap::new();
+        let mut wildberries_accounts = BTreeMap::new();
+        for account in &snapshot.accounts {
+            if let Some(ozon) = &account.ozon {
                 let client_id = lookup(&ozon.client_id_env).unwrap_or_default();
                 let api_key = lookup(&ozon.api_key_env).unwrap_or_default();
-                (!client_id.trim().is_empty() && !api_key.trim().is_empty()).then(|| {
-                    (
-                        ozon.store_id.clone(),
-                        StoreCredentials { client_id, api_key },
-                    )
-                })
-            })
-            .collect();
-        let wildberries_accounts = snapshot
-            .accounts
-            .iter()
-            .filter_map(|account| {
-                account.wildberries.as_ref().and_then(|wildberries| {
-                    let token = lookup(&wildberries.api_token_env).unwrap_or_default();
-                    (!token.trim().is_empty())
-                        .then(|| (account.id.clone(), WbCredentials { token }))
-                })
-            })
-            .collect();
+                match (client_id.is_empty(), api_key.is_empty()) {
+                    (true, true) => {}
+                    (false, false) => {
+                        validate_credential(&client_id, &ozon.client_id_env)?;
+                        validate_credential(&api_key, &ozon.api_key_env)?;
+                        stores.insert(
+                            ozon.store_id.clone(),
+                            StoreCredentials { client_id, api_key },
+                        );
+                    }
+                    _ => bail!(
+                        "для магазина {} должны быть одновременно заданы {} и {}",
+                        ozon.store_id,
+                        ozon.client_id_env,
+                        ozon.api_key_env
+                    ),
+                }
+            }
+            if let Some(wildberries) = &account.wildberries {
+                let token = lookup(&wildberries.api_token_env).unwrap_or_default();
+                if !token.is_empty() {
+                    validate_credential(&token, &wildberries.api_token_env)?;
+                    wildberries_accounts.insert(account.id.clone(), WbCredentials { token });
+                }
+            }
+        }
         Ok(Self {
             bind,
             transport,
@@ -1111,6 +1162,43 @@ mod tests {
     }
 
     #[test]
+    fn app_config_inserts_only_wildberries_accounts_with_non_empty_tokens() {
+        let mut registry = sample_registry();
+        for (id, token_env) in [
+            ("wb_configured", "WB_CONFIGURED_TOKEN"),
+            ("wb_without_token", "WB_MISSING_TOKEN"),
+        ] {
+            registry.accounts.push(MarketplaceAccount {
+                id: id.into(),
+                organization: id.into(),
+                marketplace: Marketplace::Wildberries,
+                seller_client_id: id.into(),
+                manager_id: "manager".into(),
+                ozon: None,
+                wildberries: Some(WildberriesAccount {
+                    api_token_env: token_env.into(),
+                }),
+            });
+        }
+        let path = write_registry(&registry);
+        let values = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("WB_CONFIGURED_TOKEN", "configured-test-token"),
+        ]);
+
+        let config =
+            AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned())).unwrap();
+
+        assert_eq!(config.wildberries_accounts.len(), 1);
+        assert_eq!(
+            config.wildberries_accounts["wb_configured"].token,
+            "configured-test-token"
+        );
+        assert!(!config.wildberries_accounts.contains_key("wb_without_token"));
+    }
+
+    #[test]
     fn credentials_are_redacted() {
         let value = format!(
             "{:?}",
@@ -1151,6 +1239,14 @@ mod tests {
         );
         assert!(RegistrySource::new(&missing).is_err());
 
+        let unreadable_as_file = std::env::temp_dir();
+        assert!(
+            AccessRegistry::load(&unreadable_as_file)
+                .unwrap_err()
+                .to_string()
+                .contains("прочитать")
+        );
+
         let invalid_json =
             std::env::temp_dir().join(format!("mcp-ozon-invalid-{}.json", std::process::id()));
         std::fs::write(&invalid_json, "{").unwrap();
@@ -1159,6 +1255,20 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("неверный JSON")
+        );
+
+        let oversized =
+            std::env::temp_dir().join(format!("mcp-ozon-oversized-{}.json", std::process::id()));
+        std::fs::write(
+            &oversized,
+            vec![b' '; usize::try_from(MAX_ACCESS_REGISTRY_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(
+            AccessRegistry::load(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("безопасный лимит")
         );
 
         let mut invalid_registry = sample_registry();
@@ -1201,6 +1311,9 @@ mod tests {
         cases.push(value);
         let mut value = sample_registry();
         value.actors[1].oidc = Some(OidcIdentity::default());
+        cases.push(value);
+        let mut value = sample_registry();
+        value.accounts[0].ozon.as_mut().unwrap().client_id_env = "lowercase".into();
         cases.push(value);
         for registry in cases {
             assert!(registry.validate().is_err());
@@ -1260,6 +1373,33 @@ mod tests {
                 .unwrap();
         assert!(config.ozon_postings_vnext);
         assert!(config.ozon_finance_accruals_preview);
+
+        let partial = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("SHOP_ID", "client"),
+        ]);
+        assert!(
+            AppConfig::from_lookup(|key| partial.get(key).map(|value| (*value).to_owned()))
+                .unwrap_err()
+                .to_string()
+                .contains("одновременно заданы")
+        );
+
+        for unsafe_value in [" leading-space", "contains\nnewline"] {
+            let invalid = BTreeMap::from([
+                ("MCP_ACTOR_ID", "admin"),
+                ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+                ("SHOP_ID", "client"),
+                ("SHOP_KEY", unsafe_value),
+            ]);
+            let error =
+                AppConfig::from_lookup(|key| invalid.get(key).map(|value| (*value).to_owned()))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("SHOP_KEY"));
+            assert!(!error.contains(unsafe_value));
+        }
     }
 
     #[test]

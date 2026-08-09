@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    num::ParseIntError,
+    num::{NonZeroUsize, ParseIntError},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -28,19 +28,49 @@ use crate::{
     },
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct LocalSessionManager {
     pub sessions: tokio::sync::RwLock<HashMap<SessionId, LocalSessionHandle>>,
     pub session_config: SessionConfig,
     event_store: Option<Arc<dyn EventStore>>,
+    max_sessions: NonZeroUsize,
 }
 
 impl LocalSessionManager {
+    /// Maximum number of local sessions retained by default.
+    pub const DEFAULT_MAX_SESSIONS: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+
     /// Configure this session manager to use a shared event store.
     pub fn with_event_store(mut self, event_store: Arc<dyn EventStore>) -> Self {
         self.event_store = Some(event_store);
         self
+    }
+
+    /// Set the hard upper bound for concurrently retained local sessions.
+    pub fn with_max_sessions(mut self, max_sessions: NonZeroUsize) -> Self {
+        self.max_sessions = max_sessions;
+        self
+    }
+
+    /// Return the configured hard upper bound for local sessions.
+    pub fn max_sessions(&self) -> NonZeroUsize {
+        self.max_sessions
+    }
+
+    fn remove_terminated_sessions(sessions: &mut HashMap<SessionId, LocalSessionHandle>) {
+        sessions.retain(|_, handle| !handle.event_tx.is_closed());
+    }
+}
+
+impl Default for LocalSessionManager {
+    fn default() -> Self {
+        Self {
+            sessions: Default::default(),
+            session_config: Default::default(),
+            event_store: None,
+            max_sessions: Self::DEFAULT_MAX_SESSIONS,
+        }
     }
 }
 
@@ -53,18 +83,29 @@ pub enum LocalSessionManagerError {
     SessionError(#[from] SessionError),
     #[error("Invalid event id: {0}")]
     InvalidEventId(#[from] EventIdParseError),
+    #[error("Local session capacity exhausted (limit: {limit})")]
+    SessionCapacityExhausted { limit: usize },
 }
 impl SessionManager for LocalSessionManager {
     type Error = LocalSessionManagerError;
     type Transport = WorkerTransport<LocalSessionWorker>;
     async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        let mut sessions = self.sessions.write().await;
+        Self::remove_terminated_sessions(&mut sessions);
+        if sessions.len() >= self.max_sessions.get() {
+            return Err(LocalSessionManagerError::SessionCapacityExhausted {
+                limit: self.max_sessions.get(),
+            });
+        }
+
         let id = session_id();
         let (handle, worker) = create_local_session_with_event_store(
             id.clone(),
             self.session_config.clone(),
             self.event_store.clone(),
         );
-        self.sessions.write().await.insert(id.clone(), handle);
+        sessions.insert(id.clone(), handle);
+        drop(sessions);
         Ok((id, WorkerTransport::spawn(worker)))
     }
     async fn initialize_session(
@@ -162,9 +203,15 @@ impl SessionManager for LocalSessionManager {
         id: SessionId,
     ) -> Result<RestoreOutcome<Self::Transport>, Self::Error> {
         let mut sessions = self.sessions.write().await;
+        Self::remove_terminated_sessions(&mut sessions);
         if sessions.contains_key(&id) {
             // A concurrent request already restored this session.
             return Ok(RestoreOutcome::AlreadyPresent);
+        }
+        if sessions.len() >= self.max_sessions.get() {
+            return Err(LocalSessionManagerError::SessionCapacityExhausted {
+                limit: self.max_sessions.get(),
+            });
         }
         let (handle, worker) = create_local_session_with_event_store(
             id.clone(),

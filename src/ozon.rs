@@ -25,9 +25,11 @@ const MAX_ERROR_BODY_BYTES: usize = 4_096;
 const MAX_ATTEMPTS: usize = 3;
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT_REQUESTS_PER_CLIENT: usize = 16;
+const MAX_GLOBAL_IN_FLIGHT_REQUESTS: usize = 32;
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(20);
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_TOTAL_RETRY_OVERHEAD: Duration = Duration::from_secs(5);
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
@@ -42,9 +44,6 @@ const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
     "/v1/analytics/data",
     "/v1/analytics/turnover/stocks",
-    "/v1/finance/accrual/by-day",
-    "/v1/finance/accrual/postings",
-    "/v1/finance/accrual/types",
     "/v1/question/list",
     "/v1/rating/history",
     "/v1/rating/summary",
@@ -61,9 +60,22 @@ pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
     "/v5/product/info/prices",
 ];
 
+/// Candidate read-only finance endpoints whose exact production contract is
+/// not yet treated as stable. They are denied unless the canary feature is
+/// explicitly enabled on both the tool router and this egress client.
+pub const PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
+    "/v1/finance/accrual/by-day",
+    "/v1/finance/accrual/postings",
+    "/v1/finance/accrual/types",
+];
+
 #[must_use]
 pub fn is_read_only_endpoint_allowed(endpoint: &str) -> bool {
     READ_ONLY_ENDPOINT_ALLOWLIST.contains(&endpoint)
+}
+
+fn is_preview_read_only_endpoint(endpoint: &str) -> bool {
+    PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST.contains(&endpoint)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +152,8 @@ pub enum OzonError {
         #[source]
         source: reqwest::Error,
     },
+    #[error("истёк общий deadline операции Ozon API")]
+    DeadlineExceeded,
     #[error("сетевая ошибка при обращении к Ozon API (request-id: {request_id:?})")]
     Network {
         request_id: Option<String>,
@@ -185,7 +199,7 @@ impl OzonError {
             Self::RateLimited { .. } => OzonErrorKind::RateLimited,
             Self::Server { .. } => OzonErrorKind::Server,
             Self::Api { .. } => OzonErrorKind::Http,
-            Self::Timeout { .. } => OzonErrorKind::Timeout,
+            Self::Timeout { .. } | Self::DeadlineExceeded => OzonErrorKind::Timeout,
             Self::Network { .. } => OzonErrorKind::Network,
             Self::Overloaded => OzonErrorKind::Overloaded,
             Self::InvalidJson { .. } => OzonErrorKind::InvalidJson,
@@ -195,7 +209,10 @@ impl OzonError {
 
     pub fn request_id(&self) -> Option<&str> {
         match self {
-            Self::EndpointNotAllowed(_) | Self::MissingCredentials(_) | Self::Overloaded => None,
+            Self::EndpointNotAllowed(_)
+            | Self::MissingCredentials(_)
+            | Self::DeadlineExceeded
+            | Self::Overloaded => None,
             Self::Unauthorized { request_id }
             | Self::Forbidden { request_id }
             | Self::NotFound { request_id }
@@ -238,8 +255,11 @@ impl RateLimiter {
 pub struct OzonClient {
     http: Client,
     base_url: String,
+    request_deadline: Duration,
+    finance_accruals_preview: bool,
     stores: Arc<BTreeMap<StoreId, StoreCredentials>>,
     rate_limiters: Arc<BTreeMap<StoreId, Arc<RateLimiter>>>,
+    global_in_flight: Arc<Semaphore>,
 }
 
 impl OzonClient {
@@ -266,6 +286,9 @@ impl OzonClient {
             .timeout(timeout)
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
             .redirect(Policy::none())
+            // Marketplace credentials must never be forwarded through an
+            // ambient HTTP(S)_PROXY inherited from the host/container.
+            .no_proxy()
             .user_agent(user_agent)
             // Keep pooled TLS connections warm so bursts of tool calls reuse an
             // established session instead of paying a handshake each time, and
@@ -290,13 +313,27 @@ impl OzonClient {
         Ok(Self {
             http,
             base_url,
+            request_deadline: timeout.saturating_add(MAX_TOTAL_RETRY_OVERHEAD),
+            finance_accruals_preview: false,
             stores: Arc::new(stores),
             rate_limiters: Arc::new(rate_limiters),
+            global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT_REQUESTS)),
         })
     }
 
     pub fn is_configured(&self, store: &StoreId) -> bool {
         self.stores.contains_key(store)
+    }
+
+    pub fn with_finance_accruals_preview(mut self, enabled: bool) -> Self {
+        self.finance_accruals_preview = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn is_endpoint_allowed(&self, endpoint: &str) -> bool {
+        is_read_only_endpoint_allowed(endpoint)
+            || (self.finance_accruals_preview && is_preview_read_only_endpoint(endpoint))
     }
 
     pub async fn post(
@@ -307,13 +344,31 @@ impl OzonClient {
     ) -> Result<Value, OzonError> {
         // Enforced here, at the only point where a request can leave the
         // process, so the read-only guarantee does not depend on callers.
-        if !is_read_only_endpoint_allowed(path) {
+        if !self.is_endpoint_allowed(path) {
             return Err(OzonError::EndpointNotAllowed(path.to_owned()));
         }
+        tokio::time::timeout(
+            self.request_deadline,
+            self.post_within_deadline(store, path, payload),
+        )
+        .await
+        .map_err(|_| OzonError::DeadlineExceeded)?
+    }
+
+    async fn post_within_deadline(
+        &self,
+        store: &StoreId,
+        path: &'static str,
+        payload: Value,
+    ) -> Result<Value, OzonError> {
         let credentials = self
             .stores
             .get(store)
             .ok_or_else(|| OzonError::MissingCredentials(store.clone()))?;
+        let _global_permit = self
+            .global_in_flight
+            .try_acquire()
+            .map_err(|_| OzonError::Overloaded)?;
         let limiter = self
             .rate_limiters
             .get(store)
@@ -833,7 +888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutating_endpoints_are_refused_by_the_client_before_any_network_access() {
+    async fn non_stable_endpoints_are_refused_by_the_client_before_any_network_access() {
         // A store with credentials pointed at a port nothing listens on: if the
         // allowlist did not reject the path first, this would fail as a network
         // error instead, so the assertion proves nothing was ever sent.
@@ -865,6 +920,16 @@ mod tests {
             assert!(error.to_string().contains(endpoint), "{endpoint}");
             assert!(format!("{error:?}").contains("EndpointNotAllowed"));
         }
+        for &endpoint in PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST {
+            assert_eq!(
+                client
+                    .post(&StoreId::from("ofk"), endpoint, serde_json::json!({}))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                OzonErrorKind::EndpointNotAllowed
+            );
+        }
 
         // The guard runs before credentials are looked up, so an unconfigured
         // store cannot be used to distinguish allowlisted from denied paths.
@@ -880,6 +945,27 @@ mod tests {
                 .kind(),
             OzonErrorKind::EndpointNotAllowed
         );
+    }
+
+    #[tokio::test]
+    async fn finance_preview_egress_requires_explicit_client_opt_in() {
+        let (base_url, requests) = mock_server(vec![MockResponse::new(200, r#"{"ok":true}"#)]);
+        let client = OzonClient::new(base_url, Duration::from_secs(1), credentials())
+            .unwrap()
+            .with_finance_accruals_preview(true);
+
+        assert_eq!(
+            client
+                .post(
+                    &StoreId::from("ofk"),
+                    "/v1/finance/accrual/types",
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap(),
+            serde_json::json!({"ok": true})
+        );
+        assert_request_count(&requests, 1);
     }
 
     #[test]
@@ -1301,6 +1387,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_logical_operation_has_a_deadline_across_attempts_and_backoff() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(200, r#"{"ok":true}"#).delay(Duration::from_millis(100)),
+        ]);
+        let mut client = OzonClient::new(base_url, Duration::from_secs(1), credentials()).unwrap();
+        client.request_deadline = Duration::from_millis(10);
+
+        let error = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OzonError::DeadlineExceeded));
+        assert_eq!(error.kind(), OzonErrorKind::Timeout);
+        assert_eq!(error.request_id(), None);
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
     async fn timeout_retries_are_bounded_and_keep_the_error_classification() {
         let responses = (0..MAX_ATTEMPTS)
             .map(|_| MockResponse::new(200, r#"{"ok":true}"#).delay(Duration::from_millis(100)))
@@ -1554,6 +1663,33 @@ mod tests {
         assert_eq!(error.kind().code(), "local_overloaded");
         assert_eq!(error.request_id(), None);
         assert!(!error.to_string().contains("shared-client"));
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn aggregate_concurrency_budget_fails_fast_before_network() {
+        let client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            credentials(),
+        )
+        .unwrap();
+        let permits = client
+            .global_in_flight
+            .acquire_many(u32::try_from(MAX_GLOBAL_IN_FLIGHT_REQUESTS).unwrap())
+            .await
+            .unwrap();
+
+        let error = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), OzonErrorKind::Overloaded);
         drop(permits);
     }
 

@@ -14,6 +14,11 @@ Local modification: `Tool` exposes the OpenAI plugin authentication extension
 The same value is mirrored into `_meta.securitySchemes` by the application for
 compatibility.
 
+Local modification: `LocalSessionManager` enforces a configurable hard session
+cap (256 by default) and prunes terminated handles before capacity checks. This
+bounds memory and task growth from repeated public MCP `initialize` requests
+without moving authentication ahead of protocol negotiation.
+
 The upstream `build.rs` is intentionally omitted: it manages Git hook settings
 for the SDK workspace and must not mutate the parent application's repository.
 

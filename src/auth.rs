@@ -108,6 +108,33 @@ struct JwksCacheState {
 
 const UNKNOWN_KID_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const FAILED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+const MAX_JWKS_BODY_BYTES: usize = 1024 * 1024;
+const MAX_JWKS_KEYS: usize = 64;
+const MAX_JWK_STRING_BYTES: usize = 16 * 1024;
+
+fn jwks_strings_are_bounded(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(value) => value.len() <= MAX_JWK_STRING_BYTES,
+        serde_json::Value::Array(values) => values.iter().all(jwks_strings_are_bounded),
+        serde_json::Value::Object(values) => values.iter().all(|(name, value)| {
+            name.len() <= MAX_JWK_STRING_BYTES && jwks_strings_are_bounded(value)
+        }),
+        _ => true,
+    }
+}
+
+fn parse_bounded_jwks(body: &[u8]) -> std::result::Result<JwkSet, JwtAuthenticationFailure> {
+    let value = serde_json::from_slice::<serde_json::Value>(body)
+        .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
+    let keys = value
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(JwtAuthenticationFailure::VerifierUnavailable)?;
+    if keys.is_empty() || keys.len() > MAX_JWKS_KEYS || !jwks_strings_are_bounded(&value) {
+        return Err(JwtAuthenticationFailure::VerifierUnavailable);
+    }
+    serde_json::from_value(value).map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)
+}
 
 #[derive(Debug, Clone)]
 pub struct JwtAuthenticator {
@@ -120,7 +147,13 @@ pub struct JwtAuthenticator {
 
 impl JwtAuthenticator {
     pub fn new(config: JwtConfig, registry: RegistrySource) -> Result<Self> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            // JWKS is an authentication trust anchor. Fetch it directly so a
+            // process-wide HTTP(S)_PROXY cannot observe or rewrite signing keys.
+            // This also keeps the local Keycloak hostname/port path unchanged.
+            .no_proxy()
+            .build()?;
         Ok(Self {
             config,
             registry,
@@ -187,22 +220,41 @@ impl JwtAuthenticator {
     }
 
     async fn fetch_jwks(&self) -> std::result::Result<JwkSet, JwtAuthenticationFailure> {
-        let keys = self
+        let mut response = self
             .client
             .get(&self.config.jwks_url)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?
-            .error_for_status()
-            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?
-            .json::<JwkSet>()
-            .await
             .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
-        if keys.keys.is_empty() {
+        if !response.status().is_success() {
             return Err(JwtAuthenticationFailure::VerifierUnavailable);
         }
-        Ok(keys)
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_JWKS_BODY_BYTES as u64)
+        {
+            return Err(JwtAuthenticationFailure::VerifierUnavailable);
+        }
+
+        let mut body = Vec::with_capacity(
+            response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or(8 * 1024)
+                .min(MAX_JWKS_BODY_BYTES),
+        );
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?
+        {
+            if chunk.len() > MAX_JWKS_BODY_BYTES.saturating_sub(body.len()) {
+                return Err(JwtAuthenticationFailure::VerifierUnavailable);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        parse_bounded_jwks(&body)
     }
 
     fn cached_decoding_key(
@@ -532,6 +584,53 @@ mod tests {
         )
     }
 
+    fn one_shot_jwks_http(
+        status: u16,
+        extra_headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        chunked: bool,
+    ) -> (String, mpsc::Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            request_sender.send(()).unwrap();
+
+            let reason = if status == 200 { "OK" } else { "Redirect" };
+            let mut headers =
+                format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n");
+            for (name, value) in extra_headers {
+                headers.push_str(&format!("{name}: {value}\r\n"));
+            }
+            if chunked {
+                headers.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+            } else {
+                headers.push_str(&format!(
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                ));
+            }
+            let _ = (|| -> std::io::Result<()> {
+                stream.write_all(headers.as_bytes())?;
+                if chunked {
+                    for chunk in body.chunks(16 * 1024) {
+                        write!(stream, "{:x}\r\n", chunk.len())?;
+                        stream.write_all(chunk)?;
+                        stream.write_all(b"\r\n")?;
+                    }
+                    stream.write_all(b"0\r\n\r\n")?;
+                } else {
+                    stream.write_all(&body)?;
+                }
+                Ok(())
+            })();
+        });
+        (format!("http://{address}"), request_receiver)
+    }
+
     fn config(jwks_url: String) -> JwtConfig {
         JwtConfig {
             issuer: "http://issuer.test/realms/ofk".to_owned(),
@@ -731,6 +830,108 @@ mod tests {
         }
         assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
         assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn jwks_fetch_is_direct_does_not_follow_redirects_and_supports_local_keycloak() {
+        let (target_url, target_requests) = mock_http(vec![(200, jwks())]);
+        let (redirect_url, redirect_requests) = one_shot_jwks_http(
+            302,
+            vec![("Location".to_owned(), target_url)],
+            jwks().into_bytes(),
+            false,
+        );
+        let redirected = JwtAuthenticator::new(config(redirect_url), registry()).unwrap();
+        assert_eq!(
+            redirected.fetch_jwks().await.unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
+        );
+        assert!(
+            redirect_requests
+                .recv_timeout(Duration::from_secs(1))
+                .is_ok()
+        );
+        assert!(
+            target_requests
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "the JWKS client must not follow redirects"
+        );
+
+        let (local_url, local_requests) = mock_http(vec![(200, jwks())]);
+        let direct = JwtAuthenticator::new(config(local_url), registry()).unwrap();
+        assert_eq!(direct.fetch_jwks().await.unwrap().keys.len(), 1);
+        assert!(local_requests.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_jwks_bodies_over_one_mib_when_sized_chunked_or_compressed() {
+        let oversized = vec![b' '; MAX_JWKS_BODY_BYTES + 1];
+        for chunked in [false, true] {
+            let (url, requests) = one_shot_jwks_http(200, Vec::new(), oversized.clone(), chunked);
+            let auth = JwtAuthenticator::new(config(url), registry()).unwrap();
+            assert_eq!(
+                auth.fetch_jwks().await.unwrap_err(),
+                JwtAuthenticationFailure::VerifierUnavailable
+            );
+            assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        }
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&oversized).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < MAX_JWKS_BODY_BYTES);
+        let (url, requests) = one_shot_jwks_http(
+            200,
+            vec![("Content-Encoding".to_owned(), "gzip".to_owned())],
+            compressed,
+            false,
+        );
+        let auth = JwtAuthenticator::new(config(url), registry()).unwrap();
+        assert_eq!(
+            auth.fetch_jwks().await.unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
+        );
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn rejects_excessive_jwk_counts_and_string_sizes_before_typed_parsing() {
+        let valid_key = json!({
+            "kty": "RSA",
+            "kid": KID,
+            "use": "sig",
+            "alg": "RS256",
+            "n": test_key().modulus,
+            "e": test_key().exponent,
+            "ignored_primitives": [null, true, 7]
+        });
+        assert_eq!(
+            parse_bounded_jwks(
+                serde_json::to_string(&json!({"keys": [valid_key.clone()]}))
+                    .unwrap()
+                    .as_bytes()
+            )
+            .unwrap()
+            .keys
+            .len(),
+            1
+        );
+
+        let too_many = vec![valid_key.clone(); MAX_JWKS_KEYS + 1];
+        for invalid in [
+            json!({"keys": too_many}),
+            json!({"keys": [{"kty": "RSA", "kid": "x".repeat(MAX_JWK_STRING_BYTES + 1)}]}),
+            json!({"keys": [{"x".repeat(MAX_JWK_STRING_BYTES + 1): "value"}]}),
+            json!({"keys": [valid_key], "ignored": "x".repeat(MAX_JWK_STRING_BYTES + 1)}),
+            json!({"keys": [{"kty": 7}]}),
+        ] {
+            assert_eq!(
+                parse_bounded_jwks(serde_json::to_string(&invalid).unwrap().as_bytes())
+                    .unwrap_err(),
+                JwtAuthenticationFailure::VerifierUnavailable
+            );
+        }
     }
 
     #[tokio::test]

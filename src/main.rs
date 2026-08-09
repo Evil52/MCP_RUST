@@ -1,6 +1,8 @@
-use std::sync::Arc;
+#![forbid(unsafe_code)]
 
-use anyhow::Result;
+use std::{num::NonZeroUsize, sync::Arc};
+
+use anyhow::{Context, Result};
 use axum::{Json, Router, routing::get};
 use mcp_ozon::{
     auth::JwtAuthenticator,
@@ -64,9 +66,17 @@ async fn main() -> Result<()> {
 async fn serve_http(bind: std::net::SocketAddr, server: OzonMcp) -> Result<()> {
     let protected_resource_metadata = server.protected_resource_metadata();
     let server = Arc::new(server);
+    let max_sessions = match std::env::var("MCP_MAX_SESSIONS") {
+        Ok(value) => value
+            .parse::<NonZeroUsize>()
+            .context("MCP_MAX_SESSIONS должен быть положительным целым числом")?,
+        Err(std::env::VarError::NotPresent) => LocalSessionManager::DEFAULT_MAX_SESSIONS,
+        Err(error) => return Err(error).context("MCP_MAX_SESSIONS содержит невалидный UTF-8"),
+    };
+    let session_manager = Arc::new(LocalSessionManager::default().with_max_sessions(max_sessions));
     let service: StreamableHttpService<OzonMcp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok((*server).clone()),
-        Default::default(),
+        session_manager,
         StreamableHttpServerConfig::default(),
     );
     let mut router = Router::new()
