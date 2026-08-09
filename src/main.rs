@@ -38,7 +38,11 @@ async fn main() -> Result<()> {
     let server = match &config.auth {
         AuthConfig::Dev { actor_id } => OzonMcp::new(client, actor_id.clone(), config.registry),
         AuthConfig::Jwt(_) => OzonMcp::new_authenticated(client, config.registry),
-    };
+    }
+    .with_preview_features(
+        config.ozon_postings_vnext,
+        config.ozon_finance_accruals_preview,
+    );
 
     match config.transport {
         TransportMode::Http => serve_http(config.bind, server, config.auth, registry).await,

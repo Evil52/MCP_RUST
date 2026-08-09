@@ -1,8 +1,8 @@
-name: mcp-ozon
+name: mcp-ozon-canary
 
 services:
   server:
-    container_name: mcp-ozon-server
+    container_name: mcp-ozon-canary
     build:
       context: .
       dockerfile: Dockerfile
@@ -12,18 +12,18 @@ services:
       MCP_TRANSPORT: http
       MCP_BIND: 0.0.0.0:8787
       MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
-      OZON_POSTINGS_VNEXT: "false"
-      OZON_FINANCE_ACCRUALS_PREVIEW: "false"
+      OZON_POSTINGS_VNEXT: "true"
+      OZON_FINANCE_ACCRUALS_PREVIEW: "true"
     ports:
-      - "127.0.0.1:8787:8787"
+      - "127.0.0.1:8789:8787"
     volumes:
       - type: bind
-        source: ./config/access.json
+        source: ./config/access.canary.json
         target: /etc/mcp-ozon/access.json
         read_only: true
         bind:
           create_host_path: false
-    restart: unless-stopped
+    restart: "no"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

@@ -1,19 +1,195 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use reqwest::{Client, StatusCode};
+use chrono::{DateTime, Utc};
+use reqwest::{
+    Client, Response, StatusCode,
+    header::{HeaderMap, RETRY_AFTER},
+    redirect::Policy,
+};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::sleep,
+};
 
 use crate::config::{StoreCredentials, StoreId};
 
-#[derive(Debug, Error)]
+const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1_048_576;
+const MAX_ERROR_BODY_BYTES: usize = 4_096;
+const MAX_ATTEMPTS: usize = 3;
+const MAX_IN_FLIGHT_REQUESTS_PER_CLIENT: usize = 16;
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(20);
+const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_REQUEST_ID_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OzonErrorKind {
+    MissingCredentials,
+    Unauthorized,
+    Forbidden,
+    NotFound,
+    RateLimited,
+    Server,
+    Http,
+    Timeout,
+    Network,
+    Overloaded,
+    InvalidJson,
+    ResponseTooLarge,
+}
+
+impl OzonErrorKind {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MissingCredentials => "missing_credentials",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::RateLimited => "rate_limited",
+            Self::Server => "upstream_server_error",
+            Self::Http => "upstream_http_error",
+            Self::Timeout => "timeout",
+            Self::Network => "network_error",
+            Self::Overloaded => "local_overloaded",
+            Self::InvalidJson => "invalid_json",
+            Self::ResponseTooLarge => "response_too_large",
+        }
+    }
+}
+
+#[derive(Error)]
 pub enum OzonError {
     #[error("для магазина {0} не настроены Client-Id и Api-Key")]
     MissingCredentials(StoreId),
-    #[error("ошибка HTTP-клиента Ozon: {0}")]
-    Request(#[from] reqwest::Error),
-    #[error("Ozon API вернул HTTP {status}: {body}")]
-    Api { status: StatusCode, body: String },
+    #[error("Ozon API отклонил авторизацию (HTTP 401, request-id: {request_id:?})")]
+    Unauthorized { request_id: Option<String> },
+    #[error("доступ к ресурсу Ozon API запрещён (HTTP 403, request-id: {request_id:?})")]
+    Forbidden { request_id: Option<String> },
+    #[error("ресурс Ozon API не найден (HTTP 404, request-id: {request_id:?})")]
+    NotFound { request_id: Option<String> },
+    #[error(
+        "Ozon API ограничил частоту запросов (HTTP 429, request-id: {request_id:?}, retry-after: {retry_after:?})"
+    )]
+    RateLimited {
+        request_id: Option<String>,
+        retry_after: Option<Duration>,
+    },
+    #[error("временная ошибка Ozon API (HTTP {status}, request-id: {request_id:?})")]
+    Server {
+        status: StatusCode,
+        request_id: Option<String>,
+        body: String,
+    },
+    #[error("Ozon API вернул неожиданный HTTP {status} (request-id: {request_id:?})")]
+    Api {
+        status: StatusCode,
+        request_id: Option<String>,
+        body: String,
+    },
+    #[error("истёк таймаут запроса к Ozon API (request-id: {request_id:?})")]
+    Timeout {
+        request_id: Option<String>,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("сетевая ошибка при обращении к Ozon API (request-id: {request_id:?})")]
+    Network {
+        request_id: Option<String>,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("локальный лимит параллельных запросов к Ozon API исчерпан")]
+    Overloaded,
+    #[error("Ozon API вернул некорректный JSON (request-id: {request_id:?})")]
+    InvalidJson {
+        request_id: Option<String>,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "ответ Ozon API превышает лимит {limit_bytes} байт (получено: {actual_bytes:?}, request-id: {request_id:?})"
+    )]
+    ResponseTooLarge {
+        limit_bytes: usize,
+        actual_bytes: Option<u64>,
+        request_id: Option<String>,
+    },
+}
+
+impl fmt::Debug for OzonError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OzonError")
+            .field("kind", &self.kind())
+            .field("message", &self.to_string())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OzonError {
+    pub fn kind(&self) -> OzonErrorKind {
+        match self {
+            Self::MissingCredentials(_) => OzonErrorKind::MissingCredentials,
+            Self::Unauthorized { .. } => OzonErrorKind::Unauthorized,
+            Self::Forbidden { .. } => OzonErrorKind::Forbidden,
+            Self::NotFound { .. } => OzonErrorKind::NotFound,
+            Self::RateLimited { .. } => OzonErrorKind::RateLimited,
+            Self::Server { .. } => OzonErrorKind::Server,
+            Self::Api { .. } => OzonErrorKind::Http,
+            Self::Timeout { .. } => OzonErrorKind::Timeout,
+            Self::Network { .. } => OzonErrorKind::Network,
+            Self::Overloaded => OzonErrorKind::Overloaded,
+            Self::InvalidJson { .. } => OzonErrorKind::InvalidJson,
+            Self::ResponseTooLarge { .. } => OzonErrorKind::ResponseTooLarge,
+        }
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::MissingCredentials(_) | Self::Overloaded => None,
+            Self::Unauthorized { request_id }
+            | Self::Forbidden { request_id }
+            | Self::NotFound { request_id }
+            | Self::RateLimited { request_id, .. }
+            | Self::Server { request_id, .. }
+            | Self::Api { request_id, .. }
+            | Self::Timeout { request_id, .. }
+            | Self::Network { request_id, .. }
+            | Self::InvalidJson { request_id, .. }
+            | Self::ResponseTooLarge { request_id, .. } => request_id.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RateLimiter {
+    next_allowed: Mutex<Instant>,
+    in_flight: Semaphore,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            next_allowed: Mutex::new(Instant::now()),
+            in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CLIENT),
+        }
+    }
+
+    async fn acquire(&self) {
+        let mut next_allowed = self.next_allowed.lock().await;
+        let wait = next_allowed.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            sleep(wait).await;
+        }
+        *next_allowed = Instant::now() + MIN_REQUEST_INTERVAL;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -21,6 +197,7 @@ pub struct OzonClient {
     http: Client,
     base_url: String,
     stores: Arc<BTreeMap<StoreId, StoreCredentials>>,
+    rate_limiters: Arc<BTreeMap<StoreId, Arc<RateLimiter>>>,
 }
 
 impl OzonClient {
@@ -45,12 +222,24 @@ impl OzonClient {
     ) -> Result<Self, reqwest::Error> {
         let http = Client::builder()
             .timeout(timeout)
+            .redirect(Policy::none())
             .user_agent(user_agent)
             .build()?;
+        let mut limiters_by_client_id = BTreeMap::new();
+        let rate_limiters = stores
+            .iter()
+            .map(|(store, credentials)| {
+                let limiter = limiters_by_client_id
+                    .entry(credentials.client_id.clone())
+                    .or_insert_with(|| Arc::new(RateLimiter::new()));
+                (store.clone(), Arc::clone(limiter))
+            })
+            .collect();
         Ok(Self {
             http,
             base_url,
             stores: Arc::new(stores),
+            rate_limiters: Arc::new(rate_limiters),
         })
     }
 
@@ -68,48 +257,501 @@ impl OzonClient {
             .stores
             .get(store)
             .ok_or_else(|| OzonError::MissingCredentials(store.clone()))?;
-        let response = self
-            .http
-            .post(format!("{}{path}", self.base_url))
-            .header("Client-Id", &credentials.client_id)
-            .header("Api-Key", &credentials.api_key)
-            .json(&payload)
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.text().await?;
+        let limiter = self
+            .rate_limiters
+            .get(store)
+            .expect("configured stores always have a rate limiter");
+        let _permit = limiter
+            .in_flight
+            .try_acquire()
+            .map_err(|_| OzonError::Overloaded)?;
 
-        if !status.is_success() {
-            return Err(OzonError::Api {
+        let mut attempt = 1;
+        loop {
+            limiter.acquire().await;
+            let started_at = Instant::now();
+            let request_trace = RequestTrace {
+                store,
+                endpoint: path,
+                started_at,
+                attempt,
+            };
+            let response = self
+                .http
+                .post(format!("{}{path}", self.base_url))
+                .header("Client-Id", &credentials.client_id)
+                .header("Api-Key", &credentials.api_key)
+                .json(&payload)
+                .send()
+                .await;
+
+            let mut response = match response {
+                Ok(response) => response,
+                Err(source) => {
+                    let error = classify_transport_error(source, None);
+                    trace_transport_failure(&request_trace, error.kind());
+                    return Err(error);
+                }
+            };
+            let status = response.status();
+            let request_id = safe_request_id(response.headers());
+            let retry_after = parse_retry_after(response.headers(), Utc::now());
+
+            if let Some((delay, kind)) = retry_plan(status, attempt, retry_after) {
+                trace_response(&request_trace, status, request_id.as_deref(), true, kind);
+                drop(response);
+                sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+
+            let result = decode_response(
+                &mut response,
                 status,
-                body: truncate(&body, 4_096),
-            });
+                request_id.clone(),
+                retry_after.duration(),
+            )
+            .await;
+            let kind = result
+                .as_ref()
+                .err()
+                .map_or(OzonErrorKind::Http, OzonError::kind);
+            trace_response(&request_trace, status, request_id.as_deref(), false, kind);
+            return result;
         }
-
-        Ok(serde_json::from_str(&body).unwrap_or_else(|_| {
-            serde_json::json!({
-                "raw": body,
-            })
-        }))
     }
 }
 
-fn truncate(value: &str, maximum_chars: usize) -> String {
-    let mut chars = value.chars();
-    let shortened: String = chars.by_ref().take(maximum_chars).collect();
-    if chars.next().is_some() {
-        format!("{shortened}…")
-    } else {
-        shortened
+fn retry_plan(
+    status: StatusCode,
+    attempt: usize,
+    retry_after: ParsedRetryAfter,
+) -> Option<(Duration, OzonErrorKind)> {
+    if !is_retriable(status) || attempt >= MAX_ATTEMPTS {
+        return None;
     }
+
+    let retry_after = match retry_after {
+        ParsedRetryAfter::Absent => None,
+        ParsedRetryAfter::Valid(delay) if delay <= MAX_RETRY_DELAY => Some(delay),
+        ParsedRetryAfter::Valid(_) | ParsedRetryAfter::Invalid => return None,
+    };
+    let kind = if status == StatusCode::TOO_MANY_REQUESTS {
+        OzonErrorKind::RateLimited
+    } else {
+        OzonErrorKind::Server
+    };
+    Some((retry_delay(attempt, retry_after), kind))
+}
+
+async fn decode_response(
+    response: &mut Response,
+    status: StatusCode,
+    request_id: Option<String>,
+    retry_after: Option<Duration>,
+) -> Result<Value, OzonError> {
+    if !status.is_success() {
+        let diagnostic = read_bounded_diagnostic_body(response).await;
+        return Err(classify_http_error(
+            status,
+            request_id,
+            retry_after,
+            diagnostic,
+        ));
+    }
+
+    let body = read_bounded_body(response, request_id.clone()).await?;
+    serde_json::from_slice(&body).map_err(|source| OzonError::InvalidJson { request_id, source })
+}
+
+async fn read_bounded_diagnostic_body(response: &mut Response) -> String {
+    let declared_length = response.content_length();
+    let declared_truncated =
+        declared_length.is_some_and(|length| length > MAX_ERROR_BODY_BYTES as u64);
+    let length_is_unknown = declared_length.is_none();
+    let mut body = Vec::with_capacity(
+        declared_length
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(MAX_ERROR_BODY_BYTES),
+    );
+    let mut truncated = declared_truncated;
+
+    while body.len() < MAX_ERROR_BODY_BYTES {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                truncated = true;
+                break;
+            }
+        };
+        let remaining = MAX_ERROR_BODY_BYTES - body.len();
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    let mut diagnostic = String::from_utf8_lossy(&body).into_owned();
+    if truncated || (length_is_unknown && body.len() == MAX_ERROR_BODY_BYTES) {
+        diagnostic.push('…');
+    }
+    diagnostic
+}
+
+async fn read_bounded_body(
+    response: &mut Response,
+    request_id: Option<String>,
+) -> Result<Vec<u8>, OzonError> {
+    if let Some(content_length) = response.content_length()
+        && content_length > MAX_RESPONSE_BODY_BYTES as u64
+    {
+        return Err(OzonError::ResponseTooLarge {
+            limit_bytes: MAX_RESPONSE_BODY_BYTES,
+            actual_bytes: Some(content_length),
+            request_id,
+        });
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(MAX_RESPONSE_BODY_BYTES);
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|source| classify_transport_error(source, request_id.clone()))?
+    {
+        let next_length = body.len().saturating_add(chunk.len());
+        if next_length > MAX_RESPONSE_BODY_BYTES {
+            return Err(OzonError::ResponseTooLarge {
+                limit_bytes: MAX_RESPONSE_BODY_BYTES,
+                actual_bytes: Some(u64::try_from(next_length).unwrap_or(u64::MAX)),
+                request_id,
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn classify_transport_error(source: reqwest::Error, request_id: Option<String>) -> OzonError {
+    if source.is_timeout() {
+        OzonError::Timeout { request_id, source }
+    } else {
+        OzonError::Network { request_id, source }
+    }
+}
+
+fn classify_http_error(
+    status: StatusCode,
+    request_id: Option<String>,
+    retry_after: Option<Duration>,
+    body: String,
+) -> OzonError {
+    match status {
+        StatusCode::UNAUTHORIZED => OzonError::Unauthorized { request_id },
+        StatusCode::FORBIDDEN => OzonError::Forbidden { request_id },
+        StatusCode::NOT_FOUND => OzonError::NotFound { request_id },
+        StatusCode::TOO_MANY_REQUESTS => OzonError::RateLimited {
+            request_id,
+            retry_after,
+        },
+        status if status.is_server_error() => OzonError::Server {
+            status,
+            request_id,
+            body,
+        },
+        status => OzonError::Api {
+            status,
+            request_id,
+            body,
+        },
+    }
+}
+
+fn is_retriable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    retry_after.unwrap_or_else(|| {
+        BASE_RETRY_DELAY
+            .saturating_mul(1_u32 << attempt.saturating_sub(1).min(8))
+            .min(MAX_RETRY_DELAY)
+    })
+}
+
+fn safe_request_id(headers: &HeaderMap) -> Option<String> {
+    [
+        "x-o3-trace-id",
+        "x-request-id",
+        "x-ozon-request-id",
+        "request-id",
+    ]
+    .iter()
+    .filter_map(|name| headers.get(*name))
+    .find_map(|value| {
+        let value = value.to_str().ok()?.trim();
+        if value.is_empty()
+            || value.len() > MAX_REQUEST_ID_BYTES
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+            })
+        {
+            None
+        } else {
+            Some(value.to_owned())
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedRetryAfter {
+    Absent,
+    Valid(Duration),
+    Invalid,
+}
+
+impl ParsedRetryAfter {
+    const fn duration(self) -> Option<Duration> {
+        match self {
+            Self::Valid(duration) => Some(duration),
+            Self::Absent | Self::Invalid => None,
+        }
+    }
+}
+
+fn parse_retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> ParsedRetryAfter {
+    let Some(value) = headers.get(RETRY_AFTER) else {
+        return ParsedRetryAfter::Absent;
+    };
+    let Ok(value) = value.to_str() else {
+        return ParsedRetryAfter::Invalid;
+    };
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_REQUEST_ID_BYTES {
+        return ParsedRetryAfter::Invalid;
+    }
+
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map(ParsedRetryAfter::Valid)
+            .unwrap_or(ParsedRetryAfter::Invalid);
+    }
+
+    let Ok(retry_at) = DateTime::parse_from_rfc2822(value) else {
+        return ParsedRetryAfter::Invalid;
+    };
+    ParsedRetryAfter::Valid(
+        retry_at
+            .with_timezone(&Utc)
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+struct RequestTrace<'a> {
+    store: &'a StoreId,
+    endpoint: &'static str,
+    started_at: Instant,
+    attempt: usize,
+}
+
+fn trace_transport_failure(request: &RequestTrace<'_>, kind: OzonErrorKind) {
+    let latency_ms = elapsed_millis(request.started_at);
+    tracing::warn!(
+        store = %request.store,
+        endpoint = request.endpoint,
+        status = "transport_error",
+        latency_ms,
+        request_id = "-",
+        attempt = request.attempt,
+        error_kind = ?kind,
+        "Ozon API request failed"
+    );
+}
+
+fn trace_response(
+    request: &RequestTrace<'_>,
+    status: StatusCode,
+    request_id: Option<&str>,
+    will_retry: bool,
+    kind: OzonErrorKind,
+) {
+    let latency_ms = elapsed_millis(request.started_at);
+    let request_id = request_id.unwrap_or("-");
+    let status_code = status.as_u16();
+    if status.is_success() {
+        tracing::info!(
+            store = %request.store,
+            endpoint = request.endpoint,
+            status = status_code,
+            latency_ms,
+            request_id,
+            attempt = request.attempt,
+            "Ozon API request completed"
+        );
+    } else {
+        tracing::warn!(
+            store = %request.store,
+            endpoint = request.endpoint,
+            status = status_code,
+            latency_ms,
+            request_id,
+            attempt = request.attempt,
+            will_retry,
+            error_kind = ?kind,
+            "Ozon API request completed with an error"
+        );
+    }
+}
+
+fn elapsed_millis(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        thread,
+    };
 
     use super::*;
-    use crate::test_support::mock_http;
+    use reqwest::header::HeaderValue;
+
+    struct MockResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        delay: Duration,
+        include_content_length: bool,
+    }
+
+    impl MockResponse {
+        fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                status,
+                headers: Vec::new(),
+                body: body.into(),
+                delay: Duration::ZERO,
+                include_content_length: true,
+            }
+        }
+
+        fn header(mut self, name: &str, value: &str) -> Self {
+            self.headers.push((name.to_owned(), value.to_owned()));
+            self
+        }
+
+        fn delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
+        }
+
+        fn without_content_length(mut self) -> Self {
+            self.include_content_length = false;
+            self
+        }
+    }
+
+    fn mock_server(responses: Vec<MockResponse>) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("mock server accepts request");
+                let request = read_request(&stream);
+                let _ = sender.send(request);
+                thread::sleep(response.delay);
+
+                let reason = match response.status {
+                    200 => "OK",
+                    302 => "Found",
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    409 => "Conflict",
+                    429 => "Too Many Requests",
+                    500 => "Internal Server Error",
+                    502 => "Bad Gateway",
+                    503 => "Service Unavailable",
+                    504 => "Gateway Timeout",
+                    _ => "Test",
+                };
+                let mut head = format!(
+                    "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nConnection: close\r\n",
+                    response.status
+                );
+                if response.include_content_length {
+                    head.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
+                }
+                for (name, value) in response.headers {
+                    head.push_str(&format!("{name}: {value}\r\n"));
+                }
+                head.push_str("\r\n");
+                if stream.write_all(head.as_bytes()).is_ok() {
+                    let _ = stream.write_all(&response.body);
+                }
+            }
+        });
+
+        (format!("http://{address}"), receiver)
+    }
+
+    fn read_request(stream: &TcpStream) -> String {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = Vec::new();
+        let mut content_length = 0;
+
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+            request.extend_from_slice(line.as_bytes());
+            if line == "\r\n" {
+                break;
+            }
+        }
+
+        let mut body = vec![0; content_length];
+        if reader.read_exact(&mut body).is_ok() {
+            request.extend_from_slice(&body);
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn assert_request_count(receiver: &mpsc::Receiver<String>, expected: usize) {
+        for _ in 0..expected {
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert!(receiver.try_recv().is_err());
+    }
 
     fn credentials() -> BTreeMap<StoreId, StoreCredentials> {
         BTreeMap::from([(
@@ -122,12 +764,23 @@ mod tests {
     }
 
     #[test]
-    fn response_bodies_are_bounded_only_when_needed() {
-        let value = "x".repeat(5_000);
-        let result = truncate(&value, 100);
-        assert_eq!(result.chars().count(), 101);
-        assert!(result.ends_with('…'));
-        assert_eq!(truncate("short", 100), "short");
+    fn error_kind_codes_are_stable() {
+        for (kind, expected) in [
+            (OzonErrorKind::MissingCredentials, "missing_credentials"),
+            (OzonErrorKind::Unauthorized, "unauthorized"),
+            (OzonErrorKind::Forbidden, "forbidden"),
+            (OzonErrorKind::NotFound, "not_found"),
+            (OzonErrorKind::RateLimited, "rate_limited"),
+            (OzonErrorKind::Server, "upstream_server_error"),
+            (OzonErrorKind::Http, "upstream_http_error"),
+            (OzonErrorKind::Timeout, "timeout"),
+            (OzonErrorKind::Network, "network_error"),
+            (OzonErrorKind::Overloaded, "local_overloaded"),
+            (OzonErrorKind::InvalidJson, "invalid_json"),
+            (OzonErrorKind::ResponseTooLarge, "response_too_large"),
+        ] {
+            assert_eq!(kind.code(), expected);
+        }
     }
 
     #[test]
@@ -144,7 +797,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_sends_credentials_and_decodes_json() {
-        let (base_url, request) = mock_http(vec![(200, r#"{"result":{"items":[1]}}"#.to_owned())]);
+        let (base_url, request) =
+            mock_server(vec![MockResponse::new(200, r#"{"result":{"items":[1]}}"#)]);
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let response = client
@@ -166,31 +820,291 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_json_success_is_returned_as_bounded_raw_data() {
-        let (base_url, _) = mock_http(vec![(200, "not-json".to_owned())]);
+    async fn successful_json_larger_than_the_legacy_one_mib_cap_is_accepted() {
+        let payload_size = 1_048_576 + 1;
+        let response = serde_json::to_vec(&serde_json::json!({
+            "payload": "x".repeat(payload_size)
+        }))
+        .unwrap();
+        assert!(response.len() < MAX_RESPONSE_BODY_BYTES);
+        let (base_url, requests) = mock_server(vec![MockResponse::new(200, response)]);
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
-        let response = client
-            .post(&StoreId::from("ofk"), "/v1/raw", serde_json::json!({}))
+        let value = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/larger-success",
+                serde_json::json!({}),
+            )
             .await
             .unwrap();
-        assert_eq!(response, serde_json::json!({ "raw": "not-json" }));
+
+        assert_eq!(value["payload"].as_str().unwrap().len(), payload_size);
+        assert_request_count(&requests, 1);
     }
 
     #[tokio::test]
-    async fn api_errors_keep_status_and_truncate_large_bodies() {
-        let (base_url, _) = mock_http(vec![(409, "x".repeat(5_000))]);
+    async fn invalid_json_is_classified_and_keeps_safe_request_id() {
+        let (base_url, _) = mock_server(vec![
+            MockResponse::new(200, "not-json").header("X-Request-Id", "req-safe_123"),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(&StoreId::from("ofk"), "/v1/raw", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::InvalidJson);
+        assert_eq!(error.request_id(), Some("req-safe_123"));
+    }
+
+    #[tokio::test]
+    async fn api_errors_keep_status_and_bound_bodies_without_displaying_them() {
+        let (base_url, requests) = mock_server(vec![MockResponse::new(409, "x".repeat(5_000))]);
         let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
 
         let error = client
             .post(&StoreId::from("ofk"), "/v1/fail", serde_json::json!({}))
             .await
             .unwrap_err();
-        let message = error.to_string();
-        let prefix = "Ozon API вернул HTTP 409 Conflict: ";
-        assert!(message.starts_with(prefix));
-        assert!(message.ends_with('…'));
-        assert_eq!(message.chars().count(), prefix.chars().count() + 4_097);
+        assert_eq!(error.kind(), OzonErrorKind::Http);
+        assert_eq!(error.request_id(), None);
+        assert!(matches!(
+            &error,
+            OzonError::Api { status, body, .. }
+                if *status == StatusCode::CONFLICT
+                    && body.chars().count() == MAX_ERROR_BODY_BYTES + 1
+                    && body.ends_with('…')
+        ));
+        assert!(!error.to_string().contains(&"x".repeat(100)));
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn truncated_error_stream_keeps_classification_and_bounded_diagnostic() {
+        let response = MockResponse::new(409, "short")
+            .without_content_length()
+            .header("Content-Length", "100");
+        let (base_url, requests) = mock_server(vec![response]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/truncated-error",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), OzonErrorKind::Http);
+        assert!(matches!(
+            &error,
+            OzonError::Api { body, .. } if body == "short…"
+        ));
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn truncated_success_stream_keeps_request_id_and_reports_network_error() {
+        let response = MockResponse::new(200, "short")
+            .without_content_length()
+            .header("Content-Length", "100")
+            .header("X-Request-Id", "truncated-success");
+        let (base_url, requests) = mock_server(vec![response]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/truncated-success",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), OzonErrorKind::Network);
+        assert_eq!(error.request_id(), Some("truncated-success"));
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn debug_output_never_contains_upstream_body_or_api_key() {
+        const PRIVATE_MARKER: &str = "customer-email-private@example.test";
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(
+                409,
+                format!(r#"{{"error":"{PRIVATE_MARKER}","echo":"test-key"}}"#),
+            )
+            .header("X-Request-Id", "safe-debug-id"),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/debug-redaction",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        let debug = format!("{error:?}");
+
+        assert_eq!(error.kind(), OzonErrorKind::Http);
+        assert!(debug.contains("Http"));
+        assert!(debug.contains("safe-debug-id"));
+        assert!(!debug.contains(PRIVATE_MARKER));
+        assert!(!debug.contains("test-key"));
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn authentication_and_not_found_statuses_have_distinct_kinds() {
+        for (status, expected_kind) in [
+            (401, OzonErrorKind::Unauthorized),
+            (403, OzonErrorKind::Forbidden),
+            (404, OzonErrorKind::NotFound),
+        ] {
+            let (base_url, requests) = mock_server(vec![
+                MockResponse::new(status, r#"{"error":"test"}"#)
+                    .header("X-Ozon-Request-Id", "ozon:req/42"),
+            ]);
+            let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+            let error = client
+                .post(&StoreId::from("ofk"), "/v1/status", serde_json::json!({}))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(error.request_id(), Some("ozon:req/42"));
+            assert_request_count(&requests, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_error_bodies_preserve_http_classification() {
+        for (status, expected_kind) in [
+            (401, OzonErrorKind::Unauthorized),
+            (403, OzonErrorKind::Forbidden),
+            (404, OzonErrorKind::NotFound),
+            (429, OzonErrorKind::RateLimited),
+            (503, OzonErrorKind::Server),
+        ] {
+            let mut response = MockResponse::new(status, "x".repeat(MAX_ERROR_BODY_BYTES + 512))
+                .header("X-O3-Trace-Id", "oversized-error");
+            if matches!(status, 429 | 503) {
+                response = response.header("Retry-After", "60");
+            }
+            let (base_url, requests) = mock_server(vec![response]);
+            let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+            let error = client
+                .post(
+                    &StoreId::from("ofk"),
+                    "/v1/oversized-error",
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), expected_kind, "HTTP {status}: {error:?}");
+            assert_eq!(error.request_id(), Some("oversized-error"));
+            match error {
+                OzonError::RateLimited { retry_after, .. } => {
+                    assert_eq!(retry_after, Some(Duration::from_secs(60)));
+                }
+                OzonError::Server { status, body, .. } => {
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(body.chars().count(), MAX_ERROR_BODY_BYTES + 1);
+                    assert!(body.ends_with('…'));
+                }
+                _ => {}
+            }
+            assert_request_count(&requests, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_retries_are_bounded() {
+        let responses = (0..MAX_ATTEMPTS)
+            .map(|_| {
+                MockResponse::new(429, r#"{"error":"slow down"}"#)
+                    .header("Retry-After", "0")
+                    .header("X-Request-Id", "rate-42")
+            })
+            .collect();
+        let (base_url, requests) = mock_server(responses);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(&StoreId::from("ofk"), "/v1/rate", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::RateLimited);
+        assert_eq!(error.request_id(), Some("rate-42"));
+        assert!(matches!(
+            &error,
+            OzonError::RateLimited {
+                retry_after: Some(delay),
+                ..
+            } if *delay == Duration::ZERO
+        ));
+        assert_request_count(&requests, MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn retryable_server_error_can_recover() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(503, r#"{"error":"temporary"}"#).header("Retry-After", "0"),
+            MockResponse::new(200, r#"{"ok":true}"#),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let value = client
+            .post(&StoreId::from("ofk"), "/v1/retry", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(value, serde_json::json!({"ok": true}));
+        assert_request_count(&requests, 2);
+    }
+
+    #[tokio::test]
+    async fn server_500_is_classified_but_not_retried() {
+        let (base_url, requests) =
+            mock_server(vec![MockResponse::new(500, r#"{"error":"permanent"}"#)]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(&StoreId::from("ofk"), "/v1/server", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::Server);
+        assert!(matches!(
+            &error,
+            OzonError::Server { status, .. }
+                if *status == StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn redirects_are_never_followed() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(302, "redirect")
+                .header("Location", "http://127.0.0.1:9/must-not-be-called"),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(&StoreId::from("ofk"), "/v1/redirect", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::Http);
+        assert!(matches!(
+            &error,
+            OzonError::Api { status, .. } if *status == StatusCode::FOUND
+        ));
+        assert_request_count(&requests, 1);
     }
 
     #[tokio::test]
@@ -207,6 +1121,7 @@ mod tests {
             .post(&StoreId::from("ofk"), "/v1/example", serde_json::json!({}))
             .await
             .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::MissingCredentials);
         assert_eq!(
             error.to_string(),
             "для магазина ofk не настроены Client-Id и Api-Key"
@@ -214,7 +1129,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_errors_are_returned() {
+    async fn timeout_errors_are_classified_without_retry() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(200, r#"{"ok":true}"#).delay(Duration::from_millis(200)),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_millis(30), credentials()).unwrap();
+
+        let error = client
+            .post(&StoreId::from("ofk"), "/v1/slow", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::Timeout);
+        assert_eq!(error.request_id(), None);
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn network_errors_are_classified_without_retry() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
@@ -233,6 +1164,432 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().starts_with("ошибка HTTP-клиента Ozon:"));
+        assert_eq!(error.kind(), OzonErrorKind::Network);
+        assert_eq!(error.request_id(), None);
+    }
+
+    #[tokio::test]
+    async fn declared_oversized_response_is_rejected_before_reading() {
+        let oversized = "x".repeat(MAX_RESPONSE_BODY_BYTES + 1);
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(200, oversized).header("X-Request-Id", "oversize-1"),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(&StoreId::from("ofk"), "/v1/large", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::ResponseTooLarge);
+        assert_eq!(error.request_id(), Some("oversize-1"));
+        assert!(matches!(
+            &error,
+            OzonError::ResponseTooLarge {
+                limit_bytes,
+                actual_bytes: Some(actual_bytes),
+                ..
+            } if *limit_bytes == MAX_RESPONSE_BODY_BYTES
+                && *actual_bytes == (MAX_RESPONSE_BODY_BYTES + 1) as u64
+        ));
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_oversized_response_is_bounded_without_content_length() {
+        let oversized = "x".repeat(MAX_RESPONSE_BODY_BYTES + 1);
+        let (base_url, _) = mock_server(vec![
+            MockResponse::new(200, oversized).without_content_length(),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/streaming-large",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::ResponseTooLarge);
+    }
+
+    #[tokio::test]
+    async fn per_store_rate_limiter_spaces_requests_at_fifty_per_second() {
+        let limiter = RateLimiter::new();
+        let started_at = Instant::now();
+        limiter.acquire().await;
+        limiter.acquire().await;
+        limiter.acquire().await;
+
+        assert!(started_at.elapsed() >= MIN_REQUEST_INTERVAL.saturating_mul(2));
+    }
+
+    #[test]
+    fn stores_with_the_same_client_id_share_one_rate_limiter() {
+        let stores = BTreeMap::from([
+            (
+                StoreId::from("first"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "first-key".to_owned(),
+                },
+            ),
+            (
+                StoreId::from("second"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "second-key".to_owned(),
+                },
+            ),
+            (
+                StoreId::from("third"),
+                StoreCredentials {
+                    client_id: "other-client".to_owned(),
+                    api_key: "third-key".to_owned(),
+                },
+            ),
+        ]);
+        let client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            stores,
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(
+            &client.rate_limiters[&StoreId::from("first")],
+            &client.rate_limiters[&StoreId::from("second")],
+        ));
+        assert!(!Arc::ptr_eq(
+            &client.rate_limiters[&StoreId::from("first")],
+            &client.rate_limiters[&StoreId::from("third")],
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_per_client_concurrency_limit_fails_fast() {
+        let stores = BTreeMap::from([
+            (
+                StoreId::from("first"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "first-key".to_owned(),
+                },
+            ),
+            (
+                StoreId::from("second"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "second-key".to_owned(),
+                },
+            ),
+        ]);
+        let client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            stores,
+        )
+        .unwrap();
+        let limiter = Arc::clone(&client.rate_limiters[&StoreId::from("first")]);
+        assert!(Arc::ptr_eq(
+            &limiter,
+            &client.rate_limiters[&StoreId::from("second")]
+        ));
+        let mut permits = Vec::new();
+        for _ in 0..MAX_IN_FLIGHT_REQUESTS_PER_CLIENT {
+            permits.push(limiter.in_flight.try_acquire().unwrap());
+        }
+        assert_eq!(limiter.in_flight.available_permits(), 0);
+
+        let error = client
+            .post(
+                &StoreId::from("second"),
+                "/v1/must-not-reach-network",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), OzonErrorKind::Overloaded);
+        assert_eq!(error.kind().code(), "local_overloaded");
+        assert_eq!(error.request_id(), None);
+        assert!(!error.to_string().contains("shared-client"));
+        drop(permits);
+    }
+
+    #[test]
+    fn only_explicit_transient_statuses_are_retriable() {
+        for status in [429, 502, 503, 504] {
+            assert!(is_retriable(StatusCode::from_u16(status).unwrap()));
+        }
+        for status in [401, 403, 404, 408, 409, 500, 501, 505] {
+            assert!(!is_retriable(StatusCode::from_u16(status).unwrap()));
+        }
+    }
+
+    #[test]
+    fn request_id_is_strictly_sanitized_and_bounded() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("safe-Id_42:part/1"),
+        );
+        assert_eq!(
+            safe_request_id(&headers).as_deref(),
+            Some("safe-Id_42:part/1")
+        );
+
+        headers.insert("x-request-id", HeaderValue::from_static("unsafe value"));
+        assert_eq!(safe_request_id(&headers), None);
+
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_str(&"x".repeat(MAX_REQUEST_ID_BYTES + 1)).unwrap(),
+        );
+        assert_eq!(safe_request_id(&headers), None);
+    }
+
+    #[test]
+    fn retry_after_is_parsed_without_shortening_server_delay() {
+        let now = DateTime::parse_from_rfc2822("Sun, 06 Nov 1994 08:49:37 GMT")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(
+            parse_retry_after(&headers, now),
+            ParsedRetryAfter::Valid(Duration::from_secs(2))
+        );
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("3600"));
+        assert_eq!(
+            parse_retry_after(&headers, now),
+            ParsedRetryAfter::Valid(Duration::from_secs(3_600))
+        );
+
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:40 GMT"),
+        );
+        assert_eq!(
+            parse_retry_after(&headers, now),
+            ParsedRetryAfter::Valid(Duration::from_secs(3))
+        );
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("not-a-date"));
+        assert_eq!(parse_retry_after(&headers, now), ParsedRetryAfter::Invalid);
+
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("18446744073709551616"),
+        );
+        assert_eq!(parse_retry_after(&headers, now), ParsedRetryAfter::Invalid);
+        assert_eq!(
+            parse_retry_after(&HeaderMap::new(), now),
+            ParsedRetryAfter::Absent
+        );
+    }
+
+    #[test]
+    fn malformed_retry_after_values_are_rejected() {
+        let now = Utc::now();
+        let mut headers = HeaderMap::new();
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_bytes(&[0xff]).unwrap());
+        assert_eq!(parse_retry_after(&headers, now), ParsedRetryAfter::Invalid);
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static(""));
+        assert_eq!(parse_retry_after(&headers, now), ParsedRetryAfter::Invalid);
+
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&"x".repeat(MAX_REQUEST_ID_BYTES + 1)).unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers, now), ParsedRetryAfter::Invalid);
+    }
+
+    #[test]
+    fn retry_backoff_is_exponential_capped_and_overridden_by_server() {
+        assert_eq!(retry_delay(1, None), BASE_RETRY_DELAY);
+        assert_eq!(retry_delay(2, None), BASE_RETRY_DELAY * 2);
+        assert_eq!(retry_delay(usize::MAX, None), MAX_RETRY_DELAY);
+        assert_eq!(
+            retry_delay(usize::MAX, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+    }
+
+    #[test]
+    fn retry_plan_allows_only_bounded_transient_retries() {
+        assert_eq!(
+            retry_plan(StatusCode::SERVICE_UNAVAILABLE, 1, ParsedRetryAfter::Absent),
+            Some((BASE_RETRY_DELAY, OzonErrorKind::Server))
+        );
+        assert_eq!(
+            retry_plan(
+                StatusCode::TOO_MANY_REQUESTS,
+                1,
+                ParsedRetryAfter::Valid(Duration::from_secs(2)),
+            ),
+            Some((Duration::from_secs(2), OzonErrorKind::RateLimited))
+        );
+        assert_eq!(
+            retry_plan(
+                StatusCode::SERVICE_UNAVAILABLE,
+                1,
+                ParsedRetryAfter::Valid(MAX_RETRY_DELAY + Duration::from_secs(1)),
+            ),
+            None
+        );
+        assert_eq!(
+            retry_plan(
+                StatusCode::SERVICE_UNAVAILABLE,
+                1,
+                ParsedRetryAfter::Invalid,
+            ),
+            None
+        );
+        assert_eq!(
+            retry_plan(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                1,
+                ParsedRetryAfter::Absent,
+            ),
+            None
+        );
+        assert_eq!(
+            retry_plan(
+                StatusCode::SERVICE_UNAVAILABLE,
+                MAX_ATTEMPTS,
+                ParsedRetryAfter::Absent,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn trace_helpers_evaluate_safe_fields_when_enabled() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let store = StoreId::from("ofk");
+            let request = RequestTrace {
+                store: &store,
+                endpoint: "/v1/trace",
+                started_at: Instant::now(),
+                attempt: 1,
+            };
+
+            trace_transport_failure(&request, OzonErrorKind::Network);
+            trace_response(
+                &request,
+                StatusCode::OK,
+                Some("trace-success"),
+                false,
+                OzonErrorKind::Http,
+            );
+            trace_response(
+                &request,
+                StatusCode::BAD_GATEWAY,
+                None,
+                true,
+                OzonErrorKind::Server,
+            );
+        });
+    }
+
+    #[test]
+    fn request_reader_handles_peer_closing_before_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        drop(peer);
+
+        assert!(read_request(&stream).is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_and_unknown_statuses_are_classified_without_unsafe_retry() {
+        for (status, expected_kind) in [
+            (502, OzonErrorKind::Server),
+            (504, OzonErrorKind::Server),
+            (418, OzonErrorKind::Http),
+        ] {
+            let mut response = MockResponse::new(status, r#"{"error":"test"}"#);
+            if matches!(status, 502 | 504) {
+                response = response.header("Retry-After", "60");
+            }
+            let (base_url, requests) = mock_server(vec![response]);
+            let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+            let error = client
+                .post(
+                    &StoreId::from("ofk"),
+                    "/v1/status-coverage",
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), expected_kind);
+            assert_request_count(&requests, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_or_overflowing_retry_after_never_retries() {
+        for value in ["not-a-date", "18446744073709551616"] {
+            let (base_url, requests) = mock_server(vec![
+                MockResponse::new(429, r#"{"error":"slow down"}"#).header("Retry-After", value),
+            ]);
+            let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+            let error = client
+                .post(
+                    &StoreId::from("ofk"),
+                    "/v1/invalid-retry-after",
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.kind(), OzonErrorKind::RateLimited);
+            assert!(matches!(
+                &error,
+                OzonError::RateLimited {
+                    retry_after: None,
+                    ..
+                }
+            ));
+            assert_request_count(&requests, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn long_retry_after_fails_without_retrying_too_early() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(429, r#"{"error":"slow down"}"#)
+                .header("Retry-After", "60")
+                .header("X-O3-Trace-Id", "o3-rate-60"),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(&StoreId::from("ofk"), "/v1/rate", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), OzonErrorKind::RateLimited);
+        assert_eq!(error.request_id(), Some("o3-rate-60"));
+        assert!(matches!(
+            &error,
+            OzonError::RateLimited {
+                retry_after: Some(delay),
+                ..
+            } if *delay == Duration::from_secs(60)
+        ));
+        assert_request_count(&requests, 1);
     }
 }

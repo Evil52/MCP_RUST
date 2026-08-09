@@ -14,8 +14,7 @@ RUN apk add --no-cache ca-certificates \
     && adduser -S -D -H -u 10001 -G mcp mcp
 
 COPY --from=builder /build/target/release/mcp-ozon /usr/local/bin/mcp-ozon
-ARG ACCESS_CONFIG=config/access.example.json
-COPY ${ACCESS_CONFIG} /etc/mcp-ozon/access.json
+COPY config/access.example.json /etc/mcp-ozon/access.json
 
 ENV MCP_TRANSPORT=http \
     MCP_BIND=0.0.0.0:8787 \

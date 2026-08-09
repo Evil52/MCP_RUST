@@ -8,7 +8,5 @@ services:
           path: ./Cargo.toml
         - action: rebuild
           path: ./Cargo.lock
-        - action: rebuild
-          path: ./config/access.json
         - action: restart
           path: ./.env

@@ -39,9 +39,9 @@ jobs:
 
       - name: Reject accidentally committed local secrets
         run: |
-          prohibited_files='(^|/)(\.env|\.sonar\.env|\.sonar-stack\.env)$'
+          prohibited_files='(^|/)(\.env|\.keycloak\.env|\.sonar\.env|\.sonar-stack\.env|sonar\.env|config/access(\.canary)?\.json)$'
           if git ls-files | grep -E "$prohibited_files"; then
-            echo "Local secret files must never be committed." >&2
+            echo "Local secret or private configuration files must never be committed." >&2
             exit 1
           fi
 
@@ -143,6 +143,45 @@ jobs:
 
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
+
+  keycloak-e2e:
+    name: Keycloak JWT E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          persist-credentials: false
+
+      - name: Prepare non-secret CI configuration
+        run: |
+          printf 'MCP_ACTOR_ID=admin\n' > .env
+          chmod 600 .env
+          cp config/access.example.json config/access.json
+          chmod 600 config/access.json
+          ./scripts/keycloak-init.sh
+
+      - name: Start Keycloak and JWT MCP
+        run: ./scripts/keycloak-up.sh
+
+      - name: Verify Keycloak to MCP authentication
+        run: ./scripts/keycloak-smoke.sh
+
+      - name: Print diagnostics on failure
+        if: failure()
+        run: |
+          docker compose --env-file .keycloak.env -f compose.auth.yaml ps
+          docker compose --env-file .keycloak.env -f compose.auth.yaml \
+            logs --no-color --tail 200
+
+      - name: Stop Keycloak test stack
+        if: always()
+        run: >-
+          docker compose
+          --env-file .keycloak.env
+          -f compose.auth.yaml
+          down --volumes --remove-orphans
 
   container:
     name: Hardened container

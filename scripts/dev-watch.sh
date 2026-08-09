@@ -17,6 +17,9 @@ command -v cargo-watch >/dev/null 2>&1 || {
   exit 1
 }
 
+# Keep host development isolated from the Docker/Tunnel endpoint on 8787.
+export MCP_BIND="${MCP_DEV_BIND:-127.0.0.1:8789}"
+
 exec cargo watch \
   --watch src \
   --watch Cargo.toml \

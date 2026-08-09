@@ -8,4 +8,5 @@
 .sonar-stack.env
 sonar.env
 /config/access.json
+/config/access.canary.json
 .DS_Store

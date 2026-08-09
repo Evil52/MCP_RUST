@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_OZON_API_BASE_URL: &str = "https://api-seller.ozon.ru";
 pub const DEFAULT_ACCESS_CONFIG_PATH: &str = "config/access.json";
+pub const DEFAULT_JWT_REQUIRED_SCOPES: &str = "mcp:tools";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -56,12 +57,6 @@ impl fmt::Display for Role {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct StoreId(pub String);
-
-impl Default for StoreId {
-    fn default() -> Self {
-        Self::from("ofk")
-    }
-}
 
 impl StoreId {
     pub fn new(value: impl Into<String>) -> Self {
@@ -187,34 +182,76 @@ impl AccessRegistry {
 
     fn validate_accounts(&self, actor_ids: &BTreeSet<&str>) -> Result<()> {
         let mut store_ids = BTreeSet::new();
+        let mut selectors = self.account_selectors()?;
         for account in &self.accounts {
-            if !actor_ids.contains(account.manager_id.as_str()) {
-                bail!(
-                    "для кабинета {} указан неизвестный manager_id={}",
-                    account.id,
-                    account.manager_id
-                );
+            Self::validate_account(account, actor_ids, &mut store_ids, &mut selectors)?;
+        }
+        Ok(())
+    }
+
+    fn account_selectors(&self) -> Result<BTreeMap<String, String>> {
+        let mut selectors = BTreeMap::new();
+        for account in &self.accounts {
+            if account.id.trim().is_empty() {
+                bail!("идентификатор кабинета не может быть пустым");
             }
-            if let Some(ozon) = &account.ozon {
-                if account.marketplace != Marketplace::Ozon {
-                    bail!(
-                        "Ozon-настройки допустимы только для Ozon-кабинета {}",
-                        account.id
-                    );
-                }
-                if ozon.store_id.0.trim().is_empty()
-                    || ozon.client_id_env.trim().is_empty()
-                    || ozon.api_key_env.trim().is_empty()
-                {
-                    bail!(
-                        "Ozon-настройки кабинета {} не могут быть пустыми",
-                        account.id
-                    );
-                }
-                if !store_ids.insert(ozon.store_id.clone()) {
-                    bail!("store_id={} должен быть уникальным", ozon.store_id);
-                }
-            }
+            selectors.insert(account.id.clone(), account.id.clone());
+        }
+        Ok(selectors)
+    }
+
+    fn validate_account(
+        account: &MarketplaceAccount,
+        actor_ids: &BTreeSet<&str>,
+        store_ids: &mut BTreeSet<StoreId>,
+        selectors: &mut BTreeMap<String, String>,
+    ) -> Result<()> {
+        if !actor_ids.contains(account.manager_id.as_str()) {
+            bail!(
+                "для кабинета {} указан неизвестный manager_id={}",
+                account.id,
+                account.manager_id
+            );
+        }
+        if let Some(ozon) = &account.ozon {
+            Self::validate_ozon_account(account, ozon, store_ids, selectors)?;
+        }
+        Ok(())
+    }
+
+    fn validate_ozon_account(
+        account: &MarketplaceAccount,
+        ozon: &OzonAccount,
+        store_ids: &mut BTreeSet<StoreId>,
+        selectors: &mut BTreeMap<String, String>,
+    ) -> Result<()> {
+        if account.marketplace != Marketplace::Ozon {
+            bail!(
+                "Ozon-настройки допустимы только для Ozon-кабинета {}",
+                account.id
+            );
+        }
+        if ozon.store_id.0.trim().is_empty()
+            || ozon.client_id_env.trim().is_empty()
+            || ozon.api_key_env.trim().is_empty()
+        {
+            bail!(
+                "Ozon-настройки кабинета {} не могут быть пустыми",
+                account.id
+            );
+        }
+        if !store_ids.insert(ozon.store_id.clone()) {
+            bail!("store_id={} должен быть уникальным", ozon.store_id);
+        }
+        if let Some(owner) = selectors.insert(ozon.store_id.0.clone(), account.id.clone())
+            && owner != account.id
+        {
+            bail!(
+                "selector магазина {:?} неоднозначен между кабинетами {} и {}",
+                ozon.store_id.0,
+                owner,
+                account.id
+            );
         }
         Ok(())
     }
@@ -241,6 +278,13 @@ impl AccessRegistry {
             let Some(identity) = &actor.oidc else {
                 continue;
             };
+            if identity.subject.is_none() && identity.username.is_none() && identity.email.is_none()
+            {
+                bail!(
+                    "OIDC identity пользователя {} должен содержать subject, username или email",
+                    actor.id
+                );
+            }
             for (field, value, values) in [
                 ("subject", identity.subject.as_deref(), &mut subjects),
                 ("username", identity.username.as_deref(), &mut usernames),
@@ -279,41 +323,93 @@ impl AccessRegistry {
         })
     }
 
+    pub fn account_for_store_selector(&self, selector: &StoreId) -> Option<&MarketplaceAccount> {
+        self.accounts.iter().find(|account| {
+            account
+                .ozon
+                .as_ref()
+                .is_some_and(|ozon| account.id == selector.0 || ozon.store_id == *selector)
+        })
+    }
+
     pub fn actor_for_oidc(
         &self,
         subject: &str,
         username: Option<&str>,
         email: Option<&str>,
     ) -> Result<&Actor> {
-        self.actors
-            .iter()
-            .find(|actor| {
-                actor.oidc.as_ref().is_some_and(|identity| {
-                    identity.subject.as_deref() == Some(subject)
-                        || username.is_some_and(|value| identity.username.as_deref() == Some(value))
+        let mut matches = self.actors.iter().filter(|actor| {
+            actor.oidc.as_ref().is_some_and(|identity| {
+                if let Some(expected_subject) = identity.subject.as_deref() {
+                    expected_subject == subject
+                } else {
+                    username.is_some_and(|value| identity.username.as_deref() == Some(value))
                         || email.is_some_and(|value| identity.email.as_deref() == Some(value))
+                }
+            })
+        });
+        let actor = matches
+            .next()
+            .context("OIDC-пользователь не зарегистрирован в реестре доступа")?;
+        if matches.next().is_some() {
+            bail!("OIDC identity неоднозначно соответствует нескольким пользователям");
+        }
+        Ok(actor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OzonCredentialBinding {
+    account_id: String,
+    seller_client_id: String,
+    store_id: StoreId,
+    client_id_env: String,
+    api_key_env: String,
+}
+
+impl OzonCredentialBinding {
+    fn snapshot(registry: &AccessRegistry) -> BTreeSet<Self> {
+        registry
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                account.ozon.as_ref().map(|ozon| Self {
+                    account_id: account.id.clone(),
+                    seller_client_id: account.seller_client_id.clone(),
+                    store_id: ozon.store_id.clone(),
+                    client_id_env: ozon.client_id_env.clone(),
+                    api_key_env: ozon.api_key_env.clone(),
                 })
             })
-            .with_context(|| "OIDC-пользователь не зарегистрирован в реестре доступа")
+            .collect()
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct RegistrySource {
     path: Arc<PathBuf>,
+    credential_bindings: Arc<BTreeSet<OzonCredentialBinding>>,
 }
 
 impl RegistrySource {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = Arc::new(path.into());
+        let registry = AccessRegistry::load(&path)?;
         let source = Self {
-            path: Arc::new(path.into()),
+            path,
+            credential_bindings: Arc::new(OzonCredentialBinding::snapshot(&registry)),
         };
-        source.load()?;
         Ok(source)
     }
 
     pub fn load(&self) -> Result<AccessRegistry> {
-        AccessRegistry::load(&self.path)
+        let registry = AccessRegistry::load(&self.path)?;
+        if OzonCredentialBinding::snapshot(&registry) != *self.credential_bindings {
+            bail!(
+                "MCP_ACCESS_CONFIG_RESTART_REQUIRED: привязки Ozon credentials изменились; перезапустите MCP, чтобы атомарно перечитать реестр и ключи"
+            );
+        }
+        Ok(registry)
     }
 
     pub fn path(&self) -> &Path {
@@ -361,6 +457,8 @@ pub struct AppConfig {
     pub transport: TransportMode,
     pub ozon_api_base_url: String,
     pub request_timeout: Duration,
+    pub ozon_postings_vnext: bool,
+    pub ozon_finance_accruals_preview: bool,
     pub stores: BTreeMap<StoreId, StoreCredentials>,
     pub auth: AuthConfig,
     pub registry: RegistrySource,
@@ -379,7 +477,69 @@ pub struct JwtConfig {
     pub jwks_url: String,
     pub resource_url: String,
     pub resource_metadata_url: String,
+    pub required_scopes: Vec<String>,
     pub jwks_cache_ttl: Duration,
+}
+
+fn is_safe_oauth_scope_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+}
+
+fn parse_required_scopes(value: &str) -> Result<Vec<String>> {
+    if value
+        .bytes()
+        .any(|byte| byte != b' ' && !matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+    {
+        bail!(
+            "MCP_JWT_REQUIRED_SCOPES должен содержать только безопасные OAuth scope-токены, разделённые пробелами"
+        );
+    }
+
+    let mut seen = BTreeSet::new();
+    let scopes = value
+        .split(' ')
+        .filter(|scope| !scope.is_empty())
+        .filter(|scope| is_safe_oauth_scope_token(scope))
+        .filter(|scope| seen.insert((*scope).to_owned()))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if scopes.is_empty() {
+        bail!("MCP_JWT_REQUIRED_SCOPES должен содержать хотя бы один OAuth scope");
+    }
+    Ok(scopes)
+}
+
+fn parse_strict_bool(value: &str, name: &str) -> Result<bool> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => bail!("{name} должен быть строго true или false"),
+    }
+}
+
+fn validate_ozon_api_base_url(value: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(value).map_err(|_| {
+        anyhow::anyhow!(
+            "OZON_API_BASE_URL должен указывать на официальный HTTPS endpoint Ozon Seller API"
+        )
+    })?;
+    let is_official_endpoint = parsed.scheme() == "https"
+        && parsed.host_str() == Some("api-seller.ozon.ru")
+        && matches!(parsed.port(), None | Some(443))
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.path() == "/"
+        && parsed.query().is_none()
+        && parsed.fragment().is_none();
+    if !is_official_endpoint {
+        bail!(
+            "OZON_API_BASE_URL разрешён только как https://api-seller.ozon.ru без credentials, query, fragment и дополнительного path"
+        );
+    }
+    Ok(DEFAULT_OZON_API_BASE_URL.to_owned())
 }
 
 impl AppConfig {
@@ -400,19 +560,27 @@ impl AppConfig {
             .parse()
             .context("MCP_BIND должен иметь формат IP:PORT")?;
         let transport = value(lookup, "MCP_TRANSPORT", "http").parse()?;
-        let ozon_api_base_url = value(lookup, "OZON_API_BASE_URL", DEFAULT_OZON_API_BASE_URL)
-            .trim_end_matches('/')
-            .to_owned();
+        let ozon_api_base_url = validate_ozon_api_base_url(&value(
+            lookup,
+            "OZON_API_BASE_URL",
+            DEFAULT_OZON_API_BASE_URL,
+        ))?;
         let timeout_seconds = value(lookup, "OZON_REQUEST_TIMEOUT_SECONDS", "30")
             .parse::<u64>()
             .context("OZON_REQUEST_TIMEOUT_SECONDS должен быть целым числом")?;
         if !(1..=300).contains(&timeout_seconds) {
             bail!("OZON_REQUEST_TIMEOUT_SECONDS должен быть от 1 до 300");
         }
+        let ozon_postings_vnext = parse_strict_bool(
+            &value(lookup, "OZON_POSTINGS_VNEXT", "false"),
+            "OZON_POSTINGS_VNEXT",
+        )?;
+        let ozon_finance_accruals_preview = parse_strict_bool(
+            &value(lookup, "OZON_FINANCE_ACCRUALS_PREVIEW", "false"),
+            "OZON_FINANCE_ACCRUALS_PREVIEW",
+        )?;
         let registry_path = value(lookup, "MCP_ACCESS_CONFIG", DEFAULT_ACCESS_CONFIG_PATH);
-        let registry = RegistrySource {
-            path: Arc::new(registry_path.into()),
-        };
+        let registry = RegistrySource::new(registry_path)?;
         let snapshot = registry.load()?;
         let auth_mode: AuthMode = value(lookup, "MCP_AUTH_MODE", "dev").parse()?;
         let auth = match auth_mode {
@@ -442,6 +610,11 @@ impl AppConfig {
                 parsed_resource.set_query(None);
                 parsed_resource.set_fragment(None);
                 let resource_metadata_url = parsed_resource.to_string();
+                let required_scopes = parse_required_scopes(&value(
+                    lookup,
+                    "MCP_JWT_REQUIRED_SCOPES",
+                    DEFAULT_JWT_REQUIRED_SCOPES,
+                ))?;
                 let ttl = value(lookup, "MCP_JWKS_CACHE_TTL_SECONDS", "300")
                     .parse::<u64>()
                     .context("MCP_JWKS_CACHE_TTL_SECONDS должен быть целым числом")?;
@@ -454,6 +627,7 @@ impl AppConfig {
                     jwks_url,
                     resource_url,
                     resource_metadata_url,
+                    required_scopes,
                     jwks_cache_ttl: Duration::from_secs(ttl),
                 })
             }
@@ -478,6 +652,8 @@ impl AppConfig {
             transport,
             ozon_api_base_url,
             request_timeout: Duration::from_secs(timeout_seconds),
+            ozon_postings_vnext,
+            ozon_finance_accruals_preview,
             stores,
             auth,
             registry,
@@ -577,6 +753,57 @@ mod tests {
     }
 
     #[test]
+    fn oidc_subject_pinning_has_precedence_over_username_and_email_fallback() {
+        let mut registry = sample_registry();
+        registry.actors[0].oidc = Some(OidcIdentity {
+            subject: Some("pinned-subject".into()),
+            username: Some("admin-user".into()),
+            email: Some("admin@example.test".into()),
+        });
+        registry.actors[1].oidc = Some(OidcIdentity {
+            subject: None,
+            username: Some("fallback-user".into()),
+            email: Some("fallback@example.test".into()),
+        });
+        registry.validate().unwrap();
+
+        assert!(
+            registry
+                .actor_for_oidc(
+                    "unrelated-subject",
+                    Some("admin-user"),
+                    Some("admin@example.test")
+                )
+                .is_err()
+        );
+        assert_eq!(
+            registry
+                .actor_for_oidc("pinned-subject", Some("different-user"), None)
+                .unwrap()
+                .id,
+            "admin"
+        );
+        assert_eq!(
+            registry
+                .actor_for_oidc("unrelated-subject", Some("fallback-user"), None)
+                .unwrap()
+                .id,
+            "manager"
+        );
+        assert_eq!(
+            registry
+                .actor_for_oidc(
+                    "another-unrelated-subject",
+                    None,
+                    Some("fallback@example.test")
+                )
+                .unwrap()
+                .id,
+            "manager"
+        );
+    }
+
+    #[test]
     fn registry_rejects_unknown_manager() {
         let mut registry = sample_registry();
         registry.accounts[0].manager_id = "missing".into();
@@ -587,6 +814,46 @@ mod tests {
                 .to_string()
                 .contains("неизвестный manager_id")
         );
+    }
+
+    #[test]
+    fn registry_rejects_blank_account_id() {
+        let mut registry = sample_registry();
+        registry.accounts[0].id = " \t".into();
+        let error = registry.validate().unwrap_err().to_string();
+        assert!(error.contains("идентификатор кабинета не может быть пустым"));
+    }
+
+    #[test]
+    fn registry_rejects_ambiguous_account_and_store_selectors() {
+        let mut registry = sample_registry();
+        registry.accounts.push(MarketplaceAccount {
+            id: "other".into(),
+            organization: "Other".into(),
+            marketplace: Marketplace::Ozon,
+            seller_client_id: "456".into(),
+            manager_id: "manager".into(),
+            ozon: Some(OzonAccount {
+                store_id: StoreId::from("shop"),
+                client_id_env: "OTHER_ID".into(),
+                api_key_env: "OTHER_KEY".into(),
+            }),
+        });
+        assert!(registry.validate().is_err());
+
+        let mut registry = sample_registry();
+        registry.accounts[0].ozon.as_mut().unwrap().store_id = StoreId::from("other");
+        registry.accounts.push(MarketplaceAccount {
+            id: "other".into(),
+            organization: "Directory".into(),
+            marketplace: Marketplace::Wildberries,
+            seller_client_id: "789".into(),
+            manager_id: "manager".into(),
+            ozon: None,
+        });
+        let error = registry.validate().unwrap_err().to_string();
+        assert!(error.contains("selector магазина"), "{error}");
+        assert!(error.contains("неоднозначен"), "{error}");
     }
 
     #[test]
@@ -678,6 +945,9 @@ mod tests {
             ..OidcIdentity::default()
         });
         cases.push(value);
+        let mut value = sample_registry();
+        value.actors[1].oidc = Some(OidcIdentity::default());
+        cases.push(value);
         for registry in cases {
             assert!(registry.validate().is_err());
         }
@@ -692,7 +962,7 @@ mod tests {
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
             ("MCP_BIND", "0.0.0.0:9999"),
             ("MCP_TRANSPORT", "stdio"),
-            ("OZON_API_BASE_URL", "https://example.invalid/"),
+            ("OZON_API_BASE_URL", "https://api-seller.ozon.ru:443/"),
             ("OZON_REQUEST_TIMEOUT_SECONDS", "5"),
             ("SHOP_ID", "client"),
             ("SHOP_KEY", "secret"),
@@ -701,8 +971,10 @@ mod tests {
             AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned())).unwrap();
         assert_eq!(config.bind, "0.0.0.0:9999".parse().unwrap());
         assert_eq!(config.transport, TransportMode::Stdio);
-        assert_eq!(config.ozon_api_base_url, "https://example.invalid");
+        assert_eq!(config.ozon_api_base_url, DEFAULT_OZON_API_BASE_URL);
         assert_eq!(config.request_timeout, Duration::from_secs(5));
+        assert!(!config.ozon_postings_vnext);
+        assert!(!config.ozon_finance_accruals_preview);
         assert!(matches!(
             config.auth,
             AuthConfig::Dev { ref actor_id } if actor_id == "admin"
@@ -719,7 +991,21 @@ mod tests {
                 .unwrap();
         assert_eq!(config.bind, "127.0.0.1:8787".parse().unwrap());
         assert_eq!(config.transport, TransportMode::Http);
+        assert!(!config.ozon_postings_vnext);
+        assert!(!config.ozon_finance_accruals_preview);
         assert!(config.stores.is_empty());
+
+        let preview = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("OZON_POSTINGS_VNEXT", "true"),
+            ("OZON_FINANCE_ACCRUALS_PREVIEW", "true"),
+        ]);
+        let config =
+            AppConfig::from_lookup(|key| preview.get(key).map(|value| (*value).to_owned()))
+                .unwrap();
+        assert!(config.ozon_postings_vnext);
+        assert!(config.ozon_finance_accruals_preview);
     }
 
     #[test]
@@ -745,6 +1031,27 @@ mod tests {
         assert!(result(Some(("MCP_AUTH_MODE", "bad"))).is_err());
         assert!(result(Some(("OZON_REQUEST_TIMEOUT_SECONDS", "bad"))).is_err());
         assert!(result(Some(("OZON_REQUEST_TIMEOUT_SECONDS", "0"))).is_err());
+        for name in ["OZON_POSTINGS_VNEXT", "OZON_FINANCE_ACCRUALS_PREVIEW"] {
+            for value in ["", "1", "yes", "TRUE", " false"] {
+                assert!(result(Some((name, value))).is_err(), "{name}={value:?}");
+            }
+        }
+        for value in [
+            "not-a-url",
+            "http://api-seller.ozon.ru",
+            "https://api-seller.ozon.ru.evil.example",
+            "https://api-seller.ozon.ru:444",
+            "https://api-seller.ozon.ru/v1",
+            "https://api-seller.ozon.ru?redirect=evil",
+            "https://api-seller.ozon.ru#fragment",
+            "https://user:secret@api-seller.ozon.ru",
+        ] {
+            let error = result(Some(("OZON_API_BASE_URL", value)))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("OZON_API_BASE_URL"));
+            assert!(!error.contains("secret"));
+        }
         assert!(AppConfig::from_lookup(|_| None).is_err());
 
         let missing_registry = std::env::temp_dir().join(format!(
@@ -784,6 +1091,27 @@ mod tests {
                 ("MCP_JWT_AUDIENCE", "ozonofk-mcp"),
                 ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
                 ("MCP_JWKS_CACHE_TTL_SECONDS", value),
+            ]);
+            assert!(
+                AppConfig::from_lookup(|key| jwt.get(key).map(|value| (*value).to_owned()))
+                    .is_err()
+            );
+        }
+
+        for value in [
+            "",
+            "mcp:tools\tanalytics:read",
+            "mcp:to\"ols",
+            "mcp:\\tools",
+            "mcp:инструменты",
+        ] {
+            let jwt = BTreeMap::from([
+                ("MCP_AUTH_MODE", "jwt"),
+                ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+                ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
+                ("MCP_JWT_AUDIENCE", "ozonofk-mcp"),
+                ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
+                ("MCP_JWT_REQUIRED_SCOPES", value),
             ]);
             assert!(
                 AppConfig::from_lookup(|key| jwt.get(key).map(|value| (*value).to_owned()))
@@ -843,7 +1171,38 @@ mod tests {
         assert!(rendered.contains("ozonofk-mcp"));
         assert!(rendered.contains("http://localhost:8788/mcp"));
         assert!(rendered.contains("http://localhost:8788/.well-known/oauth-protected-resource"));
+        assert!(rendered.contains("mcp:tools"));
         assert!(rendered.contains("600s"));
+
+        assert!(matches!(
+            config.auth,
+            AuthConfig::Jwt(JwtConfig {
+                ref required_scopes,
+                ..
+            }) if required_scopes == &["mcp:tools"]
+        ));
+
+        let custom_values = BTreeMap::from([
+            ("MCP_AUTH_MODE", "jwt"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("MCP_JWT_ISSUER", "http://localhost:8180/realms/ofk"),
+            ("MCP_JWT_AUDIENCE", "ozonofk-mcp"),
+            ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
+            (
+                "MCP_JWT_REQUIRED_SCOPES",
+                " mcp:tools analytics:read mcp:tools ",
+            ),
+        ]);
+        let custom =
+            AppConfig::from_lookup(|key| custom_values.get(key).map(|value| (*value).to_owned()))
+                .unwrap();
+        assert!(matches!(
+            custom.auth,
+            AuthConfig::Jwt(JwtConfig {
+                ref required_scopes,
+                ..
+            }) if required_scopes == &["mcp:tools", "analytics:read"]
+        ));
     }
 
     #[test]

@@ -21,12 +21,12 @@ files=(
   README.md
   SECURITY.md
   compose.auth.yaml
+  compose.canary.yaml
   compose.dev.yaml
   compose.yaml
   config/access.example.json
   config/keycloak/ofk-realm.json
   deny.toml
-  methods.json
   sonar-project.properties
   compose.sonar.yaml
   .github/dependabot.yml
@@ -35,7 +35,12 @@ files=(
   .github/workflows/dependency-review.yml
   ops/macos/com.ofk.mcp-ozon-runtime.plist.in
   scripts/ensure-local-runtime.sh
+  scripts/canary-init.sh
   scripts/install-local-runtime-agent.sh
+  scripts/keycloak-init.sh
+  scripts/keycloak-smoke.sh
+  scripts/keycloak-sync-config.sh
+  scripts/keycloak-up.sh
   scripts/local-ci.sh
   scripts/sonar-reports.sh
   scripts/sonar-bootstrap.sh
@@ -58,10 +63,14 @@ files=(
   for relative_path in "${files[@]}"; do
     source_path="$project_root/$relative_path"
     if [[ ! -f "$source_path" ]]; then
+      # Backticks are literal Markdown delimiters.
+      # shellcheck disable=SC2016
       printf '\n> Missing expected file: `%s`\n' "$relative_path"
       continue
     fi
 
+    # Backticks are literal Markdown delimiters.
+    # shellcheck disable=SC2016
     printf '\n## File: `%s`\n\n````text\n' "$relative_path"
     sed -e 's/\r$//' "$source_path"
     printf '\n````\n'

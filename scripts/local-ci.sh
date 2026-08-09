@@ -5,6 +5,13 @@ set -euo pipefail
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root"
 
+readonly required_rust_version="1.97.1"
+actual_rust_version="$(rustc --version | awk '{ print $2 }')"
+if [[ "$actual_rust_version" != "$required_rust_version" ]]; then
+  echo "Rust $required_rust_version is required; active rustc is $actual_rust_version" >&2
+  exit 1
+fi
+
 echo "==> Formatting"
 cargo fmt --all -- --check
 

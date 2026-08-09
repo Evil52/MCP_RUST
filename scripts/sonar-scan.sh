@@ -8,7 +8,10 @@ scanner_container="mcp-ozon-sonar-scan-$$"
 sonar_env_file="$project_root/.sonar.env"
 sonar_token_source="environment"
 
-if [[ -f "$sonar_env_file" ]]; then
+load_sonar_env() {
+  local replace_token="${1:-false}"
+  local key value
+  [[ -f "$sonar_env_file" ]] || return 0
   while IFS='=' read -r key value || [[ -n "$key" ]]; do
     value="${value%$'\r'}"
     case "$key" in
@@ -18,7 +21,7 @@ if [[ -f "$sonar_env_file" ]]; then
         fi
         ;;
       SONAR_TOKEN)
-        if [[ -z "${SONAR_TOKEN:-}" ]]; then
+        if [[ "$replace_token" == "true" || -z "${SONAR_TOKEN:-}" ]]; then
           export SONAR_TOKEN="$value"
           sonar_token_source=".sonar.env"
         fi
@@ -27,20 +30,29 @@ if [[ -f "$sonar_env_file" ]]; then
       *) echo "Ignoring unsupported variable '$key' in .sonar.env." >&2 ;;
     esac
   done < "$sonar_env_file"
-fi
+}
+
+bearer_http_status() {
+  local token="$1"
+  local url="$2"
+  printf 'header = "Authorization: Bearer %s"\n' "$token" \
+    | curl --config - \
+      --silent \
+      --show-error \
+      --output /dev/null \
+      --write-out '%{http_code}' \
+      "$url"
+}
+
+load_sonar_env
 
 SONAR_HOST_URL="${SONAR_HOST_URL:-http://127.0.0.1:9000}"
 
 if [[ "$SONAR_HOST_URL" == "http://127.0.0.1:9000" ]] \
   || [[ "$SONAR_HOST_URL" == "http://localhost:9000" ]]; then
   "$project_root/scripts/sonar-up.sh"
-  if [[ "$sonar_token_source" == ".sonar.env" ]]; then
-    while IFS='=' read -r key value || [[ -n "$key" ]]; do
-      value="${value%$'\r'}"
-      if [[ "$key" == "SONAR_TOKEN" ]]; then
-        export SONAR_TOKEN="$value"
-      fi
-    done < "$sonar_env_file"
+  if [[ "$sonar_token_source" == ".sonar.env" || -z "${SONAR_TOKEN:-}" ]]; then
+    load_sonar_env true
   fi
 fi
 
@@ -64,19 +76,17 @@ if [[ -z "$SONAR_TOKEN" ]]; then
   echo "Sonar token is empty." >&2
   exit 1
 fi
+if [[ ! "$SONAR_TOKEN" =~ ^[[:alnum:]_.-]+$ ]]; then
+  echo "Sonar token has an unexpected format." >&2
+  exit 1
+fi
 
 echo "Using SONAR_TOKEN from $sonar_token_source (value hidden)."
 
 scanner_host_url="${SONAR_HOST_URL/127.0.0.1/host.docker.internal}"
 scanner_host_url="${scanner_host_url/localhost/host.docker.internal}"
 
-token_status="$(
-  curl --silent --show-error \
-    --output /dev/null \
-    --write-out '%{http_code}' \
-    --header "Authorization: Bearer $SONAR_TOKEN" \
-    "$SONAR_HOST_URL/api/v2/analysis/version"
-)"
+token_status="$(bearer_http_status "$SONAR_TOKEN" "$SONAR_HOST_URL/api/v2/analysis/version")"
 if [[ "$token_status" != "200" ]]; then
   echo "SonarQube rejected the token (HTTP $token_status). Create a new analysis token and try again." >&2
   exit 1
@@ -93,11 +103,7 @@ docker create \
   --env SONAR_HOST_URL="$scanner_host_url" \
   --env SONAR_TOKEN \
   --workdir /usr/src \
-  "$scanner_image" \
-  -Dsonar.scm.disabled=true \
-  -Dsonar.rust.clippyReport.reportPaths=reports/clippy.json \
-  -Dsonar.rust.lcov.reportPaths=reports/lcov.info \
-  -Dsonar.testExecutionReportPaths=reports/test-executions.xml >/dev/null
+  "$scanner_image" >/dev/null
 
 echo "Copying project files and Sonar reports..."
 docker cp "$project_root/Cargo.toml" "$scanner_container:/usr/src/Cargo.toml" >/dev/null

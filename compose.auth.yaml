@@ -2,7 +2,7 @@ name: mcp-ozon-auth
 
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
     environment:
       POSTGRES_DB: ${KEYCLOAK_DB_NAME:?set in .keycloak.env}
       POSTGRES_USER: ${KEYCLOAK_DB_USER:?set in .keycloak.env}
@@ -33,14 +33,29 @@ services:
       KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?set in .keycloak.env}
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:?set in .keycloak.env}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?set in .keycloak.env}
+      KC_HOSTNAME: http://localhost:8180
     networks:
       - identity
+      - auth-edge
     ports:
       - "127.0.0.1:8180:8080"
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - /bin/bash
+        - -ec
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3;
+          grep -qm1 'HTTP/1.1 200 OK' <&3
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
     security_opt:
       - no-new-privileges:true
 
@@ -48,8 +63,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      args:
-        ACCESS_CONFIG: config/access.json
     env_file:
       - .env
     environment:
@@ -58,7 +71,10 @@ services:
       MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
       MCP_AUTH_MODE: jwt
       MCP_JWT_ISSUER: http://localhost:8180/realms/ofk
-      MCP_JWT_AUDIENCE: ozonofk-mcp
+      MCP_JWT_AUDIENCE: http://localhost:8788/mcp
+      MCP_JWT_REQUIRED_SCOPES: "mcp:tools"
+      OZON_POSTINGS_VNEXT: "false"
+      OZON_FINANCE_ACCRUALS_PREVIEW: "false"
       MCP_JWT_JWKS_URL: http://keycloak:8080/realms/ofk/protocol/openid-connect/certs
       MCP_PUBLIC_URL: http://localhost:8788/mcp
       MCP_JWKS_CACHE_TTL_SECONDS: "300"
@@ -67,8 +83,16 @@ services:
       - outbound
     ports:
       - "127.0.0.1:8788:8787"
+    volumes:
+      - type: bind
+        source: ./config/access.json
+        target: /etc/mcp-ozon/access.json
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
-      - keycloak
+      keycloak:
+        condition: service_healthy
     restart: unless-stopped
     read_only: true
     tmpfs:
@@ -90,4 +114,8 @@ volumes:
 networks:
   identity:
     internal: true
+  auth-edge:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
   outbound:

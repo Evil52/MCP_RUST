@@ -8,6 +8,32 @@
   "duplicateEmailsAllowed": false,
   "resetPasswordAllowed": true,
   "bruteForceProtected": true,
+  "clientScopes": [
+    {
+      "name": "mcp:tools",
+      "description": "Access OzonOFK MCP tools",
+      "protocol": "openid-connect",
+      "attributes": {
+        "display.on.consent.screen": "true",
+        "include.in.token.scope": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "mcp-resource-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "http://localhost:8788/mcp",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true",
+            "lightweight.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
   "clients": [
     {
       "clientId": "ozonofk-mcp",
@@ -20,29 +46,21 @@
       "serviceAccountsEnabled": false,
       "redirectUris": ["http://localhost:*/*"],
       "webOrigins": ["http://localhost:*"],
-      "protocolMappers": [
-        {
-          "name": "ozonofk audience",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-audience-mapper",
-          "consentRequired": false,
-          "config": {
-            "included.client.audience": "ozonofk-mcp",
-            "access.token.claim": "true",
-            "id.token.claim": "false",
-            "lightweight.claim": "false"
-          }
-        }
-      ]
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "optionalClientScopes": ["mcp:tools", "offline_access"],
+      "protocolMappers": []
     }
   ],
   "users": [
     {
-      "username": "rustam_magasumov",
-      "firstName": "Рустам",
-      "lastName": "Магасумов",
+      "username": "admin",
+      "firstName": "Example",
+      "lastName": "Administrator",
+      "email": "admin@localhost.invalid",
       "enabled": true,
-      "emailVerified": false,
+      "emailVerified": true,
       "requiredActions": ["UPDATE_PASSWORD"]
     }
   ]
