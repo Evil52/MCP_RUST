@@ -10,3 +10,4 @@ sonar.env
 /config/access.json
 /config/access.canary.json
 .DS_Store
+/nvim.log

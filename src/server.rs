@@ -31,6 +31,7 @@ const MAX_POSTING_NUMBERS: usize = 1_000;
 const MAX_GROUP_STATES: usize = 100;
 const MAX_OPERATION_TYPES: usize = 100;
 const MAX_RATINGS: usize = 100;
+const MIN_REVIEWS_LIMIT: u32 = 20;
 const MAX_OFFSET: u32 = 1_000_000;
 const MAX_PAGE: u32 = 1_000_000;
 const OZON_TOOL_FAILURE: &str = "OZON_TOOL_CALL_FAILED";
@@ -944,8 +945,11 @@ pub struct RatingHistoryInput {
     pub date_from: String,
     #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
     pub date_to: String,
-    #[serde(default)]
-    #[schemars(length(max = 100), inner(length(min = 1, max = 128)))]
+    #[schemars(
+        description = "От одного до 100 кодов из ozon_seller_rating, например rating_shipment_delay_cb",
+        length(min = 1, max = 100),
+        inner(length(min = 1, max = 128))
+    )]
     pub ratings: Vec<String>,
     #[serde(default = "default_true")]
     pub with_premium_scores: bool,
@@ -965,13 +969,13 @@ pub struct ReviewsInput {
     )]
     pub store: Option<StoreId>,
     #[serde(default = "default_reviews_limit")]
-    #[schemars(range(min = 1, max = 100))]
+    #[schemars(range(min = 20, max = 100))]
     pub limit: u32,
     #[serde(default)]
     #[schemars(length(max = 4_096))]
     pub last_id: String,
-    #[serde(default)]
-    #[schemars(length(max = 128))]
+    #[serde(default = "default_all_status")]
+    #[schemars(length(min = 1, max = 128))]
     pub status: String,
     #[serde(default)]
     pub direction: SortDirection,
@@ -979,6 +983,10 @@ pub struct ReviewsInput {
 
 fn default_reviews_limit() -> u32 {
     100
+}
+
+fn default_all_status() -> String {
+    "ALL".to_owned()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -997,8 +1005,8 @@ pub struct QuestionsInput {
     pub date_from: String,
     #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
     pub date_to: String,
-    #[serde(default)]
-    #[schemars(length(max = 128))]
+    #[serde(default = "default_all_status")]
+    #[schemars(length(min = 1, max = 128))]
     pub status: String,
     #[serde(default)]
     #[schemars(length(max = 4_096))]
@@ -1540,6 +1548,7 @@ impl OzonMcp {
         Parameters(input): Parameters<RatingHistoryInput>,
     ) -> Result<Json<OzonResult>, String> {
         let (from, to) = validate_and_expand_dates(&input.date_from, &input.date_to, 366)?;
+        validate_count("ratings", input.ratings.len(), 1, MAX_RATINGS)?;
         validate_string_list("ratings", &input.ratings, MAX_RATINGS, MAX_ENUM_VALUE_CHARS)?;
         self.request(
             &identity,
@@ -1565,8 +1574,14 @@ impl OzonMcp {
         identity: RequestIdentity,
         Parameters(input): Parameters<ReviewsInput>,
     ) -> Result<Json<OzonResult>, String> {
+        if input.limit < MIN_REVIEWS_LIMIT {
+            return Err(format!(
+                "limit для отзывов должен быть от {MIN_REVIEWS_LIMIT} до 100"
+            ));
+        }
         validate_limit(input.limit, 100)?;
         validate_max_chars("last_id", &input.last_id, MAX_OPAQUE_TOKEN_CHARS)?;
+        validate_non_blank("status", &input.status)?;
         validate_max_chars("status", &input.status, MAX_ENUM_VALUE_CHARS)?;
         self.request(
             &identity,
@@ -1593,6 +1608,7 @@ impl OzonMcp {
         Parameters(input): Parameters<QuestionsInput>,
     ) -> Result<Json<OzonResult>, String> {
         let (from, to) = validate_and_expand_dates(&input.date_from, &input.date_to, 366)?;
+        validate_non_blank("status", &input.status)?;
         validate_max_chars("status", &input.status, MAX_ENUM_VALUE_CHARS)?;
         validate_max_chars("last_id", &input.last_id, MAX_OPAQUE_TOKEN_CHARS)?;
         self.request(
@@ -2065,7 +2081,16 @@ mod tests {
             ("ozon_reviews", 100),
         ] {
             let schema = schema(tool);
-            assert_eq!(schema["properties"]["limit"]["minimum"], json!(1), "{tool}");
+            let minimum = if tool == "ozon_reviews" {
+                MIN_REVIEWS_LIMIT
+            } else {
+                1
+            };
+            assert_eq!(
+                schema["properties"]["limit"]["minimum"],
+                json!(minimum),
+                "{tool}"
+            );
             assert_eq!(
                 schema["properties"]["limit"]["maximum"],
                 json!(maximum),
@@ -2083,6 +2108,19 @@ mod tests {
         assert_eq!(
             accrual_postings["properties"]["posting_numbers"]["minItems"],
             json!(1)
+        );
+
+        let rating_history = schema("ozon_seller_rating_history");
+        assert_eq!(
+            rating_history["properties"]["ratings"]["minItems"],
+            json!(1)
+        );
+        assert!(
+            rating_history["required"]
+                .as_array()
+                .expect("rating history required fields")
+                .iter()
+                .any(|field| field == "ratings")
         );
 
         let returns = schema("ozon_returns");
@@ -2280,6 +2318,11 @@ mod tests {
         for tool in ["ozon_reviews", "ozon_questions"] {
             let schema = schema(tool);
             assert_eq!(
+                schema["properties"]["status"]["minLength"],
+                json!(1),
+                "{tool}.status"
+            );
+            assert_eq!(
                 schema["properties"]["status"]["maxLength"],
                 json!(MAX_ENUM_VALUE_CHARS),
                 "{tool}.status"
@@ -2330,6 +2373,29 @@ mod tests {
                 "{tool}.last_id"
             );
         }
+    }
+
+    #[test]
+    fn customer_feedback_inputs_have_ozon_safe_defaults() {
+        let reviews: ReviewsInput = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(reviews.limit, 100);
+        assert_eq!(reviews.status, "ALL");
+
+        let questions: QuestionsInput = serde_json::from_value(json!({
+            "date_from": "2026-08-08",
+            "date_to": "2026-08-08"
+        }))
+        .unwrap();
+        assert_eq!(questions.status, "ALL");
+
+        assert!(
+            serde_json::from_value::<RatingHistoryInput>(json!({
+                "date_from": "2026-08-08",
+                "date_to": "2026-08-08"
+            }))
+            .is_err(),
+            "rating history must require at least one explicit Ozon rating code"
+        );
     }
 
     #[test]
@@ -3002,7 +3068,7 @@ mod tests {
                         store: Some(StoreId::from("store_a")),
                         date_from: "2026-05-01".to_owned(),
                         date_to: "2026-05-10".to_owned(),
-                        ratings: vec!["rating_on_time".to_owned()],
+                        ratings: vec!["rating_shipment_delay_cb".to_owned()],
                         with_premium_scores: false,
                     }),
                 )
@@ -3178,7 +3244,7 @@ mod tests {
                 json!({
                     "date_from": "2026-05-01T00:00:00.000Z",
                     "date_to": "2026-05-10T23:59:59.999Z",
-                    "ratings": ["rating_on_time"],
+                    "ratings": ["rating_shipment_delay_cb"],
                     "with_premium_scores": false,
                 }),
             ),
@@ -3814,7 +3880,7 @@ mod tests {
                         store: Some(StoreId::from("store_a")),
                         limit: 100,
                         last_id: oversized_token.clone(),
-                        status: String::new(),
+                        status: "ALL".to_owned(),
                         direction: SortDirection::Asc,
                     }),
                 )
@@ -3844,7 +3910,7 @@ mod tests {
                         store: Some(StoreId::from("store_a")),
                         date_from: "2026-01-01".to_owned(),
                         date_to: "2026-01-02".to_owned(),
-                        status: String::new(),
+                        status: "ALL".to_owned(),
                         last_id: oversized_token,
                     }),
                 )
@@ -4057,6 +4123,66 @@ mod tests {
                 )
                 .await,
             "ratings",
+        );
+        assert_validation_error(
+            server
+                .seller_rating_history(
+                    RequestIdentity::dev(),
+                    Parameters(RatingHistoryInput {
+                        store: Some(StoreId::from("store_a")),
+                        date_from: "2026-01-01".to_owned(),
+                        date_to: "2026-01-02".to_owned(),
+                        ratings: Vec::new(),
+                        with_premium_scores: true,
+                    }),
+                )
+                .await,
+            "ratings",
+        );
+        assert_validation_error(
+            server
+                .reviews(
+                    RequestIdentity::dev(),
+                    Parameters(ReviewsInput {
+                        store: Some(StoreId::from("store_a")),
+                        limit: MIN_REVIEWS_LIMIT - 1,
+                        last_id: String::new(),
+                        status: "ALL".to_owned(),
+                        direction: SortDirection::Asc,
+                    }),
+                )
+                .await,
+            "limit",
+        );
+        assert_validation_error(
+            server
+                .reviews(
+                    RequestIdentity::dev(),
+                    Parameters(ReviewsInput {
+                        store: Some(StoreId::from("store_a")),
+                        limit: MIN_REVIEWS_LIMIT,
+                        last_id: String::new(),
+                        status: " ".to_owned(),
+                        direction: SortDirection::Asc,
+                    }),
+                )
+                .await,
+            "status",
+        );
+        assert_validation_error(
+            server
+                .questions(
+                    RequestIdentity::dev(),
+                    Parameters(QuestionsInput {
+                        store: Some(StoreId::from("store_a")),
+                        date_from: "2026-01-01".to_owned(),
+                        date_to: "2026-01-02".to_owned(),
+                        status: " ".to_owned(),
+                        last_id: String::new(),
+                    }),
+                )
+                .await,
+            "status",
         );
 
         assert!(

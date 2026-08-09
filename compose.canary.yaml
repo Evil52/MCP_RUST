@@ -18,7 +18,7 @@ services:
       - "127.0.0.1:8789:8787"
     volumes:
       - type: bind
-        source: ./config/access.canary.json
+        source: ${MCP_CANARY_ACCESS_CONFIG:-./config/access.canary.json}
         target: /etc/mcp-ozon/access.json
         read_only: true
         bind:

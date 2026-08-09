@@ -35,7 +35,9 @@ files=(
   .github/workflows/dependency-review.yml
   ops/macos/com.ofk.mcp-ozon-runtime.plist.in
   scripts/ensure-local-runtime.sh
+  scripts/canary-down.sh
   scripts/canary-init.sh
+  scripts/canary-up.sh
   scripts/install-local-runtime-agent.sh
   scripts/keycloak-init.sh
   scripts/keycloak-smoke.sh

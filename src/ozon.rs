@@ -23,6 +23,7 @@ use crate::config::{StoreCredentials, StoreId};
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
 const MAX_ATTEMPTS: usize = 3;
+const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT_REQUESTS_PER_CLIENT: usize = 16;
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(20);
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -222,6 +223,7 @@ impl OzonClient {
     ) -> Result<Self, reqwest::Error> {
         let http = Client::builder()
             .timeout(timeout)
+            .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
             .redirect(Policy::none())
             .user_agent(user_agent)
             .build()?;
@@ -289,7 +291,14 @@ impl OzonClient {
                 Ok(response) => response,
                 Err(source) => {
                     let error = classify_transport_error(source, None);
-                    trace_transport_failure(&request_trace, error.kind());
+                    let kind = error.kind();
+                    let will_retry = is_retriable_transport(kind) && attempt < MAX_ATTEMPTS;
+                    trace_transport_failure(&request_trace, kind, will_retry);
+                    if will_retry {
+                        sleep(retry_delay(attempt, None)).await;
+                        attempt += 1;
+                        continue;
+                    }
                     return Err(error);
                 }
             };
@@ -485,6 +494,10 @@ fn is_retriable(status: StatusCode) -> bool {
     )
 }
 
+fn is_retriable_transport(kind: OzonErrorKind) -> bool {
+    matches!(kind, OzonErrorKind::Timeout | OzonErrorKind::Network)
+}
+
 fn retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
     retry_after.unwrap_or_else(|| {
         BASE_RETRY_DELAY
@@ -572,7 +585,7 @@ struct RequestTrace<'a> {
     attempt: usize,
 }
 
-fn trace_transport_failure(request: &RequestTrace<'_>, kind: OzonErrorKind) {
+fn trace_transport_failure(request: &RequestTrace<'_>, kind: OzonErrorKind, will_retry: bool) {
     let latency_ms = elapsed_millis(request.started_at);
     tracing::warn!(
         store = %request.store,
@@ -581,6 +594,7 @@ fn trace_transport_failure(request: &RequestTrace<'_>, kind: OzonErrorKind) {
         latency_ms,
         request_id = "-",
         attempt = request.attempt,
+        will_retry,
         error_kind = ?kind,
         "Ozon API request failed"
     );
@@ -1129,10 +1143,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_errors_are_classified_without_retry() {
-        let (base_url, requests) = mock_server(vec![
-            MockResponse::new(200, r#"{"ok":true}"#).delay(Duration::from_millis(200)),
-        ]);
+    async fn timeout_retries_are_bounded_and_keep_the_error_classification() {
+        let responses = (0..MAX_ATTEMPTS)
+            .map(|_| MockResponse::new(200, r#"{"ok":true}"#).delay(Duration::from_millis(200)))
+            .collect();
+        let (base_url, requests) = mock_server(responses);
         let client = OzonClient::new(base_url, Duration::from_millis(30), credentials()).unwrap();
 
         let error = client
@@ -1141,11 +1156,32 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), OzonErrorKind::Timeout);
         assert_eq!(error.request_id(), None);
-        assert_request_count(&requests, 1);
+        assert_request_count(&requests, MAX_ATTEMPTS);
     }
 
     #[tokio::test]
-    async fn network_errors_are_classified_without_retry() {
+    async fn a_transport_timeout_can_recover_on_a_bounded_retry() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(200, r#"{"discarded":true}"#).delay(Duration::from_millis(80)),
+            MockResponse::new(200, r#"{"ok":true}"#),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_millis(30), credentials()).unwrap();
+
+        let value = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/timeout-retry",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, serde_json::json!({"ok": true}));
+        assert_request_count(&requests, 2);
+    }
+
+    #[tokio::test]
+    async fn network_retries_are_bounded_and_keep_the_error_classification() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
@@ -1483,7 +1519,7 @@ mod tests {
                 attempt: 1,
             };
 
-            trace_transport_failure(&request, OzonErrorKind::Network);
+            trace_transport_failure(&request, OzonErrorKind::Network, true);
             trace_response(
                 &request,
                 StatusCode::OK,
