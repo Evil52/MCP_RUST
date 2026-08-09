@@ -26,6 +26,16 @@
         "client_id_env": "EXAMPLE_OZON_CLIENT_ID",
         "api_key_env": "EXAMPLE_OZON_API_KEY"
       }
+    },
+    {
+      "id": "example_wb",
+      "organization": "Example Wildberries organization",
+      "marketplace": "wildberries",
+      "seller_client_id": "replace-me",
+      "manager_id": "manager",
+      "wildberries": {
+        "api_token_env": "EXAMPLE_WB_API_TOKEN"
+      }
     }
   ]
 }

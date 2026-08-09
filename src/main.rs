@@ -7,6 +7,7 @@ use mcp_ozon::{
     config::{AppConfig, AuthConfig, TransportMode},
     ozon::OzonClient,
     server::OzonMcp,
+    wb::WbClient,
 };
 use rmcp::{
     ServiceExt,
@@ -34,6 +35,7 @@ async fn main() -> Result<()> {
         config.request_timeout,
         config.stores,
     )?;
+    let wb_client = WbClient::new(config.request_timeout, config.wildberries_accounts);
     let registry = config.registry.clone();
     let server = match &config.auth {
         AuthConfig::Dev { actor_id } => OzonMcp::new(client, actor_id.clone(), registry),
@@ -42,6 +44,7 @@ async fn main() -> Result<()> {
             OzonMcp::new_authenticated(client, registry, authenticator)
         }
     }
+    .with_wildberries_client(wb_client)
     .with_preview_features(
         config.ozon_postings_vnext,
         config.ozon_finance_accruals_preview,

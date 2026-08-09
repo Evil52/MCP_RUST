@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use chrono::{NaiveDate, Utc};
 use rmcp::{
     Json, RoleServer, ServerHandler,
@@ -24,6 +26,7 @@ use crate::{
     },
     config::{Actor, Marketplace, RegistrySource, Role, StoreId},
     ozon::OzonClient,
+    wb::WbClient,
 };
 
 const MAX_ANALYTICS_PERIOD_DAYS: i64 = 366;
@@ -42,6 +45,7 @@ const MIN_REVIEWS_LIMIT: u32 = 20;
 const MAX_OFFSET: u32 = 1_000_000;
 const MAX_PAGE: u32 = 1_000_000;
 const OZON_TOOL_FAILURE: &str = "OZON_TOOL_CALL_FAILED";
+const WB_TOOL_FAILURE: &str = "WB_TOOL_CALL_FAILED";
 const ACCESS_DENIED: &str = "ACCESS_DENIED";
 const UNKNOWN_STORE: &str = "UNKNOWN_STORE";
 const STORE_REQUIRED: &str = "STORE_REQUIRED";
@@ -93,6 +97,7 @@ fn config_error(error: anyhow::Error) -> String {
 #[derive(Debug, Clone)]
 pub struct OzonMcp {
     client: OzonClient,
+    wb_client: WbClient,
     default_actor_id: Option<String>,
     authenticator: Option<JwtAuthenticator>,
     registry: RegistrySource,
@@ -154,6 +159,7 @@ impl OzonMcp {
     pub fn new(client: OzonClient, actor_id: String, registry: RegistrySource) -> Self {
         Self {
             client,
+            wb_client: WbClient::empty(Duration::from_secs(30)),
             default_actor_id: Some(actor_id),
             authenticator: None,
             registry,
@@ -171,6 +177,7 @@ impl OzonMcp {
         let tool_router = Self::default_tool_router(Some(&authenticator));
         Self {
             client,
+            wb_client: WbClient::empty(Duration::from_secs(30)),
             default_actor_id: None,
             authenticator: Some(authenticator),
             registry,
@@ -178,6 +185,11 @@ impl OzonMcp {
             finance_accruals_preview: false,
             tool_router,
         }
+    }
+
+    pub fn with_wildberries_client(mut self, wb_client: WbClient) -> Self {
+        self.wb_client = wb_client;
+        self
     }
 
     pub fn protected_resource_metadata(&self) -> Option<ProtectedResourceMetadata> {
@@ -273,6 +285,49 @@ impl OzonMcp {
                 "{STORE_REQUIRED}: доступно несколько магазинов Ozon; явно передайте поле store из ozon_stores_status или marketplace_accounts."
             )),
         }
+    }
+
+    fn resolve_wb_account(
+        &self,
+        identity: &RequestIdentity,
+        selector: Option<&str>,
+    ) -> Result<String, String> {
+        let (registry, actor) = self.access_context(identity)?;
+        if let Some(selector) = selector {
+            validate_non_blank("account", selector)?;
+            validate_max_chars("account", selector, MAX_STORE_SELECTOR_CHARS)?;
+            let account = registry
+                .accounts
+                .iter()
+                .find(|account| account.id == selector && account.wildberries.is_some())
+                .ok_or_else(|| {
+                    "UNKNOWN_WB_ACCOUNT: выбранный кабинет Wildberries не зарегистрирован. Получите допустимый account через wb_stores_status или marketplace_accounts.".to_owned()
+                })?;
+            if !actor.can_access_account(account) {
+                return Err(format!(
+                    "{ACCESS_DENIED}: текущий пользователь не имеет доступа к выбранному кабинету Wildberries."
+                ));
+            }
+            return Ok(account.id.clone());
+        }
+
+        let mut accessible = registry
+            .accounts
+            .iter()
+            .filter(|account| account.wildberries.is_some() && actor.can_access_account(account));
+        match (accessible.next(), accessible.next()) {
+            (None, _) => Err("NO_ACCESSIBLE_WB_ACCOUNT: у текущего пользователя нет доступных кабинетов Wildberries.".to_owned()),
+            (Some(account), None) => Ok(account.id.clone()),
+            (Some(_), Some(_)) => Err("WB_ACCOUNT_REQUIRED: доступно несколько кабинетов Wildberries; явно передайте поле account из wb_stores_status.".to_owned()),
+        }
+    }
+
+    fn wb_error(&self, account: &str, endpoint: &str, error: crate::wb::WbError) -> String {
+        let kind = error.kind().code();
+        let request_id = error.request_id().unwrap_or("-");
+        format!(
+            "{WB_TOOL_FAILURE}: kind={kind}; account={account}; endpoint={endpoint}; request_id={request_id}; message={error}. Остановите текущую операцию и не вызывайте автоматически другие WB-инструменты или кабинеты."
+        )
     }
 
     fn actor_status(actor: &Actor) -> ActorStatus {
@@ -607,9 +662,84 @@ pub struct AccountStatus {
     pub configured: bool,
 }
 
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WbResult {
+    pub account_id: String,
+    pub endpoint: &'static str,
+    pub fetched_at: String,
+    pub data: Value,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WbStoresResult {
+    pub actor: ActorStatus,
+    pub default_account: Option<String>,
+    pub access_mode: &'static str,
+    pub accounts: Vec<WbStoreStatus>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WbStoreStatus {
+    pub account_id: String,
+    pub organization: String,
+    pub seller_client_id: String,
+    pub manager: String,
+    pub configured: bool,
+    pub api_token_env: String,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EmptyInput {}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbAccountInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbSalesFunnelInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(
+        description = "Начало периода в формате YYYY-MM-DD",
+        length(equal = 10)
+    )]
+    pub date_from: String,
+    #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
+    pub date_to: String,
+    #[serde(default)]
+    #[schemars(length(max = 1_000))]
+    pub nm_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(length(max = 100), inner(length(min = 1, max = 128)))]
+    pub brand_names: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000))]
+    pub subject_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000))]
+    pub tag_ids: Vec<u64>,
+    #[serde(default)]
+    pub skip_deleted_nm: bool,
+    #[serde(default = "default_product_limit")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub limit: u32,
+    #[serde(default)]
+    #[schemars(range(max = 1_000_000))]
+    pub offset: u32,
+}
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
@@ -1148,7 +1278,125 @@ impl OzonMcp {
         }))
     }
 
-    /// Показывает доступные текущему пользователю кабинеты Ozon и реестр кабинетов Wildberries. WB пока зарегистрированы только в справочнике и не подключены к API.
+    /// Показывает доступные кабинеты Wildberries и наличие токенов, не раскрывая секреты и не выполняя сетевые запросы.
+    #[tool(
+        name = "wb_stores_status",
+        annotations(title = "Статус кабинетов Wildberries", read_only_hint = true)
+    )]
+    async fn wb_stores_status(
+        &self,
+        identity: RequestIdentity,
+        Parameters(_input): Parameters<EmptyInput>,
+    ) -> Result<Json<WbStoresResult>, String> {
+        let (registry, actor) = self.access_context(&identity)?;
+        let accessible_accounts: Vec<_> = registry
+            .accounts
+            .iter()
+            .filter(|account| account.wildberries.is_some() && actor.can_access_account(account))
+            .collect();
+        Ok(Json(WbStoresResult {
+            actor: Self::actor_status(&actor),
+            default_account: (accessible_accounts.len() == 1)
+                .then(|| accessible_accounts[0].id.clone()),
+            access_mode: "server-side RBAC, explicit read-only WB methods",
+            accounts: accessible_accounts
+                .into_iter()
+                .map(|account| {
+                    let wildberries = account
+                        .wildberries
+                        .as_ref()
+                        .expect("filtered Wildberries account");
+                    let manager = registry
+                        .actor(&account.manager_id)
+                        .expect("validated manager");
+                    WbStoreStatus {
+                        account_id: account.id.clone(),
+                        organization: account.organization.clone(),
+                        seller_client_id: account.seller_client_id.clone(),
+                        manager: manager.name.clone(),
+                        configured: self.wb_client.is_configured(&account.id),
+                        api_token_env: wildberries.api_token_env.clone(),
+                    }
+                })
+                .collect(),
+        }))
+    }
+
+    /// Проверяет авторизацию выбранного кабинета через официальный read-only WB /ping.
+    #[tool(
+        name = "wb_ping",
+        annotations(title = "Проверка подключения Wildberries", read_only_hint = true)
+    )]
+    async fn wb_ping(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbAccountInput>,
+    ) -> Result<Json<WbResult>, String> {
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "common:/ping";
+        let data = self
+            .wb_client
+            .ping(&account)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Json(WbResult {
+            account_id: account,
+            endpoint,
+            fetched_at: Utc::now().to_rfc3339(),
+            data,
+        }))
+    }
+
+    /// Получает read-only воронку продаж Wildberries по карточкам за выбранный период.
+    #[tool(
+        name = "wb_sales_funnel",
+        annotations(title = "Воронка продаж Wildberries", read_only_hint = true)
+    )]
+    async fn wb_sales_funnel(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbSalesFunnelInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_date_range(&input.date_from, &input.date_to, 366)?;
+        validate_count("nm_ids", input.nm_ids.len(), 0, MAX_PRODUCT_FILTER_ITEMS)?;
+        validate_string_list("brand_names", &input.brand_names, 100, MAX_ENUM_VALUE_CHARS)?;
+        validate_count(
+            "subject_ids",
+            input.subject_ids.len(),
+            0,
+            MAX_PRODUCT_FILTER_ITEMS,
+        )?;
+        validate_count("tag_ids", input.tag_ids.len(), 0, MAX_PRODUCT_FILTER_ITEMS)?;
+        validate_limit(input.limit, 1_000)?;
+        validate_max_u32("offset", input.offset, MAX_OFFSET)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "analytics:/api/analytics/v3/sales-funnel/products";
+        let data = self
+            .wb_client
+            .sales_funnel(
+                &account,
+                json!({
+                    "selectedPeriod": { "start": input.date_from, "end": input.date_to },
+                    "nmIds": input.nm_ids,
+                    "brandNames": input.brand_names,
+                    "subjectIds": input.subject_ids,
+                    "tagIds": input.tag_ids,
+                    "skipDeletedNm": input.skip_deleted_nm,
+                    "limit": input.limit,
+                    "offset": input.offset,
+                }),
+            )
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Json(WbResult {
+            account_id: account,
+            endpoint,
+            fetched_at: Utc::now().to_rfc3339(),
+            data,
+        }))
+    }
+
+    /// Показывает доступные текущему пользователю кабинеты Ozon и Wildberries и состояние их read-only интеграций.
     #[tool(
         name = "marketplace_accounts",
         annotations(title = "Доступные кабинеты маркетплейсов", read_only_hint = true)
@@ -1166,12 +1414,18 @@ impl OzonMcp {
                 .iter()
                 .filter(|account| actor.can_access_account(account))
                 .map(|account| {
-                    let (integration_status, configured) = match &account.ozon {
-                        Some(ozon) => (
+                    let (integration_status, configured) = if let Some(ozon) = &account.ozon {
+                        (
                             "read_only_ozon_api",
                             self.client.is_configured(&ozon.store_id),
-                        ),
-                        None => ("directory_only", false),
+                        )
+                    } else if account.wildberries.is_some() {
+                        (
+                            "read_only_wildberries_api",
+                            self.wb_client.is_configured(&account.id),
+                        )
+                    } else {
+                        ("directory_only", false)
                     };
                     let manager = registry
                         .actor(&account.manager_id)
@@ -1745,22 +1999,22 @@ impl ServerHandler for OzonMcp {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("mcp-ozon", env!("CARGO_PKG_VERSION"))
-                    .with_title("Ozon Seller Analytics"),
+                    .with_title("Ozon and Wildberries Seller Analytics"),
             )
             .with_instructions(
-                "Read-only MCP для аналитики магазинов Ozon. Все инструменты только получают данные. \
-                 Сервер не изменяет товары, цены, остатки, заказы, отзывы, вопросы или рекламу. \
+                "Read-only MCP для аналитики кабинетов Ozon и Wildberries. Все инструменты только получают данные. \
+                 Сервер не изменяет товары, цены, остатки, заказы, отзывы, вопросы, рекламу или настройки кабинетов. \
                  Доступ к магазинам проверяется сервером по подтверждённой идентичности: JWT/OIDC \
                  в защищённом режиме или MCP_ACTOR_ID в локальном dev-режиме. Менеджер видит только \
                  закреплённый кабинет, администратор — все кабинеты. Не запрашивайте роль или имя \
                  пользователя через аргументы инструмента и не пытайтесь обходить ACCESS_DENIED. \
                  Вызывайте инструменты только когда OzonOFK доступен в текущем чате и пользователь \
                  явно разрешил текущий вызов согласно настройкам ChatGPT. Никогда не заявляйте о \
-                 прямом доступе к Ozon без успешного результата инструмента OzonOFK. Если доступ \
+                 прямом доступе к маркетплейсу без успешного результата инструмента OzonOFK. Если доступ \
                  отклонён, коннектор недоступен или любой инструмент завершился ошибкой, остановитесь: \
-                 не вызывайте автоматически другой инструмент или магазин Ozon и дождитесь нового \
-                 явного запроса пользователя. ozon_stores_status показывает только локальную \
-                 конфигурацию и не подтверждает доступность Ozon API.",
+                 не вызывайте автоматически другой инструмент или кабинет и дождитесь нового \
+                 явного запроса пользователя. ozon_stores_status и wb_stores_status показывают только локальную \
+                 конфигурацию и не подтверждают доступность внешнего API.",
             )
     }
 }
@@ -1863,7 +2117,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::JwtConfig;
+    use crate::config::{JwtConfig, MarketplaceAccount};
     use crate::test_support::mock_http;
     use axum::Extension;
     use rmcp::transport::{
@@ -1888,7 +2142,7 @@ mod tests {
           "accounts": [
             {"id":"store_a","organization":"Example organization A","marketplace":"ozon","seller_client_id":"client-a","manager_id":"admin","ozon":{"store_id":"store_a","client_id_env":"OZON_CLIENT_ID","api_key_env":"OZON_API_KEY"}},
             {"id":"account_b","organization":"Example organization B","marketplace":"ozon","seller_client_id":"client-b","manager_id":"manager","ozon":{"store_id":"store_b","client_id_env":"EVRO_ID","api_key_env":"EVRO_KEY"}},
-            {"id":"account_wb","organization":"WB directory","marketplace":"wildberries","seller_client_id":"42","manager_id":"admin"}
+            {"id":"account_wb","organization":"WB account","marketplace":"wildberries","seller_client_id":"42","manager_id":"admin","wildberries":{"api_token_env":"WB_TOKEN"}}
           ]
         }"#).unwrap();
         RegistrySource::new(path).unwrap()
@@ -1954,6 +2208,44 @@ mod tests {
         )
     }
 
+    fn mock_wb_server_for(
+        actor: &str,
+        expected_requests: usize,
+    ) -> (OzonMcp, mpsc::Receiver<String>) {
+        let responses =
+            vec![(200, r#"{"data":{"products":[]},"Status":"OK"}"#.to_owned()); expected_requests];
+        mock_wb_server_with_responses(actor, responses)
+    }
+
+    fn mock_wb_server_with_responses(
+        actor: &str,
+        responses: Vec<(u16, String)>,
+    ) -> (OzonMcp, mpsc::Receiver<String>) {
+        let (base_url, receiver) = mock_http(responses);
+        let wb_client = WbClient::new_for_test(
+            Duration::from_secs(3),
+            BTreeMap::from([(
+                "account_wb".to_owned(),
+                crate::wb::WbCredentials {
+                    token: "test-wb-token".to_owned(),
+                },
+            )]),
+            &base_url,
+            &base_url,
+        );
+        let ozon_client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        (
+            OzonMcp::new(ozon_client, actor.to_owned(), registry_source())
+                .with_wildberries_client(wb_client),
+            receiver,
+        )
+    }
+
     fn selector_registry_source() -> RegistrySource {
         let sequence = REGISTRY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
@@ -1973,7 +2265,7 @@ mod tests {
             {"id":"account_a","organization":"Example organization A","marketplace":"ozon","seller_client_id":"client-a","manager_id":"manager_a","ozon":{"store_id":"store_a","client_id_env":"OZON_CLIENT_ID","api_key_env":"OZON_API_KEY"}},
             {"id":"account_b","organization":"Example organization B","marketplace":"ozon","seller_client_id":"client-b","manager_id":"manager_b","ozon":{"store_id":"store_b","client_id_env":"OFK_K_ID","api_key_env":"OFK_K_KEY"}},
             {"id":"account_c","organization":"Example organization C","marketplace":"ozon","seller_client_id":"client-c","manager_id":"manager_c","ozon":{"store_id":"store_c","client_id_env":"MEGA_ID","api_key_env":"MEGA_KEY"}},
-            {"id":"wb_directory","organization":"WB","marketplace":"wildberries","seller_client_id":"1","manager_id":"manager_wb"}
+            {"id":"wb_directory","organization":"WB","marketplace":"wildberries","seller_client_id":"1","manager_id":"manager_wb","wildberries":{"api_token_env":"WB_TOKEN"}}
           ]
         }"#).unwrap();
         RegistrySource::new(path).unwrap()
@@ -2081,6 +2373,203 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn wb_tools_apply_rbac_and_send_only_exact_read_only_contracts() {
+        fn result_text(body: &str) -> Value {
+            let envelope: Value = serde_json::from_str(body).unwrap();
+            let text = envelope
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .expect("tool result must contain text");
+            serde_json::from_str(text).unwrap()
+        }
+
+        let (server, requests) = mock_wb_server_for("admin", 2);
+        let status = call_tool_over_http(server.clone(), "wb_stores_status", json!({})).await;
+        let status = result_text(&status);
+        assert_eq!(status["default_account"], json!("account_wb"));
+        assert_eq!(status["accounts"][0]["configured"], json!(true));
+        assert!(status.to_string().find("test-wb-token").is_none());
+
+        let ping = call_tool_over_http(server.clone(), "wb_ping", json!({})).await;
+        assert_eq!(result_text(&ping)["account_id"], json!("account_wb"));
+
+        let funnel = call_tool_over_http(
+            server,
+            "wb_sales_funnel",
+            json!({
+                "account": "account_wb",
+                "date_from": "2026-08-01",
+                "date_to": "2026-08-08",
+                "nm_ids": [],
+                "brand_names": [],
+                "subject_ids": [],
+                "tag_ids": [],
+                "skip_deleted_nm": false,
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+        assert_eq!(
+            result_text(&funnel)["endpoint"],
+            json!("analytics:/api/analytics/v3/sales-funnel/products")
+        );
+
+        let ping_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(ping_request.starts_with("GET /ping HTTP/1.1\r\n"));
+        assert!(
+            ping_request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-wb-token")
+        );
+        let funnel_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (path, body) = request_path_and_body(&funnel_request);
+        assert_eq!(path, "/api/analytics/v3/sales-funnel/products");
+        assert_eq!(
+            body,
+            json!({
+                "selectedPeriod": {"start": "2026-08-01", "end": "2026-08-08"},
+                "nmIds": [],
+                "brandNames": [],
+                "subjectIds": [],
+                "tagIds": [],
+                "skipDeletedNm": false,
+                "limit": 10,
+                "offset": 0
+            })
+        );
+        assert!(requests.try_recv().is_err());
+
+        let (manager, denied_requests) = mock_wb_server_for("manager", 0);
+        let denied =
+            call_tool_over_http(manager, "wb_ping", json!({"account": "account_wb"})).await;
+        assert!(denied.contains(ACCESS_DENIED));
+        assert!(denied_requests.try_recv().is_err());
+
+        let (admin, unknown_requests) = mock_wb_server_for("admin", 0);
+        let unknown = call_tool_over_http(admin, "wb_ping", json!({"account": "unknown-wb"})).await;
+        assert!(unknown.contains("UNKNOWN_WB_ACCOUNT"));
+        assert!(unknown_requests.try_recv().is_err());
+
+        let (errors, error_requests) = mock_wb_server_with_responses(
+            "admin",
+            vec![(401, "{}".to_owned()), (403, "{}".to_owned())],
+        );
+        let ping_error = call_tool_over_http(errors.clone(), "wb_ping", json!({})).await;
+        assert!(ping_error.contains(WB_TOOL_FAILURE));
+        assert!(ping_error.contains("kind=unauthorized"));
+        let funnel_error = call_tool_over_http(
+            errors,
+            "wb_sales_funnel",
+            json!({
+                "date_from": "2026-08-01",
+                "date_to": "2026-08-08",
+                "limit": 10,
+                "offset": 0
+            }),
+        )
+        .await;
+        assert!(funnel_error.contains(WB_TOOL_FAILURE));
+        assert!(funnel_error.contains("kind=forbidden"));
+        error_requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        error_requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(error_requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn wb_resolution_directory_and_error_paths_fail_closed_before_network() {
+        let no_wb = manager_server("manager");
+        assert!(
+            no_wb
+                .resolve_wb_account(&RequestIdentity::dev(), None)
+                .unwrap_err()
+                .starts_with("NO_ACCESSIBLE_WB_ACCOUNT")
+        );
+
+        let source = registry_source();
+        let mut registry = source.load().unwrap();
+        let mut second_wb = registry
+            .accounts
+            .iter()
+            .find(|account| account.id == "account_wb")
+            .unwrap()
+            .clone();
+        second_wb.id = "account_wb_2".to_owned();
+        second_wb.seller_client_id = "43".to_owned();
+        second_wb.wildberries.as_mut().unwrap().api_token_env = "WB_TOKEN_2".to_owned();
+        registry.accounts.push(second_wb);
+        registry.accounts.push(MarketplaceAccount {
+            id: "wb_directory".to_owned(),
+            organization: "WB directory entry".to_owned(),
+            marketplace: Marketplace::Wildberries,
+            seller_client_id: "44".to_owned(),
+            manager_id: "admin".to_owned(),
+            ozon: None,
+            wildberries: None,
+        });
+        let path = source.path().to_path_buf();
+        fs::write(&path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        let source = RegistrySource::new(path).unwrap();
+
+        let server = OzonMcp::new(
+            OzonClient::new(
+                "http://127.0.0.1:1".to_owned(),
+                Duration::from_secs(1),
+                BTreeMap::new(),
+            )
+            .unwrap(),
+            "admin".to_owned(),
+            source,
+        );
+        assert!(
+            server
+                .resolve_wb_account(&RequestIdentity::dev(), None)
+                .unwrap_err()
+                .starts_with("WB_ACCOUNT_REQUIRED")
+        );
+        let accounts = server
+            .marketplace_accounts(RequestIdentity::dev(), Parameters(EmptyInput::default()))
+            .await
+            .unwrap()
+            .0;
+        assert!(accounts.accounts.iter().any(|account| {
+            account.id == "wb_directory"
+                && account.integration_status == "directory_only"
+                && !account.configured
+        }));
+
+        let error = server.wb_error(
+            "account_wb",
+            "common:/ping",
+            crate::wb::WbError::Forbidden {
+                request_id: Some("safe-id".to_owned()),
+            },
+        );
+        assert!(error.contains(WB_TOOL_FAILURE));
+        assert!(error.contains("kind=forbidden"));
+        assert!(error.contains("request_id=safe-id"));
+
+        let oversized_subjects = WbSalesFunnelInput {
+            account: Some("account_wb".to_owned()),
+            date_from: "2026-08-01".to_owned(),
+            date_to: "2026-08-08".to_owned(),
+            nm_ids: Vec::new(),
+            brand_names: Vec::new(),
+            subject_ids: vec![1; MAX_PRODUCT_FILTER_ITEMS + 1],
+            tag_ids: Vec::new(),
+            skip_deleted_nm: false,
+            limit: 10,
+            offset: 0,
+        };
+        let error = server
+            .wb_sales_funnel(RequestIdentity::dev(), Parameters(oversized_subjects))
+            .await
+            .err()
+            .expect("oversized WB subject filter must be rejected");
+        assert!(error.contains("subject_ids"));
+    }
+
     #[test]
     fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
         fn assert_policy(tools: Vec<rmcp::model::Tool>, expected: &Value) {
@@ -2103,7 +2592,7 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
-        assert_eq!(dev_tools.len(), 17);
+        assert_eq!(dev_tools.len(), 20);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -2114,7 +2603,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 17);
+        assert_eq!(jwt_tools.len(), 20);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -2126,7 +2615,7 @@ mod tests {
             .with_preview_features(false, true)
             .tool_router
             .list_all();
-        assert_eq!(preview_tools.len(), 20);
+        assert_eq!(preview_tools.len(), 23);
         assert_policy(
             preview_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -2139,6 +2628,9 @@ mod tests {
             "ozon_stores_status",
             "marketplace_accounts",
             "list_members",
+            "wb_stores_status",
+            "wb_ping",
+            "wb_sales_funnel",
             "ozon_analytics",
             "ozon_product_stocks",
             "ozon_product_prices",
@@ -2169,7 +2661,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         let default_names = names(&server());
-        assert_eq!(default_names.len(), 17);
+        assert_eq!(default_names.len(), 20);
         assert!(preview_names.is_disjoint(&default_names));
         for name in STABLE_TOOL_NAMES {
             assert!(
@@ -2184,7 +2676,7 @@ mod tests {
         assert!(preview_names.is_disjoint(&names(&authenticated)));
 
         let enabled_names = names(&server().with_preview_features(false, true));
-        assert_eq!(enabled_names.len(), 20);
+        assert_eq!(enabled_names.len(), 23);
         assert!(preview_names.is_subset(&enabled_names));
         assert_eq!(
             enabled_names
@@ -2699,7 +3191,10 @@ mod tests {
             "read_only_ozon_api"
         );
         assert!(accounts.accounts[0].configured);
-        assert_eq!(accounts.accounts[2].integration_status, "directory_only");
+        assert_eq!(
+            accounts.accounts[2].integration_status,
+            "read_only_wildberries_api"
+        );
         assert!(!accounts.accounts[2].configured);
 
         let members = server

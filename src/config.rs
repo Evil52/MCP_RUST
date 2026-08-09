@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::wb::WbCredentials;
+
 pub const DEFAULT_OZON_API_BASE_URL: &str = "https://api-seller.ozon.ru";
 pub const DEFAULT_ACCESS_CONFIG_PATH: &str = "config/access.json";
 pub const DEFAULT_JWT_REQUIRED_SCOPES: &str = "mcp:tools";
@@ -130,6 +132,8 @@ pub struct MarketplaceAccount {
     pub manager_id: String,
     #[serde(default)]
     pub ozon: Option<OzonAccount>,
+    #[serde(default)]
+    pub wildberries: Option<WildberriesAccount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +142,12 @@ pub struct OzonAccount {
     pub store_id: StoreId,
     pub client_id_env: String,
     pub api_key_env: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WildberriesAccount {
+    pub api_token_env: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,8 +223,17 @@ impl AccessRegistry {
                 account.manager_id
             );
         }
+        if account.ozon.is_some() && account.wildberries.is_some() {
+            bail!(
+                "кабинет {} не может одновременно содержать Ozon и Wildberries credentials",
+                account.id
+            );
+        }
         if let Some(ozon) = &account.ozon {
             Self::validate_ozon_account(account, ozon, store_ids, selectors)?;
+        }
+        if let Some(wildberries) = &account.wildberries {
+            Self::validate_wildberries_account(account, wildberries)?;
         }
         Ok(())
     }
@@ -250,6 +269,25 @@ impl AccessRegistry {
                 "selector магазина {:?} неоднозначен между кабинетами {} и {}",
                 ozon.store_id.0,
                 owner,
+                account.id
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_wildberries_account(
+        account: &MarketplaceAccount,
+        wildberries: &WildberriesAccount,
+    ) -> Result<()> {
+        if account.marketplace != Marketplace::Wildberries {
+            bail!(
+                "Wildberries-настройки допустимы только для WB-кабинета {}",
+                account.id
+            );
+        }
+        if wildberries.api_token_env.trim().is_empty() {
+            bail!(
+                "Wildberries-настройки кабинета {} не могут быть пустыми",
                 account.id
             );
         }
@@ -367,6 +405,29 @@ struct OzonCredentialBinding {
     api_key_env: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct WbCredentialBinding {
+    account_id: String,
+    seller_client_id: String,
+    api_token_env: String,
+}
+
+impl WbCredentialBinding {
+    fn snapshot(registry: &AccessRegistry) -> BTreeSet<Self> {
+        registry
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                account.wildberries.as_ref().map(|wildberries| Self {
+                    account_id: account.id.clone(),
+                    seller_client_id: account.seller_client_id.clone(),
+                    api_token_env: wildberries.api_token_env.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
 impl OzonCredentialBinding {
     fn snapshot(registry: &AccessRegistry) -> BTreeSet<Self> {
         registry
@@ -389,6 +450,7 @@ impl OzonCredentialBinding {
 pub struct RegistrySource {
     path: Arc<PathBuf>,
     credential_bindings: Arc<BTreeSet<OzonCredentialBinding>>,
+    wb_credential_bindings: Arc<BTreeSet<WbCredentialBinding>>,
 }
 
 impl RegistrySource {
@@ -398,6 +460,7 @@ impl RegistrySource {
         let source = Self {
             path,
             credential_bindings: Arc::new(OzonCredentialBinding::snapshot(&registry)),
+            wb_credential_bindings: Arc::new(WbCredentialBinding::snapshot(&registry)),
         };
         Ok(source)
     }
@@ -407,6 +470,11 @@ impl RegistrySource {
         if OzonCredentialBinding::snapshot(&registry) != *self.credential_bindings {
             bail!(
                 "MCP_ACCESS_CONFIG_RESTART_REQUIRED: привязки Ozon credentials изменились; перезапустите MCP, чтобы атомарно перечитать реестр и ключи"
+            );
+        }
+        if WbCredentialBinding::snapshot(&registry) != *self.wb_credential_bindings {
+            bail!(
+                "MCP_ACCESS_CONFIG_RESTART_REQUIRED: привязки Wildberries credentials изменились; перезапустите MCP, чтобы атомарно перечитать реестр и ключи"
             );
         }
         Ok(registry)
@@ -460,6 +528,7 @@ pub struct AppConfig {
     pub ozon_postings_vnext: bool,
     pub ozon_finance_accruals_preview: bool,
     pub stores: BTreeMap<StoreId, StoreCredentials>,
+    pub wildberries_accounts: BTreeMap<String, WbCredentials>,
     pub auth: AuthConfig,
     pub registry: RegistrySource,
 }
@@ -660,6 +729,17 @@ impl AppConfig {
                 })
             })
             .collect();
+        let wildberries_accounts = snapshot
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                account.wildberries.as_ref().and_then(|wildberries| {
+                    let token = lookup(&wildberries.api_token_env).unwrap_or_default();
+                    (!token.trim().is_empty())
+                        .then(|| (account.id.clone(), WbCredentials { token }))
+                })
+            })
+            .collect();
         Ok(Self {
             bind,
             transport,
@@ -668,6 +748,7 @@ impl AppConfig {
             ozon_postings_vnext,
             ozon_finance_accruals_preview,
             stores,
+            wildberries_accounts,
             auth,
             registry,
         })
@@ -726,6 +807,7 @@ mod tests {
                     client_id_env: "SHOP_ID".into(),
                     api_key_env: "SHOP_KEY".into(),
                 }),
+                wildberries: None,
             }],
         }
     }
@@ -851,6 +933,7 @@ mod tests {
                 client_id_env: "OTHER_ID".into(),
                 api_key_env: "OTHER_KEY".into(),
             }),
+            wildberries: None,
         });
         assert!(registry.validate().is_err());
 
@@ -863,10 +946,75 @@ mod tests {
             seller_client_id: "789".into(),
             manager_id: "manager".into(),
             ozon: None,
+            wildberries: None,
         });
         let error = registry.validate().unwrap_err().to_string();
         assert!(error.contains("selector магазина"), "{error}");
         assert!(error.contains("неоднозначен"), "{error}");
+    }
+
+    #[test]
+    fn registry_validates_wildberries_bindings_and_loads_only_present_tokens() {
+        let wb_account = MarketplaceAccount {
+            id: "wb_shop".into(),
+            organization: "WB Shop".into(),
+            marketplace: Marketplace::Wildberries,
+            seller_client_id: "42".into(),
+            manager_id: "manager".into(),
+            ozon: None,
+            wildberries: Some(WildberriesAccount {
+                api_token_env: "WB_TOKEN".into(),
+            }),
+        };
+        let mut registry = sample_registry();
+        registry.accounts.push(wb_account.clone());
+        registry.validate().unwrap();
+        let path = write_registry(&registry);
+        let values = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("WB_TOKEN", "test-wb-token"),
+        ]);
+        let config =
+            AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned())).unwrap();
+        assert!(config.wildberries_accounts.contains_key("wb_shop"));
+        assert_eq!(
+            format!("{:?}", config.wildberries_accounts["wb_shop"]),
+            "WbCredentials { token: \"<redacted>\" }"
+        );
+
+        let mut wrong_marketplace = sample_registry();
+        let mut invalid = wb_account.clone();
+        invalid.marketplace = Marketplace::Ozon;
+        wrong_marketplace.accounts.push(invalid);
+        assert!(wrong_marketplace.validate().is_err());
+
+        let mut blank_binding = sample_registry();
+        let mut invalid = wb_account.clone();
+        invalid.wildberries.as_mut().unwrap().api_token_env = " ".into();
+        blank_binding.accounts.push(invalid);
+        assert!(blank_binding.validate().is_err());
+
+        let mut mixed = sample_registry();
+        let mut invalid = wb_account;
+        invalid.ozon = mixed.accounts[0].ozon.clone();
+        mixed.accounts.push(invalid);
+        assert!(mixed.validate().is_err());
+
+        let source = RegistrySource::new(&path).unwrap();
+        registry.accounts[1]
+            .wildberries
+            .as_mut()
+            .unwrap()
+            .api_token_env = "WB_TOKEN_ROTATED".into();
+        std::fs::write(&path, serde_json::to_vec(&registry).unwrap()).unwrap();
+        assert!(
+            source
+                .load()
+                .unwrap_err()
+                .to_string()
+                .contains("Wildberries credentials")
+        );
     }
 
     #[test]
