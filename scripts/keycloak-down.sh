@@ -23,7 +23,7 @@ if [[ -f "$state_file" && ! -L "$state_file" ]]; then
       ;;
   esac
   runtime_dir="$(dirname "$runtime_registry")"
-  export MCP_AUTH_CONFIG_DIR="$runtime_dir"
+  export MCP_AUTH_CONFIG_FILE="$runtime_registry"
 elif [[ -e "$state_file" ]]; then
   echo "Keycloak runtime state must be a regular file, not a symlink" >&2
   exit 1

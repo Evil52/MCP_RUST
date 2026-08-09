@@ -168,6 +168,9 @@ jobs:
       - name: Verify Keycloak to MCP authentication
         run: ./scripts/keycloak-smoke.sh
 
+      - name: Verify Authorization Code with PKCE S256
+        run: ./scripts/keycloak-pkce-smoke.sh
+
       - name: Print diagnostics on failure
         if: failure()
         run: |
@@ -177,11 +180,15 @@ jobs:
 
       - name: Stop Keycloak test stack
         if: always()
-        run: >-
-          docker compose
-          --env-file .keycloak.env
-          -f compose.auth.yaml
-          down --volumes --remove-orphans
+        run: |
+          if [[ -f .keycloak.env ]]; then
+            ./scripts/keycloak-down.sh || true
+            docker compose \
+              --env-file .keycloak.env \
+              -f compose.auth.yaml \
+              down --volumes --remove-orphans || true
+          fi
+          rm -f .env .keycloak.env config/access.json
 
   container:
     name: Hardened container

@@ -40,7 +40,9 @@ files=(
   scripts/canary-up.sh
   scripts/install-local-runtime-agent.sh
   scripts/keycloak-down.sh
+  scripts/keycloak-env.sh
   scripts/keycloak-init.sh
+  scripts/keycloak-pkce-smoke.sh
   scripts/keycloak-smoke.sh
   scripts/keycloak-sync-config.sh
   scripts/keycloak-up.sh

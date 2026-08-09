@@ -12,6 +12,8 @@ metadata_url="http://127.0.0.1:8788/.well-known/oauth-protected-resource"
 resource_metadata_url="http://localhost:8788/.well-known/oauth-protected-resource"
 required_scope="mcp:tools"
 kcadm_config="/tmp/mcp-ozon-kcadm.config"
+actor_id="keycloak_e2e_manager"
+username="keycloak-e2e-manager"
 
 for dependency in curl docker jq; do
   if ! command -v "$dependency" >/dev/null 2>&1; then
@@ -20,17 +22,10 @@ for dependency in curl docker jq; do
   fi
 done
 
-admin_identity="$(
-  jq -ec \
-    '[.actors[] | select(.role == "admin" and .oidc.username != null)]
-     | if length == 1
-       then {actor_id: .[0].id, username: .[0].oidc.username}
-       else error("expected exactly one admin with oidc.username")
-       end' \
-    "$project_dir/config/access.json"
-)"
-actor_id="$(jq -er '.actor_id' <<<"$admin_identity")"
-username="$(jq -er '.username' <<<"$admin_identity")"
+safe_curl() {
+  command curl --disable --noproxy '*' "$@"
+}
+
 for identity_value in "$actor_id" "$username"; do
   if [[ ! "$identity_value" =~ ^[A-Za-z0-9._@-]{1,128}$ ]]; then
     echo "Admin actor id and OIDC username must use safe identifier characters" >&2
@@ -43,10 +38,10 @@ if [[ -L "$env_file" || ! -f "$env_file" || ! -r "$env_file" ]]; then
   exit 1
 fi
 
-set -a
-# shellcheck disable=SC1090
-source "$env_file"
-set +a
+# shellcheck source=scripts/keycloak-env.sh
+source "$project_dir/scripts/keycloak-env.sh"
+keycloak_load_env_file "$env_file"
+export -n KEYCLOAK_DB_PASSWORD KEYCLOAK_ADMIN_PASSWORD KEYCLOAK_TEST_USER_PASSWORD
 
 for required_name in \
   KEYCLOAK_ADMIN_USER \
@@ -67,17 +62,42 @@ compose=(
 
 smoke_dir="$(mktemp -d "${TMPDIR:-/tmp}/mcp-ozon-keycloak-smoke.XXXXXX")"
 chmod 700 "$smoke_dir"
+owns_test_user=false
+user_id=""
 
 cleanup() {
+  delete_test_user >/dev/null 2>&1 || true
   "${compose[@]}" exec -T keycloak rm -f "$kcadm_config" >/dev/null 2>&1 || true
   rm -rf "$smoke_dir"
 }
 trap cleanup EXIT
 
+delete_test_user() {
+  local remaining_users
+  if [[ "$owns_test_user" != "true" || -z "$user_id" ]]; then
+    return
+  fi
+  "${compose[@]}" exec -T keycloak \
+    /opt/keycloak/bin/kcadm.sh delete "users/$user_id" \
+    --config "$kcadm_config" \
+    --target-realm ofk >/dev/null
+  remaining_users="$("${compose[@]}" exec -T keycloak \
+    /opt/keycloak/bin/kcadm.sh get users \
+    --config "$kcadm_config" \
+    --target-realm ofk \
+    --query "username=$username" \
+    --fields id,username)"
+  jq -e --arg username "$username" \
+    '[.[] | select(.username == $username)] | length == 0' \
+    <<<"$remaining_users" >/dev/null
+  owns_test_user=false
+  user_id=""
+}
+
 for _attempt in $(seq 1 90); do
-  if curl --fail --silent --show-error \
+  if safe_curl --fail --silent --show-error \
     "$keycloak_url/realms/ofk/.well-known/openid-configuration" >/dev/null 2>&1 \
-    && curl --fail --silent --show-error \
+    && safe_curl --fail --silent --show-error \
       "http://127.0.0.1:8788/health" >/dev/null 2>&1
   then
     break
@@ -85,7 +105,7 @@ for _attempt in $(seq 1 90); do
   sleep 1
 done
 
-curl --fail --silent --show-error \
+safe_curl --fail --silent --show-error \
   "$keycloak_url/realms/ofk/.well-known/openid-configuration" \
   | jq -e \
     --arg issuer "$keycloak_url/realms/ofk" \
@@ -94,11 +114,14 @@ curl --fail --silent --show-error \
      and (.scopes_supported | index($scope)) != null
      and (.code_challenge_methods_supported | index("S256")) != null' >/dev/null
 
-curl --fail --silent --show-error "$metadata_url" \
+safe_curl --fail --silent --show-error "$metadata_url" \
   | jq -e \
     --arg resource "$resource_url" \
+    --arg issuer "$keycloak_url/realms/ofk" \
     --arg scope "$required_scope" \
-    '.resource == $resource and (.scopes_supported | index($scope)) != null' >/dev/null
+    '.resource == $resource
+     and .authorization_servers == [$issuer]
+     and (.scopes_supported | index($scope)) != null' >/dev/null
 
 KC_CLI_PASSWORD="$KEYCLOAK_ADMIN_PASSWORD" "${compose[@]}" exec -T \
   -e KC_CLI_PASSWORD \
@@ -107,13 +130,14 @@ KC_CLI_PASSWORD="$KEYCLOAK_ADMIN_PASSWORD" "${compose[@]}" exec -T \
   --server http://127.0.0.1:8080 \
   --realm master \
   --user "$KEYCLOAK_ADMIN_USER" >/dev/null
+"${compose[@]}" exec -T keycloak chmod 600 "$kcadm_config"
 
 user_json="$("${compose[@]}" exec -T keycloak \
   /opt/keycloak/bin/kcadm.sh get users \
   --config "$kcadm_config" \
   --target-realm ofk \
   --query "username=$username" \
-  --fields id,username)"
+  --fields id,username,email,firstName,lastName)"
 user_id="$(jq -r --arg username "$username" \
   '[.[] | select(.username == $username)]
    | if length == 1 then .[0].id else "" end' <<<"$user_json")"
@@ -121,7 +145,15 @@ user_id="$(jq -r --arg username "$username" \
 if [[ -z "$user_id" ]]; then
   user_payload="$(
     jq -cn --arg username "$username" \
-      '{username: $username, enabled: true, emailVerified: false, requiredActions: []}'
+      '{
+        username: $username,
+        firstName: "Keycloak",
+        lastName: "E2E Manager",
+        email: "keycloak-e2e-manager@localhost.invalid",
+        enabled: true,
+        emailVerified: true,
+        requiredActions: []
+      }'
   )"
   printf '%s' "$user_payload" \
     | "${compose[@]}" exec -T keycloak \
@@ -134,12 +166,29 @@ if [[ -z "$user_id" ]]; then
     --config "$kcadm_config" \
     --target-realm ofk \
     --query "username=$username" \
-    --fields id,username)"
+    --fields id,username,email,firstName,lastName)"
   user_id="$(jq -er --arg username "$username" \
     '[.[] | select(.username == $username)]
-     | if length == 1 then .[0].id else error("user provisioning failed") end' \
+     | if length == 1
+       and .[0].email == "keycloak-e2e-manager@localhost.invalid"
+       and .[0].firstName == "Keycloak"
+       and .[0].lastName == "E2E Manager"
+       then .[0].id
+       else error("reserved E2E user provisioning failed")
+       end' \
     <<<"$user_json")"
+elif ! jq -e \
+  --arg username "$username" \
+  '[.[] | select(.username == $username)]
+   | length == 1
+     and .[0].email == "keycloak-e2e-manager@localhost.invalid"
+     and .[0].firstName == "Keycloak"
+     and .[0].lastName == "E2E Manager"' \
+  <<<"$user_json" >/dev/null; then
+  echo "Reserved Keycloak E2E username has an unexpected profile; refusing to modify it" >&2
+  exit 1
 fi
+owns_test_user=true
 
 KC_CLI_PASSWORD="$KEYCLOAK_TEST_USER_PASSWORD" "${compose[@]}" exec -T \
   -e KC_CLI_PASSWORD \
@@ -154,10 +203,13 @@ KC_CLI_PASSWORD="$KEYCLOAK_TEST_USER_PASSWORD" "${compose[@]}" exec -T \
   --target-realm ofk \
   --set 'requiredActions=[]' >/dev/null
 
-token_response="$(
+token_response_file="$smoke_dir/token.response.json"
+token_status="$(
   printf '%s' "$KEYCLOAK_TEST_USER_PASSWORD" \
-    | curl --fail --silent --show-error \
+    | safe_curl --silent --show-error \
       --request POST \
+      --output "$token_response_file" \
+      --write-out '%{http_code}' \
       --data-urlencode 'grant_type=password' \
       --data-urlencode 'client_id=ozonofk-mcp' \
       --data-urlencode "scope=openid profile email $required_scope" \
@@ -165,15 +217,25 @@ token_response="$(
       --data-urlencode 'password@-' \
       "$keycloak_url/realms/ofk/protocol/openid-connect/token"
 )"
-access_token="$(jq -er '.access_token' <<<"$token_response")"
+chmod 600 "$token_response_file"
+if [[ "$token_status" != "200" ]]; then
+  token_error="$(jq -r '.error // "unknown_error"' "$token_response_file" 2>/dev/null || printf 'invalid_json')"
+  echo "Password-grant JWT smoke failed: HTTP $token_status, OAuth error=$token_error" >&2
+  exit 1
+fi
+jq --exit-status --raw-output --join-output '.access_token' \
+  "$token_response_file" >"$smoke_dir/access-token"
+chmod 600 "$smoke_dir/access-token"
 
 auth_header_file="$smoke_dir/authorization.header"
-printf 'Authorization: Bearer %s\n' "$access_token" >"$auth_header_file"
+printf 'Authorization: Bearer ' >"$auth_header_file"
+cat "$smoke_dir/access-token" >>"$auth_header_file"
+printf '\n' >>"$auth_header_file"
 chmod 600 "$auth_header_file"
 
 without_token_headers="$smoke_dir/without-token.headers"
 without_token_status="$(
-  curl --silent --output /dev/null --write-out '%{http_code}' \
+  safe_curl --silent --output /dev/null --write-out '%{http_code}' \
     --dump-header "$without_token_headers" \
     "$mcp_url"
 )"
@@ -197,10 +259,13 @@ if ! awk -v metadata="$resource_metadata_url" -v scope="$required_scope" '
   exit 1
 fi
 
-missing_scope_token_response="$(
+missing_scope_token_response="$smoke_dir/missing-scope-token.response.json"
+missing_scope_token_status="$(
   printf '%s' "$KEYCLOAK_TEST_USER_PASSWORD" \
-    | curl --fail --silent --show-error \
+    | safe_curl --silent --show-error \
       --request POST \
+      --output "$missing_scope_token_response" \
+      --write-out '%{http_code}' \
       --data-urlencode 'grant_type=password' \
       --data-urlencode 'client_id=ozonofk-mcp' \
       --data-urlencode 'scope=openid profile email' \
@@ -208,12 +273,22 @@ missing_scope_token_response="$(
       --data-urlencode 'password@-' \
       "$keycloak_url/realms/ofk/protocol/openid-connect/token"
 )"
-missing_scope_token="$(jq -er '.access_token' <<<"$missing_scope_token_response")"
+chmod 600 "$missing_scope_token_response"
+if [[ "$missing_scope_token_status" != "200" ]]; then
+  missing_scope_error="$(jq -r '.error // "unknown_error"' "$missing_scope_token_response" 2>/dev/null || printf 'invalid_json')"
+  echo "Missing-scope JWT setup failed: HTTP $missing_scope_token_status, OAuth error=$missing_scope_error" >&2
+  exit 1
+fi
+jq --exit-status --raw-output --join-output '.access_token' \
+  "$missing_scope_token_response" >"$smoke_dir/missing-scope-token"
+chmod 600 "$smoke_dir/missing-scope-token"
 missing_scope_header_file="$smoke_dir/missing-scope-authorization.header"
-printf 'Authorization: Bearer %s\n' "$missing_scope_token" >"$missing_scope_header_file"
+printf 'Authorization: Bearer ' >"$missing_scope_header_file"
+cat "$smoke_dir/missing-scope-token" >>"$missing_scope_header_file"
+printf '\n' >>"$missing_scope_header_file"
 chmod 600 "$missing_scope_header_file"
 missing_scope_status="$(
-  curl --silent --output /dev/null --write-out '%{http_code}' \
+  safe_curl --silent --output /dev/null --write-out '%{http_code}' \
     --header @"$missing_scope_header_file" \
     "$mcp_url"
 )"
@@ -227,7 +302,7 @@ request() {
   local response_file="$2"
   local headers_file="$3"
   shift 3
-  curl --fail --silent --show-error \
+  safe_curl --fail --silent --show-error \
     --request POST \
     --header @"$auth_header_file" \
     --header 'Accept: application/json, text/event-stream' \
@@ -321,8 +396,16 @@ jq -e \
   --arg actor "$actor_id" \
   '.result.isError != true
    and (.result.content[0].text | fromjson | .actor.id == $actor)
-   and (.result.content[0].text | fromjson | any(.members[]; .id == $actor and .role == "admin"))' \
+   and (.result.content[0].text | fromjson | .actor.role == "manager")
+   and (.result.content[0].text | fromjson | .members | length == 1)
+   and (.result.content[0].text | fromjson
+        | any(.members[];
+            .id == $actor
+            and .role == "manager"
+            and (.account_ids | length) == 0
+            and (.accounts | length) == 0))' \
   <<<"$members_json" >/dev/null
 
 member_count="$(jq -r '.result.content[0].text | fromjson | .members | length' <<<"$members_json")"
+delete_test_user
 echo "Keycloak JWT E2E passed: no-token=401, missing-scope=401, actor=$actor_id, visible_members=$member_count"

@@ -8,6 +8,15 @@ compose_file="$project_dir/compose.auth.yaml"
 access_config="$project_dir/config/access.json"
 state_dir="$project_dir/target/keycloak"
 state_file="$state_dir/runtime-registry"
+e2e_actor_id="keycloak_e2e_manager"
+e2e_username="keycloak-e2e-manager"
+
+for dependency in docker jq; do
+  if ! command -v "$dependency" >/dev/null 2>&1; then
+    echo "Missing dependency: $dependency" >&2
+    exit 1
+  fi
+done
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   temporary_root="/private/tmp"
@@ -62,15 +71,28 @@ else
 fi
 
 chmod 700 "$runtime_dir"
-install -m 644 "$access_config" "$runtime_registry.tmp"
+jq -e \
+  --arg actor_id "$e2e_actor_id" \
+  --arg username "$e2e_username" \
+  'if any(.actors[]; .id == $actor_id or .oidc.username == $username)
+   then error("dedicated Keycloak E2E identity collides with access registry")
+   else .actors += [{
+     id: $actor_id,
+     name: "Keycloak E2E Manager",
+     role: "manager",
+     account_ids: [],
+     oidc: {username: $username}
+   }]
+   end' \
+  "$access_config" >"$runtime_registry.tmp"
+chmod 644 "$runtime_registry.tmp"
 mv -f "$runtime_registry.tmp" "$runtime_registry"
-cmp -s "$access_config" "$runtime_registry"
-export MCP_AUTH_CONFIG_DIR="$runtime_dir"
+export MCP_AUTH_CONFIG_FILE="$runtime_registry"
 
 docker compose \
   --env-file "$env_file" \
   -f "$compose_file" \
-  up -d --build --wait --wait-timeout 180
+  up -d --build --force-recreate --wait --wait-timeout 180
 
 "$project_dir/scripts/keycloak-sync-config.sh"
 
