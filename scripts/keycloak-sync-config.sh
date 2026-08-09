@@ -18,7 +18,7 @@ for dependency in docker jq; do
   fi
 done
 
-if [[ ! -r "$env_file" ]]; then
+if [[ -L "$env_file" || ! -f "$env_file" || ! -r "$env_file" ]]; then
   echo "Missing $env_file; run ./scripts/keycloak-init.sh" >&2
   exit 1
 fi

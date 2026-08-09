@@ -5,7 +5,16 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 env_file="$project_dir/.keycloak.env"
 
+if [[ -L "$env_file" ]]; then
+  echo ".keycloak.env must be a regular file, not a symlink" >&2
+  exit 1
+fi
+
 if [[ -e "$env_file" ]]; then
+  if [[ ! -f "$env_file" ]]; then
+    echo ".keycloak.env must be a regular file" >&2
+    exit 1
+  fi
   chmod 600 "$env_file"
   if ! grep -q '^KEYCLOAK_TEST_USER_PASSWORD=' "$env_file"; then
     keycloak_test_user_secret="$(openssl rand -hex 32)"

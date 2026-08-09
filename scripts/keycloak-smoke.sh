@@ -9,8 +9,8 @@ keycloak_url="http://localhost:8180"
 mcp_url="http://127.0.0.1:8788/mcp"
 resource_url="http://localhost:8788/mcp"
 metadata_url="http://127.0.0.1:8788/.well-known/oauth-protected-resource"
+resource_metadata_url="http://localhost:8788/.well-known/oauth-protected-resource"
 required_scope="mcp:tools"
-username="admin"
 kcadm_config="/tmp/mcp-ozon-kcadm.config"
 
 for dependency in curl docker jq; do
@@ -20,7 +20,25 @@ for dependency in curl docker jq; do
   fi
 done
 
-if [[ ! -r "$env_file" ]]; then
+admin_identity="$(
+  jq -ec \
+    '[.actors[] | select(.role == "admin" and .oidc.username != null)]
+     | if length == 1
+       then {actor_id: .[0].id, username: .[0].oidc.username}
+       else error("expected exactly one admin with oidc.username")
+       end' \
+    "$project_dir/config/access.json"
+)"
+actor_id="$(jq -er '.actor_id' <<<"$admin_identity")"
+username="$(jq -er '.username' <<<"$admin_identity")"
+for identity_value in "$actor_id" "$username"; do
+  if [[ ! "$identity_value" =~ ^[A-Za-z0-9._@-]{1,128}$ ]]; then
+    echo "Admin actor id and OIDC username must use safe identifier characters" >&2
+    exit 1
+  fi
+done
+
+if [[ -L "$env_file" || ! -f "$env_file" || ! -r "$env_file" ]]; then
   echo "Missing $env_file; run ./scripts/keycloak-init.sh" >&2
   exit 1
 fi
@@ -96,8 +114,32 @@ user_json="$("${compose[@]}" exec -T keycloak \
   --target-realm ofk \
   --query "username=$username" \
   --fields id,username)"
-user_id="$(jq -er --arg username "$username" \
-  '.[] | select(.username == $username) | .id' <<<"$user_json")"
+user_id="$(jq -r --arg username "$username" \
+  '[.[] | select(.username == $username)]
+   | if length == 1 then .[0].id else "" end' <<<"$user_json")"
+
+if [[ -z "$user_id" ]]; then
+  user_payload="$(
+    jq -cn --arg username "$username" \
+      '{username: $username, enabled: true, emailVerified: false, requiredActions: []}'
+  )"
+  printf '%s' "$user_payload" \
+    | "${compose[@]}" exec -T keycloak \
+      /opt/keycloak/bin/kcadm.sh create users \
+      --config "$kcadm_config" \
+      --target-realm ofk \
+      --file - >/dev/null
+  user_json="$("${compose[@]}" exec -T keycloak \
+    /opt/keycloak/bin/kcadm.sh get users \
+    --config "$kcadm_config" \
+    --target-realm ofk \
+    --query "username=$username" \
+    --fields id,username)"
+  user_id="$(jq -er --arg username "$username" \
+    '[.[] | select(.username == $username)]
+     | if length == 1 then .[0].id else error("user provisioning failed") end' \
+    <<<"$user_json")"
+fi
 
 KC_CLI_PASSWORD="$KEYCLOAK_TEST_USER_PASSWORD" "${compose[@]}" exec -T \
   -e KC_CLI_PASSWORD \
@@ -110,8 +152,6 @@ KC_CLI_PASSWORD="$KEYCLOAK_TEST_USER_PASSWORD" "${compose[@]}" exec -T \
   /opt/keycloak/bin/kcadm.sh update "users/$user_id" \
   --config "$kcadm_config" \
   --target-realm ofk \
-  --set 'email=admin@localhost.invalid' \
-  --set 'emailVerified=true' \
   --set 'requiredActions=[]' >/dev/null
 
 token_response="$(
@@ -131,9 +171,29 @@ auth_header_file="$smoke_dir/authorization.header"
 printf 'Authorization: Bearer %s\n' "$access_token" >"$auth_header_file"
 chmod 600 "$auth_header_file"
 
-without_token_status="$(curl --silent --output /dev/null --write-out '%{http_code}' "$mcp_url")"
+without_token_headers="$smoke_dir/without-token.headers"
+without_token_status="$(
+  curl --silent --output /dev/null --write-out '%{http_code}' \
+    --dump-header "$without_token_headers" \
+    "$mcp_url"
+)"
 if [[ "$without_token_status" != "401" ]]; then
   echo "Expected MCP without JWT to return 401, got $without_token_status" >&2
+  exit 1
+fi
+if ! awk -v metadata="$resource_metadata_url" -v scope="$required_scope" '
+  BEGIN { found = 0 }
+  {
+    line = tolower($0)
+    expected_metadata = "resource_metadata=\"" tolower(metadata) "\""
+    expected_scope = "scope=\"" tolower(scope) "\""
+    if (index(line, "www-authenticate:") == 1 && index(line, "bearer") > 0 && index(line, expected_metadata) > 0 && index(line, expected_scope) > 0) {
+      found = 1
+    }
+  }
+  END { exit(found ? 0 : 1) }
+' "$without_token_headers"; then
+  echo "MCP 401 response did not contain the expected OAuth challenge" >&2
   exit 1
 fi
 
@@ -214,10 +274,43 @@ request \
   --header "Mcp-Session-Id: $session_id" \
   --header 'MCP-Protocol-Version: 2025-06-18'
 
+tools_headers="$smoke_dir/tools.headers"
+tools_body="$smoke_dir/tools.body"
+request \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  "$tools_body" \
+  "$tools_headers" \
+  --header "Mcp-Session-Id: $session_id" \
+  --header 'MCP-Protocol-Version: 2025-06-18'
+
+expected_tools='[
+  "list_members",
+  "marketplace_accounts",
+  "ozon_analytics",
+  "ozon_fbo_postings",
+  "ozon_fbs_postings",
+  "ozon_finance_totals",
+  "ozon_finance_transactions",
+  "ozon_product_prices",
+  "ozon_product_stocks",
+  "ozon_questions",
+  "ozon_returns",
+  "ozon_reviews",
+  "ozon_rfbs_returns",
+  "ozon_seller_rating",
+  "ozon_seller_rating_history",
+  "ozon_stock_turnover",
+  "ozon_stores_status"
+]'
+tools_json="$(json_response "$tools_body")"
+jq -e --argjson expected "$expected_tools" \
+  '([.result.tools[].name] | sort) == ($expected | sort)' \
+  <<<"$tools_json" >/dev/null
+
 members_headers="$smoke_dir/members.headers"
 members_body="$smoke_dir/members.body"
 request \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_members","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_members","arguments":{}}}' \
   "$members_body" \
   "$members_headers" \
   --header "Mcp-Session-Id: $session_id" \
@@ -225,11 +318,11 @@ request \
 
 members_json="$(json_response "$members_body")"
 jq -e \
-  --arg actor "$username" \
+  --arg actor "$actor_id" \
   '.result.isError != true
    and (.result.content[0].text | fromjson | .actor.id == $actor)
    and (.result.content[0].text | fromjson | any(.members[]; .id == $actor and .role == "admin"))' \
   <<<"$members_json" >/dev/null
 
 member_count="$(jq -r '.result.content[0].text | fromjson | .members | length' <<<"$members_json")"
-echo "Keycloak JWT E2E passed: no-token=401, missing-scope=401, actor=$username, visible_members=$member_count"
+echo "Keycloak JWT E2E passed: no-token=401, missing-scope=401, actor=$actor_id, visible_members=$member_count"

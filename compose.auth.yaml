@@ -85,8 +85,8 @@ services:
       - "127.0.0.1:8788:8787"
     volumes:
       - type: bind
-        source: ./config/access.json
-        target: /etc/mcp-ozon/access.json
+        source: ${MCP_AUTH_CONFIG_DIR:-./config}
+        target: /etc/mcp-ozon
         read_only: true
         bind:
           create_host_path: false
