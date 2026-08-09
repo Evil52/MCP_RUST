@@ -606,6 +606,19 @@ impl AppConfig {
                 if !matches!(parsed_resource.scheme(), "http" | "https") {
                     bail!("MCP_PUBLIC_URL должен использовать http или https");
                 }
+                let parsed_audience = reqwest::Url::parse(&audience).context(
+                    "MCP_JWT_AUDIENCE должен быть абсолютным URL ресурса MCP_PUBLIC_URL",
+                )?;
+                if !matches!(parsed_audience.scheme(), "http" | "https") {
+                    bail!("MCP_JWT_AUDIENCE должен использовать http или https");
+                }
+                let resource_url = parsed_resource.to_string();
+                let audience = parsed_audience.to_string();
+                if audience != resource_url {
+                    bail!(
+                        "MCP_JWT_AUDIENCE должен точно совпадать с нормализованным URL ресурса MCP_PUBLIC_URL"
+                    );
+                }
                 parsed_resource.set_path("/.well-known/oauth-protected-resource");
                 parsed_resource.set_query(None);
                 parsed_resource.set_fragment(None);
@@ -1074,7 +1087,7 @@ mod tests {
                 ("MCP_AUTH_MODE", "jwt"),
                 ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
                 ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
-                ("MCP_JWT_AUDIENCE", "ozonofk-mcp"),
+                ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
                 ("MCP_PUBLIC_URL", value),
             ]);
             assert!(
@@ -1088,7 +1101,7 @@ mod tests {
                 ("MCP_AUTH_MODE", "jwt"),
                 ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
                 ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
-                ("MCP_JWT_AUDIENCE", "ozonofk-mcp"),
+                ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
                 ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
                 ("MCP_JWKS_CACHE_TTL_SECONDS", value),
             ]);
@@ -1109,7 +1122,7 @@ mod tests {
                 ("MCP_AUTH_MODE", "jwt"),
                 ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
                 ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
-                ("MCP_JWT_AUDIENCE", "ozonofk-mcp"),
+                ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
                 ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
                 ("MCP_JWT_REQUIRED_SCOPES", value),
             ]);
@@ -1134,7 +1147,7 @@ mod tests {
             ("MCP_AUTH_MODE", "jwt"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
             ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
-            ("MCP_JWT_AUDIENCE", "ozonofk-mcp"),
+            ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
             ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
         ];
         for omitted in ["MCP_JWT_ISSUER", "MCP_JWT_AUDIENCE", "MCP_PUBLIC_URL"] {
@@ -1156,7 +1169,7 @@ mod tests {
             ("MCP_AUTH_MODE", "jwt"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
             ("MCP_JWT_ISSUER", "http://localhost:8180/realms/ofk/"),
-            ("MCP_JWT_AUDIENCE", "ozonofk-mcp"),
+            ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
             (
                 "MCP_JWT_JWKS_URL",
                 "http://keycloak:8080/realms/ofk/protocol/openid-connect/certs",
@@ -1168,7 +1181,7 @@ mod tests {
             AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned())).unwrap();
         let rendered = format!("{:?}", config.auth);
         assert!(rendered.contains("http://localhost:8180/realms/ofk"));
-        assert!(rendered.contains("ozonofk-mcp"));
+        assert!(rendered.contains("audience: \"http://localhost:8788/mcp\""));
         assert!(rendered.contains("http://localhost:8788/mcp"));
         assert!(rendered.contains("http://localhost:8788/.well-known/oauth-protected-resource"));
         assert!(rendered.contains("mcp:tools"));
@@ -1186,7 +1199,7 @@ mod tests {
             ("MCP_AUTH_MODE", "jwt"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
             ("MCP_JWT_ISSUER", "http://localhost:8180/realms/ofk"),
-            ("MCP_JWT_AUDIENCE", "ozonofk-mcp"),
+            ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
             ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
             (
                 "MCP_JWT_REQUIRED_SCOPES",
@@ -1203,6 +1216,43 @@ mod tests {
                 ..
             }) if required_scopes == &["mcp:tools", "analytics:read"]
         ));
+    }
+
+    #[test]
+    fn jwt_audience_must_be_the_normalized_public_resource_url() {
+        let path = write_registry(&sample_registry());
+        let config_from = |audience: &str, public_url: &str| {
+            let values = BTreeMap::from([
+                ("MCP_AUTH_MODE", "jwt"),
+                ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+                ("MCP_JWT_ISSUER", "http://localhost:8180/realms/ofk"),
+                ("MCP_JWT_AUDIENCE", audience),
+                ("MCP_PUBLIC_URL", public_url),
+            ]);
+            AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
+        };
+
+        let config = config_from("http://localhost/mcp", "HTTP://LOCALHOST:80/mcp").unwrap();
+        assert!(matches!(
+            config.auth,
+            AuthConfig::Jwt(JwtConfig {
+                ref audience,
+                ref resource_url,
+                ..
+            }) if audience == "http://localhost/mcp" && resource_url == audience
+        ));
+
+        for audience in [
+            "ozonofk-mcp",
+            "ftp://localhost:8788/mcp",
+            "http://localhost:8788/mcp/",
+            "http://localhost:8788/other",
+        ] {
+            let error = config_from(audience, "http://localhost:8788/mcp")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("MCP_JWT_AUDIENCE"), "{error}");
+        }
     }
 
     #[test]

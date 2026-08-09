@@ -4,8 +4,13 @@ RUN apk add --no-cache clang cmake
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 COPY src ./src
-RUN cargo build --locked --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --locked --release \
+    && cp /build/target/release/mcp-ozon /build/mcp-ozon
 
 FROM alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40 AS runtime
 
@@ -13,7 +18,7 @@ RUN apk add --no-cache ca-certificates \
     && addgroup -S -g 10001 mcp \
     && adduser -S -D -H -u 10001 -G mcp mcp
 
-COPY --from=builder /build/target/release/mcp-ozon /usr/local/bin/mcp-ozon
+COPY --from=builder /build/mcp-ozon /usr/local/bin/mcp-ozon
 COPY config/access.example.json /etc/mcp-ozon/access.json
 
 ENV MCP_TRANSPORT=http \

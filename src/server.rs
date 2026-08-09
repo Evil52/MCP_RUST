@@ -1,20 +1,27 @@
 use chrono::{NaiveDate, Utc};
 use rmcp::{
-    Json, ServerHandler,
+    Json, RoleServer, ServerHandler,
     handler::server::{
         common::{AsRequestContext, FromContextPart},
         router::tool::ToolRouter,
+        tool::ToolCallContext,
         wrapper::Parameters,
     },
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        JsonObject, MetaObject, ServerCapabilities, ServerInfo,
+    },
     schemars::JsonSchema,
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    auth::AuthenticatedActor,
+    auth::{
+        AuthenticatedActor, JwtAuthenticationFailure, JwtAuthenticator, ProtectedResourceMetadata,
+    },
     config::{Actor, Marketplace, RegistrySource, Role, StoreId},
     ozon::OzonClient,
 };
@@ -87,15 +94,57 @@ fn config_error(error: anyhow::Error) -> String {
 pub struct OzonMcp {
     client: OzonClient,
     default_actor_id: Option<String>,
+    authenticator: Option<JwtAuthenticator>,
     registry: RegistrySource,
     postings_vnext: bool,
     finance_accruals_preview: bool,
     tool_router: ToolRouter<Self>,
 }
 
+fn tool_security_schemes(authenticator: Option<&JwtAuthenticator>) -> Vec<JsonObject> {
+    let mut scheme = JsonObject::new();
+    match authenticator {
+        Some(authenticator) => {
+            scheme.insert("type".to_owned(), Value::String("oauth2".to_owned()));
+            scheme.insert(
+                "scopes".to_owned(),
+                Value::Array(
+                    authenticator
+                        .required_scopes()
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            );
+        }
+        None => {
+            scheme.insert("type".to_owned(), Value::String("noauth".to_owned()));
+        }
+    }
+    vec![scheme]
+}
+
 impl OzonMcp {
-    fn default_tool_router() -> ToolRouter<Self> {
+    fn default_tool_router(authenticator: Option<&JwtAuthenticator>) -> ToolRouter<Self> {
         let mut tool_router = Self::tool_router();
+        let security_schemes = tool_security_schemes(authenticator);
+        let security_schemes_value = Value::Array(
+            security_schemes
+                .iter()
+                .cloned()
+                .map(Value::Object)
+                .collect(),
+        );
+        for route in tool_router.map.values_mut() {
+            route.attr.security_schemes = Some(security_schemes.clone());
+            route
+                .attr
+                .meta
+                .get_or_insert_with(MetaObject::new)
+                .0
+                .insert("securitySchemes".to_owned(), security_schemes_value.clone());
+        }
         for &name in FINANCE_ACCRUAL_PREVIEW_TOOLS {
             tool_router.disable_route(name);
         }
@@ -106,22 +155,35 @@ impl OzonMcp {
         Self {
             client,
             default_actor_id: Some(actor_id),
+            authenticator: None,
             registry,
             postings_vnext: false,
             finance_accruals_preview: false,
-            tool_router: Self::default_tool_router(),
+            tool_router: Self::default_tool_router(None),
         }
     }
 
-    pub fn new_authenticated(client: OzonClient, registry: RegistrySource) -> Self {
+    pub fn new_authenticated(
+        client: OzonClient,
+        registry: RegistrySource,
+        authenticator: JwtAuthenticator,
+    ) -> Self {
+        let tool_router = Self::default_tool_router(Some(&authenticator));
         Self {
             client,
             default_actor_id: None,
+            authenticator: Some(authenticator),
             registry,
             postings_vnext: false,
             finance_accruals_preview: false,
-            tool_router: Self::default_tool_router(),
+            tool_router,
         }
+    }
+
+    pub fn protected_resource_metadata(&self) -> Option<ProtectedResourceMetadata> {
+        self.authenticator
+            .as_ref()
+            .map(JwtAuthenticator::protected_resource_metadata)
     }
 
     pub fn with_preview_features(
@@ -390,14 +452,41 @@ where
     C: AsRequestContext,
 {
     fn from_context_part(context: &mut C) -> Result<Self, rmcp::ErrorData> {
-        let actor_id = context
-            .as_request_context()
+        let actor_id =
+            authenticated_actor(context.as_request_context()).map(|actor| actor.actor_id.clone());
+        Ok(Self { actor_id })
+    }
+}
+
+fn authenticated_actor(context: &RequestContext<RoleServer>) -> Option<&AuthenticatedActor> {
+    context.extensions.get::<AuthenticatedActor>().or_else(|| {
+        context
             .extensions
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<AuthenticatedActor>())
-            .map(|actor| actor.actor_id.clone());
-        Ok(Self { actor_id })
+    })
+}
+
+fn request_headers(context: &RequestContext<RoleServer>) -> axum::http::HeaderMap {
+    context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .map(|parts| parts.headers.clone())
+        .unwrap_or_default()
+}
+
+fn authentication_failure_response(
+    authenticator: &JwtAuthenticator,
+    failure: JwtAuthenticationFailure,
+) -> CallToolResponse {
+    let mut result = CallToolResult::error(vec![ContentBlock::text(failure.public_message())]);
+    if let Some(challenge) = authenticator.challenge(&failure) {
+        let mut meta = MetaObject::new();
+        meta.0
+            .insert("mcp/www_authenticate".to_owned(), json!([challenge]));
+        result = result.with_meta(Some(meta));
     }
+    result.into()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1626,6 +1715,32 @@ impl OzonMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OzonMcp {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        mut context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        if let Some(authenticator) = &self.authenticator {
+            let actor = match authenticated_actor(&context).cloned() {
+                Some(actor) => actor,
+                None => {
+                    let headers = request_headers(&context);
+                    match authenticator.authenticate(&headers).await {
+                        Ok(actor) => actor,
+                        Err(failure) => {
+                            return Ok(authentication_failure_response(authenticator, failure));
+                        }
+                    }
+                }
+            };
+            context.extensions.insert(actor);
+        }
+
+        self.tool_router
+            .call(ToolCallContext::new(self, request, context))
+            .await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
@@ -1748,6 +1863,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::config::JwtConfig;
     use crate::test_support::mock_http;
     use axum::Extension;
     use rmcp::transport::{
@@ -1776,6 +1892,23 @@ mod tests {
           ]
         }"#).unwrap();
         RegistrySource::new(path).unwrap()
+    }
+
+    fn jwt_authenticator(registry: &RegistrySource) -> JwtAuthenticator {
+        JwtAuthenticator::new(
+            JwtConfig {
+                issuer: "http://issuer.test/realms/ofk".to_owned(),
+                audience: "ozonofk-mcp".to_owned(),
+                jwks_url: "http://127.0.0.1:1/jwks".to_owned(),
+                resource_url: "http://localhost:8788/mcp".to_owned(),
+                resource_metadata_url: "http://localhost:8788/.well-known/oauth-protected-resource"
+                    .to_owned(),
+                required_scopes: vec!["mcp:tools".to_owned()],
+                jwks_cache_ttl: Duration::from_secs(300),
+            },
+            registry.clone(),
+        )
+        .unwrap()
     }
 
     fn server() -> OzonMcp {
@@ -1949,6 +2082,58 @@ mod tests {
     }
 
     #[test]
+    fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
+        fn assert_policy(tools: Vec<rmcp::model::Tool>, expected: &Value) {
+            for tool in tools {
+                let serialized = serde_json::to_value(&tool).unwrap();
+                assert_eq!(
+                    serialized.get("securitySchemes"),
+                    Some(expected),
+                    "{} canonical security policy differs",
+                    tool.name
+                );
+                assert_eq!(
+                    serialized.pointer("/_meta/securitySchemes"),
+                    Some(expected),
+                    "{} compatibility mirror differs",
+                    tool.name
+                );
+                assert!(serialized.get("security_schemes").is_none());
+            }
+        }
+
+        let dev_tools = server().tool_router.list_all();
+        assert_eq!(dev_tools.len(), 17);
+        assert_policy(dev_tools, &json!([{"type": "noauth"}]));
+
+        let seed = server();
+        let authenticator = jwt_authenticator(&seed.registry);
+        let authenticated = OzonMcp::new_authenticated(seed.client, seed.registry, authenticator);
+        let metadata = authenticated.protected_resource_metadata().unwrap();
+        assert_eq!(metadata.resource, "http://localhost:8788/mcp");
+        assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
+
+        let jwt_tools = authenticated.tool_router.list_all();
+        assert_eq!(jwt_tools.len(), 17);
+        assert_policy(
+            jwt_tools,
+            &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
+        );
+
+        let seed = server();
+        let authenticator = jwt_authenticator(&seed.registry);
+        let preview_tools = OzonMcp::new_authenticated(seed.client, seed.registry, authenticator)
+            .with_preview_features(false, true)
+            .tool_router
+            .list_all();
+        assert_eq!(preview_tools.len(), 20);
+        assert_policy(
+            preview_tools,
+            &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
+        );
+    }
+
+    #[test]
     fn finance_preview_routes_are_visible_only_when_explicitly_enabled() {
         const STABLE_TOOL_NAMES: &[&str] = &[
             "ozon_stores_status",
@@ -1994,7 +2179,8 @@ mod tests {
         }
 
         let seed = server();
-        let authenticated = OzonMcp::new_authenticated(seed.client, seed.registry);
+        let authenticator = jwt_authenticator(&seed.registry);
+        let authenticated = OzonMcp::new_authenticated(seed.client, seed.registry, authenticator);
         assert!(preview_names.is_disjoint(&names(&authenticated)));
 
         let enabled_names = names(&server().with_preview_features(false, true));
@@ -2608,7 +2794,9 @@ mod tests {
             BTreeMap::new(),
         )
         .unwrap();
-        let server = OzonMcp::new_authenticated(client, registry_source());
+        let registry = registry_source();
+        let authenticator = jwt_authenticator(&registry);
+        let server = OzonMcp::new_authenticated(client, registry, authenticator);
 
         let denied = server
             .marketplace_accounts(RequestIdentity::dev(), Parameters(EmptyInput {}))
@@ -2638,7 +2826,9 @@ mod tests {
             BTreeMap::new(),
         )
         .unwrap();
-        let server = Arc::new(OzonMcp::new_authenticated(client, registry_source()));
+        let registry = registry_source();
+        let authenticator = jwt_authenticator(&registry);
+        let server = Arc::new(OzonMcp::new_authenticated(client, registry, authenticator));
         let service: StreamableHttpService<OzonMcp, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok((*server).clone()),
@@ -3416,6 +3606,33 @@ mod tests {
             assert_eq!(actual_path, expected_path);
             assert_eq!(actual_body, expected_body, "{expected_path}");
         }
+    }
+
+    #[tokio::test]
+    async fn analytics_without_sort_emits_an_empty_sort_list() {
+        let (server, requests) = mock_server(1);
+        server
+            .analytics(
+                RequestIdentity::dev(),
+                Parameters(AnalyticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    date_from: "2026-01-01".to_owned(),
+                    date_to: "2026-01-02".to_owned(),
+                    metrics: vec![AnalyticsMetric::Revenue],
+                    dimensions: vec![AnalyticsDimension::Sku],
+                    limit: 25,
+                    offset: 0,
+                    sort_by: None,
+                    sort_direction: SortDirection::Asc,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (path, body) = request_path_and_body(&request);
+        assert_eq!(path, "/v1/analytics/data");
+        assert_eq!(body["sort"], json!([]));
     }
 
     #[tokio::test]

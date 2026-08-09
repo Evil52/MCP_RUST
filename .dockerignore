@@ -8,6 +8,15 @@
 !src/
 !src/**
 
+!vendor/
+!vendor/rmcp/
+!vendor/rmcp/Cargo.toml
+!vendor/rmcp/LICENSE
+!vendor/rmcp/README.md
+!vendor/rmcp/UPSTREAM.md
+!vendor/rmcp/src/
+!vendor/rmcp/src/**
+
 !config/
 !config/access.example.json
 !config/keycloak/

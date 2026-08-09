@@ -1,16 +1,18 @@
-use std::{collections::BTreeSet, sync::Arc, time::Instant};
-
-use anyhow::{Context, Result, anyhow, bail};
-use axum::{
-    Json,
-    extract::{Request, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
-    middleware::Next,
-    response::{IntoResponse, Response},
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
 };
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+
+use anyhow::Result;
+use axum::http::HeaderMap;
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind as JwtErrorKind,
+    jwk::JwkSet,
+};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{JwtConfig, RegistrySource};
 
@@ -18,6 +20,65 @@ use crate::config::{JwtConfig, RegistrySource};
 pub struct AuthenticatedActor {
     pub actor_id: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JwtAuthenticationFailure {
+    MissingCredentials,
+    InvalidToken,
+    ExpiredToken,
+    WrongAudience,
+    InsufficientScope,
+    AccessDenied,
+    VerifierUnavailable,
+}
+
+impl JwtAuthenticationFailure {
+    fn oauth_error(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::MissingCredentials => Some(("invalid_token", "No access token was provided")),
+            Self::InvalidToken => Some(("invalid_token", "The access token is invalid")),
+            Self::ExpiredToken => Some(("invalid_token", "The access token has expired")),
+            Self::WrongAudience => Some(("invalid_token", "The access token audience is invalid")),
+            Self::InsufficientScope => Some((
+                "insufficient_scope",
+                "The access token lacks a required scope",
+            )),
+            Self::AccessDenied | Self::VerifierUnavailable => None,
+        }
+    }
+
+    pub fn public_message(self) -> &'static str {
+        match self {
+            Self::MissingCredentials => "Требуется авторизация: access token не передан.",
+            Self::InvalidToken => "Требуется повторная авторизация: access token недействителен.",
+            Self::ExpiredToken => "Требуется повторная авторизация: access token истёк.",
+            Self::WrongAudience => {
+                "Требуется повторная авторизация: access token выпущен для другого ресурса."
+            }
+            Self::InsufficientScope => {
+                "Требуется повторная авторизация с необходимыми разрешениями."
+            }
+            Self::AccessDenied => "Доступ для подтверждённой учётной записи не разрешён.",
+            Self::VerifierUnavailable => "Сервис проверки access token временно недоступен.",
+        }
+    }
+}
+
+impl fmt::Display for JwtAuthenticationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingCredentials => "missing bearer credentials",
+            Self::InvalidToken => "invalid access token",
+            Self::ExpiredToken => "expired access token",
+            Self::WrongAudience => "invalid access token audience",
+            Self::InsufficientScope => "insufficient OAuth scope",
+            Self::AccessDenied => "authenticated identity is not authorized",
+            Self::VerifierUnavailable => "JWT verifier is temporarily unavailable",
+        })
+    }
+}
+
+impl std::error::Error for JwtAuthenticationFailure {}
 
 #[derive(Debug, Clone, Deserialize)]
 struct AccessTokenClaims {
@@ -38,12 +99,23 @@ struct CachedJwks {
     keys: JwkSet,
 }
 
+#[derive(Debug, Default)]
+struct JwksCacheState {
+    cache: Option<CachedJwks>,
+    last_unknown_kid_refresh_at: Option<Instant>,
+    last_failed_refresh_at: Option<Instant>,
+}
+
+const UNKNOWN_KID_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
+const FAILED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 pub struct JwtAuthenticator {
     config: JwtConfig,
     registry: RegistrySource,
     client: reqwest::Client,
-    cache: Arc<RwLock<Option<CachedJwks>>>,
+    cache: Arc<RwLock<JwksCacheState>>,
+    refresh_gate: Arc<Mutex<()>>,
 }
 
 impl JwtAuthenticator {
@@ -53,7 +125,8 @@ impl JwtAuthenticator {
             config,
             registry,
             client,
-            cache: Arc::new(RwLock::new(None)),
+            cache: Arc::new(RwLock::new(JwksCacheState::default())),
+            refresh_gate: Arc::new(Mutex::new(())),
         })
     }
 
@@ -66,22 +139,35 @@ impl JwtAuthenticator {
         }
     }
 
-    fn challenge(&self) -> HeaderValue {
-        HeaderValue::from_str(&format!(
-            "Bearer resource_metadata=\"{}\", scope=\"{}\"",
-            self.config.resource_metadata_url,
-            self.config.required_scopes.join(" ")
-        ))
-        .expect("resource metadata URL was validated at startup")
+    pub fn required_scopes(&self) -> &[String] {
+        &self.config.required_scopes
     }
 
-    fn validate_required_scopes(&self, scope_claim: Option<&str>) -> Result<()> {
-        let scope_claim = scope_claim.context("JWT не содержит claim scope")?;
+    pub fn resource_metadata_url(&self) -> &str {
+        &self.config.resource_metadata_url
+    }
+
+    pub fn challenge(&self, failure: &JwtAuthenticationFailure) -> Option<String> {
+        let (error, error_description) = failure.oauth_error()?;
+        Some(format!(
+            "Bearer resource_metadata=\"{}\", scope=\"{}\", error=\"{error}\", error_description=\"{error_description}\"",
+            self.resource_metadata_url(),
+            self.required_scopes().join(" ")
+        ))
+    }
+
+    fn validate_required_scopes(
+        &self,
+        scope_claim: Option<&str>,
+    ) -> std::result::Result<(), JwtAuthenticationFailure> {
+        let Some(scope_claim) = scope_claim else {
+            return Err(JwtAuthenticationFailure::InsufficientScope);
+        };
         if scope_claim
             .bytes()
             .any(|byte| byte != b' ' && !matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
         {
-            bail!("JWT содержит некорректный OAuth scope");
+            return Err(JwtAuthenticationFailure::InsufficientScope);
         }
         let granted = scope_claim
             .split(' ')
@@ -95,68 +181,130 @@ impl JwtAuthenticator {
             .cloned()
             .collect::<Vec<_>>();
         if !missing.is_empty() {
-            bail!(
-                "JWT не содержит обязательные OAuth scopes: {}",
-                missing.join(" ")
-            );
+            return Err(JwtAuthenticationFailure::InsufficientScope);
         }
         Ok(())
     }
 
-    async fn refresh_jwks(&self) -> Result<()> {
+    async fn fetch_jwks(&self) -> std::result::Result<JwkSet, JwtAuthenticationFailure> {
         let keys = self
             .client
             .get(&self.config.jwks_url)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-            .context("не удалось получить JWKS")?
+            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?
             .error_for_status()
-            .context("Keycloak вернул ошибку при запросе JWKS")?
+            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?
             .json::<JwkSet>()
             .await
-            .context("Keycloak вернул некорректный JWKS")?;
+            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
         if keys.keys.is_empty() {
-            bail!("JWKS не содержит ключей");
+            return Err(JwtAuthenticationFailure::VerifierUnavailable);
         }
-        *self.cache.write().await = Some(CachedJwks {
-            fetched_at: Instant::now(),
-            keys,
-        });
-        Ok(())
+        Ok(keys)
     }
 
-    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey> {
-        let needs_refresh = self.cache.read().await.as_ref().is_none_or(|cache| {
-            cache.fetched_at.elapsed() >= self.config.jwks_cache_ttl
-                || cache.keys.find(kid).is_none()
-        });
-        if needs_refresh {
-            self.refresh_jwks().await?;
-        }
-        let cache = self.cache.read().await;
-        let jwk = cache
+    fn cached_decoding_key(
+        &self,
+        state: &JwksCacheState,
+        kid: &str,
+    ) -> std::result::Result<Option<DecodingKey>, JwtAuthenticationFailure> {
+        let fresh_cache = state
+            .cache
             .as_ref()
-            .and_then(|cache| cache.keys.find(kid))
-            .ok_or_else(|| anyhow!("JWT подписан неизвестным ключом kid={kid:?}"))?;
-        DecodingKey::from_jwk(jwk).context("неподдерживаемый ключ JWKS")
+            .filter(|cache| cache.fetched_at.elapsed() < self.config.jwks_cache_ttl);
+        if let Some(jwk) = fresh_cache.and_then(|cache| cache.keys.find(kid)) {
+            return DecodingKey::from_jwk(jwk)
+                .map(Some)
+                .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable);
+        }
+        if state
+            .last_failed_refresh_at
+            .is_some_and(|at| at.elapsed() < FAILED_REFRESH_COOLDOWN)
+        {
+            return Err(JwtAuthenticationFailure::VerifierUnavailable);
+        }
+        if fresh_cache.is_some()
+            && state
+                .last_unknown_kid_refresh_at
+                .is_some_and(|at| at.elapsed() < UNKNOWN_KID_REFRESH_COOLDOWN)
+        {
+            return Err(JwtAuthenticationFailure::InvalidToken);
+        }
+        Ok(None)
     }
 
-    pub async fn authenticate(&self, headers: &HeaderMap) -> Result<AuthenticatedActor> {
+    async fn decoding_key(
+        &self,
+        kid: &str,
+    ) -> std::result::Result<DecodingKey, JwtAuthenticationFailure> {
+        let cached_key = {
+            let state = self.cache.read().await;
+            self.cached_decoding_key(&state, kid)?
+        };
+        if let Some(key) = cached_key {
+            return Ok(key);
+        }
+
+        // Only one task may fetch JWKS. Every waiter re-checks the cache after
+        // acquiring the gate, so concurrent misses are coalesced into one fetch.
+        let _refresh_guard = self.refresh_gate.lock().await;
+        let cached_key = {
+            let state = self.cache.read().await;
+            self.cached_decoding_key(&state, kid)?
+        };
+        if let Some(key) = cached_key {
+            return Ok(key);
+        }
+
+        let refresh_is_for_unknown_kid =
+            self.cache.read().await.cache.as_ref().is_some_and(|cache| {
+                cache.fetched_at.elapsed() < self.config.jwks_cache_ttl
+                    && cache.keys.find(kid).is_none()
+            });
+        let keys = match self.fetch_jwks().await {
+            Ok(keys) => keys,
+            Err(error) => {
+                let failed_at = Instant::now();
+                let mut state = self.cache.write().await;
+                state.last_failed_refresh_at = Some(failed_at);
+                if refresh_is_for_unknown_kid {
+                    state.last_unknown_kid_refresh_at = Some(failed_at);
+                }
+                return Err(error);
+            }
+        };
+        let fetched_at = Instant::now();
+        let key = keys.find(kid).map(DecodingKey::from_jwk).transpose();
+        let missing_after_refresh = matches!(key, Ok(None));
+        let mut state = self.cache.write().await;
+        state.cache = Some(CachedJwks { fetched_at, keys });
+        state.last_failed_refresh_at = None;
+        state.last_unknown_kid_refresh_at =
+            (refresh_is_for_unknown_kid || missing_after_refresh).then_some(fetched_at);
+        key.map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?
+            .ok_or(JwtAuthenticationFailure::InvalidToken)
+    }
+
+    pub async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+    ) -> std::result::Result<AuthenticatedActor, JwtAuthenticationFailure> {
         let value = headers
             .get(axum::http::header::AUTHORIZATION)
-            .context("отсутствует Authorization: Bearer")?
+            .ok_or(JwtAuthenticationFailure::MissingCredentials)?
             .to_str()
-            .context("некорректный заголовок Authorization")?;
+            .map_err(|_| JwtAuthenticationFailure::InvalidToken)?;
         let token = value
             .strip_prefix("Bearer ")
             .filter(|token| !token.trim().is_empty())
-            .context("ожидается Authorization: Bearer <token>")?;
-        let header = decode_header(token).context("некорректный JWT header")?;
+            .ok_or(JwtAuthenticationFailure::InvalidToken)?;
+        let header = decode_header(token).map_err(|_| JwtAuthenticationFailure::InvalidToken)?;
         if header.alg != Algorithm::RS256 {
-            bail!("разрешён только алгоритм RS256");
+            return Err(JwtAuthenticationFailure::InvalidToken);
         }
-        let kid = header.kid.context("JWT header не содержит kid")?;
+        let kid = header.kid.ok_or(JwtAuthenticationFailure::InvalidToken)?;
         let key = self.decoding_key(&kid).await?;
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[self.config.issuer.as_str()]);
@@ -168,20 +316,29 @@ impl JwtAuthenticator {
             .map(str::to_owned)
             .collect();
         let claims = decode::<AccessTokenClaims>(token, &key, &validation)
-            .context("JWT не прошёл проверку подписи или claims")?
+            .map_err(|error| match error.kind() {
+                JwtErrorKind::ExpiredSignature => JwtAuthenticationFailure::ExpiredToken,
+                JwtErrorKind::InvalidAudience => JwtAuthenticationFailure::WrongAudience,
+                _ => JwtAuthenticationFailure::InvalidToken,
+            })?
             .claims;
         self.validate_required_scopes(claims.scope.as_deref())?;
-        let registry = self.registry.load()?;
+        let registry = self
+            .registry
+            .load()
+            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
         let verified_email = if claims.email_verified == Some(true) {
             claims.email.as_deref()
         } else {
             None
         };
-        let actor = registry.actor_for_oidc(
-            &claims.sub,
-            claims.preferred_username.as_deref(),
-            verified_email,
-        )?;
+        let actor = registry
+            .actor_for_oidc(
+                &claims.sub,
+                claims.preferred_username.as_deref(),
+                verified_email,
+            )
+            .map_err(|_| JwtAuthenticationFailure::AccessDenied)?;
         Ok(AuthenticatedActor {
             actor_id: actor.id.clone(),
         })
@@ -196,68 +353,37 @@ pub struct ProtectedResourceMetadata {
     pub scopes_supported: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct AuthErrorBody {
-    error: &'static str,
-    message: &'static str,
-}
-
-pub async fn require_jwt(
-    State(auth): State<JwtAuthenticator>,
-    mut request: Request,
-    next: Next,
-) -> Response {
-    match auth.authenticate(request.headers()).await {
-        Ok(actor) => {
-            request.extensions_mut().insert(actor);
-            next.run(request).await
-        }
-        Err(error) => {
-            tracing::warn!(reason = %error, "MCP JWT отклонён");
-            let mut response = (
-                StatusCode::UNAUTHORIZED,
-                Json(AuthErrorBody {
-                    error: "unauthorized",
-                    message: "Требуется действительный access token",
-                }),
-            )
-                .into_response();
-            response
-                .headers_mut()
-                .insert(axum::http::header::WWW_AUTHENTICATE, auth.challenge());
-            response
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
-        io::Write,
+        io::{Read, Write},
+        net::TcpListener,
         process::{Command, Stdio},
         sync::{
             OnceLock,
             atomic::{AtomicU64, Ordering},
+            mpsc,
         },
         time::Duration,
     };
 
     use axum::{
-        Extension, Router,
-        body::Body,
-        http::{Request as HttpRequest, header::AUTHORIZATION},
-        middleware,
-        routing::get,
+        Router,
+        http::{HeaderValue, header::AUTHORIZATION},
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::{EncodingKey, Header, encode};
     use serde::Serialize;
     use serde_json::json;
-    use tower::ServiceExt;
 
     use super::*;
-    use crate::test_support::mock_http;
+    use crate::{ozon::OzonClient, server::OzonMcp, test_support::mock_http};
+    use rmcp::transport::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        streamable_http_server::session::local::LocalSessionManager,
+    };
 
     const KID: &str = "test-key";
 
@@ -282,10 +408,6 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success());
         output.stdout
-    }
-
-    async fn no_content() -> StatusCode {
-        StatusCode::NO_CONTENT
     }
 
     fn test_key() -> &'static TestKey {
@@ -365,11 +487,15 @@ mod tests {
     }
 
     fn jwks() -> String {
+        jwks_with_kid(KID)
+    }
+
+    fn jwks_with_kid(kid: &str) -> String {
         let key = test_key();
         json!({
             "keys": [{
                 "kty": "RSA",
-                "kid": KID,
+                "kid": kid,
                 "use": "sig",
                 "alg": "RS256",
                 "n": key.modulus,
@@ -377,6 +503,33 @@ mod tests {
             }]
         })
         .to_string()
+    }
+
+    fn blocking_jwks_http(
+        body: String,
+    ) -> (String, tokio::sync::oneshot::Receiver<()>, mpsc::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            started_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (
+            format!("http://{address}"),
+            started_receiver,
+            release_sender,
+        )
     }
 
     fn config(jwks_url: String) -> JwtConfig {
@@ -428,9 +581,34 @@ mod tests {
         email_verified: Option<bool>,
         scope: Option<&str>,
     ) -> String {
+        let now = chrono::Utc::now().timestamp();
+        token_with_identity_and_times(
+            kid,
+            audience,
+            subject,
+            username,
+            email,
+            email_verified,
+            scope,
+            now + 3_600,
+            now - 1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn token_with_identity_and_times(
+        kid: Option<&str>,
+        audience: &str,
+        subject: &str,
+        username: Option<&str>,
+        email: Option<&str>,
+        email_verified: Option<bool>,
+        scope: Option<&str>,
+        exp: i64,
+        nbf: i64,
+    ) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = kid.map(str::to_owned);
-        let now = chrono::Utc::now().timestamp();
         encode(
             &header,
             &TestClaims {
@@ -441,8 +619,8 @@ mod tests {
                 preferred_username: username,
                 email,
                 email_verified,
-                exp: now + 3_600,
-                nbf: now - 1,
+                exp,
+                nbf,
             },
             &test_key().encoding,
         )
@@ -458,6 +636,80 @@ mod tests {
         headers
     }
 
+    async fn call_mcp_tool(
+        endpoint: &str,
+        bearer: Option<&str>,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut request = reqwest::Client::new()
+            .post(endpoint)
+            .header("accept", "application/json, text/event-stream")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }));
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.unwrap();
+        assert!(response.status().is_success());
+        response.json().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_authentication_is_checked_per_http_request_before_dispatch() {
+        let registry = registry();
+        let (jwks_url, _) = mock_http(vec![(200, jwks())]);
+        let authenticator = JwtAuthenticator::new(config(jwks_url), registry.clone()).unwrap();
+        let client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let server = Arc::new(OzonMcp::new_authenticated(client, registry, authenticator));
+        let service: StreamableHttpService<OzonMcp, LocalSessionManager> =
+            StreamableHttpService::new(
+                move || Ok((*server).clone()),
+                Default::default(),
+                StreamableHttpServerConfig::default()
+                    .with_legacy_session_mode(false)
+                    .with_json_response(true),
+            );
+        let router = Router::new().nest_service("/mcp", service);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let missing = call_mcp_tool(&endpoint, None, "ozon_analytics", json!({})).await;
+        assert_eq!(missing["result"]["isError"], true);
+        assert!(missing["result"]["_meta"]["mcp/www_authenticate"].is_array());
+        assert_eq!(
+            missing["result"]["content"][0]["text"],
+            "Требуется авторизация: access token не передан."
+        );
+
+        let valid_token = token(Some(KID), "ozonofk-mcp", "admin");
+        let valid = call_mcp_tool(&endpoint, Some(&valid_token), "list_members", json!({})).await;
+        assert_ne!(valid["result"]["isError"], true);
+        assert_eq!(valid["result"]["structuredContent"]["actor"]["id"], "admin");
+
+        let unknown_token = token(Some(KID), "ozonofk-mcp", "not-provisioned");
+        let unknown =
+            call_mcp_tool(&endpoint, Some(&unknown_token), "list_members", json!({})).await;
+        assert_eq!(unknown["result"]["isError"], true);
+        assert!(unknown["result"].get("_meta").is_none());
+        assert_eq!(
+            unknown["result"]["content"][0]["text"],
+            "Доступ для подтверждённой учётной записи не разрешён."
+        );
+
+        task.abort();
+    }
+
     #[tokio::test]
     async fn authenticates_rs256_tokens_and_caches_jwks() {
         let (base_url, requests) = mock_http(vec![(200, jwks())]);
@@ -467,6 +719,11 @@ mod tests {
         assert_eq!(metadata.authorization_servers.len(), 1);
         assert_eq!(metadata.bearer_methods_supported, ["header"]);
         assert_eq!(metadata.scopes_supported, ["mcp:tools"]);
+        assert_eq!(auth.required_scopes(), ["mcp:tools"]);
+        assert_eq!(
+            auth.resource_metadata_url(),
+            "http://localhost:8788/.well-known/oauth-protected-resource"
+        );
 
         let headers = bearer(&token(Some(KID), "ozonofk-mcp", "admin"));
         for _ in 0..2 {
@@ -474,6 +731,239 @@ mod tests {
         }
         assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
         assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_valid_kid_waiters_reuse_one_empty_cache_refresh() {
+        const CALLS: usize = 16;
+        let (base_url, request_started, release_response) = blocking_jwks_http(jwks());
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLS + 1));
+        let mut tasks = Vec::new();
+        for _ in 0..CALLS {
+            let auth = auth.clone();
+            let barrier = barrier.clone();
+            let token = token(Some(KID), "ozonofk-mcp", "admin");
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                auth.authenticate(&bearer(&token)).await
+            }));
+        }
+
+        barrier.wait().await;
+        tokio::time::timeout(Duration::from_secs(1), request_started)
+            .await
+            .expect("the single JWKS request must start")
+            .unwrap();
+        for _ in 0..CALLS {
+            tokio::task::yield_now().await;
+        }
+        release_response.send(()).unwrap();
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap().actor_id, "admin");
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_random_unknown_kids_are_singleflight_and_bounded() {
+        let (base_url, requests) = mock_http(vec![(200, jwks())]);
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+        let mut tasks = Vec::new();
+        for index in 0..24 {
+            let auth = auth.clone();
+            let token = token(
+                Some(&format!("attacker-controlled-kid-{}", index % 11)),
+                "ozonofk-mcp",
+                "admin",
+            );
+            tasks.push(tokio::spawn(async move {
+                auth.authenticate(&bearer(&token)).await
+            }));
+        }
+        for task in tasks {
+            assert_eq!(
+                task.await.unwrap().unwrap_err(),
+                JwtAuthenticationFailure::InvalidToken
+            );
+        }
+
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(requests.try_recv().is_err());
+
+        // A different attacker-controlled kid within the global cooldown must
+        // not allocate per-kid state or trigger another network refresh.
+        assert_eq!(
+            auth.authenticate(&bearer(&token(
+                Some("another-random-kid"),
+                "ozonofk-mcp",
+                "admin"
+            )))
+            .await
+            .unwrap_err(),
+            JwtAuthenticationFailure::InvalidToken
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_failed_empty_cache_refresh_is_negative_cached_and_retriable() {
+        let (base_url, requests) = mock_http(vec![(500, "{}".to_owned()), (200, jwks())]);
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+        let concurrent_failures = async {
+            let mut tasks = Vec::new();
+            for index in 0..24 {
+                let auth = auth.clone();
+                let token = token(
+                    Some(&format!("random-kid-during-outage-{index}")),
+                    "ozonofk-mcp",
+                    "admin",
+                );
+                tasks.push(tokio::spawn(async move {
+                    auth.authenticate(&bearer(&token)).await
+                }));
+            }
+            for task in tasks {
+                assert_eq!(
+                    task.await.unwrap().unwrap_err(),
+                    JwtAuthenticationFailure::VerifierUnavailable
+                );
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), concurrent_failures)
+            .await
+            .expect("JWKS failure waiters must reuse the bounded negative-cache result");
+
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(requests.try_recv().is_err());
+
+        // Avoid a real five-second sleep while proving that a later request can
+        // retry an empty cache after the global failure cooldown expires.
+        auth.cache.write().await.last_failed_refresh_at =
+            Some(std::time::Instant::now() - FAILED_REFRESH_COOLDOWN - Duration::from_millis(1));
+        assert_eq!(
+            auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "admin")))
+                .await
+                .unwrap()
+                .actor_id,
+            "admin"
+        );
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_unknown_kid_refresh_sets_both_global_cooldowns() {
+        let (base_url, requests) = mock_http(vec![(200, jwks()), (500, "{}".to_owned())]);
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+
+        auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "admin")))
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.authenticate(&bearer(&token(
+                Some("unknown-during-outage"),
+                "ozonofk-mcp",
+                "admin"
+            )))
+            .await
+            .unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
+        );
+        assert_eq!(
+            auth.authenticate(&bearer(&token(
+                Some("another-unknown-during-outage"),
+                "ozonofk-mcp",
+                "admin"
+            )))
+            .await
+            .unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
+        );
+
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn fresh_unknown_kid_refreshes_once_for_normal_key_rotation() {
+        const ROTATED_KID: &str = "rotated-test-key";
+        let (base_url, requests) =
+            mock_http(vec![(200, jwks()), (200, jwks_with_kid(ROTATED_KID))]);
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+
+        assert_eq!(
+            auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "admin")))
+                .await
+                .unwrap()
+                .actor_id,
+            "admin"
+        );
+        assert_eq!(
+            auth.authenticate(&bearer(&token(Some(ROTATED_KID), "ozonofk-mcp", "admin")))
+                .await
+                .unwrap()
+                .actor_id,
+            "admin"
+        );
+
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn builds_safe_oauth_challenges_only_for_recoverable_authentication_failures() {
+        let auth =
+            JwtAuthenticator::new(config("http://127.0.0.1:1".to_owned()), registry()).unwrap();
+        for (failure, oauth_error, description) in [
+            (
+                JwtAuthenticationFailure::MissingCredentials,
+                "invalid_token",
+                "No access token was provided",
+            ),
+            (
+                JwtAuthenticationFailure::InvalidToken,
+                "invalid_token",
+                "The access token is invalid",
+            ),
+            (
+                JwtAuthenticationFailure::ExpiredToken,
+                "invalid_token",
+                "The access token has expired",
+            ),
+            (
+                JwtAuthenticationFailure::WrongAudience,
+                "invalid_token",
+                "The access token audience is invalid",
+            ),
+            (
+                JwtAuthenticationFailure::InsufficientScope,
+                "insufficient_scope",
+                "The access token lacks a required scope",
+            ),
+        ] {
+            let challenge = auth.challenge(&failure).unwrap();
+            assert!(challenge.is_ascii());
+            assert!(challenge.contains(
+                "resource_metadata=\"http://localhost:8788/.well-known/oauth-protected-resource\""
+            ));
+            assert!(challenge.contains("scope=\"mcp:tools\""));
+            assert!(challenge.contains(&format!("error=\"{oauth_error}\"")));
+            assert!(challenge.contains(&format!("error_description=\"{description}\"")));
+            assert!(!failure.public_message().is_empty());
+            assert!(!failure.to_string().is_empty());
+        }
+
+        for failure in [
+            JwtAuthenticationFailure::AccessDenied,
+            JwtAuthenticationFailure::VerifierUnavailable,
+        ] {
+            assert_eq!(auth.challenge(&failure), None);
+            assert!(!failure.public_message().is_empty());
+            assert!(!failure.to_string().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -500,7 +990,10 @@ mod tests {
             Some(true),
             Some("mcp:tools"),
         );
-        assert!(auth.authenticate(&bearer(&mismatched)).await.is_err());
+        assert_eq!(
+            auth.authenticate(&bearer(&mismatched)).await.unwrap_err(),
+            JwtAuthenticationFailure::AccessDenied
+        );
 
         let exact_subject = token_with_identity(
             Some(KID),
@@ -541,7 +1034,10 @@ mod tests {
                 email_verified,
                 Some("mcp:tools"),
             );
-            assert!(auth.authenticate(&bearer(&token)).await.is_err());
+            assert_eq!(
+                auth.authenticate(&bearer(&token)).await.unwrap_err(),
+                JwtAuthenticationFailure::AccessDenied
+            );
         }
 
         let verified = token_with_identity(
@@ -590,7 +1086,7 @@ mod tests {
             Some("mcp:tools"),
         );
         let error = auth.authenticate(&bearer(&token)).await.unwrap_err();
-        assert!(error.to_string().contains("неоднозначно"), "{error}");
+        assert_eq!(error, JwtAuthenticationFailure::AccessDenied);
     }
 
     #[tokio::test]
@@ -607,7 +1103,10 @@ mod tests {
             Some("mcp:tools\tanalytics:read"),
         ] {
             let token = token_with_scope(Some(KID), "ozonofk-mcp", "admin", scope);
-            assert!(auth.authenticate(&bearer(&token)).await.is_err());
+            assert_eq!(
+                auth.authenticate(&bearer(&token)).await.unwrap_err(),
+                JwtAuthenticationFailure::InsufficientScope
+            );
         }
 
         let token = token_with_scope(
@@ -626,19 +1125,28 @@ mod tests {
     async fn rejects_bad_headers_algorithms_claims_and_unknown_users() {
         let auth =
             JwtAuthenticator::new(config("http://127.0.0.1:1".to_owned()), registry()).unwrap();
-        assert!(auth.authenticate(&HeaderMap::new()).await.is_err());
+        assert_eq!(
+            auth.authenticate(&HeaderMap::new()).await.unwrap_err(),
+            JwtAuthenticationFailure::MissingCredentials
+        );
 
         for value in ["Basic abc", "Bearer ", "Bearer not-a-jwt"] {
             let mut headers = HeaderMap::new();
             headers.insert(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
-            assert!(auth.authenticate(&headers).await.is_err());
+            assert_eq!(
+                auth.authenticate(&headers).await.unwrap_err(),
+                JwtAuthenticationFailure::InvalidToken
+            );
         }
         let mut invalid_text = HeaderMap::new();
         invalid_text.insert(
             AUTHORIZATION,
             HeaderValue::from_bytes(b"Bearer \xff").unwrap(),
         );
-        assert!(auth.authenticate(&invalid_text).await.is_err());
+        assert_eq!(
+            auth.authenticate(&invalid_text).await.unwrap_err(),
+            JwtAuthenticationFailure::InvalidToken
+        );
 
         let hs_token = encode(
             &Header::new(Algorithm::HS256),
@@ -646,24 +1154,64 @@ mod tests {
             &EncodingKey::from_secret(b"test"),
         )
         .unwrap();
-        assert!(auth.authenticate(&bearer(&hs_token)).await.is_err());
-        assert!(
+        assert_eq!(
+            auth.authenticate(&bearer(&hs_token)).await.unwrap_err(),
+            JwtAuthenticationFailure::InvalidToken
+        );
+        assert_eq!(
             auth.authenticate(&bearer(&token(None, "ozonofk-mcp", "admin")))
                 .await
-                .is_err()
+                .unwrap_err(),
+            JwtAuthenticationFailure::InvalidToken
         );
 
         let (base_url, _) = mock_http(vec![(200, jwks()), (200, jwks())]);
         let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
-        assert!(
+        let signed = token(Some(KID), "ozonofk-mcp", "admin");
+        let mut parts = signed.split('.').map(str::to_owned).collect::<Vec<_>>();
+        let mut signature = URL_SAFE_NO_PAD.decode(&parts[2]).unwrap();
+        signature[0] ^= 1;
+        parts[2] = URL_SAFE_NO_PAD.encode(signature);
+        assert_eq!(
+            auth.authenticate(&bearer(&parts.join(".")))
+                .await
+                .unwrap_err(),
+            JwtAuthenticationFailure::InvalidToken
+        );
+        assert_eq!(
             auth.authenticate(&bearer(&token(Some(KID), "wrong", "admin")))
                 .await
-                .is_err()
+                .unwrap_err(),
+            JwtAuthenticationFailure::WrongAudience
         );
-        assert!(
+        assert_eq!(
             auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "unknown")))
                 .await
-                .is_err()
+                .unwrap_err(),
+            JwtAuthenticationFailure::AccessDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn classifies_expired_tokens_after_signature_verification() {
+        let (base_url, _) = mock_http(vec![(200, jwks())]);
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let expired = token_with_identity_and_times(
+            Some(KID),
+            "ozonofk-mcp",
+            "subject-1",
+            Some("admin"),
+            Some("admin@example.test"),
+            Some(true),
+            Some("mcp:tools"),
+            now - 120,
+            now - 3_600,
+        );
+
+        assert_eq!(
+            auth.authenticate(&bearer(&expired)).await.unwrap_err(),
+            JwtAuthenticationFailure::ExpiredToken
         );
     }
 
@@ -676,27 +1224,30 @@ mod tests {
         ] {
             let (base_url, _) = mock_http(vec![(status, body)]);
             let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
-            assert!(
+            assert_eq!(
                 auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "admin")))
                     .await
-                    .is_err()
+                    .unwrap_err(),
+                JwtAuthenticationFailure::VerifierUnavailable
             );
         }
 
         let auth =
             JwtAuthenticator::new(config("http://127.0.0.1:1".to_owned()), registry()).unwrap();
-        assert!(
+        assert_eq!(
             auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "admin")))
                 .await
-                .is_err()
+                .unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
         );
 
         let (base_url, _) = mock_http(vec![(200, jwks())]);
         let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
-        assert!(
+        assert_eq!(
             auth.authenticate(&bearer(&token(Some("unknown"), "ozonofk-mcp", "admin")))
                 .await
-                .is_err()
+                .unwrap_err(),
+            JwtAuthenticationFailure::InvalidToken
         );
 
         let (base_url, requests) = mock_http(vec![(200, jwks()), (200, jwks())]);
@@ -708,61 +1259,5 @@ mod tests {
         auth.authenticate(&headers).await.unwrap();
         assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
         assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
-    }
-
-    #[tokio::test]
-    async fn middleware_rejects_missing_token_and_forwards_verified_identity() {
-        let unauthenticated =
-            JwtAuthenticator::new(config("http://127.0.0.1:1".to_owned()), registry()).unwrap();
-        let app = Router::new()
-            .route("/", get(no_content))
-            .route_layer(middleware::from_fn_with_state(unauthenticated, require_jwt));
-        let response = app
-            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(no_content().await, StatusCode::NO_CONTENT);
-        assert!(
-            response
-                .headers()
-                .get(axum::http::header::WWW_AUTHENTICATE)
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("oauth-protected-resource")
-        );
-        assert_eq!(
-            response
-                .headers()
-                .get(axum::http::header::WWW_AUTHENTICATE)
-                .unwrap(),
-            "Bearer resource_metadata=\"http://localhost:8788/.well-known/oauth-protected-resource\", scope=\"mcp:tools\""
-        );
-
-        let (base_url, _) = mock_http(vec![(200, jwks())]);
-        let authenticated = JwtAuthenticator::new(config(base_url), registry()).unwrap();
-        let app = Router::new()
-            .route(
-                "/",
-                get(
-                    |Extension(actor): Extension<AuthenticatedActor>| async move { actor.actor_id },
-                ),
-            )
-            .route_layer(middleware::from_fn_with_state(authenticated, require_jwt));
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/")
-                    .header(
-                        AUTHORIZATION,
-                        format!("Bearer {}", token(Some(KID), "ozonofk-mcp", "admin")),
-                    )
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
     }
 }

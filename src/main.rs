@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::{Json, Router, middleware, routing::get};
+use axum::{Json, Router, routing::get};
 use mcp_ozon::{
-    auth::{JwtAuthenticator, require_jwt},
+    auth::JwtAuthenticator,
     config::{AppConfig, AuthConfig, TransportMode},
     ozon::OzonClient,
     server::OzonMcp,
@@ -36,8 +36,11 @@ async fn main() -> Result<()> {
     )?;
     let registry = config.registry.clone();
     let server = match &config.auth {
-        AuthConfig::Dev { actor_id } => OzonMcp::new(client, actor_id.clone(), config.registry),
-        AuthConfig::Jwt(_) => OzonMcp::new_authenticated(client, config.registry),
+        AuthConfig::Dev { actor_id } => OzonMcp::new(client, actor_id.clone(), registry),
+        AuthConfig::Jwt(jwt_config) => {
+            let authenticator = JwtAuthenticator::new(jwt_config.clone(), registry.clone())?;
+            OzonMcp::new_authenticated(client, registry, authenticator)
+        }
     }
     .with_preview_features(
         config.ozon_postings_vnext,
@@ -45,7 +48,7 @@ async fn main() -> Result<()> {
     );
 
     match config.transport {
-        TransportMode::Http => serve_http(config.bind, server, config.auth, registry).await,
+        TransportMode::Http => serve_http(config.bind, server).await,
         TransportMode::Stdio => {
             if matches!(config.auth, AuthConfig::Jwt(_)) {
                 anyhow::bail!("MCP_AUTH_MODE=jwt поддерживается только с MCP_TRANSPORT=http");
@@ -55,40 +58,26 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve_http(
-    bind: std::net::SocketAddr,
-    server: OzonMcp,
-    auth_config: AuthConfig,
-    registry: mcp_ozon::config::RegistrySource,
-) -> Result<()> {
+async fn serve_http(bind: std::net::SocketAddr, server: OzonMcp) -> Result<()> {
+    let protected_resource_metadata = server.protected_resource_metadata();
     let server = Arc::new(server);
     let service: StreamableHttpService<OzonMcp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok((*server).clone()),
         Default::default(),
         StreamableHttpServerConfig::default(),
     );
-    let router = match auth_config {
-        AuthConfig::Dev { .. } => Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .nest_service("/mcp", service),
-        AuthConfig::Jwt(config) => {
-            let authenticator = JwtAuthenticator::new(config, registry)?;
-            let metadata = authenticator.protected_resource_metadata();
-            let protected = Router::new()
-                .nest_service("/mcp", service)
-                .route_layer(middleware::from_fn_with_state(authenticator, require_jwt));
-            Router::new()
-                .route("/health", get(|| async { "ok" }))
-                .route(
-                    "/.well-known/oauth-protected-resource",
-                    get(move || {
-                        let metadata = metadata.clone();
-                        async move { Json(metadata) }
-                    }),
-                )
-                .merge(protected)
-        }
-    };
+    let mut router = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .nest_service("/mcp", service);
+    if let Some(metadata) = protected_resource_metadata {
+        router = router.route(
+            "/.well-known/oauth-protected-resource",
+            get(move || {
+                let metadata = metadata.clone();
+                async move { Json(metadata) }
+            }),
+        );
+    }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, endpoint = %format!("http://{bind}/mcp"), "MCP Ozon запущен");
 

@@ -1,6 +1,8 @@
 #!/bin/bash
 
 set -euo pipefail
+set +x
+umask 077
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 env_file="$project_dir/.keycloak.env"
@@ -11,7 +13,7 @@ resource_url="http://localhost:8788/mcp"
 metadata_url="http://127.0.0.1:8788/.well-known/oauth-protected-resource"
 resource_metadata_url="http://localhost:8788/.well-known/oauth-protected-resource"
 required_scope="mcp:tools"
-kcadm_config="/tmp/mcp-ozon-kcadm.config"
+kcadm_config="/tmp/mcp-ozon-kcadm.$$.config"
 actor_id="keycloak_e2e_manager"
 username="keycloak-e2e-manager"
 
@@ -64,13 +66,28 @@ smoke_dir="$(mktemp -d "${TMPDIR:-/tmp}/mcp-ozon-keycloak-smoke.XXXXXX")"
 chmod 700 "$smoke_dir"
 owns_test_user=false
 user_id=""
+session_id=""
 
 cleanup() {
+  terminate_mcp_session >/dev/null 2>&1 || true
   delete_test_user >/dev/null 2>&1 || true
   "${compose[@]}" exec -T keycloak rm -f "$kcadm_config" >/dev/null 2>&1 || true
   rm -rf "$smoke_dir"
 }
 trap cleanup EXIT
+
+terminate_mcp_session() {
+  if [[ -z "$session_id" ]]; then
+    return
+  fi
+  safe_curl --fail --silent --show-error \
+    --request DELETE \
+    --header "Mcp-Session-Id: $session_id" \
+    --header 'MCP-Protocol-Version: 2025-06-18' \
+    --output /dev/null \
+    "$mcp_url"
+  session_id=""
+}
 
 delete_test_user() {
   local remaining_users
@@ -233,32 +250,6 @@ cat "$smoke_dir/access-token" >>"$auth_header_file"
 printf '\n' >>"$auth_header_file"
 chmod 600 "$auth_header_file"
 
-without_token_headers="$smoke_dir/without-token.headers"
-without_token_status="$(
-  safe_curl --silent --output /dev/null --write-out '%{http_code}' \
-    --dump-header "$without_token_headers" \
-    "$mcp_url"
-)"
-if [[ "$without_token_status" != "401" ]]; then
-  echo "Expected MCP without JWT to return 401, got $without_token_status" >&2
-  exit 1
-fi
-if ! awk -v metadata="$resource_metadata_url" -v scope="$required_scope" '
-  BEGIN { found = 0 }
-  {
-    line = tolower($0)
-    expected_metadata = "resource_metadata=\"" tolower(metadata) "\""
-    expected_scope = "scope=\"" tolower(scope) "\""
-    if (index(line, "www-authenticate:") == 1 && index(line, "bearer") > 0 && index(line, expected_metadata) > 0 && index(line, expected_scope) > 0) {
-      found = 1
-    }
-  }
-  END { exit(found ? 0 : 1) }
-' "$without_token_headers"; then
-  echo "MCP 401 response did not contain the expected OAuth challenge" >&2
-  exit 1
-fi
-
 missing_scope_token_response="$smoke_dir/missing-scope-token.response.json"
 missing_scope_token_status="$(
   printf '%s' "$KEYCLOAK_TEST_USER_PASSWORD" \
@@ -287,15 +278,10 @@ printf 'Authorization: Bearer ' >"$missing_scope_header_file"
 cat "$smoke_dir/missing-scope-token" >>"$missing_scope_header_file"
 printf '\n' >>"$missing_scope_header_file"
 chmod 600 "$missing_scope_header_file"
-missing_scope_status="$(
-  safe_curl --silent --output /dev/null --write-out '%{http_code}' \
-    --header @"$missing_scope_header_file" \
-    "$mcp_url"
-)"
-if [[ "$missing_scope_status" != "401" ]]; then
-  echo "Expected MCP JWT without $required_scope to return 401, got $missing_scope_status" >&2
-  exit 1
-fi
+
+invalid_header_file="$smoke_dir/invalid-authorization.header"
+printf '%s\n' 'Authorization: Bearer not-a-jwt' >"$invalid_header_file"
+chmod 600 "$invalid_header_file"
 
 request() {
   local body="$1"
@@ -304,7 +290,6 @@ request() {
   shift 3
   safe_curl --fail --silent --show-error \
     --request POST \
-    --header @"$auth_header_file" \
     --header 'Accept: application/json, text/event-stream' \
     --header 'Content-Type: application/json' \
     "$@" \
@@ -325,6 +310,67 @@ json_response() {
   fi
 }
 
+assert_call_auth_error() {
+  local scenario="$1"
+  local request_id="$2"
+  local expected_error="$3"
+  local header_file="${4:-}"
+  local response_headers="$smoke_dir/$scenario.headers"
+  local response_body="$smoke_dir/$scenario.body"
+  local response_status
+  local response_json
+  local request_body
+  local curl_args=(
+    --silent
+    --show-error
+    --request POST
+    --header 'Accept: application/json, text/event-stream'
+    --header 'Content-Type: application/json'
+    --header "Mcp-Session-Id: $session_id"
+    --header 'MCP-Protocol-Version: 2025-06-18'
+  )
+
+  if [[ -n "$header_file" ]]; then
+    curl_args+=(--header @"$header_file")
+  fi
+  request_body="$(jq -cn --argjson id "$request_id" \
+    '{jsonrpc:"2.0", id:$id, method:"tools/call", params:{name:"list_members", arguments:{}}}')"
+  response_status="$(
+    safe_curl "${curl_args[@]}" \
+      --dump-header "$response_headers" \
+      --output "$response_body" \
+      --write-out '%{http_code}' \
+      --data "$request_body" \
+      "$mcp_url"
+  )"
+  chmod 600 "$response_headers" "$response_body"
+  if [[ "$response_status" != "200" ]]; then
+    echo "Expected $scenario tools/call to return HTTP 200, got $response_status" >&2
+    exit 1
+  fi
+  response_json="$(json_response "$response_body")"
+  jq -e \
+    --argjson expected_id "$request_id" \
+    --arg expected_error "$expected_error" \
+    --arg metadata "$resource_metadata_url" \
+    --arg scope "$required_scope" '
+      .jsonrpc == "2.0"
+      and .id == $expected_id
+      and (has("error") | not)
+      and .result.isError == true
+      and ((.result._meta["mcp/www_authenticate"] // null) as $challenges
+        | ($challenges | type) == "array"
+        and ($challenges | length) > 0
+        and any($challenges[];
+          type == "string"
+          and startswith("Bearer ")
+          and contains("resource_metadata=\"" + $metadata + "\"")
+          and contains("scope=\"" + $scope + "\"")
+          and contains("error=\"" + $expected_error + "\"")
+          and test("error_description=\"[^\"]+\"")))' \
+    <<<"$response_json" >/dev/null
+}
+
 initialize_headers="$smoke_dir/initialize.headers"
 initialize_body="$smoke_dir/initialize.body"
 request \
@@ -333,10 +379,11 @@ request \
   "$initialize_headers"
 
 json_response "$initialize_body" \
-  | jq -e '.result.serverInfo.name != null' >/dev/null
-session_id="$(awk 'BEGIN { IGNORECASE=1 } /^mcp-session-id:/ { gsub("\r", "", $2); print $2; exit }' "$initialize_headers")"
-if [[ -z "$session_id" ]]; then
-  echo "MCP initialize response did not contain mcp-session-id" >&2
+  | jq -e '.id == 1 and .result.serverInfo.name != null' >/dev/null
+session_id="$(awk 'tolower($1) == "mcp-session-id:" { gsub("\r", "", $2); print $2; exit }' "$initialize_headers")"
+if (( ${#session_id} < 1 || ${#session_id} > 256 )) \
+  || [[ ! "$session_id" =~ ^[-A-Za-z0-9._~]+$ ]]; then
+  echo "MCP initialize response did not contain a safe mcp-session-id" >&2
   exit 1
 fi
 
@@ -379,22 +426,44 @@ expected_tools='[
 ]'
 tools_json="$(json_response "$tools_body")"
 jq -e --argjson expected "$expected_tools" \
-  '([.result.tools[].name] | sort) == ($expected | sort)' \
+  '.id == 2 and ([.result.tools[].name] | sort) == ($expected | sort)' \
   <<<"$tools_json" >/dev/null
+
+stale_tools_headers="$smoke_dir/stale-tools.headers"
+stale_tools_body="$smoke_dir/stale-tools.body"
+request \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}' \
+  "$stale_tools_body" \
+  "$stale_tools_headers" \
+  --header @"$invalid_header_file" \
+  --header "Mcp-Session-Id: $session_id" \
+  --header 'MCP-Protocol-Version: 2025-06-18'
+jq -e --argjson expected "$expected_tools" \
+  '.id == 3 and ([.result.tools[].name] | sort) == ($expected | sort)' \
+  <<<"$(json_response "$stale_tools_body")" >/dev/null
+
+assert_call_auth_error missing-credentials 4 invalid_token
+assert_call_auth_error invalid-token 5 invalid_token "$invalid_header_file"
+# The local Keycloak workaround binds the resource audience to the optional mcp:tools scope.
+# Omitting that scope therefore also omits the required audience and is correctly invalid_token;
+# deterministic Rust/wire tests cover valid-audience tokens that lack only the required scope.
+assert_call_auth_error missing-scope 6 invalid_token "$missing_scope_header_file"
 
 members_headers="$smoke_dir/members.headers"
 members_body="$smoke_dir/members.body"
 request \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_members","arguments":{}}}' \
+  '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_members","arguments":{}}}' \
   "$members_body" \
   "$members_headers" \
+  --header @"$auth_header_file" \
   --header "Mcp-Session-Id: $session_id" \
   --header 'MCP-Protocol-Version: 2025-06-18'
 
 members_json="$(json_response "$members_body")"
 jq -e \
   --arg actor "$actor_id" \
-  '.result.isError != true
+  '.id == 7
+   and .result.isError != true
    and (.result.content[0].text | fromjson | .actor.id == $actor)
    and (.result.content[0].text | fromjson | .actor.role == "manager")
    and (.result.content[0].text | fromjson | .members | length == 1)
@@ -407,5 +476,6 @@ jq -e \
   <<<"$members_json" >/dev/null
 
 member_count="$(jq -r '.result.content[0].text | fromjson | .members | length' <<<"$members_json")"
+terminate_mcp_session
 delete_test_user
-echo "Keycloak JWT E2E passed: no-token=401, missing-scope=401, actor=$actor_id, visible_members=$member_count"
+echo "Keycloak JWT E2E passed: discovery is public; denied tools/call responses use MCP OAuth challenges; actor=$actor_id, visible_members=$member_count"
