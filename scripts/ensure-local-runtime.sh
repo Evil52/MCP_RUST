@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -eu
+set -euo pipefail
 
 profile_name="${TUNNEL_CLIENT_PROFILE:-ozon-local}"
 profile_dir="${TUNNEL_CLIENT_PROFILE_DIR:-$HOME/.config/tunnel-client}"
@@ -11,12 +11,47 @@ mcp_health_url="${MCP_HEALTH_URL:-http://127.0.0.1:8787/health}"
 mcp_server_url="${MCP_SERVER_URL:-http://127.0.0.1:8787/mcp}"
 tunnel_client="${TUNNEL_CLIENT_BIN:-$HOME/.local/bin/tunnel-client}"
 mcp_container_name="${MCP_CONTAINER_NAME:-mcp-ozon-server}"
+runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
+runtime_registry="$runtime_dir/access.json"
 lock_dir="${TMPDIR:-/tmp}/mcp-ozon-runtime-agent.lock"
 
 if ! mkdir "$lock_dir" 2>/dev/null; then
   exit 0
 fi
-trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+# shellcheck disable=SC2329 # Called indirectly by the EXIT trap.
+cleanup() {
+  rmdir "$lock_dir" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  runtime_mode_command=(/usr/bin/stat -f '%Lp')
+  runtime_owner_command=(/usr/bin/stat -f '%u')
+else
+  runtime_mode_command=(stat -c '%a')
+  runtime_owner_command=(stat -c '%u')
+fi
+
+if [[ -L "$runtime_dir" || ! -d "$runtime_dir" ]]; then
+  echo "persistent runtime directory is unavailable; rerun the installer" >&2
+  exit 1
+fi
+if [[ "$("${runtime_owner_command[@]}" "$runtime_dir")" != "$(id -u)" ]]; then
+  echo "persistent runtime directory is not owned by the current user" >&2
+  exit 1
+fi
+if [[ "$("${runtime_mode_command[@]}" "$runtime_dir")" != "700" ]]; then
+  echo "persistent runtime directory must have mode 700; rerun the installer" >&2
+  exit 1
+fi
+if [[ -L "$runtime_registry" || ! -f "$runtime_registry" ]]; then
+  echo "persistent runtime registry is unavailable; rerun the installer" >&2
+  exit 1
+fi
+if [[ "$("${runtime_mode_command[@]}" "$runtime_registry")" != "644" ]]; then
+  echo "persistent runtime registry must have mode 644 inside its private directory" >&2
+  exit 1
+fi
 
 docker_bin="${DOCKER_BIN:-$(command -v docker || true)}"
 if [[ -z "$docker_bin" ]]; then
@@ -58,8 +93,28 @@ if [[ ! -r "$profile_path" || ! -r "$runtime_key_path" ]]; then
   exit 1
 fi
 
+if ! "$docker_bin" container inspect "$mcp_container_name" >/dev/null 2>&1; then
+  echo "managed MCP container is unavailable; rerun the installer" >&2
+  exit 1
+fi
+mounted_registry="$(
+  "$docker_bin" container inspect \
+    --format '{{range .Mounts}}{{if eq .Destination "/etc/mcp-ozon/access.json"}}{{.Source}}{{end}}{{end}}' \
+    "$mcp_container_name" 2>/dev/null || true
+)"
+if [[ "$mounted_registry" != "$runtime_registry" ]]; then
+  echo "MCP container uses an unmanaged registry mount; rerun the installer" >&2
+  exit 1
+fi
 if ! /usr/bin/curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&1; then
-  "$docker_bin" start "$mcp_container_name" >/dev/null
+  container_running="$(
+    "$docker_bin" container inspect --format '{{.State.Running}}' "$mcp_container_name"
+  )"
+  if [[ "$container_running" == "true" ]]; then
+    "$docker_bin" restart "$mcp_container_name" >/dev/null
+  else
+    "$docker_bin" start "$mcp_container_name" >/dev/null
+  fi
 
   for _attempt in $(seq 1 60); do
     if /usr/bin/curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&1; then

@@ -18,7 +18,7 @@ services:
       - "127.0.0.1:8787:8787"
     volumes:
       - type: bind
-        source: ./config/access.json
+        source: ${MCP_ACCESS_CONFIG_HOST:-./config/access.json}
         target: /etc/mcp-ozon/access.json
         read_only: true
         bind:

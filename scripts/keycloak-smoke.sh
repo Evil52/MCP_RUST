@@ -501,7 +501,14 @@ expected_tools='[
   "wb_sales_funnel_grouped_history",
   "wb_warehouse_stocks",
   "wb_orders",
+  "wb_product_cards",
+  "wb_product_prices",
   "wb_sales",
+  "wb_tariff_boxes",
+  "wb_tariff_commissions",
+  "wb_tariff_pallets",
+  "wb_tariff_returns",
+  "wb_acceptance_coefficients",
   "wb_stores_status"
 ]'
 tools_json="$(json_response "$tools_body")"
