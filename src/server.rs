@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use chrono::{NaiveDate, Utc};
+use chrono::{NaiveDate, NaiveDateTime, Utc};
 use rmcp::{
     Json, RoleServer, ServerHandler,
     handler::server::{
@@ -86,7 +86,16 @@ fn is_sensitive_marketplace_field(field: &str) -> bool {
         || field.contains("passport")
         || matches!(
             field.as_str(),
-            "buyer" | "buyer_id" | "customer" | "customer_id" | "recipient" | "recipient_id"
+            "buyer"
+                | "buyer_id"
+                | "customer"
+                | "customer_id"
+                | "recipient"
+                | "recipient_id"
+                | "srid"
+                | "rid"
+                | "odid"
+                | "gnumber"
         )
 }
 
@@ -356,6 +365,17 @@ impl OzonMcp {
         format!(
             "{WB_TOOL_FAILURE}: kind={kind}; account={account}; endpoint={endpoint}; request_id={request_id}; message={error}. Остановите текущую операцию и не вызывайте автоматически другие WB-инструменты или кабинеты."
         )
+    }
+
+    fn wb_result(account_id: String, endpoint: &'static str, mut data: Value) -> Json<WbResult> {
+        redact_marketplace_pii(&mut data);
+        Json(WbResult {
+            account_id,
+            endpoint,
+            fetched_at: Utc::now().to_rfc3339(),
+            data_classification: UNTRUSTED_DATA_CLASSIFICATION,
+            data,
+        })
     }
 
     fn actor_status(actor: &Actor) -> ActorStatus {
@@ -772,6 +792,114 @@ pub struct WbSalesFunnelInput {
     #[serde(default)]
     #[schemars(range(max = 1_000_000))]
     pub offset: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WbAggregationLevel {
+    #[default]
+    Day,
+    Week,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbSalesFunnelHistoryInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(
+        description = "Начало периода в формате YYYY-MM-DD; WB хранит историю этого отчёта за последнюю неделю",
+        length(equal = 10)
+    )]
+    pub date_from: String,
+    #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
+    pub date_to: String,
+    #[schemars(length(min = 1, max = 20))]
+    pub nm_ids: Vec<u64>,
+    #[serde(default)]
+    pub skip_deleted_nm: bool,
+    #[serde(default)]
+    pub aggregation_level: WbAggregationLevel,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbSalesFunnelGroupedHistoryInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(
+        description = "Начало периода в формате YYYY-MM-DD; WB хранит историю этого отчёта за последнюю неделю",
+        length(equal = 10)
+    )]
+    pub date_from: String,
+    #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
+    pub date_to: String,
+    #[serde(default)]
+    #[schemars(length(max = 16), inner(length(min = 1, max = 128)))]
+    pub brand_names: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 16))]
+    pub subject_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(length(max = 16))]
+    pub tag_ids: Vec<u64>,
+    #[serde(default)]
+    pub skip_deleted_nm: bool,
+    #[serde(default)]
+    pub aggregation_level: WbAggregationLevel,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbWarehouseStocksInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000))]
+    pub nm_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000))]
+    pub chrt_ids: Vec<u64>,
+    #[serde(default = "default_product_limit")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub limit: u32,
+    #[serde(default)]
+    #[schemars(range(max = 1_000_000))]
+    pub offset: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbStatisticsReportInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(
+        description = "Дата изменения в формате YYYY-MM-DD или RFC3339",
+        length(min = 10, max = 64)
+    )]
+    pub date_from: String,
+    #[serde(default)]
+    #[schemars(
+        description = "0 — данные начиная с date_from; 1 — только данные за указанную дату изменения",
+        range(max = 1)
+    )]
+    pub flag: u8,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
@@ -1360,19 +1488,12 @@ impl OzonMcp {
     ) -> Result<Json<WbResult>, String> {
         let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
         let endpoint = "analytics:/ping";
-        let mut data = self
+        let data = self
             .wb_client
             .ping(&account)
             .await
             .map_err(|error| self.wb_error(&account, endpoint, error))?;
-        redact_marketplace_pii(&mut data);
-        Ok(Json(WbResult {
-            account_id: account,
-            endpoint,
-            fetched_at: Utc::now().to_rfc3339(),
-            data_classification: UNTRUSTED_DATA_CLASSIFICATION,
-            data,
-        }))
+        Ok(Self::wb_result(account, endpoint, data))
     }
 
     /// Получает read-only воронку продаж Wildberries по карточкам за выбранный период.
@@ -1400,7 +1521,7 @@ impl OzonMcp {
         validate_max_u32("offset", input.offset, MAX_OFFSET)?;
         let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
         let endpoint = "analytics:/api/analytics/v3/sales-funnel/products";
-        let mut data = self
+        let data = self
             .wb_client
             .sales_funnel(
                 &account,
@@ -1417,14 +1538,166 @@ impl OzonMcp {
             )
             .await
             .map_err(|error| self.wb_error(&account, endpoint, error))?;
-        redact_marketplace_pii(&mut data);
-        Ok(Json(WbResult {
-            account_id: account,
-            endpoint,
-            fetched_at: Utc::now().to_rfc3339(),
-            data_classification: UNTRUSTED_DATA_CLASSIFICATION,
-            data,
-        }))
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only динамику воронки Wildberries по товарам за период до семи дней.
+    #[tool(
+        name = "wb_sales_funnel_history",
+        annotations(title = "История воронки Wildberries", read_only_hint = true)
+    )]
+    async fn wb_sales_funnel_history(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbSalesFunnelHistoryInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_date_range(&input.date_from, &input.date_to, 7)?;
+        validate_count("nm_ids", input.nm_ids.len(), 1, 20)?;
+        validate_positive_ids("nm_ids", &input.nm_ids)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "analytics:/api/analytics/v3/sales-funnel/products/history";
+        let data = self
+            .wb_client
+            .sales_funnel_history(
+                &account,
+                json!({
+                    "selectedPeriod": { "start": input.date_from, "end": input.date_to },
+                    "nmIds": input.nm_ids,
+                    "skipDeletedNm": input.skip_deleted_nm,
+                    "aggregationLevel": input.aggregation_level,
+                }),
+            )
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only динамику воронки Wildberries по брендам, категориям и ярлыкам.
+    #[tool(
+        name = "wb_sales_funnel_grouped_history",
+        annotations(title = "Групповая история воронки Wildberries", read_only_hint = true)
+    )]
+    async fn wb_sales_funnel_grouped_history(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbSalesFunnelGroupedHistoryInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_date_range(&input.date_from, &input.date_to, 7)?;
+        validate_string_list("brand_names", &input.brand_names, 16, MAX_ENUM_VALUE_CHARS)?;
+        validate_count("subject_ids", input.subject_ids.len(), 0, 16)?;
+        validate_count("tag_ids", input.tag_ids.len(), 0, 16)?;
+        validate_positive_ids("subject_ids", &input.subject_ids)?;
+        validate_positive_ids("tag_ids", &input.tag_ids)?;
+        let combinations = input.brand_names.len().max(1)
+            * input.subject_ids.len().max(1)
+            * input.tag_ids.len().max(1);
+        if combinations > 16 {
+            return Err(
+                "произведение количества brand_names, subject_ids и tag_ids не может превышать 16"
+                    .to_owned(),
+            );
+        }
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "analytics:/api/analytics/v3/sales-funnel/grouped/history";
+        let data = self
+            .wb_client
+            .sales_funnel_grouped_history(
+                &account,
+                json!({
+                    "selectedPeriod": { "start": input.date_from, "end": input.date_to },
+                    "brandNames": input.brand_names,
+                    "subjectIds": input.subject_ids,
+                    "tagIds": input.tag_ids,
+                    "skipDeletedNm": input.skip_deleted_nm,
+                    "aggregationLevel": input.aggregation_level,
+                }),
+            )
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only текущие остатки товаров на складах Wildberries.
+    #[tool(
+        name = "wb_warehouse_stocks",
+        annotations(title = "Остатки Wildberries", read_only_hint = true)
+    )]
+    async fn wb_warehouse_stocks(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbWarehouseStocksInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_count("nm_ids", input.nm_ids.len(), 0, MAX_PRODUCT_FILTER_ITEMS)?;
+        validate_count(
+            "chrt_ids",
+            input.chrt_ids.len(),
+            0,
+            MAX_PRODUCT_FILTER_ITEMS,
+        )?;
+        validate_positive_ids("nm_ids", &input.nm_ids)?;
+        validate_positive_ids("chrt_ids", &input.chrt_ids)?;
+        validate_limit(input.limit, 1_000)?;
+        validate_max_u32("offset", input.offset, MAX_OFFSET)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "analytics:/api/analytics/v1/stocks-report/wb-warehouses";
+        let data = self
+            .wb_client
+            .warehouse_stocks(
+                &account,
+                json!({
+                    "nmIds": input.nm_ids,
+                    "chrtIds": input.chrt_ids,
+                    "limit": input.limit,
+                    "offset": input.offset,
+                }),
+            )
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only список заказов Wildberries, изменённых после date_from.
+    #[tool(
+        name = "wb_orders",
+        annotations(title = "Заказы Wildberries", read_only_hint = true)
+    )]
+    async fn wb_orders(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbStatisticsReportInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_wb_change_date(&input.date_from)?;
+        validate_flag(input.flag)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "statistics:/api/v1/supplier/orders";
+        let data = self
+            .wb_client
+            .orders(&account, input.date_from, input.flag)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only список продаж и возвратов Wildberries, изменённых после date_from.
+    #[tool(
+        name = "wb_sales",
+        annotations(title = "Продажи и возвраты Wildberries", read_only_hint = true)
+    )]
+    async fn wb_sales(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbStatisticsReportInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_wb_change_date(&input.date_from)?;
+        validate_flag(input.flag)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "statistics:/api/v1/supplier/sales";
+        let data = self
+            .wb_client
+            .sales(&account, input.date_from, input.flag)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
     }
 
     /// Показывает доступные текущему пользователю кабинеты Ozon и Wildberries и состояние их read-only интеграций.
@@ -2131,6 +2404,32 @@ fn validate_string_list(
     Ok(())
 }
 
+fn validate_positive_ids(field: &str, values: &[u64]) -> Result<(), String> {
+    if values.contains(&0) {
+        return Err(format!("{field} должен содержать только положительные ID"));
+    }
+    Ok(())
+}
+
+fn validate_wb_change_date(value: &str) -> Result<(), String> {
+    validate_non_blank("date_from", value)?;
+    validate_max_chars("date_from", value, 64)?;
+    if NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+        || chrono::DateTime::parse_from_rfc3339(value).is_ok()
+        || NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f").is_ok()
+    {
+        return Ok(());
+    }
+    Err("date_from должен иметь формат YYYY-MM-DD или RFC3339".to_owned())
+}
+
+fn validate_flag(flag: u8) -> Result<(), String> {
+    if flag > 1 {
+        return Err("flag должен быть равен 0 или 1".to_owned());
+    }
+    Ok(())
+}
+
 fn validate_max_u32(field: &str, value: u32, maximum: u32) -> Result<(), String> {
     if value > maximum {
         return Err(format!("{field} не может превышать {maximum}"));
@@ -2504,16 +2803,26 @@ mod tests {
         let pii = json!({
             "Status": "OK",
             "buyer": {"name": "Buyer Name"},
-            "rows": [{"recipient_phone": "+70000000000", "customerEmail": "b@example.test", "sum": 7}],
+            "rows": [{
+                "recipient_phone": "+70000000000",
+                "customerEmail": "b@example.test",
+                "srid": "private-srid",
+                "rid": "private-rid",
+                "odid": "private-odid",
+                "gNumber": "private-gnumber",
+                "sum": 7
+            }],
         })
         .to_string();
-        let (server, requests) =
-            mock_wb_server_with_responses("admin", vec![(200, pii.clone()), (200, pii)]);
+        let (server, requests) = mock_wb_server_with_responses(
+            "admin",
+            vec![(200, pii.clone()), (200, pii.clone()), (200, pii)],
+        );
 
         let ping = result_text(&call_tool_over_http(server.clone(), "wb_ping", json!({})).await);
         let funnel = result_text(
             &call_tool_over_http(
-                server,
+                server.clone(),
                 "wb_sales_funnel",
                 json!({
                     "account": "account_wb",
@@ -2530,20 +2839,32 @@ mod tests {
             )
             .await,
         );
+        let orders = result_text(
+            &call_tool_over_http(
+                server,
+                "wb_orders",
+                json!({"date_from": "2026-08-01", "flag": 0}),
+            )
+            .await,
+        );
 
-        for tool in [&ping, &funnel] {
+        for tool in [&ping, &funnel, &orders] {
             let data = &tool["data"];
             assert_eq!(data["Status"], json!("OK"));
             assert_eq!(data["buyer"], json!(REDACTED_VALUE));
             assert_eq!(data["rows"][0]["recipient_phone"], json!(REDACTED_VALUE));
             assert_eq!(data["rows"][0]["customerEmail"], json!(REDACTED_VALUE));
+            assert_eq!(data["rows"][0]["srid"], json!(REDACTED_VALUE));
+            assert_eq!(data["rows"][0]["rid"], json!(REDACTED_VALUE));
+            assert_eq!(data["rows"][0]["odid"], json!(REDACTED_VALUE));
+            assert_eq!(data["rows"][0]["gNumber"], json!(REDACTED_VALUE));
             assert_eq!(data["rows"][0]["sum"], json!(7));
             let rendered = tool.to_string();
             assert!(!rendered.contains("+70000000000"), "{rendered}");
             assert!(!rendered.contains("b@example.test"), "{rendered}");
             assert!(!rendered.contains("Buyer Name"), "{rendered}");
         }
-        for _ in 0..2 {
+        for _ in 0..3 {
             requests.recv_timeout(Duration::from_secs(2)).unwrap();
         }
     }
@@ -2559,7 +2880,7 @@ mod tests {
             serde_json::from_str(text).unwrap()
         }
 
-        let (server, requests) = mock_wb_server_for("admin", 2);
+        let (server, requests) = mock_wb_server_for("admin", 7);
         let status = call_tool_over_http(server.clone(), "wb_stores_status", json!({})).await;
         let status = result_text(&status);
         assert_eq!(status["default_account"], json!("account_wb"));
@@ -2575,7 +2896,7 @@ mod tests {
         );
 
         let funnel = call_tool_over_http(
-            server,
+            server.clone(),
             "wb_sales_funnel",
             json!({
                 "account": "account_wb",
@@ -2601,6 +2922,101 @@ mod tests {
             json!(UNTRUSTED_DATA_CLASSIFICATION)
         );
 
+        let history = result_text(
+            &call_tool_over_http(
+                server.clone(),
+                "wb_sales_funnel_history",
+                json!({
+                    "account": "account_wb",
+                    "date_from": "2026-08-04",
+                    "date_to": "2026-08-10",
+                    "nm_ids": [123456],
+                    "skip_deleted_nm": true,
+                    "aggregation_level": "day"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(
+            history["endpoint"],
+            json!("analytics:/api/analytics/v3/sales-funnel/products/history")
+        );
+
+        let grouped = result_text(
+            &call_tool_over_http(
+                server.clone(),
+                "wb_sales_funnel_grouped_history",
+                json!({
+                    "account": "account_wb",
+                    "date_from": "2026-08-04",
+                    "date_to": "2026-08-10",
+                    "brand_names": ["Example brand"],
+                    "subject_ids": [101],
+                    "tag_ids": [202],
+                    "skip_deleted_nm": false,
+                    "aggregation_level": "week"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(
+            grouped["endpoint"],
+            json!("analytics:/api/analytics/v3/sales-funnel/grouped/history")
+        );
+
+        let stocks = result_text(
+            &call_tool_over_http(
+                server.clone(),
+                "wb_warehouse_stocks",
+                json!({
+                    "account": "account_wb",
+                    "nm_ids": [123456],
+                    "chrt_ids": [654321],
+                    "limit": 100,
+                    "offset": 0
+                }),
+            )
+            .await,
+        );
+        assert_eq!(
+            stocks["endpoint"],
+            json!("analytics:/api/analytics/v1/stocks-report/wb-warehouses")
+        );
+
+        let orders = result_text(
+            &call_tool_over_http(
+                server.clone(),
+                "wb_orders",
+                json!({
+                    "account": "account_wb",
+                    "date_from": "2026-08-01T00:00:00Z",
+                    "flag": 0
+                }),
+            )
+            .await,
+        );
+        assert_eq!(
+            orders["endpoint"],
+            json!("statistics:/api/v1/supplier/orders")
+        );
+
+        let sales = result_text(
+            &call_tool_over_http(
+                server,
+                "wb_sales",
+                json!({
+                    "account": "account_wb",
+                    "date_from": "2026-08-02",
+                    "flag": 1
+                }),
+            )
+            .await,
+        );
+        assert_eq!(
+            sales["endpoint"],
+            json!("statistics:/api/v1/supplier/sales")
+        );
+
         let ping_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(ping_request.starts_with("GET /ping HTTP/1.1\r\n"));
         assert!(
@@ -2624,6 +3040,48 @@ mod tests {
                 "offset": 0
             })
         );
+        let history_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (path, body) = request_path_and_body(&history_request);
+        assert_eq!(path, "/api/analytics/v3/sales-funnel/products/history");
+        assert_eq!(
+            body,
+            json!({
+                "selectedPeriod": {"start": "2026-08-04", "end": "2026-08-10"},
+                "nmIds": [123456],
+                "skipDeletedNm": true,
+                "aggregationLevel": "day"
+            })
+        );
+        let grouped_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (path, body) = request_path_and_body(&grouped_request);
+        assert_eq!(path, "/api/analytics/v3/sales-funnel/grouped/history");
+        assert_eq!(
+            body,
+            json!({
+                "selectedPeriod": {"start": "2026-08-04", "end": "2026-08-10"},
+                "brandNames": ["Example brand"],
+                "subjectIds": [101],
+                "tagIds": [202],
+                "skipDeletedNm": false,
+                "aggregationLevel": "week"
+            })
+        );
+        let stocks_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (path, body) = request_path_and_body(&stocks_request);
+        assert_eq!(path, "/api/analytics/v1/stocks-report/wb-warehouses");
+        assert_eq!(
+            body,
+            json!({"nmIds": [123456], "chrtIds": [654321], "limit": 100, "offset": 0})
+        );
+        let orders_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(orders_request.starts_with(
+            "GET /api/v1/supplier/orders?dateFrom=2026-08-01T00%3A00%3A00Z&flag=0 HTTP/1.1\r\n"
+        ));
+        let sales_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            sales_request
+                .starts_with("GET /api/v1/supplier/sales?dateFrom=2026-08-02&flag=1 HTTP/1.1\r\n")
+        );
         assert!(requests.try_recv().is_err());
 
         let (manager, denied_requests) = mock_wb_server_for("manager", 0);
@@ -2639,13 +3097,21 @@ mod tests {
 
         let (errors, error_requests) = mock_wb_server_with_responses(
             "admin",
-            vec![(401, "{}".to_owned()), (403, "{}".to_owned())],
+            vec![
+                (401, "{}".to_owned()),
+                (403, "{}".to_owned()),
+                (500, "{}".to_owned()),
+                (500, "{}".to_owned()),
+                (500, "{}".to_owned()),
+                (500, "{}".to_owned()),
+                (500, "{}".to_owned()),
+            ],
         );
         let ping_error = call_tool_over_http(errors.clone(), "wb_ping", json!({})).await;
         assert!(ping_error.contains(WB_TOOL_FAILURE));
         assert!(ping_error.contains("kind=unauthorized"));
         let funnel_error = call_tool_over_http(
-            errors,
+            errors.clone(),
             "wb_sales_funnel",
             json!({
                 "date_from": "2026-08-01",
@@ -2657,9 +3123,159 @@ mod tests {
         .await;
         assert!(funnel_error.contains(WB_TOOL_FAILURE));
         assert!(funnel_error.contains("kind=forbidden"));
-        error_requests.recv_timeout(Duration::from_secs(1)).unwrap();
-        error_requests.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let history_error = call_tool_over_http(
+            errors.clone(),
+            "wb_sales_funnel_history",
+            json!({
+                "date_from": "2026-08-04",
+                "date_to": "2026-08-10",
+                "nm_ids": [123456]
+            }),
+        )
+        .await;
+        assert!(history_error.contains("kind=upstream_http_error"));
+        let grouped_error = call_tool_over_http(
+            errors.clone(),
+            "wb_sales_funnel_grouped_history",
+            json!({"date_from": "2026-08-04", "date_to": "2026-08-10"}),
+        )
+        .await;
+        assert!(grouped_error.contains("kind=upstream_http_error"));
+        let stocks_error = call_tool_over_http(
+            errors.clone(),
+            "wb_warehouse_stocks",
+            json!({"limit": 100, "offset": 0}),
+        )
+        .await;
+        assert!(stocks_error.contains("kind=upstream_http_error"));
+        let orders_error = call_tool_over_http(
+            errors.clone(),
+            "wb_orders",
+            json!({"date_from": "2026-08-01", "flag": 0}),
+        )
+        .await;
+        assert!(orders_error.contains("kind=upstream_http_error"));
+        let sales_error = call_tool_over_http(
+            errors,
+            "wb_sales",
+            json!({"date_from": "2026-08-01", "flag": 1}),
+        )
+        .await;
+        assert!(sales_error.contains("kind=upstream_http_error"));
+        for _ in 0..7 {
+            error_requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
         assert!(error_requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn wb_extended_inputs_fail_closed_before_network() {
+        let (server, requests) = mock_wb_server_for("admin", 0);
+
+        let history = WbSalesFunnelHistoryInput {
+            account: Some("account_wb".to_owned()),
+            date_from: "2026-08-01".to_owned(),
+            date_to: "2026-08-08".to_owned(),
+            nm_ids: vec![1],
+            skip_deleted_nm: false,
+            aggregation_level: WbAggregationLevel::Day,
+        };
+        let error = server
+            .wb_sales_funnel_history(RequestIdentity::dev(), Parameters(history))
+            .await
+            .err()
+            .expect("eight inclusive days must be rejected");
+        assert!(error.contains("7 дней"));
+
+        let history = WbSalesFunnelHistoryInput {
+            account: Some("account_wb".to_owned()),
+            date_from: "2026-08-04".to_owned(),
+            date_to: "2026-08-10".to_owned(),
+            nm_ids: vec![0],
+            skip_deleted_nm: false,
+            aggregation_level: WbAggregationLevel::Week,
+        };
+        let error = server
+            .wb_sales_funnel_history(RequestIdentity::dev(), Parameters(history))
+            .await
+            .err()
+            .expect("zero nm_id must be rejected");
+        assert!(error.contains("положительные ID"));
+
+        let grouped = WbSalesFunnelGroupedHistoryInput {
+            account: Some("account_wb".to_owned()),
+            date_from: "2026-08-04".to_owned(),
+            date_to: "2026-08-10".to_owned(),
+            brand_names: vec!["A".to_owned(); 5],
+            subject_ids: vec![1; 4],
+            tag_ids: Vec::new(),
+            skip_deleted_nm: false,
+            aggregation_level: WbAggregationLevel::Day,
+        };
+        let error = server
+            .wb_sales_funnel_grouped_history(RequestIdentity::dev(), Parameters(grouped))
+            .await
+            .err()
+            .expect("more than sixteen grouped combinations must be rejected");
+        assert!(error.contains("не может превышать 16"));
+
+        let stocks = WbWarehouseStocksInput {
+            account: Some("account_wb".to_owned()),
+            nm_ids: Vec::new(),
+            chrt_ids: vec![0],
+            limit: 100,
+            offset: 0,
+        };
+        let error = server
+            .wb_warehouse_stocks(RequestIdentity::dev(), Parameters(stocks))
+            .await
+            .err()
+            .expect("zero chrt_id must be rejected");
+        assert!(error.contains("положительные ID"));
+
+        let stocks = WbWarehouseStocksInput {
+            account: Some("account_wb".to_owned()),
+            nm_ids: Vec::new(),
+            chrt_ids: vec![1; MAX_PRODUCT_FILTER_ITEMS + 1],
+            limit: 100,
+            offset: 0,
+        };
+        let error = server
+            .wb_warehouse_stocks(RequestIdentity::dev(), Parameters(stocks))
+            .await
+            .err()
+            .expect("oversized chrt_ids must be rejected");
+        assert!(error.contains("chrt_ids"));
+
+        let report = WbStatisticsReportInput {
+            account: Some("account_wb".to_owned()),
+            date_from: "not-a-date".to_owned(),
+            flag: 0,
+        };
+        let error = server
+            .wb_orders(RequestIdentity::dev(), Parameters(report))
+            .await
+            .err()
+            .expect("malformed dateFrom must be rejected");
+        assert!(error.contains("RFC3339"));
+
+        let report = WbStatisticsReportInput {
+            account: Some("account_wb".to_owned()),
+            date_from: "2026-08-01T00:00:00".to_owned(),
+            flag: 2,
+        };
+        let error = server
+            .wb_sales(RequestIdentity::dev(), Parameters(report))
+            .await
+            .err()
+            .expect("flag outside 0..=1 must be rejected");
+        assert!(error.contains("0 или 1"));
+
+        assert!(validate_wb_change_date("2026-08-01").is_ok());
+        assert!(validate_wb_change_date("2026-08-01T00:00:00Z").is_ok());
+        assert!(validate_wb_change_date("2026-08-01T00:00:00").is_ok());
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2797,7 +3413,7 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
-        assert_eq!(dev_tools.len(), 20);
+        assert_eq!(dev_tools.len(), 25);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -2808,7 +3424,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 20);
+        assert_eq!(jwt_tools.len(), 25);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -2820,7 +3436,7 @@ mod tests {
             .with_preview_features(false, true)
             .tool_router
             .list_all();
-        assert_eq!(preview_tools.len(), 23);
+        assert_eq!(preview_tools.len(), 28);
         assert_policy(
             preview_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -2836,6 +3452,11 @@ mod tests {
             "wb_stores_status",
             "wb_ping",
             "wb_sales_funnel",
+            "wb_sales_funnel_history",
+            "wb_sales_funnel_grouped_history",
+            "wb_warehouse_stocks",
+            "wb_orders",
+            "wb_sales",
             "ozon_analytics",
             "ozon_product_stocks",
             "ozon_product_prices",
@@ -2866,7 +3487,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         let default_names = names(&server());
-        assert_eq!(default_names.len(), 20);
+        assert_eq!(default_names.len(), 25);
         assert!(preview_names.is_disjoint(&default_names));
         for name in STABLE_TOOL_NAMES {
             assert!(
@@ -2881,7 +3502,7 @@ mod tests {
         assert!(preview_names.is_disjoint(&names(&authenticated)));
 
         let enabled_names = names(&server().with_preview_features(false, true));
-        assert_eq!(enabled_names.len(), 23);
+        assert_eq!(enabled_names.len(), 28);
         assert!(preview_names.is_subset(&enabled_names));
         assert_eq!(
             enabled_names

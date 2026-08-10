@@ -497,6 +497,11 @@ expected_tools='[
   "ozon_stores_status",
   "wb_ping",
   "wb_sales_funnel",
+  "wb_sales_funnel_history",
+  "wb_sales_funnel_grouped_history",
+  "wb_warehouse_stocks",
+  "wb_orders",
+  "wb_sales",
   "wb_stores_status"
 ]'
 tools_json="$(json_response "$tools_body")"

@@ -7,7 +7,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use reqwest::{
-    Client, Method, Response, StatusCode,
+    Client, Method, Response, StatusCode, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER},
     redirect::Policy,
 };
@@ -20,8 +20,14 @@ use tokio::{
 use tracing::{info, warn};
 
 const ANALYTICS_API_BASE_URL: &str = "https://seller-analytics-api.wildberries.ru";
+const STATISTICS_API_BASE_URL: &str = "https://statistics-api.wildberries.ru";
 const PING_PATH: &str = "/ping";
 const SALES_FUNNEL_PATH: &str = "/api/analytics/v3/sales-funnel/products";
+const SALES_FUNNEL_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/products/history";
+const SALES_FUNNEL_GROUPED_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/grouped/history";
+const WAREHOUSE_STOCKS_PATH: &str = "/api/analytics/v1/stocks-report/wb-warehouses";
+const ORDERS_PATH: &str = "/api/v1/supplier/orders";
+const SALES_PATH: &str = "/api/v1/supplier/sales";
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
 const MAX_ATTEMPTS: usize = 3;
@@ -30,7 +36,8 @@ const MAX_IN_FLIGHT_REQUESTS_PER_TOKEN: usize = 4;
 const MAX_GLOBAL_IN_FLIGHT_REQUESTS: usize = 8;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const PING_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
-const SALES_FUNNEL_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
+const ANALYTICS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
+const STATISTICS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_LOGICAL_REQUEST_DURATION: Duration = Duration::from_secs(60);
@@ -44,8 +51,15 @@ const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Mirrors [`crate::ozon::READ_ONLY_ENDPOINT_ALLOWLIST`]: it is enforced inside
 /// [`WbClient::request`], the only place a WB request can leave the process, so
 /// adding a mutating call requires deliberately editing this list.
-const READ_ONLY_ENDPOINT_ALLOWLIST: &[(Method, &str)] =
-    &[(Method::GET, PING_PATH), (Method::POST, SALES_FUNNEL_PATH)];
+const READ_ONLY_ENDPOINT_ALLOWLIST: &[(Method, &str)] = &[
+    (Method::GET, PING_PATH),
+    (Method::POST, SALES_FUNNEL_PATH),
+    (Method::POST, SALES_FUNNEL_HISTORY_PATH),
+    (Method::POST, SALES_FUNNEL_GROUPED_HISTORY_PATH),
+    (Method::POST, WAREHOUSE_STOCKS_PATH),
+    (Method::GET, ORDERS_PATH),
+    (Method::GET, SALES_PATH),
+];
 
 #[derive(Clone)]
 pub struct WbCredentials {
@@ -197,11 +211,19 @@ impl WbError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestClass {
     AnalyticsPing,
-    SalesFunnel,
+    AnalyticsReport,
+    StatisticsReport,
 }
 
-const REQUEST_CLASS_BY_ALLOWLIST_INDEX: [RequestClass; READ_ONLY_ENDPOINT_ALLOWLIST.len()] =
-    [RequestClass::AnalyticsPing, RequestClass::SalesFunnel];
+const REQUEST_CLASS_BY_ALLOWLIST_INDEX: [RequestClass; READ_ONLY_ENDPOINT_ALLOWLIST.len()] = [
+    RequestClass::AnalyticsPing,
+    RequestClass::AnalyticsReport,
+    RequestClass::AnalyticsReport,
+    RequestClass::AnalyticsReport,
+    RequestClass::AnalyticsReport,
+    RequestClass::StatisticsReport,
+    RequestClass::StatisticsReport,
+];
 
 impl RequestClass {
     fn for_request(method: &Method, path: &str) -> Option<Self> {
@@ -217,7 +239,8 @@ impl RequestClass {
 #[derive(Debug, Clone, Copy)]
 struct ClientPolicy {
     ping_interval: Duration,
-    sales_funnel_interval: Duration,
+    analytics_interval: Duration,
+    statistics_interval: Duration,
     max_attempts: usize,
     base_retry_delay: Duration,
     max_retry_delay: Duration,
@@ -228,7 +251,8 @@ impl ClientPolicy {
     fn production(request_timeout: Duration) -> Self {
         Self {
             ping_interval: PING_MIN_REQUEST_INTERVAL,
-            sales_funnel_interval: SALES_FUNNEL_MIN_REQUEST_INTERVAL,
+            analytics_interval: ANALYTICS_MIN_REQUEST_INTERVAL,
+            statistics_interval: STATISTICS_MIN_REQUEST_INTERVAL,
             max_attempts: MAX_ATTEMPTS,
             base_retry_delay: BASE_RETRY_DELAY,
             max_retry_delay: MAX_RETRY_DELAY,
@@ -242,7 +266,8 @@ impl ClientPolicy {
     const fn immediate_single_attempt(logical_timeout: Duration) -> Self {
         Self {
             ping_interval: Duration::ZERO,
-            sales_funnel_interval: Duration::ZERO,
+            analytics_interval: Duration::ZERO,
+            statistics_interval: Duration::ZERO,
             max_attempts: 1,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -253,7 +278,8 @@ impl ClientPolicy {
     fn interval(self, request_class: RequestClass) -> Duration {
         match request_class {
             RequestClass::AnalyticsPing => self.ping_interval,
-            RequestClass::SalesFunnel => self.sales_funnel_interval,
+            RequestClass::AnalyticsReport => self.analytics_interval,
+            RequestClass::StatisticsReport => self.statistics_interval,
         }
     }
 }
@@ -287,7 +313,8 @@ impl PacingGate {
 struct TokenLimiter {
     in_flight: Semaphore,
     analytics_ping: PacingGate,
-    sales_funnel: PacingGate,
+    analytics_reports: PacingGate,
+    statistics_reports: PacingGate,
 }
 
 impl TokenLimiter {
@@ -295,14 +322,16 @@ impl TokenLimiter {
         Self {
             in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_TOKEN),
             analytics_ping: PacingGate::new(),
-            sales_funnel: PacingGate::new(),
+            analytics_reports: PacingGate::new(),
+            statistics_reports: PacingGate::new(),
         }
     }
 
     async fn pace(&self, request_class: RequestClass, interval: Duration) {
         match request_class {
             RequestClass::AnalyticsPing => self.analytics_ping.pace(interval).await,
-            RequestClass::SalesFunnel => self.sales_funnel.pace(interval).await,
+            RequestClass::AnalyticsReport => self.analytics_reports.pace(interval).await,
+            RequestClass::StatisticsReport => self.statistics_reports.pace(interval).await,
         }
     }
 }
@@ -311,6 +340,7 @@ impl TokenLimiter {
 pub struct WbClient {
     http: Client,
     analytics_base_url: String,
+    statistics_base_url: String,
     accounts: Arc<BTreeMap<String, WbCredentials>>,
     limiters: Arc<BTreeMap<String, Arc<TokenLimiter>>>,
     global_in_flight: Arc<Semaphore>,
@@ -323,6 +353,7 @@ impl WbClient {
         Self::build(
             timeout,
             accounts,
+            STATISTICS_API_BASE_URL,
             ANALYTICS_API_BASE_URL,
             ClientPolicy::production(timeout),
         )
@@ -332,12 +363,13 @@ impl WbClient {
     pub(crate) fn new_for_test(
         timeout: Duration,
         accounts: BTreeMap<String, WbCredentials>,
-        _common_base_url: &str,
+        common_base_url: &str,
         analytics_base_url: &str,
     ) -> Self {
         Self::build(
             timeout,
             accounts,
+            common_base_url,
             analytics_base_url,
             ClientPolicy::immediate_single_attempt(timeout),
         )
@@ -347,15 +379,16 @@ impl WbClient {
     fn new_for_test_with_policy(
         timeout: Duration,
         accounts: BTreeMap<String, WbCredentials>,
-        analytics_base_url: &str,
+        base_url: &str,
         policy: ClientPolicy,
     ) -> Self {
-        Self::build(timeout, accounts, analytics_base_url, policy)
+        Self::build(timeout, accounts, base_url, base_url, policy)
     }
 
     fn build(
         timeout: Duration,
         accounts: BTreeMap<String, WbCredentials>,
+        statistics_base_url: &str,
         analytics_base_url: &str,
         policy: ClientPolicy,
     ) -> Self {
@@ -392,6 +425,7 @@ impl WbClient {
         Self {
             http,
             analytics_base_url: analytics_base_url.trim_end_matches('/').to_owned(),
+            statistics_base_url: statistics_base_url.trim_end_matches('/').to_owned(),
             accounts: Arc::new(accounts),
             limiters: Arc::new(limiters),
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT_REQUESTS)),
@@ -413,8 +447,8 @@ impl WbClient {
             account,
             Method::GET,
             "analytics:/ping",
-            &self.analytics_base_url,
             PING_PATH,
+            None,
             None,
         )
         .await
@@ -425,15 +459,110 @@ impl WbClient {
             account,
             Method::POST,
             "analytics:/api/analytics/v3/sales-funnel/products",
-            &self.analytics_base_url,
             SALES_FUNNEL_PATH,
+            None,
             Some(payload),
         )
         .await
     }
 
+    pub async fn sales_funnel_history(
+        &self,
+        account: &str,
+        payload: Value,
+    ) -> Result<Value, WbError> {
+        self.request(
+            account,
+            Method::POST,
+            "analytics:/api/analytics/v3/sales-funnel/products/history",
+            SALES_FUNNEL_HISTORY_PATH,
+            None,
+            Some(payload),
+        )
+        .await
+    }
+
+    pub async fn sales_funnel_grouped_history(
+        &self,
+        account: &str,
+        payload: Value,
+    ) -> Result<Value, WbError> {
+        self.request(
+            account,
+            Method::POST,
+            "analytics:/api/analytics/v3/sales-funnel/grouped/history",
+            SALES_FUNNEL_GROUPED_HISTORY_PATH,
+            None,
+            Some(payload),
+        )
+        .await
+    }
+
+    pub async fn warehouse_stocks(&self, account: &str, payload: Value) -> Result<Value, WbError> {
+        self.request(
+            account,
+            Method::POST,
+            "analytics:/api/analytics/v1/stocks-report/wb-warehouses",
+            WAREHOUSE_STOCKS_PATH,
+            None,
+            Some(payload),
+        )
+        .await
+    }
+
+    pub async fn orders(
+        &self,
+        account: &str,
+        date_from: String,
+        flag: u8,
+    ) -> Result<Value, WbError> {
+        self.statistics_report(
+            account,
+            ORDERS_PATH,
+            "statistics:/api/v1/supplier/orders",
+            date_from,
+            flag,
+        )
+        .await
+    }
+
+    pub async fn sales(
+        &self,
+        account: &str,
+        date_from: String,
+        flag: u8,
+    ) -> Result<Value, WbError> {
+        self.statistics_report(
+            account,
+            SALES_PATH,
+            "statistics:/api/v1/supplier/sales",
+            date_from,
+            flag,
+        )
+        .await
+    }
+
+    async fn statistics_report(
+        &self,
+        account: &str,
+        path: &'static str,
+        endpoint: &'static str,
+        date_from: String,
+        flag: u8,
+    ) -> Result<Value, WbError> {
+        self.request(
+            account,
+            Method::GET,
+            endpoint,
+            path,
+            Some(vec![("dateFrom", date_from), ("flag", flag.to_string())]),
+            None,
+        )
+        .await
+    }
+
     /// Drives [`Self::request`] with an arbitrary method and path so the
-    /// read-only guard can be exercised. `ping` and `sales_funnel` are
+    /// read-only guard can be exercised. Public methods above are allowlisted
     /// allowlisted by construction and cannot reach the denial branch.
     #[cfg(test)]
     pub(crate) async fn request_for_test(
@@ -442,15 +571,8 @@ impl WbClient {
         method: Method,
         path: &'static str,
     ) -> Result<Value, WbError> {
-        self.request(
-            account,
-            method,
-            "test:endpoint",
-            &self.analytics_base_url,
-            path,
-            None,
-        )
-        .await
+        self.request(account, method, "test:endpoint", path, None, None)
+            .await
     }
 
     async fn request(
@@ -458,8 +580,8 @@ impl WbClient {
         account: &str,
         method: Method,
         endpoint: &'static str,
-        base_url: &str,
         path: &'static str,
+        query: Option<Vec<(&'static str, String)>>,
         payload: Option<Value>,
     ) -> Result<Value, WbError> {
         // Enforced here, at the only point where a WB request can leave the
@@ -470,7 +592,16 @@ impl WbClient {
                 path: path.to_owned(),
             });
         };
-        let url = format!("{base_url}{path}");
+        let base_url = match request_class {
+            RequestClass::AnalyticsPing | RequestClass::AnalyticsReport => &self.analytics_base_url,
+            RequestClass::StatisticsReport => &self.statistics_base_url,
+        };
+        let mut url = Url::parse(&format!("{base_url}{path}"))
+            .expect("static production or validated test WB base URL");
+        if let Some(query) = query {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let url = url.to_string();
         let credentials = self
             .accounts
             .get(account)
@@ -892,7 +1023,8 @@ mod tests {
     fn retrying_policy(logical_timeout: Duration) -> ClientPolicy {
         ClientPolicy {
             ping_interval: Duration::ZERO,
-            sales_funnel_interval: Duration::ZERO,
+            analytics_interval: Duration::ZERO,
+            statistics_interval: Duration::ZERO,
             max_attempts: 3,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -908,8 +1040,12 @@ mod tests {
             Duration::from_secs(10)
         );
         assert_eq!(
-            policy.interval(RequestClass::SalesFunnel),
+            policy.interval(RequestClass::AnalyticsReport),
             Duration::from_secs(20)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::StatisticsReport),
+            Duration::from_secs(60)
         );
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.logical_timeout, Duration::from_secs(10));
@@ -923,7 +1059,11 @@ mod tests {
         );
         assert_eq!(
             RequestClass::for_request(&Method::POST, SALES_FUNNEL_PATH),
-            Some(RequestClass::SalesFunnel)
+            Some(RequestClass::AnalyticsReport)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, ORDERS_PATH),
+            Some(RequestClass::StatisticsReport)
         );
         assert_eq!(
             RequestClass::for_request(&Method::GET, "/not-allowed"),
@@ -936,6 +1076,11 @@ mod tests {
         let (base_url, requests) = mock_http(vec![
             (200, r#"{"Status":"OK"}"#.to_owned()),
             (200, r#"{"data":{"products":[]}}"#.to_owned()),
+            (200, r#"[]"#.to_owned()),
+            (200, r#"{"data":[]}"#.to_owned()),
+            (200, r#"{"items":[]}"#.to_owned()),
+            (200, r#"[]"#.to_owned()),
+            (200, r#"[]"#.to_owned()),
         ]);
         let client = client(&format!("{base_url}/"));
         assert!(client.is_configured("account"));
@@ -950,6 +1095,41 @@ mod tests {
                 .unwrap()["data"]["products"],
             json!([])
         );
+        assert_eq!(
+            client
+                .sales_funnel_history("account", payload.clone())
+                .await
+                .unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            client
+                .sales_funnel_grouped_history("account", payload.clone())
+                .await
+                .unwrap()["data"],
+            json!([])
+        );
+        assert_eq!(
+            client
+                .warehouse_stocks("account", payload.clone())
+                .await
+                .unwrap()["items"],
+            json!([])
+        );
+        assert_eq!(
+            client
+                .orders("account", "2026-08-01T00:00:00Z".to_owned(), 0)
+                .await
+                .unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            client
+                .sales("account", "2026-08-01T00:00:00Z".to_owned(), 1)
+                .await
+                .unwrap(),
+            json!([])
+        );
 
         let ping = requests.recv().unwrap();
         assert!(ping.starts_with("GET /ping HTTP/1.1\r\n"));
@@ -961,8 +1141,31 @@ mod tests {
         assert!(funnel.starts_with("POST /api/analytics/v3/sales-funnel/products HTTP/1.1\r\n"));
         assert_eq!(
             serde_json::from_str::<Value>(funnel.split_once("\r\n\r\n").unwrap().1).unwrap(),
-            payload
+            payload.clone()
         );
+        for expected_path in [
+            SALES_FUNNEL_HISTORY_PATH,
+            SALES_FUNNEL_GROUPED_HISTORY_PATH,
+            WAREHOUSE_STOCKS_PATH,
+        ] {
+            let request = requests.recv().unwrap();
+            assert!(
+                request.starts_with(&format!("POST {expected_path} HTTP/1.1\r\n")),
+                "{request}"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(request.split_once("\r\n\r\n").unwrap().1).unwrap(),
+                payload
+            );
+        }
+        let orders = requests.recv().unwrap();
+        assert!(orders.starts_with(
+            "GET /api/v1/supplier/orders?dateFrom=2026-08-01T00%3A00%3A00Z&flag=0 HTTP/1.1\r\n"
+        ));
+        let sales = requests.recv().unwrap();
+        assert!(sales.starts_with(
+            "GET /api/v1/supplier/sales?dateFrom=2026-08-01T00%3A00%3A00Z&flag=1 HTTP/1.1\r\n"
+        ));
     }
 
     #[tokio::test]
@@ -1732,7 +1935,8 @@ mod tests {
             WbErrorKind::EndpointNotAllowed
         );
 
-        // The two allowlisted reads pass the guard and only then fail on the
+        // Every allowlisted read maps to an explicit quota class. The ping
+        // call below passes the guard and only then fails on the
         // network, which is what keeps this test honest.
         assert_eq!(
             RequestClass::for_request(&Method::GET, PING_PATH),
@@ -1740,8 +1944,24 @@ mod tests {
         );
         assert_eq!(
             RequestClass::for_request(&Method::POST, SALES_FUNNEL_PATH),
-            Some(RequestClass::SalesFunnel)
+            Some(RequestClass::AnalyticsReport)
         );
+        for path in [
+            SALES_FUNNEL_HISTORY_PATH,
+            SALES_FUNNEL_GROUPED_HISTORY_PATH,
+            WAREHOUSE_STOCKS_PATH,
+        ] {
+            assert_eq!(
+                RequestClass::for_request(&Method::POST, path),
+                Some(RequestClass::AnalyticsReport)
+            );
+        }
+        for path in [ORDERS_PATH, SALES_PATH] {
+            assert_eq!(
+                RequestClass::for_request(&Method::GET, path),
+                Some(RequestClass::StatisticsReport)
+            );
+        }
         assert_eq!(
             client.ping("account").await.unwrap_err().kind(),
             WbErrorKind::Network
