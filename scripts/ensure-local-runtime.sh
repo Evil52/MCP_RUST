@@ -13,7 +13,27 @@ tunnel_client="${TUNNEL_CLIENT_BIN:-$HOME/.local/bin/tunnel-client}"
 mcp_container_name="${MCP_CONTAINER_NAME:-mcp-ozon-server}"
 runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
 runtime_registry="$runtime_dir/access.json"
+tunnel_restart_state="$runtime_dir/tunnel-restart.state"
+tunnel_poll_stale_after_seconds="${TUNNEL_POLL_STALE_AFTER_SECONDS:-90}"
+tunnel_poll_startup_grace_seconds="${TUNNEL_POLL_STARTUP_GRACE_SECONDS:-75}"
+tunnel_restart_cooldown_seconds="${TUNNEL_RESTART_COOLDOWN_SECONDS:-300}"
 lock_dir="${TMPDIR:-/tmp}/mcp-ozon-runtime-agent.lock"
+
+if [[ ! "$tunnel_poll_stale_after_seconds" =~ ^[0-9]+$ ]] \
+  || ((tunnel_poll_stale_after_seconds < 45 || tunnel_poll_stale_after_seconds > 600)); then
+  echo "TUNNEL_POLL_STALE_AFTER_SECONDS must be an integer from 45 to 600" >&2
+  exit 1
+fi
+if [[ ! "$tunnel_poll_startup_grace_seconds" =~ ^[0-9]+$ ]] \
+  || ((tunnel_poll_startup_grace_seconds < 30 || tunnel_poll_startup_grace_seconds > 180)); then
+  echo "TUNNEL_POLL_STARTUP_GRACE_SECONDS must be an integer from 30 to 180" >&2
+  exit 1
+fi
+if [[ ! "$tunnel_restart_cooldown_seconds" =~ ^[0-9]+$ ]] \
+  || ((tunnel_restart_cooldown_seconds < 60 || tunnel_restart_cooldown_seconds > 3600)); then
+  echo "TUNNEL_RESTART_COOLDOWN_SECONDS must be an integer from 60 to 3600" >&2
+  exit 1
+fi
 
 if ! mkdir "$lock_dir" 2>/dev/null; then
   exit 0
@@ -93,6 +113,121 @@ if [[ ! -r "$profile_path" || ! -r "$runtime_key_path" ]]; then
   exit 1
 fi
 
+tunnel_health_base_url() {
+  local health_base_url
+
+  [[ -r "$health_url_file" ]] || return 1
+  health_base_url="$(tr -d '[:space:]' <"$health_url_file")"
+  [[ "$health_base_url" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] || return 1
+  printf '%s\n' "$health_base_url"
+}
+
+tunnel_local_ready() {
+  local health_base_url
+
+  health_base_url="$(tunnel_health_base_url)" || return 1
+  /usr/bin/curl --max-time 3 --fail --silent --show-error \
+    "$health_base_url/healthz" >/dev/null 2>&1 \
+    && /usr/bin/curl --max-time 3 --fail --silent --show-error \
+      "$health_base_url/readyz" >/dev/null 2>&1
+}
+
+tunnel_poll_is_fresh() {
+  local health_base_url last_success now poll_age
+
+  tunnel_local_ready || return 1
+  health_base_url="$(tunnel_health_base_url)" || return 1
+  if ! last_success="$(
+    /usr/bin/curl --max-time 3 --fail --silent --show-error \
+      "$health_base_url/metrics" 2>/dev/null \
+      | awk '/^commands_poll_last_successful_timestamp_seconds[{ ]/ {
+          printf "%.0f\n", $2
+        }'
+  )"; then
+    return 1
+  fi
+  [[ "$last_success" =~ ^[0-9]+$ ]] || return 1
+
+  now="$(date +%s)"
+  ((last_success > 0 && now >= last_success)) || return 1
+  poll_age=$((now - last_success))
+  ((poll_age <= tunnel_poll_stale_after_seconds))
+}
+
+tunnel_poll_is_fresh_or_starting() {
+  local health_base_url process_started now uptime
+
+  if tunnel_poll_is_fresh; then
+    return 0
+  fi
+  tunnel_local_ready || return 1
+  health_base_url="$(tunnel_health_base_url)" || return 1
+  if ! process_started="$(
+    /usr/bin/curl --max-time 3 --fail --silent --show-error \
+      "$health_base_url/metrics" 2>/dev/null \
+      | awk '/^process_start_time_seconds[ {]/ {
+          printf "%.0f\n", $2
+        }'
+  )"; then
+    return 1
+  fi
+  [[ "$process_started" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  ((process_started > 0 && now >= process_started)) || return 1
+  uptime=$((now - process_started))
+  ((uptime <= tunnel_poll_startup_grace_seconds))
+}
+
+openai_control_plane_preflight() {
+  local status
+
+  status="$(
+    /usr/bin/curl --noproxy '*' --connect-timeout 3 --max-time 6 \
+      --silent --output /dev/null --write-out '%{http_code}' \
+      https://api.openai.com/v1/models 2>/dev/null || true
+  )"
+  case "$status" in
+    401)
+      return 0
+      ;;
+    403)
+      echo "OpenAI control plane returned HTTP 403; check VPN route, region, and kill-switch" >&2
+      return 1
+      ;;
+    000 | "")
+      echo "OpenAI control plane is unreachable; check VPN and VPN-provided DNS" >&2
+      return 1
+      ;;
+    *)
+      echo "OpenAI control-plane preflight returned HTTP $status; tunnel restart suppressed" >&2
+      return 1
+      ;;
+  esac
+}
+
+tunnel_restart_is_allowed() {
+  local last_restart now elapsed
+
+  [[ -e "$tunnel_restart_state" ]] || return 0
+  [[ ! -L "$tunnel_restart_state" && -f "$tunnel_restart_state" ]] || return 1
+  last_restart="$(tr -d '[:space:]' <"$tunnel_restart_state")"
+  [[ "$last_restart" =~ ^[0-9]+$ ]] || return 1
+  now="$(date +%s)"
+  ((now >= last_restart)) || return 1
+  elapsed=$((now - last_restart))
+  ((elapsed >= tunnel_restart_cooldown_seconds))
+}
+
+record_tunnel_restart() {
+  local temporary_state
+
+  temporary_state="$runtime_dir/.tunnel-restart.$$.tmp"
+  umask 077
+  printf '%s\n' "$(date +%s)" >"$temporary_state"
+  chmod 600 "$temporary_state"
+  mv -f "$temporary_state" "$tunnel_restart_state"
+}
+
 if ! "$docker_bin" container inspect "$mcp_container_name" >/dev/null 2>&1; then
   echo "managed MCP container is unavailable; rerun the installer" >&2
   exit 1
@@ -129,13 +264,22 @@ if ! /usr/bin/curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&
   exit 1
 fi
 
-if [[ -r "$health_url_file" ]]; then
-  health_base_url="$(tr -d '[:space:]' <"$health_url_file")"
-  if [[ "$health_base_url" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] \
-    && /usr/bin/curl --fail --silent --show-error "$health_base_url/healthz" >/dev/null 2>&1 \
-    && /usr/bin/curl --fail --silent --show-error "$health_base_url/readyz" >/dev/null 2>&1; then
+if tunnel_poll_is_fresh_or_starting; then
+  exit 0
+fi
+
+if ! openai_control_plane_preflight; then
+  if tunnel_poll_is_fresh; then
     exit 0
   fi
+  exit 1
+fi
+if tunnel_poll_is_fresh; then
+  exit 0
+fi
+if ! tunnel_restart_is_allowed; then
+  echo "Tunnel poll is stale, but restart cooldown is active" >&2
+  exit 1
 fi
 
 tunnel_id="$(awk -F'"' '/"tunnel_id"[[:space:]]*:/ { print $4; exit }' "$profile_path")"
@@ -144,6 +288,7 @@ if [[ ! "$tunnel_id" =~ ^tunnel_[0-9a-f]{32}$ ]]; then
   exit 1
 fi
 
+record_tunnel_restart
 "$tunnel_client" runtimes stop "$profile_name" >/dev/null 2>&1 || true
 "$tunnel_client" doctor \
   --profile "$profile_name" \
@@ -157,16 +302,11 @@ fi
   --mcp-server-url "$mcp_server_url" >/dev/null
 
 for _attempt in $(seq 1 60); do
-  if [[ -r "$health_url_file" ]]; then
-    health_base_url="$(tr -d '[:space:]' <"$health_url_file")"
-    if [[ "$health_base_url" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] \
-      && /usr/bin/curl --fail --silent --show-error "$health_base_url/healthz" >/dev/null 2>&1 \
-      && /usr/bin/curl --fail --silent --show-error "$health_base_url/readyz" >/dev/null 2>&1; then
-      exit 0
-    fi
+  if tunnel_poll_is_fresh; then
+    exit 0
   fi
   sleep 1
 done
 
-echo "tunnel-client did not become ready" >&2
+echo "tunnel-client did not establish a fresh control-plane poll" >&2
 exit 1
