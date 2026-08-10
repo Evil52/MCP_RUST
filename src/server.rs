@@ -902,6 +902,145 @@ pub struct WbStatisticsReportInput {
     pub flag: u8,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WbLocale {
+    Ru,
+    En,
+    Zh,
+}
+
+impl WbLocale {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ru => "ru",
+            Self::En => "en",
+            Self::Zh => "zh",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbProductCardsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Язык полей ответа: ru, en или zh")]
+    pub locale: Option<WbLocale>,
+    #[serde(default = "default_true")]
+    pub ascending: bool,
+    #[serde(default)]
+    #[schemars(
+        description = "Фильтр фотографий: -1 — без фильтра, 0 — без фото, 1 — с фото",
+        range(min = -1, max = 1)
+    )]
+    pub with_photo: Option<i8>,
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 256))]
+    pub text_search: Option<String>,
+    #[serde(default)]
+    pub allowed_categories_only: Option<bool>,
+    #[serde(default)]
+    #[schemars(length(max = 100), inner(range(min = 1)))]
+    pub tag_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(length(max = 100), inner(range(min = 1)))]
+    pub object_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(length(max = 100), inner(length(min = 1, max = 128)))]
+    pub brands: Vec<String>,
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub imt_id: Option<u64>,
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 64))]
+    pub cursor_updated_at: Option<String>,
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub cursor_nm_id: Option<u64>,
+    #[serde(default = "default_wb_cards_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: u32,
+}
+
+fn default_wb_cards_limit() -> u32 {
+    50
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbProductPricesInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub nm_id: Option<u64>,
+    #[serde(default = "default_wb_prices_limit")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub limit: u32,
+    #[serde(default)]
+    #[schemars(range(max = 1_000_000))]
+    pub offset: u32,
+}
+
+fn default_wb_prices_limit() -> u32 {
+    1_000
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbTariffCommissionsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Язык названий категорий: ru, en или zh")]
+    pub locale: Option<WbLocale>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbTariffDateInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(description = "Дата тарифа в формате YYYY-MM-DD", length(equal = 10))]
+    pub date: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbAcceptanceCoefficientsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "До 100 уникальных положительных ID складов; пустой список означает все склады",
+        length(max = 100),
+        inner(range(min = 1))
+    )]
+    pub warehouse_ids: Vec<u64>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum SortDirection {
@@ -1700,6 +1839,167 @@ impl OzonMcp {
         Ok(Self::wb_result(account, endpoint, data))
     }
 
+    /// Получает read-only список карточек товаров Wildberries с безопасными фильтрами и курсором.
+    #[tool(
+        name = "wb_product_cards",
+        annotations(title = "Карточки товаров Wildberries", read_only_hint = true)
+    )]
+    async fn wb_product_cards(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbProductCardsInput>,
+    ) -> Result<Json<WbResult>, String> {
+        let payload = wb_product_cards_payload(&input)?;
+        let locale = input.locale.map(|locale| locale.as_str().to_owned());
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "content:/content/v2/get/cards/list";
+        let data = self
+            .wb_client
+            .product_cards(&account, locale, payload)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only текущие цены и скидки Wildberries без возможности их изменения.
+    #[tool(
+        name = "wb_product_prices",
+        annotations(title = "Цены товаров Wildberries", read_only_hint = true)
+    )]
+    async fn wb_product_prices(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbProductPricesInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_limit(input.limit, 1_000)?;
+        validate_max_u32("offset", input.offset, MAX_OFFSET)?;
+        if input.nm_id == Some(0) {
+            return Err("nm_id должен быть положительным ID".to_owned());
+        }
+        if input.nm_id.is_some() && input.offset != 0 {
+            return Err("offset должен быть равен 0 при фильтрации по nm_id".to_owned());
+        }
+        let limit = if input.nm_id.is_some() {
+            1
+        } else {
+            input.limit
+        };
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "prices:/api/v2/list/goods/filter";
+        let data = self
+            .wb_client
+            .product_prices(&account, input.nm_id, limit, input.offset)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only комиссии Wildberries по категориям товаров.
+    #[tool(
+        name = "wb_tariff_commissions",
+        annotations(title = "Комиссии Wildberries", read_only_hint = true)
+    )]
+    async fn wb_tariff_commissions(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbTariffCommissionsInput>,
+    ) -> Result<Json<WbResult>, String> {
+        let locale = input.locale.map(|locale| locale.as_str().to_owned());
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "common:/api/v1/tariffs/commission";
+        let data = self
+            .wb_client
+            .tariff_commissions(&account, locale)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only тарифы Wildberries для товаров в коробах на выбранную дату.
+    #[tool(
+        name = "wb_tariff_boxes",
+        annotations(title = "Тарифы Wildberries для коробов", read_only_hint = true)
+    )]
+    async fn wb_tariff_boxes(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbTariffDateInput>,
+    ) -> Result<Json<WbResult>, String> {
+        parse_date(&input.date, "date")?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "common:/api/v1/tariffs/box";
+        let data = self
+            .wb_client
+            .tariff_boxes(&account, input.date)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only тарифы Wildberries для товаров на монопаллетах на выбранную дату.
+    #[tool(
+        name = "wb_tariff_pallets",
+        annotations(title = "Тарифы Wildberries для монопаллет", read_only_hint = true)
+    )]
+    async fn wb_tariff_pallets(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbTariffDateInput>,
+    ) -> Result<Json<WbResult>, String> {
+        parse_date(&input.date, "date")?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "common:/api/v1/tariffs/pallet";
+        let data = self
+            .wb_client
+            .tariff_pallets(&account, input.date)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only тарифы Wildberries на возврат товаров продавцу на выбранную дату.
+    #[tool(
+        name = "wb_tariff_returns",
+        annotations(title = "Тарифы Wildberries на возврат", read_only_hint = true)
+    )]
+    async fn wb_tariff_returns(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbTariffDateInput>,
+    ) -> Result<Json<WbResult>, String> {
+        parse_date(&input.date, "date")?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "common:/api/v1/tariffs/return";
+        let data = self
+            .wb_client
+            .tariff_returns(&account, input.date)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Получает read-only коэффициенты приёмки поставок Wildberries на ближайшие 14 дней.
+    #[tool(
+        name = "wb_acceptance_coefficients",
+        annotations(title = "Коэффициенты приёмки Wildberries", read_only_hint = true)
+    )]
+    async fn wb_acceptance_coefficients(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbAcceptanceCoefficientsInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_count("warehouse_ids", input.warehouse_ids.len(), 0, 100)?;
+        validate_unique_positive_ids("warehouse_ids", &input.warehouse_ids)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "common:/api/tariffs/v1/acceptance/coefficients";
+        let data = self
+            .wb_client
+            .acceptance_coefficients(&account, input.warehouse_ids)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
     /// Показывает доступные текущему пользователю кабинеты Ozon и Wildberries и состояние их read-only интеграций.
     #[tool(
         name = "marketplace_accounts",
@@ -2409,6 +2709,113 @@ fn validate_positive_ids(field: &str, values: &[u64]) -> Result<(), String> {
         return Err(format!("{field} должен содержать только положительные ID"));
     }
     Ok(())
+}
+
+fn validate_unique_positive_ids(field: &str, values: &[u64]) -> Result<(), String> {
+    validate_positive_ids(field, values)?;
+    let unique = values
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique.len() != values.len() {
+        return Err(format!("{field} не должен содержать повторяющиеся ID"));
+    }
+    Ok(())
+}
+
+fn wb_product_cards_payload(input: &WbProductCardsInput) -> Result<Value, String> {
+    validate_limit(input.limit, 100)?;
+    if input
+        .with_photo
+        .is_some_and(|with_photo| !(-1..=1).contains(&with_photo))
+    {
+        return Err("with_photo должен быть равен -1, 0 или 1".to_owned());
+    }
+    if let Some(text_search) = input.text_search.as_deref() {
+        validate_non_blank("text_search", text_search)?;
+        validate_max_chars("text_search", text_search, MAX_IDENTIFIER_CHARS)?;
+        if text_search.trim() != text_search || text_search.chars().any(char::is_control) {
+            return Err(
+                "text_search не должен содержать управляющие символы или пробелы по краям"
+                    .to_owned(),
+            );
+        }
+    }
+    validate_count("tag_ids", input.tag_ids.len(), 0, 100)?;
+    validate_count("object_ids", input.object_ids.len(), 0, 100)?;
+    validate_positive_ids("tag_ids", &input.tag_ids)?;
+    validate_positive_ids("object_ids", &input.object_ids)?;
+    validate_string_list("brands", &input.brands, 100, MAX_ENUM_VALUE_CHARS)?;
+    if input
+        .brands
+        .iter()
+        .any(|brand| brand.trim() != brand || brand.chars().any(char::is_control))
+    {
+        return Err(
+            "brands не должен содержать управляющие символы или пробелы по краям".to_owned(),
+        );
+    }
+    if input.imt_id == Some(0) {
+        return Err("imt_id должен быть положительным ID".to_owned());
+    }
+    if input.cursor_nm_id == Some(0) {
+        return Err("cursor_nm_id должен быть положительным ID".to_owned());
+    }
+    match (&input.cursor_updated_at, input.cursor_nm_id) {
+        (Some(updated_at), Some(_)) => {
+            validate_max_chars("cursor_updated_at", updated_at, 64)?;
+            chrono::DateTime::parse_from_rfc3339(updated_at).map_err(|_| {
+                "cursor_updated_at должен иметь формат RFC3339 с часовым поясом".to_owned()
+            })?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "cursor_updated_at и cursor_nm_id должны передаваться только вместе".to_owned(),
+            );
+        }
+    }
+
+    let mut filter = serde_json::Map::new();
+    if let Some(with_photo) = input.with_photo {
+        filter.insert("withPhoto".to_owned(), json!(with_photo));
+    }
+    if let Some(text_search) = &input.text_search {
+        filter.insert("textSearch".to_owned(), json!(text_search));
+    }
+    if let Some(allowed_categories_only) = input.allowed_categories_only {
+        filter.insert(
+            "allowedCategoriesOnly".to_owned(),
+            json!(allowed_categories_only),
+        );
+    }
+    if !input.tag_ids.is_empty() {
+        filter.insert("tagIDs".to_owned(), json!(input.tag_ids));
+    }
+    if !input.object_ids.is_empty() {
+        filter.insert("objectIDs".to_owned(), json!(input.object_ids));
+    }
+    if !input.brands.is_empty() {
+        filter.insert("brands".to_owned(), json!(input.brands));
+    }
+    if let Some(imt_id) = input.imt_id {
+        filter.insert("imtID".to_owned(), json!(imt_id));
+    }
+
+    let mut cursor = serde_json::Map::new();
+    cursor.insert("limit".to_owned(), json!(input.limit));
+    if let (Some(updated_at), Some(nm_id)) = (&input.cursor_updated_at, input.cursor_nm_id) {
+        cursor.insert("updatedAt".to_owned(), json!(updated_at));
+        cursor.insert("nmID".to_owned(), json!(nm_id));
+    }
+
+    let mut settings = serde_json::Map::new();
+    settings.insert("sort".to_owned(), json!({ "ascending": input.ascending }));
+    if !filter.is_empty() {
+        settings.insert("filter".to_owned(), Value::Object(filter));
+    }
+    settings.insert("cursor".to_owned(), Value::Object(cursor));
+    Ok(json!({ "settings": settings }))
 }
 
 fn validate_wb_change_date(value: &str) -> Result<(), String> {
@@ -3170,6 +3577,421 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wb_catalog_p0_tools_send_only_exact_official_read_only_contracts() {
+        let (server, requests) = mock_wb_server_for("admin", 7);
+
+        let cards = server
+            .wb_product_cards(
+                RequestIdentity::dev(),
+                Parameters(WbProductCardsInput {
+                    account: Some("account_wb".to_owned()),
+                    locale: Some(WbLocale::Zh),
+                    ascending: false,
+                    with_photo: Some(-1),
+                    text_search: Some("Кресло".to_owned()),
+                    allowed_categories_only: Some(false),
+                    tag_ids: vec![11, 12],
+                    object_ids: vec![21],
+                    brands: vec!["OFK".to_owned()],
+                    imt_id: Some(31),
+                    cursor_updated_at: Some("2026-08-10T12:34:56Z".to_owned()),
+                    cursor_nm_id: Some(41),
+                    limit: 100,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(cards.endpoint, "content:/content/v2/get/cards/list");
+        assert_eq!(cards.data_classification, UNTRUSTED_DATA_CLASSIFICATION);
+
+        let prices = server
+            .wb_product_prices(
+                RequestIdentity::dev(),
+                Parameters(WbProductPricesInput {
+                    account: Some("account_wb".to_owned()),
+                    nm_id: Some(123_456),
+                    limit: 1_000,
+                    offset: 0,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(prices.endpoint, "prices:/api/v2/list/goods/filter");
+
+        let commissions = server
+            .wb_tariff_commissions(
+                RequestIdentity::dev(),
+                Parameters(WbTariffCommissionsInput {
+                    account: Some("account_wb".to_owned()),
+                    locale: Some(WbLocale::En),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(commissions.endpoint, "common:/api/v1/tariffs/commission");
+
+        for (endpoint, result) in [
+            (
+                "common:/api/v1/tariffs/box",
+                server
+                    .wb_tariff_boxes(
+                        RequestIdentity::dev(),
+                        Parameters(WbTariffDateInput {
+                            account: Some("account_wb".to_owned()),
+                            date: "2026-08-10".to_owned(),
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "common:/api/v1/tariffs/pallet",
+                server
+                    .wb_tariff_pallets(
+                        RequestIdentity::dev(),
+                        Parameters(WbTariffDateInput {
+                            account: Some("account_wb".to_owned()),
+                            date: "2026-08-11".to_owned(),
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            ),
+            (
+                "common:/api/v1/tariffs/return",
+                server
+                    .wb_tariff_returns(
+                        RequestIdentity::dev(),
+                        Parameters(WbTariffDateInput {
+                            account: Some("account_wb".to_owned()),
+                            date: "2026-08-12".to_owned(),
+                        }),
+                    )
+                    .await
+                    .unwrap(),
+            ),
+        ] {
+            assert_eq!(result.0.endpoint, endpoint);
+        }
+
+        let acceptance = server
+            .wb_acceptance_coefficients(
+                RequestIdentity::dev(),
+                Parameters(WbAcceptanceCoefficientsInput {
+                    account: Some("account_wb".to_owned()),
+                    warehouse_ids: vec![507, 117_501],
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            acceptance.endpoint,
+            "common:/api/tariffs/v1/acceptance/coefficients"
+        );
+
+        let cards_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (path, body) = request_path_and_body(&cards_request);
+        assert_eq!(path, "/content/v2/get/cards/list?locale=zh");
+        assert_eq!(
+            body,
+            json!({
+                "settings": {
+                    "sort": {"ascending": false},
+                    "filter": {
+                        "withPhoto": -1,
+                        "textSearch": "Кресло",
+                        "allowedCategoriesOnly": false,
+                        "tagIDs": [11, 12],
+                        "objectIDs": [21],
+                        "brands": ["OFK"],
+                        "imtID": 31
+                    },
+                    "cursor": {
+                        "updatedAt": "2026-08-10T12:34:56Z",
+                        "nmID": 41,
+                        "limit": 100
+                    }
+                }
+            })
+        );
+
+        let prices_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(prices_request.starts_with(
+            "GET /api/v2/list/goods/filter?limit=1&offset=0&filterNmID=123456 HTTP/1.1\r\n"
+        ));
+        let commissions_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            commissions_request
+                .starts_with("GET /api/v1/tariffs/commission?locale=en HTTP/1.1\r\n")
+        );
+        for expected in [
+            "/api/v1/tariffs/box?date=2026-08-10",
+            "/api/v1/tariffs/pallet?date=2026-08-11",
+            "/api/v1/tariffs/return?date=2026-08-12",
+        ] {
+            let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(
+                request.starts_with(&format!("GET {expected} HTTP/1.1\r\n")),
+                "{request}"
+            );
+        }
+        let acceptance_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acceptance_request.starts_with(
+            "GET /api/tariffs/v1/acceptance/coefficients?warehouseIDs=507%2C117501 HTTP/1.1\r\n"
+        ));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn wb_catalog_p0_omits_absent_filters_and_uses_safe_defaults() {
+        let (server, requests) = mock_wb_server_for("admin", 4);
+
+        server
+            .wb_product_cards(
+                RequestIdentity::dev(),
+                Parameters(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await
+            .unwrap();
+        server
+            .wb_product_prices(
+                RequestIdentity::dev(),
+                Parameters(serde_json::from_value(json!({"limit": 500, "offset": 2})).unwrap()),
+            )
+            .await
+            .unwrap();
+        server
+            .wb_tariff_commissions(
+                RequestIdentity::dev(),
+                Parameters(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await
+            .unwrap();
+        server
+            .wb_acceptance_coefficients(
+                RequestIdentity::dev(),
+                Parameters(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let cards_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (path, body) = request_path_and_body(&cards_request);
+        assert_eq!(path, "/content/v2/get/cards/list");
+        assert_eq!(
+            body,
+            json!({"settings":{"sort":{"ascending":true},"cursor":{"limit":50}}})
+        );
+        assert!(body.pointer("/settings/filter").is_none());
+        assert!(body.pointer("/settings/cursor/updatedAt").is_none());
+        assert!(body.pointer("/settings/cursor/nmID").is_none());
+
+        let prices_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            prices_request
+                .starts_with("GET /api/v2/list/goods/filter?limit=500&offset=2 HTTP/1.1\r\n")
+        );
+        let commissions_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(commissions_request.starts_with("GET /api/v1/tariffs/commission HTTP/1.1\r\n"));
+        let acceptance_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            acceptance_request
+                .starts_with("GET /api/tariffs/v1/acceptance/coefficients HTTP/1.1\r\n")
+        );
+        assert!(requests.try_recv().is_err());
+
+        assert_eq!(WbLocale::Ru.as_str(), "ru");
+        assert_eq!(WbLocale::En.as_str(), "en");
+        assert_eq!(WbLocale::Zh.as_str(), "zh");
+    }
+
+    #[tokio::test]
+    async fn wb_catalog_p0_invalid_inputs_fail_closed_before_network() {
+        let (server, requests) = mock_wb_server_for("admin", 0);
+        let cards = |value| serde_json::from_value::<WbProductCardsInput>(value).unwrap();
+        let prices = |value| serde_json::from_value::<WbProductPricesInput>(value).unwrap();
+
+        let unknown = call_tool_over_http(
+            server.clone(),
+            "wb_product_cards",
+            json!({"raw_path": "/api/v3/orders"}),
+        )
+        .await;
+        assert!(
+            unknown.contains("failed to deserialize parameters"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("unknown field `raw_path`"), "{unknown}");
+
+        for (input, expected) in [
+            (json!({"with_photo": 2}), "with_photo"),
+            (json!({"text_search": " bad"}), "text_search"),
+            (json!({"text_search": "bad\nline"}), "text_search"),
+            (json!({"text_search": "x".repeat(257)}), "text_search"),
+            (json!({"tag_ids": [0]}), "tag_ids"),
+            (json!({"object_ids": vec![1; 101]}), "object_ids"),
+            (json!({"brands": vec!["brand"; 101]}), "brands"),
+            (json!({"brands": [" bad"]}), "brands"),
+            (json!({"brands": ["bad\nbrand"]}), "brands"),
+            (json!({"imt_id": 0}), "imt_id"),
+            (json!({"cursor_nm_id": 0}), "cursor_nm_id"),
+            (
+                json!({"cursor_updated_at": "2026-08-10T12:00:00Z"}),
+                "только вместе",
+            ),
+            (
+                json!({"cursor_updated_at": "not-rfc3339", "cursor_nm_id": 1}),
+                "RFC3339",
+            ),
+            (json!({"limit": 0}), "limit"),
+        ] {
+            let error = server
+                .wb_product_cards(RequestIdentity::dev(), Parameters(cards(input)))
+                .await
+                .err()
+                .expect("invalid cards input must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        for (input, expected) in [
+            (json!({"nm_id": 0}), "nm_id"),
+            (json!({"nm_id": 1, "offset": 1}), "offset"),
+            (json!({"limit": 0}), "limit"),
+            (json!({"offset": MAX_OFFSET + 1}), "offset"),
+        ] {
+            let error = server
+                .wb_product_prices(RequestIdentity::dev(), Parameters(prices(input)))
+                .await
+                .err()
+                .expect("invalid prices input must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let date_error = server
+            .wb_tariff_boxes(
+                RequestIdentity::dev(),
+                Parameters(WbTariffDateInput {
+                    account: None,
+                    date: "10.08.2026".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .expect("malformed tariff date must be rejected");
+        assert!(date_error.contains("YYYY-MM-DD"));
+
+        for warehouse_ids in [vec![1; 101], vec![0], vec![1, 1]] {
+            let error = server
+                .wb_acceptance_coefficients(
+                    RequestIdentity::dev(),
+                    Parameters(WbAcceptanceCoefficientsInput {
+                        account: None,
+                        warehouse_ids,
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid warehouse IDs must be rejected");
+            assert!(error.contains("warehouse_ids"), "{error}");
+        }
+
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn wb_catalog_p0_handlers_preserve_structured_upstream_errors() {
+        let (server, requests) =
+            mock_wb_server_with_responses("admin", vec![(500, "{}".to_owned()); 7]);
+
+        let cards = server
+            .wb_product_cards(
+                RequestIdentity::dev(),
+                Parameters(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await
+            .err()
+            .expect("cards upstream error must propagate");
+        let prices = server
+            .wb_product_prices(
+                RequestIdentity::dev(),
+                Parameters(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await
+            .err()
+            .expect("prices upstream error must propagate");
+        let commissions = server
+            .wb_tariff_commissions(
+                RequestIdentity::dev(),
+                Parameters(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await
+            .err()
+            .expect("commissions upstream error must propagate");
+        let boxes = server
+            .wb_tariff_boxes(
+                RequestIdentity::dev(),
+                Parameters(WbTariffDateInput {
+                    account: None,
+                    date: "2026-08-10".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .expect("box tariff upstream error must propagate");
+        let pallets = server
+            .wb_tariff_pallets(
+                RequestIdentity::dev(),
+                Parameters(WbTariffDateInput {
+                    account: None,
+                    date: "2026-08-10".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .expect("pallet tariff upstream error must propagate");
+        let returns = server
+            .wb_tariff_returns(
+                RequestIdentity::dev(),
+                Parameters(WbTariffDateInput {
+                    account: None,
+                    date: "2026-08-10".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .expect("return tariff upstream error must propagate");
+        let acceptance = server
+            .wb_acceptance_coefficients(
+                RequestIdentity::dev(),
+                Parameters(serde_json::from_value(json!({})).unwrap()),
+            )
+            .await
+            .err()
+            .expect("acceptance upstream error must propagate");
+
+        for error in [
+            cards,
+            prices,
+            commissions,
+            boxes,
+            pallets,
+            returns,
+            acceptance,
+        ] {
+            assert!(error.contains(WB_TOOL_FAILURE), "{error}");
+            assert!(error.contains("kind=upstream_http_error"), "{error}");
+        }
+        for _ in 0..7 {
+            requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn wb_extended_inputs_fail_closed_before_network() {
         let (server, requests) = mock_wb_server_for("admin", 0);
 
@@ -3413,7 +4235,7 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
-        assert_eq!(dev_tools.len(), 25);
+        assert_eq!(dev_tools.len(), 32);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -3424,7 +4246,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 25);
+        assert_eq!(jwt_tools.len(), 32);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -3436,7 +4258,7 @@ mod tests {
             .with_preview_features(false, true)
             .tool_router
             .list_all();
-        assert_eq!(preview_tools.len(), 28);
+        assert_eq!(preview_tools.len(), 35);
         assert_policy(
             preview_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -3457,6 +4279,13 @@ mod tests {
             "wb_warehouse_stocks",
             "wb_orders",
             "wb_sales",
+            "wb_product_cards",
+            "wb_product_prices",
+            "wb_tariff_commissions",
+            "wb_tariff_boxes",
+            "wb_tariff_pallets",
+            "wb_tariff_returns",
+            "wb_acceptance_coefficients",
             "ozon_analytics",
             "ozon_product_stocks",
             "ozon_product_prices",
@@ -3487,7 +4316,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         let default_names = names(&server());
-        assert_eq!(default_names.len(), 25);
+        assert_eq!(default_names.len(), 32);
         assert!(preview_names.is_disjoint(&default_names));
         for name in STABLE_TOOL_NAMES {
             assert!(
@@ -3502,7 +4331,7 @@ mod tests {
         assert!(preview_names.is_disjoint(&names(&authenticated)));
 
         let enabled_names = names(&server().with_preview_features(false, true));
-        assert_eq!(enabled_names.len(), 28);
+        assert_eq!(enabled_names.len(), 35);
         assert!(preview_names.is_subset(&enabled_names));
         assert_eq!(
             enabled_names
@@ -3651,6 +4480,31 @@ mod tests {
                 "transaction_type"
             ]
         );
+
+        let cards = schema("wb_product_cards");
+        assert_eq!(cards["properties"]["limit"]["minimum"], json!(1));
+        assert_eq!(cards["properties"]["limit"]["maximum"], json!(100));
+        assert_eq!(cards["properties"]["with_photo"]["minimum"], json!(-1));
+        assert_eq!(cards["properties"]["with_photo"]["maximum"], json!(1));
+        let cards_schema = serde_json::to_string(cards.as_ref()).unwrap();
+        for locale in ["ru", "en", "zh"] {
+            assert!(cards_schema.contains(locale), "missing locale {locale}");
+        }
+
+        let prices = schema("wb_product_prices");
+        assert_eq!(prices["properties"]["limit"]["minimum"], json!(1));
+        assert_eq!(prices["properties"]["limit"]["maximum"], json!(1_000));
+        assert_eq!(prices["properties"]["offset"]["maximum"], json!(MAX_OFFSET));
+
+        let acceptance = schema("wb_acceptance_coefficients");
+        assert_eq!(
+            acceptance["properties"]["warehouse_ids"]["maxItems"],
+            json!(100)
+        );
+        assert_eq!(
+            acceptance["properties"]["warehouse_ids"]["items"]["minimum"],
+            json!(1)
+        );
     }
 
     #[test]
@@ -3699,6 +4553,27 @@ mod tests {
             );
         }
 
+        for tool in [
+            "wb_product_cards",
+            "wb_product_prices",
+            "wb_tariff_commissions",
+            "wb_tariff_boxes",
+            "wb_tariff_pallets",
+            "wb_tariff_returns",
+            "wb_acceptance_coefficients",
+        ] {
+            assert_eq!(
+                schema(tool)["properties"]["account"]["minLength"],
+                json!(1),
+                "{tool}"
+            );
+            assert_eq!(
+                schema(tool)["properties"]["account"]["maxLength"],
+                json!(MAX_STORE_SELECTOR_CHARS),
+                "{tool}"
+            );
+        }
+
         for (tool, fields) in [
             ("ozon_analytics", &["date_from", "date_to"][..]),
             ("ozon_fbs_postings", &["date_from", "date_to"][..]),
@@ -3710,6 +4585,9 @@ mod tests {
             ("ozon_seller_rating_history", &["date_from", "date_to"][..]),
             ("ozon_questions", &["date_from", "date_to"][..]),
             ("ozon_finance_accrual_by_day", &["date"][..]),
+            ("wb_tariff_boxes", &["date"][..]),
+            ("wb_tariff_pallets", &["date"][..]),
+            ("wb_tariff_returns", &["date"][..]),
         ] {
             let schema = schema(tool);
             for field in fields {
@@ -3752,6 +4630,26 @@ mod tests {
         assert_eq!(
             turnover["properties"]["skus"]["items"]["maxLength"],
             json!(MAX_IDENTIFIER_CHARS)
+        );
+
+        let cards = schema("wb_product_cards");
+        assert_eq!(cards["properties"]["text_search"]["minLength"], json!(1));
+        assert_eq!(
+            cards["properties"]["text_search"]["maxLength"],
+            json!(MAX_IDENTIFIER_CHARS)
+        );
+        assert_eq!(
+            cards["properties"]["cursor_updated_at"]["maxLength"],
+            json!(64)
+        );
+        for field in ["tag_ids", "object_ids"] {
+            assert_eq!(cards["properties"][field]["maxItems"], json!(100));
+            assert_eq!(cards["properties"][field]["items"]["minimum"], json!(1));
+        }
+        assert_eq!(cards["properties"]["brands"]["maxItems"], json!(100));
+        assert_eq!(
+            cards["properties"]["brands"]["items"]["maxLength"],
+            json!(MAX_ENUM_VALUE_CHARS)
         );
 
         let postings = schema("ozon_fbs_postings");
@@ -3843,6 +4741,7 @@ mod tests {
             ("ozon_stock_turnover", "offset"),
             ("ozon_fbs_postings", "offset"),
             ("ozon_fbo_postings", "offset"),
+            ("wb_product_prices", "offset"),
         ] {
             assert_eq!(
                 schema(tool)["properties"][field]["maximum"],

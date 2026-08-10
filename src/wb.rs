@@ -21,6 +21,9 @@ use tracing::{info, warn};
 
 const ANALYTICS_API_BASE_URL: &str = "https://seller-analytics-api.wildberries.ru";
 const STATISTICS_API_BASE_URL: &str = "https://statistics-api.wildberries.ru";
+const CONTENT_API_BASE_URL: &str = "https://content-api.wildberries.ru";
+const PRICES_API_BASE_URL: &str = "https://discounts-prices-api.wildberries.ru";
+const COMMON_API_BASE_URL: &str = "https://common-api.wildberries.ru";
 const PING_PATH: &str = "/ping";
 const SALES_FUNNEL_PATH: &str = "/api/analytics/v3/sales-funnel/products";
 const SALES_FUNNEL_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/products/history";
@@ -28,6 +31,13 @@ const SALES_FUNNEL_GROUPED_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/
 const WAREHOUSE_STOCKS_PATH: &str = "/api/analytics/v1/stocks-report/wb-warehouses";
 const ORDERS_PATH: &str = "/api/v1/supplier/orders";
 const SALES_PATH: &str = "/api/v1/supplier/sales";
+const PRODUCT_CARDS_PATH: &str = "/content/v2/get/cards/list";
+const PRODUCT_PRICES_PATH: &str = "/api/v2/list/goods/filter";
+const TARIFF_COMMISSIONS_PATH: &str = "/api/v1/tariffs/commission";
+const TARIFF_BOXES_PATH: &str = "/api/v1/tariffs/box";
+const TARIFF_PALLETS_PATH: &str = "/api/v1/tariffs/pallet";
+const TARIFF_RETURNS_PATH: &str = "/api/v1/tariffs/return";
+const ACCEPTANCE_COEFFICIENTS_PATH: &str = "/api/tariffs/v1/acceptance/coefficients";
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
 const MAX_ATTEMPTS: usize = 3;
@@ -38,6 +48,11 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 const PING_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
 const ANALYTICS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
 const STATISTICS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
+const CONTENT_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(600);
+const PRICES_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(600);
+const COMMISSION_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
+const LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
+const ACCEPTANCE_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_LOGICAL_REQUEST_DURATION: Duration = Duration::from_secs(60);
@@ -45,20 +60,129 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Every Wildberries request this process is allowed to make, as an exact
-/// `(method, path)` pair.
+/// Fixed Wildberries hosts. There is deliberately no host supplied by callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiHost {
+    Analytics,
+    Statistics,
+    Content,
+    Prices,
+    Common,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestClass {
+    AnalyticsPing,
+    AnalyticsReport,
+    StatisticsReport,
+    ContentReport,
+    PricesReport,
+    CommissionTariff,
+    LogisticsTariff,
+    AcceptanceTariff,
+}
+
+/// Single source of truth for every request that may leave this process.
+/// Method, exact path, fixed host and quota bucket live in the same record so
+/// extending one dimension cannot silently drift out of sync with another.
+#[derive(Debug)]
+struct EndpointPolicy {
+    method: Method,
+    path: &'static str,
+    host: ApiHost,
+    request_class: RequestClass,
+}
+
+/// Every Wildberries request this process is allowed to make.
 ///
 /// Mirrors [`crate::ozon::READ_ONLY_ENDPOINT_ALLOWLIST`]: it is enforced inside
 /// [`WbClient::request`], the only place a WB request can leave the process, so
 /// adding a mutating call requires deliberately editing this list.
-const READ_ONLY_ENDPOINT_ALLOWLIST: &[(Method, &str)] = &[
-    (Method::GET, PING_PATH),
-    (Method::POST, SALES_FUNNEL_PATH),
-    (Method::POST, SALES_FUNNEL_HISTORY_PATH),
-    (Method::POST, SALES_FUNNEL_GROUPED_HISTORY_PATH),
-    (Method::POST, WAREHOUSE_STOCKS_PATH),
-    (Method::GET, ORDERS_PATH),
-    (Method::GET, SALES_PATH),
+const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
+    EndpointPolicy {
+        method: Method::GET,
+        path: PING_PATH,
+        host: ApiHost::Analytics,
+        request_class: RequestClass::AnalyticsPing,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: SALES_FUNNEL_PATH,
+        host: ApiHost::Analytics,
+        request_class: RequestClass::AnalyticsReport,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: SALES_FUNNEL_HISTORY_PATH,
+        host: ApiHost::Analytics,
+        request_class: RequestClass::AnalyticsReport,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: SALES_FUNNEL_GROUPED_HISTORY_PATH,
+        host: ApiHost::Analytics,
+        request_class: RequestClass::AnalyticsReport,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: WAREHOUSE_STOCKS_PATH,
+        host: ApiHost::Analytics,
+        request_class: RequestClass::AnalyticsReport,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: ORDERS_PATH,
+        host: ApiHost::Statistics,
+        request_class: RequestClass::StatisticsReport,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: SALES_PATH,
+        host: ApiHost::Statistics,
+        request_class: RequestClass::StatisticsReport,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: PRODUCT_CARDS_PATH,
+        host: ApiHost::Content,
+        request_class: RequestClass::ContentReport,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: PRODUCT_PRICES_PATH,
+        host: ApiHost::Prices,
+        request_class: RequestClass::PricesReport,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: TARIFF_COMMISSIONS_PATH,
+        host: ApiHost::Common,
+        request_class: RequestClass::CommissionTariff,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: TARIFF_BOXES_PATH,
+        host: ApiHost::Common,
+        request_class: RequestClass::LogisticsTariff,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: TARIFF_PALLETS_PATH,
+        host: ApiHost::Common,
+        request_class: RequestClass::LogisticsTariff,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: TARIFF_RETURNS_PATH,
+        host: ApiHost::Common,
+        request_class: RequestClass::LogisticsTariff,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: ACCEPTANCE_COEFFICIENTS_PATH,
+        host: ApiHost::Common,
+        request_class: RequestClass::AcceptanceTariff,
+    },
 ];
 
 #[derive(Clone)]
@@ -125,6 +249,10 @@ pub enum WbError {
         request_id: Option<String>,
         retry_after: Option<Duration>,
     },
+    #[error(
+        "локальный лимит частоты запросов WB ещё не восстановлен (retry-after: {retry_after:?})"
+    )]
+    LocalRateLimited { retry_after: Duration },
     #[error("WB API вернул HTTP {status} (request-id: {request_id:?})")]
     Api {
         status: StatusCode,
@@ -180,7 +308,7 @@ impl WbError {
             Self::MissingCredentials(_) => WbErrorKind::MissingCredentials,
             Self::Unauthorized { .. } => WbErrorKind::Unauthorized,
             Self::Forbidden { .. } => WbErrorKind::Forbidden,
-            Self::RateLimited { .. } => WbErrorKind::RateLimited,
+            Self::RateLimited { .. } | Self::LocalRateLimited { .. } => WbErrorKind::RateLimited,
             Self::Api { .. } => WbErrorKind::Http,
             Self::Timeout { .. } | Self::DeadlineExceeded => WbErrorKind::Timeout,
             Self::Network { .. } => WbErrorKind::Network,
@@ -202,37 +330,25 @@ impl WbError {
             | Self::ResponseTooLarge { request_id, .. } => request_id.as_deref(),
             Self::EndpointNotAllowed { .. }
             | Self::MissingCredentials(_)
+            | Self::LocalRateLimited { .. }
             | Self::DeadlineExceeded
             | Self::Overloaded => None,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RequestClass {
-    AnalyticsPing,
-    AnalyticsReport,
-    StatisticsReport,
-}
-
-const REQUEST_CLASS_BY_ALLOWLIST_INDEX: [RequestClass; READ_ONLY_ENDPOINT_ALLOWLIST.len()] = [
-    RequestClass::AnalyticsPing,
-    RequestClass::AnalyticsReport,
-    RequestClass::AnalyticsReport,
-    RequestClass::AnalyticsReport,
-    RequestClass::AnalyticsReport,
-    RequestClass::StatisticsReport,
-    RequestClass::StatisticsReport,
-];
-
-impl RequestClass {
-    fn for_request(method: &Method, path: &str) -> Option<Self> {
+impl EndpointPolicy {
+    fn for_request(method: &Method, path: &str) -> Option<&'static Self> {
         READ_ONLY_ENDPOINT_ALLOWLIST
             .iter()
-            .position(|(allowed_method, allowed_path)| {
-                allowed_method == method && *allowed_path == path
-            })
-            .and_then(|index| REQUEST_CLASS_BY_ALLOWLIST_INDEX.get(index).copied())
+            .find(|policy| policy.method == *method && policy.path == path)
+    }
+}
+
+impl RequestClass {
+    #[cfg(test)]
+    fn for_request(method: &Method, path: &str) -> Option<Self> {
+        EndpointPolicy::for_request(method, path).map(|policy| policy.request_class)
     }
 }
 
@@ -241,6 +357,11 @@ struct ClientPolicy {
     ping_interval: Duration,
     analytics_interval: Duration,
     statistics_interval: Duration,
+    content_interval: Duration,
+    prices_interval: Duration,
+    commission_interval: Duration,
+    logistics_tariff_interval: Duration,
+    acceptance_interval: Duration,
     max_attempts: usize,
     base_retry_delay: Duration,
     max_retry_delay: Duration,
@@ -253,6 +374,11 @@ impl ClientPolicy {
             ping_interval: PING_MIN_REQUEST_INTERVAL,
             analytics_interval: ANALYTICS_MIN_REQUEST_INTERVAL,
             statistics_interval: STATISTICS_MIN_REQUEST_INTERVAL,
+            content_interval: CONTENT_MIN_REQUEST_INTERVAL,
+            prices_interval: PRICES_MIN_REQUEST_INTERVAL,
+            commission_interval: COMMISSION_MIN_REQUEST_INTERVAL,
+            logistics_tariff_interval: LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL,
+            acceptance_interval: ACCEPTANCE_MIN_REQUEST_INTERVAL,
             max_attempts: MAX_ATTEMPTS,
             base_retry_delay: BASE_RETRY_DELAY,
             max_retry_delay: MAX_RETRY_DELAY,
@@ -268,6 +394,11 @@ impl ClientPolicy {
             ping_interval: Duration::ZERO,
             analytics_interval: Duration::ZERO,
             statistics_interval: Duration::ZERO,
+            content_interval: Duration::ZERO,
+            prices_interval: Duration::ZERO,
+            commission_interval: Duration::ZERO,
+            logistics_tariff_interval: Duration::ZERO,
+            acceptance_interval: Duration::ZERO,
             max_attempts: 1,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -280,6 +411,11 @@ impl ClientPolicy {
             RequestClass::AnalyticsPing => self.ping_interval,
             RequestClass::AnalyticsReport => self.analytics_interval,
             RequestClass::StatisticsReport => self.statistics_interval,
+            RequestClass::ContentReport => self.content_interval,
+            RequestClass::PricesReport => self.prices_interval,
+            RequestClass::CommissionTariff => self.commission_interval,
+            RequestClass::LogisticsTariff => self.logistics_tariff_interval,
+            RequestClass::AcceptanceTariff => self.acceptance_interval,
         }
     }
 }
@@ -307,6 +443,19 @@ impl PacingGate {
         }
         *next_allowed = Instant::now() + interval;
     }
+
+    /// Reserves a slot only when it is available now. This is used for
+    /// minute-scale quotas where queueing would consume the complete logical
+    /// request deadline before any network attempt can start.
+    async fn try_pace(&self, interval: Duration) -> Result<(), Duration> {
+        let mut next_allowed = self.next_allowed.lock().await;
+        let wait = next_allowed.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            return Err(wait);
+        }
+        *next_allowed = Instant::now() + interval;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -315,6 +464,11 @@ struct TokenLimiter {
     analytics_ping: PacingGate,
     analytics_reports: PacingGate,
     statistics_reports: PacingGate,
+    content_reports: PacingGate,
+    prices_reports: PacingGate,
+    commission_tariffs: PacingGate,
+    logistics_tariffs: PacingGate,
+    acceptance_tariffs: PacingGate,
 }
 
 impl TokenLimiter {
@@ -324,14 +478,74 @@ impl TokenLimiter {
             analytics_ping: PacingGate::new(),
             analytics_reports: PacingGate::new(),
             statistics_reports: PacingGate::new(),
+            content_reports: PacingGate::new(),
+            prices_reports: PacingGate::new(),
+            commission_tariffs: PacingGate::new(),
+            logistics_tariffs: PacingGate::new(),
+            acceptance_tariffs: PacingGate::new(),
         }
     }
 
-    async fn pace(&self, request_class: RequestClass, interval: Duration) {
+    async fn pace(&self, request_class: RequestClass, interval: Duration) -> Result<(), WbError> {
         match request_class {
             RequestClass::AnalyticsPing => self.analytics_ping.pace(interval).await,
             RequestClass::AnalyticsReport => self.analytics_reports.pace(interval).await,
             RequestClass::StatisticsReport => self.statistics_reports.pace(interval).await,
+            RequestClass::ContentReport => self.content_reports.pace(interval).await,
+            RequestClass::PricesReport => self.prices_reports.pace(interval).await,
+            RequestClass::CommissionTariff => {
+                return self
+                    .commission_tariffs
+                    .try_pace(interval)
+                    .await
+                    .map_err(|retry_after| WbError::LocalRateLimited { retry_after });
+            }
+            RequestClass::LogisticsTariff => self.logistics_tariffs.pace(interval).await,
+            RequestClass::AcceptanceTariff => self.acceptance_tariffs.pace(interval).await,
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BaseUrls {
+    analytics: String,
+    statistics: String,
+    content: String,
+    prices: String,
+    common: String,
+}
+
+impl BaseUrls {
+    fn production() -> Self {
+        Self {
+            analytics: ANALYTICS_API_BASE_URL.to_owned(),
+            statistics: STATISTICS_API_BASE_URL.to_owned(),
+            content: CONTENT_API_BASE_URL.to_owned(),
+            prices: PRICES_API_BASE_URL.to_owned(),
+            common: COMMON_API_BASE_URL.to_owned(),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(common_base_url: &str, analytics_base_url: &str) -> Self {
+        let common = common_base_url.trim_end_matches('/').to_owned();
+        Self {
+            analytics: analytics_base_url.trim_end_matches('/').to_owned(),
+            statistics: common.clone(),
+            content: common.clone(),
+            prices: common.clone(),
+            common,
+        }
+    }
+
+    fn base_url(&self, host: ApiHost) -> &str {
+        match host {
+            ApiHost::Analytics => &self.analytics,
+            ApiHost::Statistics => &self.statistics,
+            ApiHost::Content => &self.content,
+            ApiHost::Prices => &self.prices,
+            ApiHost::Common => &self.common,
         }
     }
 }
@@ -339,8 +553,7 @@ impl TokenLimiter {
 #[derive(Debug, Clone)]
 pub struct WbClient {
     http: Client,
-    analytics_base_url: String,
-    statistics_base_url: String,
+    base_urls: BaseUrls,
     accounts: Arc<BTreeMap<String, WbCredentials>>,
     limiters: Arc<BTreeMap<String, Arc<TokenLimiter>>>,
     global_in_flight: Arc<Semaphore>,
@@ -353,8 +566,7 @@ impl WbClient {
         Self::build(
             timeout,
             accounts,
-            STATISTICS_API_BASE_URL,
-            ANALYTICS_API_BASE_URL,
+            BaseUrls::production(),
             ClientPolicy::production(timeout),
         )
     }
@@ -369,8 +581,7 @@ impl WbClient {
         Self::build(
             timeout,
             accounts,
-            common_base_url,
-            analytics_base_url,
+            BaseUrls::for_test(common_base_url, analytics_base_url),
             ClientPolicy::immediate_single_attempt(timeout),
         )
     }
@@ -382,14 +593,18 @@ impl WbClient {
         base_url: &str,
         policy: ClientPolicy,
     ) -> Self {
-        Self::build(timeout, accounts, base_url, base_url, policy)
+        Self::build(
+            timeout,
+            accounts,
+            BaseUrls::for_test(base_url, base_url),
+            policy,
+        )
     }
 
     fn build(
         timeout: Duration,
         accounts: BTreeMap<String, WbCredentials>,
-        statistics_base_url: &str,
-        analytics_base_url: &str,
+        base_urls: BaseUrls,
         policy: ClientPolicy,
     ) -> Self {
         let http = Client::builder()
@@ -424,8 +639,7 @@ impl WbClient {
             .collect();
         Self {
             http,
-            analytics_base_url: analytics_base_url.trim_end_matches('/').to_owned(),
-            statistics_base_url: statistics_base_url.trim_end_matches('/').to_owned(),
+            base_urls,
             accounts: Arc::new(accounts),
             limiters: Arc::new(limiters),
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT_REQUESTS)),
@@ -542,6 +756,135 @@ impl WbClient {
         .await
     }
 
+    pub async fn product_cards(
+        &self,
+        account: &str,
+        locale: Option<String>,
+        payload: Value,
+    ) -> Result<Value, WbError> {
+        self.request(
+            account,
+            Method::POST,
+            "content:/content/v2/get/cards/list",
+            PRODUCT_CARDS_PATH,
+            locale.map(|locale| vec![("locale", locale)]),
+            Some(payload),
+        )
+        .await
+    }
+
+    pub async fn product_prices(
+        &self,
+        account: &str,
+        nm_id: Option<u64>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Value, WbError> {
+        let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+        if let Some(nm_id) = nm_id {
+            query.push(("filterNmID", nm_id.to_string()));
+        }
+        self.request(
+            account,
+            Method::GET,
+            "prices:/api/v2/list/goods/filter",
+            PRODUCT_PRICES_PATH,
+            Some(query),
+            None,
+        )
+        .await
+    }
+
+    pub async fn tariff_commissions(
+        &self,
+        account: &str,
+        locale: Option<String>,
+    ) -> Result<Value, WbError> {
+        self.request(
+            account,
+            Method::GET,
+            "common:/api/v1/tariffs/commission",
+            TARIFF_COMMISSIONS_PATH,
+            locale.map(|locale| vec![("locale", locale)]),
+            None,
+        )
+        .await
+    }
+
+    pub async fn tariff_boxes(&self, account: &str, date: String) -> Result<Value, WbError> {
+        self.dated_tariff(
+            account,
+            TARIFF_BOXES_PATH,
+            "common:/api/v1/tariffs/box",
+            date,
+        )
+        .await
+    }
+
+    pub async fn tariff_pallets(&self, account: &str, date: String) -> Result<Value, WbError> {
+        self.dated_tariff(
+            account,
+            TARIFF_PALLETS_PATH,
+            "common:/api/v1/tariffs/pallet",
+            date,
+        )
+        .await
+    }
+
+    pub async fn tariff_returns(&self, account: &str, date: String) -> Result<Value, WbError> {
+        self.dated_tariff(
+            account,
+            TARIFF_RETURNS_PATH,
+            "common:/api/v1/tariffs/return",
+            date,
+        )
+        .await
+    }
+
+    pub async fn acceptance_coefficients(
+        &self,
+        account: &str,
+        warehouse_ids: Vec<u64>,
+    ) -> Result<Value, WbError> {
+        let query = (!warehouse_ids.is_empty()).then(|| {
+            vec![(
+                "warehouseIDs",
+                warehouse_ids
+                    .into_iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )]
+        });
+        self.request(
+            account,
+            Method::GET,
+            "common:/api/tariffs/v1/acceptance/coefficients",
+            ACCEPTANCE_COEFFICIENTS_PATH,
+            query,
+            None,
+        )
+        .await
+    }
+
+    async fn dated_tariff(
+        &self,
+        account: &str,
+        path: &'static str,
+        endpoint: &'static str,
+        date: String,
+    ) -> Result<Value, WbError> {
+        self.request(
+            account,
+            Method::GET,
+            endpoint,
+            path,
+            Some(vec![("date", date)]),
+            None,
+        )
+        .await
+    }
+
     async fn statistics_report(
         &self,
         account: &str,
@@ -586,16 +929,14 @@ impl WbClient {
     ) -> Result<Value, WbError> {
         // Enforced here, at the only point where a WB request can leave the
         // process, so the read-only guarantee does not depend on callers.
-        let Some(request_class) = RequestClass::for_request(&method, path) else {
+        let Some(endpoint_policy) = EndpointPolicy::for_request(&method, path) else {
             return Err(WbError::EndpointNotAllowed {
                 method,
                 path: path.to_owned(),
             });
         };
-        let base_url = match request_class {
-            RequestClass::AnalyticsPing | RequestClass::AnalyticsReport => &self.analytics_base_url,
-            RequestClass::StatisticsReport => &self.statistics_base_url,
-        };
+        let request_class = endpoint_policy.request_class;
+        let base_url = self.base_urls.base_url(endpoint_policy.host);
         let mut url = Url::parse(&format!("{base_url}{path}"))
             .expect("static production or validated test WB base URL");
         if let Some(query) = query {
@@ -654,7 +995,7 @@ impl WbClient {
         loop {
             limiter
                 .pace(request_class, self.policy.interval(request_class))
-                .await;
+                .await?;
             let mut request = self
                 .http
                 .request(method.clone(), &url)
@@ -1022,13 +1363,10 @@ mod tests {
 
     fn retrying_policy(logical_timeout: Duration) -> ClientPolicy {
         ClientPolicy {
-            ping_interval: Duration::ZERO,
-            analytics_interval: Duration::ZERO,
-            statistics_interval: Duration::ZERO,
             max_attempts: 3,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
-            logical_timeout,
+            ..ClientPolicy::immediate_single_attempt(logical_timeout)
         }
     }
 
@@ -1046,6 +1384,26 @@ mod tests {
         assert_eq!(
             policy.interval(RequestClass::StatisticsReport),
             Duration::from_secs(60)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::ContentReport),
+            Duration::from_millis(600)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::PricesReport),
+            Duration::from_millis(600)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::CommissionTariff),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::LogisticsTariff),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::AcceptanceTariff),
+            Duration::from_secs(10)
         );
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.logical_timeout, Duration::from_secs(10));
@@ -1066,9 +1424,157 @@ mod tests {
             Some(RequestClass::StatisticsReport)
         );
         assert_eq!(
+            RequestClass::for_request(&Method::POST, PRODUCT_CARDS_PATH),
+            Some(RequestClass::ContentReport)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, PRODUCT_PRICES_PATH),
+            Some(RequestClass::PricesReport)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, TARIFF_COMMISSIONS_PATH),
+            Some(RequestClass::CommissionTariff)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, TARIFF_BOXES_PATH),
+            Some(RequestClass::LogisticsTariff)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, ACCEPTANCE_COEFFICIENTS_PATH),
+            Some(RequestClass::AcceptanceTariff)
+        );
+        assert_eq!(
             RequestClass::for_request(&Method::GET, "/not-allowed"),
             None
         );
+
+        let urls = BaseUrls::production();
+        assert_eq!(urls.base_url(ApiHost::Analytics), ANALYTICS_API_BASE_URL);
+        assert_eq!(urls.base_url(ApiHost::Statistics), STATISTICS_API_BASE_URL);
+        assert_eq!(urls.base_url(ApiHost::Content), CONTENT_API_BASE_URL);
+        assert_eq!(urls.base_url(ApiHost::Prices), PRICES_API_BASE_URL);
+        assert_eq!(urls.base_url(ApiHost::Common), COMMON_API_BASE_URL);
+    }
+
+    #[test]
+    fn endpoint_policy_table_matches_the_immutable_security_snapshot() {
+        let expected = [
+            (
+                Method::GET,
+                PING_PATH,
+                ApiHost::Analytics,
+                RequestClass::AnalyticsPing,
+            ),
+            (
+                Method::POST,
+                SALES_FUNNEL_PATH,
+                ApiHost::Analytics,
+                RequestClass::AnalyticsReport,
+            ),
+            (
+                Method::POST,
+                SALES_FUNNEL_HISTORY_PATH,
+                ApiHost::Analytics,
+                RequestClass::AnalyticsReport,
+            ),
+            (
+                Method::POST,
+                SALES_FUNNEL_GROUPED_HISTORY_PATH,
+                ApiHost::Analytics,
+                RequestClass::AnalyticsReport,
+            ),
+            (
+                Method::POST,
+                WAREHOUSE_STOCKS_PATH,
+                ApiHost::Analytics,
+                RequestClass::AnalyticsReport,
+            ),
+            (
+                Method::GET,
+                ORDERS_PATH,
+                ApiHost::Statistics,
+                RequestClass::StatisticsReport,
+            ),
+            (
+                Method::GET,
+                SALES_PATH,
+                ApiHost::Statistics,
+                RequestClass::StatisticsReport,
+            ),
+            (
+                Method::POST,
+                PRODUCT_CARDS_PATH,
+                ApiHost::Content,
+                RequestClass::ContentReport,
+            ),
+            (
+                Method::GET,
+                PRODUCT_PRICES_PATH,
+                ApiHost::Prices,
+                RequestClass::PricesReport,
+            ),
+            (
+                Method::GET,
+                TARIFF_COMMISSIONS_PATH,
+                ApiHost::Common,
+                RequestClass::CommissionTariff,
+            ),
+            (
+                Method::GET,
+                TARIFF_BOXES_PATH,
+                ApiHost::Common,
+                RequestClass::LogisticsTariff,
+            ),
+            (
+                Method::GET,
+                TARIFF_PALLETS_PATH,
+                ApiHost::Common,
+                RequestClass::LogisticsTariff,
+            ),
+            (
+                Method::GET,
+                TARIFF_RETURNS_PATH,
+                ApiHost::Common,
+                RequestClass::LogisticsTariff,
+            ),
+            (
+                Method::GET,
+                ACCEPTANCE_COEFFICIENTS_PATH,
+                ApiHost::Common,
+                RequestClass::AcceptanceTariff,
+            ),
+        ];
+        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), expected.len());
+        for (policy, (method, path, host, request_class)) in
+            READ_ONLY_ENDPOINT_ALLOWLIST.iter().zip(expected)
+        {
+            assert_eq!(policy.method, method, "method drift for {path}");
+            assert_eq!(policy.path, path, "path drift for {path}");
+            assert_eq!(policy.host, host, "host drift for {path}");
+            assert_eq!(
+                policy.request_class, request_class,
+                "quota class drift for {path}"
+            );
+        }
+
+        let mut pairs = READ_ONLY_ENDPOINT_ALLOWLIST
+            .iter()
+            .map(|policy| (policy.method.as_str(), policy.path))
+            .collect::<Vec<_>>();
+        let original_len = pairs.len();
+        pairs.sort_unstable();
+        pairs.dedup();
+        assert_eq!(pairs.len(), original_len);
+
+        for policy in READ_ONLY_ENDPOINT_ALLOWLIST {
+            assert!(policy.path.starts_with('/'));
+            assert!(!policy.path.contains("//"));
+            assert_eq!(
+                EndpointPolicy::for_request(&policy.method, policy.path)
+                    .map(|found| (found.host, found.request_class)),
+                Some((policy.host, policy.request_class))
+            );
+        }
     }
 
     #[tokio::test]
@@ -1169,6 +1675,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_price_and_tariff_requests_have_exact_contracts() {
+        let (base_url, requests) = mock_http(vec![
+            (200, r#"{"cards":[]}"#.to_owned()),
+            (200, r#"{"data":{"listGoods":[]}}"#.to_owned()),
+            (200, r#"{"report":[]}"#.to_owned()),
+            (200, r#"{"response":{"data":{}}}"#.to_owned()),
+            (200, r#"{"response":{"data":{}}}"#.to_owned()),
+            (200, r#"{"response":{"data":{}}}"#.to_owned()),
+            (200, r#"[]"#.to_owned()),
+            (200, r#"[]"#.to_owned()),
+        ]);
+        let client = client(&base_url);
+        let cards_payload = json!({
+            "settings": {
+                "cursor": {"limit": 100},
+                "filter": {"withPhoto": -1}
+            }
+        });
+
+        assert_eq!(
+            client
+                .product_cards("account", Some("ru".to_owned()), cards_payload.clone())
+                .await
+                .unwrap()["cards"],
+            json!([])
+        );
+        assert_eq!(
+            client
+                .product_prices("account", Some(123_456), 100, 25)
+                .await
+                .unwrap()["data"]["listGoods"],
+            json!([])
+        );
+        assert_eq!(
+            client
+                .tariff_commissions("account", Some("en".to_owned()))
+                .await
+                .unwrap()["report"],
+            json!([])
+        );
+        assert!(
+            client
+                .tariff_boxes("account", "2026-08-11".to_owned())
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .tariff_pallets("account", "2026-08-12".to_owned())
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .tariff_returns("account", "2026-08-13".to_owned())
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            client
+                .acceptance_coefficients("account", vec![507, 117_501])
+                .await
+                .unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            client
+                .acceptance_coefficients("account", Vec::new())
+                .await
+                .unwrap(),
+            json!([])
+        );
+
+        let cards = requests.recv().unwrap();
+        assert!(cards.starts_with("POST /content/v2/get/cards/list?locale=ru HTTP/1.1\r\n"));
+        assert_eq!(
+            serde_json::from_str::<Value>(cards.split_once("\r\n\r\n").unwrap().1).unwrap(),
+            cards_payload
+        );
+        for expected in [
+            "GET /api/v2/list/goods/filter?limit=100&offset=25&filterNmID=123456 HTTP/1.1\r\n",
+            "GET /api/v1/tariffs/commission?locale=en HTTP/1.1\r\n",
+            "GET /api/v1/tariffs/box?date=2026-08-11 HTTP/1.1\r\n",
+            "GET /api/v1/tariffs/pallet?date=2026-08-12 HTTP/1.1\r\n",
+            "GET /api/v1/tariffs/return?date=2026-08-13 HTTP/1.1\r\n",
+            "GET /api/tariffs/v1/acceptance/coefficients?warehouseIDs=507%2C117501 HTTP/1.1\r\n",
+            "GET /api/tariffs/v1/acceptance/coefficients HTTP/1.1\r\n",
+        ] {
+            let request = requests.recv().unwrap();
+            assert!(request.starts_with(expected), "{request}");
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn ping_targets_the_analytics_host() {
         let (analytics_base_url, requests) =
             mock_http(vec![(200, r#"{"Status":"OK"}"#.to_owned())]);
@@ -1186,6 +1791,107 @@ mod tests {
                 .unwrap()
                 .starts_with("GET /ping HTTP/1.1\r\n")
         );
+    }
+
+    #[tokio::test]
+    async fn every_request_class_targets_its_dedicated_fixed_host() {
+        let (analytics, analytics_requests) = mock_http(vec![
+            (200, r#"{"Status":"OK"}"#.to_owned()),
+            (200, r#"{"data":{"products":[]}}"#.to_owned()),
+        ]);
+        let (statistics, statistics_requests) = mock_http(vec![(200, "[]".to_owned())]);
+        let (content, content_requests) = mock_http(vec![(200, r#"{"cards":[]}"#.to_owned())]);
+        let (prices, prices_requests) =
+            mock_http(vec![(200, r#"{"data":{"listGoods":[]}}"#.to_owned())]);
+        let (common, common_requests) = mock_http(vec![
+            (200, r#"{"report":[]}"#.to_owned()),
+            (200, r#"{"response":{"data":{}}}"#.to_owned()),
+            (200, "[]".to_owned()),
+        ]);
+        let client = WbClient::build(
+            Duration::from_secs(2),
+            credentials(),
+            BaseUrls {
+                analytics,
+                statistics,
+                content,
+                prices,
+                common,
+            },
+            ClientPolicy::immediate_single_attempt(Duration::from_secs(2)),
+        );
+
+        client.ping("account").await.unwrap();
+        client
+            .sales_funnel("account", json!({"limit": 1}))
+            .await
+            .unwrap();
+        client
+            .orders("account", "2026-08-01T00:00:00Z".to_owned(), 0)
+            .await
+            .unwrap();
+        client
+            .product_cards("account", None, json!({"settings":{"cursor":{"limit":1}}}))
+            .await
+            .unwrap();
+        client.product_prices("account", None, 1, 0).await.unwrap();
+        client.tariff_commissions("account", None).await.unwrap();
+        client
+            .tariff_boxes("account", "2026-08-10".to_owned())
+            .await
+            .unwrap();
+        client
+            .acceptance_coefficients("account", Vec::new())
+            .await
+            .unwrap();
+
+        assert!(
+            analytics_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /ping HTTP/1.1\r\n")
+        );
+        assert!(
+            analytics_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("POST /api/analytics/v3/sales-funnel/products HTTP/1.1\r\n")
+        );
+        assert!(analytics_requests.try_recv().is_err());
+        assert!(
+            statistics_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /api/v1/supplier/orders?dateFrom=")
+        );
+        assert!(statistics_requests.try_recv().is_err());
+        assert!(
+            content_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("POST /content/v2/get/cards/list HTTP/1.1\r\n")
+        );
+        assert!(content_requests.try_recv().is_err());
+        assert!(
+            prices_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /api/v2/list/goods/filter?limit=1&offset=0 HTTP/1.1\r\n")
+        );
+        assert!(prices_requests.try_recv().is_err());
+        for expected in [
+            "GET /api/v1/tariffs/commission HTTP/1.1\r\n",
+            "GET /api/v1/tariffs/box?date=2026-08-10 HTTP/1.1\r\n",
+            "GET /api/tariffs/v1/acceptance/coefficients HTTP/1.1\r\n",
+        ] {
+            assert!(
+                common_requests
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .starts_with(expected)
+            );
+        }
+        assert!(common_requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1586,6 +2292,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn minute_scale_commission_quota_fails_fast_with_retry_after() {
+        let (base_url, requests) = mock_http(vec![(200, r#"{"report":[]}"#.to_owned())]);
+        let mut policy = ClientPolicy::immediate_single_attempt(Duration::from_secs(2));
+        policy.commission_interval = Duration::from_secs(60);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_secs(1),
+            credentials(),
+            &base_url,
+            policy,
+        );
+
+        client.tariff_commissions("account", None).await.unwrap();
+        let started = Instant::now();
+        let error = client
+            .tariff_commissions("account", None)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(error.kind(), WbErrorKind::RateLimited);
+        assert_eq!(error.request_id(), None);
+        assert!(matches!(
+            error,
+            WbError::LocalRateLimited { retry_after }
+                if retry_after > Duration::from_secs(59)
+                    && retry_after <= Duration::from_secs(60)
+        ));
+        requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(requests.try_recv().is_err());
+    }
+
     #[test]
     fn trace_helpers_evaluate_only_safe_fields_when_enabled() {
         let subscriber = tracing_subscriber::fmt()
@@ -1907,8 +2644,13 @@ mod tests {
             (Method::POST, "/api/v3/orders"),
             (Method::POST, "/content/v2/cards/update"),
             (Method::POST, "/public/api/v1/prices"),
+            (Method::DELETE, PRODUCT_CARDS_PATH),
+            (Method::POST, PRODUCT_PRICES_PATH),
+            (Method::POST, TARIFF_COMMISSIONS_PATH),
+            (Method::POST, ACCEPTANCE_COEFFICIENTS_PATH),
             // Near-misses of allowlisted paths.
             (Method::GET, "/ping/"),
+            (Method::GET, "/api/v1/tariffs/commission/"),
             (Method::GET, ""),
         ] {
             let error = client
@@ -1963,6 +2705,28 @@ mod tests {
             );
         }
         assert_eq!(
+            RequestClass::for_request(&Method::POST, PRODUCT_CARDS_PATH),
+            Some(RequestClass::ContentReport)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, PRODUCT_PRICES_PATH),
+            Some(RequestClass::PricesReport)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, TARIFF_COMMISSIONS_PATH),
+            Some(RequestClass::CommissionTariff)
+        );
+        for path in [TARIFF_BOXES_PATH, TARIFF_PALLETS_PATH, TARIFF_RETURNS_PATH] {
+            assert_eq!(
+                RequestClass::for_request(&Method::GET, path),
+                Some(RequestClass::LogisticsTariff)
+            );
+        }
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, ACCEPTANCE_COEFFICIENTS_PATH),
+            Some(RequestClass::AcceptanceTariff)
+        );
+        assert_eq!(
             client.ping("account").await.unwrap_err().kind(),
             WbErrorKind::Network
         );
@@ -1996,6 +2760,9 @@ mod tests {
             WbError::RateLimited {
                 request_id: None,
                 retry_after: None,
+            },
+            WbError::LocalRateLimited {
+                retry_after: Duration::from_secs(1),
             },
             WbError::ResponseTooLarge {
                 limit_bytes: 1,
