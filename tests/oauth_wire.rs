@@ -23,6 +23,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use mcp_ozon::{
     auth::JwtAuthenticator,
     config::{JwtConfig, RegistrySource},
+    http::build_router,
     ozon::OzonClient,
     server::OzonMcp,
 };
@@ -30,10 +31,7 @@ use reqwest::{
     Client, StatusCode,
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap},
 };
-use rmcp::transport::{
-    StreamableHttpServerConfig, StreamableHttpService,
-    streamable_http_server::session::local::LocalSessionManager,
-};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -262,19 +260,12 @@ async fn start_mcp_server(registry: &RegistrySource, jwks_url: String) -> Runnin
         registry.clone(),
     )
     .expect("test JWT authenticator configuration must be valid");
-    let server = std::sync::Arc::new(OzonMcp::new_authenticated(
-        client,
-        registry.clone(),
-        authenticator,
-    ));
-    let service: StreamableHttpService<OzonMcp, LocalSessionManager> = StreamableHttpService::new(
-        move || Ok((*server).clone()),
-        Default::default(),
-        StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(true)
-            .with_json_response(false),
+    // Drive the production router rather than a replica, so the OAuth wire
+    // contract is asserted against the wiring `main.rs` actually serves.
+    let router = build_router(
+        OzonMcp::new_authenticated(client, registry.clone(), authenticator),
+        LocalSessionManager::DEFAULT_MAX_SESSIONS,
     );
-    let router = Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("MCP listener must bind");

@@ -2459,6 +2459,95 @@ mod tests {
         assert!(!is_sensitive_marketplace_field("review_text"));
     }
 
+    #[test]
+    fn redaction_recursion_is_bounded_by_the_json_parser_depth_limit() {
+        // `redact_marketplace_pii` recurses once per nesting level, so it is
+        // stack-safe only because serde_json refuses to build a Value deeper
+        // than its 128-level recursion limit. This pins that assumption: if
+        // `serde_json/unbounded_depth` is ever enabled, a hostile upstream
+        // payload could overflow the stack, and this test fails first.
+        let hostile = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
+        assert!(serde_json::from_str::<Value>(&hostile).is_err());
+
+        // At a depth the parser does accept, redaction still reaches the leaf.
+        let deep = format!(
+            "{}{}{}",
+            "[".repeat(120),
+            r#"{"phone":"+70000000000","sum":7}"#,
+            "]".repeat(120)
+        );
+        let mut value: Value =
+            serde_json::from_str(&deep).expect("120 levels is within the parser limit");
+        redact_marketplace_pii(&mut value);
+        let mut leaf = &value;
+        for _ in 0..120 {
+            leaf = &leaf[0];
+        }
+        assert_eq!(leaf["phone"], json!(REDACTED_VALUE));
+        assert_eq!(leaf["sum"], json!(7));
+    }
+
+    #[tokio::test]
+    async fn wildberries_payloads_are_redacted_before_reaching_the_model() {
+        // The Ozon test above exercises the redaction function; this one
+        // exercises the WB call sites. Without it, deleting the redaction call
+        // from either WB tool would keep line coverage at 100% and ship PII.
+        fn result_text(body: &str) -> Value {
+            let envelope: Value = serde_json::from_str(body).unwrap();
+            let text = envelope
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .expect("tool result must contain text");
+            serde_json::from_str(text).unwrap()
+        }
+
+        let pii = json!({
+            "Status": "OK",
+            "buyer": {"name": "Buyer Name"},
+            "rows": [{"recipient_phone": "+70000000000", "customerEmail": "b@example.test", "sum": 7}],
+        })
+        .to_string();
+        let (server, requests) =
+            mock_wb_server_with_responses("admin", vec![(200, pii.clone()), (200, pii)]);
+
+        let ping = result_text(&call_tool_over_http(server.clone(), "wb_ping", json!({})).await);
+        let funnel = result_text(
+            &call_tool_over_http(
+                server,
+                "wb_sales_funnel",
+                json!({
+                    "account": "account_wb",
+                    "date_from": "2026-08-01",
+                    "date_to": "2026-08-08",
+                    "nm_ids": [],
+                    "brand_names": [],
+                    "subject_ids": [],
+                    "tag_ids": [],
+                    "skip_deleted_nm": false,
+                    "limit": 10,
+                    "offset": 0
+                }),
+            )
+            .await,
+        );
+
+        for tool in [&ping, &funnel] {
+            let data = &tool["data"];
+            assert_eq!(data["Status"], json!("OK"));
+            assert_eq!(data["buyer"], json!(REDACTED_VALUE));
+            assert_eq!(data["rows"][0]["recipient_phone"], json!(REDACTED_VALUE));
+            assert_eq!(data["rows"][0]["customerEmail"], json!(REDACTED_VALUE));
+            assert_eq!(data["rows"][0]["sum"], json!(7));
+            let rendered = tool.to_string();
+            assert!(!rendered.contains("+70000000000"), "{rendered}");
+            assert!(!rendered.contains("b@example.test"), "{rendered}");
+            assert!(!rendered.contains("Buyer Name"), "{rendered}");
+        }
+        for _ in 0..2 {
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn wb_tools_apply_rbac_and_send_only_exact_read_only_contracts() {
         fn result_text(body: &str) -> Value {
@@ -3273,19 +3362,49 @@ mod tests {
 
     #[test]
     fn finance_endpoint_role_policy_is_fail_closed() {
-        for role in [Role::Manager, Role::Analyst] {
+        // Full matrix rather than spot checks: a new finance endpoint added to
+        // the gate must be denied for every non-finance role, not just the two
+        // that happened to be sampled.
+        for endpoint in FINANCE_ENDPOINTS {
+            for role in [Role::Manager, Role::Analyst] {
+                assert!(
+                    OzonMcp::authorize_endpoint_for_role(role, endpoint)
+                        .unwrap_err()
+                        .starts_with(ROLE_ACCESS_DENIED),
+                    "{role} must not reach {endpoint}"
+                );
+            }
+            for role in [Role::Finance, Role::Admin] {
+                assert!(
+                    OzonMcp::authorize_endpoint_for_role(role, endpoint).is_ok(),
+                    "{role} must reach {endpoint}"
+                );
+            }
+        }
+
+        // Every reachable finance path must be gated. Without this, adding a
+        // finance endpoint to the read-only allowlist and forgetting the gate
+        // silently exposes financial data to managers and analysts.
+        for endpoint in READ_ONLY_ENDPOINT_ALLOWLIST {
+            if endpoint.contains("/finance/") {
+                assert!(
+                    FINANCE_ENDPOINTS.contains(endpoint),
+                    "{endpoint} is reachable but not role-gated"
+                );
+            }
+        }
+        // ...and the gate must not name paths that cannot be reached at all.
+        for endpoint in FINANCE_ENDPOINTS {
             assert!(
-                OzonMcp::authorize_endpoint_for_role(role, "/v3/finance/transaction/totals")
-                    .unwrap_err()
-                    .starts_with(ROLE_ACCESS_DENIED)
+                READ_ONLY_ENDPOINT_ALLOWLIST.contains(endpoint)
+                    || PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST.contains(endpoint),
+                "{endpoint} is gated but unreachable"
             );
         }
-        for role in [Role::Finance, Role::Admin] {
-            assert!(
-                OzonMcp::authorize_endpoint_for_role(role, "/v1/finance/accrual/postings").is_ok()
-            );
+
+        for role in [Role::Manager, Role::Analyst, Role::Finance, Role::Admin] {
+            assert!(OzonMcp::authorize_endpoint_for_role(role, "/v1/analytics/data").is_ok());
         }
-        assert!(OzonMcp::authorize_endpoint_for_role(Role::Manager, "/v1/analytics/data").is_ok());
     }
 
     #[test]

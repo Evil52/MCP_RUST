@@ -197,6 +197,9 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Verify hardening declared by the shipped Compose files
+        run: ./scripts/verify-compose-hardening.sh
+
       - name: Build image
         run: docker build --pull --tag mcp-ozon:ci .
 

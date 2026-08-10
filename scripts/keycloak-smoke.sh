@@ -67,14 +67,86 @@ chmod 700 "$smoke_dir"
 owns_test_user=false
 user_id=""
 session_id=""
+rotated_key_component_name="mcp-ozon-e2e-rotated-rsa"
+owns_rotated_key=false
 
 cleanup() {
   terminate_mcp_session >/dev/null 2>&1 || true
+  delete_rotated_key >/dev/null 2>&1 || true
   delete_test_user >/dev/null 2>&1 || true
   "${compose[@]}" exec -T keycloak rm -f "$kcadm_config" >/dev/null 2>&1 || true
   rm -rf "$smoke_dir"
 }
 trap cleanup EXIT
+
+rotated_key_component_id() {
+  "${compose[@]}" exec -T keycloak \
+    /opt/keycloak/bin/kcadm.sh get components \
+    --config "$kcadm_config" \
+    --target-realm ofk \
+    --fields id,name \
+    | jq -r --arg name "$rotated_key_component_name" \
+      '[.[] | select(.name == $name)] | if length == 1 then .[0].id else "" end'
+}
+
+delete_rotated_key() {
+  local component_id
+  if [[ "$owns_rotated_key" != "true" ]]; then
+    return
+  fi
+  component_id="$(rotated_key_component_id)"
+  if [[ -n "$component_id" ]]; then
+    "${compose[@]}" exec -T keycloak \
+      /opt/keycloak/bin/kcadm.sh delete "components/$component_id" \
+      --config "$kcadm_config" \
+      --target-realm ofk >/dev/null
+  fi
+  owns_rotated_key=false
+}
+
+realm_signing_kids() {
+  safe_curl --fail --silent --show-error \
+    "$keycloak_url/realms/ofk/protocol/openid-connect/certs" \
+    | jq -c '[.keys[] | select(.use == "sig") | .kid] | sort'
+}
+
+jwt_header_kid() {
+  local segment padding
+  segment="$(cut -d. -f1 <"$1" | tr '_-' '/+')"
+  padding=$(( ${#segment} % 4 ))
+  if (( padding == 2 )); then
+    segment="$segment=="
+  elif (( padding == 3 )); then
+    segment="$segment="
+  fi
+  printf '%s' "$segment" | base64 -d 2>/dev/null | jq -er '.kid'
+}
+
+issue_access_token() {
+  local scope="$1" destination="$2" response_file status oauth_error
+  response_file="$destination.response.json"
+  status="$(
+    printf '%s' "$KEYCLOAK_TEST_USER_PASSWORD" \
+      | safe_curl --silent --show-error \
+        --request POST \
+        --output "$response_file" \
+        --write-out '%{http_code}' \
+        --data-urlencode 'grant_type=password' \
+        --data-urlencode 'client_id=ozonofk-mcp' \
+        --data-urlencode "scope=$scope" \
+        --data-urlencode "username=$username" \
+        --data-urlencode 'password@-' \
+        "$keycloak_url/realms/ofk/protocol/openid-connect/token"
+  )"
+  chmod 600 "$response_file"
+  if [[ "$status" != "200" ]]; then
+    oauth_error="$(jq -r '.error // "unknown_error"' "$response_file" 2>/dev/null || printf 'invalid_json')"
+    echo "Token request failed: HTTP $status, OAuth error=$oauth_error" >&2
+    return 1
+  fi
+  jq --exit-status --raw-output --join-output '.access_token' "$response_file" >"$destination"
+  chmod 600 "$destination"
+}
 
 terminate_mcp_session() {
   if [[ -z "$session_id" ]]; then
@@ -422,7 +494,10 @@ expected_tools='[
   "ozon_seller_rating",
   "ozon_seller_rating_history",
   "ozon_stock_turnover",
-  "ozon_stores_status"
+  "ozon_stores_status",
+  "wb_ping",
+  "wb_sales_funnel",
+  "wb_stores_status"
 ]'
 tools_json="$(json_response "$tools_body")"
 jq -e --argjson expected "$expected_tools" \
@@ -476,6 +551,102 @@ jq -e \
   <<<"$members_json" >/dev/null
 
 member_count="$(jq -r '.result.content[0].text | fromjson | .members | length' <<<"$members_json")"
+
+# Realm key rotation must be picked up without restarting the MCP and without
+# waiting out the JWKS cache TTL, otherwise every rotation is an outage. The
+# unit tests cover this against a mock JWKS; only this step proves it against
+# a real Keycloak rotation and a real cached verifier.
+mcp_container="$("${compose[@]}" ps -q server)"
+if [[ -z "$mcp_container" ]]; then
+  echo "Could not resolve the MCP container for the rotation check" >&2
+  exit 1
+fi
+mcp_started_before="$(docker inspect -f '{{.State.StartedAt}}' "$mcp_container")"
+original_kid="$(jwt_header_kid "$smoke_dir/access-token")"
+original_kids="$(realm_signing_kids)"
+jq -e --arg kid "$original_kid" 'index($kid) != null' <<<"$original_kids" >/dev/null
+
+jq -cn --arg name "$rotated_key_component_name" \
+  '{
+    name: $name,
+    providerId: "rsa-generated",
+    providerType: "org.keycloak.keys.KeyProvider",
+    config: {
+      priority: ["200"],
+      algorithm: ["RS256"],
+      enabled: ["true"],
+      active: ["true"]
+    }
+  }' \
+  | "${compose[@]}" exec -T keycloak \
+    /opt/keycloak/bin/kcadm.sh create components \
+    --config "$kcadm_config" \
+    --target-realm ofk \
+    --file - >/dev/null
+owns_rotated_key=true
+
+rotated_kids="$original_kids"
+for _attempt in $(seq 1 30); do
+  rotated_kids="$(realm_signing_kids)"
+  if [[ "$rotated_kids" != "$original_kids" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$rotated_kids" == "$original_kids" ]]; then
+  echo "Keycloak did not publish a rotated signing key" >&2
+  exit 1
+fi
+
+issue_access_token "openid profile email $required_scope" "$smoke_dir/rotated-access-token"
+rotated_kid="$(jwt_header_kid "$smoke_dir/rotated-access-token")"
+if [[ "$rotated_kid" == "$original_kid" ]]; then
+  echo "Rotation did not change the token signing key; the check would be vacuous" >&2
+  exit 1
+fi
+jq -e --arg kid "$rotated_kid" 'index($kid) == null' <<<"$original_kids" >/dev/null
+
+rotated_header_file="$smoke_dir/rotated-authorization.header"
+printf 'Authorization: Bearer ' >"$rotated_header_file"
+cat "$smoke_dir/rotated-access-token" >>"$rotated_header_file"
+printf '\n' >>"$rotated_header_file"
+chmod 600 "$rotated_header_file"
+
+rotated_headers="$smoke_dir/rotated.headers"
+rotated_body="$smoke_dir/rotated.body"
+request \
+  '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_members","arguments":{}}}' \
+  "$rotated_body" \
+  "$rotated_headers" \
+  --header @"$rotated_header_file" \
+  --header "Mcp-Session-Id: $session_id" \
+  --header 'MCP-Protocol-Version: 2025-06-18'
+jq -e \
+  --arg actor "$actor_id" \
+  '.id == 8
+   and .result.isError != true
+   and (.result.content[0].text | fromjson | .actor.id == $actor)' \
+  <<<"$(json_response "$rotated_body")" >/dev/null
+
+# A token signed by the still-published previous key must keep working, so a
+# rotation does not invalidate tokens already issued to live clients.
+request \
+  '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"list_members","arguments":{}}}' \
+  "$smoke_dir/previous-key.body" \
+  "$smoke_dir/previous-key.headers" \
+  --header @"$auth_header_file" \
+  --header "Mcp-Session-Id: $session_id" \
+  --header 'MCP-Protocol-Version: 2025-06-18'
+jq -e '.id == 9 and .result.isError != true' \
+  <<<"$(json_response "$smoke_dir/previous-key.body")" >/dev/null
+
+mcp_started_after="$(docker inspect -f '{{.State.StartedAt}}' "$mcp_container")"
+if [[ "$mcp_started_before" != "$mcp_started_after" ]]; then
+  echo "The MCP restarted during rotation; the refresh path was not exercised" >&2
+  exit 1
+fi
+
+delete_rotated_key
 terminate_mcp_session
 delete_test_user
-echo "Keycloak JWT E2E passed: discovery is public; denied tools/call responses use MCP OAuth challenges; actor=$actor_id, visible_members=$member_count"
+echo "Keycloak JWT E2E passed: discovery is public; denied tools/call responses use MCP OAuth challenges; realm key rotation ($original_kid -> $rotated_kid) was picked up without restarting the MCP and without invalidating previously issued tokens; actor=$actor_id, visible_members=$member_count"

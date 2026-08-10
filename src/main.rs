@@ -1,23 +1,17 @@
 #![forbid(unsafe_code)]
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::num::NonZeroUsize;
 
-use anyhow::{Context, Result};
-use axum::{Json, Router, routing::get};
+use anyhow::Result;
 use mcp_ozon::{
     auth::JwtAuthenticator,
     config::{AppConfig, AuthConfig, TransportMode},
+    http::build_router,
     ozon::OzonClient,
     server::OzonMcp,
     wb::WbClient,
 };
-use rmcp::{
-    ServiceExt,
-    transport::{
-        StreamableHttpServerConfig, StreamableHttpService,
-        streamable_http_server::session::local::LocalSessionManager,
-    },
-};
+use rmcp::ServiceExt;
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -53,7 +47,7 @@ async fn main() -> Result<()> {
     );
 
     match config.transport {
-        TransportMode::Http => serve_http(config.bind, server).await,
+        TransportMode::Http => serve_http(config.bind, config.max_sessions, server).await,
         TransportMode::Stdio => {
             if matches!(config.auth, AuthConfig::Jwt(_)) {
                 anyhow::bail!("MCP_AUTH_MODE=jwt поддерживается только с MCP_TRANSPORT=http");
@@ -63,34 +57,12 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve_http(bind: std::net::SocketAddr, server: OzonMcp) -> Result<()> {
-    let protected_resource_metadata = server.protected_resource_metadata();
-    let server = Arc::new(server);
-    let max_sessions = match std::env::var("MCP_MAX_SESSIONS") {
-        Ok(value) => value
-            .parse::<NonZeroUsize>()
-            .context("MCP_MAX_SESSIONS должен быть положительным целым числом")?,
-        Err(std::env::VarError::NotPresent) => LocalSessionManager::DEFAULT_MAX_SESSIONS,
-        Err(error) => return Err(error).context("MCP_MAX_SESSIONS содержит невалидный UTF-8"),
-    };
-    let session_manager = Arc::new(LocalSessionManager::default().with_max_sessions(max_sessions));
-    let service: StreamableHttpService<OzonMcp, LocalSessionManager> = StreamableHttpService::new(
-        move || Ok((*server).clone()),
-        session_manager,
-        StreamableHttpServerConfig::default(),
-    );
-    let mut router = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .nest_service("/mcp", service);
-    if let Some(metadata) = protected_resource_metadata {
-        router = router.route(
-            "/.well-known/oauth-protected-resource",
-            get(move || {
-                let metadata = metadata.clone();
-                async move { Json(metadata) }
-            }),
-        );
-    }
+async fn serve_http(
+    bind: std::net::SocketAddr,
+    max_sessions: NonZeroUsize,
+    server: OzonMcp,
+) -> Result<()> {
+    let router = build_router(server, max_sessions);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, endpoint = %format!("http://{bind}/mcp"), "MCP Ozon запущен");
 

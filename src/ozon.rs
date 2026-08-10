@@ -842,6 +842,82 @@ mod tests {
         (format!("http://{address}"), receiver)
     }
 
+    /// Serves `count` sequential requests over HTTP keep-alive and reports how
+    /// many TCP connections the client actually opened.
+    ///
+    /// The general-purpose mock always answers with `Connection: close`, so it
+    /// cannot observe pooling at all.
+    fn keep_alive_mock_server(count: usize) -> (String, mpsc::Receiver<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+
+        // Exactly one connection is ever accepted. If the client does not reuse
+        // it, the next request never arrives on this socket and the read below
+        // sees EOF, which fails the test from the mock thread.
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("mock server accepts");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            for _ in 0..count {
+                let mut content_length = 0_usize;
+                loop {
+                    let mut line = String::new();
+                    assert!(
+                        reader.read_line(&mut line).unwrap() > 0,
+                        "client closed the connection instead of reusing it"
+                    );
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0_u8; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let payload = br#"{"result":"ok"}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(payload).unwrap();
+            }
+            sender.send(count).expect("served count is reported");
+        });
+
+        (format!("http://{address}"), receiver)
+    }
+
+    #[tokio::test]
+    async fn sequential_requests_reuse_one_pooled_connection() {
+        // Connection pooling is what makes a burst of tool calls cheap: without
+        // it every call pays a fresh TCP and TLS handshake against Ozon. This
+        // fails if the idle pool is ever disabled or sized to zero.
+        const REQUESTS: usize = 5;
+        let (base_url, connections) = keep_alive_mock_server(REQUESTS);
+        let client = OzonClient::new(base_url, Duration::from_secs(5), credentials()).unwrap();
+
+        for _ in 0..REQUESTS {
+            client
+                .post(
+                    &StoreId::from("ofk"),
+                    "/v1/rating/summary",
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            connections.recv_timeout(Duration::from_secs(10)).unwrap(),
+            REQUESTS,
+            "all {REQUESTS} calls must be served over the single pooled connection"
+        );
+    }
+
     fn read_request(stream: &TcpStream) -> String {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request = Vec::new();

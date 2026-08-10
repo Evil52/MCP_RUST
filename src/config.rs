@@ -4,6 +4,7 @@ use std::{
     fs::File,
     io::Read,
     net::SocketAddr,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
@@ -11,7 +12,9 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use rmcp::schemars::JsonSchema;
+use rmcp::{
+    schemars::JsonSchema, transport::streamable_http_server::session::local::LocalSessionManager,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::wb::WbCredentials;
@@ -622,6 +625,7 @@ impl FromStr for TransportMode {
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind: SocketAddr,
+    pub max_sessions: NonZeroUsize,
     pub transport: TransportMode,
     pub ozon_api_base_url: String,
     pub request_timeout: Duration,
@@ -681,6 +685,28 @@ fn parse_required_scopes(value: &str) -> Result<Vec<String>> {
     Ok(scopes)
 }
 
+/// Parses `MCP_MAX_SESSIONS`, which may only *lower* the built-in bound.
+///
+/// Raising it past the vendored default would let a single deployment opt back
+/// into the unbounded-session memory exhaustion the limit exists to prevent, so
+/// an out-of-range value fails startup instead of being silently clamped.
+fn parse_max_sessions(value: Option<&str>) -> Result<NonZeroUsize> {
+    let Some(value) = value else {
+        return Ok(LocalSessionManager::DEFAULT_MAX_SESSIONS);
+    };
+    let parsed = value
+        .trim()
+        .parse::<NonZeroUsize>()
+        .context("MCP_MAX_SESSIONS должен быть положительным целым числом")?;
+    if parsed > LocalSessionManager::DEFAULT_MAX_SESSIONS {
+        bail!(
+            "MCP_MAX_SESSIONS может только уменьшать лимит: максимум {}",
+            LocalSessionManager::DEFAULT_MAX_SESSIONS
+        );
+    }
+    Ok(parsed)
+}
+
 fn parse_strict_bool(value: &str, name: &str) -> Result<bool> {
     match value {
         "true" => Ok(true),
@@ -728,6 +754,7 @@ impl AppConfig {
         let bind = value(lookup, "MCP_BIND", "127.0.0.1:8787")
             .parse()
             .context("MCP_BIND должен иметь формат IP:PORT")?;
+        let max_sessions = parse_max_sessions(lookup("MCP_MAX_SESSIONS").as_deref())?;
         let transport = value(lookup, "MCP_TRANSPORT", "http").parse()?;
         let ozon_api_base_url = validate_ozon_api_base_url(&value(
             lookup,
@@ -848,6 +875,7 @@ impl AppConfig {
         }
         Ok(Self {
             bind,
+            max_sessions,
             transport,
             ozon_api_base_url,
             request_timeout: Duration::from_secs(timeout_seconds),
@@ -1043,6 +1071,145 @@ mod tests {
     }
 
     #[test]
+    fn env_names_and_credentials_are_accepted_exactly_at_their_limits() {
+        // Boundary pairs: the largest accepted value and the smallest rejected
+        // one, so an off-by-one in either bound is caught.
+        let longest = format!("A{}", "B".repeat(MAX_ENV_NAME_BYTES - 1));
+        assert_eq!(longest.len(), MAX_ENV_NAME_BYTES);
+        validate_env_name(&longest, "client_id_env").unwrap();
+        assert!(validate_env_name(&format!("{longest}C"), "client_id_env").is_err());
+
+        for accepted in ["A", "_", "_A0", "OZON_CLIENT_ID", "A0_9"] {
+            validate_env_name(accepted, "client_id_env").unwrap();
+        }
+        for rejected in [
+            "",
+            "0LEADING_DIGIT",
+            "lower_case",
+            "MiXeD",
+            "WITH-DASH",
+            "WITH SPACE",
+            "WITH.DOT",
+            "WITH$DOLLAR",
+            "ПЕРЕМЕННАЯ",
+            "TRAILING\n",
+        ] {
+            let error = validate_env_name(rejected, "client_id_env")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("client_id_env"), "{rejected:?}: {error}");
+        }
+
+        let longest = "k".repeat(MAX_CREDENTIAL_BYTES);
+        validate_credential(&longest, "OZON_API_KEY").unwrap();
+        assert!(validate_credential(&format!("{longest}k"), "OZON_API_KEY").is_err());
+
+        // An empty credential is not rejected here: absent keys are filtered
+        // out before validation, so emptiness is not this function's contract.
+        validate_credential("", "OZON_API_KEY").unwrap();
+        for accepted in ["!", "~", "a-b_c.d:e/f", "0123456789"] {
+            validate_credential(accepted, "OZON_API_KEY").unwrap();
+        }
+        // Header-splitting and whitespace payloads must never reach a client.
+        for rejected in [
+            " leading",
+            "trailing ",
+            "with space",
+            "with\ttab",
+            "with\nnewline",
+            "with\r\nsplit",
+            "with\0nul",
+            "ключ",
+            "with\u{7f}del",
+        ] {
+            let error = validate_credential(rejected, "OZON_API_KEY")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("OZON_API_KEY"), "{rejected:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_registry_file_is_refused_at_the_exact_limit() {
+        let path = std::env::temp_dir().join(format!(
+            "mcp-ozon-oversize-{}-{}.json",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        // Padding a valid registry with whitespace keeps it parseable, so the
+        // only thing under test is the size guard.
+        let mut document = serde_json::to_vec(&sample_registry()).unwrap();
+        let padding = MAX_ACCESS_REGISTRY_BYTES as usize - document.len();
+        document.extend(std::iter::repeat_n(b' ', padding));
+        assert_eq!(document.len() as u64, MAX_ACCESS_REGISTRY_BYTES);
+        std::fs::write(&path, &document).unwrap();
+        RegistrySource::new(&path).expect("a registry exactly at the limit is accepted");
+
+        document.push(b' ');
+        std::fs::write(&path, &document).unwrap();
+        let error = RegistrySource::new(&path).unwrap_err().to_string();
+        assert!(error.contains("превышает безопасный лимит"), "{error}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_readers_never_observe_a_torn_registry_while_it_is_rewritten() {
+        // Every tool call loads the registry, so reads run concurrently with an
+        // operator editing the file. Each observation must be one whole
+        // generation — never a mix — and no reader may panic or deadlock.
+        let path = write_registry(&sample_registry());
+        let mut renamed = sample_registry();
+        renamed.actors[1].name = "Renamed manager".to_owned();
+        let generations = [
+            serde_json::to_vec_pretty(&sample_registry()).unwrap(),
+            serde_json::to_vec_pretty(&renamed).unwrap(),
+        ];
+        let source = RegistrySource::new(&path).unwrap();
+
+        std::thread::scope(|scope| {
+            let writer_path = path.clone();
+            let writer = scope.spawn(move || {
+                for round in 0..200 {
+                    std::fs::write(&writer_path, &generations[round % 2]).unwrap();
+                }
+            });
+            let readers: Vec<_> = (0..4)
+                .map(|_| {
+                    let source = source.clone();
+                    scope.spawn(move || {
+                        let mut observed = 0_usize;
+                        for _ in 0..200 {
+                            // A partially written file is a legitimate transient
+                            // error; a wrong-but-parsed registry is not.
+                            if let Ok(registry) = source.load() {
+                                let name = registry.actor("manager").unwrap().name.clone();
+                                assert!(
+                                    matches!(name.as_str(), "Manager" | "Renamed manager"),
+                                    "torn registry generation: {name:?}"
+                                );
+                                assert_eq!(registry.actors.len(), 2);
+                                assert_eq!(registry.accounts.len(), 1);
+                                observed += 1;
+                            }
+                        }
+                        observed
+                    })
+                })
+                .collect();
+            writer.join().unwrap();
+            let observed: usize = readers
+                .into_iter()
+                .map(|reader| reader.join().unwrap())
+                .sum();
+            // Guards against a vacuous pass where every read happened to fail.
+            assert!(observed > 0, "no reader ever observed a whole registry");
+        });
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn registry_rejects_unknown_manager() {
         let mut registry = sample_registry();
         registry.accounts[0].manager_id = "missing".into();
@@ -1113,7 +1280,8 @@ mod tests {
         let mut registry = sample_registry();
         registry.accounts.push(wb_account.clone());
         registry.validate().unwrap();
-        let path = write_registry(&registry);
+        let path = std::env::temp_dir().join(format!("mcp-ozon-bench-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
         let values = BTreeMap::from([
             ("MCP_ACTOR_ID", "admin"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
@@ -1180,7 +1348,8 @@ mod tests {
                 }),
             });
         }
-        let path = write_registry(&registry);
+        let path = std::env::temp_dir().join(format!("mcp-ozon-bench-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
         let values = BTreeMap::from([
             ("MCP_ACTOR_ID", "admin"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
@@ -1422,6 +1591,40 @@ mod tests {
         };
         assert!(result(Some(("MCP_BIND", "bad"))).is_err());
         assert!(result(Some(("MCP_TRANSPORT", "bad"))).is_err());
+
+        // MCP_MAX_SESSIONS may only lower the vendored bound, so a raised or
+        // unparsable value must stop startup instead of being clamped.
+        assert_eq!(
+            result(None).unwrap().max_sessions,
+            LocalSessionManager::DEFAULT_MAX_SESSIONS
+        );
+        assert_eq!(
+            result(Some(("MCP_MAX_SESSIONS", " 32 ")))
+                .unwrap()
+                .max_sessions
+                .get(),
+            32
+        );
+        assert_eq!(
+            result(Some((
+                "MCP_MAX_SESSIONS",
+                &LocalSessionManager::DEFAULT_MAX_SESSIONS.to_string()
+            )))
+            .unwrap()
+            .max_sessions,
+            LocalSessionManager::DEFAULT_MAX_SESSIONS
+        );
+        for value in ["0", "-1", "", "bad", "1.5", "18446744073709551616"] {
+            assert!(
+                result(Some(("MCP_MAX_SESSIONS", value))).is_err(),
+                "MCP_MAX_SESSIONS={value:?}"
+            );
+        }
+        let raised = (LocalSessionManager::DEFAULT_MAX_SESSIONS.get() + 1).to_string();
+        let error = result(Some(("MCP_MAX_SESSIONS", &raised)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("может только уменьшать лимит"), "{error}");
         assert!(result(Some(("MCP_AUTH_MODE", "bad"))).is_err());
         assert!(result(Some(("OZON_REQUEST_TIMEOUT_SECONDS", "bad"))).is_err());
         assert!(result(Some(("OZON_REQUEST_TIMEOUT_SECONDS", "0"))).is_err());
