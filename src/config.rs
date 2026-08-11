@@ -150,6 +150,15 @@ pub struct OzonAccount {
     pub store_id: StoreId,
     pub client_id_env: String,
     pub api_key_env: String,
+    #[serde(default)]
+    pub performance: Option<OzonPerformanceAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OzonPerformanceAccount {
+    pub client_id_env: String,
+    pub client_secret_env: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,6 +322,21 @@ impl AccessRegistry {
         }
         validate_env_name(&ozon.client_id_env, "client_id_env")?;
         validate_env_name(&ozon.api_key_env, "api_key_env")?;
+        if let Some(performance) = &ozon.performance {
+            if performance.client_id_env.trim().is_empty()
+                || performance.client_secret_env.trim().is_empty()
+            {
+                bail!(
+                    "Performance-настройки кабинета {} не могут быть пустыми",
+                    account.id
+                );
+            }
+            validate_env_name(&performance.client_id_env, "performance.client_id_env")?;
+            validate_env_name(
+                &performance.client_secret_env,
+                "performance.client_secret_env",
+            )?;
+        }
         if !store_ids.insert(ozon.store_id.clone()) {
             bail!("store_id={} должен быть уникальным", ozon.store_id);
         }
@@ -458,6 +482,8 @@ struct OzonCredentialBinding {
     store_id: StoreId,
     client_id_env: String,
     api_key_env: String,
+    performance_client_id_env: Option<String>,
+    performance_client_secret_env: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -495,6 +521,14 @@ impl OzonCredentialBinding {
                     store_id: ozon.store_id.clone(),
                     client_id_env: ozon.client_id_env.clone(),
                     api_key_env: ozon.api_key_env.clone(),
+                    performance_client_id_env: ozon
+                        .performance
+                        .as_ref()
+                        .map(|performance| performance.client_id_env.clone()),
+                    performance_client_secret_env: ozon
+                        .performance
+                        .as_ref()
+                        .map(|performance| performance.client_secret_env.clone()),
                 })
             })
             .collect()
@@ -594,6 +628,38 @@ pub struct StoreCredentials {
     pub api_key: String,
 }
 
+#[derive(Clone)]
+pub struct PerformanceCredentials {
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+impl fmt::Debug for PerformanceCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PerformanceCredentials")
+            .field("client_id", &"<redacted>")
+            .field("client_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+fn validate_unique_performance_client_ids(
+    stores: &BTreeMap<StoreId, PerformanceCredentials>,
+) -> Result<()> {
+    let mut first_by_client_id: BTreeMap<&str, &StoreId> = BTreeMap::new();
+    for (store, credentials) in stores {
+        if let Some(first_store) = first_by_client_id.get(credentials.client_id.as_str()) {
+            bail!(
+                "Performance client_id нельзя совместно использовать для разных магазинов: {first_store} и {store}"
+            );
+        } else {
+            first_by_client_id.insert(credentials.client_id.as_str(), store);
+        }
+    }
+    Ok(())
+}
+
 impl fmt::Debug for StoreCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -632,6 +698,7 @@ pub struct AppConfig {
     pub ozon_postings_vnext: bool,
     pub ozon_finance_accruals_preview: bool,
     pub stores: BTreeMap<StoreId, StoreCredentials>,
+    pub performance_stores: BTreeMap<StoreId, PerformanceCredentials>,
     pub wildberries_accounts: BTreeMap<String, WbCredentials>,
     pub auth: AuthConfig,
     pub registry: RegistrySource,
@@ -842,6 +909,7 @@ impl AppConfig {
             }
         };
         let mut stores = BTreeMap::new();
+        let mut performance_stores = BTreeMap::new();
         let mut wildberries_accounts = BTreeMap::new();
         for account in &snapshot.accounts {
             if let Some(ozon) = &account.ozon {
@@ -864,6 +932,30 @@ impl AppConfig {
                         ozon.api_key_env
                     ),
                 }
+                if let Some(performance) = &ozon.performance {
+                    let client_id = lookup(&performance.client_id_env).unwrap_or_default();
+                    let client_secret = lookup(&performance.client_secret_env).unwrap_or_default();
+                    match (client_id.is_empty(), client_secret.is_empty()) {
+                        (true, true) => {}
+                        (false, false) => {
+                            validate_credential(&client_id, &performance.client_id_env)?;
+                            validate_credential(&client_secret, &performance.client_secret_env)?;
+                            performance_stores.insert(
+                                ozon.store_id.clone(),
+                                PerformanceCredentials {
+                                    client_id,
+                                    client_secret,
+                                },
+                            );
+                        }
+                        _ => bail!(
+                            "для Performance API магазина {} должны быть одновременно заданы {} и {}",
+                            ozon.store_id,
+                            performance.client_id_env,
+                            performance.client_secret_env
+                        ),
+                    }
+                }
             }
             if let Some(wildberries) = &account.wildberries {
                 let token = lookup(&wildberries.api_token_env).unwrap_or_default();
@@ -873,6 +965,7 @@ impl AppConfig {
                 }
             }
         }
+        validate_unique_performance_client_ids(&performance_stores)?;
         Ok(Self {
             bind,
             max_sessions,
@@ -882,6 +975,7 @@ impl AppConfig {
             ozon_postings_vnext,
             ozon_finance_accruals_preview,
             stores,
+            performance_stores,
             wildberries_accounts,
             auth,
             registry,
@@ -940,10 +1034,42 @@ mod tests {
                     store_id: StoreId::from("shop"),
                     client_id_env: "SHOP_ID".into(),
                     api_key_env: "SHOP_KEY".into(),
+                    performance: None,
                 }),
                 wildberries: None,
             }],
         }
+    }
+
+    fn performance_registry() -> AccessRegistry {
+        let mut registry = sample_registry();
+        registry.accounts[0].ozon.as_mut().unwrap().performance = Some(OzonPerformanceAccount {
+            client_id_env: "SHOP_PERFORMANCE_ID".into(),
+            client_secret_env: "SHOP_PERFORMANCE_SECRET".into(),
+        });
+        registry
+    }
+
+    fn two_store_performance_registry() -> AccessRegistry {
+        let mut registry = performance_registry();
+        registry.accounts.push(MarketplaceAccount {
+            id: "second_shop".into(),
+            organization: "Second shop".into(),
+            marketplace: Marketplace::Ozon,
+            seller_client_id: "456".into(),
+            manager_id: "manager".into(),
+            ozon: Some(OzonAccount {
+                store_id: StoreId::from("second_shop"),
+                client_id_env: "SECOND_SHOP_ID".into(),
+                api_key_env: "SECOND_SHOP_KEY".into(),
+                performance: Some(OzonPerformanceAccount {
+                    client_id_env: "SECOND_PERFORMANCE_ID".into(),
+                    client_secret_env: "SECOND_PERFORMANCE_SECRET".into(),
+                }),
+            }),
+            wildberries: None,
+        });
+        registry
     }
 
     #[test]
@@ -1243,6 +1369,7 @@ mod tests {
                 store_id: StoreId::from("shop"),
                 client_id_env: "OTHER_ID".into(),
                 api_key_env: "OTHER_KEY".into(),
+                performance: None,
             }),
             wildberries: None,
         });
@@ -1378,6 +1505,161 @@ mod tests {
         );
         assert!(!value.contains("secret"));
         assert!(!value.contains("\"id\""));
+    }
+
+    #[test]
+    fn complete_performance_pair_loads_and_partial_pairs_fail_closed() {
+        let path = write_registry(&performance_registry());
+        let complete = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("SHOP_PERFORMANCE_ID", "performance-client"),
+            ("SHOP_PERFORMANCE_SECRET", "performance-secret"),
+        ]);
+        let config =
+            AppConfig::from_lookup(|key| complete.get(key).map(|value| (*value).to_owned()))
+                .unwrap();
+        let credentials = &config.performance_stores[&StoreId::from("shop")];
+        assert_eq!(credentials.client_id, "performance-client");
+        assert_eq!(credentials.client_secret, "performance-secret");
+
+        for (name, value) in [
+            ("SHOP_PERFORMANCE_ID", "performance-client"),
+            ("SHOP_PERFORMANCE_SECRET", "performance-secret"),
+        ] {
+            let partial = BTreeMap::from([
+                ("MCP_ACTOR_ID", "admin"),
+                ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+                (name, value),
+            ]);
+            let error =
+                AppConfig::from_lookup(|key| partial.get(key).map(|value| (*value).to_owned()))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("должны быть одновременно заданы"), "{error}");
+            assert!(!error.contains(value), "{error}");
+        }
+
+        for performance in [
+            OzonPerformanceAccount {
+                client_id_env: " ".into(),
+                client_secret_env: "SHOP_PERFORMANCE_SECRET".into(),
+            },
+            OzonPerformanceAccount {
+                client_id_env: "SHOP_PERFORMANCE_ID".into(),
+                client_secret_env: " ".into(),
+            },
+        ] {
+            let mut registry = sample_registry();
+            registry.accounts[0].ozon.as_mut().unwrap().performance = Some(performance);
+            assert!(registry.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_performance_secret_env_name_is_rejected() {
+        let mut registry = performance_registry();
+        registry.accounts[0]
+            .ozon
+            .as_mut()
+            .unwrap()
+            .performance
+            .as_mut()
+            .unwrap()
+            .client_secret_env = "INVALID-PERFORMANCE-SECRET".into();
+
+        let error = registry.validate().unwrap_err().to_string();
+        assert!(error.contains("performance.client_secret_env"), "{error}");
+    }
+
+    #[test]
+    fn omitted_performance_pair_keeps_store_unconfigured() {
+        let path = write_registry(&performance_registry());
+        let values = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+        ]);
+
+        let config =
+            AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned())).unwrap();
+
+        assert!(config.performance_stores.is_empty());
+    }
+
+    #[test]
+    fn duplicate_performance_client_id_is_rejected_even_with_the_same_secret() {
+        let path = write_registry(&two_store_performance_registry());
+        let shared = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("SHOP_PERFORMANCE_ID", "shared-client"),
+            ("SHOP_PERFORMANCE_SECRET", "shared-secret"),
+            ("SECOND_PERFORMANCE_ID", "shared-client"),
+            ("SECOND_PERFORMANCE_SECRET", "shared-secret"),
+        ]);
+        let error = AppConfig::from_lookup(|key| shared.get(key).map(|value| (*value).to_owned()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("нельзя совместно использовать"), "{error}");
+        for sensitive in ["shared-client", "shared-secret"] {
+            assert!(!error.contains(sensitive), "{error}");
+        }
+
+        let mut unique = shared.clone();
+        unique.insert("SECOND_PERFORMANCE_ID", "second-client");
+        let config =
+            AppConfig::from_lookup(|key| unique.get(key).map(|value| (*value).to_owned())).unwrap();
+        assert_eq!(config.performance_stores.len(), 2);
+
+        let mut conflicting = shared;
+        conflicting.insert("SECOND_PERFORMANCE_SECRET", "different-secret");
+        let error =
+            AppConfig::from_lookup(|key| conflicting.get(key).map(|value| (*value).to_owned()))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("нельзя совместно использовать"), "{error}");
+        for sensitive in ["shared-client", "shared-secret", "different-secret"] {
+            assert!(!error.contains(sensitive), "{error}");
+        }
+    }
+
+    #[test]
+    fn performance_credentials_debug_is_redacted() {
+        let value = format!(
+            "{:?}",
+            PerformanceCredentials {
+                client_id: "performance-client".into(),
+                client_secret: "performance-secret".into(),
+            }
+        );
+        assert_eq!(
+            value,
+            "PerformanceCredentials { client_id: \"<redacted>\", client_secret: \"<redacted>\" }"
+        );
+        assert!(!value.contains("performance-client"));
+        assert!(!value.contains("performance-secret"));
+    }
+
+    #[test]
+    fn performance_credential_binding_edit_requires_restart() {
+        let path = write_registry(&performance_registry());
+        let source = RegistrySource::new(&path).unwrap();
+        let mut edited = performance_registry();
+        edited.accounts[0]
+            .ozon
+            .as_mut()
+            .unwrap()
+            .performance
+            .as_mut()
+            .unwrap()
+            .client_secret_env = "SHOP_PERFORMANCE_SECRET_ROTATED".into();
+        std::fs::write(&path, serde_json::to_vec_pretty(&edited).unwrap()).unwrap();
+        let error = source.load().unwrap_err().to_string();
+        assert!(
+            error.starts_with("MCP_ACCESS_CONFIG_RESTART_REQUIRED:"),
+            "{error}"
+        );
+        assert!(error.contains("Ozon credentials"), "{error}");
     }
 
     #[test]

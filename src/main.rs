@@ -8,6 +8,7 @@ use mcp_ozon::{
     config::{AppConfig, AuthConfig, TransportMode},
     http::build_router,
     ozon::OzonClient,
+    ozon_performance::PerformanceClient,
     server::OzonMcp,
     wb::WbClient,
 };
@@ -32,6 +33,8 @@ async fn main() -> Result<()> {
         config.stores,
     )?;
     let wb_client = WbClient::new(config.request_timeout, config.wildberries_accounts);
+    let performance_client =
+        PerformanceClient::new(config.request_timeout, config.performance_stores)?;
     let registry = config.registry.clone();
     let server = match &config.auth {
         AuthConfig::Dev { actor_id } => OzonMcp::new(client, actor_id.clone(), registry),
@@ -41,6 +44,7 @@ async fn main() -> Result<()> {
         }
     }
     .with_wildberries_client(wb_client)
+    .with_performance_client(performance_client)
     .with_preview_features(
         config.ozon_postings_vnext,
         config.ozon_finance_accruals_preview,

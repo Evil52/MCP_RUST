@@ -20,18 +20,25 @@ Production credentials must never be used in CI; tests use local mocks only.
 
 The following properties are treated as release gates:
 
-1. Marketplace egress is read-only. `OzonClient::post` and `WbClient::request` enforce exact
-   allowlists before credentials are selected and before any socket is opened. Chat input cannot
-   supply a host, HTTP method, or path. Redirects and ambient HTTP proxies are disabled.
-2. Production Ozon egress uses 16 stable reporting/list/info paths. Three finance-accrual preview
-   paths require an explicit client capability and remain disabled in the production Compose file.
-   WB egress is limited to `GET /ping` and
-   `POST /api/analytics/v3/sales-funnel/products`; POST is required by WB for this read operation.
+1. Marketplace egress is read-only. `OzonClient::post`, `PerformanceClient::get`, and
+   `WbClient::request` enforce exact allowlists before credentials are selected and before any
+   socket is opened. Chat input cannot supply a host, HTTP method, or path. Redirects and ambient
+   HTTP proxies are disabled.
+2. Production Ozon Seller egress uses 16 stable reporting/list/info paths. Three finance-accrual
+   preview paths require an explicit client capability and remain disabled in the production
+   Compose file. Ozon Performance business egress is fixed to exactly
+   `GET /api/client/campaign`, `GET /api/client/statistics/daily/json`, and
+   `GET /api/client/statistics/expense/json`; its internal `POST /api/client/token` is not
+   model-callable. WB egress likewise requires an exact allowlisted method, path, host, and quota.
+   A safe HTTP verb is never sufficient by itself.
 3. Every MCP tool rejects unknown fields and applies bounded runtime validation in addition to its
    JSON Schema. A denied role, account, endpoint, malformed input, missing credential, or exhausted
    resource budget fails before marketplace network access.
-4. Account RBAC is enforced by the Rust server. Ozon finance methods require `finance` or `admin`;
-   actors with other roles cannot reach those endpoints even if the underlying API key is broad.
+4. Account RBAC is enforced by the Rust server. Ozon Seller finance and all Ozon Performance
+   methods require `finance` or `admin`; actors with other roles are rejected before credential
+   selection and cannot reach those endpoints even if the underlying API credential is broad.
+   A Performance Client ID may belong to only one configured store; startup rejects reuse across
+   stores because an organization-wide advertising response cannot be safely partitioned by ACL.
 5. Marketplace responses are bounded after decompression, obvious PII fields are redacted, and the
    result is labelled `untrusted_external_marketplace_data`. Marketplace text must never be treated
    as model instructions or forwarded to another tool without a new explicit user request.
@@ -46,6 +53,9 @@ The following properties are treated as release gates:
 
 - Ozon: per-Client-Id pacing, per-client concurrency 16, global concurrency 32, at most three
   attempts for explicitly transient failures, and a logical deadline covering rate waits/retries.
+- Ozon Performance: fixed official host, one-second per-Client-Id pacing, per-client concurrency 2,
+  global concurrency 8, bounded cached OAuth tokens, and at most one replay after an HTTP 401 token
+  refresh. There is no generic retry that can create or duplicate an advertising operation.
 - Wildberries: quota is shared by token rather than account alias, funnel pacing is 20 seconds,
   ping pacing is 10 seconds, per-token concurrency is 4, global concurrency is 8, and the complete
   operation has a 60-second deadline. Vendor retry headers are parsed conservatively.
@@ -77,8 +87,10 @@ has broader vendor permissions.
 ## Known residual risks
 
 - The standard Compose file imports `.env` into the container. Keep a dedicated runtime `.env`
-  containing only MCP/Ozon/WB variables; do not place Sonar, SSH, performance-advertising, or other
-  unrelated secrets in it. A production orchestrator should use managed secrets instead of plain
+  containing only MCP settings and credentials explicitly referenced by the access registry,
+  including Ozon Seller, Ozon Performance, and Wildberries credentials. The registry stores only
+  environment-variable names, never secret values. Do not place Sonar, SSH, or other unrelated
+  secrets in this file. A production orchestrator should use managed secrets instead of plain
   container environment variables.
 - The bounded session manager currently returns a generic HTTP 500 when capacity is exhausted.
   Allocation is safely rejected, but a future transport update should map this condition to 429/503.
@@ -98,6 +110,11 @@ has broader vendor permissions.
   RustSec/cargo-deny, CodeQL, dependency review, secret scanning, and the hardened-container job.
 - Verify the production tool list contains no preview tools and every tool advertises
   `readOnlyHint=true`, `destructiveHint=false`, and the expected OAuth/noauth policy.
+- Verify the Ozon Performance namespace contains exactly `ozon_performance_campaigns`,
+  `ozon_performance_daily`, and `ozon_performance_expenses`. Assert that the mutating GET paths
+  `/api/client/campaign/all_sku_promo/activate`,
+  `/api/client/campaign/all_sku_promo/deactivate`, and
+  `/api/client/campaign/all_sku_promo/set_bid` fail locally without credentials or network access.
 - Confirm the runtime registry and `.env` are ignored regular files with mode `600`; never copy their
   contents into logs, screenshots, CI artifacts, or Git.
 - Run OAuth/Keycloak smoke tests only against disposable test identities. Run marketplace canaries

@@ -463,6 +463,9 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         "ozon_fbs_postings",
         "ozon_finance_totals",
         "ozon_finance_transactions",
+        "ozon_performance_campaigns",
+        "ozon_performance_daily",
+        "ozon_performance_expenses",
         "ozon_product_prices",
         "ozon_product_stocks",
         "ozon_questions",
@@ -533,7 +536,7 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(32)
+        Some(35)
     );
 
     let missing_before_validation = post_rpc(

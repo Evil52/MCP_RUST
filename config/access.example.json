@@ -24,7 +24,11 @@
       "ozon": {
         "store_id": "example_store",
         "client_id_env": "EXAMPLE_OZON_CLIENT_ID",
-        "api_key_env": "EXAMPLE_OZON_API_KEY"
+        "api_key_env": "EXAMPLE_OZON_API_KEY",
+        "performance": {
+          "client_id_env": "EXAMPLE_OZON_PERFORMANCE_CLIENT_ID",
+          "client_secret_env": "EXAMPLE_OZON_PERFORMANCE_CLIENT_SECRET"
+        }
       }
     },
     {

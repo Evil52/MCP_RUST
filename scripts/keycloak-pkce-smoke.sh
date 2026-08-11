@@ -998,6 +998,11 @@ mcp_list_tools_public() {
   local response_body="$smoke_dir/public.tools-list.body"
   local stale_response_headers="$smoke_dir/stale.tools-list.headers"
   local stale_response_body="$smoke_dir/stale.tools-list.body"
+  local expected_performance_tools='[
+    "ozon_performance_campaigns",
+    "ozon_performance_daily",
+    "ozon_performance_expenses"
+  ]'
   local response_status
   local stale_response_status
 
@@ -1010,7 +1015,15 @@ mcp_list_tools_public() {
     exit 1
   fi
   json_response "$response_body" \
-    | jq -e '.id == 2 and (.result.tools | any(.name == "list_members"))' >/dev/null
+    | jq -e --argjson expected "$expected_performance_tools" '
+        .id == 2
+        and (.result.tools | any(.name == "list_members"))
+        and ([.result.tools[] | select(.name | startswith("ozon_performance_")) | .name] | sort)
+          == ($expected | sort)
+        and all(
+          .result.tools[] | select(.name | startswith("ozon_performance_"));
+          .annotations.readOnlyHint == true and .annotations.destructiveHint == false
+        )' >/dev/null
 
   stale_response_status="$(mcp_request \
     '{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}' \
@@ -1022,7 +1035,15 @@ mcp_list_tools_public() {
     exit 1
   fi
   json_response "$stale_response_body" \
-    | jq -e '.id == 3 and (.result.tools | any(.name == "list_members"))' >/dev/null
+    | jq -e --argjson expected "$expected_performance_tools" '
+        .id == 3
+        and (.result.tools | any(.name == "list_members"))
+        and ([.result.tools[] | select(.name | startswith("ozon_performance_")) | .name] | sort)
+          == ($expected | sort)
+        and all(
+          .result.tools[] | select(.name | startswith("ozon_performance_"));
+          .annotations.readOnlyHint == true and .annotations.destructiveHint == false
+        )' >/dev/null
 }
 
 assert_call_auth_error() {
@@ -1100,6 +1121,35 @@ assert_valid_members_call() {
     <<<"$response_json" >/dev/null
 }
 
+assert_manager_performance_denied() {
+  local request_id="$1"
+  local header_file="$2"
+  local response_headers="$smoke_dir/manager-performance-denied.mcp.headers"
+  local response_body="$smoke_dir/manager-performance-denied.mcp.body"
+  local response_status
+  local request_body
+  local response_json
+
+  request_body="$(jq -cn --argjson id "$request_id" \
+    '{jsonrpc:"2.0", id:$id, method:"tools/call", params:{name:"ozon_performance_campaigns", arguments:{}}}')"
+  response_status="$(mcp_request \
+    "$request_body" \
+    "$response_body" \
+    "$response_headers" \
+    "$header_file")"
+  if [[ "$response_status" != "200" ]]; then
+    echo "Expected manager Ozon Performance denial to return HTTP 200, got $response_status" >&2
+    exit 1
+  fi
+  response_json="$(json_response "$response_body")"
+  jq -e --argjson expected_id "$request_id" '
+    .id == $expected_id
+    and .result.isError == true
+    and (.result.content | any(
+      .type == "text" and (.text | startswith("ROLE_ACCESS_DENIED:"))
+    ))' <<<"$response_json" >/dev/null
+}
+
 access_token_header="$smoke_dir/access-token.authorization"
 invalid_token_header="$smoke_dir/invalid-token.authorization"
 refresh_token_header="$smoke_dir/refresh-token.authorization"
@@ -1118,6 +1168,7 @@ assert_call_auth_error invalid-token 5 invalid_token "$invalid_token_header"
 # deterministic Rust/wire tests cover valid-audience tokens that lack only the required scope.
 assert_call_auth_error missing-scope 6 invalid_token "$smoke_dir/missing-scope.authorization"
 assert_valid_members_call access-token 7 "$access_token_header"
+assert_manager_performance_denied 10 "$access_token_header"
 assert_call_auth_error refresh-token-as-bearer 8 invalid_token "$refresh_token_header"
 
 refresh_response="$smoke_dir/refresh.response.json"
@@ -1188,4 +1239,4 @@ assert_invalid_grant "$revoked_refresh_status" "$revoked_refresh_response" 'revo
 
 terminate_mcp_session
 delete_test_user
-echo "Keycloak PKCE E2E passed: S256 enforced; public discovery and MCP OAuth tool-call challenges verified; JWT and refresh accepted, actor=$actor_id"
+echo "Keycloak PKCE E2E passed: S256 enforced; public discovery, Performance read-only inventory/RBAC, and MCP OAuth tool-call challenges verified; JWT and refresh accepted, actor=$actor_id"

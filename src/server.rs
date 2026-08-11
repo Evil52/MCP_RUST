@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use chrono::{NaiveDate, NaiveDateTime, Utc};
 use rmcp::{
@@ -26,6 +26,10 @@ use crate::{
     },
     config::{Actor, Marketplace, RegistrySource, Role, StoreId},
     ozon::OzonClient,
+    ozon_performance::{
+        CAMPAIGNS_PATH, CampaignsQuery, DAILY_STATS_PATH, EXPENSES_PATH, PerformanceClient,
+        StatisticsQuery,
+    },
     wb::WbClient,
 };
 
@@ -41,10 +45,13 @@ const MAX_POSTING_NUMBERS: usize = 1_000;
 const MAX_GROUP_STATES: usize = 100;
 const MAX_OPERATION_TYPES: usize = 100;
 const MAX_RATINGS: usize = 100;
+const MAX_PERFORMANCE_CAMPAIGNS: usize = 10;
+const MAX_PERFORMANCE_PERIOD_DAYS: i64 = 31;
 const MIN_REVIEWS_LIMIT: u32 = 20;
 const MAX_OFFSET: u32 = 1_000_000;
 const MAX_PAGE: u32 = 1_000_000;
 const OZON_TOOL_FAILURE: &str = "OZON_TOOL_CALL_FAILED";
+const OZON_PERFORMANCE_TOOL_FAILURE: &str = "OZON_PERFORMANCE_TOOL_CALL_FAILED";
 const WB_TOOL_FAILURE: &str = "WB_TOOL_CALL_FAILED";
 const ACCESS_DENIED: &str = "ACCESS_DENIED";
 const UNKNOWN_STORE: &str = "UNKNOWN_STORE";
@@ -118,6 +125,7 @@ fn redact_marketplace_pii(value: &mut Value) {
 #[derive(Debug, Clone)]
 pub struct OzonMcp {
     client: OzonClient,
+    performance_client: PerformanceClient,
     wb_client: WbClient,
     default_actor_id: Option<String>,
     authenticator: Option<JwtAuthenticator>,
@@ -185,6 +193,7 @@ impl OzonMcp {
     pub fn new(client: OzonClient, actor_id: String, registry: RegistrySource) -> Self {
         Self {
             client,
+            performance_client: PerformanceClient::empty(Duration::from_secs(30)),
             wb_client: WbClient::empty(Duration::from_secs(30)),
             default_actor_id: Some(actor_id),
             authenticator: None,
@@ -203,6 +212,7 @@ impl OzonMcp {
         let tool_router = Self::default_tool_router(Some(&authenticator));
         Self {
             client,
+            performance_client: PerformanceClient::empty(Duration::from_secs(30)),
             wb_client: WbClient::empty(Duration::from_secs(30)),
             default_actor_id: None,
             authenticator: Some(authenticator),
@@ -215,6 +225,11 @@ impl OzonMcp {
 
     pub fn with_wildberries_client(mut self, wb_client: WbClient) -> Self {
         self.wb_client = wb_client;
+        self
+    }
+
+    pub fn with_performance_client(mut self, performance_client: PerformanceClient) -> Self {
+        self.performance_client = performance_client;
         self
     }
 
@@ -324,6 +339,16 @@ impl OzonMcp {
         Ok(())
     }
 
+    fn authorize_performance_for_role(role: Role) -> Result<(), String> {
+        if matches!(role, Role::Finance | Role::Admin) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{ROLE_ACCESS_DENIED}: рекламные бюджеты и расходы Ozon Performance доступны только ролям finance и admin"
+            ))
+        }
+    }
+
     fn resolve_wb_account(
         &self,
         identity: &RequestIdentity,
@@ -424,6 +449,47 @@ impl OzonMcp {
             data_classification: UNTRUSTED_DATA_CLASSIFICATION,
             data,
         }))
+    }
+
+    fn performance_context(
+        &self,
+        identity: &RequestIdentity,
+        store: Option<&StoreId>,
+    ) -> Result<StoreId, String> {
+        if let Some(store) = store {
+            validate_non_blank("store", &store.0)?;
+            validate_max_chars("store", &store.0, MAX_STORE_SELECTOR_CHARS)?;
+        }
+        let (registry, actor) = self.access_context(identity)?;
+        Self::authorize_performance_for_role(actor.role)?;
+        Self::resolve_store_for_actor(&registry, &actor, store)
+    }
+
+    fn performance_result(
+        store: StoreId,
+        endpoint: &'static str,
+        mut data: Value,
+    ) -> Json<OzonResult> {
+        redact_marketplace_pii(&mut data);
+        Json(OzonResult {
+            store,
+            endpoint,
+            fetched_at: Utc::now().to_rfc3339(),
+            data_classification: UNTRUSTED_DATA_CLASSIFICATION,
+            data,
+        })
+    }
+
+    fn performance_error(
+        store: &StoreId,
+        endpoint: &'static str,
+        error: crate::ozon_performance::PerformanceError,
+    ) -> String {
+        let kind = error.kind().code();
+        let request_id = error.request_id().unwrap_or("-");
+        format!(
+            "{OZON_PERFORMANCE_TOOL_FAILURE}: kind={kind}; store={store}; endpoint={endpoint}; request_id={request_id}; message={error}. Остановите текущую операцию и не вызывайте автоматически другие рекламные инструменты или магазины."
+        )
     }
 
     async fn product_list(
@@ -669,6 +735,7 @@ pub struct StoreStatus {
     pub seller_client_id: String,
     pub manager: String,
     pub configured: bool,
+    pub performance_configured: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1437,6 +1504,107 @@ pub struct FinanceAccrualByDayPreviewInput {
     pub last_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PerformanceAdvObjectType {
+    Sku,
+    Banner,
+    SearchPromo,
+    VideoBanner,
+}
+
+impl PerformanceAdvObjectType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sku => "SKU",
+            Self::Banner => "BANNER",
+            Self::SearchPromo => "SEARCH_PROMO",
+            Self::VideoBanner => "VIDEO_BANNER",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PerformanceCampaignState {
+    CampaignStateUnknown,
+    CampaignStateRunning,
+    CampaignStatePlanned,
+    CampaignStateStopped,
+    CampaignStateInactive,
+    CampaignStateArchived,
+    CampaignStateModerationDraft,
+    CampaignStateModerationInProgress,
+    CampaignStateModerationFailed,
+    CampaignStateFinished,
+}
+
+impl PerformanceCampaignState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CampaignStateUnknown => "CAMPAIGN_STATE_UNKNOWN",
+            Self::CampaignStateRunning => "CAMPAIGN_STATE_RUNNING",
+            Self::CampaignStatePlanned => "CAMPAIGN_STATE_PLANNED",
+            Self::CampaignStateStopped => "CAMPAIGN_STATE_STOPPED",
+            Self::CampaignStateInactive => "CAMPAIGN_STATE_INACTIVE",
+            Self::CampaignStateArchived => "CAMPAIGN_STATE_ARCHIVED",
+            Self::CampaignStateModerationDraft => "CAMPAIGN_STATE_MODERATION_DRAFT",
+            Self::CampaignStateModerationInProgress => "CAMPAIGN_STATE_MODERATION_IN_PROGRESS",
+            Self::CampaignStateModerationFailed => "CAMPAIGN_STATE_MODERATION_FAILED",
+            Self::CampaignStateFinished => "CAMPAIGN_STATE_FINISHED",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceCampaignsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(length(max = 10), inner(range(min = 1)))]
+    pub campaign_ids: Vec<u64>,
+    #[serde(default)]
+    pub adv_object_type: Option<PerformanceAdvObjectType>,
+    #[serde(default)]
+    pub state: Option<PerformanceCampaignState>,
+    #[serde(default = "default_page")]
+    #[schemars(range(min = 1, max = 1_000_000))]
+    pub page: u32,
+    #[serde(default = "default_performance_page_size")]
+    #[schemars(range(min = 1, max = 100))]
+    pub page_size: u32,
+}
+
+fn default_performance_page_size() -> u32 {
+    100
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceStatisticsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(length(max = 10), inner(range(min = 1)))]
+    pub campaign_ids: Vec<u64>,
+    #[schemars(
+        description = "Начало периода в формате YYYY-MM-DD",
+        length(equal = 10)
+    )]
+    pub date_from: String,
+    #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
+    pub date_to: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StoreOnlyInput {
@@ -1570,6 +1738,9 @@ impl OzonMcp {
                         seller_client_id: account.seller_client_id.clone(),
                         manager: manager.name.clone(),
                         configured: self.client.is_configured(&ozon.store_id),
+                        performance_configured: self
+                            .performance_client
+                            .is_configured(&ozon.store_id),
                     }
                 })
                 .collect(),
@@ -2470,6 +2641,104 @@ impl OzonMcp {
         .await
     }
 
+    /// Возвращает настройки и состояния рекламных кампаний Ozon Performance без возможности их изменить.
+    #[tool(
+        name = "ozon_performance_campaigns",
+        annotations(title = "Рекламные кампании Ozon", read_only_hint = true)
+    )]
+    async fn performance_campaigns(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<PerformanceCampaignsInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_campaign_ids(&input.campaign_ids)?;
+        if input.page == 0 {
+            return Err("page должен быть не меньше 1".to_owned());
+        }
+        validate_max_u32("page", input.page, MAX_PAGE)?;
+        validate_limit(input.page_size, 100)?;
+        let store = self.performance_context(&identity, input.store.as_ref())?;
+        let data = self
+            .performance_client
+            .campaigns(
+                &store,
+                CampaignsQuery {
+                    campaign_ids: input.campaign_ids,
+                    adv_object_type: input.adv_object_type.map(PerformanceAdvObjectType::as_str),
+                    state: input.state.map(PerformanceCampaignState::as_str),
+                    page: input.page,
+                    page_size: input.page_size,
+                },
+            )
+            .await
+            .map_err(|error| Self::performance_error(&store, CAMPAIGNS_PATH, error))?;
+        Ok(Self::performance_result(store, CAMPAIGNS_PATH, data))
+    }
+
+    /// Возвращает готовую дневную статистику рекламы: показы, клики, расходы и заказы. Период ограничен 31 днём.
+    #[tool(
+        name = "ozon_performance_daily",
+        annotations(title = "Дневная статистика рекламы Ozon", read_only_hint = true)
+    )]
+    async fn performance_daily(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<PerformanceStatisticsInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_campaign_ids(&input.campaign_ids)?;
+        validate_date_range(
+            &input.date_from,
+            &input.date_to,
+            MAX_PERFORMANCE_PERIOD_DAYS,
+        )?;
+        let store = self.performance_context(&identity, input.store.as_ref())?;
+        let data = self
+            .performance_client
+            .daily_statistics(
+                &store,
+                StatisticsQuery {
+                    campaign_ids: input.campaign_ids,
+                    date_from: input.date_from,
+                    date_to: input.date_to,
+                },
+            )
+            .await
+            .map_err(|error| Self::performance_error(&store, DAILY_STATS_PATH, error))?;
+        Ok(Self::performance_result(store, DAILY_STATS_PATH, data))
+    }
+
+    /// Возвращает расходы рекламных кампаний Ozon и их разбивку по источникам средств. Период ограничен 31 днём.
+    #[tool(
+        name = "ozon_performance_expenses",
+        annotations(title = "Расходы рекламы Ozon", read_only_hint = true)
+    )]
+    async fn performance_expenses(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<PerformanceStatisticsInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_campaign_ids(&input.campaign_ids)?;
+        validate_date_range(
+            &input.date_from,
+            &input.date_to,
+            MAX_PERFORMANCE_PERIOD_DAYS,
+        )?;
+        let store = self.performance_context(&identity, input.store.as_ref())?;
+        let data = self
+            .performance_client
+            .expenses(
+                &store,
+                StatisticsQuery {
+                    campaign_ids: input.campaign_ids,
+                    date_from: input.date_from,
+                    date_to: input.date_to,
+                },
+            )
+            .await
+            .map_err(|error| Self::performance_error(&store, EXPENSES_PATH, error))?;
+        Ok(Self::performance_result(store, EXPENSES_PATH, data))
+    }
+
     /// Возвращает текущую сводку рейтингов и показателей качества продавца.
     #[tool(
         name = "ozon_seller_rating",
@@ -2672,6 +2941,20 @@ fn validate_count(field: &str, count: usize, minimum: usize, maximum: usize) -> 
     Ok(())
 }
 
+fn validate_campaign_ids(values: &[u64]) -> Result<(), String> {
+    validate_count("campaign_ids", values.len(), 0, MAX_PERFORMANCE_CAMPAIGNS)?;
+    let mut unique = BTreeSet::new();
+    for value in values {
+        if *value == 0 {
+            return Err("campaign_ids не должен содержать 0".to_owned());
+        }
+        if !unique.insert(*value) {
+            return Err("campaign_ids не должен содержать дубликаты".to_owned());
+        }
+    }
+    Ok(())
+}
+
 fn validate_max_chars(field: &str, value: &str, maximum: usize) -> Result<(), String> {
     if value.chars().count() > maximum {
         return Err(format!("{field} не может быть длиннее {maximum} символов"));
@@ -2858,7 +3141,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::config::{JwtConfig, MarketplaceAccount};
+    use crate::config::{JwtConfig, MarketplaceAccount, PerformanceCredentials};
     use crate::ozon::{
         PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST, READ_ONLY_ENDPOINT_ALLOWLIST,
         is_read_only_endpoint_allowed,
@@ -2951,6 +3234,71 @@ mod tests {
             OzonMcp::new(client, "admin".to_owned(), registry_source()),
             receiver,
         )
+    }
+
+    fn performance_registry_source() -> RegistrySource {
+        let sequence = REGISTRY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mcp-ozon-performance-access-{}-{sequence}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "actors": [
+                {"id":"admin","name":"Administrator","role":"admin"},
+                {"id":"finance","name":"Finance","role":"finance","account_ids":["account_a"]},
+                {"id":"manager","name":"Manager","role":"manager","account_ids":["account_a"]},
+                {"id":"analyst","name":"Analyst","role":"analyst","account_ids":["account_a"]},
+                {"id":"finance_denied","name":"Restricted finance","role":"finance","account_ids":["account_b"]}
+              ],
+              "accounts": [
+                {"id":"account_a","organization":"Example organization A","marketplace":"ozon","seller_client_id":"seller-a","manager_id":"admin","ozon":{"store_id":"store_a","client_id_env":"OZON_CLIENT_ID","api_key_env":"OZON_API_KEY"}},
+                {"id":"account_b","organization":"Example organization B","marketplace":"ozon","seller_client_id":"seller-b","manager_id":"admin","ozon":{"store_id":"store_b","client_id_env":"OZON_B_CLIENT_ID","api_key_env":"OZON_B_API_KEY"}}
+              ]
+            }"#,
+        )
+        .unwrap();
+        RegistrySource::new(path).unwrap()
+    }
+
+    fn performance_mock_server(
+        actor: &str,
+        responses: Vec<(u16, String)>,
+    ) -> (OzonMcp, mpsc::Receiver<String>) {
+        let (base_url, receiver) = mock_http(responses);
+        let performance_client = PerformanceClient::new_for_test(
+            base_url,
+            Duration::from_secs(3),
+            BTreeMap::from([(
+                StoreId::from("store_a"),
+                PerformanceCredentials {
+                    client_id: "test-performance-client".to_owned(),
+                    client_secret: "test-performance-secret".to_owned(),
+                },
+            )]),
+        );
+        let ozon_client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        (
+            OzonMcp::new(ozon_client, actor.to_owned(), performance_registry_source())
+                .with_performance_client(performance_client),
+            receiver,
+        )
+    }
+
+    fn performance_token_response() -> String {
+        json!({
+            "access_token": "test-performance-access-token",
+            "token_type": "Bearer",
+            "expires_in": 1_800
+        })
+        .to_string()
     }
 
     fn mock_wb_server_for(
@@ -4235,7 +4583,7 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
-        assert_eq!(dev_tools.len(), 32);
+        assert_eq!(dev_tools.len(), 35);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -4246,7 +4594,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 32);
+        assert_eq!(jwt_tools.len(), 35);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -4258,7 +4606,7 @@ mod tests {
             .with_preview_features(false, true)
             .tool_router
             .list_all();
-        assert_eq!(preview_tools.len(), 35);
+        assert_eq!(preview_tools.len(), 38);
         assert_policy(
             preview_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -4296,6 +4644,9 @@ mod tests {
             "ozon_rfbs_returns",
             "ozon_finance_transactions",
             "ozon_finance_totals",
+            "ozon_performance_campaigns",
+            "ozon_performance_daily",
+            "ozon_performance_expenses",
             "ozon_seller_rating",
             "ozon_seller_rating_history",
             "ozon_reviews",
@@ -4316,7 +4667,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         let default_names = names(&server());
-        assert_eq!(default_names.len(), 32);
+        assert_eq!(default_names.len(), 35);
         assert!(preview_names.is_disjoint(&default_names));
         for name in STABLE_TOOL_NAMES {
             assert!(
@@ -4331,7 +4682,7 @@ mod tests {
         assert!(preview_names.is_disjoint(&names(&authenticated)));
 
         let enabled_names = names(&server().with_preview_features(false, true));
-        assert_eq!(enabled_names.len(), 35);
+        assert_eq!(enabled_names.len(), 38);
         assert!(preview_names.is_subset(&enabled_names));
         assert_eq!(
             enabled_names
@@ -6805,5 +7156,608 @@ mod tests {
         assert!(error.contains("не настроены Client-Id и Api-Key"));
         assert!(error.contains("не вызывайте автоматически другие инструменты"));
         assert!(error.contains("не заявляйте о прямом доступе к Ozon"));
+    }
+
+    #[tokio::test]
+    async fn performance_tools_send_exact_read_only_queries_and_mark_payloads_untrusted() {
+        let (server, requests) = performance_mock_server(
+            "admin",
+            vec![
+                (200, performance_token_response()),
+                (
+                    200,
+                    json!({
+                        "rows": [{
+                            "campaignId": 11,
+                            "customerEmail": "must-not-leave-server@example.test"
+                        }]
+                    })
+                    .to_string(),
+                ),
+                (200, json!({"daily": []}).to_string()),
+                (200, json!({"expenses": []}).to_string()),
+            ],
+        );
+
+        let campaigns = server
+            .performance_campaigns(
+                RequestIdentity::dev(),
+                Parameters(PerformanceCampaignsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: vec![11, 22],
+                    adv_object_type: Some(PerformanceAdvObjectType::Sku),
+                    state: Some(PerformanceCampaignState::CampaignStateRunning),
+                    page: 2,
+                    page_size: 10,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(campaigns.store, StoreId::from("store_a"));
+        assert_eq!(campaigns.endpoint, CAMPAIGNS_PATH);
+        assert_eq!(campaigns.data_classification, UNTRUSTED_DATA_CLASSIFICATION);
+        assert_eq!(
+            campaigns.data["rows"][0]["customerEmail"],
+            json!(REDACTED_VALUE)
+        );
+
+        let daily = server
+            .performance_daily(
+                RequestIdentity::dev(),
+                Parameters(PerformanceStatisticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: vec![11, 22],
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-09".to_owned(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(daily.endpoint, DAILY_STATS_PATH);
+        assert_eq!(daily.data_classification, UNTRUSTED_DATA_CLASSIFICATION);
+
+        let expenses = server
+            .performance_expenses(
+                RequestIdentity::dev(),
+                Parameters(PerformanceStatisticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: vec![11, 22],
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-09".to_owned(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(expenses.endpoint, EXPENSES_PATH);
+        assert_eq!(expenses.data_classification, UNTRUSTED_DATA_CLASSIFICATION);
+
+        let captured = (0..4)
+            .map(|_| requests.recv_timeout(Duration::from_secs(3)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captured[0].lines().next().unwrap(),
+            "POST /api/client/token HTTP/1.1"
+        );
+        assert_eq!(
+            captured[1].lines().next().unwrap(),
+            "GET /api/client/campaign?campaignIds=11&campaignIds=22&advObjectType=SKU&state=CAMPAIGN_STATE_RUNNING&page=2&pageSize=10 HTTP/1.1"
+        );
+        assert_eq!(
+            captured[2].lines().next().unwrap(),
+            "GET /api/client/statistics/daily/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
+        );
+        assert_eq!(
+            captured[3].lines().next().unwrap(),
+            "GET /api/client/statistics/expense/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn performance_tools_enforce_role_and_account_access_before_network() {
+        for role in [Role::Finance, Role::Admin] {
+            assert!(OzonMcp::authorize_performance_for_role(role).is_ok());
+        }
+        for role in [Role::Manager, Role::Analyst] {
+            let error = OzonMcp::authorize_performance_for_role(role).unwrap_err();
+            assert!(error.contains(ROLE_ACCESS_DENIED), "{error}");
+        }
+
+        let (finance, finance_requests) = performance_mock_server(
+            "finance",
+            vec![
+                (200, performance_token_response()),
+                (200, json!({"campaigns": []}).to_string()),
+            ],
+        );
+        assert_eq!(
+            finance
+                .performance_context(&RequestIdentity::dev(), None)
+                .unwrap(),
+            StoreId::from("store_a")
+        );
+        finance
+            .performance_campaigns(
+                RequestIdentity::dev(),
+                Parameters(PerformanceCampaignsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: Vec::new(),
+                    adv_object_type: None,
+                    state: None,
+                    page: 1,
+                    page_size: 100,
+                }),
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            finance_requests
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+        }
+        assert!(finance_requests.try_recv().is_err());
+
+        for actor in ["manager", "analyst"] {
+            let (server, requests) = performance_mock_server(actor, Vec::new());
+            let error = server
+                .performance_campaigns(
+                    RequestIdentity::dev(),
+                    Parameters(PerformanceCampaignsInput {
+                        store: Some(StoreId::from("store_a")),
+                        campaign_ids: Vec::new(),
+                        adv_object_type: None,
+                        state: None,
+                        page: 1,
+                        page_size: 100,
+                    }),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(error.contains(ROLE_ACCESS_DENIED), "{error}");
+            assert!(requests.try_recv().is_err());
+        }
+
+        let (restricted_finance, requests) = performance_mock_server("finance_denied", Vec::new());
+        let error = restricted_finance
+            .performance_expenses(
+                RequestIdentity::dev(),
+                Parameters(PerformanceStatisticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: Vec::new(),
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-02".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains(ACCESS_DENIED), "{error}");
+        assert!(!error.contains("Example organization A"), "{error}");
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn performance_runtime_validation_rejects_invalid_inputs_before_network() {
+        fn campaigns_input(
+            campaign_ids: Vec<u64>,
+            page: u32,
+            page_size: u32,
+        ) -> PerformanceCampaignsInput {
+            PerformanceCampaignsInput {
+                store: Some(StoreId::from("store_a")),
+                campaign_ids,
+                adv_object_type: None,
+                state: None,
+                page,
+                page_size,
+            }
+        }
+
+        fn statistics_input(date_from: &str, date_to: &str) -> PerformanceStatisticsInput {
+            PerformanceStatisticsInput {
+                store: Some(StoreId::from("store_a")),
+                campaign_ids: vec![1],
+                date_from: date_from.to_owned(),
+                date_to: date_to.to_owned(),
+            }
+        }
+
+        let (server, requests) = performance_mock_server("admin", Vec::new());
+        assert_validation_error(
+            server
+                .performance_campaigns(
+                    RequestIdentity::dev(),
+                    Parameters(campaigns_input(
+                        (1..=(MAX_PERFORMANCE_CAMPAIGNS as u64 + 1)).collect(),
+                        1,
+                        100,
+                    )),
+                )
+                .await,
+            "campaign_ids",
+        );
+        for campaign_ids in [vec![0], vec![1, 1]] {
+            assert_validation_error(
+                server
+                    .performance_campaigns(
+                        RequestIdentity::dev(),
+                        Parameters(campaigns_input(campaign_ids, 1, 100)),
+                    )
+                    .await,
+                "campaign_ids",
+            );
+        }
+        for (page, page_size, field) in [
+            (0, 100, "page"),
+            (MAX_PAGE + 1, 100, "page"),
+            (1, 0, "limit"),
+            (1, 101, "limit"),
+        ] {
+            assert_validation_error(
+                server
+                    .performance_campaigns(
+                        RequestIdentity::dev(),
+                        Parameters(campaigns_input(Vec::new(), page, page_size)),
+                    )
+                    .await,
+                field,
+            );
+        }
+        for (date_from, date_to, field) in [
+            ("not-a-date", "2026-08-01", "date_from"),
+            ("2026-08-02", "2026-08-01", "date_to"),
+            ("2026-01-01", "2026-02-01", "31"),
+        ] {
+            assert_validation_error(
+                server
+                    .performance_daily(
+                        RequestIdentity::dev(),
+                        Parameters(statistics_input(date_from, date_to)),
+                    )
+                    .await,
+                field,
+            );
+        }
+        assert_validation_error(
+            server
+                .performance_expenses(
+                    RequestIdentity::dev(),
+                    Parameters(PerformanceStatisticsInput {
+                        store: Some(StoreId::from("store_a")),
+                        campaign_ids: vec![0],
+                        date_from: "2026-08-01".to_owned(),
+                        date_to: "2026-08-02".to_owned(),
+                    }),
+                )
+                .await,
+            "campaign_ids",
+        );
+        assert_validation_error(
+            server
+                .performance_expenses(
+                    RequestIdentity::dev(),
+                    Parameters(statistics_input("invalid", "2026-08-02")),
+                )
+                .await,
+            "date_from",
+        );
+        assert_validation_error(
+            server
+                .performance_campaigns(
+                    RequestIdentity::dev(),
+                    Parameters(PerformanceCampaignsInput {
+                        store: Some(StoreId::from("   ")),
+                        campaign_ids: Vec::new(),
+                        adv_object_type: None,
+                        state: None,
+                        page: 1,
+                        page_size: 100,
+                    }),
+                )
+                .await,
+            "store",
+        );
+        assert_validation_error(
+            server
+                .performance_campaigns(
+                    RequestIdentity::dev(),
+                    Parameters(PerformanceCampaignsInput {
+                        store: Some(StoreId::new("x".repeat(MAX_STORE_SELECTOR_CHARS + 1))),
+                        campaign_ids: Vec::new(),
+                        adv_object_type: None,
+                        state: None,
+                        page: 1,
+                        page_size: 100,
+                    }),
+                )
+                .await,
+            "store",
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn performance_query_enum_values_are_exhaustive_and_stable() {
+        for (value, expected) in [
+            (PerformanceAdvObjectType::Sku, "SKU"),
+            (PerformanceAdvObjectType::Banner, "BANNER"),
+            (PerformanceAdvObjectType::SearchPromo, "SEARCH_PROMO"),
+            (PerformanceAdvObjectType::VideoBanner, "VIDEO_BANNER"),
+        ] {
+            assert_eq!(value.as_str(), expected);
+        }
+        for (value, expected) in [
+            (
+                PerformanceCampaignState::CampaignStateUnknown,
+                "CAMPAIGN_STATE_UNKNOWN",
+            ),
+            (
+                PerformanceCampaignState::CampaignStateRunning,
+                "CAMPAIGN_STATE_RUNNING",
+            ),
+            (
+                PerformanceCampaignState::CampaignStatePlanned,
+                "CAMPAIGN_STATE_PLANNED",
+            ),
+            (
+                PerformanceCampaignState::CampaignStateStopped,
+                "CAMPAIGN_STATE_STOPPED",
+            ),
+            (
+                PerformanceCampaignState::CampaignStateInactive,
+                "CAMPAIGN_STATE_INACTIVE",
+            ),
+            (
+                PerformanceCampaignState::CampaignStateArchived,
+                "CAMPAIGN_STATE_ARCHIVED",
+            ),
+            (
+                PerformanceCampaignState::CampaignStateModerationDraft,
+                "CAMPAIGN_STATE_MODERATION_DRAFT",
+            ),
+            (
+                PerformanceCampaignState::CampaignStateModerationInProgress,
+                "CAMPAIGN_STATE_MODERATION_IN_PROGRESS",
+            ),
+            (
+                PerformanceCampaignState::CampaignStateModerationFailed,
+                "CAMPAIGN_STATE_MODERATION_FAILED",
+            ),
+            (
+                PerformanceCampaignState::CampaignStateFinished,
+                "CAMPAIGN_STATE_FINISHED",
+            ),
+        ] {
+            assert_eq!(value.as_str(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn performance_mcp_boundary_and_schemas_are_strict() {
+        let tools = server().tool_router.list_all();
+        let schema = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("performance tool must be registered")
+                .input_schema
+                .clone()
+        };
+        let campaigns = schema("ozon_performance_campaigns");
+        assert_eq!(campaigns["additionalProperties"], json!(false));
+        assert_eq!(
+            campaigns["properties"]["campaign_ids"]["maxItems"],
+            json!(10)
+        );
+        assert_eq!(
+            campaigns["properties"]["campaign_ids"]["items"]["minimum"],
+            json!(1)
+        );
+        assert_eq!(campaigns["properties"]["page"]["minimum"], json!(1));
+        assert_eq!(campaigns["properties"]["page"]["maximum"], json!(MAX_PAGE));
+        assert_eq!(campaigns["properties"]["page_size"]["minimum"], json!(1));
+        assert_eq!(campaigns["properties"]["page_size"]["maximum"], json!(100));
+
+        for tool in ["ozon_performance_daily", "ozon_performance_expenses"] {
+            let schema = schema(tool);
+            assert_eq!(schema["additionalProperties"], json!(false), "{tool}");
+            assert_eq!(
+                schema["properties"]["campaign_ids"]["maxItems"],
+                json!(10),
+                "{tool}"
+            );
+            for field in ["date_from", "date_to"] {
+                assert_eq!(
+                    schema["properties"][field]["minLength"],
+                    json!(10),
+                    "{tool}.{field}"
+                );
+                assert_eq!(
+                    schema["properties"][field]["maxLength"],
+                    json!(10),
+                    "{tool}.{field}"
+                );
+            }
+        }
+
+        let (server, requests) = performance_mock_server("admin", Vec::new());
+        let body = call_tool_over_http(
+            server,
+            "ozon_performance_campaigns",
+            json!({"store":"store_a", "unexpected":true}),
+        )
+        .await;
+        assert!(body.contains("unknown field"), "{body}");
+        assert!(body.contains("unexpected"), "{body}");
+        assert!(requests.try_recv().is_err());
+
+        let (server, requests) = performance_mock_server("admin", Vec::new());
+        let body = call_tool_over_http(
+            server,
+            "ozon_performance_daily",
+            json!({
+                "store":"store_a",
+                "date_from":"2026-08-01",
+                "date_to":"2026-08-02",
+                "raw_path":"/api/client/campaign/1"
+            }),
+        )
+        .await;
+        assert!(body.contains("unknown field"), "{body}");
+        assert!(body.contains("raw_path"), "{body}");
+        assert!(requests.try_recv().is_err());
+
+        let (server, requests) = performance_mock_server("admin", Vec::new());
+        let body = call_tool_over_http(
+            server,
+            "ozon_performance_campaigns",
+            json!({"store":"store_a", "state":"DELETE"}),
+        )
+        .await;
+        assert!(body.contains("unknown variant"), "{body}");
+        assert!(body.contains("DELETE"), "{body}");
+        assert!(requests.try_recv().is_err());
+
+        for tool in ["ozon_performance_daily", "ozon_performance_expenses"] {
+            let (server, requests) = performance_mock_server(
+                "admin",
+                vec![
+                    (200, performance_token_response()),
+                    (200, json!({"rows": []}).to_string()),
+                ],
+            );
+            let body = call_tool_over_http(
+                server,
+                tool,
+                json!({
+                    "store":"store_a",
+                    "campaign_ids":[11],
+                    "date_from":"2026-08-01",
+                    "date_to":"2026-08-02"
+                }),
+            )
+            .await;
+            assert!(body.contains(UNTRUSTED_DATA_CLASSIFICATION), "{body}");
+            for _ in 0..2 {
+                requests.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn performance_errors_are_structured_and_status_never_exposes_credentials() {
+        let (server, requests) = performance_mock_server(
+            "admin",
+            vec![
+                (200, performance_token_response()),
+                (
+                    403,
+                    json!({"message":"upstream-body-must-not-be-reflected"}).to_string(),
+                ),
+                (429, json!({"message":"rate limited"}).to_string()),
+                (500, json!({"message":"server error"}).to_string()),
+            ],
+        );
+        let error = server
+            .performance_campaigns(
+                RequestIdentity::dev(),
+                Parameters(PerformanceCampaignsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: Vec::new(),
+                    adv_object_type: None,
+                    state: None,
+                    page: 1,
+                    page_size: 100,
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.starts_with(OZON_PERFORMANCE_TOOL_FAILURE), "{error}");
+        assert!(error.contains("kind=forbidden"), "{error}");
+        assert!(error.contains("store=store_a"), "{error}");
+        assert!(error.contains("endpoint=/api/client/campaign"), "{error}");
+        assert!(error.contains("request_id=-"), "{error}");
+        assert!(!error.contains("upstream-body-must-not-be-reflected"));
+        assert!(!error.contains("test-performance-secret"));
+
+        let daily_error = server
+            .performance_daily(
+                RequestIdentity::dev(),
+                Parameters(PerformanceStatisticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: vec![11],
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-02".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(daily_error.contains("kind=rate_limited"), "{daily_error}");
+        assert!(
+            daily_error.contains("endpoint=/api/client/statistics/daily/json"),
+            "{daily_error}"
+        );
+
+        let expenses_error = server
+            .performance_expenses(
+                RequestIdentity::dev(),
+                Parameters(PerformanceStatisticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: vec![11],
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-02".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            expenses_error.contains("kind=upstream_http_error"),
+            "{expenses_error}"
+        );
+        assert!(
+            expenses_error.contains("endpoint=/api/client/statistics/expense/json"),
+            "{expenses_error}"
+        );
+
+        for _ in 0..4 {
+            requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        assert!(requests.try_recv().is_err());
+
+        let structured = OzonMcp::performance_error(
+            &StoreId::from("store_a"),
+            DAILY_STATS_PATH,
+            crate::ozon_performance::PerformanceError::RateLimited {
+                request_id: Some("safe/id:1".to_owned()),
+            },
+        );
+        assert!(structured.contains("kind=rate_limited"), "{structured}");
+        assert!(structured.contains("request_id=safe/id:1"), "{structured}");
+        assert!(!structured.contains('\n'));
+        assert!(!structured.contains('\r'));
+
+        let (server, requests) = performance_mock_server("admin", Vec::new());
+        let status = server
+            .stores_status(RequestIdentity::dev(), Parameters(EmptyInput {}))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(status.stores.len(), 2);
+        assert_eq!(status.stores[0].store_id, StoreId::from("store_a"));
+        assert!(status.stores[0].performance_configured);
+        assert_eq!(status.stores[1].store_id, StoreId::from("store_b"));
+        assert!(!status.stores[1].performance_configured);
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains("test-performance-client"));
+        assert!(!serialized.contains("test-performance-secret"));
+        assert!(requests.try_recv().is_err());
     }
 }
