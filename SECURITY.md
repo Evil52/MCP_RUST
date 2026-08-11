@@ -29,7 +29,9 @@ The following properties are treated as release gates:
    Compose file. Ozon Performance business egress is fixed to exactly
    `GET /api/client/campaign`, `GET /api/client/statistics/daily/json`, and
    `GET /api/client/statistics/expense/json`; its internal `POST /api/client/token` is not
-   model-callable. WB egress likewise requires an exact allowlisted method, path, host, and quota.
+   model-callable. WB Promotion egress is fixed to `GET /adv/v1/promotion/count`,
+   `GET /api/advert/v2/adverts`, and `GET /adv/v3/fullstats`. WB egress likewise requires an
+   exact allowlisted method, path, host, and quota.
    A safe HTTP verb is never sufficient by itself.
 3. Every MCP tool rejects unknown fields and applies bounded runtime validation in addition to its
    JSON Schema. A denied role, account, endpoint, malformed input, missing credential, or exhausted
@@ -58,7 +60,8 @@ The following properties are treated as release gates:
   refresh. There is no generic retry that can create or duplicate an advertising operation.
 - Wildberries: quota is shared by token rather than account alias, funnel pacing is 20 seconds,
   ping pacing is 10 seconds, per-token concurrency is 4, global concurrency is 8, and the complete
-  operation has a 60-second deadline. Vendor retry headers are parsed conservatively.
+  operation has a 60-second deadline. Promotion campaign reads share a 200 ms quota bucket and
+  full statistics has a separate 20-second bucket. Vendor retry headers are parsed conservatively.
 - MCP HTTP: the local session registry defaults to a hard maximum of 256 entries and atomically
   rejects N+1/concurrent overflow. `MCP_MAX_SESSIONS` can lower this value.
 - Responses are streamed and capped at 8 MiB after decompression; error diagnostics are capped at
@@ -115,6 +118,10 @@ has broader vendor permissions.
   `/api/client/campaign/all_sku_promo/activate`,
   `/api/client/campaign/all_sku_promo/deactivate`, and
   `/api/client/campaign/all_sku_promo/set_bid` fail locally without credentials or network access.
+- Verify the WB Promotion namespace contains exactly `wb_promotion_campaigns`,
+  `wb_promotion_campaign_details`, and `wb_promotion_stats`. Assert that campaign start, pause,
+  stop, delete, budget deposit, bid changes, SKU-promo activation and deactivation fail locally
+  without credentials or network access, including the mutating operations that use HTTP `GET`.
 - Confirm the runtime registry and `.env` are ignored regular files with mode `600`; never copy their
   contents into logs, screenshots, CI artifacts, or Git.
 - Run OAuth/Keycloak smoke tests only against disposable test identities. Run marketplace canaries

@@ -47,6 +47,8 @@ const MAX_OPERATION_TYPES: usize = 100;
 const MAX_RATINGS: usize = 100;
 const MAX_PERFORMANCE_CAMPAIGNS: usize = 10;
 const MAX_PERFORMANCE_PERIOD_DAYS: i64 = 31;
+const MAX_WB_PROMOTION_CAMPAIGNS: usize = 50;
+const MAX_WB_PROMOTION_PERIOD_DAYS: i64 = 31;
 const MIN_REVIEWS_LIMIT: u32 = 20;
 const MAX_OFFSET: u32 = 1_000_000;
 const MAX_PAGE: u32 = 1_000_000;
@@ -1106,6 +1108,83 @@ pub struct WbAcceptanceCoefficientsInput {
         inner(range(min = 1))
     )]
     pub warehouse_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WbPromotionPaymentType {
+    Cpm,
+    Cpc,
+}
+
+impl WbPromotionPaymentType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpm => "cpm",
+            Self::Cpc => "cpc",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbPromotionCampaignDetailsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(
+        description = "От 1 до 50 уникальных положительных ID кампаний из wb_promotion_campaigns",
+        length(min = 1, max = 50),
+        inner(range(min = 1)),
+        extend("uniqueItems" = true)
+    )]
+    pub campaign_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Необязательный непустой фильтр официальных статусов WB: -1, 4, 7, 8, 9 или 11",
+        length(min = 1, max = 6),
+        extend(
+            "uniqueItems" = true,
+            "items" = {"type": "integer", "enum": [-1, 4, 7, 8, 9, 11]}
+        )
+    )]
+    pub statuses: Option<Vec<i32>>,
+    #[serde(default)]
+    #[schemars(description = "Необязательный тип оплаты кампании: cpm или cpc")]
+    pub payment_type: Option<WbPromotionPaymentType>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbPromotionStatsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(
+        description = "От 1 до 50 уникальных положительных ID кампаний из wb_promotion_campaigns; официальный fullstats поддерживает кампании в статусах 7, 9 и 11",
+        length(min = 1, max = 50),
+        inner(range(min = 1)),
+        extend("uniqueItems" = true)
+    )]
+    pub campaign_ids: Vec<u64>,
+    #[schemars(
+        description = "Начало периода в формате YYYY-MM-DD",
+        length(equal = 10),
+        regex(pattern = r"^\d{4}-\d{2}-\d{2}$")
+    )]
+    pub begin_date: String,
+    #[schemars(
+        description = "Конец периода в формате YYYY-MM-DD",
+        length(equal = 10),
+        regex(pattern = r"^\d{4}-\d{2}-\d{2}$")
+    )]
+    pub end_date: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
@@ -2171,6 +2250,111 @@ impl OzonMcp {
         Ok(Self::wb_result(account, endpoint, data))
     }
 
+    /// Возвращает read-only сводку рекламных кампаний Wildberries и их ID, не изменяя кампании.
+    #[tool(
+        name = "wb_promotion_campaigns",
+        annotations(
+            title = "Рекламные кампании Wildberries",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn wb_promotion_campaigns(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbAccountInput>,
+    ) -> Result<Json<WbResult>, String> {
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "promotion:/adv/v1/promotion/count";
+        let data = self
+            .wb_client
+            .promotion_campaigns(&account)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Возвращает read-only настройки выбранных рекламных кампаний Wildberries. Требует явный ограниченный список ID.
+    #[tool(
+        name = "wb_promotion_campaign_details",
+        annotations(
+            title = "Настройки рекламных кампаний Wildberries",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn wb_promotion_campaign_details(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbPromotionCampaignDetailsInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_count(
+            "campaign_ids",
+            input.campaign_ids.len(),
+            1,
+            MAX_WB_PROMOTION_CAMPAIGNS,
+        )?;
+        validate_unique_positive_ids("campaign_ids", &input.campaign_ids)?;
+        if let Some(statuses) = input.statuses.as_deref() {
+            validate_wb_promotion_statuses(statuses)?;
+        }
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "promotion:/api/advert/v2/adverts";
+        let data = self
+            .wb_client
+            .promotion_campaign_details(
+                &account,
+                input.campaign_ids,
+                input.statuses.unwrap_or_default(),
+                input
+                    .payment_type
+                    .map(|payment_type| payment_type.as_str().to_owned()),
+            )
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Возвращает read-only статистику кампаний Wildberries в статусах 7, 9 и 11 за период не более 31 дня.
+    #[tool(
+        name = "wb_promotion_stats",
+        annotations(
+            title = "Статистика рекламы Wildberries",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn wb_promotion_stats(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbPromotionStatsInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_count(
+            "campaign_ids",
+            input.campaign_ids.len(),
+            1,
+            MAX_WB_PROMOTION_CAMPAIGNS,
+        )?;
+        validate_unique_positive_ids("campaign_ids", &input.campaign_ids)?;
+        validate_wb_promotion_date_range(&input.begin_date, &input.end_date)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "promotion:/adv/v3/fullstats";
+        let data = self
+            .wb_client
+            .promotion_stats(
+                &account,
+                input.campaign_ids,
+                input.begin_date,
+                input.end_date,
+            )
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
     /// Показывает доступные текущему пользователю кабинеты Ozon и Wildberries и состояние их read-only интеграций.
     #[tool(
         name = "marketplace_accounts",
@@ -3002,6 +3186,38 @@ fn validate_unique_positive_ids(field: &str, values: &[u64]) -> Result<(), Strin
         .collect::<std::collections::BTreeSet<_>>();
     if unique.len() != values.len() {
         return Err(format!("{field} не должен содержать повторяющиеся ID"));
+    }
+    Ok(())
+}
+
+fn validate_wb_promotion_statuses(statuses: &[i32]) -> Result<(), String> {
+    const ALLOWED_STATUSES: &[i32] = &[-1, 4, 7, 8, 9, 11];
+    validate_count("statuses", statuses.len(), 1, ALLOWED_STATUSES.len())?;
+    let unique = statuses.iter().copied().collect::<BTreeSet<_>>();
+    if unique.len() != statuses.len() {
+        return Err("statuses не должен содержать повторяющиеся значения".to_owned());
+    }
+    if statuses
+        .iter()
+        .any(|status| !ALLOWED_STATUSES.contains(status))
+    {
+        return Err(
+            "statuses допускает только официальные значения WB: -1, 4, 7, 8, 9, 11".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_wb_promotion_date_range(begin_date: &str, end_date: &str) -> Result<(), String> {
+    let begin = parse_date(begin_date, "begin_date")?;
+    let end = parse_date(end_date, "end_date")?;
+    if end < begin {
+        return Err("end_date не может быть раньше begin_date".to_owned());
+    }
+    if (end - begin).num_days() + 1 > MAX_WB_PROMOTION_PERIOD_DAYS {
+        return Err(format!(
+            "период WB Promotion не может превышать {MAX_WB_PROMOTION_PERIOD_DAYS} день"
+        ));
     }
     Ok(())
 }
@@ -4340,6 +4556,288 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wb_promotion_tools_send_only_exact_bounded_read_only_contracts() {
+        let payload = json!({
+            "adverts": [],
+            "customerEmail": "must-not-reach-model@example.test"
+        })
+        .to_string();
+        let (server, requests) = mock_wb_server_with_responses(
+            "admin",
+            vec![
+                (200, payload.clone()),
+                (200, payload.clone()),
+                (200, payload),
+            ],
+        );
+        let end = Utc::now().date_naive();
+        let begin = end - chrono::Duration::days(2);
+        let begin_date = begin.format("%Y-%m-%d").to_string();
+        let end_date = end.format("%Y-%m-%d").to_string();
+
+        let campaigns = server
+            .wb_promotion_campaigns(
+                RequestIdentity::dev(),
+                Parameters(WbAccountInput {
+                    account: Some("account_wb".to_owned()),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        let details = server
+            .wb_promotion_campaign_details(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionCampaignDetailsInput {
+                    account: Some("account_wb".to_owned()),
+                    campaign_ids: vec![101, 202],
+                    statuses: Some(vec![-1, 4, 7, 8, 9, 11]),
+                    payment_type: Some(WbPromotionPaymentType::Cpc),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        let stats = server
+            .wb_promotion_stats(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionStatsInput {
+                    account: Some("account_wb".to_owned()),
+                    campaign_ids: vec![101, 202],
+                    begin_date: begin_date.clone(),
+                    end_date: end_date.clone(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+
+        for (result, endpoint) in [
+            (campaigns, "promotion:/adv/v1/promotion/count"),
+            (details, "promotion:/api/advert/v2/adverts"),
+            (stats, "promotion:/adv/v3/fullstats"),
+        ] {
+            assert_eq!(result.account_id, "account_wb");
+            assert_eq!(result.endpoint, endpoint);
+            assert_eq!(result.data_classification, UNTRUSTED_DATA_CLASSIFICATION);
+            assert_eq!(result.data["customerEmail"], json!(REDACTED_VALUE));
+        }
+
+        let campaigns_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            campaigns_request.starts_with("GET /adv/v1/promotion/count HTTP/1.1\r\n"),
+            "{campaigns_request}"
+        );
+        let details_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            details_request.starts_with(
+                "GET /api/advert/v2/adverts?ids=101%2C202&statuses=-1%2C4%2C7%2C8%2C9%2C11&payment_type=cpc HTTP/1.1\r\n"
+            ),
+            "{details_request}"
+        );
+        let stats_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            stats_request.starts_with(&format!(
+                "GET /adv/v3/fullstats?ids=101%2C202&beginDate={begin_date}&endDate={end_date} HTTP/1.1\r\n"
+            )),
+            "{stats_request}"
+        );
+        assert!(requests.try_recv().is_err());
+        assert_eq!(WbPromotionPaymentType::Cpm.as_str(), "cpm");
+        assert_eq!(WbPromotionPaymentType::Cpc.as_str(), "cpc");
+    }
+
+    #[tokio::test]
+    async fn wb_promotion_invalid_inputs_fail_closed_before_network() {
+        let (server, requests) = mock_wb_server_for("admin", 0);
+
+        for campaign_ids in [vec![], vec![0], vec![1, 1], vec![1; 51]] {
+            let error = server
+                .wb_promotion_campaign_details(
+                    RequestIdentity::dev(),
+                    Parameters(WbPromotionCampaignDetailsInput {
+                        account: Some("account_wb".to_owned()),
+                        campaign_ids,
+                        statuses: None,
+                        payment_type: None,
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid details campaign IDs must be rejected");
+            assert!(error.contains("campaign_ids"), "{error}");
+        }
+
+        for statuses in [vec![], vec![9, 9], vec![5], vec![-1, 4, 7, 8, 9, 11, 12]] {
+            let error = server
+                .wb_promotion_campaign_details(
+                    RequestIdentity::dev(),
+                    Parameters(WbPromotionCampaignDetailsInput {
+                        account: Some("account_wb".to_owned()),
+                        campaign_ids: vec![1],
+                        statuses: Some(statuses),
+                        payment_type: None,
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid promotion statuses must be rejected");
+            assert!(error.contains("statuses"), "{error}");
+        }
+
+        for campaign_ids in [vec![], vec![0], vec![1, 1], vec![1; 51]] {
+            let error = server
+                .wb_promotion_stats(
+                    RequestIdentity::dev(),
+                    Parameters(WbPromotionStatsInput {
+                        account: Some("account_wb".to_owned()),
+                        campaign_ids,
+                        begin_date: "2026-07-01".to_owned(),
+                        end_date: "2026-07-02".to_owned(),
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid stats campaign IDs must be rejected");
+            assert!(error.contains("campaign_ids"), "{error}");
+        }
+
+        for (begin_date, end_date, expected) in [
+            ("bad", "2026-07-02", "begin_date"),
+            ("2026-07-01", "bad", "end_date"),
+            ("2026-07-02", "2026-07-01", "раньше"),
+            ("2026-06-01", "2026-07-02", "31"),
+        ] {
+            let error = server
+                .wb_promotion_stats(
+                    RequestIdentity::dev(),
+                    Parameters(WbPromotionStatsInput {
+                        account: Some("account_wb".to_owned()),
+                        campaign_ids: vec![1],
+                        begin_date: begin_date.to_owned(),
+                        end_date: end_date.to_owned(),
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid promotion period must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        for (tool, arguments) in [
+            (
+                "wb_promotion_campaigns",
+                json!({"account":"account_wb", "raw_path":"/adv/v0/start"}),
+            ),
+            (
+                "wb_promotion_campaign_details",
+                json!({"account":"account_wb", "campaign_ids":[1], "payment_type":"write"}),
+            ),
+            (
+                "wb_promotion_stats",
+                json!({
+                    "account":"account_wb",
+                    "campaign_ids":[1],
+                    "begin_date":"2026-07-01",
+                    "end_date":"2026-07-02",
+                    "method":"POST"
+                }),
+            ),
+        ] {
+            let body = call_tool_over_http(server.clone(), tool, arguments).await;
+            assert!(body.contains("failed to deserialize parameters"), "{body}");
+        }
+        assert!(requests.try_recv().is_err());
+
+        let (manager, manager_requests) = mock_wb_server_for("manager", 0);
+        let denied = manager
+            .wb_promotion_campaigns(
+                RequestIdentity::dev(),
+                Parameters(WbAccountInput {
+                    account: Some("account_wb".to_owned()),
+                }),
+            )
+            .await
+            .err()
+            .expect("inaccessible WB account must be rejected");
+        assert!(denied.contains(ACCESS_DENIED), "{denied}");
+        assert!(manager_requests.try_recv().is_err());
+
+        let (admin, unknown_requests) = mock_wb_server_for("admin", 0);
+        let unknown = admin
+            .wb_promotion_campaign_details(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionCampaignDetailsInput {
+                    account: Some("unknown-wb".to_owned()),
+                    campaign_ids: vec![1],
+                    statuses: None,
+                    payment_type: None,
+                }),
+            )
+            .await
+            .err()
+            .expect("unknown WB account must be rejected");
+        assert!(unknown.contains("UNKNOWN_WB_ACCOUNT"), "{unknown}");
+        assert!(unknown_requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn wb_promotion_handlers_preserve_structured_upstream_errors() {
+        let (server, requests) =
+            mock_wb_server_with_responses("admin", vec![(500, "{}".to_owned()); 3]);
+        let date = Utc::now().date_naive().format("%Y-%m-%d").to_string();
+
+        let campaigns = server
+            .wb_promotion_campaigns(
+                RequestIdentity::dev(),
+                Parameters(WbAccountInput { account: None }),
+            )
+            .await
+            .err()
+            .expect("campaign list error must propagate");
+        let details = server
+            .wb_promotion_campaign_details(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionCampaignDetailsInput {
+                    account: None,
+                    campaign_ids: vec![1],
+                    statuses: None,
+                    payment_type: None,
+                }),
+            )
+            .await
+            .err()
+            .expect("campaign details error must propagate");
+        let stats = server
+            .wb_promotion_stats(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionStatsInput {
+                    account: None,
+                    campaign_ids: vec![1],
+                    begin_date: date.clone(),
+                    end_date: date,
+                }),
+            )
+            .await
+            .err()
+            .expect("campaign stats error must propagate");
+
+        for (error, endpoint) in [
+            (campaigns, "promotion:/adv/v1/promotion/count"),
+            (details, "promotion:/api/advert/v2/adverts"),
+            (stats, "promotion:/adv/v3/fullstats"),
+        ] {
+            assert!(error.contains(WB_TOOL_FAILURE), "{error}");
+            assert!(error.contains("kind=upstream_http_error"), "{error}");
+            assert!(error.contains(endpoint), "{error}");
+        }
+        for _ in 0..3 {
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn wb_extended_inputs_fail_closed_before_network() {
         let (server, requests) = mock_wb_server_for("admin", 0);
 
@@ -4583,7 +5081,7 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
-        assert_eq!(dev_tools.len(), 35);
+        assert_eq!(dev_tools.len(), 38);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -4594,7 +5092,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 35);
+        assert_eq!(jwt_tools.len(), 38);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -4606,7 +5104,7 @@ mod tests {
             .with_preview_features(false, true)
             .tool_router
             .list_all();
-        assert_eq!(preview_tools.len(), 38);
+        assert_eq!(preview_tools.len(), 41);
         assert_policy(
             preview_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -4634,6 +5132,9 @@ mod tests {
             "wb_tariff_pallets",
             "wb_tariff_returns",
             "wb_acceptance_coefficients",
+            "wb_promotion_campaigns",
+            "wb_promotion_campaign_details",
+            "wb_promotion_stats",
             "ozon_analytics",
             "ozon_product_stocks",
             "ozon_product_prices",
@@ -4667,7 +5168,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         let default_names = names(&server());
-        assert_eq!(default_names.len(), 35);
+        assert_eq!(default_names.len(), 38);
         assert!(preview_names.is_disjoint(&default_names));
         for name in STABLE_TOOL_NAMES {
             assert!(
@@ -4682,7 +5183,7 @@ mod tests {
         assert!(preview_names.is_disjoint(&names(&authenticated)));
 
         let enabled_names = names(&server().with_preview_features(false, true));
-        assert_eq!(enabled_names.len(), 38);
+        assert_eq!(enabled_names.len(), 41);
         assert!(preview_names.is_subset(&enabled_names));
         assert_eq!(
             enabled_names
@@ -7533,6 +8034,86 @@ mod tests {
             ),
         ] {
             assert_eq!(value.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn wb_promotion_schemas_and_annotations_are_strict() {
+        let tools = server().tool_router.list_all();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("WB Promotion tool must be registered")
+        };
+
+        let campaigns = tool("wb_promotion_campaigns");
+        assert_eq!(campaigns.input_schema["additionalProperties"], json!(false));
+        assert_eq!(
+            campaigns.input_schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["account"]
+        );
+
+        let details = tool("wb_promotion_campaign_details");
+        let details_schema = &details.input_schema;
+        assert_eq!(details_schema["additionalProperties"], json!(false));
+        assert!(
+            details_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("campaign_ids"))
+        );
+        let ids = &details_schema["properties"]["campaign_ids"];
+        assert_eq!(ids["minItems"], json!(1));
+        assert_eq!(ids["maxItems"], json!(MAX_WB_PROMOTION_CAMPAIGNS));
+        assert_eq!(ids["uniqueItems"], json!(true));
+        assert_eq!(ids["items"]["minimum"], json!(1));
+        let statuses = &details_schema["properties"]["statuses"];
+        assert_eq!(statuses["minItems"], json!(1));
+        assert_eq!(statuses["maxItems"], json!(6));
+        assert_eq!(statuses["uniqueItems"], json!(true));
+        assert_eq!(statuses["items"]["enum"], json!([-1, 4, 7, 8, 9, 11]));
+        let details_rendered = serde_json::to_string(details_schema).unwrap();
+        assert!(details_rendered.contains("\"cpm\""), "{details_rendered}");
+        assert!(details_rendered.contains("\"cpc\""), "{details_rendered}");
+
+        let stats = tool("wb_promotion_stats");
+        let stats_schema = &stats.input_schema;
+        assert_eq!(stats_schema["additionalProperties"], json!(false));
+        let stats_ids = &stats_schema["properties"]["campaign_ids"];
+        assert_eq!(stats_ids["minItems"], json!(1));
+        assert_eq!(stats_ids["maxItems"], json!(MAX_WB_PROMOTION_CAMPAIGNS));
+        assert_eq!(stats_ids["uniqueItems"], json!(true));
+        assert_eq!(stats_ids["items"]["minimum"], json!(1));
+        for field in ["begin_date", "end_date"] {
+            assert_eq!(stats_schema["properties"][field]["minLength"], json!(10));
+            assert_eq!(stats_schema["properties"][field]["maxLength"], json!(10));
+            assert_eq!(
+                stats_schema["properties"][field]["pattern"],
+                json!(r"^\d{4}-\d{2}-\d{2}$")
+            );
+            assert!(
+                stats_schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(field))
+            );
+        }
+
+        for name in [
+            "wb_promotion_campaigns",
+            "wb_promotion_campaign_details",
+            "wb_promotion_stats",
+        ] {
+            let annotations = tool(name).annotations.as_ref().unwrap();
+            assert_eq!(annotations.read_only_hint, Some(true), "{name}");
+            assert_eq!(annotations.destructive_hint, Some(false), "{name}");
+            assert_eq!(annotations.idempotent_hint, Some(true), "{name}");
+            assert_eq!(annotations.open_world_hint, Some(true), "{name}");
         }
     }
 

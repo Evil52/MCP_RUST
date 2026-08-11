@@ -1,11 +1,11 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use reqwest::{
     Client, Method, Response, StatusCode, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER},
@@ -24,6 +24,7 @@ const STATISTICS_API_BASE_URL: &str = "https://statistics-api.wildberries.ru";
 const CONTENT_API_BASE_URL: &str = "https://content-api.wildberries.ru";
 const PRICES_API_BASE_URL: &str = "https://discounts-prices-api.wildberries.ru";
 const COMMON_API_BASE_URL: &str = "https://common-api.wildberries.ru";
+const PROMOTION_API_BASE_URL: &str = "https://advert-api.wildberries.ru";
 const PING_PATH: &str = "/ping";
 const SALES_FUNNEL_PATH: &str = "/api/analytics/v3/sales-funnel/products";
 const SALES_FUNNEL_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/products/history";
@@ -38,6 +39,9 @@ const TARIFF_BOXES_PATH: &str = "/api/v1/tariffs/box";
 const TARIFF_PALLETS_PATH: &str = "/api/v1/tariffs/pallet";
 const TARIFF_RETURNS_PATH: &str = "/api/v1/tariffs/return";
 const ACCEPTANCE_COEFFICIENTS_PATH: &str = "/api/tariffs/v1/acceptance/coefficients";
+pub(crate) const PROMOTION_CAMPAIGNS_PATH: &str = "/adv/v1/promotion/count";
+pub(crate) const PROMOTION_DETAILS_PATH: &str = "/api/advert/v2/adverts";
+pub(crate) const PROMOTION_STATS_PATH: &str = "/adv/v3/fullstats";
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
 const MAX_ATTEMPTS: usize = 3;
@@ -53,6 +57,10 @@ const PRICES_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(600);
 const COMMISSION_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
 const LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const ACCEPTANCE_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
+const PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(200);
+const PROMOTION_STATS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
+const MAX_PROMOTION_CAMPAIGN_IDS: usize = 50;
+const MAX_PROMOTION_STATS_IDS: usize = 50;
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_LOGICAL_REQUEST_DURATION: Duration = Duration::from_secs(60);
@@ -68,6 +76,7 @@ enum ApiHost {
     Content,
     Prices,
     Common,
+    Promotion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +89,8 @@ enum RequestClass {
     CommissionTariff,
     LogisticsTariff,
     AcceptanceTariff,
+    PromotionCampaign,
+    PromotionStats,
 }
 
 /// Single source of truth for every request that may leave this process.
@@ -183,6 +194,24 @@ const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
         host: ApiHost::Common,
         request_class: RequestClass::AcceptanceTariff,
     },
+    EndpointPolicy {
+        method: Method::GET,
+        path: PROMOTION_CAMPAIGNS_PATH,
+        host: ApiHost::Promotion,
+        request_class: RequestClass::PromotionCampaign,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: PROMOTION_DETAILS_PATH,
+        host: ApiHost::Promotion,
+        request_class: RequestClass::PromotionCampaign,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: PROMOTION_STATS_PATH,
+        host: ApiHost::Promotion,
+        request_class: RequestClass::PromotionStats,
+    },
 ];
 
 #[derive(Clone)]
@@ -202,6 +231,7 @@ impl fmt::Debug for WbCredentials {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WbErrorKind {
     EndpointNotAllowed,
+    InvalidArguments,
     MissingCredentials,
     Unauthorized,
     Forbidden,
@@ -218,6 +248,7 @@ impl WbErrorKind {
     pub const fn code(self) -> &'static str {
         match self {
             Self::EndpointNotAllowed => "endpoint_not_allowed",
+            Self::InvalidArguments => "invalid_arguments",
             Self::MissingCredentials => "missing_credentials",
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
@@ -236,6 +267,8 @@ impl WbErrorKind {
 pub enum WbError {
     #[error("запрос {method} {path} отсутствует в read-only allowlist Wildberries API")]
     EndpointNotAllowed { method: Method, path: String },
+    #[error("некорректные параметры read-only запроса WB Promotion API: {field}")]
+    InvalidArguments { field: &'static str },
     #[error("для кабинета WB {0} не настроен API token")]
     MissingCredentials(String),
     #[error("WB API отклонил авторизацию (HTTP 401, request-id: {request_id:?})")]
@@ -305,6 +338,7 @@ impl WbError {
     pub const fn kind(&self) -> WbErrorKind {
         match self {
             Self::EndpointNotAllowed { .. } => WbErrorKind::EndpointNotAllowed,
+            Self::InvalidArguments { .. } => WbErrorKind::InvalidArguments,
             Self::MissingCredentials(_) => WbErrorKind::MissingCredentials,
             Self::Unauthorized { .. } => WbErrorKind::Unauthorized,
             Self::Forbidden { .. } => WbErrorKind::Forbidden,
@@ -329,6 +363,7 @@ impl WbError {
             | Self::InvalidJson { request_id, .. }
             | Self::ResponseTooLarge { request_id, .. } => request_id.as_deref(),
             Self::EndpointNotAllowed { .. }
+            | Self::InvalidArguments { .. }
             | Self::MissingCredentials(_)
             | Self::LocalRateLimited { .. }
             | Self::DeadlineExceeded
@@ -362,6 +397,8 @@ struct ClientPolicy {
     commission_interval: Duration,
     logistics_tariff_interval: Duration,
     acceptance_interval: Duration,
+    promotion_campaign_interval: Duration,
+    promotion_stats_interval: Duration,
     max_attempts: usize,
     base_retry_delay: Duration,
     max_retry_delay: Duration,
@@ -379,6 +416,8 @@ impl ClientPolicy {
             commission_interval: COMMISSION_MIN_REQUEST_INTERVAL,
             logistics_tariff_interval: LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL,
             acceptance_interval: ACCEPTANCE_MIN_REQUEST_INTERVAL,
+            promotion_campaign_interval: PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL,
+            promotion_stats_interval: PROMOTION_STATS_MIN_REQUEST_INTERVAL,
             max_attempts: MAX_ATTEMPTS,
             base_retry_delay: BASE_RETRY_DELAY,
             max_retry_delay: MAX_RETRY_DELAY,
@@ -399,6 +438,8 @@ impl ClientPolicy {
             commission_interval: Duration::ZERO,
             logistics_tariff_interval: Duration::ZERO,
             acceptance_interval: Duration::ZERO,
+            promotion_campaign_interval: Duration::ZERO,
+            promotion_stats_interval: Duration::ZERO,
             max_attempts: 1,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -416,6 +457,8 @@ impl ClientPolicy {
             RequestClass::CommissionTariff => self.commission_interval,
             RequestClass::LogisticsTariff => self.logistics_tariff_interval,
             RequestClass::AcceptanceTariff => self.acceptance_interval,
+            RequestClass::PromotionCampaign => self.promotion_campaign_interval,
+            RequestClass::PromotionStats => self.promotion_stats_interval,
         }
     }
 }
@@ -469,6 +512,8 @@ struct TokenLimiter {
     commission_tariffs: PacingGate,
     logistics_tariffs: PacingGate,
     acceptance_tariffs: PacingGate,
+    promotion_campaigns: PacingGate,
+    promotion_stats: PacingGate,
 }
 
 impl TokenLimiter {
@@ -483,6 +528,8 @@ impl TokenLimiter {
             commission_tariffs: PacingGate::new(),
             logistics_tariffs: PacingGate::new(),
             acceptance_tariffs: PacingGate::new(),
+            promotion_campaigns: PacingGate::new(),
+            promotion_stats: PacingGate::new(),
         }
     }
 
@@ -502,6 +549,14 @@ impl TokenLimiter {
             }
             RequestClass::LogisticsTariff => self.logistics_tariffs.pace(interval).await,
             RequestClass::AcceptanceTariff => self.acceptance_tariffs.pace(interval).await,
+            RequestClass::PromotionCampaign => self.promotion_campaigns.pace(interval).await,
+            RequestClass::PromotionStats => {
+                return self
+                    .promotion_stats
+                    .try_pace(interval)
+                    .await
+                    .map_err(|retry_after| WbError::LocalRateLimited { retry_after });
+            }
         }
         Ok(())
     }
@@ -514,6 +569,7 @@ struct BaseUrls {
     content: String,
     prices: String,
     common: String,
+    promotion: String,
 }
 
 impl BaseUrls {
@@ -524,6 +580,7 @@ impl BaseUrls {
             content: CONTENT_API_BASE_URL.to_owned(),
             prices: PRICES_API_BASE_URL.to_owned(),
             common: COMMON_API_BASE_URL.to_owned(),
+            promotion: PROMOTION_API_BASE_URL.to_owned(),
         }
     }
 
@@ -535,7 +592,8 @@ impl BaseUrls {
             statistics: common.clone(),
             content: common.clone(),
             prices: common.clone(),
-            common,
+            common: common.clone(),
+            promotion: common,
         }
     }
 
@@ -546,6 +604,7 @@ impl BaseUrls {
             ApiHost::Content => &self.content,
             ApiHost::Prices => &self.prices,
             ApiHost::Common => &self.common,
+            ApiHost::Promotion => &self.promotion,
         }
     }
 }
@@ -867,6 +926,79 @@ impl WbClient {
         .await
     }
 
+    /// Lists all promotion campaigns grouped by type and status.
+    ///
+    /// Although some WB write operations also use `GET`, this method can only
+    /// reach anything except the exact read-only path enforced by the client allowlist.
+    pub async fn promotion_campaigns(&self, account: &str) -> Result<Value, WbError> {
+        self.request(
+            account,
+            Method::GET,
+            "promotion:/adv/v1/promotion/count",
+            PROMOTION_CAMPAIGNS_PATH,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Returns details for promotion campaigns using only documented filters.
+    pub async fn promotion_campaign_details(
+        &self,
+        account: &str,
+        ids: Vec<u64>,
+        statuses: Vec<i32>,
+        payment_type: Option<String>,
+    ) -> Result<Value, WbError> {
+        // Local safety cap: callers must select a bounded campaign set rather
+        // than accidentally requesting every campaign in a large account.
+        validate_promotion_ids(&ids, MAX_PROMOTION_CAMPAIGN_IDS)?;
+        validate_promotion_statuses(&statuses)?;
+        validate_payment_type(payment_type.as_deref())?;
+
+        let mut query = vec![("ids", comma_separated(ids))];
+        if !statuses.is_empty() {
+            query.push(("statuses", comma_separated(statuses)));
+        }
+        if let Some(payment_type) = payment_type {
+            query.push(("payment_type", payment_type));
+        }
+        self.request(
+            account,
+            Method::GET,
+            "promotion:/api/advert/v2/adverts",
+            PROMOTION_DETAILS_PATH,
+            Some(query),
+            None,
+        )
+        .await
+    }
+
+    /// Returns campaign statistics for an inclusive period of at most 31 days.
+    pub async fn promotion_stats(
+        &self,
+        account: &str,
+        ids: Vec<u64>,
+        begin_date: String,
+        end_date: String,
+    ) -> Result<Value, WbError> {
+        validate_promotion_ids(&ids, MAX_PROMOTION_STATS_IDS)?;
+        validate_promotion_period(&begin_date, &end_date)?;
+        self.request(
+            account,
+            Method::GET,
+            "promotion:/adv/v3/fullstats",
+            PROMOTION_STATS_PATH,
+            Some(vec![
+                ("ids", comma_separated(ids)),
+                ("beginDate", begin_date),
+                ("endDate", end_date),
+            ]),
+            None,
+        )
+        .await
+    }
+
     async fn dated_tariff(
         &self,
         account: &str,
@@ -959,8 +1091,11 @@ impl WbClient {
             .in_flight
             .try_acquire()
             .map_err(|_| WbError::Overloaded)?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {}", credentials.token))
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", credentials.token))
             .map_err(|_| WbError::Unauthorized { request_id: None })?;
+        // Prevent accidental disclosure if reqwest headers are ever formatted
+        // by future middleware or debug instrumentation.
+        authorization.set_sensitive(true);
 
         timeout(
             self.logical_timeout,
@@ -1067,6 +1202,65 @@ impl WbClient {
             return result;
         }
     }
+}
+
+fn comma_separated<T: ToString>(values: impl IntoIterator<Item = T>) -> String {
+    values
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn validate_promotion_ids(ids: &[u64], maximum: usize) -> Result<(), WbError> {
+    let unique = ids.iter().collect::<BTreeSet<_>>().len();
+    if ids.is_empty() || ids.len() > maximum || ids.contains(&0) || unique != ids.len() {
+        return Err(WbError::InvalidArguments { field: "ids" });
+    }
+    Ok(())
+}
+
+fn validate_promotion_statuses(statuses: &[i32]) -> Result<(), WbError> {
+    let unique = statuses.iter().collect::<BTreeSet<_>>().len();
+    if statuses.len() > 6
+        || unique != statuses.len()
+        || statuses
+            .iter()
+            .any(|status| !matches!(status, -1 | 4 | 7 | 8 | 9 | 11))
+    {
+        return Err(WbError::InvalidArguments { field: "statuses" });
+    }
+    Ok(())
+}
+
+fn validate_payment_type(payment_type: Option<&str>) -> Result<(), WbError> {
+    if payment_type.is_some_and(|value| !matches!(value, "cpm" | "cpc")) {
+        return Err(WbError::InvalidArguments {
+            field: "payment_type",
+        });
+    }
+    Ok(())
+}
+
+fn parse_strict_date(value: &str, field: &'static str) -> Result<NaiveDate, WbError> {
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| WbError::InvalidArguments { field })?;
+    if date.format("%Y-%m-%d").to_string() != value {
+        return Err(WbError::InvalidArguments { field });
+    }
+    Ok(date)
+}
+
+fn validate_promotion_period(begin_date: &str, end_date: &str) -> Result<(), WbError> {
+    let begin = parse_strict_date(begin_date, "begin_date")?;
+    let end = parse_strict_date(end_date, "end_date")?;
+    let days = end.signed_duration_since(begin).num_days();
+    if !(0..=30).contains(&days) {
+        return Err(WbError::InvalidArguments {
+            field: "date_range",
+        });
+    }
+    Ok(())
 }
 
 fn classify_transport_error(error: reqwest::Error, request_id: Option<String>) -> WbError {
@@ -1405,6 +1599,14 @@ mod tests {
             policy.interval(RequestClass::AcceptanceTariff),
             Duration::from_secs(10)
         );
+        assert_eq!(
+            policy.interval(RequestClass::PromotionCampaign),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::PromotionStats),
+            Duration::from_secs(20)
+        );
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.logical_timeout, Duration::from_secs(10));
         assert_eq!(
@@ -1444,6 +1646,14 @@ mod tests {
             Some(RequestClass::AcceptanceTariff)
         );
         assert_eq!(
+            RequestClass::for_request(&Method::GET, PROMOTION_CAMPAIGNS_PATH),
+            Some(RequestClass::PromotionCampaign)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, PROMOTION_STATS_PATH),
+            Some(RequestClass::PromotionStats)
+        );
+        assert_eq!(
             RequestClass::for_request(&Method::GET, "/not-allowed"),
             None
         );
@@ -1454,6 +1664,7 @@ mod tests {
         assert_eq!(urls.base_url(ApiHost::Content), CONTENT_API_BASE_URL);
         assert_eq!(urls.base_url(ApiHost::Prices), PRICES_API_BASE_URL);
         assert_eq!(urls.base_url(ApiHost::Common), COMMON_API_BASE_URL);
+        assert_eq!(urls.base_url(ApiHost::Promotion), PROMOTION_API_BASE_URL);
     }
 
     #[test]
@@ -1542,6 +1753,24 @@ mod tests {
                 ACCEPTANCE_COEFFICIENTS_PATH,
                 ApiHost::Common,
                 RequestClass::AcceptanceTariff,
+            ),
+            (
+                Method::GET,
+                PROMOTION_CAMPAIGNS_PATH,
+                ApiHost::Promotion,
+                RequestClass::PromotionCampaign,
+            ),
+            (
+                Method::GET,
+                PROMOTION_DETAILS_PATH,
+                ApiHost::Promotion,
+                RequestClass::PromotionCampaign,
+            ),
+            (
+                Method::GET,
+                PROMOTION_STATS_PATH,
+                ApiHost::Promotion,
+                RequestClass::PromotionStats,
             ),
         ];
         assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), expected.len());
@@ -1808,6 +2037,12 @@ mod tests {
             (200, r#"{"response":{"data":{}}}"#.to_owned()),
             (200, "[]".to_owned()),
         ]);
+        let (promotion, promotion_requests) = mock_http(vec![
+            (200, r#"{"adverts":[],"all":0}"#.to_owned()),
+            (200, r#"{"adverts":[]}"#.to_owned()),
+            (200, r#"{"adverts":[]}"#.to_owned()),
+            (200, "[]".to_owned()),
+        ]);
         let client = WbClient::build(
             Duration::from_secs(2),
             credentials(),
@@ -1817,6 +2052,7 @@ mod tests {
                 content,
                 prices,
                 common,
+                promotion,
             },
             ClientPolicy::immediate_single_attempt(Duration::from_secs(2)),
         );
@@ -1842,6 +2078,29 @@ mod tests {
             .unwrap();
         client
             .acceptance_coefficients("account", Vec::new())
+            .await
+            .unwrap();
+        client.promotion_campaigns("account").await.unwrap();
+        client
+            .promotion_campaign_details(
+                "account",
+                vec![12, 34],
+                vec![9, 11],
+                Some("cpm".to_owned()),
+            )
+            .await
+            .unwrap();
+        client
+            .promotion_campaign_details("account", vec![56], Vec::new(), None)
+            .await
+            .unwrap();
+        client
+            .promotion_stats(
+                "account",
+                vec![12, 34],
+                "2026-08-01".to_owned(),
+                "2026-08-11".to_owned(),
+            )
             .await
             .unwrap();
 
@@ -1892,6 +2151,25 @@ mod tests {
             );
         }
         assert!(common_requests.try_recv().is_err());
+        for expected in [
+            "GET /adv/v1/promotion/count HTTP/1.1\r\n",
+            "GET /api/advert/v2/adverts?ids=12%2C34&statuses=9%2C11&payment_type=cpm HTTP/1.1\r\n",
+            "GET /api/advert/v2/adverts?ids=56 HTTP/1.1\r\n",
+            "GET /adv/v3/fullstats?ids=12%2C34&beginDate=2026-08-01&endDate=2026-08-11 HTTP/1.1\r\n",
+        ] {
+            let request = promotion_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            assert!(request.starts_with(expected), "{request}");
+            assert!(request.ends_with("\r\n\r\n"), "GET must have no body");
+            assert!(!request.to_ascii_lowercase().contains("content-type:"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token")
+            );
+        }
+        assert!(promotion_requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2624,6 +2902,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promotion_arguments_fail_closed_before_any_network_attempt() {
+        let client = WbClient::new_for_test(
+            Duration::from_millis(100),
+            credentials(),
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
+
+        for ids in [Vec::new(), vec![0], vec![1, 1], (1..=51).collect()] {
+            let error = client
+                .promotion_campaign_details("account", ids, Vec::new(), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, WbError::InvalidArguments { field: "ids" }));
+        }
+        for statuses in [vec![0], vec![4, 4], vec![-1, 4, 7, 8, 9, 11, 11]] {
+            let error = client
+                .promotion_campaign_details("account", vec![1], statuses, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                WbError::InvalidArguments { field: "statuses" }
+            ));
+        }
+        let error = client
+            .promotion_campaign_details("account", vec![1], Vec::new(), Some("CPM".to_owned()))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WbError::InvalidArguments {
+                field: "payment_type"
+            }
+        ));
+
+        for ids in [Vec::new(), vec![0], vec![1, 1], (1..=51).collect()] {
+            let error = client
+                .promotion_stats(
+                    "account",
+                    ids,
+                    "2026-08-01".to_owned(),
+                    "2026-08-02".to_owned(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, WbError::InvalidArguments { field: "ids" }));
+        }
+        for (begin_date, end_date, field) in [
+            ("not-a-date", "2026-08-02", "begin_date"),
+            ("2026-8-01", "2026-08-02", "begin_date"),
+            ("2026-08-01", "not-a-date", "end_date"),
+            ("2026-08-02", "2026-08-01", "date_range"),
+            ("2026-08-01", "2026-09-01", "date_range"),
+        ] {
+            let error = client
+                .promotion_stats(
+                    "account",
+                    vec![1],
+                    begin_date.to_owned(),
+                    end_date.to_owned(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                WbError::InvalidArguments { field: actual } if actual == field
+            ));
+        }
+
+        assert_eq!(
+            WbError::InvalidArguments { field: "ids" }.kind(),
+            WbErrorKind::InvalidArguments
+        );
+    }
+
+    #[tokio::test]
+    async fn promotion_stats_quota_fails_fast_and_campaign_routes_share_one_gate() {
+        let mut policy = ClientPolicy::immediate_single_attempt(Duration::from_secs(2));
+        policy.promotion_stats_interval = PROMOTION_STATS_MIN_REQUEST_INTERVAL;
+        policy.promotion_campaign_interval = PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL;
+        policy.logical_timeout = Duration::from_millis(20);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_millis(100),
+            credentials(),
+            "http://127.0.0.1:1",
+            policy,
+        );
+        let limiter = client.limiters.get("account").unwrap();
+
+        *limiter.promotion_stats.next_allowed.lock().await =
+            Instant::now() + PROMOTION_STATS_MIN_REQUEST_INTERVAL;
+        let started = Instant::now();
+        let error = client
+            .promotion_stats(
+                "account",
+                vec![1],
+                "2026-08-01".to_owned(),
+                "2026-08-31".to_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(matches!(
+            error,
+            WbError::LocalRateLimited { retry_after }
+                if retry_after > Duration::from_secs(19)
+                    && retry_after <= PROMOTION_STATS_MIN_REQUEST_INTERVAL
+        ));
+
+        // Both campaign list and details use this exact gate. A pending slot
+        // therefore blocks details before any connection can be attempted.
+        *limiter.promotion_campaigns.next_allowed.lock().await =
+            Instant::now() + Duration::from_millis(200);
+        let error = client
+            .promotion_campaign_details("account", vec![1], Vec::new(), Some("cpc".to_owned()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WbError::DeadlineExceeded));
+    }
+
+    #[tokio::test]
     async fn only_allowlisted_read_only_wb_requests_can_reach_the_network() {
         // Pointed at a port nothing listens on: a denied request must fail as
         // EndpointNotAllowed, never as a network error, proving nothing was sent.
@@ -2648,9 +3048,32 @@ mod tests {
             (Method::POST, PRODUCT_PRICES_PATH),
             (Method::POST, TARIFF_COMMISSIONS_PATH),
             (Method::POST, ACCEPTANCE_COEFFICIENTS_PATH),
+            // WB Promotion has mutating GET routes, so allowing every GET is
+            // unsafe. These exact operations must remain unreachable.
+            (Method::GET, "/adv/v0/delete"),
+            (Method::GET, "/adv/v0/start"),
+            (Method::GET, "/adv/v0/pause"),
+            (Method::GET, "/adv/v0/stop"),
+            (Method::POST, "/adv/v0/rename"),
+            (Method::POST, "/adv/v2/seacat/save-ad"),
+            (Method::POST, "/adv/v1/budget/deposit"),
+            (Method::POST, "/adv/v0/normquery/set-minus"),
+            (Method::PATCH, "/api/advert/v1/bids"),
+            (Method::PATCH, "/adv/v0/auction/nms"),
+            (Method::PUT, "/adv/v0/auction/placements"),
+            (Method::POST, "/adv/v0/all_sku_promo/activate"),
+            (Method::POST, "/adv/v0/all_sku_promo/deactivate"),
+            (Method::POST, "/adv/v0/all_sku_promo/set_bid"),
+            // Wrong methods for the three newly allowlisted read endpoints.
+            (Method::POST, PROMOTION_CAMPAIGNS_PATH),
+            (Method::POST, PROMOTION_DETAILS_PATH),
+            (Method::POST, PROMOTION_STATS_PATH),
             // Near-misses of allowlisted paths.
             (Method::GET, "/ping/"),
             (Method::GET, "/api/v1/tariffs/commission/"),
+            (Method::GET, "/adv/v1/promotion/count/"),
+            (Method::GET, "/api/advert/v2/adverts/"),
+            (Method::GET, "/adv/v3/fullstats/"),
             (Method::GET, ""),
         ] {
             let error = client
@@ -2726,6 +3149,16 @@ mod tests {
             RequestClass::for_request(&Method::GET, ACCEPTANCE_COEFFICIENTS_PATH),
             Some(RequestClass::AcceptanceTariff)
         );
+        for path in [PROMOTION_CAMPAIGNS_PATH, PROMOTION_DETAILS_PATH] {
+            assert_eq!(
+                RequestClass::for_request(&Method::GET, path),
+                Some(RequestClass::PromotionCampaign)
+            );
+        }
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, PROMOTION_STATS_PATH),
+            Some(RequestClass::PromotionStats)
+        );
         assert_eq!(
             client.ping("account").await.unwrap_err().kind(),
             WbErrorKind::Network
@@ -2736,6 +3169,7 @@ mod tests {
     fn error_kind_codes_are_stable() {
         let pairs = [
             (WbErrorKind::EndpointNotAllowed, "endpoint_not_allowed"),
+            (WbErrorKind::InvalidArguments, "invalid_arguments"),
             (WbErrorKind::MissingCredentials, "missing_credentials"),
             (WbErrorKind::Unauthorized, "unauthorized"),
             (WbErrorKind::Forbidden, "forbidden"),
@@ -2755,6 +3189,7 @@ mod tests {
                 method: Method::POST,
                 path: "/api/v3/orders".to_owned(),
             },
+            WbError::InvalidArguments { field: "ids" },
             WbError::Unauthorized { request_id: None },
             WbError::Forbidden { request_id: None },
             WbError::RateLimited {

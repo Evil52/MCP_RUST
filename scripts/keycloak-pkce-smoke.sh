@@ -1003,6 +1003,11 @@ mcp_list_tools_public() {
     "ozon_performance_daily",
     "ozon_performance_expenses"
   ]'
+  local expected_wb_promotion_tools='[
+    "wb_promotion_campaigns",
+    "wb_promotion_campaign_details",
+    "wb_promotion_stats"
+  ]'
   local response_status
   local stale_response_status
 
@@ -1015,13 +1020,20 @@ mcp_list_tools_public() {
     exit 1
   fi
   json_response "$response_body" \
-    | jq -e --argjson expected "$expected_performance_tools" '
+    | jq -e --argjson expected "$expected_performance_tools" \
+        --argjson expected_wb "$expected_wb_promotion_tools" '
         .id == 2
         and (.result.tools | any(.name == "list_members"))
         and ([.result.tools[] | select(.name | startswith("ozon_performance_")) | .name] | sort)
           == ($expected | sort)
+        and ([.result.tools[] | select(.name | startswith("wb_promotion_")) | .name] | sort)
+          == ($expected_wb | sort)
         and all(
           .result.tools[] | select(.name | startswith("ozon_performance_"));
+          .annotations.readOnlyHint == true and .annotations.destructiveHint == false
+        )
+        and all(
+          .result.tools[] | select(.name | startswith("wb_promotion_"));
           .annotations.readOnlyHint == true and .annotations.destructiveHint == false
         )' >/dev/null
 
@@ -1035,13 +1047,20 @@ mcp_list_tools_public() {
     exit 1
   fi
   json_response "$stale_response_body" \
-    | jq -e --argjson expected "$expected_performance_tools" '
+    | jq -e --argjson expected "$expected_performance_tools" \
+        --argjson expected_wb "$expected_wb_promotion_tools" '
         .id == 3
         and (.result.tools | any(.name == "list_members"))
         and ([.result.tools[] | select(.name | startswith("ozon_performance_")) | .name] | sort)
           == ($expected | sort)
+        and ([.result.tools[] | select(.name | startswith("wb_promotion_")) | .name] | sort)
+          == ($expected_wb | sort)
         and all(
           .result.tools[] | select(.name | startswith("ozon_performance_"));
+          .annotations.readOnlyHint == true and .annotations.destructiveHint == false
+        )
+        and all(
+          .result.tools[] | select(.name | startswith("wb_promotion_"));
           .annotations.readOnlyHint == true and .annotations.destructiveHint == false
         )' >/dev/null
 }

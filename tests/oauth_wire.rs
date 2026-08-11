@@ -480,6 +480,9 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         "wb_acceptance_coefficients",
         "wb_product_cards",
         "wb_product_prices",
+        "wb_promotion_campaigns",
+        "wb_promotion_campaign_details",
+        "wb_promotion_stats",
         "wb_sales_funnel",
         "wb_sales_funnel_history",
         "wb_sales_funnel_grouped_history",
@@ -536,7 +539,7 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .map(Vec::len),
-        Some(35)
+        Some(38)
     );
 
     let missing_before_validation = post_rpc(
