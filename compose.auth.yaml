@@ -97,7 +97,7 @@ services:
     mem_limit: 768m
     cpus: 2.0
     pids_limit: 256
-    stop_grace_period: 15s
+    stop_grace_period: 70s
     logging:
       driver: json-file
       options:

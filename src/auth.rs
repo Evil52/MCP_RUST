@@ -411,7 +411,7 @@ mod tests {
         collections::BTreeMap,
         fs,
         io::{Read, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         process::{Command, Stdio},
         sync::{
             OnceLock,
@@ -584,6 +584,42 @@ mod tests {
         )
     }
 
+    fn write_jwks_http_response(
+        stream: &mut TcpStream,
+        status: u16,
+        extra_headers: &[(String, String)],
+        body: &[u8],
+        chunked: bool,
+    ) -> std::io::Result<()> {
+        let reason = if status == 200 { "OK" } else { "Redirect" };
+        let mut headers =
+            format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n");
+        for (name, value) in extra_headers {
+            headers.push_str(&format!("{name}: {value}\r\n"));
+        }
+        if chunked {
+            headers.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        } else {
+            headers.push_str(&format!(
+                "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ));
+        }
+
+        stream.write_all(headers.as_bytes())?;
+        if chunked {
+            for chunk in body.chunks(16 * 1024) {
+                write!(stream, "{:x}\r\n", chunk.len())?;
+                stream.write_all(chunk)?;
+                stream.write_all(b"\r\n")?;
+            }
+            stream.write_all(b"0\r\n\r\n")?;
+        } else {
+            stream.write_all(body)?;
+        }
+        Ok(())
+    }
+
     fn one_shot_jwks_http(
         status: u16,
         extra_headers: Vec<(String, String)>,
@@ -598,35 +634,7 @@ mod tests {
             let mut request = [0_u8; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
             request_sender.send(()).unwrap();
-
-            let reason = if status == 200 { "OK" } else { "Redirect" };
-            let mut headers =
-                format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n");
-            for (name, value) in extra_headers {
-                headers.push_str(&format!("{name}: {value}\r\n"));
-            }
-            if chunked {
-                headers.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
-            } else {
-                headers.push_str(&format!(
-                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                ));
-            }
-            let _ = (|| -> std::io::Result<()> {
-                stream.write_all(headers.as_bytes())?;
-                if chunked {
-                    for chunk in body.chunks(16 * 1024) {
-                        write!(stream, "{:x}\r\n", chunk.len())?;
-                        stream.write_all(chunk)?;
-                        stream.write_all(b"\r\n")?;
-                    }
-                    stream.write_all(b"0\r\n\r\n")?;
-                } else {
-                    stream.write_all(&body)?;
-                }
-                Ok(())
-            })();
+            let _ = write_jwks_http_response(&mut stream, status, &extra_headers, &body, chunked);
         });
         (format!("http://{address}"), request_receiver)
     }

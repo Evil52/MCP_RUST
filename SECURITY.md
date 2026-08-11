@@ -62,10 +62,31 @@ The following properties are treated as release gates:
   ping pacing is 10 seconds, per-token concurrency is 4, global concurrency is 8, and the complete
   operation has a 60-second deadline. Promotion campaign reads share a 200 ms quota bucket and
   full statistics has a separate 20-second bucket. Vendor retry headers are parsed conservatively.
-- MCP HTTP: the local session registry defaults to a hard maximum of 256 entries and atomically
-  rejects N+1/concurrent overflow. `MCP_MAX_SESSIONS` can lower this value.
-- Responses are streamed and capped at 8 MiB after decompression; error diagnostics are capped at
-  4 KiB. JWKS is capped at 1 MiB, 64 keys, and 16 KiB per JSON string/field name.
+- MCP HTTP: at most 32 non-GET requests parse and execute inside the MCP service at once; the 33rd
+  fails fast with HTTP 503 while `/health` remains available. That ingress permit is released as
+  soon as the handler constructs a response. Result-bearing POST responses have a separate hard
+  cap of 16, acquired before dispatch and held through the response body until EOF or drop. Valid
+  id-less JSON-RPC notifications (including `notifications/initialized` and
+  `notifications/cancelled`) and valid client responses/errors bypass only the result-body cap, so
+  unread control responses cannot starve cancellation ingress. Long-lived GET/SSE connections have
+  an independent hard cap of 64, so stream shadows cannot consume POST execution capacity;
+  overflow returns HTTP 503 and `Retry-After: 1`. POST bodies are fully received under one
+  10-second deadline and a fixed 256 KiB streaming limit before JSON deserialization (the rmcp
+  transport keeps the same 256 KiB limit as defense in depth).
+  The local session registry separately defaults to a hard maximum of 256 entries and atomically
+  rejects N+1/concurrent overflow; `MCP_MAX_SESSIONS` can lower that value.
+- A shared 16-slot `tools/call` admission gate applies across every MCP session. Overflow fails
+  locally before marketplace dispatch, while JSON-RPC cancellation drops the local outbound future
+  and releases its permits. An already delivered read-only vendor request may still finish remotely.
+- On SIGTERM/Ctrl-C the HTTP listener stops accepting immediately, drains naturally for up to
+  55 seconds, then cancels MCP sessions, streams, and calls. Remaining connection futures are
+  dropped by 65 seconds; Compose allows 70 seconds, leaving a 5-second termination margin.
+- Successful marketplace responses are streamed and capped at 2 MiB after decompression; larger
+  pages or periods must be split into bounded requests. The inner JSON for a structured MCP result
+  has the same 2 MiB data budget plus 64 KiB of metadata headroom. MCP compatibility carries it in
+  both `structuredContent` and a text JSON fallback; the serialized `CallToolResult` is separately
+  capped at 6 MiB plus 64 KiB. Error diagnostics are capped at 4 KiB. JWKS is capped at 1 MiB,
+  64 keys, and 16 KiB per JSON string/field name.
 - Compose runs the MCP process as non-root with a read-only filesystem, no Linux capabilities,
   `no-new-privileges`, loopback-only published ports, memory/CPU/PID limits, and bounded log files.
 

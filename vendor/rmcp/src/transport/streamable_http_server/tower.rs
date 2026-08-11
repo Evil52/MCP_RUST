@@ -30,10 +30,9 @@ use crate::{
         InitializeRequestParams, InitializedNotification, JsonObject, JsonRpcError,
         ProtocolVersion, RequestId, ServerInfo, ServerJsonRpcMessage, ServerResult,
     },
-    serve_server,
     service::{
         NotificationContext, RequestContext, Service, negotiate_protocol_version,
-        serve_directly_with_ct, uses_legacy_lifecycle,
+        serve_directly_with_ct, serve_server_with_ct, uses_legacy_lifecycle,
     },
     transport::{
         OneshotTransport, TransportAdapterIdentity,
@@ -1287,10 +1286,10 @@ where
         schema
     }
 
-    /// Spawn a task that runs `serve_server` for the given session, waits for
+    /// Spawn a task that runs `serve_server_with_ct` for the given session, waits for
     /// it to finish, and then calls `close_session`.
     ///
-    /// `init_done_tx`: when `Some`, the sender is fired after `serve_server`
+    /// `init_done_tx`: when `Some`, the sender is fired after `serve_server_with_ct`
     /// returns successfully, signalling to the caller that the MCP handshake
     /// is complete. Used by `try_restore_from_store` to synchronise with the
     /// restore `initialize` replay; `handle_post` passes `None`.
@@ -1299,15 +1298,19 @@ where
         session_id: SessionId,
         service: S,
         transport: M::Transport,
+        session_ct: CancellationToken,
         init_done_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) where
         S: crate::ServerHandler + Send + 'static,
         M: SessionManager,
     {
         tokio::spawn(async move {
-            let svc =
-                serve_server::<S, M::Transport, _, TransportAdapterIdentity>(service, transport)
-                    .await;
+            let svc = serve_server_with_ct::<S, M::Transport, _, TransportAdapterIdentity>(
+                service,
+                transport,
+                session_ct,
+            )
+            .await;
             match svc {
                 Ok(svc) => {
                     if let Some(tx) = init_done_tx {
@@ -1461,6 +1464,7 @@ where
             session_id.clone(),
             service,
             transport,
+            self.config.cancellation_token.child_token(),
             Some(init_done_tx),
         );
 
@@ -1865,6 +1869,7 @@ where
                     session_id.clone(),
                     service,
                     transport,
+                    self.config.cancellation_token.child_token(),
                     None,
                 );
                 // get initialize response

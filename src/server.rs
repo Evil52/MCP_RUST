@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use chrono::{NaiveDate, NaiveDateTime, Utc};
 use rmcp::{
@@ -19,6 +19,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 
 use crate::{
     auth::{
@@ -49,12 +50,14 @@ const MAX_PERFORMANCE_CAMPAIGNS: usize = 10;
 const MAX_PERFORMANCE_PERIOD_DAYS: i64 = 31;
 const MAX_WB_PROMOTION_CAMPAIGNS: usize = 50;
 const MAX_WB_PROMOTION_PERIOD_DAYS: i64 = 31;
+const MAX_IN_FLIGHT_TOOL_CALLS: usize = 16;
 const MIN_REVIEWS_LIMIT: u32 = 20;
 const MAX_OFFSET: u32 = 1_000_000;
 const MAX_PAGE: u32 = 1_000_000;
 const OZON_TOOL_FAILURE: &str = "OZON_TOOL_CALL_FAILED";
 const OZON_PERFORMANCE_TOOL_FAILURE: &str = "OZON_PERFORMANCE_TOOL_CALL_FAILED";
 const WB_TOOL_FAILURE: &str = "WB_TOOL_CALL_FAILED";
+const MCP_TOOL_FAILURE: &str = "MCP_TOOL_CALL_FAILED";
 const ACCESS_DENIED: &str = "ACCESS_DENIED";
 const UNKNOWN_STORE: &str = "UNKNOWN_STORE";
 const STORE_REQUIRED: &str = "STORE_REQUIRED";
@@ -135,6 +138,7 @@ pub struct OzonMcp {
     postings_vnext: bool,
     finance_accruals_preview: bool,
     tool_router: ToolRouter<Self>,
+    tool_call_slots: Arc<Semaphore>,
 }
 
 fn tool_security_schemes(authenticator: Option<&JwtAuthenticator>) -> Vec<JsonObject> {
@@ -203,6 +207,7 @@ impl OzonMcp {
             postings_vnext: false,
             finance_accruals_preview: false,
             tool_router: Self::default_tool_router(None),
+            tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
         }
     }
 
@@ -222,6 +227,34 @@ impl OzonMcp {
             postings_vnext: false,
             finance_accruals_preview: false,
             tool_router,
+            tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
+        }
+    }
+
+    async fn run_tool_call_with_admission(
+        &self,
+        cancellation: tokio_util::sync::CancellationToken,
+        dispatch: Pin<
+            Box<dyn Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_>,
+        >,
+    ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        let cancellation = cancellation.cancelled_owned();
+        tokio::pin!(cancellation);
+        let admission = std::future::ready(self.tool_call_slots.try_acquire());
+        let _tool_call_slot = tokio::select! {
+            biased;
+            _ = &mut cancellation => return Ok(tool_call_cancelled_response()),
+            permit = admission => match permit {
+                Ok(permit) => permit,
+                Err(_) => return Ok(tool_call_overloaded_response()),
+            },
+        };
+
+        tokio::pin!(dispatch);
+        tokio::select! {
+            biased;
+            _ = &mut cancellation => Ok(tool_call_cancelled_response()),
+            result = &mut dispatch => result,
         }
     }
 
@@ -662,6 +695,29 @@ fn authentication_failure_response(
         result = result.with_meta(Some(meta));
     }
     result.into()
+}
+
+fn tool_call_control_failure(kind: &'static str, message: &'static str) -> CallToolResponse {
+    CallToolResult::structured_error(json!({
+        "error_code": MCP_TOOL_FAILURE,
+        "kind": kind,
+        "message": message,
+    }))
+    .into()
+}
+
+fn tool_call_overloaded_response() -> CallToolResponse {
+    tool_call_control_failure(
+        "local_overloaded",
+        "Сервер уже обрабатывает максимально допустимое число вызовов инструментов. Текущий вызов не был запущен; дождитесь завершения активных операций и повторите его отдельным запросом.",
+    )
+}
+
+fn tool_call_cancelled_response() -> CallToolResponse {
+    tool_call_control_failure(
+        "cancelled",
+        "Вызов инструмента отменён клиентом и больше не выполняется.",
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3031,6 +3087,7 @@ impl ServerHandler for OzonMcp {
         request: CallToolRequestParams,
         mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        let cancellation = context.ct.clone();
         if let Some(authenticator) = &self.authenticator {
             let actor = match authenticated_actor(&context).cloned() {
                 Some(actor) => actor,
@@ -3047,8 +3104,15 @@ impl ServerHandler for OzonMcp {
             context.extensions.insert(actor);
         }
 
-        self.tool_router
-            .call(ToolCallContext::new(self, request, context))
+        // Authentication deliberately precedes admission control so an
+        // unauthenticated caller cannot use the response to observe whether
+        // the server is currently saturated. Once authenticated, fail fast:
+        // queued model calls must not grow memory without bound or reserve an
+        // outbound marketplace slot long after the user has moved on.
+        let dispatch = self
+            .tool_router
+            .call(ToolCallContext::new(self, request, context));
+        self.run_tool_call_with_admission(cancellation, Box::pin(dispatch))
             .await
     }
 
@@ -3222,7 +3286,7 @@ fn validate_wb_promotion_date_range(begin_date: &str, end_date: &str) -> Result<
     Ok(())
 }
 
-fn wb_product_cards_payload(input: &WbProductCardsInput) -> Result<Value, String> {
+fn validate_wb_product_cards_input(input: &WbProductCardsInput) -> Result<(), String> {
     validate_limit(input.limit, 100)?;
     if input
         .with_photo
@@ -3275,6 +3339,10 @@ fn wb_product_cards_payload(input: &WbProductCardsInput) -> Result<Value, String
         }
     }
 
+    Ok(())
+}
+
+fn wb_product_cards_filter(input: &WbProductCardsInput) -> serde_json::Map<String, Value> {
     let mut filter = serde_json::Map::new();
     if let Some(with_photo) = input.with_photo {
         filter.insert("withPhoto".to_owned(), json!(with_photo));
@@ -3300,14 +3368,23 @@ fn wb_product_cards_payload(input: &WbProductCardsInput) -> Result<Value, String
     if let Some(imt_id) = input.imt_id {
         filter.insert("imtID".to_owned(), json!(imt_id));
     }
+    filter
+}
 
+fn wb_product_cards_cursor(input: &WbProductCardsInput) -> serde_json::Map<String, Value> {
     let mut cursor = serde_json::Map::new();
     cursor.insert("limit".to_owned(), json!(input.limit));
     if let (Some(updated_at), Some(nm_id)) = (&input.cursor_updated_at, input.cursor_nm_id) {
         cursor.insert("updatedAt".to_owned(), json!(updated_at));
         cursor.insert("nmID".to_owned(), json!(nm_id));
     }
+    cursor
+}
 
+fn wb_product_cards_payload(input: &WbProductCardsInput) -> Result<Value, String> {
+    validate_wb_product_cards_input(input)?;
+    let filter = wb_product_cards_filter(input);
+    let cursor = wb_product_cards_cursor(input);
     let mut settings = serde_json::Map::new();
     settings.insert("sort".to_owned(), json!({ "ascending": input.ascending }));
     if !filter.is_empty() {
@@ -3350,7 +3427,7 @@ mod tests {
         fs,
         sync::{
             Arc,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             mpsc,
         },
         time::Duration,
@@ -3368,8 +3445,67 @@ mod tests {
         StreamableHttpServerConfig, StreamableHttpService,
         streamable_http_server::session::local::LocalSessionManager,
     };
+    use tokio::sync::Barrier;
 
     static REGISTRY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct PendingDispatch {
+        polled: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl std::future::Future for PendingDispatch {
+        type Output = Result<CallToolResponse, rmcp::ErrorData>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.polled.store(true, Ordering::SeqCst);
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDispatch {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn complete_tool_result(response: &CallToolResponse) -> &CallToolResult {
+        match response {
+            CallToolResponse::Complete(result) => result,
+            _ => panic!("expected a complete tool response"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a complete tool response")]
+    fn complete_tool_result_rejects_non_terminal_responses() {
+        let response = rmcp::model::InputRequiredResult::from_request_state("test").into();
+        complete_tool_result(&response);
+    }
+
+    fn assert_control_failure(response: &CallToolResponse, expected_kind: &str) {
+        let result = complete_tool_result(response);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("error_code"))
+                .and_then(Value::as_str),
+            Some(MCP_TOOL_FAILURE)
+        );
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(Value::as_str),
+            Some(expected_kind)
+        );
+    }
 
     fn registry_source() -> RegistrySource {
         let sequence = REGISTRY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -3654,6 +3790,151 @@ mod tests {
             error.contains(field),
             "expected error for {field}, got: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_call_limit_is_shared_across_clones_and_simulated_sessions() {
+        let server = server();
+        let entered = Arc::new(Barrier::new(MAX_IN_FLIGHT_TOOL_CALLS + 1));
+        let release = Arc::new(Semaphore::new(0));
+
+        let clones = (0..MAX_IN_FLIGHT_TOOL_CALLS)
+            .map(|_| server.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            clones
+                .iter()
+                .all(|clone| Arc::ptr_eq(&server.tool_call_slots, &clone.tool_call_slots))
+        );
+
+        let mut active = Vec::with_capacity(MAX_IN_FLIGHT_TOOL_CALLS);
+        for clone in clones {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            active.push(tokio::spawn(async move {
+                clone
+                    .run_tool_call_with_admission(
+                        tokio_util::sync::CancellationToken::new(),
+                        Box::pin(async move {
+                            entered.wait().await;
+                            let _release =
+                                release.acquire().await.expect("test semaphore stays open");
+                            Ok(CallToolResult::success(vec![ContentBlock::text("ok")]).into())
+                        }),
+                    )
+                    .await
+                    .expect("test tool call must return a response")
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), entered.wait())
+            .await
+            .expect("all admitted calls must reach the test tool");
+        assert_eq!(server.tool_call_slots.available_permits(), 0);
+
+        // A call through another clone, as created for another MCP session,
+        // must be rejected before dispatch.
+        let overloaded = tokio::time::timeout(
+            Duration::from_millis(100),
+            server.clone().run_tool_call_with_admission(
+                tokio_util::sync::CancellationToken::new(),
+                Box::pin(std::future::pending::<
+                    Result<CallToolResponse, rmcp::ErrorData>,
+                >()),
+            ),
+        )
+        .await
+        .expect("overflow must fail fast")
+        .expect("overflow is a tool-level response");
+        assert_control_failure(&overloaded, "local_overloaded");
+        assert_eq!(server.tool_call_slots.available_permits(), 0);
+
+        release.add_permits(MAX_IN_FLIGHT_TOOL_CALLS);
+        for task in active {
+            let response = task.await.expect("admitted task must not panic");
+            assert_eq!(complete_tool_result(&response).is_error, Some(false));
+        }
+        assert_eq!(
+            server.tool_call_slots.available_permits(),
+            MAX_IN_FLIGHT_TOOL_CALLS
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_dispatch_and_recovers_the_global_permit_promptly() {
+        let server = server();
+        let polled = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let clone = server.clone();
+        let call_cancellation = cancellation.clone();
+        let dispatch = PendingDispatch {
+            polled: Arc::clone(&polled),
+            dropped: Arc::clone(&dropped),
+        };
+        let call = tokio::spawn(async move {
+            clone
+                .run_tool_call_with_admission(call_cancellation, Box::pin(dispatch))
+                .await
+                .expect("cancelled call returns a safe tool-level result")
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !polled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("test tool must start before cancellation");
+        assert_eq!(
+            server.tool_call_slots.available_permits(),
+            MAX_IN_FLIGHT_TOOL_CALLS - 1
+        );
+
+        cancellation.cancel();
+        let response = tokio::time::timeout(Duration::from_millis(250), call)
+            .await
+            .expect("cancellation must not wait for the tool deadline")
+            .expect("cancelled task must not panic");
+        assert_control_failure(&response, "cancelled");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "router future must be dropped on cancellation"
+        );
+        assert_eq!(
+            server.tool_call_slots.available_permits(),
+            MAX_IN_FLIGHT_TOOL_CALLS
+        );
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let response = server
+            .run_tool_call_with_admission(
+                cancellation,
+                Box::pin(std::future::pending::<
+                    Result<CallToolResponse, rmcp::ErrorData>,
+                >()),
+            )
+            .await
+            .expect("pre-cancelled call returns a safe tool-level result");
+        assert_control_failure(&response, "cancelled");
+        assert_eq!(
+            server.tool_call_slots.available_permits(),
+            MAX_IN_FLIGHT_TOOL_CALLS
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_still_precedes_tool_call_admission_control() {
+        let seed = server();
+        let authenticator = jwt_authenticator(&seed.registry);
+        let server = OzonMcp::new_authenticated(seed.client, seed.registry, authenticator);
+        let _all_slots = Arc::clone(&server.tool_call_slots)
+            .acquire_many_owned(MAX_IN_FLIGHT_TOOL_CALLS as u32)
+            .await
+            .expect("tool call semaphore stays open");
+
+        let response = call_tool_over_http(server, "marketplace_accounts", json!({})).await;
+        assert!(response.contains("Требуется авторизация"), "{response}");
+        assert!(!response.contains("local_overloaded"), "{response}");
     }
 
     #[test]

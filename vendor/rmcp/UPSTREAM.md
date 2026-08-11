@@ -19,6 +19,20 @@ cap (256 by default) and prunes terminated handles before capacity checks. This
 bounds memory and task growth from repeated public MCP `initialize` requests
 without moving authentication ahead of protocol negotiation.
 
+Local modification: structured tool results produced through `Json<T>` are
+serialized into a byte buffer capped at 2 MiB plus 64 KiB of bounded
+wrapper-metadata headroom. Oversized serialization stops at the cap; accepted
+input is dropped before the bounded bytes are parsed into `Value`, and the byte
+buffer is dropped before the fallback text is built. The compatibility-required
+fallback text and `structuredContent` are both retained, then an allocation-free
+counting pass caps the serialized `CallToolResult` at 6 MiB plus 64 KiB. Size and
+serialization failures return payload-free protocol errors.
+
+Local modification: Streamable HTTP legacy session workers inherit a child of
+the server configuration's cancellation token. Cancelling the root token now
+terminates both sessions that are still handshaking and fully initialized
+sessions, allowing the application to enforce a bounded graceful shutdown.
+
 The upstream `build.rs` is intentionally omitted: it manages Git hook settings
 for the SDK workspace and must not mutate the parent application's repository.
 

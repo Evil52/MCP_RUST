@@ -19,11 +19,15 @@ use axum::{
 use mcp_ozon::{
     auth::JwtAuthenticator,
     config::{JwtConfig, RegistrySource},
-    http::build_router,
+    http::{
+        MCP_MAX_IN_FLIGHT_STREAMS, MCP_REQUEST_BODY_LIMIT_BYTES, build_router,
+        build_router_with_cancellation,
+    },
     ozon::OzonClient,
     server::OzonMcp,
 };
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -229,6 +233,246 @@ async fn a_client_can_initialize_a_session_against_the_production_router() {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
         "session id must be an opaque safe token: {session_id}"
     );
+}
+
+#[tokio::test]
+async fn cancelling_the_router_root_terminates_an_active_legacy_session() {
+    let cancellation_token = CancellationToken::new();
+    let server = OzonMcp::new(ozon_client(), "admin".to_owned(), registry());
+    let router = build_router_with_cancellation(
+        server,
+        NonZeroUsize::new(4).expect("non-zero"),
+        cancellation_token.clone(),
+    );
+
+    let initialized = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(CONTENT_TYPE, "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .header("host", "localhost")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {"name": "root-cancellation-test", "version": "0"}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("initialize request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(initialized.status(), StatusCode::OK);
+    let session_id = initialized
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("initialize establishes a session")
+        .to_owned();
+    axum::body::to_bytes(initialized.into_body(), MCP_REQUEST_BODY_LIMIT_BYTES)
+        .await
+        .expect("initialize stream completes");
+
+    let handshake_complete = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(CONTENT_TYPE, "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .header("mcp-session-id", &session_id)
+                .header("host", "localhost")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                        "params": {}
+                    })
+                    .to_string(),
+                ))
+                .expect("initialized notification builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(handshake_complete.status(), StatusCode::ACCEPTED);
+
+    cancellation_token.cancel();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/mcp")
+                        .header("accept", "text/event-stream")
+                        .header("mcp-protocol-version", "2025-06-18")
+                        .header("mcp-session-id", &session_id)
+                        .header("host", "localhost")
+                        .body(Body::empty())
+                        .expect("session probe builds"),
+                )
+                .await
+                .expect("router responds");
+            if response.status() == StatusCode::NOT_FOUND {
+                break;
+            }
+            assert_eq!(response.status(), StatusCode::OK);
+            drop(response);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("root cancellation must close the legacy session promptly");
+
+    let (health_status, _, body) = get(router, "/health").await;
+    assert_eq!(health_status, StatusCode::OK);
+    assert_eq!(body, "ok");
+}
+
+#[tokio::test]
+async fn production_router_bounds_get_sse_shadows_without_blocking_post_or_health() {
+    let router = dev_router();
+    let initialize = || {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(CONTENT_TYPE, "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header("host", "localhost")
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "stream-limit-test", "version": "0"}
+                    }
+                })
+                .to_string(),
+            ))
+            .expect("initialize request builds")
+    };
+    let initialized = router
+        .clone()
+        .oneshot(initialize())
+        .await
+        .expect("router responds");
+    assert_eq!(initialized.status(), StatusCode::OK);
+    let session_id = initialized
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("initialize establishes a session")
+        .to_owned();
+    let _ = axum::body::to_bytes(initialized.into_body(), MCP_REQUEST_BODY_LIMIT_BYTES)
+        .await
+        .expect("initialize stream completes");
+
+    let stream_request = || {
+        Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("accept", "text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header("mcp-session-id", &session_id)
+            .header("host", "localhost")
+            .body(Body::empty())
+            .expect("stream request builds")
+    };
+    let mut streams = Vec::with_capacity(MCP_MAX_IN_FLIGHT_STREAMS);
+    for _ in 0..MCP_MAX_IN_FLIGHT_STREAMS {
+        let response = router
+            .clone()
+            .oneshot(stream_request())
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        streams.push(response);
+    }
+
+    let overloaded = router
+        .clone()
+        .oneshot(stream_request())
+        .await
+        .expect("router responds");
+    assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        overloaded
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+
+    let post = router
+        .clone()
+        .oneshot(initialize())
+        .await
+        .expect("router responds");
+    assert_eq!(post.status(), StatusCode::OK);
+    drop(post);
+    let (health_status, _, _) = get(router.clone(), "/health").await;
+    assert_eq!(health_status, StatusCode::OK);
+
+    drop(streams.pop());
+    let recovered = router
+        .oneshot(stream_request())
+        .await
+        .expect("router responds");
+    assert_eq!(recovered.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn production_router_enforces_the_mcp_body_limit_while_streaming() {
+    let post = |body: Vec<u8>| async move {
+        dev_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("host", "localhost")
+                    // Deliberately omit Content-Length: the transport must
+                    // enforce the bound from streamed bytes, not trust a
+                    // caller-controlled header.
+                    .body(Body::from(body))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds")
+    };
+
+    let at_limit = post(vec![b' '; MCP_REQUEST_BODY_LIMIT_BYTES]).await;
+    assert_ne!(at_limit.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let over_limit = post(vec![b' '; MCP_REQUEST_BODY_LIMIT_BYTES + 1]).await;
+    assert_eq!(over_limit.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(over_limit.headers().get("mcp-session-id").is_none());
 }
 
 #[tokio::test]

@@ -20,7 +20,7 @@ use tokio::{
 
 use crate::config::{StoreCredentials, StoreId};
 
-const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1_048_576;
+const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
 const MAX_ATTEMPTS: usize = 3;
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1560,7 +1560,7 @@ mod tests {
 
         // Transparent gzip/brotli decoding is enabled for throughput, which
         // means a compact upstream body can expand enormously. Highly
-        // compressible padding stands in for a decompression bomb: ~8 MiB of
+        // compressible padding stands in for a decompression bomb: ~2 MiB of
         // zeros ships as a few KiB but must still be refused after the limit.
         let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
         encoder

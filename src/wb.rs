@@ -14,7 +14,7 @@ use reqwest::{
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Semaphore, SemaphorePermit},
     time::{sleep, timeout},
 };
 use tracing::{info, warn};
@@ -42,7 +42,7 @@ const ACCEPTANCE_COEFFICIENTS_PATH: &str = "/api/tariffs/v1/acceptance/coefficie
 pub(crate) const PROMOTION_CAMPAIGNS_PATH: &str = "/adv/v1/promotion/count";
 pub(crate) const PROMOTION_DETAILS_PATH: &str = "/api/advert/v2/adverts";
 pub(crate) const PROMOTION_STATS_PATH: &str = "/adv/v3/fullstats";
-const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1_048_576;
+const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
 const MAX_ATTEMPTS: usize = 3;
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -475,22 +475,37 @@ impl PacingGate {
         }
     }
 
-    /// Reserves exactly one departure slot. Holding this small lock across the
-    /// sleep deliberately prevents a cancelled or delayed caller from opening
-    /// an accidental burst after the interval.
-    async fn pace(&self, interval: Duration) {
-        let mut next_allowed = self.next_allowed.lock().await;
-        let wait = next_allowed.saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
+    /// Waits until a departure could be claimed, without consuming it. The
+    /// caller must acquire the network permits before [`Self::try_claim`], so
+    /// local overload cannot burn a marketplace quota slot.
+    async fn wait_until_ready(&self) {
+        loop {
+            let wait = self
+                .next_allowed
+                .lock()
+                .await
+                .saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                return;
+            }
             sleep(wait).await;
         }
-        *next_allowed = Instant::now() + interval;
     }
 
-    /// Reserves a slot only when it is available now. This is used for
-    /// minute-scale quotas where queueing would consume the complete logical
-    /// request deadline before any network attempt can start.
-    async fn try_pace(&self, interval: Duration) -> Result<(), Duration> {
+    /// Checks availability without consuming a minute-scale quota slot.
+    async fn ensure_ready_now(&self) -> Result<(), Duration> {
+        let next_allowed = self.next_allowed.lock().await;
+        let wait = next_allowed.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            return Err(wait);
+        }
+        Ok(())
+    }
+
+    /// Atomically consumes one departure only after both network permits have
+    /// been acquired. A competing caller may win between readiness and this
+    /// claim; the loser releases its permits and returns to readiness waiting.
+    async fn try_claim(&self, interval: Duration) -> Result<(), Duration> {
         let mut next_allowed = self.next_allowed.lock().await;
         let wait = next_allowed.saturating_duration_since(Instant::now());
         if !wait.is_zero() {
@@ -498,6 +513,16 @@ impl PacingGate {
         }
         *next_allowed = Instant::now() + interval;
         Ok(())
+    }
+
+    /// Extends a shared token/class cooldown without ever shortening an
+    /// existing quota or another response's longer server-directed delay.
+    async fn extend_cooldown(&self, delay: Duration) {
+        let cooldown_until = Instant::now() + delay;
+        let mut next_allowed = self.next_allowed.lock().await;
+        if *next_allowed < cooldown_until {
+            *next_allowed = cooldown_until;
+        }
     }
 }
 
@@ -533,32 +558,46 @@ impl TokenLimiter {
         }
     }
 
-    async fn pace(&self, request_class: RequestClass, interval: Duration) -> Result<(), WbError> {
+    fn gate(&self, request_class: RequestClass) -> &PacingGate {
         match request_class {
-            RequestClass::AnalyticsPing => self.analytics_ping.pace(interval).await,
-            RequestClass::AnalyticsReport => self.analytics_reports.pace(interval).await,
-            RequestClass::StatisticsReport => self.statistics_reports.pace(interval).await,
-            RequestClass::ContentReport => self.content_reports.pace(interval).await,
-            RequestClass::PricesReport => self.prices_reports.pace(interval).await,
-            RequestClass::CommissionTariff => {
-                return self
-                    .commission_tariffs
-                    .try_pace(interval)
-                    .await
-                    .map_err(|retry_after| WbError::LocalRateLimited { retry_after });
-            }
-            RequestClass::LogisticsTariff => self.logistics_tariffs.pace(interval).await,
-            RequestClass::AcceptanceTariff => self.acceptance_tariffs.pace(interval).await,
-            RequestClass::PromotionCampaign => self.promotion_campaigns.pace(interval).await,
-            RequestClass::PromotionStats => {
-                return self
-                    .promotion_stats
-                    .try_pace(interval)
-                    .await
-                    .map_err(|retry_after| WbError::LocalRateLimited { retry_after });
-            }
+            RequestClass::AnalyticsPing => &self.analytics_ping,
+            RequestClass::AnalyticsReport => &self.analytics_reports,
+            RequestClass::StatisticsReport => &self.statistics_reports,
+            RequestClass::ContentReport => &self.content_reports,
+            RequestClass::PricesReport => &self.prices_reports,
+            RequestClass::CommissionTariff => &self.commission_tariffs,
+            RequestClass::LogisticsTariff => &self.logistics_tariffs,
+            RequestClass::AcceptanceTariff => &self.acceptance_tariffs,
+            RequestClass::PromotionCampaign => &self.promotion_campaigns,
+            RequestClass::PromotionStats => &self.promotion_stats,
         }
-        Ok(())
+    }
+
+    async fn wait_until_ready(&self, request_class: RequestClass) -> Result<(), WbError> {
+        let gate = self.gate(request_class);
+        if matches!(
+            request_class,
+            RequestClass::CommissionTariff | RequestClass::PromotionStats
+        ) {
+            gate.ensure_ready_now()
+                .await
+                .map_err(|retry_after| WbError::LocalRateLimited { retry_after })
+        } else {
+            gate.wait_until_ready().await;
+            Ok(())
+        }
+    }
+
+    async fn try_claim(
+        &self,
+        request_class: RequestClass,
+        interval: Duration,
+    ) -> Result<(), Duration> {
+        self.gate(request_class).try_claim(interval).await
+    }
+
+    async fn extend_cooldown(&self, request_class: RequestClass, delay: Duration) {
+        self.gate(request_class).extend_cooldown(delay).await;
     }
 }
 
@@ -618,6 +657,23 @@ pub struct WbClient {
     global_in_flight: Arc<Semaphore>,
     logical_timeout: Duration,
     policy: ClientPolicy,
+}
+
+#[derive(Clone, Copy)]
+struct AttemptContext<'a> {
+    account: &'a str,
+    method: &'a Method,
+    endpoint: &'static str,
+    request_class: RequestClass,
+    limiter: &'a TokenLimiter,
+    url: &'a str,
+    authorization: &'a HeaderValue,
+    payload: Option<&'a Value>,
+}
+
+enum AttemptOutcome {
+    Complete(Value),
+    Retry(Duration),
 }
 
 impl WbClient {
@@ -1083,14 +1139,6 @@ impl WbClient {
             .limiters
             .get(account)
             .expect("configured WB account has a limiter");
-        let _global_permit = self
-            .global_in_flight
-            .try_acquire()
-            .map_err(|_| WbError::Overloaded)?;
-        let _permit = limiter
-            .in_flight
-            .try_acquire()
-            .map_err(|_| WbError::Overloaded)?;
         let mut authorization = HeaderValue::from_str(&format!("Bearer {}", credentials.token))
             .map_err(|_| WbError::Unauthorized { request_id: None })?;
         // Prevent accidental disclosure if reqwest headers are ever formatted
@@ -1126,81 +1174,185 @@ impl WbClient {
         authorization: HeaderValue,
         payload: Option<Value>,
     ) -> Result<Value, WbError> {
+        let context = AttemptContext {
+            account,
+            method: &method,
+            endpoint,
+            request_class,
+            limiter,
+            url: &url,
+            authorization: &authorization,
+            payload: payload.as_ref(),
+        };
         let mut attempt = 1;
         loop {
-            limiter
-                .pace(request_class, self.policy.interval(request_class))
-                .await?;
-            let mut request = self
-                .http
-                .request(method.clone(), &url)
-                .header(AUTHORIZATION, authorization.clone());
-            if let Some(payload) = payload.as_ref() {
-                request = request.json(payload);
+            match self.request_attempt(context, attempt).await? {
+                AttemptOutcome::Complete(value) => return Ok(value),
+                AttemptOutcome::Retry(delay) => {
+                    sleep(delay).await;
+                    attempt += 1;
+                }
             }
+        }
+    }
 
-            let started = Instant::now();
-            let response = request.send().await;
-            let response = match response {
-                Ok(response) => response,
-                Err(source) => {
-                    let error = classify_transport_error(source, None);
-                    let will_retry =
-                        is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts;
-                    trace_transport_failure(
-                        account, endpoint, attempt, started, &error, will_retry,
-                    );
-                    if will_retry {
-                        sleep(retry_delay(attempt, None, self.policy)).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(error);
+    async fn acquire_request_permits<'a>(
+        &'a self,
+        limiter: &'a TokenLimiter,
+        request_class: RequestClass,
+    ) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>), WbError> {
+        let interval = self.policy.interval(request_class);
+        loop {
+            // Readiness does not consume quota. Queued callers therefore hold
+            // no network capacity, and a fail-fast permit rejection cannot
+            // postpone the next real WB request by 20 or 60s.
+            limiter.wait_until_ready(request_class).await?;
+            let global_permit = self
+                .global_in_flight
+                .try_acquire()
+                .map_err(|_| WbError::Overloaded)?;
+            let token_permit = match limiter.in_flight.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    drop(global_permit);
+                    return Err(WbError::Overloaded);
                 }
             };
-            let status = response.status();
-            let request_id = extract_request_id(response.headers());
-            let retry_after = parse_retry_delay(response.headers(), Utc::now());
-
-            if let Some(delay) = retry_plan(status, attempt, retry_after, self.policy) {
-                trace_response(
-                    account,
-                    endpoint,
-                    attempt,
-                    started,
-                    status,
-                    request_id.as_deref(),
-                    None,
-                    true,
-                );
-                drop(response);
-                sleep(delay).await;
-                attempt += 1;
-                continue;
+            if limiter.try_claim(request_class, interval).await.is_ok() {
+                return Ok((global_permit, token_permit));
             }
 
-            let result =
-                decode_response(response, request_id.clone(), retry_after.duration()).await;
-            let will_retry = result.as_ref().is_err_and(|error| {
-                is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts
-            });
+            // Another ready caller claimed the departure between our readiness
+            // check and permit acquisition. Never queue while reserving scarce
+            // HTTP capacity; retry the readiness phase.
+            drop(token_permit);
+            drop(global_permit);
+        }
+    }
+
+    async fn request_attempt(
+        &self,
+        context: AttemptContext<'_>,
+        attempt: usize,
+    ) -> Result<AttemptOutcome, WbError> {
+        // Both permits are released when this helper returns, before the retry
+        // loop performs any backoff sleep.
+        let (_global_permit, _token_permit) = self
+            .acquire_request_permits(context.limiter, context.request_class)
+            .await?;
+        let mut request = self
+            .http
+            .request(context.method.clone(), context.url)
+            .header(AUTHORIZATION, context.authorization.clone());
+        if let Some(payload) = context.payload {
+            request = request.json(payload);
+        }
+
+        let started = Instant::now();
+        match request.send().await {
+            Ok(response) => {
+                self.response_outcome(context, attempt, started, response)
+                    .await
+            }
+            Err(source) => {
+                transport_failure_outcome(context, attempt, started, source, self.policy)
+            }
+        }
+    }
+
+    async fn response_outcome(
+        &self,
+        context: AttemptContext<'_>,
+        attempt: usize,
+        started: Instant,
+        response: Response,
+    ) -> Result<AttemptOutcome, WbError> {
+        let status = response.status();
+        let request_id = extract_request_id(response.headers());
+        let retry_after = parse_retry_delay(response.headers(), Utc::now());
+        let planned_retry = retry_plan(status, attempt, retry_after, self.policy);
+        let vendor_cooldown = match retry_after {
+            ParsedRetryDelay::Valid(delay)
+                if is_retriable(status) && delay <= self.policy.max_retry_delay =>
+            {
+                Some(delay)
+            }
+            ParsedRetryDelay::Absent | ParsedRetryDelay::Invalid | ParsedRetryDelay::Valid(_) => {
+                None
+            }
+        };
+        if let Some(delay) = planned_retry.into_iter().chain(vendor_cooldown).max() {
+            // A vendor-directed retry is shared by every alias using this
+            // seller token and endpoint class. Extending the gate before
+            // permits are released prevents sibling calls from creating a
+            // same-token 429/503 retry storm during the cooldown.
+            context
+                .limiter
+                .extend_cooldown(context.request_class, delay)
+                .await;
+        }
+
+        if let Some(delay) = planned_retry {
             trace_response(
-                account,
-                endpoint,
+                context.account,
+                context.endpoint,
                 attempt,
                 started,
                 status,
                 request_id.as_deref(),
-                result.as_ref().err(),
-                will_retry,
+                None,
+                true,
             );
-            if will_retry {
-                sleep(retry_delay(attempt, None, self.policy)).await;
-                attempt += 1;
-                continue;
-            }
-            return result;
+            drop(response);
+            return Ok(AttemptOutcome::Retry(delay));
         }
+
+        let result = decode_response(response, request_id.clone(), retry_after.duration()).await;
+        let will_retry = result.as_ref().is_err_and(|error| {
+            is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts
+        });
+        trace_response(
+            context.account,
+            context.endpoint,
+            attempt,
+            started,
+            status,
+            request_id.as_deref(),
+            result.as_ref().err(),
+            will_retry,
+        );
+        if will_retry {
+            return Ok(AttemptOutcome::Retry(retry_delay(
+                attempt,
+                None,
+                self.policy,
+            )));
+        }
+        result.map(AttemptOutcome::Complete)
+    }
+}
+
+fn transport_failure_outcome(
+    context: AttemptContext<'_>,
+    attempt: usize,
+    started: Instant,
+    source: reqwest::Error,
+    policy: ClientPolicy,
+) -> Result<AttemptOutcome, WbError> {
+    let error = classify_transport_error(source, None);
+    let will_retry = is_retriable_transport(error.kind()) && attempt < policy.max_attempts;
+    trace_transport_failure(
+        context.account,
+        context.endpoint,
+        attempt,
+        started,
+        &error,
+        will_retry,
+    );
+    if will_retry {
+        Ok(AttemptOutcome::Retry(retry_delay(attempt, None, policy)))
+    } else {
+        Err(error)
     }
 }
 
@@ -2214,6 +2366,491 @@ mod tests {
             client.ping("alias").await.unwrap_err().kind(),
             WbErrorKind::Overloaded
         );
+    }
+
+    #[tokio::test]
+    async fn global_overload_does_not_burn_a_ready_departure_slot() {
+        let (base_url, requests) = mock_http(vec![(200, r#"{"Status":"OK"}"#.to_owned())]);
+        let mut policy = ClientPolicy::immediate_single_attempt(Duration::from_millis(250));
+        policy.ping_interval = Duration::from_secs(20);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_millis(200),
+            credentials(),
+            &base_url,
+            policy,
+        );
+
+        let all_global_permits = client
+            .global_in_flight
+            .try_acquire_many(MAX_GLOBAL_IN_FLIGHT_REQUESTS as u32)
+            .unwrap();
+        assert_eq!(
+            client.ping("account").await.unwrap_err().kind(),
+            WbErrorKind::Overloaded
+        );
+        assert!(requests.try_recv().is_err(), "overload must not reach WB");
+        drop(all_global_permits);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), client.ping("account"))
+            .await
+            .expect("the unconsumed departure must remain immediately available")
+            .unwrap();
+        assert_eq!(response["Status"], "OK");
+        assert!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /ping HTTP/1.1\r\n")
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn token_overload_does_not_burn_a_minute_quota_slot() {
+        let (base_url, requests) = mock_http(vec![(200, r#"{"report":[]}"#.to_owned())]);
+        let mut policy = ClientPolicy::immediate_single_attempt(Duration::from_millis(250));
+        policy.commission_interval = Duration::from_secs(60);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_secs(1),
+            credentials(),
+            &base_url,
+            policy,
+        );
+        let limiter = client.limiters.get("account").unwrap();
+
+        let all_token_permits = limiter
+            .in_flight
+            .try_acquire_many(MAX_IN_FLIGHT_REQUESTS_PER_TOKEN as u32)
+            .unwrap();
+        assert_eq!(
+            client
+                .tariff_commissions("account", None)
+                .await
+                .unwrap_err()
+                .kind(),
+            WbErrorKind::Overloaded
+        );
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT_REQUESTS,
+            "a rejected token permit must release the tentative global permit"
+        );
+        assert!(requests.try_recv().is_err(), "overload must not reach WB");
+        drop(all_token_permits);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.tariff_commissions("account", None),
+        )
+        .await
+        .expect("the unconsumed minute quota must remain immediately available")
+        .unwrap();
+        assert_eq!(response["report"], json!([]));
+        assert!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /api/v1/tariffs/commission HTTP/1.1\r\n")
+        );
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn competing_ready_call_releases_permits_before_waiting_for_the_next_slot() {
+        let (base_url, requests) = mock_http(vec![
+            (200, r#"{"Status":"OK"}"#.to_owned()),
+            (200, r#"{"Status":"OK"}"#.to_owned()),
+        ]);
+        let mut policy = ClientPolicy::immediate_single_attempt(Duration::from_secs(2));
+        policy.ping_interval = Duration::from_millis(500);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_secs(2),
+            credentials(),
+            &base_url,
+            policy,
+        );
+        let limiter = Arc::clone(client.limiters.get("account").unwrap());
+
+        // Queue both callers behind the same gate. Tokio's FIFO mutex then
+        // lets both observe readiness before either can reacquire the gate to
+        // claim the departure: the first claim wins and the loser must release
+        // both network permits before waiting for the following slot.
+        let gate = limiter.analytics_ping.next_allowed.lock().await;
+        let mut calls = tokio::task::JoinSet::new();
+        {
+            let client = client.clone();
+            calls.spawn(async move { client.ping("account").await });
+        }
+        {
+            let client = client.clone();
+            calls.spawn(async move { client.ping("account").await });
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        drop(gate);
+
+        let first = tokio::time::timeout(Duration::from_secs(1), calls.join_next())
+            .await
+            .expect("the winning departure must complete promptly")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["Status"], "OK");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), calls.join_next())
+                .await
+                .is_err(),
+            "the competing call must wait for the next paced departure"
+        );
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT_REQUESTS
+        );
+        assert_eq!(
+            limiter.in_flight.available_permits(),
+            MAX_IN_FLIGHT_REQUESTS_PER_TOKEN
+        );
+        let second = tokio::time::timeout(Duration::from_secs(1), calls.join_next())
+            .await
+            .expect("the competing call must resume at the next slot")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second["Status"], "OK");
+        assert!(calls.is_empty());
+        for _ in 0..2 {
+            assert!(
+                requests
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .starts_with("GET /ping HTTP/1.1\r\n")
+            );
+        }
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn paced_waiters_from_noisy_tokens_do_not_starve_an_unrelated_account() {
+        let accounts = BTreeMap::from([
+            (
+                "noisy-a".to_owned(),
+                WbCredentials {
+                    token: "noisy-token-a".to_owned(),
+                },
+            ),
+            (
+                "noisy-b".to_owned(),
+                WbCredentials {
+                    token: "noisy-token-b".to_owned(),
+                },
+            ),
+            (
+                "quiet".to_owned(),
+                WbCredentials {
+                    token: "quiet-token".to_owned(),
+                },
+            ),
+        ]);
+        let responses =
+            vec![(200, r#"{"Status":"OK"}"#.to_owned()); 2 * MAX_IN_FLIGHT_REQUESTS_PER_TOKEN + 1];
+        let (base_url, requests) = mock_http(responses);
+        let client = WbClient::new_for_test(Duration::from_secs(2), accounts, &base_url, &base_url);
+        let noisy_a = Arc::clone(client.limiters.get("noisy-a").unwrap());
+        let noisy_b = Arc::clone(client.limiters.get("noisy-b").unwrap());
+
+        // Holding both departure gates deterministically leaves all noisy
+        // requests waiting in pacing. Four calls per token used to acquire all
+        // eight global permits before reaching these locks.
+        let noisy_a_gate = noisy_a.analytics_ping.next_allowed.lock().await;
+        let noisy_b_gate = noisy_b.analytics_ping.next_allowed.lock().await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(
+            2 * MAX_IN_FLIGHT_REQUESTS_PER_TOKEN + 1,
+        ));
+        let mut noisy_requests = Vec::new();
+        for account in ["noisy-a", "noisy-b"] {
+            for _ in 0..MAX_IN_FLIGHT_REQUESTS_PER_TOKEN {
+                let client = client.clone();
+                let barrier = Arc::clone(&barrier);
+                noisy_requests.push(tokio::spawn(async move {
+                    barrier.wait().await;
+                    client.ping(account).await
+                }));
+            }
+        }
+        barrier.wait().await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT_REQUESTS,
+            "pacing waiters must not reserve the shared network budget"
+        );
+        assert_eq!(
+            noisy_a.in_flight.available_permits(),
+            MAX_IN_FLIGHT_REQUESTS_PER_TOKEN
+        );
+        assert_eq!(
+            noisy_b.in_flight.available_permits(),
+            MAX_IN_FLIGHT_REQUESTS_PER_TOKEN
+        );
+        let quiet = tokio::time::timeout(Duration::from_secs(1), client.ping("quiet"))
+            .await
+            .expect("an unrelated token must not wait behind noisy pacing queues")
+            .expect("the unrelated request must have a network permit");
+        assert_eq!(quiet["Status"], "OK");
+        assert!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /ping HTTP/1.1\r\n")
+        );
+
+        drop((noisy_a_gate, noisy_b_gate));
+        for request in noisy_requests {
+            assert_eq!(request.await.unwrap().unwrap()["Status"], "OK");
+            assert!(
+                requests
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .starts_with("GET /ping HTTP/1.1\r\n")
+            );
+        }
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_releases_global_and_token_network_permits() {
+        let (base_url, requests, task) = raw_http(vec![
+            raw_response(
+                503,
+                "x-request-id: retrying\r\n",
+                br#"{"error":"temporary"}"#,
+            ),
+            raw_response(200, "", br#"{"Status":"QUIET"}"#),
+            raw_response(200, "", br#"{"Status":"RETRIED"}"#),
+        ]);
+        let accounts = BTreeMap::from([
+            (
+                "noisy".to_owned(),
+                WbCredentials {
+                    token: "noisy-token".to_owned(),
+                },
+            ),
+            (
+                "quiet".to_owned(),
+                WbCredentials {
+                    token: "quiet-token".to_owned(),
+                },
+            ),
+        ]);
+        let mut policy = retrying_policy(Duration::from_secs(2));
+        policy.base_retry_delay = Duration::from_millis(400);
+        let client =
+            WbClient::new_for_test_with_policy(Duration::from_secs(1), accounts, &base_url, policy);
+        let noisy_limiter = Arc::clone(client.limiters.get("noisy").unwrap());
+        let noisy_client = client.clone();
+        let noisy = tokio::spawn(async move { noisy_client.ping("noisy").await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if requests.try_recv().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first retryable request must reach the mock");
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if client.global_in_flight.available_permits() == MAX_GLOBAL_IN_FLIGHT_REQUESTS
+                    && noisy_limiter.in_flight.available_permits()
+                        == MAX_IN_FLIGHT_REQUESTS_PER_TOKEN
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry backoff must not retain network permits");
+
+        assert_eq!(client.ping("quiet").await.unwrap()["Status"], "QUIET");
+        assert_eq!(noisy.await.unwrap().unwrap()["Status"], "RETRIED");
+        for _ in 0..2 {
+            requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        assert!(requests.try_recv().is_err());
+        task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn vendor_retry_after_extends_only_the_shared_token_class_gate() {
+        let (base_url, requests, task) = raw_http(vec![
+            raw_response(503, "Retry-After: 1\r\n", br#"{"error":"temporary"}"#),
+            raw_response(200, "", br#"{"Status":"QUIET"}"#),
+            raw_response(200, "", br#"{"Status":"SAME"}"#),
+            raw_response(200, "", br#"{"Status":"SAME"}"#),
+        ]);
+        let accounts = BTreeMap::from([
+            (
+                "same".to_owned(),
+                WbCredentials {
+                    token: "shared-token".to_owned(),
+                },
+            ),
+            (
+                "other".to_owned(),
+                WbCredentials {
+                    token: "other-token".to_owned(),
+                },
+            ),
+        ]);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_secs(1),
+            accounts,
+            &base_url,
+            retrying_policy(Duration::from_secs(3)),
+        );
+        let same_limiter = Arc::clone(client.limiters.get("same").unwrap());
+        let first_client = client.clone();
+        let first = tokio::spawn(async move { first_client.ping("same").await });
+
+        let first_request = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(request) = requests.try_recv() {
+                    break request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first same-token request must reach the mock");
+        assert!(first_request.starts_with(b"GET /ping HTTP/1.1\r\n"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let remaining = same_limiter
+                    .analytics_ping
+                    .next_allowed
+                    .lock()
+                    .await
+                    .saturating_duration_since(Instant::now());
+                if remaining > Duration::from_millis(500) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Retry-After cooldown must reach the shared gate");
+
+        let sibling_client = client.clone();
+        let mut sibling = tokio::spawn(async move { sibling_client.ping("same").await });
+        let quiet = tokio::time::timeout(Duration::from_millis(300), client.ping("other"))
+            .await
+            .expect("an unrelated token must not inherit the cooldown")
+            .unwrap();
+        assert_eq!(quiet["Status"], "QUIET");
+        assert!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with(b"GET /ping HTTP/1.1\r\n")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut sibling)
+                .await
+                .is_err(),
+            "a same-token sibling must remain behind Retry-After"
+        );
+        assert!(requests.try_recv().is_err());
+
+        assert_eq!(first.await.unwrap().unwrap()["Status"], "SAME");
+        assert_eq!(sibling.await.unwrap().unwrap()["Status"], "SAME");
+        for _ in 0..2 {
+            assert!(
+                requests
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .starts_with(b"GET /ping HTTP/1.1\r\n")
+            );
+        }
+        assert!(requests.try_recv().is_err());
+        task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_attempt_retry_after_still_extends_the_shared_token_gate() {
+        let (base_url, requests, task) = raw_http(vec![
+            raw_response(429, "Retry-After: 1\r\n", br#"{"error":"limited"}"#),
+            raw_response(200, "", br#"{"Status":"QUIET"}"#),
+            raw_response(200, "", br#"{"Status":"SAME"}"#),
+        ]);
+        let accounts = BTreeMap::from([
+            (
+                "same".to_owned(),
+                WbCredentials {
+                    token: "shared-token".to_owned(),
+                },
+            ),
+            (
+                "other".to_owned(),
+                WbCredentials {
+                    token: "other-token".to_owned(),
+                },
+            ),
+        ]);
+        let mut policy = retrying_policy(Duration::from_secs(3));
+        policy.max_attempts = 1;
+        let client =
+            WbClient::new_for_test_with_policy(Duration::from_secs(1), accounts, &base_url, policy);
+
+        assert!(matches!(
+            client.ping("same").await,
+            Err(WbError::RateLimited {
+                retry_after: Some(delay),
+                ..
+            }) if delay == Duration::from_secs(1)
+        ));
+        assert!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with(b"GET /ping HTTP/1.1\r\n")
+        );
+
+        let sibling_client = client.clone();
+        let mut sibling = tokio::spawn(async move { sibling_client.ping("same").await });
+        let quiet = tokio::time::timeout(Duration::from_millis(300), client.ping("other"))
+            .await
+            .expect("an unrelated token must not inherit the final-attempt cooldown")
+            .unwrap();
+        assert_eq!(quiet["Status"], "QUIET");
+        assert!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with(b"GET /ping HTTP/1.1\r\n")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut sibling)
+                .await
+                .is_err(),
+            "a same-token sibling must honor Retry-After after the final attempt"
+        );
+
+        assert_eq!(sibling.await.unwrap().unwrap()["Status"], "SAME");
+        assert!(
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with(b"GET /ping HTTP/1.1\r\n")
+        );
+        assert!(requests.try_recv().is_err());
+        task.join().unwrap();
     }
 
     #[tokio::test]

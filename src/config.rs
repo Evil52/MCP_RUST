@@ -804,6 +804,193 @@ fn validate_ozon_api_base_url(value: &str) -> Result<String> {
     Ok(DEFAULT_OZON_API_BASE_URL.to_owned())
 }
 
+fn lookup_value(
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+    key: &str,
+    default: &str,
+) -> String {
+    lookup(key).unwrap_or_else(|| default.to_owned())
+}
+
+fn load_jwt_config(lookup: &mut dyn FnMut(&str) -> Option<String>) -> Result<JwtConfig> {
+    let issuer = lookup("MCP_JWT_ISSUER")
+        .context("MCP_JWT_ISSUER обязателен при MCP_AUTH_MODE=jwt")?
+        .trim_end_matches('/')
+        .to_owned();
+    let audience =
+        lookup("MCP_JWT_AUDIENCE").context("MCP_JWT_AUDIENCE обязателен при MCP_AUTH_MODE=jwt")?;
+    let jwks_url = lookup("MCP_JWT_JWKS_URL")
+        .unwrap_or_else(|| format!("{issuer}/protocol/openid-connect/certs"));
+    let resource_url =
+        lookup("MCP_PUBLIC_URL").context("MCP_PUBLIC_URL обязателен при MCP_AUTH_MODE=jwt")?;
+    let mut parsed_resource =
+        reqwest::Url::parse(&resource_url).context("MCP_PUBLIC_URL должен быть абсолютным URL")?;
+    if !matches!(parsed_resource.scheme(), "http" | "https") {
+        bail!("MCP_PUBLIC_URL должен использовать http или https");
+    }
+    let parsed_audience = reqwest::Url::parse(&audience)
+        .context("MCP_JWT_AUDIENCE должен быть абсолютным URL ресурса MCP_PUBLIC_URL")?;
+    if !matches!(parsed_audience.scheme(), "http" | "https") {
+        bail!("MCP_JWT_AUDIENCE должен использовать http или https");
+    }
+    let resource_url = parsed_resource.to_string();
+    let audience = parsed_audience.to_string();
+    if audience != resource_url {
+        bail!(
+            "MCP_JWT_AUDIENCE должен точно совпадать с нормализованным URL ресурса MCP_PUBLIC_URL"
+        );
+    }
+    parsed_resource.set_path("/.well-known/oauth-protected-resource");
+    parsed_resource.set_query(None);
+    parsed_resource.set_fragment(None);
+    let resource_metadata_url = parsed_resource.to_string();
+    let required_scopes = parse_required_scopes(&lookup_value(
+        lookup,
+        "MCP_JWT_REQUIRED_SCOPES",
+        DEFAULT_JWT_REQUIRED_SCOPES,
+    ))?;
+    let ttl = lookup_value(lookup, "MCP_JWKS_CACHE_TTL_SECONDS", "300")
+        .parse::<u64>()
+        .context("MCP_JWKS_CACHE_TTL_SECONDS должен быть целым числом")?;
+    if !(30..=86_400).contains(&ttl) {
+        bail!("MCP_JWKS_CACHE_TTL_SECONDS должен быть от 30 до 86400");
+    }
+    Ok(JwtConfig {
+        issuer,
+        audience,
+        jwks_url,
+        resource_url,
+        resource_metadata_url,
+        required_scopes,
+        jwks_cache_ttl: Duration::from_secs(ttl),
+    })
+}
+
+fn load_auth_config(
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+    snapshot: &AccessRegistry,
+) -> Result<AuthConfig> {
+    let auth_mode: AuthMode = lookup_value(lookup, "MCP_AUTH_MODE", "dev").parse()?;
+    match auth_mode {
+        AuthMode::Dev => {
+            let actor_id =
+                lookup("MCP_ACTOR_ID").context("MCP_ACTOR_ID обязателен при MCP_AUTH_MODE=dev")?;
+            snapshot.actor(&actor_id)?;
+            Ok(AuthConfig::Dev { actor_id })
+        }
+        AuthMode::Jwt => Ok(AuthConfig::Jwt(load_jwt_config(lookup)?)),
+    }
+}
+
+fn load_credential_pair(
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+    first_env: &str,
+    second_env: &str,
+    incomplete_message: String,
+) -> Result<Option<(String, String)>> {
+    let first = lookup(first_env).unwrap_or_default();
+    let second = lookup(second_env).unwrap_or_default();
+    match (first.is_empty(), second.is_empty()) {
+        (true, true) => Ok(None),
+        (false, false) => {
+            validate_credential(&first, first_env)?;
+            validate_credential(&second, second_env)?;
+            Ok(Some((first, second)))
+        }
+        _ => bail!(incomplete_message),
+    }
+}
+
+fn load_ozon_credentials(
+    account: &MarketplaceAccount,
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+    stores: &mut BTreeMap<StoreId, StoreCredentials>,
+    performance_stores: &mut BTreeMap<StoreId, PerformanceCredentials>,
+) -> Result<()> {
+    let Some(ozon) = &account.ozon else {
+        return Ok(());
+    };
+    if let Some((client_id, api_key)) = load_credential_pair(
+        lookup,
+        &ozon.client_id_env,
+        &ozon.api_key_env,
+        format!(
+            "для магазина {} должны быть одновременно заданы {} и {}",
+            ozon.store_id, ozon.client_id_env, ozon.api_key_env
+        ),
+    )? {
+        stores.insert(
+            ozon.store_id.clone(),
+            StoreCredentials { client_id, api_key },
+        );
+    }
+    if let Some(performance) = &ozon.performance
+        && let Some((client_id, client_secret)) = load_credential_pair(
+            lookup,
+            &performance.client_id_env,
+            &performance.client_secret_env,
+            format!(
+                "для Performance API магазина {} должны быть одновременно заданы {} и {}",
+                ozon.store_id, performance.client_id_env, performance.client_secret_env
+            ),
+        )?
+    {
+        performance_stores.insert(
+            ozon.store_id.clone(),
+            PerformanceCredentials {
+                client_id,
+                client_secret,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn load_wildberries_credentials(
+    account: &MarketplaceAccount,
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+    wildberries_accounts: &mut BTreeMap<String, WbCredentials>,
+) -> Result<()> {
+    let Some(wildberries) = &account.wildberries else {
+        return Ok(());
+    };
+    let token = lookup(&wildberries.api_token_env).unwrap_or_default();
+    if token.is_empty() {
+        return Ok(());
+    }
+    validate_credential(&token, &wildberries.api_token_env)?;
+    wildberries_accounts.insert(account.id.clone(), WbCredentials { token });
+    Ok(())
+}
+
+struct MarketplaceCredentials {
+    stores: BTreeMap<StoreId, StoreCredentials>,
+    performance_stores: BTreeMap<StoreId, PerformanceCredentials>,
+    wildberries_accounts: BTreeMap<String, WbCredentials>,
+}
+
+fn load_marketplace_credentials(
+    snapshot: &AccessRegistry,
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<MarketplaceCredentials> {
+    let mut credentials = MarketplaceCredentials {
+        stores: BTreeMap::new(),
+        performance_stores: BTreeMap::new(),
+        wildberries_accounts: BTreeMap::new(),
+    };
+    for account in &snapshot.accounts {
+        load_ozon_credentials(
+            account,
+            lookup,
+            &mut credentials.stores,
+            &mut credentials.performance_stores,
+        )?;
+        load_wildberries_credentials(account, lookup, &mut credentials.wildberries_accounts)?;
+    }
+    validate_unique_performance_client_ids(&credentials.performance_stores)?;
+    Ok(credentials)
+}
+
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
@@ -815,157 +1002,35 @@ impl AppConfig {
     }
 
     fn from_lookup_inner(lookup: &mut dyn FnMut(&str) -> Option<String>) -> Result<Self> {
-        let value = |lookup: &mut dyn FnMut(&str) -> Option<String>, key: &str, default: &str| {
-            lookup(key).unwrap_or_else(|| default.to_owned())
-        };
-        let bind = value(lookup, "MCP_BIND", "127.0.0.1:8787")
+        let bind = lookup_value(lookup, "MCP_BIND", "127.0.0.1:8787")
             .parse()
             .context("MCP_BIND должен иметь формат IP:PORT")?;
         let max_sessions = parse_max_sessions(lookup("MCP_MAX_SESSIONS").as_deref())?;
-        let transport = value(lookup, "MCP_TRANSPORT", "http").parse()?;
-        let ozon_api_base_url = validate_ozon_api_base_url(&value(
+        let transport = lookup_value(lookup, "MCP_TRANSPORT", "http").parse()?;
+        let ozon_api_base_url = validate_ozon_api_base_url(&lookup_value(
             lookup,
             "OZON_API_BASE_URL",
             DEFAULT_OZON_API_BASE_URL,
         ))?;
-        let timeout_seconds = value(lookup, "OZON_REQUEST_TIMEOUT_SECONDS", "30")
+        let timeout_seconds = lookup_value(lookup, "OZON_REQUEST_TIMEOUT_SECONDS", "30")
             .parse::<u64>()
             .context("OZON_REQUEST_TIMEOUT_SECONDS должен быть целым числом")?;
         if !(1..=300).contains(&timeout_seconds) {
             bail!("OZON_REQUEST_TIMEOUT_SECONDS должен быть от 1 до 300");
         }
         let ozon_postings_vnext = parse_strict_bool(
-            &value(lookup, "OZON_POSTINGS_VNEXT", "false"),
+            &lookup_value(lookup, "OZON_POSTINGS_VNEXT", "false"),
             "OZON_POSTINGS_VNEXT",
         )?;
         let ozon_finance_accruals_preview = parse_strict_bool(
-            &value(lookup, "OZON_FINANCE_ACCRUALS_PREVIEW", "false"),
+            &lookup_value(lookup, "OZON_FINANCE_ACCRUALS_PREVIEW", "false"),
             "OZON_FINANCE_ACCRUALS_PREVIEW",
         )?;
-        let registry_path = value(lookup, "MCP_ACCESS_CONFIG", DEFAULT_ACCESS_CONFIG_PATH);
+        let registry_path = lookup_value(lookup, "MCP_ACCESS_CONFIG", DEFAULT_ACCESS_CONFIG_PATH);
         let registry = RegistrySource::new(registry_path)?;
         let snapshot = registry.load()?;
-        let auth_mode: AuthMode = value(lookup, "MCP_AUTH_MODE", "dev").parse()?;
-        let auth = match auth_mode {
-            AuthMode::Dev => {
-                let actor_id = lookup("MCP_ACTOR_ID")
-                    .context("MCP_ACTOR_ID обязателен при MCP_AUTH_MODE=dev")?;
-                snapshot.actor(&actor_id)?;
-                AuthConfig::Dev { actor_id }
-            }
-            AuthMode::Jwt => {
-                let issuer = lookup("MCP_JWT_ISSUER")
-                    .context("MCP_JWT_ISSUER обязателен при MCP_AUTH_MODE=jwt")?
-                    .trim_end_matches('/')
-                    .to_owned();
-                let audience = lookup("MCP_JWT_AUDIENCE")
-                    .context("MCP_JWT_AUDIENCE обязателен при MCP_AUTH_MODE=jwt")?;
-                let jwks_url = lookup("MCP_JWT_JWKS_URL")
-                    .unwrap_or_else(|| format!("{issuer}/protocol/openid-connect/certs"));
-                let resource_url = lookup("MCP_PUBLIC_URL")
-                    .context("MCP_PUBLIC_URL обязателен при MCP_AUTH_MODE=jwt")?;
-                let mut parsed_resource = reqwest::Url::parse(&resource_url)
-                    .context("MCP_PUBLIC_URL должен быть абсолютным URL")?;
-                if !matches!(parsed_resource.scheme(), "http" | "https") {
-                    bail!("MCP_PUBLIC_URL должен использовать http или https");
-                }
-                let parsed_audience = reqwest::Url::parse(&audience).context(
-                    "MCP_JWT_AUDIENCE должен быть абсолютным URL ресурса MCP_PUBLIC_URL",
-                )?;
-                if !matches!(parsed_audience.scheme(), "http" | "https") {
-                    bail!("MCP_JWT_AUDIENCE должен использовать http или https");
-                }
-                let resource_url = parsed_resource.to_string();
-                let audience = parsed_audience.to_string();
-                if audience != resource_url {
-                    bail!(
-                        "MCP_JWT_AUDIENCE должен точно совпадать с нормализованным URL ресурса MCP_PUBLIC_URL"
-                    );
-                }
-                parsed_resource.set_path("/.well-known/oauth-protected-resource");
-                parsed_resource.set_query(None);
-                parsed_resource.set_fragment(None);
-                let resource_metadata_url = parsed_resource.to_string();
-                let required_scopes = parse_required_scopes(&value(
-                    lookup,
-                    "MCP_JWT_REQUIRED_SCOPES",
-                    DEFAULT_JWT_REQUIRED_SCOPES,
-                ))?;
-                let ttl = value(lookup, "MCP_JWKS_CACHE_TTL_SECONDS", "300")
-                    .parse::<u64>()
-                    .context("MCP_JWKS_CACHE_TTL_SECONDS должен быть целым числом")?;
-                if !(30..=86_400).contains(&ttl) {
-                    bail!("MCP_JWKS_CACHE_TTL_SECONDS должен быть от 30 до 86400");
-                }
-                AuthConfig::Jwt(JwtConfig {
-                    issuer,
-                    audience,
-                    jwks_url,
-                    resource_url,
-                    resource_metadata_url,
-                    required_scopes,
-                    jwks_cache_ttl: Duration::from_secs(ttl),
-                })
-            }
-        };
-        let mut stores = BTreeMap::new();
-        let mut performance_stores = BTreeMap::new();
-        let mut wildberries_accounts = BTreeMap::new();
-        for account in &snapshot.accounts {
-            if let Some(ozon) = &account.ozon {
-                let client_id = lookup(&ozon.client_id_env).unwrap_or_default();
-                let api_key = lookup(&ozon.api_key_env).unwrap_or_default();
-                match (client_id.is_empty(), api_key.is_empty()) {
-                    (true, true) => {}
-                    (false, false) => {
-                        validate_credential(&client_id, &ozon.client_id_env)?;
-                        validate_credential(&api_key, &ozon.api_key_env)?;
-                        stores.insert(
-                            ozon.store_id.clone(),
-                            StoreCredentials { client_id, api_key },
-                        );
-                    }
-                    _ => bail!(
-                        "для магазина {} должны быть одновременно заданы {} и {}",
-                        ozon.store_id,
-                        ozon.client_id_env,
-                        ozon.api_key_env
-                    ),
-                }
-                if let Some(performance) = &ozon.performance {
-                    let client_id = lookup(&performance.client_id_env).unwrap_or_default();
-                    let client_secret = lookup(&performance.client_secret_env).unwrap_or_default();
-                    match (client_id.is_empty(), client_secret.is_empty()) {
-                        (true, true) => {}
-                        (false, false) => {
-                            validate_credential(&client_id, &performance.client_id_env)?;
-                            validate_credential(&client_secret, &performance.client_secret_env)?;
-                            performance_stores.insert(
-                                ozon.store_id.clone(),
-                                PerformanceCredentials {
-                                    client_id,
-                                    client_secret,
-                                },
-                            );
-                        }
-                        _ => bail!(
-                            "для Performance API магазина {} должны быть одновременно заданы {} и {}",
-                            ozon.store_id,
-                            performance.client_id_env,
-                            performance.client_secret_env
-                        ),
-                    }
-                }
-            }
-            if let Some(wildberries) = &account.wildberries {
-                let token = lookup(&wildberries.api_token_env).unwrap_or_default();
-                if !token.is_empty() {
-                    validate_credential(&token, &wildberries.api_token_env)?;
-                    wildberries_accounts.insert(account.id.clone(), WbCredentials { token });
-                }
-            }
-        }
-        validate_unique_performance_client_ids(&performance_stores)?;
+        let auth = load_auth_config(lookup, &snapshot)?;
+        let credentials = load_marketplace_credentials(&snapshot, lookup)?;
         Ok(Self {
             bind,
             max_sessions,
@@ -974,9 +1039,9 @@ impl AppConfig {
             request_timeout: Duration::from_secs(timeout_seconds),
             ozon_postings_vnext,
             ozon_finance_accruals_preview,
-            stores,
-            performance_stores,
-            wildberries_accounts,
+            stores: credentials.stores,
+            performance_stores: credentials.performance_stores,
+            wildberries_accounts: credentials.wildberries_accounts,
             auth,
             registry,
         })
