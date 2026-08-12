@@ -1469,4 +1469,154 @@ mod tests {
         assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
         assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
     }
+
+    /// A JWKS document whose `keys` member is absent or is not an array must
+    /// leave the verifier unavailable. These shapes reach `parse_bounded_jwks`
+    /// before any typed parsing, so getting them wrong would either accept a
+    /// key-less trust anchor or panic on the unwrapped array.
+    #[test]
+    fn jwks_documents_without_a_usable_key_array_are_refused() {
+        let valid_key = json!({
+            "kty": "RSA",
+            "kid": KID,
+            "use": "sig",
+            "alg": "RS256",
+            "n": test_key().modulus,
+            "e": test_key().exponent
+        });
+        for malformed in [
+            json!({}),
+            json!({"keys": null}),
+            json!({"keys": {}}),
+            json!({"keys": "not-an-array"}),
+            json!({"keys": 1}),
+            // An IdP mid-rotation can publish an empty set; it is not a usable
+            // trust anchor and must not be cached as one.
+            json!({"keys": []}),
+            // JSON member names are case sensitive: `Keys` is not `keys`.
+            json!({"Keys": [valid_key.clone()]}),
+            // A top-level array is not a JWKS document.
+            json!([valid_key]),
+        ] {
+            assert_eq!(
+                parse_bounded_jwks(malformed.to_string().as_bytes()).unwrap_err(),
+                JwtAuthenticationFailure::VerifierUnavailable,
+                "malformed JWKS must be refused: {malformed}"
+            );
+        }
+
+        // Not JSON at all — an HTML error page served with a 200 status.
+        assert_eq!(
+            parse_bounded_jwks(b"<html>502 Bad Gateway</html>").unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
+        );
+    }
+
+    /// The IdP publishes a key under the exact `kid` the token names, but the
+    /// key material itself cannot be turned into an RS256 decoding key. That is
+    /// an operator-side outage, not an invalid token: reporting it as
+    /// `InvalidToken` would tell the client to re-authorize forever, and
+    /// unwrapping it would take the process down.
+    #[tokio::test]
+    async fn a_matching_kid_with_unusable_key_material_reports_the_verifier_unavailable() {
+        let unusable = json!({
+            "keys": [{
+                "kty": "RSA",
+                "kid": KID,
+                "use": "sig",
+                "alg": "RS256",
+                "n": "!!! not base64url !!!",
+                "e": test_key().exponent
+            }]
+        })
+        .to_string();
+
+        // The document itself must survive bounded parsing: the failure has to
+        // come from the key material, not from the envelope.
+        assert_eq!(
+            parse_bounded_jwks(unusable.as_bytes()).unwrap().keys.len(),
+            1
+        );
+
+        let (base_url, requests) = mock_http(vec![(200, unusable.clone())]);
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+        let headers = bearer(&token(Some(KID), "ozonofk-mcp", "admin"));
+        assert_eq!(
+            auth.authenticate(&headers).await.unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
+        );
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        // The same failure must be reported from the cached path, without
+        // another fetch, rather than being retried on every request.
+        assert_eq!(
+            auth.authenticate(&headers).await.unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
+        );
+    }
+
+    /// The JWKS response is cut off mid-body. The prefix that does arrive is
+    /// deliberately a *complete, parseable* JWKS document, so a reader that
+    /// swallowed the truncation error would parse it and authenticate against a
+    /// half-delivered trust anchor. Only the transport error distinguishes the
+    /// two outcomes, which is exactly why it must not be ignored.
+    #[tokio::test]
+    async fn a_truncated_jwks_response_is_refused_even_though_its_prefix_parses() {
+        let prefix = jwks();
+        // Same document plus trailing whitespace: valid JSON either way, so the
+        // declared length is the only signal that bytes are missing.
+        let declared_length = prefix.len() + 64;
+        assert!(parse_bounded_jwks(prefix.as_bytes()).is_ok());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            // Promise the padded document, then hang up after the prefix.
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n{prefix}"
+            );
+        });
+
+        let auth = JwtAuthenticator::new(config(format!("http://{address}")), registry()).unwrap();
+        assert_eq!(
+            auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "admin")))
+                .await
+                .unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable,
+            "a truncated JWKS must not authenticate a token, even when its prefix parses"
+        );
+    }
+
+    /// A perfectly valid, correctly signed token must still be refused when the
+    /// access registry cannot be read, because the registry is what maps the
+    /// verified subject onto an actor. Failing open here would authenticate a
+    /// subject with no authorization record at all.
+    #[tokio::test]
+    async fn an_unreadable_registry_refuses_an_otherwise_valid_token() {
+        let (base_url, _) = mock_http(vec![(200, jwks()), (200, jwks())]);
+        let registry = registry();
+        let auth = JwtAuthenticator::new(config(base_url), registry.clone()).unwrap();
+        let headers = bearer(&token(Some(KID), "ozonofk-mcp", "admin"));
+
+        // Same token, same JWKS: only the registry changes between the calls.
+        assert_eq!(auth.authenticate(&headers).await.unwrap().actor_id, "admin");
+
+        fs::remove_file(registry.path()).unwrap();
+        assert_eq!(
+            auth.authenticate(&headers).await.unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
+        );
+
+        // A registry that is present but no longer valid JSON must fail the
+        // same way instead of being served from the parsed cache.
+        fs::write(registry.path(), b"{\"version\": 1, \"actors\": [").unwrap();
+        assert_eq!(
+            auth.authenticate(&headers).await.unwrap_err(),
+            JwtAuthenticationFailure::VerifierUnavailable
+        );
+    }
 }

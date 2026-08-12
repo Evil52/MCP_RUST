@@ -80,8 +80,52 @@ fn jwt_config() -> JwtConfig {
 }
 
 fn dev_router() -> Router {
+    dev_router_with_session_limit(4)
+}
+
+fn dev_router_with_session_limit(max_sessions: usize) -> Router {
     let server = OzonMcp::new(ozon_client(), "admin".to_owned(), registry());
-    build_router(server, NonZeroUsize::new(4).expect("non-zero"))
+    build_router(
+        server,
+        NonZeroUsize::new(max_sessions).expect("session limit is non-zero"),
+    )
+}
+
+/// Sends the MCP `initialize` handshake and reports the status and session id.
+async fn initialize_session(router: Router) -> (StatusCode, Option<String>) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(CONTENT_TYPE, "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-06-18")
+                .header("host", "localhost")
+                .body(Body::from(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "clientInfo": {"name": "router-test", "version": "0"}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (status, session_id)
 }
 
 fn jwt_router() -> Router {
@@ -233,6 +277,51 @@ async fn a_client_can_initialize_a_session_against_the_production_router() {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
         "session id must be an opaque safe token: {session_id}"
     );
+}
+
+/// The session cap must be enforced by the router that `main.rs` builds, not
+/// merely by the session manager in isolation. `max_sessions` is what stops an
+/// unauthenticated client from exhausting process memory by opening sessions, so
+/// a router that accepted the bound and then failed to apply it would be a live
+/// denial-of-service hole that a manager-level unit test cannot see.
+#[tokio::test]
+async fn the_production_router_enforces_its_session_cap_end_to_end() {
+    const LIMIT: usize = 2;
+    let router = dev_router_with_session_limit(LIMIT);
+
+    let mut session_ids = Vec::new();
+    for attempt in 1..=LIMIT {
+        let (status, session_id) = initialize_session(router.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "session {attempt} of {LIMIT} must be accepted"
+        );
+        session_ids.push(session_id.expect("an accepted initialize must open a session"));
+    }
+    // Distinct sessions, so the cap is counting real sessions rather than
+    // handing the same one out repeatedly.
+    session_ids.sort();
+    session_ids.dedup();
+    assert_eq!(session_ids.len(), LIMIT);
+
+    let (status, session_id) = initialize_session(router.clone()).await;
+    assert!(
+        status.is_server_error(),
+        "session {} must be refused once the cap is reached, got {status}",
+        LIMIT + 1
+    );
+    assert!(
+        session_id.is_none(),
+        "a refused initialize must not hand out a session id"
+    );
+
+    // Refusing the extra session must not take the process down with it: the
+    // liveness probe has to keep answering so orchestration sees a healthy
+    // container that is merely at capacity.
+    let (status, _, body) = get(router, "/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "ok");
 }
 
 #[tokio::test]

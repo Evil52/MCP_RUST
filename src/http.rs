@@ -1368,6 +1368,65 @@ mod tests {
         }
     }
 
+    /// The classifier only lets a body bypass the response budget when it has
+    /// fully recognised it as a permit-free notification or client response.
+    /// JSON that is malformed *inside* an otherwise recognised position must
+    /// therefore be guarded: swallowing a nested parse error would let a flood of
+    /// garbage bodies produce result bodies without consuming the 16-slot
+    /// response budget that bounds retained response memory.
+    #[test]
+    fn malformed_json_inside_any_recognised_position_still_requires_a_permit() {
+        for malformed in [
+            // Malformed value inside a params object and a params array.
+            br#"{"jsonrpc":"2.0","method":"x","params":{"a":}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"x","params":{"a":1,}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"x","params":[1,]}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"x","params":[{"a":}]}"#.as_slice(),
+            // Malformed value inside error.data and inside result.
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"x","data":{"a":}}}"#
+                .as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"result":{"a":}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"result":[1,]}"#.as_slice(),
+            // Malformed value under an unknown envelope field.
+            br#"{"jsonrpc":"2.0","method":"x","extra":{"a":}}"#.as_slice(),
+            // Non-string member names, which JSON does not permit at all.
+            br#"{"jsonrpc":"2.0",1:2}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"error":{1:2}}"#.as_slice(),
+            // Truncated at every depth, including mid-string and mid-number.
+            br#"{"jsonrpc":"2.0","method":"x","params":{"a":1"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"x","params":["#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"unterminated"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"result":"#.as_slice(),
+            br#"{"jsonrpc":"2.0""#.as_slice(),
+            b"{".as_slice(),
+            b"".as_slice(),
+        ] {
+            let rendered = String::from_utf8_lossy(malformed);
+            assert!(
+                post_requires_response_permit(malformed),
+                "malformed body must not bypass the response budget: {rendered}"
+            );
+        }
+
+        // The well-formed counterparts of the two shapes above still bypass the
+        // budget, so the guard above is driven by the malformedness and not by
+        // the surrounding envelope having become unrecognisable.
+        for bypassed in [
+            br#"{"jsonrpc":"2.0","method":"x","params":{"a":1}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"x","params":[1]}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"result":{"a":1}}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":1,"message":"x","data":{"a":1}}}"#
+                .as_slice(),
+        ] {
+            let rendered = String::from_utf8_lossy(bypassed);
+            assert!(
+                !post_requires_response_permit(bypassed),
+                "well-formed body must stay permit-free: {rendered}"
+            );
+        }
+    }
+
     #[test]
     fn response_permit_classifier_rejects_duplicate_envelope_and_error_fields() {
         for duplicate in [

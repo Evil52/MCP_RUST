@@ -1210,4 +1210,208 @@ mod tests {
             !PerformanceClient::empty(Duration::from_secs(1)).is_configured(&StoreId::from("one"))
         );
     }
+
+    /// The upstream answers 401, the cached token is invalidated and refreshed,
+    /// and the request is replayed — but each of those three steps can fail on
+    /// its own. None of them may loop, panic, or report a misleading error kind.
+    #[tokio::test]
+    async fn every_step_of_the_unauthorized_replay_can_fail_without_looping() {
+        let store = StoreId::from("shop");
+
+        // The very first data request never reaches the upstream: the token was
+        // obtained, then the connection failed.
+        let (base_url, requests) = mock_http(vec![(200, token(1_800))]);
+        let client =
+            PerformanceClient::new_for_test(base_url, Duration::from_secs(3), credentials());
+        assert_eq!(
+            client
+                .campaigns(&store, campaigns_query())
+                .await
+                .expect_err("a failed first data request must surface")
+                .kind(),
+            PerformanceErrorKind::Network
+        );
+        assert!(
+            requests.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "the token request must have been made"
+        );
+
+        // The refresh triggered by the 401 fails upstream. The reported error
+        // must be the refresh failure, not the original 401.
+        let (base_url, requests) = mock_http(vec![
+            (200, token(1_800)),
+            (401, "{}".to_owned()),
+            (500, "{}".to_owned()),
+        ]);
+        let client =
+            PerformanceClient::new_for_test(base_url, Duration::from_secs(3), credentials());
+        let error = client
+            .campaigns(&store, campaigns_query())
+            .await
+            .expect_err("a failed token refresh must surface");
+        assert_eq!(error.kind(), PerformanceErrorKind::Http);
+        for expected in [
+            "POST /api/client/token",
+            "GET /api/client/campaign?",
+            "POST /api/client/token",
+        ] {
+            let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(request.starts_with(expected), "{request}");
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "a failed refresh must not replay the data request"
+        );
+
+        // The refresh succeeds but the replayed request cannot be delivered.
+        let (base_url, requests) = mock_http(vec![
+            (200, token(1_800)),
+            (401, "{}".to_owned()),
+            (200, token(1_800)),
+        ]);
+        let client =
+            PerformanceClient::new_for_test(base_url, Duration::from_secs(3), credentials());
+        assert_eq!(
+            client
+                .campaigns(&store, campaigns_query())
+                .await
+                .expect_err("a failed replay must surface")
+                .kind(),
+            PerformanceErrorKind::Network
+        );
+        for _ in 0..3 {
+            requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+
+        // A second 401 on the replay must be reported, not refreshed again:
+        // exactly one replay per request, so a permanently unauthorized
+        // principal cannot spin the token endpoint.
+        let (base_url, requests) = mock_http(vec![
+            (200, token(1_800)),
+            (401, "{}".to_owned()),
+            (200, token(1_800)),
+            (401, "{}".to_owned()),
+            (200, token(1_800)),
+            (200, json!({"list": []}).to_string()),
+        ]);
+        let client =
+            PerformanceClient::new_for_test(base_url, Duration::from_secs(3), credentials());
+        assert_eq!(
+            client
+                .campaigns(&store, campaigns_query())
+                .await
+                .expect_err("a second 401 must be reported")
+                .kind(),
+            PerformanceErrorKind::Unauthorized
+        );
+        let mut observed = Vec::new();
+        while let Ok(request) = requests.recv_timeout(Duration::from_millis(200)) {
+            observed.push(request);
+        }
+        assert_eq!(
+            observed.len(),
+            4,
+            "one token, one 401, one refresh, one replay — and nothing more: {observed:#?}"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|request| request.starts_with("POST /api/client/token"))
+                .count(),
+            2,
+            "the token endpoint must be called at most twice per request"
+        );
+    }
+
+    /// A response that promises more bytes than it delivers must be reported as a
+    /// transport failure. Accepting the prefix would hand a truncated advertising
+    /// report to the model as if it were complete.
+    #[tokio::test]
+    async fn a_truncated_performance_response_is_reported_as_a_transport_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let token_body = token(1_800);
+            let responses = [
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{token_body}",
+                    token_body.len()
+                ),
+                // Promises 4096 bytes of JSON, delivers a valid-JSON prefix and
+                // hangs up, so only the length mismatch reveals the truncation.
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{\"list\":[]}".to_owned(),
+            ];
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0_u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let client = PerformanceClient::new_for_test(
+            format!("http://{address}"),
+            Duration::from_secs(3),
+            credentials(),
+        );
+        assert_eq!(
+            client
+                .campaigns(&StoreId::from("shop"), campaigns_query())
+                .await
+                .expect_err("a truncated body must not be decoded")
+                .kind(),
+            PerformanceErrorKind::Network
+        );
+    }
+
+    /// The process-wide budget is checked before the per-account gate, so a burst
+    /// spread across accounts fails fast instead of queueing. The account gate is
+    /// left completely free here, so only the global budget can explain the
+    /// refusal — and releasing one permit must restore service immediately.
+    #[tokio::test]
+    async fn the_global_performance_budget_fails_fast_while_the_account_gate_is_free() {
+        let client = PerformanceClient::new_for_test(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_millis(30),
+            credentials(),
+        );
+        let store = StoreId::from("shop");
+        let state = client.accounts.get(&store).unwrap();
+        assert_eq!(
+            state.in_flight.available_permits(),
+            MAX_IN_FLIGHT_PER_CLIENT,
+            "the account gate must be untouched for this test to mean anything"
+        );
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_GLOBAL_IN_FLIGHT {
+            held.push(
+                Arc::clone(&client.global_in_flight)
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            client
+                .campaigns(&store, campaigns_query())
+                .await
+                .expect_err("an exhausted global budget must fail fast")
+                .kind(),
+            PerformanceErrorKind::Overloaded
+        );
+
+        // Freeing one permit lets the next request through the gate; it then
+        // fails on the unreachable upstream, which proves the previous refusal
+        // came from the budget rather than from the network.
+        held.pop();
+        assert_eq!(
+            client
+                .campaigns(&store, campaigns_query())
+                .await
+                .expect_err("the upstream is unreachable in this test")
+                .kind(),
+            PerformanceErrorKind::Network
+        );
+    }
 }

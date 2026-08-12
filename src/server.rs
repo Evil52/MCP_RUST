@@ -5340,6 +5340,1018 @@ mod tests {
         assert!(validate_date_range("2025-08-11", "2026-08-10", 365).is_ok());
     }
 
+    /// Every Wildberries tool must resolve the account through RBAC *before* it
+    /// touches the network, for both an explicitly selected foreign account and
+    /// an omitted selector. The mock upstream is configured with working
+    /// credentials for `account_wb`, so a handler that forgot `resolve_wb_account`
+    /// — or that called it after dispatch — would leak a request into `requests`
+    /// and fail the final assertion instead of silently passing.
+    #[tokio::test]
+    async fn every_wildberries_tool_denies_a_foreign_account_before_any_network_call() {
+        // `manager` manages the Ozon account_b only; account_wb belongs to admin.
+        let (server, requests) = mock_wb_server_for("manager", 0);
+
+        macro_rules! assert_denied_before_network {
+            ($method:ident, |$account:ident| $input:expr) => {{
+                let selected = {
+                    let $account = Some("account_wb".to_owned());
+                    $input
+                };
+                let denied = server
+                    .$method(RequestIdentity::dev(), Parameters(selected))
+                    .await
+                    .err()
+                    .expect(concat!(
+                        stringify!($method),
+                        " must deny an actor without access to the selected WB account"
+                    ));
+                assert!(
+                    denied.starts_with(ACCESS_DENIED),
+                    concat!(
+                        stringify!($method),
+                        " must fail with ACCESS_DENIED, got: {}"
+                    ),
+                    denied
+                );
+
+                let unresolved = {
+                    let $account = None;
+                    $input
+                };
+                let refused = server
+                    .$method(RequestIdentity::dev(), Parameters(unresolved))
+                    .await
+                    .err()
+                    .expect(concat!(
+                        stringify!($method),
+                        " must refuse to guess an account for an actor with none"
+                    ));
+                assert!(
+                    refused.starts_with("NO_ACCESSIBLE_WB_ACCOUNT"),
+                    concat!(
+                        stringify!($method),
+                        " must fail with NO_ACCESSIBLE_WB_ACCOUNT, got: {}"
+                    ),
+                    refused
+                );
+            }};
+        }
+
+        assert_denied_before_network!(wb_ping, |account| WbAccountInput { account });
+        assert_denied_before_network!(wb_sales_funnel, |account| WbSalesFunnelInput {
+            account,
+            date_from: "2026-08-01".to_owned(),
+            date_to: "2026-08-08".to_owned(),
+            nm_ids: Vec::new(),
+            brand_names: Vec::new(),
+            subject_ids: Vec::new(),
+            tag_ids: Vec::new(),
+            skip_deleted_nm: false,
+            limit: 10,
+            offset: 0,
+        });
+        assert_denied_before_network!(wb_sales_funnel_history, |account| {
+            WbSalesFunnelHistoryInput {
+                account,
+                date_from: "2026-08-04".to_owned(),
+                date_to: "2026-08-10".to_owned(),
+                nm_ids: vec![123_456],
+                skip_deleted_nm: true,
+                aggregation_level: WbAggregationLevel::Day,
+            }
+        });
+        assert_denied_before_network!(wb_sales_funnel_grouped_history, |account| {
+            WbSalesFunnelGroupedHistoryInput {
+                account,
+                date_from: "2026-08-04".to_owned(),
+                date_to: "2026-08-10".to_owned(),
+                brand_names: vec!["Example brand".to_owned()],
+                subject_ids: vec![101],
+                tag_ids: vec![202],
+                skip_deleted_nm: false,
+                aggregation_level: WbAggregationLevel::Week,
+            }
+        });
+        assert_denied_before_network!(wb_warehouse_stocks, |account| WbWarehouseStocksInput {
+            account,
+            nm_ids: vec![123_456],
+            chrt_ids: vec![654_321],
+            limit: 100,
+            offset: 0,
+        });
+        assert_denied_before_network!(wb_orders, |account| WbStatisticsReportInput {
+            account,
+            date_from: "2026-08-01T00:00:00Z".to_owned(),
+            flag: 0,
+        });
+        assert_denied_before_network!(wb_sales, |account| WbStatisticsReportInput {
+            account,
+            date_from: "2026-08-02".to_owned(),
+            flag: 1,
+        });
+        assert_denied_before_network!(wb_product_cards, |account| WbProductCardsInput {
+            account,
+            locale: Some(WbLocale::Ru),
+            ascending: false,
+            with_photo: Some(1),
+            text_search: None,
+            allowed_categories_only: None,
+            tag_ids: Vec::new(),
+            object_ids: Vec::new(),
+            brands: Vec::new(),
+            imt_id: None,
+            cursor_updated_at: None,
+            cursor_nm_id: None,
+            limit: 10,
+        });
+        assert_denied_before_network!(wb_product_prices, |account| WbProductPricesInput {
+            account,
+            nm_id: None,
+            limit: 10,
+            offset: 0,
+        });
+        assert_denied_before_network!(wb_tariff_commissions, |account| WbTariffCommissionsInput {
+            account,
+            locale: Some(WbLocale::Ru),
+        });
+        assert_denied_before_network!(wb_tariff_boxes, |account| WbTariffDateInput {
+            account,
+            date: "2026-08-01".to_owned(),
+        });
+        assert_denied_before_network!(wb_tariff_pallets, |account| WbTariffDateInput {
+            account,
+            date: "2026-08-01".to_owned(),
+        });
+        assert_denied_before_network!(wb_tariff_returns, |account| WbTariffDateInput {
+            account,
+            date: "2026-08-01".to_owned(),
+        });
+        assert_denied_before_network!(wb_acceptance_coefficients, |account| {
+            WbAcceptanceCoefficientsInput {
+                account,
+                warehouse_ids: vec![507],
+            }
+        });
+        assert_denied_before_network!(wb_promotion_campaigns, |account| WbAccountInput { account });
+        assert_denied_before_network!(wb_promotion_campaign_details, |account| {
+            WbPromotionCampaignDetailsInput {
+                account,
+                campaign_ids: vec![777],
+                statuses: None,
+                payment_type: None,
+            }
+        });
+        assert_denied_before_network!(wb_promotion_stats, |account| WbPromotionStatsInput {
+            account,
+            campaign_ids: vec![777],
+            begin_date: "2026-08-01".to_owned(),
+            end_date: "2026-08-01".to_owned(),
+        });
+
+        assert!(
+            requests.try_recv().is_err(),
+            "a denied Wildberries tool must never reach the upstream API"
+        );
+    }
+
+    /// Every bounded Ozon tool input must be rejected before the request leaves
+    /// the process. The mock upstream expects zero requests and `store_a` is
+    /// fully accessible to the default actor, so validation is the only thing
+    /// that can stop a call here: a validator dropped from any one tool shows up
+    /// as a leaked request rather than as a quietly relaxed bound.
+    #[tokio::test]
+    async fn every_bounded_ozon_tool_input_is_rejected_before_any_network_call() {
+        let (server, requests) = mock_server(0);
+        let identity = RequestIdentity::dev;
+
+        macro_rules! assert_rejected {
+            ($method:ident, $input:expr, $expected:expr, $why:expr) => {{
+                let tool = stringify!($method);
+                let error = server
+                    .$method(identity(), Parameters($input))
+                    .await
+                    .err()
+                    .expect(concat!(
+                        stringify!($method),
+                        " must reject its out-of-range input"
+                    ));
+                let named = error.contains($expected);
+                assert!(
+                    named,
+                    "{tool} must name {:?} when rejecting {}, got: {error}",
+                    $expected, $why
+                );
+            }};
+        }
+
+        fn analytics(metrics: usize, dimensions: usize, limit: u32) -> AnalyticsInput {
+            AnalyticsInput {
+                store: None,
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-08".to_owned(),
+                metrics: vec![AnalyticsMetric::Revenue; metrics],
+                dimensions: vec![AnalyticsDimension::Day; dimensions],
+                limit,
+                offset: 0,
+                sort_by: None,
+                sort_direction: SortDirection::Desc,
+            }
+        }
+
+        // Both ends of every analytics bound, so an off-by-one in either
+        // direction is caught rather than only the obviously empty case.
+        assert_rejected!(analytics, analytics(0, 1, 10), "metrics", "no metrics");
+        assert_rejected!(analytics, analytics(11, 1, 10), "metrics", "11 metrics");
+        assert_rejected!(
+            analytics,
+            analytics(1, 0, 10),
+            "dimensions",
+            "no dimensions"
+        );
+        assert_rejected!(analytics, analytics(1, 3, 10), "dimensions", "3 dimensions");
+        assert_rejected!(analytics, analytics(1, 1, 0), "limit", "limit 0");
+        assert_rejected!(analytics, analytics(1, 1, 1_001), "limit", "limit 1001");
+        // The accepted boundary values must still pass validation, which they
+        // prove by failing later, on the store lookup rather than on a bound.
+        for accepted in [analytics(10, 2, 1), analytics(1, 1, 1_000)] {
+            let error = server
+                .analytics(identity(), Parameters(accepted))
+                .await
+                .err()
+                .expect("the mock upstream serves no responses");
+            assert!(
+                !error.contains("metrics")
+                    && !error.contains("dimensions")
+                    && !error.contains("limit"),
+                "boundary analytics input must pass validation, got: {error}"
+            );
+        }
+
+        assert_rejected!(
+            stock_turnover,
+            TurnoverInput {
+                store: None,
+                skus: Vec::new(),
+                limit: 0,
+                offset: 0,
+            },
+            "limit",
+            "limit 0"
+        );
+
+        // 367 inclusive days against a 366-day cap, and a malformed `date_to`
+        // alongside a well-formed `date_from`.
+        for (date_from, date_to, expected, why) in [
+            ("2025-08-01", "2026-08-02", "366", "367 inclusive days"),
+            ("2026-08-01", "not-a-date", "date_to", "malformed date_to"),
+            ("2026-08-08", "2026-08-01", "date_to", "reversed range"),
+        ] {
+            assert_rejected!(
+                finance_totals,
+                FinanceTotalsInput {
+                    store: None,
+                    date_from: date_from.to_owned(),
+                    date_to: date_to.to_owned(),
+                    posting_number: String::new(),
+                    transaction_type: String::new(),
+                },
+                expected,
+                why
+            );
+        }
+
+        assert_rejected!(
+            finance_transactions,
+            FinanceInput {
+                store: None,
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                posting_number: String::new(),
+                operation_types: Vec::new(),
+                transaction_type: String::new(),
+                page: 1,
+                page_size: 0,
+            },
+            "limit",
+            "page_size 0"
+        );
+
+        assert_rejected!(
+            returns,
+            ReturnsInput {
+                store: None,
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                return_schema: ReturnSchema::Fbo,
+                offer_id: String::new(),
+                posting_numbers: Vec::new(),
+                limit: 501,
+                last_id: 0,
+            },
+            "limit",
+            "limit above 500"
+        );
+
+        assert_rejected!(
+            rfbs_returns,
+            RfbsReturnsInput {
+                store: None,
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                offer_id: String::new(),
+                posting_number: String::new(),
+                group_state: Vec::new(),
+                last_id: 0,
+                limit: 101,
+            },
+            "limit",
+            "limit above 100"
+        );
+
+        assert_rejected!(
+            seller_rating_history,
+            RatingHistoryInput {
+                store: None,
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                ratings: Vec::new(),
+                with_premium_scores: false,
+            },
+            "ratings",
+            "no ratings"
+        );
+        assert_rejected!(
+            seller_rating_history,
+            RatingHistoryInput {
+                store: None,
+                date_from: "2025-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                ratings: vec!["rating_on_time".to_owned()],
+                with_premium_scores: false,
+            },
+            "366",
+            "367 inclusive days"
+        );
+
+        // Both returns tools bound the period as well as the page size.
+        assert_rejected!(
+            returns,
+            ReturnsInput {
+                store: None,
+                date_from: "2025-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                return_schema: ReturnSchema::Fbs,
+                offer_id: String::new(),
+                posting_numbers: Vec::new(),
+                limit: 100,
+                last_id: 0,
+            },
+            "366",
+            "367 inclusive days"
+        );
+        assert_rejected!(
+            rfbs_returns,
+            RfbsReturnsInput {
+                store: None,
+                date_from: "2025-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                offer_id: String::new(),
+                posting_number: String::new(),
+                group_state: Vec::new(),
+                last_id: 0,
+                limit: 100,
+            },
+            "366",
+            "367 inclusive days"
+        );
+
+        // Advertising campaign ids are bounded, positive and unique; a duplicate
+        // or a zero must never be forwarded to the Performance API.
+        for (campaign_ids, expected, why) in [
+            (vec![0_u64], "0", "a zero campaign id"),
+            (vec![7, 7], "дубликаты", "a duplicated campaign id"),
+            (
+                vec![1; MAX_PERFORMANCE_CAMPAIGNS + 1],
+                "campaign_ids",
+                "too many campaign ids",
+            ),
+        ] {
+            assert_rejected!(
+                performance_daily,
+                PerformanceStatisticsInput {
+                    store: None,
+                    campaign_ids,
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-02".to_owned(),
+                },
+                expected,
+                why
+            );
+        }
+
+        // `limit` below the review floor and above the API cap are separate
+        // rejections; both must stop before the network.
+        for (limit, expected, why) in [
+            (19, "20", "limit below the review floor"),
+            (101, "limit", "limit above the review cap"),
+        ] {
+            assert_rejected!(
+                reviews,
+                ReviewsInput {
+                    store: None,
+                    limit,
+                    last_id: String::new(),
+                    status: "ALL".to_owned(),
+                    direction: SortDirection::Desc,
+                },
+                expected,
+                why
+            );
+        }
+
+        assert_rejected!(
+            questions,
+            QuestionsInput {
+                store: None,
+                date_from: "2025-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                status: "ALL".to_owned(),
+                last_id: String::new(),
+            },
+            "366",
+            "367 inclusive days"
+        );
+
+        for (limit, expected, why) in [
+            (0, "limit", "limit 0"),
+            (1_001, "limit", "limit above the posting cap"),
+        ] {
+            assert_rejected!(
+                fbs_postings,
+                PostingListInput {
+                    store: None,
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-02".to_owned(),
+                    status: String::new(),
+                    limit,
+                    offset: 0,
+                    cursor: None,
+                    direction: SortDirection::Desc,
+                },
+                expected,
+                why
+            );
+        }
+        assert_rejected!(
+            fbo_postings,
+            PostingListInput {
+                store: None,
+                date_from: "2025-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                status: String::new(),
+                limit: 100,
+                offset: 0,
+                cursor: None,
+                direction: SortDirection::Desc,
+            },
+            "366",
+            "367 inclusive days"
+        );
+
+        assert!(
+            requests.try_recv().is_err(),
+            "a rejected Ozon tool input must never reach the upstream API"
+        );
+    }
+
+    /// The Wildberries counterpart of the Ozon bound sweep: every bounded WB
+    /// input must be refused before the request leaves the process. The actor
+    /// here *does* own `account_wb`, so RBAC cannot mask a missing bound — only
+    /// input validation stands between these calls and the upstream.
+    #[tokio::test]
+    async fn every_bounded_wildberries_tool_input_is_rejected_before_any_network_call() {
+        let (server, requests) = mock_wb_server_for("admin", 0);
+        let identity = RequestIdentity::dev;
+        let account = || Some("account_wb".to_owned());
+
+        macro_rules! assert_rejected {
+            ($method:ident, $input:expr, $expected:expr, $why:expr) => {{
+                let tool = stringify!($method);
+                let error = server
+                    .$method(identity(), Parameters($input))
+                    .await
+                    .err()
+                    .expect(concat!(
+                        stringify!($method),
+                        " must reject its out-of-range input"
+                    ));
+                let named = error.contains($expected);
+                assert!(
+                    named,
+                    "{tool} must name {:?} when rejecting {}, got: {error}",
+                    $expected, $why
+                );
+            }};
+        }
+
+        fn funnel(
+            account: Option<String>,
+            nm_ids: usize,
+            brand_names: usize,
+            tag_ids: usize,
+            limit: u32,
+            offset: u32,
+        ) -> WbSalesFunnelInput {
+            WbSalesFunnelInput {
+                account,
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-08".to_owned(),
+                nm_ids: vec![1; nm_ids],
+                brand_names: vec!["Brand".to_owned(); brand_names],
+                subject_ids: Vec::new(),
+                tag_ids: vec![1; tag_ids],
+                skip_deleted_nm: false,
+                limit,
+                offset,
+            }
+        }
+
+        assert_rejected!(
+            wb_sales_funnel,
+            funnel(account(), MAX_PRODUCT_FILTER_ITEMS + 1, 0, 0, 10, 0),
+            "nm_ids",
+            "too many nm_ids"
+        );
+        assert_rejected!(
+            wb_sales_funnel,
+            funnel(account(), 0, 101, 0, 10, 0),
+            "brand_names",
+            "too many brand_names"
+        );
+        assert_rejected!(
+            wb_sales_funnel,
+            funnel(account(), 0, 0, MAX_PRODUCT_FILTER_ITEMS + 1, 10, 0),
+            "tag_ids",
+            "too many tag_ids"
+        );
+        assert_rejected!(
+            wb_sales_funnel,
+            funnel(account(), 0, 0, 0, 0, 0),
+            "limit",
+            "limit 0"
+        );
+        assert_rejected!(
+            wb_sales_funnel,
+            funnel(account(), 0, 0, 0, 1_001, 0),
+            "limit",
+            "limit above the WB cap"
+        );
+        assert_rejected!(
+            wb_sales_funnel,
+            funnel(account(), 0, 0, 0, 10, MAX_OFFSET + 1),
+            "offset",
+            "offset above the cap"
+        );
+        // A blank brand name is rejected even when the list length is legal, so
+        // an empty filter value can never be forwarded as a wildcard.
+        assert_rejected!(
+            wb_sales_funnel,
+            WbSalesFunnelInput {
+                account: account(),
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-08".to_owned(),
+                nm_ids: Vec::new(),
+                brand_names: vec!["  ".to_owned()],
+                subject_ids: Vec::new(),
+                tag_ids: Vec::new(),
+                skip_deleted_nm: false,
+                limit: 10,
+                offset: 0,
+            },
+            "brand_names",
+            "a blank brand name"
+        );
+
+        // The history endpoint requires between one and twenty nm_ids.
+        for (nm_ids, why) in [(0_usize, "no nm_ids"), (21, "21 nm_ids")] {
+            assert_rejected!(
+                wb_sales_funnel_history,
+                WbSalesFunnelHistoryInput {
+                    account: account(),
+                    date_from: "2026-08-04".to_owned(),
+                    date_to: "2026-08-10".to_owned(),
+                    nm_ids: vec![1; nm_ids],
+                    skip_deleted_nm: false,
+                    aggregation_level: WbAggregationLevel::Day,
+                },
+                "nm_ids",
+                why
+            );
+        }
+
+        fn grouped(
+            account: Option<String>,
+            date_to: &str,
+            subject_ids: Vec<u64>,
+            tag_ids: Vec<u64>,
+        ) -> WbSalesFunnelGroupedHistoryInput {
+            WbSalesFunnelGroupedHistoryInput {
+                account,
+                date_from: "2026-08-04".to_owned(),
+                date_to: date_to.to_owned(),
+                brand_names: Vec::new(),
+                subject_ids,
+                tag_ids,
+                skip_deleted_nm: false,
+                aggregation_level: WbAggregationLevel::Day,
+            }
+        }
+
+        assert_rejected!(
+            wb_sales_funnel_grouped_history,
+            grouped(account(), "2026-08-11", Vec::new(), Vec::new()),
+            "7",
+            "eight inclusive days"
+        );
+        assert_rejected!(
+            wb_sales_funnel_grouped_history,
+            WbSalesFunnelGroupedHistoryInput {
+                brand_names: vec!["Brand".to_owned(); 17],
+                ..grouped(account(), "2026-08-10", Vec::new(), Vec::new())
+            },
+            "brand_names",
+            "17 brand_names"
+        );
+        assert_rejected!(
+            wb_sales_funnel_grouped_history,
+            grouped(account(), "2026-08-10", vec![1; 17], Vec::new()),
+            "subject_ids",
+            "17 subject_ids"
+        );
+        assert_rejected!(
+            wb_sales_funnel_grouped_history,
+            grouped(account(), "2026-08-10", Vec::new(), vec![1; 17]),
+            "tag_ids",
+            "17 tag_ids"
+        );
+        assert_rejected!(
+            wb_sales_funnel_grouped_history,
+            grouped(account(), "2026-08-10", vec![0], Vec::new()),
+            "subject_ids",
+            "a zero subject_id"
+        );
+        assert_rejected!(
+            wb_sales_funnel_grouped_history,
+            grouped(account(), "2026-08-10", Vec::new(), vec![0]),
+            "tag_ids",
+            "a zero tag_id"
+        );
+
+        for (nm_ids, limit, offset, expected, why) in [
+            (
+                vec![1; MAX_PRODUCT_FILTER_ITEMS + 1],
+                100,
+                0,
+                "nm_ids",
+                "too many nm_ids",
+            ),
+            (vec![0], 100, 0, "nm_ids", "a zero nm_id"),
+            (Vec::new(), 0, 0, "limit", "limit 0"),
+            (Vec::new(), 1_001, 0, "limit", "limit above the WB cap"),
+            (
+                Vec::new(),
+                100,
+                MAX_OFFSET + 1,
+                "offset",
+                "offset above the cap",
+            ),
+        ] {
+            assert_rejected!(
+                wb_warehouse_stocks,
+                WbWarehouseStocksInput {
+                    account: account(),
+                    nm_ids,
+                    chrt_ids: Vec::new(),
+                    limit,
+                    offset,
+                },
+                expected,
+                why
+            );
+        }
+
+        // `flag` is a two-valued switch; `date_from` is bounded and non-blank.
+        assert_rejected!(
+            wb_orders,
+            WbStatisticsReportInput {
+                account: account(),
+                date_from: "2026-08-01".to_owned(),
+                flag: 2,
+            },
+            "flag",
+            "a flag outside 0..=1"
+        );
+        for (date_from, expected, why) in [
+            (String::new(), "не может быть пустым", "a blank date_from"),
+            (
+                " ".repeat(3),
+                "не может быть пустым",
+                "a whitespace-only date_from",
+            ),
+            // A *valid* RFC3339 timestamp padded with fractional digits past the
+            // 64-character bound. chrono parses it happily, so only the length
+            // bound stands between it and the upstream query string.
+            (
+                format!("2026-08-01T00:00:00.{}Z", "0".repeat(50)),
+                "не может быть длиннее 64",
+                "an over-long but well-formed date_from",
+            ),
+            (
+                "2026-13-01".to_owned(),
+                "YYYY-MM-DD или RFC3339",
+                "an impossible month",
+            ),
+        ] {
+            assert_rejected!(
+                wb_sales,
+                WbStatisticsReportInput {
+                    account: account(),
+                    date_from,
+                    flag: 0,
+                },
+                expected,
+                why
+            );
+        }
+
+        fn cards(account: Option<String>) -> WbProductCardsInput {
+            WbProductCardsInput {
+                account,
+                locale: None,
+                ascending: false,
+                with_photo: None,
+                text_search: None,
+                allowed_categories_only: None,
+                tag_ids: Vec::new(),
+                object_ids: Vec::new(),
+                brands: Vec::new(),
+                imt_id: None,
+                cursor_updated_at: None,
+                cursor_nm_id: None,
+                limit: 10,
+            }
+        }
+
+        assert_rejected!(
+            wb_product_cards,
+            WbProductCardsInput {
+                text_search: Some("   ".to_owned()),
+                ..cards(account())
+            },
+            "text_search",
+            "a blank text_search"
+        );
+        assert_rejected!(
+            wb_product_cards,
+            WbProductCardsInput {
+                tag_ids: vec![1; 101],
+                ..cards(account())
+            },
+            "tag_ids",
+            "101 tag_ids"
+        );
+        assert_rejected!(
+            wb_product_cards,
+            WbProductCardsInput {
+                object_ids: vec![0],
+                ..cards(account())
+            },
+            "object_ids",
+            "a zero object_id"
+        );
+        assert_rejected!(
+            wb_product_cards,
+            WbProductCardsInput {
+                cursor_updated_at: Some("1".repeat(65)),
+                cursor_nm_id: Some(1),
+                ..cards(account())
+            },
+            "cursor_updated_at",
+            "an over-long cursor"
+        );
+
+        assert_rejected!(
+            wb_promotion_stats,
+            WbPromotionStatsInput {
+                account: account(),
+                campaign_ids: Vec::new(),
+                begin_date: "2026-08-01".to_owned(),
+                end_date: "2026-08-01".to_owned(),
+            },
+            "campaign_ids",
+            "no campaign_ids"
+        );
+
+        // Every date-scoped tariff tool parses its `date` before resolving the
+        // account, so a malformed date can never reach the upstream.
+        assert_rejected!(
+            wb_tariff_boxes,
+            WbTariffDateInput {
+                account: account(),
+                date: "01-08-2026".to_owned(),
+            },
+            "date",
+            "a day-first date"
+        );
+        assert_rejected!(
+            wb_tariff_pallets,
+            WbTariffDateInput {
+                account: account(),
+                date: "2026-02-30".to_owned(),
+            },
+            "date",
+            "an impossible calendar day"
+        );
+        assert_rejected!(
+            wb_tariff_returns,
+            WbTariffDateInput {
+                account: account(),
+                date: String::new(),
+            },
+            "date",
+            "an empty date"
+        );
+
+        // The `account` selector itself is bounded and must be non-blank, so a
+        // blank or oversized selector is refused before the registry lookup.
+        for (selector, expected, why) in [
+            ("   ".to_owned(), "account", "a whitespace-only selector"),
+            (
+                "a".repeat(MAX_STORE_SELECTOR_CHARS + 1),
+                "account",
+                "an over-long selector",
+            ),
+        ] {
+            assert_rejected!(
+                wb_ping,
+                WbAccountInput {
+                    account: Some(selector),
+                },
+                expected,
+                why
+            );
+        }
+
+        assert!(
+            requests.try_recv().is_err(),
+            "a rejected Wildberries tool input must never reach the upstream API"
+        );
+    }
+
+    /// The experimental finance-accrual tools are opt-in. With the preview off,
+    /// each one must refuse on its own — a tool that only checked the router
+    /// route would still be reachable through a direct MCP `tools/call`.
+    #[tokio::test]
+    async fn every_finance_accrual_preview_tool_is_closed_when_the_preview_is_off() {
+        let (server, requests) = mock_server(0);
+        assert!(!server.finance_accruals_preview);
+
+        let postings = server
+            .finance_accrual_postings_preview(
+                RequestIdentity::dev(),
+                Parameters(FinanceAccrualPostingsPreviewInput {
+                    store: None,
+                    posting_numbers: vec!["12345-0001-1".to_owned()],
+                }),
+            )
+            .await
+            .err()
+            .expect("the postings preview must be closed by default");
+        assert!(postings.starts_with(PREVIEW_DISABLED), "{postings}");
+
+        let types = server
+            .finance_accrual_types_preview(
+                RequestIdentity::dev(),
+                Parameters(FinanceAccrualTypesPreviewInput { store: None }),
+            )
+            .await
+            .err()
+            .expect("the accrual types preview must be closed by default");
+        assert!(types.starts_with(PREVIEW_DISABLED), "{types}");
+
+        let by_day = server
+            .finance_accrual_by_day_preview(
+                RequestIdentity::dev(),
+                Parameters(FinanceAccrualByDayPreviewInput {
+                    store: None,
+                    date: "2026-08-01".to_owned(),
+                    last_id: String::new(),
+                }),
+            )
+            .await
+            .err()
+            .expect("the by-day preview must be closed by default");
+        assert!(by_day.starts_with(PREVIEW_DISABLED), "{by_day}");
+
+        assert!(
+            requests.try_recv().is_err(),
+            "a disabled preview tool must never reach the upstream API"
+        );
+    }
+
+    /// A signed token outlives the registry entry it was issued against: an
+    /// employee removed from `access.json` still holds an unexpired, correctly
+    /// signed access token. Every identity-bound tool must refuse that verified
+    /// but unknown subject rather than silently falling back to the process
+    /// default actor, which would grant the revoked token admin reach.
+    #[tokio::test]
+    async fn a_verified_subject_missing_from_the_registry_is_refused_by_identity_bound_tools() {
+        let revoked = RequestIdentity::authenticated("ghost");
+        let (server, wb_requests) = mock_wb_server_for("admin", 0);
+
+        let outcomes = vec![
+            (
+                "ozon_stores_status",
+                server
+                    .stores_status(revoked.clone(), Parameters(EmptyInput {}))
+                    .await
+                    .err(),
+            ),
+            (
+                "wb_stores_status",
+                server
+                    .wb_stores_status(revoked.clone(), Parameters(EmptyInput {}))
+                    .await
+                    .err(),
+            ),
+            (
+                "list_members",
+                server
+                    .list_members(revoked.clone(), Parameters(EmptyInput {}))
+                    .await
+                    .err(),
+            ),
+            (
+                "marketplace_accounts",
+                server
+                    .marketplace_accounts(revoked.clone(), Parameters(EmptyInput {}))
+                    .await
+                    .err(),
+            ),
+            (
+                "wb_ping",
+                server
+                    .wb_ping(
+                        revoked.clone(),
+                        Parameters(WbAccountInput { account: None }),
+                    )
+                    .await
+                    .err(),
+            ),
+        ];
+        for (tool, outcome) in outcomes {
+            let missing = format!("{tool} must refuse a revoked identity");
+            let error = outcome.expect(&missing);
+            assert!(
+                error.starts_with("MCP_ACCESS_CONFIG_ERROR"),
+                "{tool} must fail closed on an unknown actor, got: {error}"
+            );
+            assert!(
+                error.contains("ghost"),
+                "{tool} must name the rejected actor, got: {error}"
+            );
+        }
+        assert!(
+            wb_requests.try_recv().is_err(),
+            "a revoked identity must never reach the upstream API"
+        );
+
+        // Ozon Performance resolves its store through the same access context,
+        // so the revoked subject must not reach the advertising credentials.
+        let (performance, performance_requests) = performance_mock_server("admin", Vec::new());
+        let error = performance
+            .performance_daily(
+                revoked,
+                Parameters(PerformanceStatisticsInput {
+                    store: None,
+                    campaign_ids: vec![1],
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-02".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .expect("ozon_performance_daily must refuse a revoked identity");
+        assert!(
+            error.starts_with("MCP_ACCESS_CONFIG_ERROR") && error.contains("ghost"),
+            "ozon_performance_daily must fail closed on an unknown actor, got: {error}"
+        );
+        assert!(
+            performance_requests.try_recv().is_err(),
+            "a revoked identity must never reach Ozon Performance"
+        );
+    }
+
     #[test]
     fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
         fn assert_policy(tools: Vec<rmcp::model::Tool>, expected: &Value) {

@@ -2204,4 +2204,172 @@ mod tests {
             std::env::remove_var("MCP_ACCESS_CONFIG");
         }
     }
+
+    /// Every environment-variable name the registry can name must be validated
+    /// at the registry boundary — not just the first field of each pair. A field
+    /// whose validation was dropped would let a registry edit point the process
+    /// at an arbitrary environment variable, so each one is corrupted
+    /// individually and the error must name that exact field.
+    #[test]
+    fn every_env_name_field_in_the_registry_is_validated_individually() {
+        type Corrupt = fn(&mut AccessRegistry);
+
+        let ozon_fields: Vec<(&str, Corrupt)> = vec![
+            ("client_id_env", |registry| {
+                registry.accounts[0].ozon.as_mut().unwrap().client_id_env = "BAD-NAME".into();
+            }),
+            ("api_key_env", |registry| {
+                registry.accounts[0].ozon.as_mut().unwrap().api_key_env = "BAD-NAME".into();
+            }),
+            ("performance.client_id_env", |registry| {
+                registry.accounts[0]
+                    .ozon
+                    .as_mut()
+                    .unwrap()
+                    .performance
+                    .as_mut()
+                    .unwrap()
+                    .client_id_env = "BAD-NAME".into();
+            }),
+            ("performance.client_secret_env", |registry| {
+                registry.accounts[0]
+                    .ozon
+                    .as_mut()
+                    .unwrap()
+                    .performance
+                    .as_mut()
+                    .unwrap()
+                    .client_secret_env = "BAD-NAME".into();
+            }),
+        ];
+        for (field, corrupt) in ozon_fields {
+            let mut registry = performance_registry();
+            corrupt(&mut registry);
+            let error = registry.validate().unwrap_err().to_string();
+            // `starts_with` rather than `contains`, so a broken
+            // `performance.client_id_env` cannot be mistaken for `client_id_env`.
+            assert!(
+                error.starts_with(field),
+                "{field} must be validated at the registry boundary, got: {error}"
+            );
+        }
+
+        let mut wildberries = sample_registry();
+        wildberries.accounts.push(MarketplaceAccount {
+            id: "wb_shop".into(),
+            organization: "WB Shop".into(),
+            marketplace: Marketplace::Wildberries,
+            seller_client_id: "42".into(),
+            manager_id: "manager".into(),
+            ozon: None,
+            wildberries: Some(WildberriesAccount {
+                api_token_env: "WB_TOKEN".into(),
+            }),
+        });
+        wildberries.validate().unwrap();
+        wildberries.accounts[1]
+            .wildberries
+            .as_mut()
+            .unwrap()
+            .api_token_env = "BAD-NAME".into();
+        let error = wildberries.validate().unwrap_err().to_string();
+        assert!(
+            error.starts_with("api_token_env"),
+            "api_token_env must be validated at the registry boundary, got: {error}"
+        );
+    }
+
+    /// Credential *values* read out of the environment must be rejected when
+    /// they contain whitespace, control bytes or non-ASCII, at every position
+    /// they are loaded from. These values become outbound HTTP header values,
+    /// so a newline that slipped through is a header-injection primitive.
+    #[test]
+    fn credential_values_are_validated_at_every_load_position() {
+        // A bare CR-LF payload that would split an outbound request header.
+        const INJECTION: &str = "value\r\nX-Injected: 1";
+
+        for (variable, expected) in [
+            ("SHOP_ID", "SHOP_ID"),
+            ("SHOP_KEY", "SHOP_KEY"),
+            ("SHOP_PERFORMANCE_ID", "SHOP_PERFORMANCE_ID"),
+            ("SHOP_PERFORMANCE_SECRET", "SHOP_PERFORMANCE_SECRET"),
+        ] {
+            let path = write_registry(&performance_registry());
+            let mut values = BTreeMap::from([
+                ("MCP_ACTOR_ID", "admin"),
+                ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+                ("SHOP_ID", "client"),
+                ("SHOP_KEY", "key"),
+                ("SHOP_PERFORMANCE_ID", "performance-client"),
+                ("SHOP_PERFORMANCE_SECRET", "performance-secret"),
+            ]);
+            values.insert(variable, INJECTION);
+            let error =
+                AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
+                    .unwrap_err()
+                    .to_string();
+            assert!(
+                error.contains(expected),
+                "a poisoned {variable} must be rejected and named, got: {error}"
+            );
+        }
+
+        let mut registry = sample_registry();
+        registry.accounts.push(MarketplaceAccount {
+            id: "wb_shop".into(),
+            organization: "WB Shop".into(),
+            marketplace: Marketplace::Wildberries,
+            seller_client_id: "42".into(),
+            manager_id: "manager".into(),
+            ozon: None,
+            wildberries: Some(WildberriesAccount {
+                api_token_env: "WB_TOKEN".into(),
+            }),
+        });
+        let path = write_registry(&registry);
+        let values = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("WB_TOKEN", INJECTION),
+        ]);
+        let error = AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("WB_TOKEN"),
+            "a poisoned WB_TOKEN must be rejected and named, got: {error}"
+        );
+    }
+
+    /// `AppConfig::from_env` reads the registry through `RegistrySource`, which
+    /// both parses it up front and re-reads it on demand. A registry that is
+    /// unreadable or invalid must abort startup rather than yield a config with
+    /// an empty access model.
+    #[test]
+    fn startup_refuses_a_missing_or_invalid_registry() {
+        let missing = std::env::temp_dir().join("mcp-ozon-config-does-not-exist.json");
+        let _ = std::fs::remove_file(&missing);
+        let values = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", missing.to_str().unwrap()),
+        ]);
+        let error = AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("реестр доступа"), "{error}");
+
+        // Structurally valid JSON that violates the registry contract: an
+        // account whose manager is not a known actor.
+        let mut orphaned = sample_registry();
+        orphaned.accounts[0].manager_id = "nobody".into();
+        let path = write_registry(&orphaned);
+        let values = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+        ]);
+        let error = AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nobody"), "{error}");
+    }
 }

@@ -1488,13 +1488,18 @@ mod tests {
     #[tokio::test]
     async fn timeout_retries_are_bounded_and_keep_the_error_classification() {
         let responses = (0..MAX_ATTEMPTS)
-            .map(|_| MockResponse::new(200, r#"{"ok":true}"#).delay(Duration::from_millis(100)))
+            .map(|_| MockResponse::new(200, r#"{"ok":true}"#).delay(Duration::from_millis(200)))
             .collect();
         let (base_url, requests) = mock_server(responses);
         // Keep each server delay longer than the client timeout, but shorter
         // than the following retry backoff. The single-threaded mock is then
         // ready to accept every retry before the client starts it.
-        let client = OzonClient::new(base_url, Duration::from_millis(10), credentials()).unwrap();
+        //
+        // The timeout also bounds connect, so it must stay comfortably above
+        // loopback connect latency: a timeout that expires mid-handshake aborts
+        // the connection before the listener can accept it, and the attempt
+        // would never reach the request count asserted below.
+        let client = OzonClient::new(base_url, Duration::from_millis(60), credentials()).unwrap();
 
         let error = client
             .post(
@@ -1512,10 +1517,12 @@ mod tests {
     #[tokio::test]
     async fn a_transport_timeout_can_recover_on_a_bounded_retry() {
         let (base_url, requests) = mock_server(vec![
-            MockResponse::new(200, r#"{"discarded":true}"#).delay(Duration::from_millis(80)),
+            MockResponse::new(200, r#"{"discarded":true}"#).delay(Duration::from_millis(200)),
             MockResponse::new(200, r#"{"ok":true}"#),
         ]);
-        let client = OzonClient::new(base_url, Duration::from_millis(30), credentials()).unwrap();
+        // As above: the timeout bounds connect too, so it stays well clear of
+        // loopback connect latency while remaining under the first delay.
+        let client = OzonClient::new(base_url, Duration::from_millis(60), credentials()).unwrap();
 
         let value = client
             .post(
@@ -1799,6 +1806,130 @@ mod tests {
             HeaderValue::from_str(&"x".repeat(MAX_REQUEST_ID_BYTES + 1)).unwrap(),
         );
         assert_eq!(safe_request_id(&headers), None);
+    }
+
+    /// A header value carrying bytes that are not UTF-8 is legal on the wire and
+    /// must be skipped rather than end the search. Aborting on the first opaque
+    /// candidate would silently drop the request id from every log line for an
+    /// upstream that happens to emit a non-UTF-8 trace header first.
+    #[test]
+    fn an_opaque_request_id_header_is_skipped_without_hiding_a_later_valid_one() {
+        let opaque = HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap();
+        assert!(opaque.to_str().is_err());
+
+        let mut headers = HeaderMap::new();
+        // The highest-priority candidate is unusable; a later one is fine.
+        headers.insert("x-o3-trace-id", opaque.clone());
+        headers.insert("x-request-id", HeaderValue::from_static("recoverable-id"));
+        assert_eq!(
+            safe_request_id(&headers).as_deref(),
+            Some("recoverable-id"),
+            "an opaque header must not mask a valid lower-priority candidate"
+        );
+
+        // Every candidate opaque: no request id, and no panic.
+        let mut all_opaque = HeaderMap::new();
+        for name in [
+            "x-o3-trace-id",
+            "x-request-id",
+            "x-ozon-request-id",
+            "request-id",
+        ] {
+            all_opaque.insert(name, opaque.clone());
+        }
+        assert_eq!(safe_request_id(&all_opaque), None);
+
+        // A value that is valid UTF-8 but empty after trimming is rejected too,
+        // so the header is never reported as a blank request id.
+        let mut blank = HeaderMap::new();
+        blank.insert("x-request-id", HeaderValue::from_static("   "));
+        blank.insert("request-id", HeaderValue::from_static("fallback-id"));
+        assert_eq!(safe_request_id(&blank).as_deref(), Some("fallback-id"));
+    }
+
+    /// The diagnostic body is capped at 4 KiB and marked with `…` when bytes may
+    /// have been dropped. With no `Content-Length` the reader cannot tell "the
+    /// body was exactly 4 KiB" from "the body was longer and got cut", so hitting
+    /// the cap must be reported as truncated — while a *declared* 4 KiB body,
+    /// which is known to be complete, must not be.
+    #[tokio::test]
+    async fn the_error_diagnostic_marks_truncation_exactly_at_the_cap() {
+        /// Returns the retained server diagnostic, or `None` when the status did
+        /// not classify as a server error.
+        async fn server_diagnostic(
+            status: u16,
+            body: Vec<u8>,
+            declare_length: bool,
+        ) -> Option<String> {
+            let mut response = MockResponse::new(status, body);
+            if !declare_length {
+                response = response.without_content_length();
+            }
+            let (base_url, requests) = mock_server(vec![response]);
+            let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+            let error = client
+                .post(
+                    &StoreId::from("ofk"),
+                    "/v1/rating/summary",
+                    serde_json::json!({}),
+                )
+                .await
+                .unwrap_err();
+            assert_request_count(&requests, 1);
+            match error {
+                OzonError::Server { body, .. } => Some(body),
+                _ => None,
+            }
+        }
+
+        async fn diagnostic(body: Vec<u8>, declare_length: bool) -> String {
+            server_diagnostic(500, body, declare_length)
+                .await
+                .expect("HTTP 500 must classify as a server error")
+        }
+
+        // A 404 is not a server error, so it carries no server diagnostic at all
+        // — the body is dropped rather than surfaced under the wrong variant.
+        assert!(
+            server_diagnostic(404, b"not found".to_vec(), true)
+                .await
+                .is_none()
+        );
+
+        // Exactly at the cap with an unknown length: more bytes may have been
+        // waiting, so the ellipsis must be present.
+        let at_cap = diagnostic(vec![b'x'; MAX_ERROR_BODY_BYTES], false).await;
+        assert!(
+            at_cap.ends_with('…'),
+            "an unknown-length body that fills the cap must be marked truncated"
+        );
+        assert_eq!(at_cap.chars().count(), MAX_ERROR_BODY_BYTES + 1);
+
+        // One byte below the cap: the stream ended on its own, so it is complete.
+        let below_cap = diagnostic(vec![b'x'; MAX_ERROR_BODY_BYTES - 1], false).await;
+        assert!(
+            !below_cap.ends_with('…'),
+            "a body that ended before the cap is complete and must not be marked"
+        );
+        assert_eq!(below_cap.chars().count(), MAX_ERROR_BODY_BYTES - 1);
+
+        // Exactly at the cap but *declared*: known-complete, so no ellipsis.
+        let declared_at_cap = diagnostic(vec![b'x'; MAX_ERROR_BODY_BYTES], true).await;
+        assert!(
+            !declared_at_cap.ends_with('…'),
+            "a declared body of exactly the cap is complete and must not be marked"
+        );
+        assert_eq!(declared_at_cap.chars().count(), MAX_ERROR_BODY_BYTES);
+
+        // One byte over the declared cap: truncated, and the retained prefix is
+        // still bounded by the cap.
+        let declared_over_cap = diagnostic(vec![b'x'; MAX_ERROR_BODY_BYTES + 1], true).await;
+        assert!(declared_over_cap.ends_with('…'));
+        assert_eq!(
+            declared_over_cap.chars().count(),
+            MAX_ERROR_BODY_BYTES + 1,
+            "the diagnostic must never retain more than the cap plus the marker"
+        );
     }
 
     #[test]
