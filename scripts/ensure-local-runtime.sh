@@ -38,7 +38,9 @@ fi
 if ! mkdir "$lock_dir" 2>/dev/null; then
   exit 0
 fi
-# shellcheck disable=SC2329 # Called indirectly by the EXIT trap.
+# shellcheck disable=SC2317,SC2329 # Called indirectly by the EXIT trap.
+# SC2317 is the pre-0.11 code for the same finding; both are listed so the
+# directive works on the shellcheck shipped by Ubuntu and on newer releases.
 cleanup() {
   rmdir "$lock_dir" 2>/dev/null || true
 }

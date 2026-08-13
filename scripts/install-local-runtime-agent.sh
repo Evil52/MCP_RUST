@@ -18,7 +18,7 @@ plist="$agent_dir/$label.plist"
 domain="gui/$(id -u)"
 temporary_plist="$(mktemp "${TMPDIR:-/tmp}/mcp-ozon-launch-agent.XXXXXX")"
 runtime_registry_tmp=""
-# shellcheck disable=SC2329 # Called indirectly by the EXIT trap.
+# shellcheck disable=SC2317,SC2329 # Called indirectly by the EXIT trap.
 cleanup() {
   rm -f "$temporary_plist"
   if [[ -n "$runtime_registry_tmp" ]]; then
