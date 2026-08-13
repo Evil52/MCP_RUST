@@ -15,7 +15,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, Semaphore, SemaphorePermit},
-    time::{sleep, timeout},
+    time::{Instant as TokioInstant, sleep, timeout_at},
 };
 use tracing::{info, warn};
 
@@ -94,12 +94,14 @@ enum RequestClass {
 }
 
 /// Single source of truth for every request that may leave this process.
-/// Method, exact path, fixed host and quota bucket live in the same record so
-/// extending one dimension cannot silently drift out of sync with another.
+/// Method, exact path, fixed host, safe observability label and quota bucket
+/// live in the same record so extending one dimension cannot silently drift
+/// out of sync with another.
 #[derive(Debug)]
 struct EndpointPolicy {
     method: Method,
     path: &'static str,
+    label: &'static str,
     host: ApiHost,
     request_class: RequestClass,
 }
@@ -113,102 +115,119 @@ const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
     EndpointPolicy {
         method: Method::GET,
         path: PING_PATH,
+        label: "analytics:/ping",
         host: ApiHost::Analytics,
         request_class: RequestClass::AnalyticsPing,
     },
     EndpointPolicy {
         method: Method::POST,
         path: SALES_FUNNEL_PATH,
+        label: "analytics:/api/analytics/v3/sales-funnel/products",
         host: ApiHost::Analytics,
         request_class: RequestClass::AnalyticsReport,
     },
     EndpointPolicy {
         method: Method::POST,
         path: SALES_FUNNEL_HISTORY_PATH,
+        label: "analytics:/api/analytics/v3/sales-funnel/products/history",
         host: ApiHost::Analytics,
         request_class: RequestClass::AnalyticsReport,
     },
     EndpointPolicy {
         method: Method::POST,
         path: SALES_FUNNEL_GROUPED_HISTORY_PATH,
+        label: "analytics:/api/analytics/v3/sales-funnel/grouped/history",
         host: ApiHost::Analytics,
         request_class: RequestClass::AnalyticsReport,
     },
     EndpointPolicy {
         method: Method::POST,
         path: WAREHOUSE_STOCKS_PATH,
+        label: "analytics:/api/analytics/v1/stocks-report/wb-warehouses",
         host: ApiHost::Analytics,
         request_class: RequestClass::AnalyticsReport,
     },
     EndpointPolicy {
         method: Method::GET,
         path: ORDERS_PATH,
+        label: "statistics:/api/v1/supplier/orders",
         host: ApiHost::Statistics,
         request_class: RequestClass::StatisticsReport,
     },
     EndpointPolicy {
         method: Method::GET,
         path: SALES_PATH,
+        label: "statistics:/api/v1/supplier/sales",
         host: ApiHost::Statistics,
         request_class: RequestClass::StatisticsReport,
     },
     EndpointPolicy {
         method: Method::POST,
         path: PRODUCT_CARDS_PATH,
+        label: "content:/content/v2/get/cards/list",
         host: ApiHost::Content,
         request_class: RequestClass::ContentReport,
     },
     EndpointPolicy {
         method: Method::GET,
         path: PRODUCT_PRICES_PATH,
+        label: "prices:/api/v2/list/goods/filter",
         host: ApiHost::Prices,
         request_class: RequestClass::PricesReport,
     },
     EndpointPolicy {
         method: Method::GET,
         path: TARIFF_COMMISSIONS_PATH,
+        label: "common:/api/v1/tariffs/commission",
         host: ApiHost::Common,
         request_class: RequestClass::CommissionTariff,
     },
     EndpointPolicy {
         method: Method::GET,
         path: TARIFF_BOXES_PATH,
+        label: "common:/api/v1/tariffs/box",
         host: ApiHost::Common,
         request_class: RequestClass::LogisticsTariff,
     },
     EndpointPolicy {
         method: Method::GET,
         path: TARIFF_PALLETS_PATH,
+        label: "common:/api/v1/tariffs/pallet",
         host: ApiHost::Common,
         request_class: RequestClass::LogisticsTariff,
     },
     EndpointPolicy {
         method: Method::GET,
         path: TARIFF_RETURNS_PATH,
+        label: "common:/api/v1/tariffs/return",
         host: ApiHost::Common,
         request_class: RequestClass::LogisticsTariff,
     },
     EndpointPolicy {
         method: Method::GET,
         path: ACCEPTANCE_COEFFICIENTS_PATH,
+        label: "common:/api/tariffs/v1/acceptance/coefficients",
         host: ApiHost::Common,
         request_class: RequestClass::AcceptanceTariff,
     },
     EndpointPolicy {
         method: Method::GET,
         path: PROMOTION_CAMPAIGNS_PATH,
+        label: "promotion:/adv/v1/promotion/count",
         host: ApiHost::Promotion,
         request_class: RequestClass::PromotionCampaign,
     },
     EndpointPolicy {
         method: Method::GET,
         path: PROMOTION_DETAILS_PATH,
+        label: "promotion:/api/advert/v2/adverts",
         host: ApiHost::Promotion,
         request_class: RequestClass::PromotionCampaign,
     },
     EndpointPolicy {
         method: Method::GET,
         path: PROMOTION_STATS_PATH,
+        label: "promotion:/adv/v3/fullstats",
         host: ApiHost::Promotion,
         request_class: RequestClass::PromotionStats,
     },
@@ -381,6 +400,10 @@ impl EndpointPolicy {
 }
 
 impl RequestClass {
+    const fn allows_automatic_retry(self) -> bool {
+        !matches!(self, Self::StatisticsReport | Self::CommissionTariff)
+    }
+
     #[cfg(test)]
     fn for_request(method: &Method, path: &str) -> Option<Self> {
         EndpointPolicy::for_request(method, path).map(|policy| policy.request_class)
@@ -502,6 +525,13 @@ impl PacingGate {
         Ok(())
     }
 
+    async fn ready_in(&self) -> Duration {
+        self.next_allowed
+            .lock()
+            .await
+            .saturating_duration_since(Instant::now())
+    }
+
     /// Atomically consumes one departure only after both network permits have
     /// been acquired. A competing caller may win between readiness and this
     /// claim; the loser releases its permits and returns to readiness waiting.
@@ -573,12 +603,18 @@ impl TokenLimiter {
         }
     }
 
-    async fn wait_until_ready(&self, request_class: RequestClass) -> Result<(), WbError> {
+    async fn wait_until_ready(
+        &self,
+        request_class: RequestClass,
+        retry: bool,
+    ) -> Result<(), WbError> {
         let gate = self.gate(request_class);
-        if matches!(
-            request_class,
-            RequestClass::CommissionTariff | RequestClass::PromotionStats
-        ) {
+        if !retry
+            && matches!(
+                request_class,
+                RequestClass::CommissionTariff | RequestClass::PromotionStats
+            )
+        {
             gate.ensure_ready_now()
                 .await
                 .map_err(|retry_after| WbError::LocalRateLimited { retry_after })
@@ -598,6 +634,10 @@ impl TokenLimiter {
 
     async fn extend_cooldown(&self, request_class: RequestClass, delay: Duration) {
         self.gate(request_class).extend_cooldown(delay).await;
+    }
+
+    async fn ready_in(&self, request_class: RequestClass) -> Duration {
+        self.gate(request_class).ready_in().await
     }
 }
 
@@ -673,7 +713,7 @@ struct AttemptContext<'a> {
 
 enum AttemptOutcome {
     Complete(Value),
-    Retry(Duration),
+    Retry { delay: Duration, error: WbError },
 }
 
 impl WbClient {
@@ -772,22 +812,14 @@ impl WbClient {
     }
 
     pub async fn ping(&self, account: &str) -> Result<Value, WbError> {
-        self.request(
-            account,
-            Method::GET,
-            "analytics:/ping",
-            PING_PATH,
-            None,
-            None,
-        )
-        .await
+        self.request(account, Method::GET, PING_PATH, None, None)
+            .await
     }
 
     pub async fn sales_funnel(&self, account: &str, payload: Value) -> Result<Value, WbError> {
         self.request(
             account,
             Method::POST,
-            "analytics:/api/analytics/v3/sales-funnel/products",
             SALES_FUNNEL_PATH,
             None,
             Some(payload),
@@ -803,7 +835,6 @@ impl WbClient {
         self.request(
             account,
             Method::POST,
-            "analytics:/api/analytics/v3/sales-funnel/products/history",
             SALES_FUNNEL_HISTORY_PATH,
             None,
             Some(payload),
@@ -819,7 +850,6 @@ impl WbClient {
         self.request(
             account,
             Method::POST,
-            "analytics:/api/analytics/v3/sales-funnel/grouped/history",
             SALES_FUNNEL_GROUPED_HISTORY_PATH,
             None,
             Some(payload),
@@ -831,7 +861,6 @@ impl WbClient {
         self.request(
             account,
             Method::POST,
-            "analytics:/api/analytics/v1/stocks-report/wb-warehouses",
             WAREHOUSE_STOCKS_PATH,
             None,
             Some(payload),
@@ -845,14 +874,8 @@ impl WbClient {
         date_from: String,
         flag: u8,
     ) -> Result<Value, WbError> {
-        self.statistics_report(
-            account,
-            ORDERS_PATH,
-            "statistics:/api/v1/supplier/orders",
-            date_from,
-            flag,
-        )
-        .await
+        self.statistics_report(account, ORDERS_PATH, date_from, flag)
+            .await
     }
 
     pub async fn sales(
@@ -861,14 +884,8 @@ impl WbClient {
         date_from: String,
         flag: u8,
     ) -> Result<Value, WbError> {
-        self.statistics_report(
-            account,
-            SALES_PATH,
-            "statistics:/api/v1/supplier/sales",
-            date_from,
-            flag,
-        )
-        .await
+        self.statistics_report(account, SALES_PATH, date_from, flag)
+            .await
     }
 
     pub async fn product_cards(
@@ -880,7 +897,6 @@ impl WbClient {
         self.request(
             account,
             Method::POST,
-            "content:/content/v2/get/cards/list",
             PRODUCT_CARDS_PATH,
             locale.map(|locale| vec![("locale", locale)]),
             Some(payload),
@@ -899,15 +915,8 @@ impl WbClient {
         if let Some(nm_id) = nm_id {
             query.push(("filterNmID", nm_id.to_string()));
         }
-        self.request(
-            account,
-            Method::GET,
-            "prices:/api/v2/list/goods/filter",
-            PRODUCT_PRICES_PATH,
-            Some(query),
-            None,
-        )
-        .await
+        self.request(account, Method::GET, PRODUCT_PRICES_PATH, Some(query), None)
+            .await
     }
 
     pub async fn tariff_commissions(
@@ -918,7 +927,6 @@ impl WbClient {
         self.request(
             account,
             Method::GET,
-            "common:/api/v1/tariffs/commission",
             TARIFF_COMMISSIONS_PATH,
             locale.map(|locale| vec![("locale", locale)]),
             None,
@@ -927,33 +935,15 @@ impl WbClient {
     }
 
     pub async fn tariff_boxes(&self, account: &str, date: String) -> Result<Value, WbError> {
-        self.dated_tariff(
-            account,
-            TARIFF_BOXES_PATH,
-            "common:/api/v1/tariffs/box",
-            date,
-        )
-        .await
+        self.dated_tariff(account, TARIFF_BOXES_PATH, date).await
     }
 
     pub async fn tariff_pallets(&self, account: &str, date: String) -> Result<Value, WbError> {
-        self.dated_tariff(
-            account,
-            TARIFF_PALLETS_PATH,
-            "common:/api/v1/tariffs/pallet",
-            date,
-        )
-        .await
+        self.dated_tariff(account, TARIFF_PALLETS_PATH, date).await
     }
 
     pub async fn tariff_returns(&self, account: &str, date: String) -> Result<Value, WbError> {
-        self.dated_tariff(
-            account,
-            TARIFF_RETURNS_PATH,
-            "common:/api/v1/tariffs/return",
-            date,
-        )
-        .await
+        self.dated_tariff(account, TARIFF_RETURNS_PATH, date).await
     }
 
     pub async fn acceptance_coefficients(
@@ -974,7 +964,6 @@ impl WbClient {
         self.request(
             account,
             Method::GET,
-            "common:/api/tariffs/v1/acceptance/coefficients",
             ACCEPTANCE_COEFFICIENTS_PATH,
             query,
             None,
@@ -987,15 +976,8 @@ impl WbClient {
     /// Although some WB write operations also use `GET`, this method can only
     /// reach anything except the exact read-only path enforced by the client allowlist.
     pub async fn promotion_campaigns(&self, account: &str) -> Result<Value, WbError> {
-        self.request(
-            account,
-            Method::GET,
-            "promotion:/adv/v1/promotion/count",
-            PROMOTION_CAMPAIGNS_PATH,
-            None,
-            None,
-        )
-        .await
+        self.request(account, Method::GET, PROMOTION_CAMPAIGNS_PATH, None, None)
+            .await
     }
 
     /// Returns details for promotion campaigns using only documented filters.
@@ -1022,7 +1004,6 @@ impl WbClient {
         self.request(
             account,
             Method::GET,
-            "promotion:/api/advert/v2/adverts",
             PROMOTION_DETAILS_PATH,
             Some(query),
             None,
@@ -1043,7 +1024,6 @@ impl WbClient {
         self.request(
             account,
             Method::GET,
-            "promotion:/adv/v3/fullstats",
             PROMOTION_STATS_PATH,
             Some(vec![
                 ("ids", comma_separated(ids)),
@@ -1059,32 +1039,22 @@ impl WbClient {
         &self,
         account: &str,
         path: &'static str,
-        endpoint: &'static str,
         date: String,
     ) -> Result<Value, WbError> {
-        self.request(
-            account,
-            Method::GET,
-            endpoint,
-            path,
-            Some(vec![("date", date)]),
-            None,
-        )
-        .await
+        self.request(account, Method::GET, path, Some(vec![("date", date)]), None)
+            .await
     }
 
     async fn statistics_report(
         &self,
         account: &str,
         path: &'static str,
-        endpoint: &'static str,
         date_from: String,
         flag: u8,
     ) -> Result<Value, WbError> {
         self.request(
             account,
             Method::GET,
-            endpoint,
             path,
             Some(vec![("dateFrom", date_from), ("flag", flag.to_string())]),
             None,
@@ -1102,15 +1072,13 @@ impl WbClient {
         method: Method,
         path: &'static str,
     ) -> Result<Value, WbError> {
-        self.request(account, method, "test:endpoint", path, None, None)
-            .await
+        self.request(account, method, path, None, None).await
     }
 
     async fn request(
         &self,
         account: &str,
         method: Method,
-        endpoint: &'static str,
         path: &'static str,
         query: Option<Vec<(&'static str, String)>>,
         payload: Option<Value>,
@@ -1123,6 +1091,7 @@ impl WbClient {
                 path: path.to_owned(),
             });
         };
+        let endpoint = endpoint_policy.label;
         let request_class = endpoint_policy.request_class;
         let base_url = self.base_urls.base_url(endpoint_policy.host);
         let mut url = Url::parse(&format!("{base_url}{path}"))
@@ -1145,21 +1114,19 @@ impl WbClient {
         // by future middleware or debug instrumentation.
         authorization.set_sensitive(true);
 
-        timeout(
-            self.logical_timeout,
-            self.request_with_retries(
-                account,
-                method,
-                endpoint,
-                request_class,
-                limiter,
-                url,
-                authorization,
-                payload,
-            ),
+        let deadline = TokioInstant::now() + self.logical_timeout;
+        self.request_with_retries(
+            account,
+            method,
+            endpoint,
+            request_class,
+            limiter,
+            url,
+            authorization,
+            payload,
+            deadline,
         )
         .await
-        .map_err(|_| WbError::DeadlineExceeded)?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1173,6 +1140,7 @@ impl WbClient {
         url: String,
         authorization: HeaderValue,
         payload: Option<Value>,
+        deadline: TokioInstant,
     ) -> Result<Value, WbError> {
         let context = AttemptContext {
             account,
@@ -1185,10 +1153,41 @@ impl WbClient {
             payload: payload.as_ref(),
         };
         let mut attempt = 1;
+        let mut preceding_retry_error = None;
         loop {
-            match self.request_attempt(context, attempt).await? {
+            let retry = preceding_retry_error.is_some();
+            let outcome =
+                match timeout_at(deadline, self.request_attempt(context, attempt, retry)).await {
+                    Err(_) => {
+                        return Err(preceding_retry_error.unwrap_or(WbError::DeadlineExceeded));
+                    }
+                    Ok(Err(error)) if is_local_admission_error(&error) => {
+                        return Err(preceding_retry_error.take().unwrap_or(error));
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Ok(Ok(outcome)) => outcome,
+                };
+            match outcome {
                 AttemptOutcome::Complete(value) => return Ok(value),
-                AttemptOutcome::Retry(delay) => {
+                AttemptOutcome::Retry { delay, error } => {
+                    // A timed-out quota-state read means no retry can fit. Map
+                    // it to an impossible wait so the shared fit check below
+                    // preserves the causal upstream error through one path.
+                    let ready_in =
+                        timeout_at(deadline, context.limiter.ready_in(context.request_class))
+                            .await
+                            .unwrap_or(Duration::MAX);
+                    let remaining = deadline.saturating_duration_since(TokioInstant::now());
+                    if !retry_wait_fits_deadline(remaining, delay, ready_in) {
+                        return Err(error);
+                    }
+                    preceding_retry_error = Some(error);
+                    // The strict fit check proves this sleep's deadline is
+                    // earlier than the logical deadline. Tokio polls the inner
+                    // sleep first even if scheduling wakes both timers late,
+                    // so wrapping it in `timeout_at` had an unreachable error
+                    // branch. The next attempt remains bounded by the outer
+                    // `timeout_at(deadline, request_attempt(...))` above.
                     sleep(delay).await;
                     attempt += 1;
                 }
@@ -1200,13 +1199,14 @@ impl WbClient {
         &'a self,
         limiter: &'a TokenLimiter,
         request_class: RequestClass,
+        retry: bool,
     ) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>), WbError> {
         let interval = self.policy.interval(request_class);
         loop {
             // Readiness does not consume quota. Queued callers therefore hold
             // no network capacity, and a fail-fast permit rejection cannot
             // postpone the next real WB request by 20 or 60s.
-            limiter.wait_until_ready(request_class).await?;
+            limiter.wait_until_ready(request_class, retry).await?;
             let global_permit = self
                 .global_in_flight
                 .try_acquire()
@@ -1234,11 +1234,12 @@ impl WbClient {
         &self,
         context: AttemptContext<'_>,
         attempt: usize,
+        retry: bool,
     ) -> Result<AttemptOutcome, WbError> {
         // Both permits are released when this helper returns, before the retry
         // loop performs any backoff sleep.
         let (_global_permit, _token_permit) = self
-            .acquire_request_permits(context.limiter, context.request_class)
+            .acquire_request_permits(context.limiter, context.request_class, retry)
             .await?;
         let mut request = self
             .http
@@ -1270,7 +1271,11 @@ impl WbClient {
         let status = response.status();
         let request_id = extract_request_id(response.headers());
         let retry_after = parse_retry_delay(response.headers(), Utc::now());
-        let planned_retry = retry_plan(status, attempt, retry_after, self.policy);
+        let planned_retry = context
+            .request_class
+            .allows_automatic_retry()
+            .then(|| retry_plan(status, attempt, retry_after, self.policy))
+            .flatten();
         let vendor_cooldown = match retry_after {
             ParsedRetryDelay::Valid(delay)
                 if is_retriable(status) && delay <= self.policy.max_retry_delay =>
@@ -1293,6 +1298,9 @@ impl WbClient {
         }
 
         if let Some(delay) = planned_retry {
+            let diagnostic = read_body(response, MAX_ERROR_BODY_BYTES, request_id.as_deref())
+                .await
+                .unwrap_or_default();
             trace_response(
                 context.account,
                 context.endpoint,
@@ -1303,14 +1311,22 @@ impl WbClient {
                 None,
                 true,
             );
-            drop(response);
-            return Ok(AttemptOutcome::Retry(delay));
+            return Ok(AttemptOutcome::Retry {
+                delay,
+                error: classify_http_status(
+                    status,
+                    request_id,
+                    retry_after.duration(),
+                    String::from_utf8_lossy(&diagnostic).into_owned(),
+                ),
+            });
         }
 
         let result = decode_response(response, request_id.clone(), retry_after.duration()).await;
-        let will_retry = result.as_ref().is_err_and(|error| {
-            is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts
-        });
+        let will_retry = context.request_class.allows_automatic_retry()
+            && result.as_ref().is_err_and(|error| {
+                is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts
+            });
         trace_response(
             context.account,
             context.endpoint,
@@ -1321,14 +1337,49 @@ impl WbClient {
             result.as_ref().err(),
             will_retry,
         );
-        if will_retry {
-            return Ok(AttemptOutcome::Retry(retry_delay(
-                attempt,
-                None,
-                self.policy,
-            )));
+        match result {
+            Err(error) if will_retry => Ok(AttemptOutcome::Retry {
+                delay: retry_delay(attempt, None, self.policy),
+                error,
+            }),
+            result => result.map(AttemptOutcome::Complete),
         }
-        result.map(AttemptOutcome::Complete)
+    }
+}
+
+fn retry_wait_fits_deadline(
+    remaining: Duration,
+    retry_delay: Duration,
+    quota_wait: Duration,
+) -> bool {
+    retry_delay.max(quota_wait) < remaining
+}
+
+fn is_local_admission_error(error: &WbError) -> bool {
+    matches!(
+        error,
+        WbError::LocalRateLimited { .. } | WbError::Overloaded
+    )
+}
+
+fn classify_http_status(
+    status: StatusCode,
+    request_id: Option<String>,
+    retry_after: Option<Duration>,
+    diagnostic: String,
+) -> WbError {
+    match status {
+        StatusCode::UNAUTHORIZED => WbError::Unauthorized { request_id },
+        StatusCode::FORBIDDEN => WbError::Forbidden { request_id },
+        StatusCode::TOO_MANY_REQUESTS => WbError::RateLimited {
+            request_id,
+            retry_after,
+        },
+        _ => WbError::Api {
+            status,
+            request_id,
+            diagnostic,
+        },
     }
 }
 
@@ -1340,7 +1391,9 @@ fn transport_failure_outcome(
     policy: ClientPolicy,
 ) -> Result<AttemptOutcome, WbError> {
     let error = classify_transport_error(source, None);
-    let will_retry = is_retriable_transport(error.kind()) && attempt < policy.max_attempts;
+    let will_retry = context.request_class.allows_automatic_retry()
+        && is_retriable_transport(error.kind())
+        && attempt < policy.max_attempts;
     trace_transport_failure(
         context.account,
         context.endpoint,
@@ -1350,7 +1403,10 @@ fn transport_failure_outcome(
         will_retry,
     );
     if will_retry {
-        Ok(AttemptOutcome::Retry(retry_delay(attempt, None, policy)))
+        Ok(AttemptOutcome::Retry {
+            delay: retry_delay(attempt, None, policy),
+            error,
+        })
     } else {
         Err(error)
     }
@@ -1439,19 +1495,12 @@ async fn decode_response(
         let diagnostic = read_body(response, MAX_ERROR_BODY_BYTES, request_id.as_deref())
             .await
             .unwrap_or_default();
-        return Err(match status {
-            StatusCode::UNAUTHORIZED => WbError::Unauthorized { request_id },
-            StatusCode::FORBIDDEN => WbError::Forbidden { request_id },
-            StatusCode::TOO_MANY_REQUESTS => WbError::RateLimited {
-                request_id,
-                retry_after,
-            },
-            _ => WbError::Api {
-                status,
-                request_id,
-                diagnostic: String::from_utf8_lossy(&diagnostic).into_owned(),
-            },
-        });
+        return Err(classify_http_status(
+            status,
+            request_id,
+            retry_after,
+            String::from_utf8_lossy(&diagnostic).into_owned(),
+        ));
     }
     let body = read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
     serde_json::from_slice(&body).map_err(|source| WbError::InvalidJson { request_id, source })
@@ -1472,7 +1521,12 @@ async fn read_body(
             request_id: request_id.map(str::to_owned),
         });
     }
-    let mut body = Vec::new();
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(limit);
+    let mut body = Vec::with_capacity(initial_capacity);
     while let Some(chunk) = response
         .chunk()
         .await
@@ -1636,17 +1690,16 @@ fn trace_response(
 fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
     ["x-request-id", "x-trace-id"]
         .into_iter()
-        .find_map(|name| headers.get(name))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| {
-            !value.is_empty()
+        .filter_map(|name| headers.get(name))
+        .find_map(|value| {
+            let value = value.to_str().ok()?.trim();
+            (!value.is_empty()
                 && value.len() <= MAX_REQUEST_ID_BYTES
                 && value.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
-                })
+                }))
+            .then(|| value.to_owned())
         })
-        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -1761,6 +1814,24 @@ mod tests {
         );
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.logical_timeout, Duration::from_secs(10));
+        for request_class in [
+            RequestClass::AnalyticsPing,
+            RequestClass::AnalyticsReport,
+            RequestClass::ContentReport,
+            RequestClass::PricesReport,
+            RequestClass::LogisticsTariff,
+            RequestClass::AcceptanceTariff,
+            RequestClass::PromotionCampaign,
+            RequestClass::PromotionStats,
+        ] {
+            assert!(request_class.allows_automatic_retry());
+        }
+        for request_class in [
+            RequestClass::StatisticsReport,
+            RequestClass::CommissionTariff,
+        ] {
+            assert!(!request_class.allows_automatic_retry());
+        }
         assert_eq!(
             ClientPolicy::production(Duration::from_secs(300)).logical_timeout,
             MAX_LOGICAL_REQUEST_DURATION
@@ -1820,117 +1891,163 @@ mod tests {
     }
 
     #[test]
+    fn production_promotion_stats_retry_wait_fits_the_sixty_second_deadline() {
+        let policy = ClientPolicy::production(Duration::from_secs(30));
+        assert_eq!(policy.logical_timeout, Duration::from_secs(60));
+        assert_eq!(
+            policy.interval(RequestClass::PromotionStats),
+            Duration::from_secs(20)
+        );
+        assert!(retry_wait_fits_deadline(
+            policy.logical_timeout,
+            policy.base_retry_delay,
+            policy.interval(RequestClass::PromotionStats),
+        ));
+
+        // Equality is deliberately rejected: a retry needs non-zero time for
+        // permit acquisition, transport and response decoding after the gate.
+        assert!(!retry_wait_fits_deadline(
+            Duration::from_secs(20),
+            policy.base_retry_delay,
+            Duration::from_secs(20),
+        ));
+        assert!(!retry_wait_fits_deadline(
+            Duration::from_secs(19),
+            policy.base_retry_delay,
+            Duration::from_secs(20),
+        ));
+    }
+
+    #[test]
     fn endpoint_policy_table_matches_the_immutable_security_snapshot() {
         let expected = [
             (
                 Method::GET,
                 PING_PATH,
+                "analytics:/ping",
                 ApiHost::Analytics,
                 RequestClass::AnalyticsPing,
             ),
             (
                 Method::POST,
                 SALES_FUNNEL_PATH,
+                "analytics:/api/analytics/v3/sales-funnel/products",
                 ApiHost::Analytics,
                 RequestClass::AnalyticsReport,
             ),
             (
                 Method::POST,
                 SALES_FUNNEL_HISTORY_PATH,
+                "analytics:/api/analytics/v3/sales-funnel/products/history",
                 ApiHost::Analytics,
                 RequestClass::AnalyticsReport,
             ),
             (
                 Method::POST,
                 SALES_FUNNEL_GROUPED_HISTORY_PATH,
+                "analytics:/api/analytics/v3/sales-funnel/grouped/history",
                 ApiHost::Analytics,
                 RequestClass::AnalyticsReport,
             ),
             (
                 Method::POST,
                 WAREHOUSE_STOCKS_PATH,
+                "analytics:/api/analytics/v1/stocks-report/wb-warehouses",
                 ApiHost::Analytics,
                 RequestClass::AnalyticsReport,
             ),
             (
                 Method::GET,
                 ORDERS_PATH,
+                "statistics:/api/v1/supplier/orders",
                 ApiHost::Statistics,
                 RequestClass::StatisticsReport,
             ),
             (
                 Method::GET,
                 SALES_PATH,
+                "statistics:/api/v1/supplier/sales",
                 ApiHost::Statistics,
                 RequestClass::StatisticsReport,
             ),
             (
                 Method::POST,
                 PRODUCT_CARDS_PATH,
+                "content:/content/v2/get/cards/list",
                 ApiHost::Content,
                 RequestClass::ContentReport,
             ),
             (
                 Method::GET,
                 PRODUCT_PRICES_PATH,
+                "prices:/api/v2/list/goods/filter",
                 ApiHost::Prices,
                 RequestClass::PricesReport,
             ),
             (
                 Method::GET,
                 TARIFF_COMMISSIONS_PATH,
+                "common:/api/v1/tariffs/commission",
                 ApiHost::Common,
                 RequestClass::CommissionTariff,
             ),
             (
                 Method::GET,
                 TARIFF_BOXES_PATH,
+                "common:/api/v1/tariffs/box",
                 ApiHost::Common,
                 RequestClass::LogisticsTariff,
             ),
             (
                 Method::GET,
                 TARIFF_PALLETS_PATH,
+                "common:/api/v1/tariffs/pallet",
                 ApiHost::Common,
                 RequestClass::LogisticsTariff,
             ),
             (
                 Method::GET,
                 TARIFF_RETURNS_PATH,
+                "common:/api/v1/tariffs/return",
                 ApiHost::Common,
                 RequestClass::LogisticsTariff,
             ),
             (
                 Method::GET,
                 ACCEPTANCE_COEFFICIENTS_PATH,
+                "common:/api/tariffs/v1/acceptance/coefficients",
                 ApiHost::Common,
                 RequestClass::AcceptanceTariff,
             ),
             (
                 Method::GET,
                 PROMOTION_CAMPAIGNS_PATH,
+                "promotion:/adv/v1/promotion/count",
                 ApiHost::Promotion,
                 RequestClass::PromotionCampaign,
             ),
             (
                 Method::GET,
                 PROMOTION_DETAILS_PATH,
+                "promotion:/api/advert/v2/adverts",
                 ApiHost::Promotion,
                 RequestClass::PromotionCampaign,
             ),
             (
                 Method::GET,
                 PROMOTION_STATS_PATH,
+                "promotion:/adv/v3/fullstats",
                 ApiHost::Promotion,
                 RequestClass::PromotionStats,
             ),
         ];
         assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), expected.len());
-        for (policy, (method, path, host, request_class)) in
+        for (policy, (method, path, label, host, request_class)) in
             READ_ONLY_ENDPOINT_ALLOWLIST.iter().zip(expected)
         {
             assert_eq!(policy.method, method, "method drift for {path}");
             assert_eq!(policy.path, path, "path drift for {path}");
+            assert_eq!(policy.label, label, "observability label drift for {path}");
             assert_eq!(policy.host, host, "host drift for {path}");
             assert_eq!(
                 policy.request_class, request_class,
@@ -3098,6 +3215,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn statistics_and_commission_classes_remain_non_retryable() {
+        for path in [ORDERS_PATH, TARIFF_COMMISSIONS_PATH] {
+            let (base_url, requests, task) = raw_http(vec![raw_response(
+                503,
+                "x-request-id: slow-original\r\n",
+                br#"{"error":"temporary"}"#,
+            )]);
+            let mut policy = retrying_policy(Duration::from_millis(50));
+            policy.statistics_interval = Duration::from_secs(1);
+            policy.commission_interval = Duration::from_secs(1);
+            policy.promotion_stats_interval = Duration::from_secs(1);
+            let client = WbClient::new_for_test_with_policy(
+                Duration::from_secs(1),
+                credentials(),
+                &base_url,
+                policy,
+            );
+
+            let error = client
+                .request("account", Method::GET, path, None, None)
+                .await
+                .expect_err("these minute-scale classes must make one attempt");
+            assert!(matches!(
+                error,
+                WbError::Api {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    ref request_id,
+                    ..
+                } if request_id.as_deref() == Some("slow-original")
+            ));
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("exactly one request must reach WB");
+            assert!(requests.try_recv().is_err());
+            task.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn promotion_stats_returns_the_upstream_error_when_quota_wait_cannot_fit() {
+        let (base_url, requests, task) = raw_http(vec![raw_response(
+            503,
+            "x-request-id: promotion-original\r\n",
+            br#"{"error":"temporary"}"#,
+        )]);
+        let mut policy = retrying_policy(Duration::from_millis(50));
+        policy.promotion_stats_interval = Duration::from_secs(1);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_secs(1),
+            credentials(),
+            &base_url,
+            policy,
+        );
+
+        let error = client
+            .promotion_stats(
+                "account",
+                vec![1],
+                "2026-08-01".to_owned(),
+                "2026-08-02".to_owned(),
+            )
+            .await
+            .expect_err("the upstream 503 must remain causal when a retry cannot fit");
+        assert!(matches!(
+            error,
+            WbError::Api {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                ref request_id,
+                ref diagnostic,
+            } if request_id.as_deref() == Some("promotion-original")
+                && diagnostic == r#"{"error":"temporary"}"#
+        ));
+        requests
+            .recv_timeout(Duration::from_secs(1))
+            .expect("exactly one request must reach WB");
+        assert!(requests.try_recv().is_err());
+        task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_retryable_error_body_is_bounded_without_losing_status_causality() {
+        let declared = MAX_ERROR_BODY_BYTES as u64 + 1;
+        let response = format!(
+            "HTTP/1.1 503 Error\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\nx-request-id: oversized-retry\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let (base_url, requests, task) = raw_http(vec![response]);
+        let mut policy = retrying_policy(Duration::from_millis(50));
+        policy.promotion_stats_interval = Duration::from_secs(1);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_secs(1),
+            credentials(),
+            &base_url,
+            policy,
+        );
+
+        let error = client
+            .promotion_stats(
+                "account",
+                vec![1],
+                "2026-08-01".to_owned(),
+                "2026-08-02".to_owned(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WbError::Api {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                ref request_id,
+                ref diagnostic,
+            } if request_id.as_deref() == Some("oversized-retry") && diagnostic.is_empty()
+        ));
+        requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(requests.try_recv().is_err());
+        task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn promotion_stats_internal_retry_waits_for_its_gate_and_recovers() {
+        let (base_url, requests, task) = raw_http(vec![
+            raw_response(
+                503,
+                "x-request-id: promotion-retry\r\n",
+                br#"{"error":"temporary"}"#,
+            ),
+            raw_response(200, "", br#"{"status":"ok"}"#),
+        ]);
+        let mut policy = retrying_policy(Duration::from_secs(1));
+        policy.promotion_stats_interval = Duration::from_millis(25);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_secs(1),
+            credentials(),
+            &base_url,
+            policy,
+        );
+
+        let response = client
+            .promotion_stats(
+                "account",
+                vec![1],
+                "2026-08-01".to_owned(),
+                "2026-08-02".to_owned(),
+            )
+            .await
+            .expect("the internal retry must wait instead of failing fast");
+        assert_eq!(response["status"], "ok");
+        for _ in 0..2 {
+            requests
+                .recv_timeout(Duration::from_secs(1))
+                .expect("both promotion attempts must reach WB");
+        }
+        assert!(requests.try_recv().is_err());
+        task.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_admission_failure_preserves_the_preceding_upstream_error() {
+        for status in [429, 503] {
+            let (base_url, requests, task) = raw_http(vec![raw_response(
+                status,
+                "x-request-id: causal-upstream\r\n",
+                br#"{"error":"temporary"}"#,
+            )]);
+            let mut policy = retrying_policy(Duration::from_secs(1));
+            policy.base_retry_delay = Duration::from_millis(100);
+            let client = WbClient::new_for_test_with_policy(
+                Duration::from_secs(1),
+                credentials(),
+                &base_url,
+                policy,
+            );
+            let limiter = Arc::clone(client.limiters.get("account").unwrap());
+            let held_permits = limiter
+                .in_flight
+                .acquire_many((MAX_IN_FLIGHT_REQUESTS_PER_TOKEN - 1) as u32)
+                .await
+                .unwrap();
+
+            let request_client = client.clone();
+            let pending = tokio::spawn(async move {
+                request_client
+                    .promotion_stats(
+                        "account",
+                        vec![1],
+                        "2026-08-01".to_owned(),
+                        "2026-08-02".to_owned(),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if requests.try_recv().is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first request must reach WB");
+            let final_permit = limiter.in_flight.acquire().await.unwrap();
+
+            let error = pending
+                .await
+                .unwrap()
+                .expect_err("retry admission must fail while all token permits are held");
+            if status == 429 {
+                assert!(matches!(
+                    error,
+                    WbError::RateLimited {
+                        ref request_id,
+                        ..
+                    } if request_id.as_deref() == Some("causal-upstream")
+                ));
+            } else {
+                assert_eq!(status, 503);
+                assert!(matches!(
+                    error,
+                    WbError::Api {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        ref request_id,
+                        ref diagnostic,
+                    } if request_id.as_deref() == Some("causal-upstream")
+                        && diagnostic == r#"{"error":"temporary"}"#
+                ));
+            }
+            assert!(requests.try_recv().is_err());
+            drop(final_permit);
+            drop(held_permits);
+            task.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn oversized_server_retry_delay_is_never_slept_or_retried() {
         let (base_url, requests, task) = raw_http(vec![raw_response(
             429,
@@ -3479,14 +3830,15 @@ mod tests {
         headers.insert("x-request-id", HeaderValue::from_static("request-id"));
         assert_eq!(extract_request_id(&headers).as_deref(), Some("request-id"));
         headers.insert("x-request-id", HeaderValue::from_static(""));
-        assert_eq!(extract_request_id(&headers), None);
+        assert_eq!(extract_request_id(&headers).as_deref(), Some("trace-id"));
         headers.insert(
             "x-request-id",
             HeaderValue::from_str(&"x".repeat(MAX_REQUEST_ID_BYTES + 1)).unwrap(),
         );
-        assert_eq!(extract_request_id(&headers), None);
+        assert_eq!(extract_request_id(&headers).as_deref(), Some("trace-id"));
         headers.insert("x-request-id", HeaderValue::from_bytes(&[0xff]).unwrap());
-        assert_eq!(extract_request_id(&headers), None);
+        assert_eq!(extract_request_id(&headers).as_deref(), Some("trace-id"));
+        headers.remove("x-trace-id");
 
         // The id is echoed into tool error text, so anything an upstream could
         // use to smuggle instructions past it is dropped rather than trimmed.

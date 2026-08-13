@@ -29,7 +29,7 @@ use mcp_ozon::{
 };
 use reqwest::{
     Client, StatusCode,
-    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST, HeaderMap, WWW_AUTHENTICATE},
 };
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde::Serialize;
@@ -292,10 +292,9 @@ fn parse_json_or_sse(headers: &HeaderMap, raw_body: &str) -> Option<Value> {
     if content_type.starts_with("application/json") {
         return Some(serde_json::from_str(raw_body).expect("JSON response must be valid"));
     }
-    assert!(
-        content_type.starts_with("text/event-stream"),
-        "unexpected MCP content type {content_type:?}: {raw_body}"
-    );
+    if !content_type.starts_with("text/event-stream") {
+        return None;
+    }
 
     let mut event_data = String::new();
     for line in raw_body.lines().chain(std::iter::once("")) {
@@ -323,6 +322,10 @@ async fn post_rpc(
 ) -> WireResponse {
     let mut request = client
         .post(endpoint)
+        // The socket uses an ephemeral loopback address, while this server's
+        // configured public protected resource is localhost:8788. Model the
+        // reverse proxy contract by preserving that public Host at the app.
+        .header(HOST, "localhost:8788")
         .header(ACCEPT, "application/json, text/event-stream")
         .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
         .json(&message);
@@ -333,6 +336,10 @@ async fn post_rpc(
         request = request.header(AUTHORIZATION, format!("Bearer {bearer}"));
     }
     let response = request.send().await.expect("MCP POST must complete");
+    finite_wire_response(response).await
+}
+
+async fn finite_wire_response(response: reqwest::Response) -> WireResponse {
     let status = response.status();
     let headers = response.headers().clone();
     let raw_body = response.text().await.expect("MCP body must be readable");
@@ -354,22 +361,37 @@ fn rpc_body(response: &WireResponse) -> &Value {
     })
 }
 
-fn assert_oauth_challenge(response: &WireResponse, oauth_error: &str) {
-    assert_eq!(response.status, StatusCode::OK, "{}", response.raw_body);
-    let body = rpc_body(response);
-    assert_eq!(
-        body.pointer("/result/isError").and_then(Value::as_bool),
-        Some(true),
-        "{body}"
-    );
-    let challenges = body
-        .pointer("/result/_meta/mcp~1www_authenticate")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("missing MCP OAuth challenge array: {body}"));
-    assert_eq!(challenges.len(), 1, "{body}");
-    let challenge = challenges[0]
-        .as_str()
-        .unwrap_or_else(|| panic!("OAuth challenge must be a string: {body}"));
+fn assert_transport_auth_failure(
+    response: &WireResponse,
+    status: StatusCode,
+    oauth_error: Option<&str>,
+    public_message: &str,
+) {
+    assert_eq!(response.status, status, "{}", response.raw_body);
+    assert_eq!(response.raw_body, public_message);
+    assert!(response.body.is_none());
+    assert!(response.headers.get(SESSION_HEADER).is_none());
+    let challenge = response
+        .headers
+        .get(WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok());
+    let Some(oauth_error) = oauth_error else {
+        if status == StatusCode::UNAUTHORIZED {
+            let challenge = challenge.expect("401 must carry a Bearer challenge");
+            assert!(challenge.starts_with("Bearer "), "{challenge}");
+            assert!(
+                challenge.contains(&format!("resource_metadata=\"{RESOURCE_METADATA_URL}\"")),
+                "{challenge}"
+            );
+            assert!(challenge.contains("scope=\"mcp:tools\""), "{challenge}");
+            assert!(!challenge.contains("error="), "{challenge}");
+            assert!(!challenge.contains("error_description="), "{challenge}");
+        } else {
+            assert!(challenge.is_none(), "unexpected challenge: {challenge:?}");
+        }
+        return;
+    };
+    let challenge = challenge.expect("OAuth failure must carry WWW-Authenticate");
     assert!(challenge.starts_with("Bearer "), "{challenge}");
     assert!(
         challenge.contains(&format!("resource_metadata=\"{RESOURCE_METADATA_URL}\"")),
@@ -391,11 +413,36 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
     let endpoint = format!("{}/mcp", mcp.base_url);
     let client = Client::new();
 
-    let initialize = post_rpc(
+    let missing_initialize = post_rpc(
         &client,
         &endpoint,
         None,
         None,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "oauth-wire-test", "version": "1.0.0"}
+            }
+        }),
+    )
+    .await;
+    assert_transport_auth_failure(
+        &missing_initialize,
+        StatusCode::UNAUTHORIZED,
+        None,
+        "Требуется авторизация: access token не передан.",
+    );
+
+    let valid_token = token(AUDIENCE, "openid profile mcp:tools");
+    let initialize = post_rpc(
+        &client,
+        &endpoint,
+        None,
+        Some(&valid_token),
         json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -422,11 +469,30 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         .expect("initialize response must establish an MCP session")
         .to_owned();
 
-    let initialized = post_rpc(
+    let missing_notification = post_rpc(
         &client,
         &endpoint,
         Some(&session_id),
         None,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }),
+    )
+    .await;
+    assert_transport_auth_failure(
+        &missing_notification,
+        StatusCode::UNAUTHORIZED,
+        None,
+        "Требуется авторизация: access token не передан.",
+    );
+
+    let initialized = post_rpc(
+        &client,
+        &endpoint,
+        Some(&session_id),
+        Some(&valid_token),
         json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
@@ -446,7 +512,7 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         &client,
         &endpoint,
         Some(&session_id),
-        None,
+        Some(&valid_token),
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
     )
     .await;
@@ -528,18 +594,11 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         json!({"jsonrpc": "2.0", "id": 20, "method": "tools/list", "params": {}}),
     )
     .await;
-    assert_eq!(
-        listed_with_stale_token.status,
-        StatusCode::OK,
-        "a stale bearer token must not break schema refresh: {}",
-        listed_with_stale_token.raw_body
-    );
-    assert_eq!(
-        rpc_body(&listed_with_stale_token)
-            .pointer("/result/tools")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(38)
+    assert_transport_auth_failure(
+        &listed_with_stale_token,
+        StatusCode::UNAUTHORIZED,
+        Some("invalid_token"),
+        "Требуется повторная авторизация: access token недействителен.",
     );
 
     let missing_before_validation = post_rpc(
@@ -555,16 +614,13 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         }),
     )
     .await;
-    assert_oauth_challenge(&missing_before_validation, "invalid_token");
-    assert_eq!(
-        rpc_body(&missing_before_validation)
-            .pointer("/result/content/0/text")
-            .and_then(Value::as_str),
-        Some("Требуется авторизация: access token не передан."),
-        "authentication must run before required argument validation"
+    assert_transport_auth_failure(
+        &missing_before_validation,
+        StatusCode::UNAUTHORIZED,
+        None,
+        "Требуется авторизация: access token не передан.",
     );
 
-    let valid_token = token(AUDIENCE, "openid profile mcp:tools");
     let valid = post_rpc(
         &client,
         &endpoint,
@@ -609,13 +665,11 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         }),
     )
     .await;
-    assert_oauth_challenge(&missing_after_valid, "invalid_token");
-    assert_eq!(
-        rpc_body(&missing_after_valid)
-            .pointer("/result/content/0/text")
-            .and_then(Value::as_str),
-        Some("Требуется авторизация: access token не передан."),
-        "a successful call must not cache its actor in the MCP session"
+    assert_transport_auth_failure(
+        &missing_after_valid,
+        StatusCode::UNAUTHORIZED,
+        None,
+        "Требуется авторизация: access token не передан.",
     );
 
     let insufficient_scope_token = token(AUDIENCE, "openid profile");
@@ -632,7 +686,12 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         }),
     )
     .await;
-    assert_oauth_challenge(&insufficient_scope, "insufficient_scope");
+    assert_transport_auth_failure(
+        &insufficient_scope,
+        StatusCode::FORBIDDEN,
+        Some("insufficient_scope"),
+        "Требуется повторная авторизация с необходимыми разрешениями.",
+    );
 
     let wrong_audience_token = token("another-resource", "mcp:tools");
     let wrong_audience = post_rpc(
@@ -648,12 +707,11 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         }),
     )
     .await;
-    assert_oauth_challenge(&wrong_audience, "invalid_token");
-    assert_eq!(
-        rpc_body(&wrong_audience)
-            .pointer("/result/content/0/text")
-            .and_then(Value::as_str),
-        Some("Требуется повторная авторизация: access token выпущен для другого ресурса.")
+    assert_transport_auth_failure(
+        &wrong_audience,
+        StatusCode::UNAUTHORIZED,
+        Some("invalid_token"),
+        "Требуется повторная авторизация: access token выпущен для другого ресурса.",
     );
 
     let unknown_actor_token = token_for_username(AUDIENCE, "mcp:tools", "not-provisioned");
@@ -670,29 +728,78 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         }),
     )
     .await;
-    assert_eq!(
-        unknown_actor.status,
-        StatusCode::OK,
-        "{}",
-        unknown_actor.raw_body
-    );
-    assert_eq!(
-        rpc_body(&unknown_actor)
-            .pointer("/result/isError")
-            .and_then(Value::as_bool),
-        Some(true),
-        "{}",
-        unknown_actor.raw_body
-    );
-    assert_eq!(
-        rpc_body(&unknown_actor).pointer("/result/_meta/mcp~1www_authenticate"),
+    assert_transport_auth_failure(
+        &unknown_actor,
+        StatusCode::FORBIDDEN,
         None,
-        "an unprovisioned identity must not trigger an OAuth reauthorization loop"
+        "Доступ для подтверждённой учётной записи не разрешён.",
     );
+
+    let missing_get = finite_wire_response(
+        client
+            .get(&endpoint)
+            .header(HOST, "localhost:8788")
+            .header(ACCEPT, "text/event-stream")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+            .header(SESSION_HEADER, &session_id)
+            .send()
+            .await
+            .expect("unauthenticated session GET must complete"),
+    )
+    .await;
+    assert_transport_auth_failure(
+        &missing_get,
+        StatusCode::UNAUTHORIZED,
+        None,
+        "Требуется авторизация: access token не передан.",
+    );
+
+    let valid_get = client
+        .get(&endpoint)
+        .header(HOST, "localhost:8788")
+        .header(ACCEPT, "text/event-stream")
+        .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+        .header(SESSION_HEADER, &session_id)
+        .bearer_auth(&valid_token)
+        .send()
+        .await
+        .expect("authenticated session GET must connect");
+    assert_eq!(valid_get.status(), StatusCode::OK);
     assert_eq!(
-        rpc_body(&unknown_actor)
-            .pointer("/result/content/0/text")
-            .and_then(Value::as_str),
-        Some("Доступ для подтверждённой учётной записи не разрешён.")
+        valid_get
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
     );
+    drop(valid_get);
+
+    let missing_delete = finite_wire_response(
+        client
+            .delete(&endpoint)
+            .header(HOST, "localhost:8788")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+            .header(SESSION_HEADER, &session_id)
+            .send()
+            .await
+            .expect("unauthenticated session DELETE must complete"),
+    )
+    .await;
+    assert_transport_auth_failure(
+        &missing_delete,
+        StatusCode::UNAUTHORIZED,
+        None,
+        "Требуется авторизация: access token не передан.",
+    );
+
+    let deleted = client
+        .delete(&endpoint)
+        .header(HOST, "localhost:8788")
+        .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+        .header(SESSION_HEADER, &session_id)
+        .bearer_auth(&valid_token)
+        .send()
+        .await
+        .expect("authenticated session DELETE must complete");
+    assert_eq!(deleted.status(), StatusCode::ACCEPTED);
 }

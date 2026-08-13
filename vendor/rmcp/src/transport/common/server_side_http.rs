@@ -253,12 +253,11 @@ where
 
     match serde_json::from_slice::<ClientJsonRpcMessage>(&collected) {
         Ok(message) => Ok(message),
-        Err(e) => {
+        Err(_) => {
+            tracing::debug!("rejected malformed JSON-RPC request body");
             let response = Response::builder()
-                .status(http::StatusCode::UNSUPPORTED_MEDIA_TYPE)
-                .body(
-                    Full::new(Bytes::from(format!("fail to deserialize request body {e}"))).boxed(),
-                )
+                .status(http::StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from_static(b"Bad Request: invalid JSON-RPC body")).boxed())
                 .expect("valid response");
             Err(response)
         }
@@ -369,10 +368,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expect_json_returns_415_for_invalid_json_under_limit() {
-        let body = Full::new(Bytes::from("not valid json"));
-        let result = expect_json(body, 4 * 1024 * 1024).await;
-        let response = result.unwrap_err();
-        assert_eq!(response.status(), http::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    async fn expect_json_returns_sanitized_400_for_invalid_json_rpc_under_limit() {
+        for invalid in ["not valid json", r#"{"jsonrpc":"2.0","id":1}"#] {
+            let body = Full::new(Bytes::copy_from_slice(invalid.as_bytes()));
+            let response = expect_json(body, 4 * 1024 * 1024).await.unwrap_err();
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("infallible response body")
+                .to_bytes();
+            assert_eq!(body.as_ref(), b"Bad Request: invalid JSON-RPC body");
+        }
     }
 }

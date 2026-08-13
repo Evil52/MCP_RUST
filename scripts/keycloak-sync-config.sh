@@ -8,6 +8,7 @@ compose_file="$project_dir/compose.auth.yaml"
 realm="ofk"
 client_id="ozonofk-mcp"
 scope_name="mcp:tools"
+identity_scope_name="basic"
 audience="${MCP_OAUTH_RESOURCE_URL:-http://localhost:8788/mcp}"
 redirect_uri="${MCP_OAUTH_REDIRECT_URI:-http://localhost:18789/callback}"
 web_origin="${MCP_OAUTH_WEB_ORIGIN:-http://localhost:18789}"
@@ -119,6 +120,80 @@ else
     | kcadm update "client-scopes/$scope_id" --file - --merge >/dev/null
 fi
 
+identity_scope_payload="$({
+  jq -cn \
+    --arg name "$identity_scope_name" \
+    '{
+      name: $name,
+      description: "OpenID Connect scope for the stable MCP actor identity",
+      protocol: "openid-connect",
+      attributes: {
+        "display.on.consent.screen": "false",
+        "include.in.token.scope": "false"
+      }
+    }'
+})"
+
+identity_scope_id="$(
+  kcadm get client-scopes --fields id,name \
+    | jq -er --arg name "$identity_scope_name" \
+      '[.[] | select(.name == $name)] | if length == 0 then "" elif length == 1 then .[0].id else error("identity scope lookup is ambiguous") end'
+)"
+
+if [[ -z "$identity_scope_id" ]]; then
+  printf '%s' "$identity_scope_payload" \
+    | kcadm create client-scopes --file - >/dev/null
+  identity_scope_id="$(
+    kcadm get client-scopes --fields id,name \
+      | jq -er --arg name "$identity_scope_name" \
+        '[.[] | select(.name == $name)] | if length == 1 then .[0].id else error("identity scope lookup failed") end'
+  )"
+else
+  printf '%s' "$identity_scope_payload" \
+    | kcadm update "client-scopes/$identity_scope_id" --file - --merge >/dev/null
+fi
+
+identity_mapper_payload="$({
+  jq -cn '
+    {
+      name: "preferred_username",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-usermodel-property-mapper",
+      consentRequired: false,
+      config: {
+        "introspection.token.claim": "true",
+        "userinfo.token.claim": "true",
+        "user.attribute": "username",
+        "id.token.claim": "true",
+        "access.token.claim": "true",
+        "claim.name": "preferred_username",
+        "jsonType.label": "String"
+      }
+    }'
+})"
+
+identity_mapper_id="$(
+  kcadm get "client-scopes/$identity_scope_id/protocol-mappers/models" \
+    | jq -er \
+      '[.[] | select(.name == "preferred_username")] | if length == 0 then "" elif length == 1 then .[0].id else error("preferred_username mapper lookup is ambiguous") end'
+)"
+
+if [[ -z "$identity_mapper_id" ]]; then
+  printf '%s' "$identity_mapper_payload" \
+    | kcadm create "client-scopes/$identity_scope_id/protocol-mappers/models" --file - >/dev/null
+  identity_mapper_id="$(
+    kcadm get "client-scopes/$identity_scope_id/protocol-mappers/models" \
+      | jq -er \
+        '[.[] | select(.name == "preferred_username")] | if length == 1 then .[0].id else error("preferred_username mapper lookup failed") end'
+  )"
+else
+  printf '%s' "$identity_mapper_payload" \
+    | jq -c --arg id "$identity_mapper_id" '. + {id: $id}' \
+    | kcadm update \
+      "client-scopes/$identity_scope_id/protocol-mappers/models/$identity_mapper_id" \
+      --file - >/dev/null
+fi
+
 mapper_payload="$({
   jq -cn \
     --arg audience "$audience" \
@@ -183,6 +258,13 @@ if ! jq -e --arg id "$scope_id" 'any(.[]; .id == $id)' \
     --no-merge >/dev/null
 fi
 
+default_scope_ids="$(kcadm get "clients/$client_uuid/default-client-scopes" --fields id,name)"
+if ! jq -e --arg id "$identity_scope_id" 'any(.[]; .id == $id)' \
+  <<<"$default_scope_ids" >/dev/null; then
+  kcadm update "clients/$client_uuid/default-client-scopes/$identity_scope_id" \
+    --no-merge >/dev/null
+fi
+
 old_mapper_ids="$(
   kcadm get "clients/$client_uuid/protocol-mappers/models" \
     | jq -r \
@@ -207,8 +289,12 @@ scope_check="$(
 mapper_check="$(
   kcadm get "client-scopes/$scope_id/protocol-mappers/models/$mapper_id"
 )"
+identity_mapper_check="$(
+  kcadm get "client-scopes/$identity_scope_id/protocol-mappers/models/$identity_mapper_id"
+)"
 client_check="$(kcadm get "clients/$client_uuid")"
 optional_scope_check="$(kcadm get "clients/$client_uuid/optional-client-scopes" --fields id,name)"
+default_scope_check="$(kcadm get "clients/$client_uuid/default-client-scopes" --fields id,name)"
 client_mappers_check="$(kcadm get "clients/$client_uuid/protocol-mappers/models")"
 
 jq -e --arg audience "$audience" \
@@ -217,6 +303,18 @@ jq -e --arg audience "$audience" \
    and .config["included.custom.audience"] == $audience
    and .config["access.token.claim"] == "true"' \
   <<<"$mapper_check" >/dev/null
+jq -e \
+  '.name == "preferred_username"
+   and .protocol == "openid-connect"
+   and .protocolMapper == "oidc-usermodel-property-mapper"
+   and .config["user.attribute"] == "username"
+   and .config["claim.name"] == "preferred_username"
+   and .config["jsonType.label"] == "String"
+   and .config["access.token.claim"] == "true"
+   and .config["id.token.claim"] == "true"
+   and .config["userinfo.token.claim"] == "true"
+   and .config["introspection.token.claim"] == "true"' \
+  <<<"$identity_mapper_check" >/dev/null
 jq -e \
   --arg redirect_uri "$redirect_uri" \
   --arg web_origin "$web_origin" \
@@ -232,6 +330,8 @@ jq -e \
   <<<"$client_check" >/dev/null
 jq -e --arg id "$scope_id" 'any(.[]; .id == $id)' \
   <<<"$optional_scope_check" >/dev/null
+jq -e --arg id "$identity_scope_id" 'any(.[]; .id == $id)' \
+  <<<"$default_scope_check" >/dev/null
 jq -e \
   'all(.[];
      .protocolMapper != "oidc-audience-mapper"
@@ -239,4 +339,4 @@ jq -e \
    )' <<<"$client_mappers_check" >/dev/null
 [[ "$scope_check" == "true" ]]
 
-echo "Keycloak configuration synchronized: client=$client_id, scope=$scope_name, audience=$audience, redirect=$redirect_uri, PKCE=S256"
+echo "Keycloak configuration synchronized: client=$client_id, scope=$scope_name, identity_claim=preferred_username, audience=$audience, redirect=$redirect_uri, PKCE=S256"

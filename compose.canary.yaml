@@ -11,11 +11,14 @@ services:
     environment:
       MCP_TRANSPORT: http
       MCP_BIND: 0.0.0.0:8787
+      MCP_DEV_ALLOW_NON_LOOPBACK: "true"
       MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
       OZON_POSTINGS_VNEXT: "true"
       OZON_FINANCE_ACCRUALS_PREVIEW: "true"
     ports:
       - "127.0.0.1:8789:8787"
+    networks:
+      - outbound
     volumes:
       - type: bind
         source: ${MCP_CANARY_ACCESS_CONFIG:-./config/access.canary.json}
@@ -24,6 +27,15 @@ services:
         bind:
           create_host_path: false
     restart: "no"
+    mem_limit: 768m
+    cpus: 2.0
+    pids_limit: 256
+    stop_grace_period: 70s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -37,3 +49,11 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+
+networks:
+  outbound:
+    name: mcp-ozon-canary-outbound
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"

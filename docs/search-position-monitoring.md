@@ -71,7 +71,7 @@ Each measurement stores only:
 - outcome (`found`, `not_found`, `blocked`, or `error`);
 - organic and sponsored positions;
 - result page, price, original price, delivery time, and availability when visible;
-- bounded latency and a payload-free error class.
+- bounded latency, upstream HTTP status, and a payload-free error class.
 
 Raw pages and generated Excel workbooks are never stored. A 90-day retention
 window is the initial recommendation. Backups are encrypted database dumps, not

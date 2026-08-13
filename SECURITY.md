@@ -55,13 +55,21 @@ The following properties are treated as release gates:
 
 - Ozon: per-Client-Id pacing, per-client concurrency 16, global concurrency 32, at most three
   attempts for explicitly transient failures, and a logical deadline covering rate waits/retries.
+  Pacing and retry backoff hold no network permit, and retry permit races preserve the preceding
+  causal upstream error rather than replacing it with a local overload.
 - Ozon Performance: fixed official host, one-second per-Client-Id pacing, per-client concurrency 2,
   global concurrency 8, bounded cached OAuth tokens, and at most one replay after an HTTP 401 token
-  refresh. There is no generic retry that can create or duplicate an advertising operation.
+  refresh. OAuth refresh and pacing hold no business-request permits. There is no generic retry
+  that can create or duplicate an advertising operation.
 - Wildberries: quota is shared by token rather than account alias, funnel pacing is 20 seconds,
   ping pacing is 10 seconds, per-token concurrency is 4, global concurrency is 8, and the complete
   operation has a 60-second deadline. Promotion campaign reads share a 200 ms quota bucket and
   full statistics has a separate 20-second bucket. Vendor retry headers are parsed conservatively.
+  Startup accepts only a syntactically valid WB Personal JWT with numeric `acc=3`; Base, Test,
+  Service, missing, malformed, and unknown token types fail closed before egress without exposing
+  the token or decoded payload. This local decode selects the capability/quota policy and does not
+  claim to verify the JWT signature; WB verifies authenticity on each request. Service/Base flows
+  remain unsupported because they require an explicit `X-Client-Secret` and matching `asid` design.
 - MCP HTTP: at most 32 non-GET requests parse and execute inside the MCP service at once; the 33rd
   fails fast with HTTP 503 while `/health` remains available. That ingress permit is released as
   soon as the handler constructs a response. Result-bearing POST responses have a separate hard
@@ -72,9 +80,30 @@ The following properties are treated as release gates:
   an independent hard cap of 64, so stream shadows cannot consume POST execution capacity;
   overflow returns HTTP 503 and `Retry-After: 1`. POST bodies are fully received under one
   10-second deadline and a fixed 256 KiB streaming limit before JSON deserialization (the rmcp
-  transport keeps the same 256 KiB limit as defense in depth).
+  transport keeps the same 256 KiB limit as defense in depth). A syntactically malformed body or
+  invalid JSON-RPC envelope with the correct media type receives a fixed, sanitized HTTP 400;
+  a non-JSON `Content-Type` remains HTTP 415 and is rejected before the body is read.
+  Browser requests carrying `Origin` are restricted to the protected resource's exact
+  scheme/host/effective port in JWT mode, or to loopback hosts in development mode. Requests
+  without `Origin` remain available to non-browser MCP clients. In JWT mode, the `Host` hostname
+  must match `MCP_PUBLIC_URL`; its port is intentionally ignored because a reverse proxy may use a
+  different internal listener port, while browser ports remain constrained by the exact Origin
+  policy. A proxy must preserve that public hostname (or deliberately rewrite it to the same
+  configured policy). Dev HTTP refuses a non-loopback bind unless the
+  deployment explicitly sets `MCP_DEV_ALLOW_NON_LOOPBACK=true`; this opt-in is intended only for
+  an isolated container whose published host port is separately restricted to loopback.
+  The in-process plaintext listener accepts HTTP/1.1 only, caps accepted TCP connections at 128,
+  and enforces a 10-second deadline for the initial and every keep-alive request header. Production
+  TLS and HTTP/2 must terminate at a hardened reverse proxy with its own bounded connection,
+  stream, header, and idle timeouts; the proxy-to-application hop uses HTTP/1.1. Keeping HTTP/2 off
+  the bounded application listener prevents an idle multiplexed connection from retaining one of
+  its 128 connection slots indefinitely.
   The local session registry separately defaults to a hard maximum of 256 entries and atomically
-  rejects N+1/concurrent overflow; `MCP_MAX_SESSIONS` can lower that value.
+  rejects N+1/concurrent overflow with HTTP 503 and `Retry-After: 1`;
+  `MCP_MAX_SESSIONS` can lower that value. Abandoned legacy sessions are reclaimed after 120
+  seconds without protocol activity (`MCP_SESSION_IDLE_TIMEOUT_SECONDS`, constrained to 90–300).
+  In-flight requests suspend the idle countdown, which restarts only after their final response;
+  dropping the initialize response does not pin its slot beyond the idle lifetime.
 - A shared 16-slot `tools/call` admission gate applies across every MCP session. Overflow fails
   locally before marketplace dispatch, while JSON-RPC cancellation drops the local outbound future
   and releases its permits. An already delivered read-only vendor request may still finish remotely.
@@ -96,11 +125,14 @@ The following properties are treated as release gates:
 loopback development instance. A shared or public Tunnel to a dev instance grants every reachable
 client that actor's read permissions; never expose an admin dev instance to multiple users.
 
-Shared or externally reachable deployments must use `MCP_AUTH_MODE=jwt`. Tool discovery remains
-public for the ChatGPT OAuth flow, while every `tools/call` validates RS256 signature, issuer,
-resource audience, required scope, time claims, and the provisioned actor on that individual HTTP
-request. Identity is not cached in the MCP session. The current Keycloak Compose stack uses
-localhost, HTTP, and `start-dev`; it is an integration-test stack, not a production deployment.
+Shared or externally reachable deployments must use `MCP_AUTH_MODE=jwt`. The OAuth protected-resource
+metadata and `/health` remain public, while every HTTP request to `/mcp` — including initialize,
+notifications, tool discovery/calls, session GET, and session DELETE — validates the RS256 signature,
+issuer, resource audience, required scope, time claims, and provisioned actor after bounded transport
+admission but before body polling or session lookup/allocation. The registry snapshot used to map the
+OIDC identity is reused for that request's tool RBAC, and identity is never cached in the MCP session.
+The current Keycloak Compose stack uses localhost, HTTP, and `start-dev`; it is an integration-test
+stack, not a production deployment.
 
 For production, use public HTTPS issuer/resource URLs, Keycloak production mode behind a correctly
 configured reverse proxy, exact redirect URIs, PKCE S256, disabled Direct Access Grants, immutable
@@ -116,8 +148,6 @@ has broader vendor permissions.
   environment-variable names, never secret values. Do not place Sonar, SSH, or other unrelated
   secrets in this file. A production orchestrator should use managed secrets instead of plain
   container environment variables.
-- The bounded session manager currently returns a generic HTTP 500 when capacity is exhausted.
-  Allocation is safely rejected, but a future transport update should map this condition to 429/503.
 - Application logs provide safe transport/error telemetry but are not an append-only corporate audit
   ledger. A production rollout that requires non-repudiation must add an external protected audit sink
   for actor/tool/account/outcome without payloads or credentials.

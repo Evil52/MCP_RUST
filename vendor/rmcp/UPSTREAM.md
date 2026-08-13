@@ -16,8 +16,20 @@ compatibility.
 
 Local modification: `LocalSessionManager` enforces a configurable hard session
 cap (256 by default) and prunes terminated handles before capacity checks. This
-bounds memory and task growth from repeated public MCP `initialize` requests
-without moving authentication ahead of protocol negotiation.
+bounds memory and task growth at the transport layer. The parent application
+additionally authenticates every `/mcp` HTTP request before session lookup or
+allocation; the vendored transport itself remains authentication-agnostic. `SessionManager`
+also exposes a backward-compatible typed error classifier: local capacity
+exhaustion maps to HTTP 503 with `Retry-After: 1`, while unclassified manager
+errors retain HTTP 500. The manager also exposes a configurable idle lifetime,
+treats closed worker handles as absent, and suspends idle expiry while a request
+is in flight; the application sets a bounded 120-second default so abandoned
+handshakes release their slots without terminating long-running calls.
+
+Local modification: a malformed body or invalid JSON-RPC envelope received with
+`Content-Type: application/json` maps to a fixed, sanitized HTTP 400 response.
+Unsupported media types remain HTTP 415 and are rejected before reading the
+body.
 
 Local modification: structured tool results produced through `Json<T>` are
 serialized into a byte buffer capped at 2 MiB plus 64 KiB of bounded

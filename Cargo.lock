@@ -991,6 +991,8 @@ dependencies = [
  "dotenvy",
  "flate2",
  "http-body",
+ "hyper",
+ "hyper-util",
  "jsonwebtoken",
  "reqwest",
  "rmcp",

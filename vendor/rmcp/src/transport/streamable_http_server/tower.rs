@@ -19,8 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use super::session::{
-    EventStore, EventStoreError, RestoreOutcome, SessionId, SessionManager, SessionRestoreMarker,
-    SessionState, SessionStore,
+    EventStore, EventStoreError, RestoreOutcome, SessionId, SessionManager,
+    SessionManagerErrorKind, SessionRestoreMarker, SessionState, SessionStore,
 };
 use crate::{
     RoleServer,
@@ -49,6 +49,29 @@ use crate::{
         },
     },
 };
+
+fn session_manager_error_response<M: SessionManager>(
+    manager: &M,
+    context: &str,
+    error: M::Error,
+) -> BoxResponse {
+    match manager.classify_error(&error) {
+        SessionManagerErrorKind::Internal => internal_error_response(context)(error),
+        SessionManagerErrorKind::CapacityExhausted => {
+            tracing::warn!(context, "session capacity exhausted");
+            Response::builder()
+                .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                .header(http::header::RETRY_AFTER, "1")
+                .body(
+                    Full::new(Bytes::from_static(
+                        b"Service Unavailable: session capacity exhausted",
+                    ))
+                    .boxed(),
+                )
+                .expect("valid response")
+        }
+    }
+}
 
 /// Default maximum POST request body size (4 MiB).
 pub(crate) const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -95,6 +118,10 @@ pub struct StreamableHttpServerConfig {
     /// non-empty, requests carrying an `Origin` header must match per RFC 6454
     /// `(scheme, host, port)`; missing-`Origin` requests still pass. Entries
     /// must include a scheme; `"null"` matches the browser's `Origin: null`.
+    /// For loopback entries only, omitting the port deliberately allows every
+    /// port so local browser development servers can use ephemeral ports.
+    /// Non-loopback entries without a port match only the scheme's default
+    /// port; an explicit port always matches exactly.
     /// examples:
     ///     allowed_origins = ["https://app.example.com", "http://localhost:8080"]
     pub allowed_origins: Vec<String>,
@@ -788,6 +815,11 @@ fn parse_origin_value(value: &str) -> Option<NormalizedOrigin> {
     let uri = http::Uri::try_from(value).ok()?;
     let scheme = uri.scheme_str()?.to_ascii_lowercase();
     let authority = uri.authority()?;
+    if let Some(path_and_query) = uri.path_and_query()
+        && (path_and_query.path() != "/" || path_and_query.query().is_some())
+    {
+        return None;
+    }
     Some(NormalizedOrigin::Tuple {
         scheme,
         host: normalize_host(authority.host()),
@@ -815,9 +847,29 @@ fn origin_is_allowed(origin: &NormalizedOrigin, allowed_origins: &[String]) -> b
                     host: o_host,
                     port: o_port,
                 },
-            ) => a_scheme == o_scheme && a_host == o_host && (a_port.is_none() || a_port == o_port),
+            ) => {
+                let same_port = if a_port.is_none() && is_loopback_host(a_host) {
+                    true
+                } else {
+                    effective_origin_port(a_scheme, *a_port)
+                        == effective_origin_port(o_scheme, *o_port)
+                };
+                a_scheme == o_scheme && a_host == o_host && same_port
+            }
             _ => false,
         })
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn effective_origin_port(scheme: &str, port: Option<u16>) -> Option<u16> {
+    port.or(match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    })
 }
 
 fn bad_request_response(message: &str) -> BoxResponse {
@@ -910,6 +962,154 @@ fn validate_origin_header(
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidatedTransportMethod {
+    Get,
+    Post,
+    Delete,
+}
+
+/// Returns whether an `Accept` header contains an exact media-range token.
+/// Header values and comma-separated ranges are inspected in place; parameters
+/// after `;` do not participate in the media-type comparison.
+fn accepts_media_type(headers: &HeaderMap, expected: &str) -> bool {
+    let mut found = false;
+    for value in headers.get_all(http::header::ACCEPT) {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        for range in value.split(',') {
+            let media_type = range.split_once(';').map_or(range, |(media_type, _)| media_type);
+            found |= media_type.trim().eq_ignore_ascii_case(expected);
+        }
+    }
+    found
+}
+
+/// Validates a singular JSON Content-Type without accepting prefix lookalikes
+/// such as `application/json-malformed`. Parameters are allowed, while a comma
+/// (which would represent an invalid combined Content-Type field) fails closed.
+fn has_json_content_type(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(http::header::CONTENT_TYPE).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    if value.contains(',') {
+        return false;
+    }
+    let (media_type, parameters) = value
+        .split_once(';')
+        .map_or((value, None), |(media_type, parameters)| {
+            (media_type, Some(parameters))
+        });
+    media_type.trim().eq_ignore_ascii_case(JSON_MIME_TYPE)
+        && parameters.is_none_or(|parameters| !parameters.trim().is_empty())
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the transport returns its final HTTP rejection without rebuilding it in callers"
+)]
+fn classify_streamable_http_request_headers(
+    method: &Method,
+    uri: &http::Uri,
+    headers: &HeaderMap,
+    config: &StreamableHttpServerConfig,
+    supports_stateless_replay: bool,
+) -> Result<ValidatedTransportMethod, BoxResponse> {
+    validate_dns_rebinding_headers(uri, headers, config)?;
+
+    let allowed_methods = match (config.legacy_session_mode, supports_stateless_replay) {
+        (true, _) => "GET, POST, DELETE",
+        (false, true) => "GET, POST",
+        (false, false) => "POST",
+    };
+    match *method {
+        Method::POST => {
+            if !accepts_media_type(headers, JSON_MIME_TYPE)
+                || !accepts_media_type(headers, EVENT_STREAM_MIME_TYPE)
+            {
+                return Err(Response::builder()
+                    .status(http::StatusCode::NOT_ACCEPTABLE)
+                    .body(
+                        Full::new(Bytes::from(
+                            "Not Acceptable: Client must accept both application/json and text/event-stream",
+                        ))
+                        .boxed(),
+                    )
+                    .expect("valid response"));
+            }
+            if !has_json_content_type(headers) {
+                return Err(Response::builder()
+                    .status(http::StatusCode::UNSUPPORTED_MEDIA_TYPE)
+                    .body(
+                        Full::new(Bytes::from(
+                            "Unsupported Media Type: Content-Type must be application/json",
+                        ))
+                        .boxed(),
+                    )
+                    .expect("valid response"));
+            }
+            Ok(ValidatedTransportMethod::Post)
+        }
+        Method::GET if config.legacy_session_mode || supports_stateless_replay => {
+            if !accepts_media_type(headers, EVENT_STREAM_MIME_TYPE) {
+                return Err(Response::builder()
+                    .status(http::StatusCode::NOT_ACCEPTABLE)
+                    .body(
+                        Full::new(Bytes::from(
+                            "Not Acceptable: Client must accept text/event-stream",
+                        ))
+                        .boxed(),
+                    )
+                    .expect("valid response"));
+            }
+            Ok(ValidatedTransportMethod::Get)
+        }
+        Method::DELETE if config.legacy_session_mode => Ok(ValidatedTransportMethod::Delete),
+        _ => Err(Response::builder()
+            .status(http::StatusCode::METHOD_NOT_ALLOWED)
+            .header(ALLOW, allowed_methods)
+            .body(Full::new(Bytes::from("Method Not Allowed")).boxed())
+            .expect("valid response")),
+    }
+}
+
+/// Performs the body-independent Streamable HTTP request checks.
+///
+/// This is the same preflight used by [`StreamableHttpService`]. An outer
+/// admission-control layer can call it before receiving a POST body, ensuring
+/// that invalid Host, Origin, method, Accept, and Content-Type headers cannot
+/// retain a body-read slot. A successful preflight does not replace the
+/// transport's own call; it only avoids reading a body that the transport is
+/// certain to reject.
+#[expect(
+    clippy::result_large_err,
+    reason = "the rejection is already the final HTTP response"
+)]
+pub fn validate_streamable_http_request_headers(
+    method: &Method,
+    uri: &http::Uri,
+    headers: &HeaderMap,
+    config: &StreamableHttpServerConfig,
+    supports_stateless_replay: bool,
+) -> Result<(), Response<BoxBody<Bytes, Infallible>>> {
+    classify_streamable_http_request_headers(
+        method,
+        uri,
+        headers,
+        config,
+        supports_stateless_replay,
+    )
+    .map(|_| ())
 }
 
 /// # Streamable HTTP server
@@ -1345,7 +1545,7 @@ where
         &self,
         session_id: &SessionId,
         parts: &http::request::Parts,
-    ) -> Result<bool, std::io::Error>
+    ) -> Result<bool, BoxResponse>
     where
         S: crate::ServerHandler + Send + 'static,
         M: SessionManager,
@@ -1393,12 +1593,7 @@ where
                 return Ok(false);
             }
             Err(e) => {
-                tracing::error!(
-                    session_id = session_id.as_ref(),
-                    error = %e,
-                    "session store load failed during restore"
-                );
-                return Err(std::io::Error::other(e));
+                return Err(internal_error_response("restore session from store")(e));
             }
         };
 
@@ -1407,21 +1602,26 @@ where
             .session_manager
             .restore_session(session_id.clone())
             .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
         {
             Ok(RestoreOutcome::Restored(t)) => t,
             Ok(RestoreOutcome::AlreadyPresent) => {
                 // Invariant violation: pending_restores ensures only one task can call
                 // restore_session per session ID, so AlreadyPresent is impossible here.
-                return Err(std::io::Error::other(
-                    "restore_session returned AlreadyPresent unexpectedly; session manager might have modified the session store outside of the restore_session API",
+                return Err(internal_error_response("restore session")(
+                    std::io::Error::other(
+                        "restore_session returned AlreadyPresent unexpectedly; session manager might have modified the session store outside of the restore_session API",
+                    ),
                 ));
             }
             Ok(RestoreOutcome::NotSupported) => {
                 return Ok(false);
             }
-            Err(e) => {
-                return Err(e);
+            Err(error) => {
+                return Err(session_manager_error_response(
+                    self.session_manager.as_ref(),
+                    "restore session",
+                    error,
+                ));
             }
         };
 
@@ -1429,7 +1629,7 @@ where
         let service = match self.get_service() {
             Ok(s) => s,
             Err(e) => {
-                return Err(e);
+                return Err(internal_error_response("get service during restore")(e));
             }
         };
 
@@ -1468,27 +1668,33 @@ where
             Some(init_done_tx),
         );
 
-        if let Err(e) = self
+        if let Err(error) = self
             .session_manager
             .initialize_session(session_id, restore_init)
             .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
         {
-            return Err(e);
+            return Err(session_manager_error_response(
+                self.session_manager.as_ref(),
+                "initialize restored session",
+                error,
+            ));
         }
 
-        if let Err(e) = self
+        if let Err(error) = self
             .session_manager
             .accept_message(session_id, restore_initialized)
             .await
-            .map_err(|e| std::io::Error::other(e.to_string()))
         {
-            return Err(e);
+            return Err(session_manager_error_response(
+                self.session_manager.as_ref(),
+                "initialize restored session",
+                error,
+            ));
         }
 
         if init_done_rx.await.is_err() {
-            return Err(std::io::Error::other(
-                "serve_server initialization failed during restore",
+            return Err(internal_error_response("initialize restored session")(
+                std::io::Error::other("serve_server initialization failed during restore"),
             ));
         }
 
@@ -1506,33 +1712,21 @@ where
         B: Body + Send + 'static,
         B::Error: Display,
     {
-        if let Err(response) =
-            validate_dns_rebinding_headers(request.uri(), request.headers(), &self.config)
-        {
-            return response;
-        }
-        let method = request.method().clone();
         let supports_stateless_replay = self.session_manager.event_store().is_some();
-        let allowed_methods = match (self.config.legacy_session_mode, supports_stateless_replay) {
-            (true, _) => "GET, POST, DELETE",
-            (false, true) => "GET, POST",
-            (false, false) => "POST",
+        let method = match classify_streamable_http_request_headers(
+            request.method(),
+            request.uri(),
+            request.headers(),
+            &self.config,
+            supports_stateless_replay,
+        ) {
+            Ok(method) => method,
+            Err(response) => return response,
         };
         let result = match method {
-            Method::POST => self.handle_post(request).await,
-            Method::GET if self.config.legacy_session_mode || supports_stateless_replay => {
-                self.handle_get(request).await
-            }
-            Method::DELETE if self.config.legacy_session_mode => self.handle_delete(request).await,
-            _ => {
-                // Handle other methods or return an error
-                let response = Response::builder()
-                    .status(http::StatusCode::METHOD_NOT_ALLOWED)
-                    .header(ALLOW, allowed_methods)
-                    .body(Full::new(Bytes::from("Method Not Allowed")).boxed())
-                    .expect("valid response");
-                return response;
-            }
+            ValidatedTransportMethod::Post => self.handle_post(request).await,
+            ValidatedTransportMethod::Get => self.handle_get(request).await,
+            ValidatedTransportMethod::Delete => self.handle_delete(request).await,
         };
         match result {
             Ok(response) => response,
@@ -1544,23 +1738,6 @@ where
         B: Body + Send + 'static,
         B::Error: Display,
     {
-        // check accept header
-        if !request
-            .headers()
-            .get(http::header::ACCEPT)
-            .and_then(|header| header.to_str().ok())
-            .is_some_and(|header| header.contains(EVENT_STREAM_MIME_TYPE))
-        {
-            return Ok(Response::builder()
-                .status(http::StatusCode::NOT_ACCEPTABLE)
-                .body(
-                    Full::new(Bytes::from(
-                        "Not Acceptable: Client must accept text/event-stream",
-                    ))
-                    .boxed(),
-                )
-                .expect("valid response"));
-        }
         let request_uses_legacy_protocol = is_legacy_request(None, request.headers())?;
         let legacy_request = self.config.legacy_session_mode && request_uses_legacy_protocol;
         if !legacy_request {
@@ -1605,14 +1782,17 @@ where
             .session_manager
             .has_session(&session_id)
             .await
-            .map_err(internal_error_response("check session"))?;
+            .map_err(|error| {
+                session_manager_error_response(
+                    self.session_manager.as_ref(),
+                    "check session",
+                    error,
+                )
+            })?;
         let (parts, _) = request.into_parts();
         if !has_session {
             // Attempt transparent cross-instance restore from external store.
-            let restored = self
-                .try_restore_from_store(&session_id, &parts)
-                .await
-                .map_err(internal_error_response("restore session"))?;
+            let restored = self.try_restore_from_store(&session_id, &parts).await?;
             if !restored {
                 // MCP spec: server MUST respond with 404 Not Found for terminated/unknown sessions
                 return Ok(Response::builder()
@@ -1662,7 +1842,13 @@ where
             .session_manager
             .create_standalone_stream(&session_id)
             .await
-            .map_err(internal_error_response("create standalone stream"))?;
+            .map_err(|error| {
+                session_manager_error_response(
+                    self.session_manager.as_ref(),
+                    "create standalone stream",
+                    error,
+                )
+            })?;
         let stream = if let Some(retry) = self.config.sse_retry {
             let priming = if self.session_manager.event_store().is_some() {
                 ServerSseMessage::retry(retry)
@@ -1687,39 +1873,6 @@ where
         B: Body + Send + 'static,
         B::Error: Display,
     {
-        // check accept header
-        if !request
-            .headers()
-            .get(http::header::ACCEPT)
-            .and_then(|header| header.to_str().ok())
-            .is_some_and(|header| {
-                header.contains(JSON_MIME_TYPE) && header.contains(EVENT_STREAM_MIME_TYPE)
-            })
-        {
-            return Ok(Response::builder()
-                .status(http::StatusCode::NOT_ACCEPTABLE)
-                .body(Full::new(Bytes::from("Not Acceptable: Client must accept both application/json and text/event-stream")).boxed())
-                .expect("valid response"));
-        }
-
-        // check content type
-        if !request
-            .headers()
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|header| header.to_str().ok())
-            .is_some_and(|header| header.starts_with(JSON_MIME_TYPE))
-        {
-            return Ok(Response::builder()
-                .status(http::StatusCode::UNSUPPORTED_MEDIA_TYPE)
-                .body(
-                    Full::new(Bytes::from(
-                        "Unsupported Media Type: Content-Type must be application/json",
-                    ))
-                    .boxed(),
-                )
-                .expect("valid response"));
-        }
-
         // json deserialize request body
         let (part, body) = request.into_parts();
         let mut message = match expect_json(body, self.config.max_request_body_bytes).await {
@@ -1742,13 +1895,16 @@ where
                     .session_manager
                     .has_session(&session_id)
                     .await
-                    .map_err(internal_error_response("check session"))?;
+                    .map_err(|error| {
+                        session_manager_error_response(
+                            self.session_manager.as_ref(),
+                            "check session",
+                            error,
+                        )
+                    })?;
                 if !has_session {
                     // Attempt transparent cross-instance restore from external store.
-                    let restored = self
-                        .try_restore_from_store(&session_id, &part)
-                        .await
-                        .map_err(internal_error_response("restore session"))?;
+                    let restored = self.try_restore_from_store(&session_id, &part).await?;
                     if !restored {
                         // MCP spec: server MUST respond with 404 Not Found for terminated/unknown sessions
                         return Ok(Response::builder()
@@ -1787,7 +1943,13 @@ where
                             .session_manager
                             .create_stream(&session_id, message)
                             .await
-                            .map_err(internal_error_response("get session"))?;
+                            .map_err(|error| {
+                                session_manager_error_response(
+                                    self.session_manager.as_ref(),
+                                    "get session",
+                                    error,
+                                )
+                            })?;
                         Ok(sse_stream_response(
                             stream,
                             self.config.sse_keep_alive,
@@ -1801,7 +1963,13 @@ where
                         self.session_manager
                             .accept_message(&session_id, message)
                             .await
-                            .map_err(internal_error_response("accept message"))?;
+                            .map_err(|error| {
+                                session_manager_error_response(
+                                    self.session_manager.as_ref(),
+                                    "accept message",
+                                    error,
+                                )
+                            })?;
                         Ok(accepted_response())
                     }
                 }
@@ -1862,7 +2030,13 @@ where
                     .session_manager
                     .create_session()
                     .await
-                    .map_err(internal_error_response("create session"))?;
+                    .map_err(|error| {
+                        session_manager_error_response(
+                            self.session_manager.as_ref(),
+                            "create session",
+                            error,
+                        )
+                    })?;
                 // spawn a task to serve the session
                 Self::spawn_session_worker(
                     self.session_manager.clone(),
@@ -1877,7 +2051,13 @@ where
                     .session_manager
                     .initialize_session(&session_id, message)
                     .await
-                    .map_err(internal_error_response("create stream"))?;
+                    .map_err(|error| {
+                        session_manager_error_response(
+                            self.session_manager.as_ref(),
+                            "initialize session",
+                            error,
+                        )
+                    })?;
                 // Persist session state to external store after a successful handshake.
                 if let (Some(store), Some(params)) =
                     (&self.config.session_store, stored_init_params)
@@ -2069,7 +2249,13 @@ where
         self.session_manager
             .close_session(&session_id)
             .await
-            .map_err(internal_error_response("close session"))?;
+            .map_err(|error| {
+                session_manager_error_response(
+                    self.session_manager.as_ref(),
+                    "close session",
+                    error,
+                )
+            })?;
         // Remove from external store: a DELETE means the client intentionally
         // ends the session, so the store entry is no longer needed.
         if let Some(store) = &self.config.session_store {
@@ -2152,5 +2338,43 @@ impl<S: Stream> Stream for CancelOnDisconnect<S> {
             *this.ct = None;
         }
         polled
+    }
+}
+
+#[cfg(test)]
+mod session_manager_error_response_tests {
+    use super::*;
+    use crate::transport::streamable_http_server::session::{
+        local::{LocalSessionManager, LocalSessionManagerError},
+        never::{ErrorSessionManagementNotSupported, NeverSessionManager},
+    };
+
+    #[test]
+    fn capacity_is_503_but_default_classification_remains_500() {
+        let local = LocalSessionManager::default();
+        let overloaded = session_manager_error_response(
+            &local,
+            "create session",
+            LocalSessionManagerError::SessionCapacityExhausted { limit: 1 },
+        );
+        assert_eq!(overloaded.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            overloaded
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        let unclassified = session_manager_error_response(
+            &NeverSessionManager::default(),
+            "create session",
+            ErrorSessionManagementNotSupported,
+        );
+        assert_eq!(
+            unclassified.status(),
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(unclassified.headers().get(http::header::RETRY_AFTER).is_none());
     }
 }

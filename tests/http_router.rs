@@ -6,22 +6,29 @@
 
 use std::{
     collections::BTreeMap,
+    convert::Infallible,
     num::NonZeroUsize,
+    pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll},
     time::Duration,
 };
 
 use axum::{
     Router,
-    body::Body,
-    http::{Request, StatusCode, header::CONTENT_TYPE},
+    body::{Body, Bytes, HttpBody},
+    http::{
+        Request, StatusCode,
+        header::{CONTENT_TYPE, WWW_AUTHENTICATE},
+    },
 };
+use http_body::Frame;
 use mcp_ozon::{
     auth::JwtAuthenticator,
     config::{JwtConfig, RegistrySource},
     http::{
         MCP_MAX_IN_FLIGHT_STREAMS, MCP_REQUEST_BODY_LIMIT_BYTES, build_router,
-        build_router_with_cancellation,
+        build_router_with_cancellation, build_router_with_session_idle_timeout,
     },
     ozon::OzonClient,
     server::OzonMcp,
@@ -31,6 +38,20 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct PendingBody;
+
+impl HttpBody for PendingBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Poll::Pending
+    }
+}
 
 const RESOURCE_URL: &str = "http://localhost:8788/mcp";
 const RESOURCE_METADATA_URL: &str = "http://localhost:8788/.well-known/oauth-protected-resource";
@@ -91,17 +112,70 @@ fn dev_router_with_session_limit(max_sessions: usize) -> Router {
     )
 }
 
+fn initialize_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(CONTENT_TYPE, "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2025-06-18")
+        .header("host", "localhost")
+        .body(Body::from(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "router-test", "version": "0"}
+                }
+            })
+            .to_string(),
+        ))
+        .expect("request builds")
+}
+
 /// Sends the MCP `initialize` handshake and reports the status and session id.
 async fn initialize_session(router: Router) -> (StatusCode, Option<String>) {
     let response = router
+        .oneshot(initialize_request())
+        .await
+        .expect("router responds");
+    let status = response.status();
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (status, session_id)
+}
+
+async fn initialize_session_with_origin(
+    router: Router,
+    origin: Option<&str>,
+) -> (StatusCode, Option<String>, String) {
+    initialize_session_with_origin_and_host(router, origin, "localhost").await
+}
+
+async fn initialize_session_with_origin_and_host(
+    router: Router,
+    origin: Option<&str>,
+    host: &str,
+) -> (StatusCode, Option<String>, String) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(CONTENT_TYPE, "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2025-06-18")
+        .header("host", host);
+    if let Some(origin) = origin {
+        request = request.header("origin", origin);
+    }
+    let response = router
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/mcp")
-                .header(CONTENT_TYPE, "application/json")
-                .header("accept", "application/json, text/event-stream")
-                .header("mcp-protocol-version", "2025-06-18")
-                .header("host", "localhost")
+            request
                 .body(Body::from(
                     json!({
                         "jsonrpc": "2.0",
@@ -110,7 +184,7 @@ async fn initialize_session(router: Router) -> (StatusCode, Option<String>) {
                         "params": {
                             "protocolVersion": "2025-06-18",
                             "capabilities": {},
-                            "clientInfo": {"name": "router-test", "version": "0"}
+                            "clientInfo": {"name": "origin-test", "version": "0"}
                         }
                     })
                     .to_string(),
@@ -125,12 +199,26 @@ async fn initialize_session(router: Router) -> (StatusCode, Option<String>) {
         .get("mcp-session-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    (status, session_id)
+    let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+        .await
+        .expect("response body is readable");
+    (
+        status,
+        session_id,
+        String::from_utf8_lossy(&body).into_owned(),
+    )
 }
 
 fn jwt_router() -> Router {
+    jwt_router_for_resource(RESOURCE_URL)
+}
+
+fn jwt_router_for_resource(resource_url: &str) -> Router {
     let registry = registry();
-    let authenticator = JwtAuthenticator::new(jwt_config(), registry.clone())
+    let mut config = jwt_config();
+    config.audience = resource_url.to_owned();
+    config.resource_url = resource_url.to_owned();
+    let authenticator = JwtAuthenticator::new(config, registry.clone())
         .expect("test authenticator configuration must be valid");
     let server = OzonMcp::new_authenticated(ozon_client(), registry, authenticator);
     build_router(server, NonZeroUsize::new(4).expect("non-zero"))
@@ -305,15 +393,29 @@ async fn the_production_router_enforces_its_session_cap_end_to_end() {
     session_ids.dedup();
     assert_eq!(session_ids.len(), LIMIT);
 
-    let (status, session_id) = initialize_session(router.clone()).await;
-    assert!(
-        status.is_server_error(),
-        "session {} must be refused once the cap is reached, got {status}",
-        LIMIT + 1
+    let response = router
+        .clone()
+        .oneshot(initialize_request())
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
     );
     assert!(
-        session_id.is_none(),
+        response.headers().get("mcp-session-id").is_none(),
         "a refused initialize must not hand out a session id"
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+        .await
+        .expect("capacity response body is readable");
+    assert_eq!(
+        body.as_ref(),
+        b"Service Unavailable: session capacity exhausted"
     );
 
     // Refusing the extra session must not take the process down with it: the
@@ -322,6 +424,39 @@ async fn the_production_router_enforces_its_session_cap_end_to_end() {
     let (status, _, body) = get(router, "/health").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "ok");
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_an_initialize_response_cannot_pin_the_only_session_slot() {
+    let server = OzonMcp::new(ozon_client(), "admin".to_owned(), registry());
+    let idle_timeout = Duration::from_secs(90);
+    let router = build_router_with_session_idle_timeout(
+        server,
+        NonZeroUsize::new(1).expect("non-zero"),
+        idle_timeout,
+    );
+
+    let response = router
+        .clone()
+        .oneshot(initialize_request())
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("mcp-session-id").is_some());
+    // Deliberately abandon the SSE body before consuming the initialize
+    // response. The session manager, not body EOF, owns eventual reclamation.
+    drop(response);
+    tokio::task::yield_now().await;
+
+    tokio::time::advance(idle_timeout).await;
+    tokio::task::yield_now().await;
+
+    let replacement = router
+        .oneshot(initialize_request())
+        .await
+        .expect("router responds after idle reclamation");
+    assert_eq!(replacement.status(), StatusCode::OK);
+    assert!(replacement.headers().get("mcp-session-id").is_some());
 }
 
 #[tokio::test]
@@ -565,6 +700,45 @@ async fn production_router_enforces_the_mcp_body_limit_while_streaming() {
 }
 
 #[tokio::test]
+async fn mcp_distinguishes_invalid_json_rpc_from_unsupported_media_type() {
+    async fn post(content_type: &'static str, body: &'static str) -> (StatusCode, String) {
+        let response = dev_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(CONTENT_TYPE, content_type)
+                    .header("accept", "application/json, text/event-stream")
+                    .header("mcp-protocol-version", "2025-06-18")
+                    .header("host", "localhost")
+                    .body(Body::from(body))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let status = response.status();
+        assert!(response.headers().get("mcp-session-id").is_none());
+        let body = axum::body::to_bytes(response.into_body(), 1_048_576)
+            .await
+            .expect("response body is readable");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    for invalid in ["not valid json", r#"{"jsonrpc":"2.0","id":1}"#] {
+        let (status, body) = post("application/json", invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "Bad Request: invalid JSON-RPC body");
+    }
+
+    let (status, body) = post("text/plain", "not valid json").await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        body,
+        "Unsupported Media Type: Content-Type must be application/json"
+    );
+}
+
+#[tokio::test]
 async fn the_mcp_endpoint_only_accepts_loopback_host_headers() {
     // DNS-rebinding protection: a browser page on an attacker's domain that
     // resolves to 127.0.0.1 still sends that domain as Host, so a foreign or
@@ -632,38 +806,163 @@ async fn the_mcp_endpoint_only_accepts_loopback_host_headers() {
 }
 
 #[tokio::test]
+async fn dev_mode_accepts_only_loopback_browser_origins_on_any_port() {
+    for origin in [
+        None,
+        Some("http://localhost:49152"),
+        Some("http://127.0.0.1:3000"),
+        Some("https://[::1]:9443"),
+    ] {
+        let (status, session_id, body) = initialize_session_with_origin(dev_router(), origin).await;
+        assert_eq!(status, StatusCode::OK, "origin={origin:?}: {body}");
+        assert!(session_id.is_some(), "origin={origin:?}: {body}");
+    }
+
+    for origin in [
+        "https://evil.example",
+        "http://localhost.evil.example:49152",
+        "null",
+    ] {
+        let (status, session_id, body) =
+            initialize_session_with_origin(dev_router(), Some(origin)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "origin={origin}: {body}");
+        assert!(session_id.is_none(), "origin={origin}: {body}");
+        assert!(!body.contains("serverInfo"), "origin={origin}: {body}");
+    }
+
+    let (status, session_id, body) =
+        initialize_session_with_origin(dev_router(), Some("not-an-origin")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(session_id.is_none(), "{body}");
+
+    for malformed in [
+        "http://localhost:49152/path",
+        "http://localhost:49152?query",
+    ] {
+        let (status, session_id, body) =
+            initialize_session_with_origin(dev_router(), Some(malformed)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "origin={malformed}: {body}"
+        );
+        assert!(session_id.is_none(), "origin={malformed}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn jwt_mode_checks_the_exact_protected_resource_origin_before_authentication() {
+    for origin in [None, Some("http://localhost:8788")] {
+        let (status, session_id, body) = initialize_session_with_origin(jwt_router(), origin).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "origin={origin:?}: {body}"
+        );
+        assert!(session_id.is_none(), "origin={origin:?}: {body}");
+    }
+
+    for origin in [
+        "http://localhost:8789",
+        "https://localhost:8788",
+        "http://127.0.0.1:8788",
+        "https://evil.example",
+    ] {
+        let (status, session_id, body) =
+            initialize_session_with_origin(jwt_router(), Some(origin)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "origin={origin}: {body}");
+        assert!(session_id.is_none(), "origin={origin}: {body}");
+        assert!(!body.contains("serverInfo"), "origin={origin}: {body}");
+    }
+
+    for origin in [
+        None,
+        Some("https://mcp.example"),
+        Some("https://mcp.example:443"),
+    ] {
+        let (status, session_id, body) = initialize_session_with_origin_and_host(
+            jwt_router_for_resource("https://mcp.example/mcp"),
+            origin,
+            "mcp.example",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "origin={origin:?}: {body}"
+        );
+        assert!(session_id.is_none(), "origin={origin:?}: {body}");
+    }
+
+    for origin in ["https://mcp.example:4443", "http://mcp.example"] {
+        let (status, session_id, body) = initialize_session_with_origin_and_host(
+            jwt_router_for_resource("https://mcp.example/mcp"),
+            Some(origin),
+            "mcp.example",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "origin={origin}: {body}");
+        assert!(session_id.is_none(), "origin={origin}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn jwt_mode_checks_the_protected_resource_hostname_before_authentication() {
+    let resource = "https://mcp.example/mcp";
+    let (status, session_id, body) = initialize_session_with_origin_and_host(
+        jwt_router_for_resource(resource),
+        None,
+        "mcp.example",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert!(session_id.is_none(), "{body}");
+
+    for host in ["localhost", "127.0.0.1", "evil.example"] {
+        let (status, session_id, body) =
+            initialize_session_with_origin_and_host(jwt_router_for_resource(resource), None, host)
+                .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "host={host}: {body}");
+        assert!(session_id.is_none(), "host={host}: {body}");
+        assert!(!body.contains("serverInfo"), "host={host}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn mcp_rejects_unauthenticated_initialize_in_jwt_mode() {
-    let response = jwt_router()
-        .oneshot(
+    let response = tokio::time::timeout(
+        Duration::from_millis(250),
+        jwt_router().oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/mcp")
                 .header(CONTENT_TYPE, "application/json")
                 .header("accept", "application/json, text/event-stream")
-                .body(Body::from(
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "tools/call",
-                        "params": {"name": "ozon_stores_status", "arguments": {}}
-                    })
-                    .to_string(),
-                ))
+                .header("host", "localhost")
+                .body(Body::new(PendingBody))
                 .expect("request builds"),
-        )
-        .await
-        .expect("router responds");
+        ),
+    )
+    .await
+    .expect("missing authorization must be rejected before polling the pending body")
+    .expect("router responds");
     let status = response.status();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(response.headers().get("mcp-session-id").is_none());
+    let challenge = response
+        .headers()
+        .get(WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .expect("401 must include a Bearer challenge");
+    assert!(challenge.starts_with("Bearer "), "{challenge}");
+    assert!(challenge.contains("resource_metadata=\""), "{challenge}");
+    assert!(!challenge.contains("error="), "{challenge}");
     let body = axum::body::to_bytes(response.into_body(), 1_048_576)
         .await
         .expect("response body is readable");
     let body = String::from_utf8_lossy(&body);
-
-    // Either the transport refuses the session outright or the tool layer
-    // returns an auth failure — but an unauthenticated caller must never get a
-    // successful tool result back.
-    assert!(
-        !body.contains("\"stores\""),
-        "unauthenticated caller received tool data: {status} {body}"
+    assert_eq!(
+        body, "Требуется авторизация: access token не передан.",
+        "{status}"
     );
 }

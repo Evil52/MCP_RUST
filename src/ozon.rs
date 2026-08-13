@@ -14,8 +14,8 @@ use reqwest::{
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, Semaphore},
-    time::sleep,
+    sync::{Mutex, Semaphore, SemaphorePermit},
+    time::{Instant as TokioInstant, sleep, timeout_at},
 };
 
 use crate::config::{StoreCredentials, StoreId};
@@ -231,6 +231,13 @@ impl OzonError {
 struct RateLimiter {
     next_allowed: Mutex<Instant>,
     in_flight: Semaphore,
+    #[cfg(test)]
+    before_claim: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 impl RateLimiter {
@@ -238,17 +245,56 @@ impl RateLimiter {
         Self {
             next_allowed: Mutex::new(Instant::now()),
             in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CLIENT),
+            #[cfg(test)]
+            before_claim: Mutex::new(None),
         }
     }
 
-    async fn acquire(&self) {
+    /// Waits until a departure could be claimed without consuming it.
+    ///
+    /// Network permits are acquired only after this returns, so a paced caller
+    /// cannot reserve scarce HTTP capacity while it sleeps.
+    async fn wait_until_ready(&self) {
+        loop {
+            let wait = self
+                .next_allowed
+                .lock()
+                .await
+                .saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                return;
+            }
+            sleep(wait).await;
+        }
+    }
+
+    /// Atomically consumes a departure after network permits are available.
+    /// A competing ready caller may win the race; the loser releases its
+    /// permits and returns to the readiness phase.
+    async fn try_claim(&self) -> Result<(), Duration> {
         let mut next_allowed = self.next_allowed.lock().await;
         let wait = next_allowed.saturating_duration_since(Instant::now());
         if !wait.is_zero() {
-            sleep(wait).await;
+            return Err(wait);
         }
         *next_allowed = Instant::now() + MIN_REQUEST_INTERVAL;
+        Ok(())
     }
+
+    /// Extends the shared Client-Id cooldown without shortening an existing
+    /// pacing slot or a longer delay installed by another upstream response.
+    async fn extend_cooldown(&self, delay: Duration) {
+        let cooldown_until = Instant::now() + delay;
+        let mut next_allowed = self.next_allowed.lock().await;
+        if *next_allowed < cooldown_until {
+            *next_allowed = cooldown_until;
+        }
+    }
+}
+
+enum RequestAttempt {
+    Complete(Value),
+    Retry { delay: Duration, error: OzonError },
 }
 
 #[derive(Debug, Clone)]
@@ -347,12 +393,9 @@ impl OzonClient {
         if !self.is_endpoint_allowed(path) {
             return Err(OzonError::EndpointNotAllowed(path.to_owned()));
         }
-        tokio::time::timeout(
-            self.request_deadline,
-            self.post_within_deadline(store, path, payload),
-        )
-        .await
-        .map_err(|_| OzonError::DeadlineExceeded)?
+        let deadline = TokioInstant::now() + self.request_deadline;
+        self.post_within_deadline(store, path, payload, deadline)
+            .await
     }
 
     async fn post_within_deadline(
@@ -360,83 +403,151 @@ impl OzonClient {
         store: &StoreId,
         path: &'static str,
         payload: Value,
+        deadline: TokioInstant,
     ) -> Result<Value, OzonError> {
         let credentials = self
             .stores
             .get(store)
             .ok_or_else(|| OzonError::MissingCredentials(store.clone()))?;
-        let _global_permit = self
-            .global_in_flight
-            .try_acquire()
-            .map_err(|_| OzonError::Overloaded)?;
         let limiter = self
             .rate_limiters
             .get(store)
             .expect("configured stores always have a rate limiter");
-        let _permit = limiter
-            .in_flight
-            .try_acquire()
-            .map_err(|_| OzonError::Overloaded)?;
 
         let mut attempt = 1;
+        let mut previous_retry_error = None;
         loop {
-            limiter.acquire().await;
-            let started_at = Instant::now();
-            let request_trace = RequestTrace {
-                store,
-                endpoint: path,
-                started_at,
-                attempt,
-            };
-            let response = self
-                .http
-                .post(format!("{}{path}", self.base_url))
-                .header("Client-Id", &credentials.client_id)
-                .header("Api-Key", &credentials.api_key)
-                .json(&payload)
-                .send()
-                .await;
+            // One absolute deadline covers admission, transport, response body,
+            // and every retry wait. Returning from this block releases both
+            // network permits before the outer loop sleeps.
+            let outcome = timeout_at(deadline, async {
+                let _permits = self.acquire_request_permits(limiter).await?;
+                let started_at = Instant::now();
+                let request_trace = RequestTrace {
+                    store,
+                    endpoint: path,
+                    started_at,
+                    attempt,
+                };
+                let response = self
+                    .http
+                    .post(format!("{}{path}", self.base_url))
+                    .header("Client-Id", &credentials.client_id)
+                    .header("Api-Key", &credentials.api_key)
+                    .json(&payload)
+                    .send()
+                    .await;
 
-            let mut response = match response {
-                Ok(response) => response,
-                Err(source) => {
-                    let error = classify_transport_error(source, None);
-                    let kind = error.kind();
-                    let will_retry = is_retriable_transport(kind) && attempt < MAX_ATTEMPTS;
-                    trace_transport_failure(&request_trace, kind, will_retry);
-                    if will_retry {
-                        sleep(retry_delay(attempt, None)).await;
-                        attempt += 1;
-                        continue;
+                let mut response = match response {
+                    Ok(response) => response,
+                    Err(source) => {
+                        let error = classify_transport_error(source, None);
+                        let kind = error.kind();
+                        let will_retry = is_retriable_transport(kind) && attempt < MAX_ATTEMPTS;
+                        trace_transport_failure(&request_trace, kind, will_retry);
+                        if will_retry {
+                            return Ok(RequestAttempt::Retry {
+                                delay: retry_delay(attempt, None),
+                                error,
+                            });
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
+                };
+                let status = response.status();
+                let request_id = safe_request_id(response.headers());
+                let retry_after = parse_retry_after(response.headers(), Utc::now());
+                let planned_retry = retry_plan(status, attempt, retry_after);
+
+                if let Some(delay) = shared_retry_cooldown(status, retry_after) {
+                    // Install a vendor-directed cooldown before `_permits` is
+                    // released, closing the window in which a same-Client-Id
+                    // sibling could leave during Retry-After.
+                    limiter.extend_cooldown(delay).await;
+                }
+
+                if let Some((delay, kind)) = planned_retry {
+                    trace_response(&request_trace, status, request_id.as_deref(), true, kind);
+                    let diagnostic = read_bounded_diagnostic_body(&mut response).await;
+                    let error =
+                        classify_http_error(status, request_id, retry_after.duration(), diagnostic);
+                    return Ok(RequestAttempt::Retry { delay, error });
+                }
+
+                let result = decode_response(
+                    &mut response,
+                    status,
+                    request_id.clone(),
+                    retry_after.duration(),
+                )
+                .await;
+                let kind = result
+                    .as_ref()
+                    .err()
+                    .map_or(OzonErrorKind::Http, OzonError::kind);
+                trace_response(&request_trace, status, request_id.as_deref(), false, kind);
+                result.map(RequestAttempt::Complete)
+            })
+            .await;
+
+            let outcome = match outcome {
+                Err(_) => {
+                    return Err(previous_retry_error
+                        .take()
+                        .unwrap_or(OzonError::DeadlineExceeded));
+                }
+                Ok(Err(OzonError::Overloaded)) => {
+                    // Once an upstream request has failed, a local race for the
+                    // retry permits must not replace its status/request-id with
+                    // an unrelated Overloaded error.
+                    return Err(previous_retry_error.take().unwrap_or(OzonError::Overloaded));
+                }
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(outcome)) => outcome,
+            };
+            match outcome {
+                RequestAttempt::Complete(value) => return Ok(value),
+                RequestAttempt::Retry { delay, error } => {
+                    previous_retry_error = Some(error);
+                    if timeout_at(deadline, sleep(delay)).await.is_err() {
+                        return Err(previous_retry_error
+                            .take()
+                            .expect("a retry wait always has a preceding upstream error"));
+                    }
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    async fn acquire_request_permits<'a>(
+        &'a self,
+        limiter: &'a RateLimiter,
+    ) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>), OzonError> {
+        loop {
+            limiter.wait_until_ready().await;
+            let global_permit = self
+                .global_in_flight
+                .try_acquire()
+                .map_err(|_| OzonError::Overloaded)?;
+            let client_permit = match limiter.in_flight.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    drop(global_permit);
+                    return Err(OzonError::Overloaded);
                 }
             };
-            let status = response.status();
-            let request_id = safe_request_id(response.headers());
-            let retry_after = parse_retry_after(response.headers(), Utc::now());
-
-            if let Some((delay, kind)) = retry_plan(status, attempt, retry_after) {
-                trace_response(&request_trace, status, request_id.as_deref(), true, kind);
-                drop(response);
-                sleep(delay).await;
-                attempt += 1;
-                continue;
+            #[cfg(test)]
+            if let Some((reached, resume)) = limiter.before_claim.lock().await.take() {
+                let _ = reached.send(());
+                let _ = resume.await;
+            }
+            if limiter.try_claim().await.is_ok() {
+                return Ok((global_permit, client_permit));
             }
 
-            let result = decode_response(
-                &mut response,
-                status,
-                request_id.clone(),
-                retry_after.duration(),
-            )
-            .await;
-            let kind = result
-                .as_ref()
-                .err()
-                .map_or(OzonErrorKind::Http, OzonError::kind);
-            trace_response(&request_trace, status, request_id.as_deref(), false, kind);
-            return result;
+            drop(client_permit);
+            drop(global_permit);
         }
     }
 }
@@ -461,6 +572,18 @@ fn retry_plan(
         OzonErrorKind::Server
     };
     Some((retry_delay(attempt, retry_after), kind))
+}
+
+/// A valid bounded Retry-After is a shared Client-Id quota signal even when
+/// the current operation has exhausted its own retry budget. Missing, invalid,
+/// and deliberately over-limit values keep the existing local retry policy.
+fn shared_retry_cooldown(status: StatusCode, retry_after: ParsedRetryAfter) -> Option<Duration> {
+    match retry_after {
+        ParsedRetryAfter::Valid(delay) if is_retriable(status) && delay <= MAX_RETRY_DELAY => {
+            Some(delay)
+        }
+        ParsedRetryAfter::Absent | ParsedRetryAfter::Valid(_) | ParsedRetryAfter::Invalid => None,
+    }
 }
 
 async fn decode_response(
@@ -752,9 +875,11 @@ fn elapsed_millis(started_at: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         io::{BufRead, BufReader, Read, Write},
         net::{TcpListener, TcpStream},
         sync::mpsc,
+        task::Poll,
         thread,
     };
 
@@ -1649,11 +1774,599 @@ mod tests {
     async fn per_store_rate_limiter_spaces_requests_at_fifty_per_second() {
         let limiter = RateLimiter::new();
         let started_at = Instant::now();
-        limiter.acquire().await;
-        limiter.acquire().await;
-        limiter.acquire().await;
+        for _ in 0..3 {
+            limiter.wait_until_ready().await;
+            limiter.try_claim().await.unwrap();
+        }
 
         assert!(started_at.elapsed() >= MIN_REQUEST_INTERVAL.saturating_mul(2));
+    }
+
+    #[tokio::test]
+    async fn claim_reports_the_remaining_delay_after_another_caller_wins() {
+        let limiter = RateLimiter::new();
+        *limiter.next_allowed.lock().await = Instant::now() + Duration::from_secs(1);
+
+        let remaining = limiter.try_claim().await.unwrap_err();
+
+        assert!(!remaining.is_zero());
+        assert!(remaining <= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn extending_a_client_cooldown_is_monotonic() {
+        let limiter = RateLimiter::new();
+        let existing = Instant::now() + Duration::from_secs(2);
+        *limiter.next_allowed.lock().await = existing;
+
+        limiter.extend_cooldown(Duration::from_millis(100)).await;
+        assert_eq!(*limiter.next_allowed.lock().await, existing);
+
+        limiter.extend_cooldown(Duration::from_secs(3)).await;
+        assert!(*limiter.next_allowed.lock().await > existing);
+    }
+
+    #[tokio::test]
+    async fn losing_the_claim_race_releases_both_network_permits() {
+        let client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            credentials(),
+        )
+        .unwrap();
+        let limiter = Arc::clone(&client.rate_limiters[&StoreId::from("ofk")]);
+        let (reached_sender, reached_receiver) = tokio::sync::oneshot::channel();
+        let (resume_sender, resume_receiver) = tokio::sync::oneshot::channel();
+        *limiter.before_claim.lock().await = Some((reached_sender, resume_receiver));
+
+        let acquisition = tokio::spawn({
+            let client = client.clone();
+            let limiter = Arc::clone(&limiter);
+            async move {
+                let permits = client.acquire_request_permits(&limiter).await.unwrap();
+                drop(permits);
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), reached_receiver)
+            .await
+            .expect("permit acquisition must reach the claim barrier")
+            .expect("claim barrier sender must remain alive");
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT_REQUESTS - 1
+        );
+        assert_eq!(
+            limiter.in_flight.available_permits(),
+            MAX_IN_FLIGHT_REQUESTS_PER_CLIENT - 1
+        );
+
+        *limiter.next_allowed.lock().await = Instant::now() + Duration::from_millis(250);
+        resume_sender
+            .send(())
+            .expect("permit acquisition must remain at the claim barrier");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if client.global_in_flight.available_permits() == MAX_GLOBAL_IN_FLIGHT_REQUESTS
+                    && limiter.in_flight.available_permits() == MAX_IN_FLIGHT_REQUESTS_PER_CLIENT
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the losing caller must release both permits before pacing again");
+
+        tokio::time::timeout(Duration::from_secs(1), acquisition)
+            .await
+            .expect("the caller must acquire fresh permits after pacing")
+            .expect("permit acquisition task must not panic");
+    }
+
+    #[tokio::test]
+    async fn pacing_wait_does_not_reserve_the_last_network_permits() {
+        let stores = BTreeMap::from([
+            (
+                StoreId::from("paced"),
+                StoreCredentials {
+                    client_id: "paced-client".to_owned(),
+                    api_key: "paced-key".to_owned(),
+                },
+            ),
+            (
+                StoreId::from("other"),
+                StoreCredentials {
+                    client_id: "other-client".to_owned(),
+                    api_key: "other-key".to_owned(),
+                },
+            ),
+        ]);
+        let client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            stores,
+        )
+        .unwrap();
+        let paced = Arc::clone(&client.rate_limiters[&StoreId::from("paced")]);
+        let other = Arc::clone(&client.rate_limiters[&StoreId::from("other")]);
+        *paced.next_allowed.lock().await = Instant::now() + Duration::from_secs(1);
+        let _global_reservations = client
+            .global_in_flight
+            .acquire_many(u32::try_from(MAX_GLOBAL_IN_FLIGHT_REQUESTS - 1).unwrap())
+            .await
+            .unwrap();
+        let _paced_reservations = paced
+            .in_flight
+            .acquire_many(u32::try_from(MAX_IN_FLIGHT_REQUESTS_PER_CLIENT - 1).unwrap())
+            .await
+            .unwrap();
+
+        let mut paced_acquisition = Box::pin(client.acquire_request_permits(&paced));
+        std::future::poll_fn(|context| {
+            assert!(matches!(
+                paced_acquisition.as_mut().poll(context),
+                Poll::Pending
+            ));
+            Poll::Ready(())
+        })
+        .await;
+
+        assert_eq!(client.global_in_flight.available_permits(), 1);
+        assert_eq!(paced.in_flight.available_permits(), 1);
+        let _last_global_permit = client
+            .global_in_flight
+            .try_acquire()
+            .expect("a paced caller must leave global capacity available");
+        let _other_client_permit = other
+            .in_flight
+            .try_acquire()
+            .expect("a paced caller must not reserve another client's capacity");
+        drop(paced_acquisition);
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_without_retry_after_releases_permits_for_a_shared_client_id() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(503, r#"{"error":"temporary"}"#)
+                .header("X-Request-Id", "retry-origin"),
+            MockResponse::new(200, r#"{"caller":"quiet"}"#),
+            MockResponse::new(200, r#"{"caller":"retried"}"#),
+        ]);
+        let stores = BTreeMap::from([
+            (
+                StoreId::from("noisy"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "noisy-key".to_owned(),
+                },
+            ),
+            (
+                StoreId::from("quiet"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "quiet-key".to_owned(),
+                },
+            ),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(2), stores).unwrap();
+        let limiter = Arc::clone(&client.rate_limiters[&StoreId::from("noisy")]);
+        let _global_reservations = client
+            .global_in_flight
+            .acquire_many(u32::try_from(MAX_GLOBAL_IN_FLIGHT_REQUESTS - 1).unwrap())
+            .await
+            .unwrap();
+        let _client_reservations = limiter
+            .in_flight
+            .acquire_many(u32::try_from(MAX_IN_FLIGHT_REQUESTS_PER_CLIENT - 1).unwrap())
+            .await
+            .unwrap();
+        let noisy_client = client.clone();
+        let noisy = tokio::spawn(async move {
+            noisy_client
+                .post(
+                    &StoreId::from("noisy"),
+                    "/v1/rating/summary",
+                    serde_json::json!({}),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if requests.try_recv().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the initial retryable request must reach the mock");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if client.global_in_flight.available_permits() == 1
+                    && limiter.in_flight.available_permits() == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry backoff must release both network permits");
+
+        let quiet = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.post(
+                &StoreId::from("quiet"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .expect("an alias must use the released permits during retry backoff")
+        .unwrap();
+        assert_eq!(quiet["caller"], "quiet");
+        assert_eq!(noisy.await.unwrap().unwrap()["caller"], "retried");
+        assert_request_count(&requests, 2);
+    }
+
+    #[tokio::test]
+    async fn bounded_retry_after_blocks_only_same_client_id_and_releases_network_permits() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(429, r#"{"error":"slow down"}"#)
+                .header("Retry-After", "1")
+                .header("X-Request-Id", "shared-cooldown"),
+            MockResponse::new(200, r#"{"caller":"other"}"#),
+            MockResponse::new(200, r#"{"caller":"shared"}"#),
+            MockResponse::new(200, r#"{"caller":"shared"}"#),
+        ]);
+        let stores = BTreeMap::from([
+            (
+                StoreId::from("noisy"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "noisy-key".to_owned(),
+                },
+            ),
+            (
+                StoreId::from("sibling"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "sibling-key".to_owned(),
+                },
+            ),
+            (
+                StoreId::from("other"),
+                StoreCredentials {
+                    client_id: "other-client".to_owned(),
+                    api_key: "other-key".to_owned(),
+                },
+            ),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(2), stores).unwrap();
+        let shared_limiter = Arc::clone(&client.rate_limiters[&StoreId::from("noisy")]);
+        let noisy_client = client.clone();
+        let noisy = tokio::spawn(async move {
+            noisy_client
+                .post(
+                    &StoreId::from("noisy"),
+                    "/v1/rating/summary",
+                    serde_json::json!({}),
+                )
+                .await
+        });
+
+        let first_request = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(request) = requests.try_recv() {
+                    break request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the rate-limited request reaches Ozon");
+        assert!(
+            first_request
+                .to_ascii_lowercase()
+                .contains("api-key: noisy-key")
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let ready_in = shared_limiter
+                    .next_allowed
+                    .lock()
+                    .await
+                    .saturating_duration_since(Instant::now());
+                if ready_in > Duration::from_millis(500)
+                    && client.global_in_flight.available_permits() == MAX_GLOBAL_IN_FLIGHT_REQUESTS
+                    && shared_limiter.in_flight.available_permits()
+                        == MAX_IN_FLIGHT_REQUESTS_PER_CLIENT
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Retry-After reaches the shared gate before permits are released");
+
+        let sibling_client = client.clone();
+        let mut sibling = tokio::spawn(async move {
+            sibling_client
+                .post(
+                    &StoreId::from("sibling"),
+                    "/v1/rating/summary",
+                    serde_json::json!({}),
+                )
+                .await
+        });
+        let other = tokio::time::timeout(
+            Duration::from_millis(300),
+            client.post(
+                &StoreId::from("other"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .expect("another Client-Id must not inherit the cooldown")
+        .unwrap();
+        assert_eq!(other["caller"], "other");
+        let other_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            other_request
+                .to_ascii_lowercase()
+                .contains("api-key: other-key")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut sibling)
+                .await
+                .is_err(),
+            "a same-Client-Id sibling must remain behind Retry-After"
+        );
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), noisy)
+                .await
+                .expect("the original request retries after the cooldown")
+                .unwrap()
+                .unwrap()["caller"],
+            "shared"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), sibling)
+                .await
+                .expect("the sibling proceeds after the cooldown")
+                .unwrap()
+                .unwrap()["caller"],
+            "shared"
+        );
+        assert_request_count(&requests, 2);
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT_REQUESTS
+        );
+        assert_eq!(
+            shared_limiter.in_flight.available_permits(),
+            MAX_IN_FLIGHT_REQUESTS_PER_CLIENT
+        );
+    }
+
+    #[tokio::test]
+    async fn final_attempt_retry_after_still_extends_the_shared_client_gate() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(429, r#"{"error":"first"}"#).header("Retry-After", "0"),
+            MockResponse::new(429, r#"{"error":"second"}"#).header("Retry-After", "0"),
+            MockResponse::new(429, r#"{"error":"final"}"#)
+                .header("Retry-After", "1")
+                .header("X-Request-Id", "final-cooldown"),
+            MockResponse::new(200, r#"{"caller":"other"}"#),
+            MockResponse::new(200, r#"{"caller":"sibling"}"#),
+        ]);
+        let stores = BTreeMap::from([
+            (
+                StoreId::from("primary"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "primary-key".to_owned(),
+                },
+            ),
+            (
+                StoreId::from("sibling"),
+                StoreCredentials {
+                    client_id: "shared-client".to_owned(),
+                    api_key: "sibling-key".to_owned(),
+                },
+            ),
+            (
+                StoreId::from("other"),
+                StoreCredentials {
+                    client_id: "other-client".to_owned(),
+                    api_key: "other-key".to_owned(),
+                },
+            ),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(2), stores).unwrap();
+        let error = client
+            .post(
+                &StoreId::from("primary"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            OzonError::RateLimited {
+                request_id: Some(request_id),
+                retry_after: Some(delay),
+            } if request_id == "final-cooldown" && *delay == Duration::from_secs(1)
+        ));
+        let shared_limiter = Arc::clone(&client.rate_limiters[&StoreId::from("primary")]);
+        assert!(
+            shared_limiter
+                .next_allowed
+                .lock()
+                .await
+                .saturating_duration_since(Instant::now())
+                > Duration::from_millis(500)
+        );
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT_REQUESTS
+        );
+        assert_eq!(
+            shared_limiter.in_flight.available_permits(),
+            MAX_IN_FLIGHT_REQUESTS_PER_CLIENT
+        );
+
+        let sibling_client = client.clone();
+        let mut sibling = tokio::spawn(async move {
+            sibling_client
+                .post(
+                    &StoreId::from("sibling"),
+                    "/v1/rating/summary",
+                    serde_json::json!({}),
+                )
+                .await
+        });
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                client.post(
+                    &StoreId::from("other"),
+                    "/v1/rating/summary",
+                    serde_json::json!({}),
+                ),
+            )
+            .await
+            .expect("another Client-Id remains available")
+            .unwrap()["caller"],
+            "other"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut sibling)
+                .await
+                .is_err(),
+            "the final attempt must leave same-Client-Id callers cooling down"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), sibling)
+                .await
+                .expect("the sibling proceeds after the final cooldown")
+                .unwrap()
+                .unwrap()["caller"],
+            "sibling"
+        );
+        assert_request_count(&requests, 5);
+    }
+
+    #[tokio::test]
+    async fn logical_deadline_preserves_the_preceding_upstream_error_and_releases_permits() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(503, r#"{"error":"temporary"}"#)
+                .header("X-Request-Id", "deadline-cause"),
+        ]);
+        let mut client = OzonClient::new(base_url, Duration::from_secs(2), credentials()).unwrap();
+        client.request_deadline = Duration::from_millis(80);
+        let limiter = Arc::clone(&client.rate_limiters[&StoreId::from("ofk")]);
+
+        let error = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            OzonError::Server {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                request_id: Some(request_id),
+                body,
+            } if request_id == "deadline-cause" && body.contains("temporary")
+        ));
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT_REQUESTS
+        );
+        assert_eq!(
+            limiter.in_flight.available_permits(),
+            MAX_IN_FLIGHT_REQUESTS_PER_CLIENT
+        );
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_reacquire_overload_keeps_the_original_upstream_error() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(503, r#"{"error":"temporary"}"#)
+                .header("Retry-After", "1")
+                .header("X-Request-Id", "causal-request-id"),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(2), credentials()).unwrap();
+        let limiter = Arc::clone(&client.rate_limiters[&StoreId::from("ofk")]);
+        let _global_reservations = client
+            .global_in_flight
+            .acquire_many(u32::try_from(MAX_GLOBAL_IN_FLIGHT_REQUESTS - 1).unwrap())
+            .await
+            .unwrap();
+        let _client_reservations = limiter
+            .in_flight
+            .acquire_many(u32::try_from(MAX_IN_FLIGHT_REQUESTS_PER_CLIENT - 1).unwrap())
+            .await
+            .unwrap();
+        let retrying_client = client.clone();
+        let retrying = tokio::spawn(async move {
+            retrying_client
+                .post(
+                    &StoreId::from("ofk"),
+                    "/v1/rating/summary",
+                    serde_json::json!({}),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if requests.try_recv().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the initial retryable request must reach the mock");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if client.global_in_flight.available_permits() == 1
+                    && limiter.in_flight.available_permits() == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retry backoff must release both network permits");
+        let _last_global_permit = client.global_in_flight.try_acquire().unwrap();
+        let _last_client_permit = limiter.in_flight.try_acquire().unwrap();
+
+        let error = retrying.await.unwrap().unwrap_err();
+        assert!(matches!(
+            &error,
+            OzonError::Server {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                request_id: Some(request_id),
+                body,
+            } if request_id == "causal-request-id" && body.contains("temporary")
+        ));
+        assert_eq!(error.kind(), OzonErrorKind::Server);
+        assert_eq!(error.request_id(), Some("causal-request-id"));
+        assert!(requests.try_recv().is_err());
     }
 
     #[test]

@@ -13,7 +13,7 @@ use reqwest::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 use crate::config::{PerformanceCredentials, StoreId};
 
@@ -231,14 +231,39 @@ impl AccountState {
         }
     }
 
-    async fn pace(&self, interval: Duration) {
-        let mut next_allowed = self.next_allowed.lock().await;
-        let wait = next_allowed.saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
+    async fn wait_until_ready(&self) {
+        loop {
+            let wait = {
+                let next_allowed = self.next_allowed.lock().await;
+                next_allowed.saturating_duration_since(Instant::now())
+            };
+            if wait.is_zero() {
+                return;
+            }
             tokio::time::sleep(wait).await;
         }
-        *next_allowed = Instant::now() + interval;
     }
+
+    async fn try_claim_request_slot(&self, interval: Duration) -> bool {
+        let mut next_allowed = self.next_allowed.lock().await;
+        let now = Instant::now();
+        if *next_allowed > now {
+            return false;
+        }
+        *next_allowed = now + interval;
+        true
+    }
+}
+
+struct RequestPermits<'a> {
+    _global: SemaphorePermit<'a>,
+    _account: SemaphorePermit<'a>,
+    _statistics: Option<SemaphorePermit<'a>>,
+}
+
+enum RequestAttempt {
+    Complete(Value),
+    Unauthorized { request_id: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -334,16 +359,16 @@ impl PerformanceClient {
     ) -> Result<Value, PerformanceError> {
         let mut pairs = Vec::with_capacity(query.campaign_ids.len() + 4);
         for campaign_id in query.campaign_ids {
-            pairs.push(("campaignIds".to_owned(), campaign_id.to_string()));
+            pairs.push(("campaignIds", campaign_id.to_string()));
         }
         if let Some(value) = query.adv_object_type {
-            pairs.push(("advObjectType".to_owned(), value.to_owned()));
+            pairs.push(("advObjectType", value.to_owned()));
         }
         if let Some(value) = query.state {
-            pairs.push(("state".to_owned(), value.to_owned()));
+            pairs.push(("state", value.to_owned()));
         }
-        pairs.push(("page".to_owned(), query.page.to_string()));
-        pairs.push(("pageSize".to_owned(), query.page_size.to_string()));
+        pairs.push(("page", query.page.to_string()));
+        pairs.push(("pageSize", query.page_size.to_string()));
         self.get(store, CAMPAIGNS_PATH, pairs).await
     }
 
@@ -371,10 +396,10 @@ impl PerformanceClient {
     ) -> Result<Value, PerformanceError> {
         let mut pairs = Vec::with_capacity(query.campaign_ids.len() + 2);
         for campaign_id in query.campaign_ids {
-            pairs.push(("campaignIds".to_owned(), campaign_id.to_string()));
+            pairs.push(("campaignIds", campaign_id.to_string()));
         }
-        pairs.push(("dateFrom".to_owned(), query.date_from));
-        pairs.push(("dateTo".to_owned(), query.date_to));
+        pairs.push(("dateFrom", query.date_from));
+        pairs.push(("dateTo", query.date_to));
         self.get(store, path, pairs).await
     }
 
@@ -382,7 +407,7 @@ impl PerformanceClient {
         &self,
         store: &StoreId,
         path: &'static str,
-        query: Vec<(String, String)>,
+        query: Vec<(&'static str, String)>,
     ) -> Result<Value, PerformanceError> {
         if !is_read_only_request_allowed(&Method::GET, path) {
             return Err(PerformanceError::EndpointNotAllowed {
@@ -402,21 +427,50 @@ impl PerformanceClient {
         &self,
         store: &StoreId,
         path: &'static str,
-        query: Vec<(String, String)>,
+        query: Vec<(&'static str, String)>,
     ) -> Result<Value, PerformanceError> {
         let state = self
             .accounts
             .get(store)
             .ok_or_else(|| PerformanceError::MissingCredentials(store.clone()))?;
-        let _global = self
+
+        // Preserve fail-fast overload semantics without retaining any permit
+        // while OAuth single-flight or account pacing may wait.
+        drop(self.try_request_permits(state, path)?);
+
+        let token = self.access_token(state).await?;
+        match self.request_attempt(state, path, &query, &token).await? {
+            RequestAttempt::Complete(value) => return Ok(value),
+            RequestAttempt::Unauthorized { .. } => {}
+        }
+
+        self.invalidate_token_if_current(state, &token).await;
+        let refreshed_token = self.access_token(state).await?;
+        match self
+            .request_attempt(state, path, &query, &refreshed_token)
+            .await?
+        {
+            RequestAttempt::Complete(value) => Ok(value),
+            RequestAttempt::Unauthorized { request_id } => {
+                Err(PerformanceError::Unauthorized { request_id })
+            }
+        }
+    }
+
+    fn try_request_permits<'a>(
+        &'a self,
+        state: &'a AccountState,
+        path: &'static str,
+    ) -> Result<RequestPermits<'a>, PerformanceError> {
+        let global = self
             .global_in_flight
             .try_acquire()
             .map_err(|_| PerformanceError::Overloaded)?;
-        let _account = state
+        let account = state
             .in_flight
             .try_acquire()
             .map_err(|_| PerformanceError::Overloaded)?;
-        let _statistics = if matches!(path, DAILY_STATS_PATH | EXPENSES_PATH) {
+        let statistics = if matches!(path, DAILY_STATS_PATH | EXPENSES_PATH) {
             Some(
                 state
                     .statistics_in_flight
@@ -426,29 +480,57 @@ impl PerformanceClient {
         } else {
             None
         };
+        Ok(RequestPermits {
+            _global: global,
+            _account: account,
+            _statistics: statistics,
+        })
+    }
 
-        let token = self.access_token(state).await?;
-        let response = self.send_get(state, path, &query, &token).await?;
-        if response.status() != StatusCode::UNAUTHORIZED {
-            return decode_json(response, MAX_RESPONSE_BODY_BYTES).await;
+    async fn request_attempt(
+        &self,
+        state: &AccountState,
+        path: &'static str,
+        query: &[(&'static str, String)],
+        token: &str,
+    ) -> Result<RequestAttempt, PerformanceError> {
+        loop {
+            state.wait_until_ready().await;
+            let permits = self.try_request_permits(state, path)?;
+
+            // Another ready waiter may have claimed the account slot between
+            // the non-blocking readiness check and permit acquisition. Never
+            // sleep while retaining scarce network capacity: release and retry.
+            if !state.try_claim_request_slot(self.interval).await {
+                drop(permits);
+                continue;
+            }
+
+            let response = self.send_get(path, query, token).await?;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                let request_id = safe_request_id(response.headers());
+                drop(response);
+                drop(permits);
+                return Ok(RequestAttempt::Unauthorized { request_id });
+            }
+
+            let result = decode_json(response, MAX_RESPONSE_BODY_BYTES)
+                .await
+                .map(RequestAttempt::Complete);
+            drop(permits);
+            return result;
         }
-        self.invalidate_token_if_current(state, &token).await;
-        let refreshed_token = self.access_token(state).await?;
-        let response = self.send_get(state, path, &query, &refreshed_token).await?;
-        decode_json(response, MAX_RESPONSE_BODY_BYTES).await
     }
 
     async fn send_get(
         &self,
-        state: &AccountState,
         path: &'static str,
-        query: &[(String, String)],
+        query: &[(&'static str, String)],
         token: &str,
     ) -> Result<Response, PerformanceError> {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| PerformanceError::InvalidToken)?;
         authorization.set_sensitive(true);
-        state.pace(self.interval).await;
         self.http
             .get(format!("{}{path}", self.base_url))
             .header(AUTHORIZATION, authorization)
@@ -569,7 +651,12 @@ async fn read_body(
             request_id,
         });
     }
-    let mut body = Vec::new();
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(limit);
+    let mut body = Vec::with_capacity(initial_capacity);
     while let Some(chunk) = response.chunk().await.map_err(classify_transport)? {
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(PerformanceError::ResponseTooLarge {
@@ -586,16 +673,16 @@ async fn read_body(
 fn safe_request_id(headers: &HeaderMap) -> Option<String> {
     ["x-o3-trace-id", "x-request-id"]
         .iter()
-        .find_map(|name| headers.get(*name))
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| {
-            !value.is_empty()
+        .filter_map(|name| headers.get(*name))
+        .find_map(|value| {
+            let value = value.to_str().ok()?.trim();
+            (!value.is_empty()
                 && value.len() <= MAX_REQUEST_ID_BYTES
                 && value.bytes().all(|byte| {
                     byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
-                })
+                }))
+            .then(|| value.to_owned())
         })
-        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -604,8 +691,11 @@ mod tests {
     use crate::test_support::mock_http;
     use std::{
         collections::BTreeMap,
+        future::Future,
         io::{Read, Write},
         net::TcpListener,
+        sync::mpsc,
+        task::{Context, Poll, Waker},
         thread,
     };
 
@@ -617,6 +707,35 @@ mod tests {
                 client_secret: "performance-secret".to_owned(),
             },
         )])
+    }
+
+    fn credentials_for(stores: &[&str]) -> BTreeMap<StoreId, PerformanceCredentials> {
+        stores
+            .iter()
+            .enumerate()
+            .map(|(index, store)| {
+                (
+                    StoreId::from(*store),
+                    PerformanceCredentials {
+                        client_id: format!("performance-client-{index}"),
+                        client_secret: format!("performance-secret-{index}"),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    async fn cache_access_token(
+        client: &PerformanceClient,
+        store: &StoreId,
+        value: &str,
+    ) -> Arc<AccountState> {
+        let state = Arc::clone(client.accounts.get(store).unwrap());
+        *state.token.lock().await = Some(CachedToken {
+            value: value.to_owned(),
+            refresh_at: Instant::now() + Duration::from_secs(60),
+        });
+        state
     }
 
     fn token(expires_in: u64) -> String {
@@ -1079,6 +1198,231 @@ mod tests {
         assert!(state.token.lock().await.is_none());
     }
 
+    #[tokio::test]
+    async fn pacing_waiters_across_accounts_do_not_hold_network_permits() {
+        let noisy_stores = ["noisy-a", "noisy-b", "noisy-c", "noisy-d"];
+        let client = PerformanceClient::build(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+            credentials_for(&["noisy-a", "noisy-b", "noisy-c", "noisy-d", "quiet"]),
+            "mcp-ozon-test",
+        )
+        .unwrap();
+        let noisy_states = noisy_stores
+            .iter()
+            .map(|store| Arc::clone(client.accounts.get(&StoreId::from(*store)).unwrap()))
+            .collect::<Vec<_>>();
+        let pacing_gates = [
+            noisy_states[0].next_allowed.lock().await,
+            noisy_states[1].next_allowed.lock().await,
+            noisy_states[2].next_allowed.lock().await,
+            noisy_states[3].next_allowed.lock().await,
+        ];
+        let query = vec![("page", "1".to_owned())];
+        let mut attempts = Vec::with_capacity(MAX_GLOBAL_IN_FLIGHT);
+        for state in &noisy_states {
+            for _ in 0..MAX_IN_FLIGHT_PER_CLIENT {
+                attempts.push(Box::pin(client.request_attempt(
+                    state,
+                    CAMPAIGNS_PATH,
+                    &query,
+                    "cached-token",
+                )));
+            }
+        }
+        assert_eq!(attempts.len(), MAX_GLOBAL_IN_FLIGHT);
+
+        // Poll every request exactly to its blocked pacing lock. This avoids
+        // scheduler- or wall-clock-dependent assertions about spawned tasks.
+        let mut context = Context::from_waker(Waker::noop());
+        for attempt in &mut attempts {
+            assert!(matches!(attempt.as_mut().poll(&mut context), Poll::Pending));
+        }
+
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT
+        );
+        for state in &noisy_states {
+            assert_eq!(
+                state.in_flight.available_permits(),
+                MAX_IN_FLIGHT_PER_CLIENT
+            );
+        }
+        let quiet = client.accounts.get(&StoreId::from("quiet")).unwrap();
+        let quiet_permits = client
+            .try_request_permits(quiet, CAMPAIGNS_PATH)
+            .expect("an unrelated ready account must retain network capacity");
+        drop(quiet_permits);
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT
+        );
+
+        drop(attempts);
+        drop(pacing_gates);
+    }
+
+    #[tokio::test]
+    async fn pacing_race_loser_releases_all_network_permits_before_waiting_again() {
+        let client = PerformanceClient::new_for_test(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(3),
+            credentials(),
+        );
+        let state = Arc::clone(client.accounts.get(&StoreId::from("shop")).unwrap());
+        let query = Vec::new();
+
+        // Hold the pacing mutex while both futures queue in a known FIFO order:
+        // the request first performs its readiness check, then the competing
+        // claimant takes the slot before that request can claim it itself.
+        let pacing_gate = state.next_allowed.lock().await;
+        let mut request =
+            Box::pin(client.request_attempt(&state, DAILY_STATS_PATH, &query, "cached-token"));
+        let mut winning_claim = Box::pin(state.try_claim_request_slot(Duration::from_secs(60)));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(request.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(
+            winning_claim.as_mut().poll(&mut context),
+            Poll::Pending
+        ));
+        drop(pacing_gate);
+
+        // The request completes the readiness check and acquires all three
+        // business permits, but its claim queues behind the competing future.
+        assert!(matches!(request.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT - 1
+        );
+        assert_eq!(
+            state.in_flight.available_permits(),
+            MAX_IN_FLIGHT_PER_CLIENT - 1
+        );
+        assert_eq!(state.statistics_in_flight.available_permits(), 0);
+
+        assert!(matches!(
+            winning_claim.as_mut().poll(&mut context),
+            Poll::Ready(true)
+        ));
+        assert!(matches!(request.as_mut().poll(&mut context), Poll::Pending));
+
+        // Losing the pacing race must return every permit before the request
+        // loops back into its 60-second pacing wait.
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT
+        );
+        assert_eq!(
+            state.in_flight.available_permits(),
+            MAX_IN_FLIGHT_PER_CLIENT
+        );
+        assert_eq!(state.statistics_in_flight.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_refresh_after_401_releases_all_business_permits() {
+        fn read_request(stream: &mut std::net::TcpStream) -> String {
+            let mut buffer = [0_u8; 4096];
+            let read = stream.read(&mut buffer).unwrap();
+            String::from_utf8_lossy(&buffer[..read]).into_owned()
+        }
+
+        fn write_json(stream: &mut std::net::TcpStream, status: u16, body: &str) {
+            write!(
+                stream,
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (refresh_started_tx, refresh_started_rx) = tokio::sync::oneshot::channel();
+        let (release_refresh_tx, release_refresh_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut first_request, _) = listener.accept().unwrap();
+            assert!(
+                read_request(&mut first_request)
+                    .starts_with("GET /api/client/statistics/daily/json?")
+            );
+            write_json(&mut first_request, 401, "{}");
+
+            let (mut refresh_request, _) = listener.accept().unwrap();
+            assert!(read_request(&mut refresh_request).starts_with("POST /api/client/token "));
+            refresh_started_tx.send(()).unwrap();
+            let refresh_response = thread::spawn(move || {
+                release_refresh_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                write_json(&mut refresh_request, 200, &token(1_800));
+            });
+
+            let (mut quiet_request, _) = listener.accept().unwrap();
+            assert!(read_request(&mut quiet_request).starts_with("GET /api/client/campaign?"));
+            write_json(&mut quiet_request, 200, r#"{"list":[]}"#);
+
+            let (mut replay_request, _) = listener.accept().unwrap();
+            assert!(
+                read_request(&mut replay_request)
+                    .starts_with("GET /api/client/statistics/daily/json?")
+            );
+            write_json(&mut replay_request, 200, r#"{"rows":[]}"#);
+            refresh_response.join().unwrap();
+        });
+
+        let client = PerformanceClient::new_for_test(
+            format!("http://{address}"),
+            Duration::from_secs(3),
+            credentials_for(&["noisy", "quiet"]),
+        );
+        let noisy_store = StoreId::from("noisy");
+        let quiet_store = StoreId::from("quiet");
+        let noisy_state = cache_access_token(&client, &noisy_store, "stale-token").await;
+        cache_access_token(&client, &quiet_store, "quiet-token").await;
+
+        let noisy_client = client.clone();
+        let noisy_task = tokio::spawn(async move {
+            noisy_client
+                .daily_statistics(&noisy_store, statistics_query())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), refresh_started_rx)
+            .await
+            .expect("the refresh request must start")
+            .expect("the server must signal refresh start");
+
+        assert_eq!(
+            client.global_in_flight.available_permits(),
+            MAX_GLOBAL_IN_FLIGHT
+        );
+        assert_eq!(
+            noisy_state.in_flight.available_permits(),
+            MAX_IN_FLIGHT_PER_CLIENT
+        );
+        assert_eq!(noisy_state.statistics_in_flight.available_permits(), 1);
+        let quiet_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.campaigns(&quiet_store, campaigns_query()),
+        )
+        .await
+        .expect("an unrelated account must not wait for OAuth refresh")
+        .unwrap();
+        assert_eq!(quiet_result, json!({"list": []}));
+
+        release_refresh_tx.send(()).unwrap();
+        let noisy_result = tokio::time::timeout(Duration::from_secs(1), noisy_task)
+            .await
+            .expect("the refreshed request must finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(noisy_result, json!({"rows": []}));
+        server.join().unwrap();
+    }
+
     #[test]
     fn credentials_request_ids_allowlist_and_error_codes_are_safe() {
         let credentials = PerformanceCredentials {
@@ -1093,11 +1437,16 @@ mod tests {
         headers.insert("x-request-id", HeaderValue::from_static("safe/id:1"));
         assert_eq!(safe_request_id(&headers).as_deref(), Some("safe/id:1"));
         headers.insert("x-o3-trace-id", HeaderValue::from_static("bad value"));
-        assert_eq!(safe_request_id(&headers), None);
+        assert_eq!(safe_request_id(&headers).as_deref(), Some("safe/id:1"));
         headers.insert(
             "x-o3-trace-id",
             HeaderValue::from_str(&"x".repeat(MAX_REQUEST_ID_BYTES + 1)).unwrap(),
         );
+        assert_eq!(safe_request_id(&headers).as_deref(), Some("safe/id:1"));
+        headers.insert("x-o3-trace-id", HeaderValue::from_static("  trace/id:2  "));
+        assert_eq!(safe_request_id(&headers).as_deref(), Some("trace/id:2"));
+        headers.insert("x-request-id", HeaderValue::from_static("also bad"));
+        headers.insert("x-o3-trace-id", HeaderValue::from_static("bad value"));
         assert_eq!(safe_request_id(&headers), None);
 
         assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 3);

@@ -14,6 +14,7 @@ token_endpoint="$issuer/protocol/openid-connect/token"
 revocation_endpoint="$issuer/protocol/openid-connect/revoke"
 jwks_uri="$issuer/protocol/openid-connect/certs"
 mcp_url="http://127.0.0.1:8788/mcp"
+mcp_host_header="Host: localhost:8788"
 resource_url="http://localhost:8788/mcp"
 metadata_url="http://127.0.0.1:8788/.well-known/oauth-protected-resource"
 resource_metadata_url="http://localhost:8788/.well-known/oauth-protected-resource"
@@ -90,6 +91,8 @@ terminate_mcp_session() {
   fi
   safe_curl --fail --silent --show-error \
     --request DELETE \
+    --header "$mcp_host_header" \
+    --header @"$access_token_header" \
     --header "Mcp-Session-Id: $session_id" \
     --header 'MCP-Protocol-Version: 2025-06-18' \
     --output /dev/null \
@@ -170,6 +173,52 @@ KC_CLI_PASSWORD="$KEYCLOAK_ADMIN_PASSWORD" "${compose[@]}" exec -T \
   --realm master \
   --user "$KEYCLOAK_ADMIN_USER" >/dev/null
 "${compose[@]}" exec -T keycloak chmod 600 "$kcadm_config"
+
+assert_username_identity_mapping() {
+  local scopes basic_scope_id mappers clients client_uuid defaults
+  scopes="$("${compose[@]}" exec -T keycloak \
+    /opt/keycloak/bin/kcadm.sh get client-scopes \
+    --config "$kcadm_config" \
+    --target-realm ofk \
+    --fields id,name)"
+  basic_scope_id="$(jq -er \
+    '[.[] | select(.name == "basic")] | if length == 1 then .[0].id else error("basic scope missing or ambiguous") end' \
+    <<<"$scopes")"
+  mappers="$("${compose[@]}" exec -T keycloak \
+    /opt/keycloak/bin/kcadm.sh get "client-scopes/$basic_scope_id/protocol-mappers/models" \
+    --config "$kcadm_config" \
+    --target-realm ofk)"
+  jq -e '
+    [.[] | select(
+      .name == "preferred_username"
+      and .protocolMapper == "oidc-usermodel-property-mapper"
+      and .config["user.attribute"] == "username"
+      and .config["claim.name"] == "preferred_username"
+      and .config["jsonType.label"] == "String"
+      and .config["access.token.claim"] == "true"
+      and .config["id.token.claim"] == "true"
+      and .config["userinfo.token.claim"] == "true"
+      and .config["introspection.token.claim"] == "true"
+    )] | length == 1' <<<"$mappers" >/dev/null
+  clients="$("${compose[@]}" exec -T keycloak \
+    /opt/keycloak/bin/kcadm.sh get clients \
+    --config "$kcadm_config" \
+    --target-realm ofk \
+    --query 'clientId=ozonofk-mcp' \
+    --fields id,clientId)"
+  client_uuid="$(jq -er \
+    '[.[] | select(.clientId == "ozonofk-mcp")] | if length == 1 then .[0].id else error("MCP client missing or ambiguous") end' \
+    <<<"$clients")"
+  defaults="$("${compose[@]}" exec -T keycloak \
+    /opt/keycloak/bin/kcadm.sh get "clients/$client_uuid/default-client-scopes" \
+    --config "$kcadm_config" \
+    --target-realm ofk \
+    --fields id,name)"
+  jq -e --arg id "$basic_scope_id" 'any(.[]; .id == $id)' \
+    <<<"$defaults" >/dev/null
+}
+
+assert_username_identity_mapping
 
 user_json="$("${compose[@]}" exec -T keycloak \
   /opt/keycloak/bin/kcadm.sh get users \
@@ -926,6 +975,7 @@ mcp_request() {
     --silent
     --show-error
     --request POST
+    --header "$mcp_host_header"
     --header 'Accept: application/json, text/event-stream'
     --header 'Content-Type: application/json'
     --header "Mcp-Session-Id: $session_id"
@@ -944,16 +994,42 @@ mcp_request() {
   chmod 600 "$headers_file" "$response_file"
 }
 
-mcp_initialize_public() {
-  local response_headers="$smoke_dir/public.initialize.headers"
-  local response_body="$smoke_dir/public.initialize.body"
+mcp_initialize_authenticated() {
+  local missing_headers="$smoke_dir/missing.initialize.headers"
+  local missing_body="$smoke_dir/missing.initialize.body"
+  local missing_status
+  local response_headers="$smoke_dir/authenticated.initialize.headers"
+  local response_body="$smoke_dir/authenticated.initialize.body"
   local response_status
+
+  missing_status="$(
+    safe_curl --silent --show-error \
+      --request POST \
+      --header "$mcp_host_header" \
+      --header 'Accept: application/json, text/event-stream' \
+      --header 'Content-Type: application/json' \
+      --dump-header "$missing_headers" \
+      --output "$missing_body" \
+      --write-out '%{http_code}' \
+      --data '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"keycloak-pkce-smoke","version":"1.0"}}}' \
+      "$mcp_url"
+  )"
+  chmod 600 "$missing_headers" "$missing_body"
+  if [[ "$missing_status" != "401" ]]; then
+    echo "Expected unauthenticated MCP initialize to return HTTP 401, got $missing_status" >&2
+    exit 1
+  fi
+  assert_transport_challenge \
+    missing-initialize "$missing_headers" "$missing_body" '' \
+    'Требуется авторизация: access token не передан.'
 
   response_status="$(
     safe_curl --silent --show-error \
       --request POST \
+      --header "$mcp_host_header" \
       --header 'Accept: application/json, text/event-stream' \
       --header 'Content-Type: application/json' \
+      --header @"$access_token_header" \
       --dump-header "$response_headers" \
       --output "$response_body" \
       --write-out '%{http_code}' \
@@ -962,7 +1038,7 @@ mcp_initialize_public() {
   )"
   chmod 600 "$response_headers" "$response_body"
   if [[ "$response_status" != "200" ]]; then
-    echo "Expected public MCP initialize to return HTTP 200, got $response_status" >&2
+    echo "Expected authenticated MCP initialize to return HTTP 200, got $response_status" >&2
     exit 1
   fi
   json_response "$response_body" \
@@ -976,26 +1052,27 @@ mcp_initialize_public() {
 }
 
 mcp_notify_initialized() {
-  local response_headers="$smoke_dir/public.notification.headers"
-  local response_body="$smoke_dir/public.notification.body"
+  local response_headers="$smoke_dir/authenticated.notification.headers"
+  local response_body="$smoke_dir/authenticated.notification.body"
   local response_status
 
   response_status="$(mcp_request \
     '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
     "$response_body" \
-    "$response_headers")"
+    "$response_headers" \
+    "$access_token_header")"
   case "$response_status" in
     200 | 202 | 204) ;;
     *)
-      echo "Public MCP initialized notification failed with HTTP $response_status" >&2
+      echo "Authenticated MCP initialized notification failed with HTTP $response_status" >&2
       exit 1
       ;;
   esac
 }
 
-mcp_list_tools_public() {
-  local response_headers="$smoke_dir/public.tools-list.headers"
-  local response_body="$smoke_dir/public.tools-list.body"
+mcp_list_tools_authenticated() {
+  local response_headers="$smoke_dir/authenticated.tools-list.headers"
+  local response_body="$smoke_dir/authenticated.tools-list.body"
   local stale_response_headers="$smoke_dir/stale.tools-list.headers"
   local stale_response_body="$smoke_dir/stale.tools-list.body"
   local expected_performance_tools='[
@@ -1014,9 +1091,10 @@ mcp_list_tools_public() {
   response_status="$(mcp_request \
     '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
     "$response_body" \
-    "$response_headers")"
+    "$response_headers" \
+    "$access_token_header")"
   if [[ "$response_status" != "200" ]]; then
-    echo "Expected public tools/list to return HTTP 200, got $response_status" >&2
+    echo "Expected authenticated tools/list to return HTTP 200, got $response_status" >&2
     exit 1
   fi
   json_response "$response_body" \
@@ -1042,38 +1120,58 @@ mcp_list_tools_public() {
     "$stale_response_body" \
     "$stale_response_headers" \
     "$invalid_token_header")"
-  if [[ "$stale_response_status" != "200" ]]; then
-    echo "Expected tools/list with a stale Authorization header to return HTTP 200, got $stale_response_status" >&2
+  if [[ "$stale_response_status" != "401" ]]; then
+    echo "Expected tools/list with a stale Authorization header to return HTTP 401, got $stale_response_status" >&2
     exit 1
   fi
-  json_response "$stale_response_body" \
-    | jq -e --argjson expected "$expected_performance_tools" \
-        --argjson expected_wb "$expected_wb_promotion_tools" '
-        .id == 3
-        and (.result.tools | any(.name == "list_members"))
-        and ([.result.tools[] | select(.name | startswith("ozon_performance_")) | .name] | sort)
-          == ($expected | sort)
-        and ([.result.tools[] | select(.name | startswith("wb_promotion_")) | .name] | sort)
-          == ($expected_wb | sort)
-        and all(
-          .result.tools[] | select(.name | startswith("ozon_performance_"));
-          .annotations.readOnlyHint == true and .annotations.destructiveHint == false
-        )
-        and all(
-          .result.tools[] | select(.name | startswith("wb_promotion_"));
-          .annotations.readOnlyHint == true and .annotations.destructiveHint == false
-        )' >/dev/null
+  assert_transport_challenge \
+    stale-tools-list "$stale_response_headers" "$stale_response_body" invalid_token \
+    'Требуется повторная авторизация: access token недействителен.'
+}
+
+assert_transport_challenge() {
+  local scenario="$1"
+  local response_headers="$2"
+  local response_body="$3"
+  local expected_error="$4"
+  local expected_body="$5"
+  local challenge
+  if [[ "$(<"$response_body")" != "$expected_body" ]]; then
+    echo "Unexpected sanitized body for $scenario" >&2
+    exit 1
+  fi
+  if grep -qi '^mcp-session-id:' "$response_headers"; then
+    echo "Authentication rejection unexpectedly allocated/exposed a session" >&2
+    exit 1
+  fi
+  challenge="$(awk 'tolower($1) == "www-authenticate:" { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$response_headers")"
+  if [[ "$challenge" != Bearer\ * \
+    || "$challenge" != *"resource_metadata=\"$resource_metadata_url\""* \
+    || "$challenge" != *"scope=\"$required_scope\""* ]]; then
+    echo "Missing or invalid Bearer challenge for $scenario" >&2
+    exit 1
+  fi
+  if [[ -z "$expected_error" ]]; then
+    if [[ "$challenge" == *'error='* || "$challenge" == *'error_description='* ]]; then
+      echo "Missing-credential challenge must not claim an invalid token" >&2
+      exit 1
+    fi
+  elif [[ "$challenge" != *"error=\"$expected_error\""* \
+    || "$challenge" != *'error_description="'* ]]; then
+    echo "Missing OAuth error details for $scenario" >&2
+    exit 1
+  fi
 }
 
 assert_call_auth_error() {
   local scenario="$1"
   local request_id="$2"
   local expected_error="$3"
-  local header_file="${4:-}"
+  local expected_body="$4"
+  local header_file="${5:-}"
   local response_headers="$smoke_dir/$scenario.mcp.headers"
   local response_body="$smoke_dir/$scenario.mcp.body"
   local response_status
-  local response_json
   local request_body
 
   request_body="$(jq -cn --argjson id "$request_id" \
@@ -1083,31 +1181,12 @@ assert_call_auth_error() {
     "$response_body" \
     "$response_headers" \
     "$header_file")"
-  if [[ "$response_status" != "200" ]]; then
-    echo "Expected $scenario tools/call to return HTTP 200, got $response_status" >&2
+  if [[ "$response_status" != "401" ]]; then
+    echo "Expected $scenario tools/call to return HTTP 401, got $response_status" >&2
     exit 1
   fi
-  response_json="$(json_response "$response_body")"
-  jq -e \
-    --argjson expected_id "$request_id" \
-    --arg expected_error "$expected_error" \
-    --arg metadata "$resource_metadata_url" \
-    --arg scope "$required_scope" '
-      .jsonrpc == "2.0"
-      and .id == $expected_id
-      and (has("error") | not)
-      and .result.isError == true
-      and ((.result._meta["mcp/www_authenticate"] // null) as $challenges
-        | ($challenges | type) == "array"
-        and ($challenges | length) > 0
-        and any($challenges[];
-          type == "string"
-          and startswith("Bearer ")
-          and contains("resource_metadata=\"" + $metadata + "\"")
-          and contains("scope=\"" + $scope + "\"")
-          and contains("error=\"" + $expected_error + "\"")
-          and test("error_description=\"[^\"]+\"")))' \
-    <<<"$response_json" >/dev/null
+  assert_transport_challenge \
+    "$scenario" "$response_headers" "$response_body" "$expected_error" "$expected_body"
 }
 
 assert_valid_members_call() {
@@ -1177,18 +1256,25 @@ make_authorization_header "$smoke_dir/refresh-token" "$refresh_token_header"
 printf '%s\n' 'Authorization: Bearer not-a-jwt' >"$invalid_token_header"
 chmod 600 "$invalid_token_header"
 
-mcp_initialize_public
+mcp_initialize_authenticated
 mcp_notify_initialized
-mcp_list_tools_public
-assert_call_auth_error missing-credentials 4 invalid_token
-assert_call_auth_error invalid-token 5 invalid_token "$invalid_token_header"
+mcp_list_tools_authenticated
+assert_call_auth_error missing-credentials 4 '' \
+  'Требуется авторизация: access token не передан.'
+assert_call_auth_error invalid-token 5 invalid_token \
+  'Требуется повторная авторизация: access token недействителен.' \
+  "$invalid_token_header"
 # The local Keycloak workaround binds the resource audience to the optional mcp:tools scope.
 # Omitting that scope therefore also omits the required audience and is correctly invalid_token;
 # deterministic Rust/wire tests cover valid-audience tokens that lack only the required scope.
-assert_call_auth_error missing-scope 6 invalid_token "$smoke_dir/missing-scope.authorization"
+assert_call_auth_error missing-scope 6 invalid_token \
+  'Требуется повторная авторизация: access token выпущен для другого ресурса.' \
+  "$smoke_dir/missing-scope.authorization"
 assert_valid_members_call access-token 7 "$access_token_header"
 assert_manager_performance_denied 10 "$access_token_header"
-assert_call_auth_error refresh-token-as-bearer 8 invalid_token "$refresh_token_header"
+assert_call_auth_error refresh-token-as-bearer 8 invalid_token \
+  'Требуется повторная авторизация: access token недействителен.' \
+  "$refresh_token_header"
 
 refresh_response="$smoke_dir/refresh.response.json"
 refresh_status="$(
@@ -1258,4 +1344,4 @@ assert_invalid_grant "$revoked_refresh_status" "$revoked_refresh_response" 'revo
 
 terminate_mcp_session
 delete_test_user
-echo "Keycloak PKCE E2E passed: S256 enforced; public discovery, Performance read-only inventory/RBAC, and MCP OAuth tool-call challenges verified; JWT and refresh accepted, actor=$actor_id"
+echo "Keycloak PKCE E2E passed: S256 enforced; public OAuth discovery, per-request MCP JWT, Performance read-only inventory/RBAC, and HTTP Bearer challenges verified; JWT and refresh accepted, actor=$actor_id"

@@ -25,7 +25,7 @@ use crate::{
     auth::{
         AuthenticatedActor, JwtAuthenticationFailure, JwtAuthenticator, ProtectedResourceMetadata,
     },
-    config::{Actor, Marketplace, RegistrySource, Role, StoreId},
+    config::{AccessRegistry, Actor, Marketplace, RegistrySource, Role, StoreId},
     ozon::OzonClient,
     ozon_performance::{
         CAMPAIGNS_PATH, CampaignsQuery, DAILY_STATS_PATH, EXPENSES_PATH, PerformanceClient,
@@ -143,11 +143,14 @@ const SENSITIVE_EXACT_FIELDS: &[&str] = &[
 ];
 
 fn is_sensitive_marketplace_field(field: &str) -> bool {
-    let field = field.to_ascii_lowercase();
-    SENSITIVE_FIELD_FRAGMENTS
+    SENSITIVE_FIELD_FRAGMENTS.iter().any(|fragment| {
+        field
+            .as_bytes()
+            .windows(fragment.len())
+            .any(|window| window.eq_ignore_ascii_case(fragment.as_bytes()))
+    }) || SENSITIVE_EXACT_FIELDS
         .iter()
-        .any(|fragment| field.contains(fragment))
-        || SENSITIVE_EXACT_FIELDS.contains(&field.as_str())
+        .any(|candidate| field.eq_ignore_ascii_case(candidate))
 }
 
 fn redact_marketplace_pii(value: &mut Value) {
@@ -313,6 +316,10 @@ impl OzonMcp {
             .map(JwtAuthenticator::protected_resource_metadata)
     }
 
+    pub(crate) fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
+        self.authenticator.as_ref()
+    }
+
     pub fn with_preview_features(
         mut self,
         postings_vnext: bool,
@@ -346,8 +353,12 @@ impl OzonMcp {
     fn access_context(
         &self,
         identity: &RequestIdentity,
-    ) -> Result<(Arc<crate::config::AccessRegistry>, Actor), String> {
-        let registry = self.registry.load().map_err(config_error)?;
+    ) -> Result<(Arc<AccessRegistry>, Actor), String> {
+        let registry = match identity.registry.as_ref() {
+            Some(RequestRegistry::Loaded(registry)) => Arc::clone(registry),
+            Some(RequestRegistry::Failed(error)) => return Err(error.clone()),
+            None => self.registry_without_request_snapshot()?,
+        };
         let actor_id = identity
             .actor_id
             .as_deref()
@@ -355,6 +366,15 @@ impl OzonMcp {
             .ok_or_else(|| "ACCESS_DENIED: отсутствует проверенная идентичность".to_owned())?;
         let actor = registry.actor(actor_id).map_err(config_error)?.clone();
         Ok((registry, actor))
+    }
+
+    fn registry_without_request_snapshot(&self) -> Result<Arc<AccessRegistry>, String> {
+        // Unit tests call individual private tool methods directly. The
+        // production router always installs one asynchronously loaded request
+        // snapshot before extracting `RequestIdentity`; retaining this
+        // defensive fallback also preserves the original fail-closed behavior
+        // if an internal caller ever bypasses the router.
+        self.registry.load().map_err(config_error)
     }
 
     fn resolve_store_for_actor(
@@ -675,9 +695,25 @@ impl OzonMcp {
     }
 }
 
+#[derive(Debug, Clone)]
+enum RequestRegistry {
+    Loaded(Arc<AccessRegistry>),
+    Failed(String),
+}
+
+impl RequestRegistry {
+    async fn load(source: &RegistrySource) -> Self {
+        match source.load_async().await {
+            Ok(registry) => Self::Loaded(registry),
+            Err(error) => Self::Failed(config_error(error)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RequestIdentity {
     actor_id: Option<String>,
+    registry: Option<RequestRegistry>,
 }
 
 impl RequestIdentity {
@@ -690,6 +726,7 @@ impl RequestIdentity {
     fn authenticated(actor_id: &str) -> Self {
         Self {
             actor_id: Some(actor_id.to_owned()),
+            registry: None,
         }
     }
 }
@@ -701,7 +738,8 @@ where
     fn from_context_part(context: &mut C) -> Result<Self, rmcp::ErrorData> {
         let actor_id =
             authenticated_actor(context.as_request_context()).map(|actor| actor.actor_id.clone());
-        Ok(Self { actor_id })
+        let registry = request_registry(context.as_request_context());
+        Ok(Self { actor_id, registry })
     }
 }
 
@@ -712,6 +750,20 @@ fn authenticated_actor(context: &RequestContext<RoleServer>) -> Option<&Authenti
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<AuthenticatedActor>())
     })
+}
+
+fn request_registry(context: &RequestContext<RoleServer>) -> Option<RequestRegistry> {
+    context
+        .extensions
+        .get::<RequestRegistry>()
+        .cloned()
+        .or_else(|| {
+            context
+                .extensions
+                .get::<axum::http::request::Parts>()
+                .and_then(|parts| parts.extensions.get::<Arc<AccessRegistry>>())
+                .map(|registry| RequestRegistry::Loaded(Arc::clone(registry)))
+        })
 }
 
 fn request_headers(context: &RequestContext<RoleServer>) -> axum::http::HeaderMap {
@@ -920,43 +972,64 @@ pub struct WbAccountInput {
     pub account: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WbSalesFunnelInput {
-    #[serde(default)]
-    #[schemars(
-        description = "Канонический account_id Wildberries из wb_stores_status",
-        length(min = 1, max = 128)
-    )]
-    pub account: Option<String>,
-    #[schemars(
-        description = "Начало периода в формате YYYY-MM-DD",
-        length(equal = 10)
-    )]
-    pub date_from: String,
-    #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
-    pub date_to: String,
-    #[serde(default)]
-    #[schemars(length(max = 1_000))]
-    pub nm_ids: Vec<u64>,
-    #[serde(default)]
-    #[schemars(length(max = 100), inner(length(min = 1, max = 128)))]
-    pub brand_names: Vec<String>,
-    #[serde(default)]
-    #[schemars(length(max = 1_000))]
-    pub subject_ids: Vec<u64>,
-    #[serde(default)]
-    #[schemars(length(max = 1_000))]
-    pub tag_ids: Vec<u64>,
-    #[serde(default)]
-    pub skip_deleted_nm: bool,
-    #[serde(default = "default_product_limit")]
-    #[schemars(range(min = 1, max = 1_000))]
-    pub limit: u32,
-    #[serde(default)]
-    #[schemars(range(max = 1_000_000))]
-    pub offset: u32,
+macro_rules! wb_funnel_filter_input {
+    (
+        $name:ident,
+        $from_description:literal,
+        brand_max = $brand_max:literal,
+        ids_max = $ids_max:literal,
+        before = { $($before:tt)* },
+        after = { $($after:tt)* }
+    ) => {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            #[serde(default)]
+            #[schemars(
+                description = "Канонический account_id Wildberries из wb_stores_status",
+                length(min = 1, max = 128)
+            )]
+            pub account: Option<String>,
+            #[schemars(description = $from_description, length(equal = 10))]
+            pub date_from: String,
+            #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
+            pub date_to: String,
+            $($before)*
+            #[serde(default)]
+            #[schemars(length(max = $brand_max), inner(length(min = 1, max = 128)))]
+            pub brand_names: Vec<String>,
+            #[serde(default)]
+            #[schemars(length(max = $ids_max))]
+            pub subject_ids: Vec<u64>,
+            #[serde(default)]
+            #[schemars(length(max = $ids_max))]
+            pub tag_ids: Vec<u64>,
+            $($after)*
+        }
+    };
 }
+
+wb_funnel_filter_input!(
+    WbSalesFunnelInput,
+    "Начало периода в формате YYYY-MM-DD",
+    brand_max = 100,
+    ids_max = 1_000,
+    before = {
+        #[serde(default)]
+        #[schemars(length(max = 1_000))]
+        pub nm_ids: Vec<u64>,
+    },
+    after = {
+        #[serde(default)]
+        pub skip_deleted_nm: bool,
+        #[serde(default = "default_product_limit")]
+        #[schemars(range(min = 1, max = 1_000))]
+        pub limit: u32,
+        #[serde(default)]
+        #[schemars(range(max = 1_000_000))]
+        pub offset: u32,
+    }
+);
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -990,36 +1063,19 @@ pub struct WbSalesFunnelHistoryInput {
     pub aggregation_level: WbAggregationLevel,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WbSalesFunnelGroupedHistoryInput {
-    #[serde(default)]
-    #[schemars(
-        description = "Канонический account_id Wildberries из wb_stores_status",
-        length(min = 1, max = 128)
-    )]
-    pub account: Option<String>,
-    #[schemars(
-        description = "Начало периода в формате YYYY-MM-DD; WB хранит историю этого отчёта за последнюю неделю",
-        length(equal = 10)
-    )]
-    pub date_from: String,
-    #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
-    pub date_to: String,
-    #[serde(default)]
-    #[schemars(length(max = 16), inner(length(min = 1, max = 128)))]
-    pub brand_names: Vec<String>,
-    #[serde(default)]
-    #[schemars(length(max = 16))]
-    pub subject_ids: Vec<u64>,
-    #[serde(default)]
-    #[schemars(length(max = 16))]
-    pub tag_ids: Vec<u64>,
-    #[serde(default)]
-    pub skip_deleted_nm: bool,
-    #[serde(default)]
-    pub aggregation_level: WbAggregationLevel,
-}
+wb_funnel_filter_input!(
+    WbSalesFunnelGroupedHistoryInput,
+    "Начало периода в формате YYYY-MM-DD; WB хранит историю этого отчёта за последнюю неделю",
+    brand_max = 16,
+    ids_max = 16,
+    before = {},
+    after = {
+        #[serde(default)]
+        pub skip_deleted_nm: bool,
+        #[serde(default)]
+        pub aggregation_level: WbAggregationLevel,
+    }
+);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1424,22 +1480,31 @@ pub struct TurnoverInput {
     pub offset: u32,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PostingListInput {
-    #[serde(default)]
-    #[schemars(
-        description = "Канонический store_id или account_id из marketplace_accounts",
-        length(min = 1, max = 128)
-    )]
-    pub store: Option<StoreId>,
-    #[schemars(
-        description = "Начало периода в формате YYYY-MM-DD",
-        length(equal = 10)
-    )]
-    pub date_from: String,
-    #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
-    pub date_to: String,
+macro_rules! period_input {
+    ($name:ident, $from_description:literal, $to_description:literal, { $($fields:tt)* }) => {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            #[serde(default)]
+            #[schemars(
+                description = "Канонический store_id или account_id из marketplace_accounts",
+                length(min = 1, max = 128)
+            )]
+            pub store: Option<StoreId>,
+            #[schemars(description = $from_description, length(equal = 10))]
+            pub date_from: String,
+            #[schemars(description = $to_description, length(equal = 10))]
+            pub date_to: String,
+            $($fields)*
+        }
+    };
+}
+
+period_input!(
+    PostingListInput,
+    "Начало периода в формате YYYY-MM-DD",
+    "Конец периода в формате YYYY-MM-DD",
+    {
     #[serde(default)]
     #[schemars(length(max = 128))]
     pub status: String,
@@ -1456,8 +1521,9 @@ pub struct PostingListInput {
     )]
     pub cursor: Option<String>,
     #[serde(default)]
-    pub direction: SortDirection,
-}
+        pub direction: SortDirection,
+    }
+);
 
 fn default_posting_limit() -> u32 {
     100
@@ -1480,25 +1546,11 @@ impl ReturnSchema {
     }
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ReturnsInput {
-    #[serde(default)]
-    #[schemars(
-        description = "Канонический store_id или account_id из marketplace_accounts",
-        length(min = 1, max = 128)
-    )]
-    pub store: Option<StoreId>,
-    #[schemars(
-        description = "Начало периода изменения статуса в формате YYYY-MM-DD",
-        length(equal = 10)
-    )]
-    pub date_from: String,
-    #[schemars(
-        description = "Конец периода изменения статуса в формате YYYY-MM-DD",
-        length(equal = 10)
-    )]
-    pub date_to: String,
+period_input!(
+    ReturnsInput,
+    "Начало периода изменения статуса в формате YYYY-MM-DD",
+    "Конец периода изменения статуса в формате YYYY-MM-DD",
+    {
     #[serde(default)]
     pub return_schema: ReturnSchema,
     #[serde(default)]
@@ -1512,32 +1564,19 @@ pub struct ReturnsInput {
     pub limit: u32,
     #[serde(default)]
     #[schemars(range(max = 18_446_744_073_709_551_615_u64))]
-    pub last_id: u64,
-}
+        pub last_id: u64,
+    }
+);
 
 fn default_returns_limit() -> u32 {
     500
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct RfbsReturnsInput {
-    #[serde(default)]
-    #[schemars(
-        description = "Канонический store_id или account_id из marketplace_accounts",
-        length(min = 1, max = 128)
-    )]
-    pub store: Option<StoreId>,
-    #[schemars(
-        description = "Начало периода создания возврата в формате YYYY-MM-DD",
-        length(equal = 10)
-    )]
-    pub date_from: String,
-    #[schemars(
-        description = "Конец периода создания возврата в формате YYYY-MM-DD",
-        length(equal = 10)
-    )]
-    pub date_to: String,
+period_input!(
+    RfbsReturnsInput,
+    "Начало периода создания возврата в формате YYYY-MM-DD",
+    "Конец периода создания возврата в формате YYYY-MM-DD",
+    {
     #[serde(default)]
     #[schemars(length(max = 256))]
     pub offer_id: String,
@@ -1552,29 +1591,19 @@ pub struct RfbsReturnsInput {
     pub last_id: u64,
     #[serde(default = "default_rfbs_returns_limit")]
     #[schemars(range(min = 1, max = 100))]
-    pub limit: u32,
-}
+        pub limit: u32,
+    }
+);
 
 fn default_rfbs_returns_limit() -> u32 {
     100
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct FinanceInput {
-    #[serde(default)]
-    #[schemars(
-        description = "Канонический store_id или account_id из marketplace_accounts",
-        length(min = 1, max = 128)
-    )]
-    pub store: Option<StoreId>,
-    #[schemars(
-        description = "Начало периода в формате YYYY-MM-DD",
-        length(equal = 10)
-    )]
-    pub date_from: String,
-    #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
-    pub date_to: String,
+period_input!(
+    FinanceInput,
+    "Начало периода в формате YYYY-MM-DD",
+    "Конец периода в формате YYYY-MM-DD",
+    {
     #[serde(default)]
     #[schemars(length(max = 256))]
     pub posting_number: String,
@@ -1589,8 +1618,9 @@ pub struct FinanceInput {
     pub page: u32,
     #[serde(default = "default_finance_page_size")]
     #[schemars(range(min = 1, max = 1_000))]
-    pub page_size: u32,
-}
+        pub page_size: u32,
+    }
+);
 
 fn default_transaction_type() -> String {
     "all".to_owned()
@@ -1604,29 +1634,19 @@ fn default_finance_page_size() -> u32 {
     1_000
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct FinanceTotalsInput {
-    #[serde(default)]
-    #[schemars(
-        description = "Канонический store_id или account_id из marketplace_accounts",
-        length(min = 1, max = 128)
-    )]
-    pub store: Option<StoreId>,
-    #[schemars(
-        description = "Начало периода в формате YYYY-MM-DD",
-        length(equal = 10)
-    )]
-    pub date_from: String,
-    #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
-    pub date_to: String,
+period_input!(
+    FinanceTotalsInput,
+    "Начало периода в формате YYYY-MM-DD",
+    "Конец периода в формате YYYY-MM-DD",
+    {
     #[serde(default)]
     #[schemars(length(max = 256))]
     pub posting_number: String,
     #[serde(default = "default_transaction_type")]
     #[schemars(length(max = 128))]
-    pub transaction_type: String,
-}
+        pub transaction_type: String,
+    }
+);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -3127,13 +3147,23 @@ impl ServerHandler for OzonMcp {
         mut context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
         let cancellation = context.ct.clone();
+        if context.extensions.get::<RequestRegistry>().is_none()
+            && let Some(registry) = request_registry(&context)
+        {
+            context.extensions.insert(registry);
+        }
         if let Some(authenticator) = &self.authenticator {
             let actor = match authenticated_actor(&context).cloned() {
                 Some(actor) => actor,
                 None => {
                     let headers = request_headers(&context);
-                    match authenticator.authenticate(&headers).await {
-                        Ok(actor) => actor,
+                    match authenticator.authenticate_with_registry(&headers).await {
+                        Ok(access) => {
+                            context
+                                .extensions
+                                .insert(RequestRegistry::Loaded(access.registry));
+                            access.actor
+                        }
                         Err(failure) => {
                             return Ok(authentication_failure_response(authenticator, failure));
                         }
@@ -3148,9 +3178,16 @@ impl ServerHandler for OzonMcp {
         // the server is currently saturated. Once authenticated, fail fast:
         // queued model calls must not grow memory without bound or reserve an
         // outbound marketplace slot long after the user has moved on.
-        let dispatch = self
-            .tool_router
-            .call(ToolCallContext::new(self, request, context));
+        let dispatch = async move {
+            if context.extensions.get::<RequestRegistry>().is_none() {
+                context
+                    .extensions
+                    .insert(RequestRegistry::load(&self.registry).await);
+            }
+            self.tool_router
+                .call(ToolCallContext::new(self, request, context))
+                .await
+        };
         self.run_tool_call_with_admission(cancellation, Box::pin(dispatch))
             .await
     }
@@ -7756,7 +7793,14 @@ mod tests {
         .unwrap();
         let registry = registry_source();
         let authenticator = jwt_authenticator(&registry);
-        let server = Arc::new(OzonMcp::new_authenticated(client, registry, authenticator));
+        let authenticated_registry = registry
+            .load()
+            .expect("the transport authentication snapshot must load");
+        let server = Arc::new(OzonMcp::new_authenticated(
+            client,
+            registry.clone(),
+            authenticator,
+        ));
         let service: StreamableHttpService<OzonMcp, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok((*server).clone()),
@@ -7769,7 +7813,8 @@ mod tests {
             .nest_service("/mcp", service)
             .layer(Extension(AuthenticatedActor {
                 actor_id: "admin".to_owned(),
-            }));
+            }))
+            .layer(Extension(authenticated_registry));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -7790,6 +7835,11 @@ mod tests {
         let body = response.text().await.unwrap();
         assert!(body.contains("admin"), "{body}");
         assert!(!body.contains(ACCESS_DENIED), "{body}");
+        assert_eq!(
+            registry.load_count(),
+            1,
+            "tool RBAC must reuse the transport authentication snapshot without reloading"
+        );
         task.abort();
     }
 
@@ -7934,6 +7984,10 @@ mod tests {
         let error = result.err().unwrap();
         assert!(error.starts_with("MCP_ACCESS_CONFIG_ERROR:"));
         assert!(error.contains("неверный JSON"));
+
+        let body = call_tool_over_http(server, "marketplace_accounts", json!({})).await;
+        assert!(body.contains("MCP_ACCESS_CONFIG_ERROR:"), "{body}");
+        assert!(body.contains("неверный JSON"), "{body}");
     }
 
     #[tokio::test]

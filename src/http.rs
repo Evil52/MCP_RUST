@@ -19,7 +19,7 @@ use axum::{
     extract::{Request, State},
     http::{
         HeaderValue, Method, StatusCode,
-        header::{CONTENT_TYPE, RETRY_AFTER},
+        header::{CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -28,13 +28,18 @@ use axum::{
 use http_body::{Frame, SizeHint};
 use rmcp::transport::{
     StreamableHttpServerConfig, StreamableHttpService,
-    streamable_http_server::session::local::LocalSessionManager,
+    streamable_http_server::{
+        session::local::LocalSessionManager, tower::validate_streamable_http_request_headers,
+    },
 };
 use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::server::OzonMcp;
+use crate::{
+    auth::{JwtAuthenticationFailure, JwtAuthenticator},
+    server::OzonMcp,
+};
 
 /// Maximum JSON body accepted by the MCP endpoint.
 ///
@@ -73,12 +78,37 @@ pub const MCP_MAX_IN_FLIGHT_POST_RESPONSES: usize = 16;
 /// execution permits needed for tool calls and session control messages.
 pub const MCP_MAX_IN_FLIGHT_STREAMS: usize = 64;
 
+/// Default period with no MCP protocol activity before a legacy session is
+/// reclaimed. In-flight requests suspend this countdown.
+pub const MCP_SESSION_IDLE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(120);
+
+const DEV_MCP_ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
+
+/// Browser origins permitted by the single-user development mode.
+///
+/// The vendored transport treats a portless loopback allowlist entry as an
+/// explicit any-port rule. That keeps local Inspector/Vite-style browser
+/// clients working even when they choose an ephemeral port, without extending
+/// the exception to a non-loopback host.
+const DEV_MCP_ALLOWED_ORIGINS: &[&str] = &[
+    "http://localhost",
+    "http://127.0.0.1",
+    "http://[::1]",
+    "https://localhost",
+    "https://127.0.0.1",
+    "https://[::1]",
+];
+
 #[derive(Clone)]
 struct McpHttpLimits {
+    auth_request_permits: Arc<Semaphore>,
+    auth_stream_permits: Arc<Semaphore>,
     request_permits: Arc<Semaphore>,
     post_response_permits: Arc<Semaphore>,
     stream_permits: Arc<Semaphore>,
     body_read_timeout: Duration,
+    transport_config: Arc<StreamableHttpServerConfig>,
+    authenticator: Option<JwtAuthenticator>,
 }
 
 struct PermitBody {
@@ -112,12 +142,19 @@ impl HttpBody for PermitBody {
 }
 
 impl McpHttpLimits {
-    fn production() -> Self {
+    fn production(
+        transport_config: StreamableHttpServerConfig,
+        authenticator: Option<JwtAuthenticator>,
+    ) -> Self {
         Self {
+            auth_request_permits: Arc::new(Semaphore::new(MCP_MAX_IN_FLIGHT_REQUESTS)),
+            auth_stream_permits: Arc::new(Semaphore::new(MCP_MAX_IN_FLIGHT_STREAMS)),
             request_permits: Arc::new(Semaphore::new(MCP_MAX_IN_FLIGHT_REQUESTS)),
             post_response_permits: Arc::new(Semaphore::new(MCP_MAX_IN_FLIGHT_POST_RESPONSES)),
             stream_permits: Arc::new(Semaphore::new(MCP_MAX_IN_FLIGHT_STREAMS)),
             body_read_timeout: MCP_REQUEST_BODY_READ_TIMEOUT,
+            transport_config: Arc::new(transport_config),
+            authenticator,
         }
     }
 
@@ -129,15 +166,32 @@ impl McpHttpLimits {
         body_read_timeout: Duration,
     ) -> Self {
         Self {
+            auth_request_permits: Arc::new(Semaphore::new(requests)),
+            auth_stream_permits: Arc::new(Semaphore::new(streams)),
             request_permits: Arc::new(Semaphore::new(requests)),
             post_response_permits: Arc::new(Semaphore::new(post_responses)),
             stream_permits: Arc::new(Semaphore::new(streams)),
             body_read_timeout,
+            transport_config: Arc::new(
+                StreamableHttpServerConfig::default()
+                    .with_max_request_body_bytes(MCP_REQUEST_BODY_LIMIT_BYTES)
+                    .with_allowed_origins(DEV_MCP_ALLOWED_ORIGINS.iter().copied()),
+            ),
+            authenticator: None,
         }
     }
 
     fn try_enter_request(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.request_permits).try_acquire_owned().ok()
+    }
+
+    fn try_enter_auth(&self, method: &Method) -> Option<OwnedSemaphorePermit> {
+        let permits = if method == Method::GET {
+            &self.auth_stream_permits
+        } else {
+            &self.auth_request_permits
+        };
+        Arc::clone(permits).try_acquire_owned().ok()
     }
 
     fn try_enter_stream(&self) -> Option<OwnedSemaphorePermit> {
@@ -158,7 +212,11 @@ enum McpBodyReadFailure {
 }
 
 async fn read_bounded_mcp_body(mut body: Body) -> Result<Vec<u8>, McpBodyReadFailure> {
-    let mut bytes = Vec::new();
+    let minimum_length = body.size_hint().lower();
+    if minimum_length > MCP_REQUEST_BODY_LIMIT_BYTES as u64 {
+        return Err(McpBodyReadFailure::TooLarge);
+    }
+    let mut bytes = Vec::with_capacity(minimum_length as usize);
     loop {
         let frame = std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await;
         let Some(frame) = frame else {
@@ -674,12 +732,99 @@ fn capacity_exhausted_response(message: &'static str) -> Response {
     response
 }
 
+fn authentication_failure_response(
+    authenticator: &JwtAuthenticator,
+    failure: JwtAuthenticationFailure,
+) -> Response {
+    let status = match failure {
+        JwtAuthenticationFailure::MissingCredentials
+        | JwtAuthenticationFailure::InvalidToken
+        | JwtAuthenticationFailure::ExpiredToken
+        | JwtAuthenticationFailure::WrongAudience => StatusCode::UNAUTHORIZED,
+        JwtAuthenticationFailure::InsufficientScope | JwtAuthenticationFailure::AccessDenied => {
+            StatusCode::FORBIDDEN
+        }
+        JwtAuthenticationFailure::VerifierUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    let mut response = (status, failure.public_message()).into_response();
+    if let Some(challenge) = authenticator.challenge(&failure) {
+        response.headers_mut().insert(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_str(&challenge)
+                .expect("validated OAuth metadata and scopes form a safe challenge"),
+        );
+    }
+    response
+}
+
 fn is_sse_response(response: &Response) -> bool {
     response
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream"))
+}
+
+fn exact_origin_from_resource_url(resource_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(resource_url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let scheme = parsed.scheme();
+    let host = parsed
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let port = parsed.port_or_known_default()?;
+    let authority_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    Some(format!("{scheme}://{authority_host}:{port}"))
+}
+
+fn allowed_mcp_origins(protected_resource_url: Option<&str>) -> Vec<String> {
+    match protected_resource_url {
+        Some(resource_url) => vec![
+            // AppConfig validates production resource URLs. Retaining one
+            // deliberately invalid entry if a programmatic caller bypasses
+            // that boundary keeps Origin-bearing requests fail-closed rather
+            // than accidentally disabling validation with an empty list.
+            exact_origin_from_resource_url(resource_url).unwrap_or_default(),
+        ],
+        None => DEV_MCP_ALLOWED_ORIGINS
+            .iter()
+            .map(|origin| (*origin).to_owned())
+            .collect(),
+    }
+}
+
+fn exact_host_from_resource_url(resource_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(resource_url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    // Host validation prevents DNS rebinding and therefore binds the hostname,
+    // not the listener-facing port. A reverse proxy may legitimately forward
+    // the public hostname to a different internal port. Browser ports remain
+    // constrained independently by the exact Origin policy above.
+    Some(parsed.host_str()?.to_owned())
+}
+
+fn allowed_mcp_hosts(protected_resource_url: Option<&str>) -> Vec<String> {
+    match protected_resource_url {
+        Some(resource_url) => vec![
+            // Keep a non-empty, non-matching policy when a programmatic caller
+            // bypasses AppConfig validation. An empty allowlist would disable
+            // rmcp's Host validation entirely.
+            exact_host_from_resource_url(resource_url).unwrap_or_default(),
+        ],
+        None => DEV_MCP_ALLOWED_HOSTS
+            .iter()
+            .map(|host| (*host).to_owned())
+            .collect(),
+    }
 }
 
 fn hold_permit_through_body(response: Response, permit: OwnedSemaphorePermit) -> Response {
@@ -695,14 +840,61 @@ fn hold_permit_through_body(response: Response, permit: OwnedSemaphorePermit) ->
 
 async fn limit_mcp_request_concurrency(
     State(limits): State<McpHttpLimits>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let method = request.method().clone();
-    if method == Method::GET {
+    // The transport performs this exact preflight again as its own security
+    // boundary. Sharing its validator here avoids reading a potentially
+    // unbounded-latency body for a request whose headers already guarantee a
+    // rejection, without maintaining a second set of subtly divergent rules.
+    if let Err(response) = validate_streamable_http_request_headers(
+        request.method(),
+        request.uri(),
+        request.headers(),
+        limits.transport_config.as_ref(),
+        false,
+    ) {
+        let (parts, body) = response.into_parts();
+        return Response::from_parts(parts, Body::new(body));
+    }
+
+    // The MCP authorization specification requires the access token on every
+    // HTTP request. Authenticate before body polling or session lookup and
+    // carry the exact registry snapshot used for OIDC mapping into the request
+    // so downstream RBAC cannot observe a different reload. A dedicated gate
+    // bounds JWT/JWKS futures without letting unauthenticated work occupy the
+    // subsequent MCP execution/stream budget.
+    if let Some(authenticator) = &limits.authenticator {
+        let Some(auth_permit) = limits.try_enter_auth(&method) else {
+            return capacity_exhausted_response("MCP authentication capacity exhausted");
+        };
+        match authenticator
+            .authenticate_with_registry(request.headers())
+            .await
+        {
+            Ok(access) => {
+                request.extensions_mut().insert(access.actor);
+                request.extensions_mut().insert(access.registry);
+            }
+            Err(failure) => return authentication_failure_response(authenticator, failure),
+        }
+        drop(auth_permit);
+    }
+
+    let permit = if method == Method::GET {
         let Some(permit) = limits.try_enter_stream() else {
             return capacity_exhausted_response("MCP stream capacity exhausted");
         };
+        permit
+    } else {
+        let Some(permit) = limits.try_enter_request() else {
+            return capacity_exhausted_response("MCP request capacity exhausted");
+        };
+        permit
+    };
+
+    if method == Method::GET {
         let response = next.run(request).await;
         if is_sse_response(&response) {
             return hold_permit_through_body(response, permit);
@@ -710,9 +902,6 @@ async fn limit_mcp_request_concurrency(
         return response;
     }
 
-    let Some(permit) = limits.try_enter_request() else {
-        return capacity_exhausted_response("MCP request capacity exhausted");
-    };
     let (request, post_response_permit) = if method == Method::POST {
         match buffer_mcp_post_body(request, limits.body_read_timeout).await {
             Ok((request, true)) => {
@@ -745,6 +934,20 @@ pub fn build_router(server: OzonMcp, max_sessions: NonZeroUsize) -> Router {
     build_router_with_cancellation(server, max_sessions, CancellationToken::new())
 }
 
+/// Builds the production router with an explicit legacy-session idle policy.
+pub fn build_router_with_session_idle_timeout(
+    server: OzonMcp,
+    max_sessions: NonZeroUsize,
+    session_idle_timeout: Duration,
+) -> Router {
+    build_router_with_cancellation_and_session_idle_timeout(
+        server,
+        max_sessions,
+        session_idle_timeout,
+        CancellationToken::new(),
+    )
+}
+
 /// Builds the complete HTTP router with a root cancellation token shared by
 /// every MCP session and response stream.
 ///
@@ -756,16 +959,47 @@ pub fn build_router_with_cancellation(
     max_sessions: NonZeroUsize,
     cancellation_token: CancellationToken,
 ) -> Router {
-    let http_limits = McpHttpLimits::production();
+    build_router_with_cancellation_and_session_idle_timeout(
+        server,
+        max_sessions,
+        MCP_SESSION_IDLE_TIMEOUT_DEFAULT,
+        cancellation_token,
+    )
+}
+
+/// Builds the complete router with explicit session-idle and cancellation
+/// policies. Existing wrappers retain the 120-second safe default.
+pub fn build_router_with_cancellation_and_session_idle_timeout(
+    server: OzonMcp,
+    max_sessions: NonZeroUsize,
+    session_idle_timeout: Duration,
+    cancellation_token: CancellationToken,
+) -> Router {
     let protected_resource_metadata = server.protected_resource_metadata();
+    let protected_resource_url = protected_resource_metadata
+        .as_ref()
+        .map(|metadata| metadata.resource.as_str());
+    let allowed_hosts = allowed_mcp_hosts(protected_resource_url);
+    let allowed_origins = allowed_mcp_origins(protected_resource_url);
+    let transport_config = StreamableHttpServerConfig::default()
+        .with_max_request_body_bytes(MCP_REQUEST_BODY_LIMIT_BYTES)
+        .with_allowed_hosts(allowed_hosts)
+        .with_allowed_origins(allowed_origins)
+        .with_cancellation_token(cancellation_token);
+    let http_limits = McpHttpLimits::production(
+        transport_config.clone(),
+        server.transport_authenticator().cloned(),
+    );
     let server = Arc::new(server);
-    let session_manager = Arc::new(LocalSessionManager::default().with_max_sessions(max_sessions));
+    let session_manager = Arc::new(
+        LocalSessionManager::default()
+            .with_max_sessions(max_sessions)
+            .with_session_idle_timeout(session_idle_timeout),
+    );
     let service: StreamableHttpService<OzonMcp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok((*server).clone()),
         session_manager,
-        StreamableHttpServerConfig::default()
-            .with_max_request_body_bytes(MCP_REQUEST_BODY_LIMIT_BYTES)
-            .with_cancellation_token(cancellation_token),
+        transport_config,
     );
     let mcp_router = Router::new()
         .fallback_service(service)
@@ -801,12 +1035,19 @@ mod tests {
 
     use axum::{
         body::{Body, Bytes, to_bytes},
-        http::{Request as HttpRequest, header::CONTENT_TYPE},
+        http::{
+            Request as HttpRequest,
+            header::{ACCEPT, CONTENT_TYPE, HOST, ORIGIN},
+        },
     };
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
+    use crate::config::{JwtConfig, RegistrySource};
+
     use super::*;
+
+    static AUTH_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     struct PendingBody;
 
@@ -819,6 +1060,42 @@ mod tests {
             _context: &mut Context<'_>,
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             Poll::Pending
+        }
+    }
+
+    struct OversizedHintBody;
+
+    impl HttpBody for OversizedHintBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            panic!("an already oversized size hint must be rejected before polling")
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact((MCP_REQUEST_BODY_LIMIT_BYTES + 1) as u64)
+        }
+    }
+
+    struct OversizedFrameBody;
+
+    impl HttpBody for OversizedFrameBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![
+                0;
+                MCP_REQUEST_BODY_LIMIT_BYTES
+                    + 1
+            ])))))
         }
     }
 
@@ -838,6 +1115,44 @@ mod tests {
 
     struct TrailersBody {
         emitted: bool,
+    }
+
+    fn test_authenticator() -> JwtAuthenticator {
+        let sequence = AUTH_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mcp-ozon-http-auth-{}-{sequence}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "actors": [{
+                    "id": "admin",
+                    "name": "Administrator",
+                    "role": "admin",
+                    "oidc": {"username": "admin"}
+                }],
+                "accounts": []
+            }))
+            .expect("test registry serializes"),
+        )
+        .expect("test registry is writable");
+        let registry = RegistrySource::new(path).expect("test registry is valid");
+        JwtAuthenticator::new(
+            JwtConfig {
+                issuer: "http://issuer.test/realms/ofk".to_owned(),
+                audience: "http://localhost:8788/mcp".to_owned(),
+                jwks_url: "http://127.0.0.1:1/certs".to_owned(),
+                resource_url: "http://localhost:8788/mcp".to_owned(),
+                resource_metadata_url: "http://localhost:8788/.well-known/oauth-protected-resource"
+                    .to_owned(),
+                required_scopes: vec!["mcp:tools".to_owned()],
+                jwks_cache_ttl: Duration::from_secs(300),
+            },
+            registry,
+        )
+        .expect("test authenticator builds")
     }
 
     impl HttpBody for TrailersBody {
@@ -899,11 +1214,18 @@ mod tests {
     }
 
     fn middleware_request_at(uri: &str, method: Method, body: Body) -> HttpRequest<Body> {
-        HttpRequest::builder()
-            .method(method)
+        let mut builder = HttpRequest::builder()
+            .method(method.clone())
             .uri(uri)
-            .body(body)
-            .expect("test request builds")
+            .header(HOST, "localhost");
+        if method == Method::POST {
+            builder = builder
+                .header(CONTENT_TYPE, "application/json")
+                .header(ACCEPT, "application/json, text/event-stream");
+        } else if method == Method::GET {
+            builder = builder.header(ACCEPT, "text/event-stream");
+        }
+        builder.body(body).expect("test request builds")
     }
 
     fn middleware_request(method: Method, body: Body) -> HttpRequest<Body> {
@@ -1018,13 +1340,11 @@ mod tests {
 
         let short = router
             .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::GET)
-                    .uri("/mcp?short=1")
-                    .body(Body::empty())
-                    .expect("short GET request builds"),
-            )
+            .oneshot(middleware_request_at(
+                "/mcp?short=1",
+                Method::GET,
+                Body::empty(),
+            ))
             .await
             .expect("router responds");
         assert_eq!(short.status(), StatusCode::OK);
@@ -1144,6 +1464,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_post_headers_are_rejected_without_polling_a_pending_body() {
+        let reached = Arc::new(AtomicUsize::new(0));
+        let limits = McpHttpLimits::for_test(1, 1, 1, Duration::from_secs(60));
+        let router = middleware_test_router(limits.clone(), Arc::clone(&reached));
+
+        let mut cases = Vec::new();
+
+        let mut bad_host = middleware_request(Method::POST, Body::new(PendingBody));
+        bad_host
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static("evil.example"));
+        cases.push((bad_host, StatusCode::FORBIDDEN));
+
+        let mut bad_origin = middleware_request(Method::POST, Body::new(PendingBody));
+        bad_origin
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_static("https://evil.example"));
+        cases.push((bad_origin, StatusCode::FORBIDDEN));
+
+        let mut bad_accept = middleware_request(Method::POST, Body::new(PendingBody));
+        bad_accept
+            .headers_mut()
+            .insert(ACCEPT, HeaderValue::from_static("application/json"));
+        cases.push((bad_accept, StatusCode::NOT_ACCEPTABLE));
+
+        let mut bad_content_type = middleware_request(Method::POST, Body::new(PendingBody));
+        bad_content_type
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        cases.push((bad_content_type, StatusCode::UNSUPPORTED_MEDIA_TYPE));
+
+        let mut substring_accept = middleware_request(Method::POST, Body::new(PendingBody));
+        substring_accept.headers_mut().insert(
+            ACCEPT,
+            HeaderValue::from_static("xapplication/json, text/event-stream-evil"),
+        );
+        cases.push((substring_accept, StatusCode::NOT_ACCEPTABLE));
+
+        let mut prefixed_content_type = middleware_request(Method::POST, Body::new(PendingBody));
+        prefixed_content_type.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json-malformed"),
+        );
+        cases.push((prefixed_content_type, StatusCode::UNSUPPORTED_MEDIA_TYPE));
+
+        for value in ["application/json,text/plain", "application/json;"] {
+            let mut malformed_content_type =
+                middleware_request(Method::POST, Body::new(PendingBody));
+            malformed_content_type
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static(value));
+            cases.push((malformed_content_type, StatusCode::UNSUPPORTED_MEDIA_TYPE));
+        }
+
+        for (request, expected_status) in cases {
+            let response =
+                tokio::time::timeout(Duration::from_secs(1), router.clone().oneshot(request))
+                    .await
+                    .expect("header preflight must not wait for the pending body")
+                    .expect("router responds");
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(limits.request_permits.available_permits(), 1);
+        }
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+
+        let mut valid = middleware_request(Method::POST, Body::from("abc"));
+        valid.headers_mut().remove(ACCEPT);
+        valid
+            .headers_mut()
+            .append(ACCEPT, HeaderValue::from_static("Application/JSON; q=1"));
+        valid
+            .headers_mut()
+            .append(ACCEPT, HeaderValue::from_static("TEXT/EVENT-STREAM; q=0.5"));
+        valid.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("Application/JSON; charset=utf-8"),
+        );
+        let response = router.oneshot(valid).await.expect("router responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_jwt_is_rejected_before_body_polling_or_session_handling() {
+        let reached = Arc::new(AtomicUsize::new(0));
+        let limits = McpHttpLimits::for_test(1, 1, 1, Duration::from_secs(60));
+        let mut protected_limits = limits.clone();
+        protected_limits.authenticator = Some(test_authenticator());
+        let router = middleware_test_router(protected_limits, Arc::clone(&reached));
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            router.oneshot(middleware_request(Method::POST, Body::new(PendingBody))),
+        )
+        .await
+        .expect("JWT rejection must not poll the pending body")
+        .expect("router responds");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get(WWW_AUTHENTICATE).is_some());
+        assert_eq!(limits.auth_request_permits.available_permits(), 1);
+        assert_eq!(limits.request_permits.available_permits(), 1);
+        assert_eq!(limits.post_response_permits.available_permits(), 1);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn jwt_verification_gate_is_bounded_separately_from_mcp_ingress() {
+        let reached = Arc::new(AtomicUsize::new(0));
+        let limits = McpHttpLimits::for_test(1, 1, 1, Duration::from_secs(60));
+        let mut protected_limits = limits.clone();
+        protected_limits.authenticator = Some(test_authenticator());
+        let router = middleware_test_router(protected_limits, Arc::clone(&reached));
+
+        let held = limits
+            .try_enter_auth(&Method::POST)
+            .expect("fresh JWT gate has capacity");
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            router.oneshot(middleware_request(Method::POST, Body::new(PendingBody))),
+        )
+        .await
+        .expect("JWT gate overload must not poll the pending body")
+        .expect("router responds");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        assert_eq!(limits.request_permits.available_permits(), 1);
+        assert_eq!(reached.load(Ordering::SeqCst), 0);
+        drop(held);
+
+        let stream = limits
+            .try_enter_auth(&Method::GET)
+            .expect("GET uses the independent stream authentication gate");
+        assert!(limits.try_enter_auth(&Method::GET).is_none());
+        assert!(limits.try_enter_auth(&Method::POST).is_some());
+        drop(stream);
+    }
+
+    #[tokio::test]
+    async fn jwt_failures_map_to_sanitized_http_statuses_and_challenges() {
+        let authenticator = test_authenticator();
+        for (failure, expected_status, expected_challenge) in [
+            (
+                JwtAuthenticationFailure::MissingCredentials,
+                StatusCode::UNAUTHORIZED,
+                true,
+            ),
+            (
+                JwtAuthenticationFailure::InvalidToken,
+                StatusCode::UNAUTHORIZED,
+                true,
+            ),
+            (
+                JwtAuthenticationFailure::ExpiredToken,
+                StatusCode::UNAUTHORIZED,
+                true,
+            ),
+            (
+                JwtAuthenticationFailure::WrongAudience,
+                StatusCode::UNAUTHORIZED,
+                true,
+            ),
+            (
+                JwtAuthenticationFailure::InsufficientScope,
+                StatusCode::FORBIDDEN,
+                true,
+            ),
+            (
+                JwtAuthenticationFailure::AccessDenied,
+                StatusCode::FORBIDDEN,
+                false,
+            ),
+            (
+                JwtAuthenticationFailure::VerifierUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                false,
+            ),
+        ] {
+            let response = authentication_failure_response(&authenticator, failure);
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response.headers().contains_key(WWW_AUTHENTICATE),
+                expected_challenge
+            );
+            assert!(response.headers().get("mcp-session-id").is_none());
+            let body = to_bytes(response.into_body(), 1_024)
+                .await
+                .expect("fixed authentication body is readable");
+            assert_eq!(body.as_ref(), failure.public_message().as_bytes());
+        }
+    }
+
+    #[tokio::test]
     async fn bounded_body_reader_ignores_non_data_frames() {
         let body = Body::new(TrailersBody { emitted: false });
         let bytes = read_bounded_mcp_body(body)
@@ -1151,6 +1667,73 @@ mod tests {
             .ok()
             .expect("trailers are not a transport failure");
         assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_body_reader_rejects_an_oversized_lower_hint_before_polling() {
+        let error = read_bounded_mcp_body(Body::new(OversizedHintBody))
+            .await
+            .expect_err("an oversized lower bound cannot fit the request budget");
+        assert!(matches!(error, McpBodyReadFailure::TooLarge));
+    }
+
+    #[tokio::test]
+    async fn bounded_body_reader_rejects_a_frame_that_exhausts_the_remaining_budget() {
+        let error = read_bounded_mcp_body(Body::new(OversizedFrameBody))
+            .await
+            .expect_err("an oversized frame cannot fit the request budget");
+        assert!(matches!(error, McpBodyReadFailure::TooLarge));
+    }
+
+    #[test]
+    #[should_panic(expected = "an already oversized size hint must be rejected before polling")]
+    fn oversized_hint_body_guard_panics_if_polled() {
+        let mut body = OversizedHintBody;
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        let _ = Pin::new(&mut body).poll_frame(&mut context);
+    }
+
+    #[test]
+    fn protected_resource_origins_are_reduced_to_an_exact_effective_port() {
+        assert_eq!(
+            allowed_mcp_origins(Some("https://mcp.example/mcp")),
+            vec!["https://mcp.example:443"]
+        );
+        assert_eq!(
+            allowed_mcp_origins(Some("http://localhost:8788/mcp?ignored=true")),
+            vec!["http://localhost:8788"]
+        );
+        assert_eq!(
+            allowed_mcp_origins(Some("https://[::1]/mcp")),
+            vec!["https://[::1]:443"]
+        );
+
+        let invalid = allowed_mcp_origins(Some("not a resource URL"));
+        assert_eq!(invalid.len(), 1);
+        assert!(invalid[0].is_empty());
+
+        let unsupported_scheme = allowed_mcp_origins(Some("ftp://mcp.example/mcp"));
+        assert_eq!(unsupported_scheme.len(), 1);
+        assert!(unsupported_scheme[0].is_empty());
+    }
+
+    #[test]
+    fn protected_resource_hosts_are_reduced_to_one_fail_closed_hostname() {
+        assert_eq!(
+            allowed_mcp_hosts(Some("https://MCP.example:4443/mcp")),
+            vec!["mcp.example"]
+        );
+        assert_eq!(allowed_mcp_hosts(Some("https://[::1]/mcp")), vec!["[::1]"]);
+        assert_eq!(
+            allowed_mcp_hosts(None),
+            vec!["localhost", "127.0.0.1", "::1"]
+        );
+
+        for invalid in ["not a resource URL", "ftp://mcp.example/mcp"] {
+            let allowed = allowed_mcp_hosts(Some(invalid));
+            assert_eq!(allowed.len(), 1);
+            assert!(allowed[0].is_empty());
+        }
     }
 
     #[tokio::test]

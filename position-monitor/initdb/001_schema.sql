@@ -19,6 +19,22 @@ CREATE TABLE search_position.monitors (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE FUNCTION search_position.touch_monitor_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $$
+BEGIN
+    NEW.updated_at = statement_timestamp();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER monitors_touch_updated_at
+    BEFORE UPDATE ON search_position.monitors
+    FOR EACH ROW
+    EXECUTE FUNCTION search_position.touch_monitor_updated_at();
+
 CREATE UNIQUE INDEX monitors_natural_key
     ON search_position.monitors (
         store_id,
@@ -68,17 +84,27 @@ CREATE TABLE search_position.measurements (
     delivery_days smallint CHECK (delivery_days IS NULL OR delivery_days >= 0),
     in_stock boolean,
     response_ms integer CHECK (response_ms IS NULL OR response_ms >= 0),
+    error_class text CHECK (
+        error_class IS NULL OR
+        (char_length(error_class) BETWEEN 1 AND 64 AND error_class !~ '[[:space:]]')
+    ),
+    http_status smallint CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
     created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (id, monitor_id),
     UNIQUE (run_id, monitor_id),
     CHECK (
         outcome <> 'found' OR
         organic_position IS NOT NULL OR
         sponsored_position IS NOT NULL
+    ),
+    CHECK (
+        outcome = 'found' OR
+        (organic_position IS NULL AND sponsored_position IS NULL)
     )
 );
 
 CREATE INDEX measurements_monitor_time
-    ON search_position.measurements (monitor_id, observed_at DESC);
+    ON search_position.measurements (monitor_id, observed_at DESC, id DESC);
 
 CREATE INDEX measurements_observed_at
     ON search_position.measurements (observed_at DESC);
@@ -87,14 +113,15 @@ CREATE TABLE search_position.alerts (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     monitor_id bigint NOT NULL
         REFERENCES search_position.monitors(id) ON DELETE RESTRICT,
-    measurement_id bigint NOT NULL
-        REFERENCES search_position.measurements(id) ON DELETE CASCADE,
+    measurement_id bigint NOT NULL,
     kind text NOT NULL
         CHECK (kind IN ('position_drop', 'not_found', 'blocked', 'collector_error')),
     previous_position integer CHECK (previous_position IS NULL OR previous_position > 0),
     current_position integer CHECK (current_position IS NULL OR current_position > 0),
     created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (measurement_id, kind)
+    UNIQUE (measurement_id, kind),
+    FOREIGN KEY (measurement_id, monitor_id)
+        REFERENCES search_position.measurements(id, monitor_id) ON DELETE CASCADE
 );
 
 CREATE INDEX alerts_created_at
@@ -117,7 +144,10 @@ SELECT DISTINCT ON (measurement.monitor_id)
     measurement.price,
     measurement.original_price,
     measurement.delivery_days,
-    measurement.in_stock
+    measurement.in_stock,
+    measurement.response_ms,
+    measurement.error_class,
+    measurement.http_status
 FROM search_position.measurements AS measurement
 JOIN search_position.monitors AS monitor ON monitor.id = measurement.monitor_id
 ORDER BY measurement.monitor_id, measurement.observed_at DESC, measurement.id DESC;
@@ -138,7 +168,12 @@ GROUP BY measurement.monitor_id, date_trunc('hour', measurement.observed_at);
 
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 REVOKE ALL ON SCHEMA search_position FROM PUBLIC;
+REVOKE ALL ON FUNCTION search_position.touch_monitor_updated_at() FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA search_position FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA search_position FROM PUBLIC;
+-- PostgreSQL's built-in PUBLIC EXECUTE is a global default. A per-schema
+-- REVOKE cannot override it, so remove it for every future function created by
+-- this dedicated database owner.
+ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 
 COMMIT;

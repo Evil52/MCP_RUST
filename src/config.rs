@@ -12,6 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
 use rmcp::{
     schemars::JsonSchema, transport::streamable_http_server::session::local::LocalSessionManager,
 };
@@ -213,6 +214,85 @@ fn validate_credential(value: &str, env_name: &str) -> Result<()> {
         bail!(
             "credential из {env_name} содержит пробельные/управляющие/non-ASCII символы или превышает безопасный лимит"
         );
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct WbTokenTypeClaims {
+    acc: u8,
+}
+
+fn decoded_base64url_len(encoded_len: usize) -> Option<usize> {
+    let remainder = encoded_len % 4;
+    // A non-padded base64url value can never have one trailing symbol.
+    if remainder == 1 {
+        None
+    } else {
+        Some(encoded_len / 4 * 3 + remainder.saturating_sub(1))
+    }
+}
+
+fn is_unpadded_base64url(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() % 4 != 1
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn invalid_wb_token_type(env_name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "credential из {env_name} должен быть корректным JWT-токеном Wildberries типа Personal"
+    )
+}
+
+/// Classifies a WB token for capability/quota selection only.
+///
+/// Signature verification is deliberately not attempted here because WB does
+/// not publish a key contract for local API-token authentication. Authenticity
+/// is still verified by WB on every request. The signed `acc` payload is decoded
+/// locally only to ensure this client's Personal quota matrix is never
+/// used for Base, Test or Service tokens. Service tokens additionally require
+/// an `X-Client-Secret` and `asid` binding that this owner-operated client does
+/// not currently configure.
+fn validate_wb_token_type(token: &str, env_name: &str) -> Result<()> {
+    let mut segments = token.split('.');
+    let (Some(header), Some(payload), Some(signature), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return Err(invalid_wb_token_type(env_name));
+    };
+    // Bound the decoded payload before handing it to the JWT parser. Do this
+    // before the alphabet check so the impossible one-symbol base64url tail is
+    // rejected explicitly rather than hidden behind a later invariant.
+    let decoded_payload_len =
+        decoded_base64url_len(payload.len()).ok_or_else(|| invalid_wb_token_type(env_name))?;
+    if !is_unpadded_base64url(header)
+        || !is_unpadded_base64url(payload)
+        || !is_unpadded_base64url(signature)
+    {
+        return Err(invalid_wb_token_type(env_name));
+    }
+
+    if decoded_payload_len > MAX_CREDENTIAL_BYTES {
+        return Err(invalid_wb_token_type(env_name));
+    }
+
+    let header = decode_header(token).map_err(|_| invalid_wb_token_type(env_name))?;
+    let mut validation = Validation::new(header.alg);
+    validation.insecure_disable_signature_validation();
+    validation.required_spec_claims.clear();
+    validation.validate_exp = false;
+    validation.validate_nbf = false;
+    validation.validate_aud = false;
+    let claims = decode::<WbTokenTypeClaims>(token, &DecodingKey::from_secret(&[]), &validation)
+        .map_err(|_| invalid_wb_token_type(env_name))?;
+    if claims.claims.acc != 3 {
+        return Err(invalid_wb_token_type(env_name));
     }
     Ok(())
 }
@@ -552,6 +632,12 @@ pub struct RegistrySource {
     credential_bindings: Arc<BTreeSet<OzonCredentialBinding>>,
     wb_credential_bindings: Arc<BTreeSet<WbCredentialBinding>>,
     cache: Arc<RwLock<Option<CachedRegistry>>>,
+    #[cfg(test)]
+    load_count: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    last_load_thread: Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
+    #[cfg(test)]
+    panic_next_load: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RegistrySource {
@@ -567,6 +653,12 @@ impl RegistrySource {
                 raw,
                 registry: Arc::new(registry),
             }))),
+            #[cfg(test)]
+            load_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            last_load_thread: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            panic_next_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         Ok(source)
     }
@@ -578,6 +670,21 @@ impl RegistrySource {
     /// stores, so the unchanged-file path avoids a full JSON parse, a full
     /// validation pass and a deep clone per call.
     pub fn load(&self) -> Result<Arc<AccessRegistry>> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+
+            self.load_count.fetch_add(1, Ordering::Relaxed);
+            *self
+                .last_load_thread
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(std::thread::current().id());
+            assert!(
+                !self.panic_next_load.swap(false, Ordering::Relaxed),
+                "injected registry load panic"
+            );
+        }
+
         let raw = read_registry_bytes(&self.path)?;
         if let Some(cached) = self.cached(&raw) {
             return Ok(cached);
@@ -601,6 +708,17 @@ impl RegistrySource {
         Ok(registry)
     }
 
+    /// Loads and validates the hot-reloadable registry without blocking a
+    /// Tokio runtime worker on filesystem I/O or JSON validation.
+    pub(crate) async fn load_async(&self) -> Result<Arc<AccessRegistry>> {
+        let source = self.clone();
+        tokio::task::spawn_blocking(move || source.load())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("не удалось безопасно выполнить фоновую загрузку реестра доступа")
+            })?
+    }
+
     fn cached(&self, raw: &[u8]) -> Option<Arc<AccessRegistry>> {
         let cache = self.read_cache();
         let cached = cache.as_ref()?;
@@ -619,6 +737,28 @@ impl RegistrySource {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_count(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+
+        self.load_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn last_load_thread(&self) -> Option<std::thread::ThreadId> {
+        *self
+            .last_load_thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn panic_on_next_load(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.panic_next_load.store(true, Ordering::Relaxed);
     }
 }
 
@@ -692,6 +832,7 @@ impl FromStr for TransportMode {
 pub struct AppConfig {
     pub bind: SocketAddr,
     pub max_sessions: NonZeroUsize,
+    pub session_idle_timeout: Duration,
     pub transport: TransportMode,
     pub ozon_api_base_url: String,
     pub request_timeout: Duration,
@@ -772,6 +913,26 @@ fn parse_max_sessions(value: Option<&str>) -> Result<NonZeroUsize> {
         );
     }
     Ok(parsed)
+}
+
+/// Parses the deploy-level session idle lifetime. The lower bound avoids
+/// pathological reconnect churn while the upper bound ensures abandoned
+/// public handshakes cannot retain the bounded registry indefinitely.
+fn parse_session_idle_timeout(value: Option<&str>) -> Result<Duration> {
+    const DEFAULT_SECONDS: u64 = 120;
+    const MIN_SECONDS: u64 = 90;
+    const MAX_SECONDS: u64 = 300;
+
+    let seconds = match value {
+        Some(value) => value
+            .parse::<u64>()
+            .context("MCP_SESSION_IDLE_TIMEOUT_SECONDS должен быть целым числом")?,
+        None => DEFAULT_SECONDS,
+    };
+    if !(MIN_SECONDS..=MAX_SECONDS).contains(&seconds) {
+        bail!("MCP_SESSION_IDLE_TIMEOUT_SECONDS должен быть от {MIN_SECONDS} до {MAX_SECONDS}");
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 fn parse_strict_bool(value: &str, name: &str) -> Result<bool> {
@@ -959,6 +1120,7 @@ fn load_wildberries_credentials(
         return Ok(());
     }
     validate_credential(&token, &wildberries.api_token_env)?;
+    validate_wb_token_type(&token, &wildberries.api_token_env)?;
     wildberries_accounts.insert(account.id.clone(), WbCredentials { token });
     Ok(())
 }
@@ -993,7 +1155,7 @@ fn load_marketplace_credentials(
 
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
-        dotenvy::dotenv().ok();
+        finish_optional_dotenv_load(dotenvy::dotenv())?;
         Self::from_lookup(|key| std::env::var(key).ok())
     }
 
@@ -1002,11 +1164,17 @@ impl AppConfig {
     }
 
     fn from_lookup_inner(lookup: &mut dyn FnMut(&str) -> Option<String>) -> Result<Self> {
-        let bind = lookup_value(lookup, "MCP_BIND", "127.0.0.1:8787")
+        let bind: SocketAddr = lookup_value(lookup, "MCP_BIND", "127.0.0.1:8787")
             .parse()
             .context("MCP_BIND должен иметь формат IP:PORT")?;
         let max_sessions = parse_max_sessions(lookup("MCP_MAX_SESSIONS").as_deref())?;
+        let session_idle_timeout =
+            parse_session_idle_timeout(lookup("MCP_SESSION_IDLE_TIMEOUT_SECONDS").as_deref())?;
         let transport = lookup_value(lookup, "MCP_TRANSPORT", "http").parse()?;
+        let dev_allow_non_loopback = parse_strict_bool(
+            &lookup_value(lookup, "MCP_DEV_ALLOW_NON_LOOPBACK", "false"),
+            "MCP_DEV_ALLOW_NON_LOOPBACK",
+        )?;
         let ozon_api_base_url = validate_ozon_api_base_url(&lookup_value(
             lookup,
             "OZON_API_BASE_URL",
@@ -1030,10 +1198,20 @@ impl AppConfig {
         let registry = RegistrySource::new(registry_path)?;
         let snapshot = registry.load()?;
         let auth = load_auth_config(lookup, &snapshot)?;
+        if transport == TransportMode::Http
+            && matches!(auth, AuthConfig::Dev { .. })
+            && !bind.ip().is_loopback()
+            && !dev_allow_non_loopback
+        {
+            bail!(
+                "MCP_AUTH_MODE=dev с MCP_TRANSPORT=http разрешён только на loopback; для изолированного контейнера задайте MCP_DEV_ALLOW_NON_LOOPBACK=true явно"
+            );
+        }
         let credentials = load_marketplace_credentials(&snapshot, lookup)?;
         Ok(Self {
             bind,
             max_sessions,
+            session_idle_timeout,
             transport,
             ozon_api_base_url,
             request_timeout: Duration::from_secs(timeout_seconds),
@@ -1048,9 +1226,20 @@ impl AppConfig {
     }
 }
 
+fn finish_optional_dotenv_load(result: dotenvy::Result<PathBuf>) -> Result<()> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) if error.not_found() => Ok(()),
+        Err(_) => bail!(
+            "не удалось безопасно загрузить .env: файл недоступен или содержит некорректное значение"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -1058,6 +1247,21 @@ mod tests {
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn wb_token_with_payload(payload: &[u8]) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+        let claims = URL_SAFE_NO_PAD.encode(payload);
+        let signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
+        format!("{header}.{claims}.{signature}")
+    }
+
+    fn wb_token_with_claims(claims: serde_json::Value) -> String {
+        wb_token_with_payload(&serde_json::to_vec(&claims).unwrap())
+    }
+
+    fn personal_wb_token() -> String {
+        wb_token_with_claims(serde_json::json!({"acc": 3}))
+    }
 
     fn write_registry(registry: &AccessRegistry) -> PathBuf {
         let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1259,6 +1463,28 @@ mod tests {
                 .to_string()
                 .contains("не удалось прочитать реестр доступа")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_registry_load_runs_off_the_runtime_thread_and_sanitizes_join_failures() {
+        let path = write_registry(&sample_registry());
+        let source = RegistrySource::new(&path).unwrap();
+        let runtime_thread = std::thread::current().id();
+
+        let first = source.load_async().await.unwrap();
+        let second = source.load_async().await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(source.load_count(), 2);
+        assert_ne!(source.last_load_thread(), Some(runtime_thread));
+
+        source.panic_on_next_load();
+        let error = source.load_async().await.unwrap_err().to_string();
+        assert!(
+            error.contains("фоновую загрузку реестра доступа"),
+            "{error}"
+        );
+        assert!(!error.contains("injected registry load panic"), "{error}");
+        assert_eq!(source.load_count(), 3);
     }
 
     #[test]
@@ -1474,10 +1700,11 @@ mod tests {
         registry.validate().unwrap();
         let path = std::env::temp_dir().join(format!("mcp-ozon-bench-{}.json", std::process::id()));
         std::fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+        let wb_token = personal_wb_token();
         let values = BTreeMap::from([
             ("MCP_ACTOR_ID", "admin"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-            ("WB_TOKEN", "test-wb-token"),
+            ("WB_TOKEN", wb_token.as_str()),
         ]);
         let config =
             AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned())).unwrap();
@@ -1542,21 +1769,94 @@ mod tests {
         }
         let path = std::env::temp_dir().join(format!("mcp-ozon-bench-{}.json", std::process::id()));
         std::fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+        let wb_token = personal_wb_token();
         let values = BTreeMap::from([
             ("MCP_ACTOR_ID", "admin"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-            ("WB_CONFIGURED_TOKEN", "configured-test-token"),
+            ("WB_CONFIGURED_TOKEN", wb_token.as_str()),
         ]);
 
         let config =
             AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned())).unwrap();
 
         assert_eq!(config.wildberries_accounts.len(), 1);
-        assert_eq!(
-            config.wildberries_accounts["wb_configured"].token,
-            "configured-test-token"
-        );
+        assert_eq!(config.wildberries_accounts["wb_configured"].token, wb_token);
         assert!(!config.wildberries_accounts.contains_key("wb_without_token"));
+    }
+
+    #[test]
+    fn production_config_accepts_only_personal_wb_jwt_tokens() {
+        assert_eq!(decoded_base64url_len(0), Some(0));
+        assert_eq!(decoded_base64url_len(1), None);
+        assert_eq!(decoded_base64url_len(2), Some(1));
+        assert_eq!(decoded_base64url_len(3), Some(2));
+        assert_eq!(decoded_base64url_len(4), Some(3));
+
+        let personal = personal_wb_token();
+        validate_wb_token_type(&personal, "WB_TOKEN").unwrap();
+
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"acc":3}"#);
+        let signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
+        let rejected = [
+            wb_token_with_claims(serde_json::json!({"acc": 1})),
+            wb_token_with_claims(serde_json::json!({"acc": 2})),
+            wb_token_with_claims(serde_json::json!({"acc": 4})),
+            wb_token_with_claims(serde_json::json!({"acc": 0})),
+            wb_token_with_claims(serde_json::json!({"acc": 255})),
+            wb_token_with_claims(serde_json::json!({"acc": "3"})),
+            wb_token_with_claims(serde_json::json!({})),
+            wb_token_with_payload(br#"{"acc":"super-secret"}"#),
+            "not-a-jwt".to_owned(),
+            format!("{header}.{payload}.{signature}.extra"),
+            format!("{header}..{signature}"),
+            format!("{header}.A.{signature}"),
+            format!("AA.{payload}.{signature}"),
+            format!("{header}.***.{signature}"),
+            format!("{header}.{payload}.!"),
+            format!("{header}.{payload}.A"),
+        ];
+        for token in rejected {
+            let error = validate_wb_token_type(&token, "WB_TOKEN")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("WB_TOKEN"), "{error}");
+            assert!(error.contains("Personal"), "{error}");
+            assert!(!error.contains("super-secret"), "{error}");
+            assert!(!error.contains(&token), "{error}");
+        }
+
+        let oversized_payload = "A".repeat((MAX_CREDENTIAL_BYTES / 3 + 1) * 4);
+        let oversized = format!("{header}.{oversized_payload}.{signature}");
+        assert!(validate_wb_token_type(&oversized, "WB_TOKEN").is_err());
+
+        let mut registry = sample_registry();
+        registry.accounts.push(MarketplaceAccount {
+            id: "wb_shop".into(),
+            organization: "WB Shop".into(),
+            marketplace: Marketplace::Wildberries,
+            seller_client_id: "42".into(),
+            manager_id: "manager".into(),
+            ozon: None,
+            wildberries: Some(WildberriesAccount {
+                api_token_env: "WB_TOKEN".into(),
+            }),
+        });
+        let path = write_registry(&registry);
+        for acc in [1, 2, 4, 5] {
+            let token = wb_token_with_claims(serde_json::json!({"acc": acc}));
+            let values = BTreeMap::from([
+                ("MCP_ACTOR_ID", "admin"),
+                ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+                ("WB_TOKEN", token.as_str()),
+            ]);
+            let error =
+                AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("WB_TOKEN"), "acc={acc}: {error}");
+            assert!(!error.contains(&token), "acc={acc}: {error}");
+        }
     }
 
     #[test]
@@ -1873,6 +2173,7 @@ mod tests {
             AppConfig::from_lookup(|key| defaults.get(key).map(|value| (*value).to_owned()))
                 .unwrap();
         assert_eq!(config.bind, "127.0.0.1:8787".parse().unwrap());
+        assert_eq!(config.session_idle_timeout, Duration::from_secs(120));
         assert_eq!(config.transport, TransportMode::Http);
         assert!(!config.ozon_postings_vnext);
         assert!(!config.ozon_finance_accruals_preview);
@@ -1972,10 +2273,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("может только уменьшать лимит"), "{error}");
+        assert_eq!(
+            result(Some(("MCP_SESSION_IDLE_TIMEOUT_SECONDS", "90")))
+                .unwrap()
+                .session_idle_timeout,
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            result(Some(("MCP_SESSION_IDLE_TIMEOUT_SECONDS", "300")))
+                .unwrap()
+                .session_idle_timeout,
+            Duration::from_secs(300)
+        );
+        for value in ["", "89", "301", "-1", "bad", " 120 "] {
+            assert!(
+                result(Some(("MCP_SESSION_IDLE_TIMEOUT_SECONDS", value))).is_err(),
+                "MCP_SESSION_IDLE_TIMEOUT_SECONDS={value:?}"
+            );
+        }
         assert!(result(Some(("MCP_AUTH_MODE", "bad"))).is_err());
         assert!(result(Some(("OZON_REQUEST_TIMEOUT_SECONDS", "bad"))).is_err());
         assert!(result(Some(("OZON_REQUEST_TIMEOUT_SECONDS", "0"))).is_err());
-        for name in ["OZON_POSTINGS_VNEXT", "OZON_FINANCE_ACCRUALS_PREVIEW"] {
+        for name in [
+            "MCP_DEV_ALLOW_NON_LOOPBACK",
+            "OZON_POSTINGS_VNEXT",
+            "OZON_FINANCE_ACCRUALS_PREVIEW",
+        ] {
             for value in ["", "1", "yes", "TRUE", " false"] {
                 assert!(result(Some((name, value))).is_err(), "{name}={value:?}");
             }
@@ -2094,6 +2417,70 @@ mod tests {
     }
 
     #[test]
+    fn dev_http_requires_loopback_or_an_explicit_container_opt_in() {
+        let path = write_registry(&sample_registry());
+        let load = |values: &BTreeMap<&str, &str>| {
+            AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
+        };
+
+        for bind in ["127.0.0.1:8787", "127.42.0.1:8787", "[::1]:8787"] {
+            let values = BTreeMap::from([
+                ("MCP_ACTOR_ID", "admin"),
+                ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+                ("MCP_BIND", bind),
+            ]);
+            assert!(load(&values).is_ok(), "bind={bind}");
+        }
+
+        for bind in ["0.0.0.0:8787", "[::]:8787", "192.0.2.10:8787"] {
+            let values = BTreeMap::from([
+                ("MCP_ACTOR_ID", "admin"),
+                ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+                ("MCP_BIND", bind),
+            ]);
+            let error = load(&values).unwrap_err().to_string();
+            assert!(error.contains("MCP_DEV_ALLOW_NON_LOOPBACK=true"), "{error}");
+        }
+
+        let opted_in = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("MCP_BIND", "0.0.0.0:8787"),
+            ("MCP_DEV_ALLOW_NON_LOOPBACK", "true"),
+        ]);
+        assert_eq!(
+            load(&opted_in).unwrap().bind,
+            "0.0.0.0:8787".parse().unwrap()
+        );
+
+        let stdio = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("MCP_BIND", "0.0.0.0:8787"),
+            ("MCP_TRANSPORT", "stdio"),
+        ]);
+        assert_eq!(load(&stdio).unwrap().transport, TransportMode::Stdio);
+
+        let stdio_typo = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("MCP_TRANSPORT", "stdio"),
+            ("MCP_DEV_ALLOW_NON_LOOPBACK", "TRUE"),
+        ]);
+        assert!(load(&stdio_typo).is_err());
+
+        let jwt_typo = BTreeMap::from([
+            ("MCP_AUTH_MODE", "jwt"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
+            ("MCP_JWT_AUDIENCE", "https://mcp.example/mcp"),
+            ("MCP_PUBLIC_URL", "https://mcp.example/mcp"),
+            ("MCP_DEV_ALLOW_NON_LOOPBACK", "yes"),
+        ]);
+        assert!(load(&jwt_typo).is_err());
+    }
+
+    #[test]
     fn app_config_loads_jwt_mode_without_trusted_actor() {
         let path = write_registry(&sample_registry());
         let values = BTreeMap::from([
@@ -2203,6 +2590,33 @@ mod tests {
             std::env::remove_var("MCP_ACTOR_ID");
             std::env::remove_var("MCP_ACCESS_CONFIG");
         }
+    }
+
+    #[test]
+    fn optional_dotenv_ignores_only_absence_and_redacts_invalid_lines() {
+        assert!(finish_optional_dotenv_load(Ok(PathBuf::from(".env"))).is_ok());
+        assert!(
+            finish_optional_dotenv_load(Err(dotenvy::Error::Io(
+                std::io::ErrorKind::NotFound.into()
+            )))
+            .is_ok()
+        );
+
+        let parse_error = finish_optional_dotenv_load(Err(dotenvy::Error::LineParse(
+            "OZON_API_KEY=super-secret value".to_owned(),
+            26,
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(parse_error.contains(".env"));
+        assert!(!parse_error.contains("super-secret"));
+
+        assert!(
+            finish_optional_dotenv_load(Err(dotenvy::Error::Io(
+                std::io::ErrorKind::PermissionDenied.into()
+            )))
+            .is_err()
+        );
     }
 
     /// Every environment-variable name the registry can name must be validated

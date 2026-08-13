@@ -14,11 +14,17 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::{JwtConfig, RegistrySource};
+use crate::config::{AccessRegistry, JwtConfig, RegistrySource};
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedActor {
     pub actor_id: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct AuthenticatedAccess {
+    pub(crate) actor: AuthenticatedActor,
+    pub(crate) registry: Arc<AccessRegistry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +41,7 @@ pub enum JwtAuthenticationFailure {
 impl JwtAuthenticationFailure {
     fn oauth_error(self) -> Option<(&'static str, &'static str)> {
         match self {
-            Self::MissingCredentials => Some(("invalid_token", "No access token was provided")),
+            Self::MissingCredentials | Self::AccessDenied | Self::VerifierUnavailable => None,
             Self::InvalidToken => Some(("invalid_token", "The access token is invalid")),
             Self::ExpiredToken => Some(("invalid_token", "The access token has expired")),
             Self::WrongAudience => Some(("invalid_token", "The access token audience is invalid")),
@@ -43,7 +49,6 @@ impl JwtAuthenticationFailure {
                 "insufficient_scope",
                 "The access token lacks a required scope",
             )),
-            Self::AccessDenied | Self::VerifierUnavailable => None,
         }
     }
 
@@ -108,6 +113,12 @@ struct JwksCacheState {
 
 const UNKNOWN_KID_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
 const FAILED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+/// Explicitly retained clock-skew allowance for `exp` and `nbf` validation.
+///
+/// `jsonwebtoken` currently defaults to the same value, but relying on that
+/// implicit default would let a dependency update silently change the token
+/// acceptance boundary.
+const JWT_CLOCK_SKEW_LEEWAY_SECONDS: u64 = 60;
 const MAX_JWKS_BODY_BYTES: usize = 1024 * 1024;
 const MAX_JWKS_KEYS: usize = 64;
 const MAX_JWK_STRING_BYTES: usize = 16 * 1024;
@@ -181,11 +192,25 @@ impl JwtAuthenticator {
     }
 
     pub fn challenge(&self, failure: &JwtAuthenticationFailure) -> Option<String> {
-        let (error, error_description) = failure.oauth_error()?;
-        Some(format!(
-            "Bearer resource_metadata=\"{}\", scope=\"{}\", error=\"{error}\", error_description=\"{error_description}\"",
+        let base = format!(
+            "Bearer resource_metadata=\"{}\", scope=\"{}\"",
             self.resource_metadata_url(),
             self.required_scopes().join(" ")
+        );
+        match failure {
+            JwtAuthenticationFailure::MissingCredentials => Some(base),
+            _ => self.oauth_challenge_with_error(base, *failure),
+        }
+    }
+
+    fn oauth_challenge_with_error(
+        &self,
+        base: String,
+        failure: JwtAuthenticationFailure,
+    ) -> Option<String> {
+        let (error, error_description) = failure.oauth_error()?;
+        Some(format!(
+            "{base}, error=\"{error}\", error_description=\"{error_description}\""
         ))
     }
 
@@ -343,6 +368,13 @@ impl JwtAuthenticator {
         &self,
         headers: &HeaderMap,
     ) -> std::result::Result<AuthenticatedActor, JwtAuthenticationFailure> {
+        Ok(self.authenticate_with_registry(headers).await?.actor)
+    }
+
+    pub(crate) async fn authenticate_with_registry(
+        &self,
+        headers: &HeaderMap,
+    ) -> std::result::Result<AuthenticatedAccess, JwtAuthenticationFailure> {
         let value = headers
             .get(axum::http::header::AUTHORIZATION)
             .ok_or(JwtAuthenticationFailure::MissingCredentials)?
@@ -363,6 +395,7 @@ impl JwtAuthenticator {
         validation.set_audience(&[self.config.audience.as_str()]);
         validation.validate_exp = true;
         validation.validate_nbf = true;
+        validation.leeway = JWT_CLOCK_SKEW_LEEWAY_SECONDS;
         validation.required_spec_claims = ["exp", "iss", "aud", "sub"]
             .into_iter()
             .map(str::to_owned)
@@ -371,13 +404,17 @@ impl JwtAuthenticator {
             .map_err(|error| match error.kind() {
                 JwtErrorKind::ExpiredSignature => JwtAuthenticationFailure::ExpiredToken,
                 JwtErrorKind::InvalidAudience => JwtAuthenticationFailure::WrongAudience,
+                JwtErrorKind::MissingRequiredClaim(claim) if claim == "aud" => {
+                    JwtAuthenticationFailure::WrongAudience
+                }
                 _ => JwtAuthenticationFailure::InvalidToken,
             })?
             .claims;
         self.validate_required_scopes(claims.scope.as_deref())?;
         let registry = self
             .registry
-            .load()
+            .load_async()
+            .await
             .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
         let verified_email = if claims.email_verified == Some(true) {
             claims.email.as_deref()
@@ -391,8 +428,10 @@ impl JwtAuthenticator {
                 verified_email,
             )
             .map_err(|_| JwtAuthenticationFailure::AccessDenied)?;
-        Ok(AuthenticatedActor {
-            actor_id: actor.id.clone(),
+        let actor_id = actor.id.clone();
+        Ok(AuthenticatedAccess {
+            actor: AuthenticatedActor { actor_id },
+            registry,
         })
     }
 }
@@ -412,6 +451,7 @@ mod tests {
         fs,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
+        num::NonZeroUsize,
         process::{Command, Stdio},
         sync::{
             OnceLock,
@@ -423,15 +463,17 @@ mod tests {
 
     use axum::{
         Router,
-        http::{HeaderValue, header::AUTHORIZATION},
+        body::Body,
+        http::{HeaderValue, Request, StatusCode, header::AUTHORIZATION},
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::{EncodingKey, Header, encode};
     use serde::Serialize;
     use serde_json::json;
+    use tower::ServiceExt;
 
     use super::*;
-    use crate::{ozon::OzonClient, server::OzonMcp, test_support::mock_http};
+    use crate::{http::build_router, ozon::OzonClient, server::OzonMcp, test_support::mock_http};
     use rmcp::transport::{
         StreamableHttpServerConfig, StreamableHttpService,
         streamable_http_server::session::local::LocalSessionManager,
@@ -813,7 +855,11 @@ mod tests {
             BTreeMap::new(),
         )
         .unwrap();
-        let server = Arc::new(OzonMcp::new_authenticated(client, registry, authenticator));
+        let server = Arc::new(OzonMcp::new_authenticated(
+            client,
+            registry.clone(),
+            authenticator,
+        ));
         let service: StreamableHttpService<OzonMcp, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok((*server).clone()),
@@ -827,6 +873,7 @@ mod tests {
         let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
+        assert_eq!(registry.load_count(), 0);
         let missing = call_mcp_tool(&endpoint, None, "ozon_analytics", json!({})).await;
         assert_eq!(missing["result"]["isError"], true);
         assert!(missing["result"]["_meta"]["mcp/www_authenticate"].is_array());
@@ -834,11 +881,17 @@ mod tests {
             missing["result"]["content"][0]["text"],
             "Требуется авторизация: access token не передан."
         );
+        assert_eq!(registry.load_count(), 0);
 
         let valid_token = token(Some(KID), "ozonofk-mcp", "admin");
         let valid = call_mcp_tool(&endpoint, Some(&valid_token), "list_members", json!({})).await;
         assert_ne!(valid["result"]["isError"], true);
         assert_eq!(valid["result"]["structuredContent"]["actor"]["id"], "admin");
+        assert_eq!(
+            registry.load_count(),
+            1,
+            "JWT subject mapping and tool RBAC must use one registry snapshot"
+        );
 
         let unknown_token = token(Some(KID), "ozonofk-mcp", "not-provisioned");
         let unknown =
@@ -849,8 +902,59 @@ mod tests {
             unknown["result"]["content"][0]["text"],
             "Доступ для подтверждённой учётной записи не разрешён."
         );
+        assert_eq!(registry.load_count(), 2);
 
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn production_router_installs_verified_actor_and_registry_before_mcp_dispatch() {
+        let registry = registry();
+        let (jwks_url, requests) = mock_http(vec![(200, jwks())]);
+        let authenticator = JwtAuthenticator::new(config(jwks_url), registry.clone()).unwrap();
+        let client = OzonClient::new(
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(1),
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let router = build_router(
+            OzonMcp::new_authenticated(client, registry.clone(), authenticator),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        let valid_token = token(Some(KID), "ozonofk-mcp", "admin");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("host", "localhost")
+                    .header("accept", "application/json, text/event-stream")
+                    .header("content-type", "application/json")
+                    .header(AUTHORIZATION, format!("Bearer {valid_token}"))
+                    .body(Body::from(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": {},
+                                "clientInfo": {"name": "transport-auth-test", "version": "0"}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("mcp-session-id").is_some());
+        assert_eq!(registry.load_count(), 1);
+        assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1162,12 +1266,23 @@ mod tests {
     fn builds_safe_oauth_challenges_only_for_recoverable_authentication_failures() {
         let auth =
             JwtAuthenticator::new(config("http://127.0.0.1:1".to_owned()), registry()).unwrap();
+        let missing = auth
+            .challenge(&JwtAuthenticationFailure::MissingCredentials)
+            .unwrap();
+        assert!(missing.starts_with("Bearer "));
+        assert!(missing.contains(
+            "resource_metadata=\"http://localhost:8788/.well-known/oauth-protected-resource\""
+        ));
+        assert!(missing.contains("scope=\"mcp:tools\""));
+        assert!(!missing.contains("error="));
+        assert!(!missing.contains("error_description="));
+        assert!(
+            !JwtAuthenticationFailure::MissingCredentials
+                .to_string()
+                .is_empty()
+        );
+
         for (failure, oauth_error, description) in [
-            (
-                JwtAuthenticationFailure::MissingCredentials,
-                "invalid_token",
-                "No access token was provided",
-            ),
             (
                 JwtAuthenticationFailure::InvalidToken,
                 "invalid_token",
@@ -1429,6 +1544,28 @@ mod tests {
                 .unwrap_err(),
             JwtAuthenticationFailure::WrongAudience
         );
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_owned());
+        let now = chrono::Utc::now().timestamp();
+        let missing_audience = encode(
+            &header,
+            &json!({
+                "iss": "http://issuer.test/realms/ofk",
+                "sub": "subject-1",
+                "scope": "mcp:tools",
+                "preferred_username": "admin",
+                "exp": now + 3_600,
+                "nbf": now - 1
+            }),
+            &test_key().encoding,
+        )
+        .unwrap();
+        assert_eq!(
+            auth.authenticate(&bearer(&missing_audience))
+                .await
+                .unwrap_err(),
+            JwtAuthenticationFailure::WrongAudience
+        );
         assert_eq!(
             auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "unknown")))
                 .await
@@ -1457,6 +1594,48 @@ mod tests {
         assert_eq!(
             auth.authenticate(&bearer(&expired)).await.unwrap_err(),
             JwtAuthenticationFailure::ExpiredToken
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_only_the_explicit_clock_skew_window() {
+        let (base_url, _) = mock_http(vec![(200, jwks())]);
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let within_skew = token_with_identity_and_times(
+            Some(KID),
+            "ozonofk-mcp",
+            "subject-1",
+            Some("admin"),
+            Some("admin@example.test"),
+            Some(true),
+            Some("mcp:tools"),
+            now - 30,
+            now + 30,
+        );
+
+        assert_eq!(
+            auth.authenticate(&bearer(&within_skew))
+                .await
+                .unwrap()
+                .actor_id,
+            "admin"
+        );
+
+        let beyond_skew = token_with_identity_and_times(
+            Some(KID),
+            "ozonofk-mcp",
+            "subject-1",
+            Some("admin"),
+            Some("admin@example.test"),
+            Some(true),
+            Some("mcp:tools"),
+            now + 3_600,
+            now + 90,
+        );
+        assert_eq!(
+            auth.authenticate(&bearer(&beyond_skew)).await.unwrap_err(),
+            JwtAuthenticationFailure::InvalidToken
         );
     }
 

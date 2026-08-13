@@ -9980,6 +9980,205 @@
 					"response": []
 				}
 			]
+		},
+		{
+			"name": "Wildberries — методы MCP (строго read-only)",
+			"description": "Справочная копия всех 17 сетевых методов Wildberries, разрешённых runtime allowlist в src/wb.rs. Папка не является источником сетевых полномочий: сервер по-прежнему проверяет точную пару method/path и фиксированный host. POST-методы здесь только читают аналитику. Не добавляйте произвольные GET: у WB существуют мутирующие GET. Локальный wb_stores_status отсутствует, потому что он не обращается к WB API. Токен задавайте только через переменную wbApiToken и не сохраняйте его в коллекции.",
+			"auth": {
+				"type": "bearer",
+				"bearer": [
+					{
+						"key": "token",
+						"value": "{{wbApiToken}}",
+						"type": "string"
+					}
+				]
+			},
+			"item": [
+				{
+					"name": "wb_ping — GET /ping",
+					"request": {
+						"method": "GET",
+						"url": "https://seller-analytics-api.wildberries.ru/ping",
+						"description": "Проверка подключения Analytics API. Runtime: wb_ping."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_sales_funnel — POST /api/analytics/v3/sales-funnel/products",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"selectedPeriod\": { \"start\": \"{{wbDateFrom}}\", \"end\": \"{{wbDateTo}}\" },\n  \"nmIds\": [],\n  \"brandNames\": [],\n  \"subjectIds\": [],\n  \"tagIds\": [],\n  \"skipDeletedNm\": false,\n  \"limit\": 1000,\n  \"offset\": 0\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products",
+						"description": "Read-only воронка продаж. Runtime: wb_sales_funnel."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_sales_funnel_history — POST /api/analytics/v3/sales-funnel/products/history",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"selectedPeriod\": { \"start\": \"{{wbDateFrom}}\", \"end\": \"{{wbDateTo}}\" },\n  \"nmIds\": [{{wbNmId}}],\n  \"skipDeletedNm\": false,\n  \"aggregationLevel\": \"day\"\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products/history",
+						"description": "Read-only история воронки по товарам. Runtime: wb_sales_funnel_history."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_sales_funnel_grouped_history — POST /api/analytics/v3/sales-funnel/grouped/history",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"selectedPeriod\": { \"start\": \"{{wbDateFrom}}\", \"end\": \"{{wbDateTo}}\" },\n  \"brandNames\": [],\n  \"subjectIds\": [],\n  \"tagIds\": [],\n  \"skipDeletedNm\": false,\n  \"aggregationLevel\": \"day\"\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/grouped/history",
+						"description": "Read-only групповая история воронки. Runtime: wb_sales_funnel_grouped_history."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_warehouse_stocks — POST /api/analytics/v1/stocks-report/wb-warehouses",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"nmIds\": [],\n  \"chrtIds\": [],\n  \"limit\": 1000,\n  \"offset\": 0\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses",
+						"description": "Read-only остатки на складах WB. Runtime: wb_warehouse_stocks."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_orders — GET /api/v1/supplier/orders",
+					"request": {
+						"method": "GET",
+						"url": "https://statistics-api.wildberries.ru/api/v1/supplier/orders?dateFrom={{wbDateFrom}}&flag=0",
+						"description": "Read-only заказы, изменённые после dateFrom. Runtime: wb_orders."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_sales — GET /api/v1/supplier/sales",
+					"request": {
+						"method": "GET",
+						"url": "https://statistics-api.wildberries.ru/api/v1/supplier/sales?dateFrom={{wbDateFrom}}&flag=0",
+						"description": "Read-only продажи и возвраты, изменённые после dateFrom. Runtime: wb_sales."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_product_cards — POST /content/v2/get/cards/list",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"settings\": {\n    \"sort\": { \"ascending\": true },\n    \"cursor\": { \"limit\": 50 }\n  }\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://content-api.wildberries.ru/content/v2/get/cards/list",
+						"description": "Read-only список карточек товаров. Runtime: wb_product_cards."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_product_prices — GET /api/v2/list/goods/filter",
+					"request": {
+						"method": "GET",
+						"url": "https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter?limit=1000&offset=0",
+						"description": "Read-only цены товаров. Runtime: wb_product_prices."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_tariff_commissions — GET /api/v1/tariffs/commission",
+					"request": {
+						"method": "GET",
+						"url": "https://common-api.wildberries.ru/api/v1/tariffs/commission",
+						"description": "Read-only комиссии по категориям. Runtime: wb_tariff_commissions."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_tariff_boxes — GET /api/v1/tariffs/box",
+					"request": {
+						"method": "GET",
+						"url": "https://common-api.wildberries.ru/api/v1/tariffs/box?date={{wbTariffDate}}",
+						"description": "Read-only тарифы коробов. Runtime: wb_tariff_boxes."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_tariff_pallets — GET /api/v1/tariffs/pallet",
+					"request": {
+						"method": "GET",
+						"url": "https://common-api.wildberries.ru/api/v1/tariffs/pallet?date={{wbTariffDate}}",
+						"description": "Read-only тарифы паллет. Runtime: wb_tariff_pallets."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_tariff_returns — GET /api/v1/tariffs/return",
+					"request": {
+						"method": "GET",
+						"url": "https://common-api.wildberries.ru/api/v1/tariffs/return?date={{wbTariffDate}}",
+						"description": "Read-only тарифы возврата. Runtime: wb_tariff_returns."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_acceptance_coefficients — GET /api/tariffs/v1/acceptance/coefficients",
+					"request": {
+						"method": "GET",
+						"url": "https://common-api.wildberries.ru/api/tariffs/v1/acceptance/coefficients",
+						"description": "Read-only коэффициенты приёмки по всем складам. Runtime: wb_acceptance_coefficients."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_campaigns — GET /adv/v1/promotion/count",
+					"request": {
+						"method": "GET",
+						"url": "https://advert-api.wildberries.ru/adv/v1/promotion/count",
+						"description": "Read-only список рекламных кампаний. Runtime: wb_promotion_campaigns."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_campaign_details — GET /api/advert/v2/adverts",
+					"request": {
+						"method": "GET",
+						"url": "https://advert-api.wildberries.ru/api/advert/v2/adverts?ids={{wbCampaignIds}}",
+						"description": "Read-only сведения о выбранных рекламных кампаниях. Runtime: wb_promotion_campaign_details."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_stats — GET /adv/v3/fullstats",
+					"request": {
+						"method": "GET",
+						"url": "https://advert-api.wildberries.ru/adv/v3/fullstats?ids={{wbCampaignIds}}&beginDate={{wbDateFrom}}&endDate={{wbDateTo}}",
+						"description": "Read-only статистика выбранных кампаний за период до 31 дня. Runtime: wb_promotion_stats."
+					},
+					"response": []
+				}
+			]
 		}
 	],
 	"auth": {
@@ -9997,6 +10196,38 @@
 			}
 		]
 	},
+	"variable": [
+		{
+			"key": "wbApiToken",
+			"value": "",
+			"type": "string"
+		},
+		{
+			"key": "wbDateFrom",
+			"value": "2026-08-01",
+			"type": "string"
+		},
+		{
+			"key": "wbDateTo",
+			"value": "2026-08-07",
+			"type": "string"
+		},
+		{
+			"key": "wbTariffDate",
+			"value": "2026-08-13",
+			"type": "string"
+		},
+		{
+			"key": "wbNmId",
+			"value": "123456",
+			"type": "string"
+		},
+		{
+			"key": "wbCampaignIds",
+			"value": "123456",
+			"type": "string"
+		}
+	],
 	"event": [
 		{
 			"listen": "prerequest",

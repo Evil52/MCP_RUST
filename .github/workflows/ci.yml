@@ -62,7 +62,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends shellcheck
-          shellcheck scripts/*.sh position-monitor/initdb/*.sh
+          shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
           if git grep -n -I -E -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|sqp_[[:alnum:]_-]{20,}'; then
             echo "A likely private key or Sonar token is committed." >&2
             exit 1
@@ -215,6 +215,12 @@ jobs:
       - name: Verify hardening declared by the shipped Compose files
         run: ./scripts/verify-compose-hardening.sh
 
+      - name: Verify position database schema and restricted roles
+        env:
+          POSITION_SCHEMA_TEST_IMAGE: mcp-ozon-position-db:ci
+          POSITION_SCHEMA_TEST_KEEP_IMAGE: "true"
+        run: ./scripts/test-position-schema.sh
+
       - name: Build image
         run: docker build --pull --tag mcp-ozon:ci .
 
@@ -265,6 +271,15 @@ jobs:
           --exit-code 1
           mcp-ozon:ci
 
+      - name: Scan position database image for fixable high and critical vulnerabilities
+        run: >-
+          trivy image
+          --scanners vuln,secret
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --exit-code 1
+          mcp-ozon-position-db:ci
+
       - name: Start hardened container and verify health
         run: |
           docker run --detach \
@@ -274,6 +289,9 @@ jobs:
             --cap-drop ALL \
             --security-opt no-new-privileges=true \
             --env MCP_ACTOR_ID=admin \
+            --env MCP_DEV_ALLOW_NON_LOOPBACK=true \
+            --env MCP_MAX_SESSIONS=8 \
+            --env MCP_SESSION_IDLE_TIMEOUT_SECONDS=90 \
             --publish 127.0.0.1:8787:8787 \
             mcp-ozon:ci
 
@@ -299,3 +317,20 @@ jobs:
           test "$(docker inspect --format '{{join .HostConfig.CapDrop ","}}' mcp-ozon-ci)" = "ALL"
           docker inspect --format '{{join .HostConfig.SecurityOpt ","}}' mcp-ozon-ci \
             | grep --fixed-strings 'no-new-privileges=true'
+
+          # Exercise the optimized release binary without marketplace access.
+          # The harness exposes only schema listing and the process-local
+          # list_members tool, then proves controlled overload and recovery.
+          python3 scripts/mcp-session-load-smoke.py \
+            --url http://127.0.0.1:8787/mcp \
+            --mode local \
+            --clients 8 \
+            --calls 5 \
+            --timeout-seconds 10
+          python3 scripts/mcp-session-load-smoke.py \
+            --url http://127.0.0.1:8787/mcp \
+            --mode schema \
+            --clients 32 \
+            --calls 3 \
+            --timeout-seconds 10 \
+            --expect-overload

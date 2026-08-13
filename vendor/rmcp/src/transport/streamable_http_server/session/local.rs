@@ -53,9 +53,23 @@ impl LocalSessionManager {
         self
     }
 
+    /// Set the period with no protocol activity after which a session worker
+    /// is terminated. In-flight requests are not idle and may run longer than
+    /// this duration; the countdown starts after their final response.
+    pub fn with_session_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.session_config.keep_alive = Some(idle_timeout);
+        self
+    }
+
     /// Return the configured hard upper bound for local sessions.
     pub fn max_sessions(&self) -> NonZeroUsize {
         self.max_sessions
+    }
+
+    /// Return the configured idle timeout, or `None` when idle eviction is
+    /// explicitly disabled through [`SessionConfig`].
+    pub fn session_idle_timeout(&self) -> Option<Duration> {
+        self.session_config.keep_alive
     }
 
     fn remove_terminated_sessions(sessions: &mut HashMap<SessionId, LocalSessionHandle>) {
@@ -89,6 +103,16 @@ pub enum LocalSessionManagerError {
 impl SessionManager for LocalSessionManager {
     type Error = LocalSessionManagerError;
     type Transport = WorkerTransport<LocalSessionWorker>;
+
+    fn classify_error(&self, error: &Self::Error) -> SessionManagerErrorKind {
+        match error {
+            LocalSessionManagerError::SessionCapacityExhausted { .. } => {
+                SessionManagerErrorKind::CapacityExhausted
+            }
+            _ => SessionManagerErrorKind::Internal,
+        }
+    }
+
     async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
         let mut sessions = self.sessions.write().await;
         Self::remove_terminated_sessions(&mut sessions);
@@ -136,7 +160,9 @@ impl SessionManager for LocalSessionManager {
     }
     async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
         let sessions = self.sessions.read().await;
-        Ok(sessions.contains_key(id))
+        Ok(sessions
+            .get(id)
+            .is_some_and(|handle| !handle.event_tx.is_closed()))
     }
     async fn create_stream(
         &self,
@@ -278,7 +304,8 @@ impl std::str::FromStr for EventId {
 }
 
 use super::{
-    EventStore, EventStoreError, RestoreOutcome, ServerSseMessage, SessionManager, StreamId,
+    EventStore, EventStoreError, RestoreOutcome, ServerSseMessage, SessionManager,
+    SessionManagerErrorKind, StreamId,
 };
 
 struct CachedTx {
@@ -1151,10 +1178,17 @@ impl Worker for LocalSessionWorker {
             .send(Ok(()))
             .map_err(|_| WorkerQuitReason::HandlerTerminated)?;
         let ct = context.cancellation_token.clone();
-        let keep_alive = self.session_config.keep_alive.unwrap_or(Duration::MAX);
         loop {
             self.evict_expired_channels();
-            let keep_alive_timeout = tokio::time::sleep(keep_alive);
+            // A request registered in `resource_router` is still being handled
+            // by the service. Do not turn the configured *idle* timeout into an
+            // operation deadline: marketplace calls may legitimately outlive
+            // it. Once the final response unregisters the resource, the next
+            // loop iteration starts a fresh idle countdown.
+            let idle_timeout = self
+                .session_config
+                .keep_alive
+                .filter(|_| self.resource_router.is_empty());
             let event = tokio::select! {
                 event = self.event_rx.recv() => {
                     if let Some(event) = event {
@@ -1169,8 +1203,15 @@ impl Worker for LocalSessionWorker {
                 _ = ct.cancelled() => {
                     return Err(WorkerQuitReason::Cancelled)
                 }
-                _ = keep_alive_timeout => {
-                    return Err(WorkerQuitReason::IdleTimeout(keep_alive))
+                _ = async {
+                    match idle_timeout {
+                        Some(timeout) => tokio::time::sleep(timeout).await,
+                        None => futures::future::pending().await,
+                    }
+                } => {
+                    return Err(WorkerQuitReason::IdleTimeout(
+                        idle_timeout.expect("idle-timeout branch is disabled while active")
+                    ))
                 }
             };
             match event {

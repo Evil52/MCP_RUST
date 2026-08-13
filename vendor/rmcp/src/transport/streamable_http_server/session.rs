@@ -71,6 +71,19 @@ pub enum RestoreOutcome<T> {
     NotSupported,
 }
 
+/// Stable transport-facing classification for session-manager failures.
+///
+/// Custom managers remain source-compatible: errors are treated as internal
+/// unless the implementation explicitly opts into a narrower classification.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionManagerErrorKind {
+    /// An unexpected session backend failure.
+    Internal,
+    /// The manager cannot allocate another session until capacity is released.
+    CapacityExhausted,
+}
+
 /// Controls how MCP sessions are created, validated, and closed.
 ///
 /// The `StreamableHttpService` calls into this
@@ -90,6 +103,16 @@ pub enum RestoreOutcome<T> {
 pub trait SessionManager: Send + Sync + 'static {
     type Error: std::error::Error + Send + 'static;
     type Transport: crate::transport::Transport<RoleServer>;
+
+    /// Classify an error for transport-level handling.
+    ///
+    /// The default preserves the historical HTTP 500 behavior for existing
+    /// custom implementations. Managers should return
+    /// [`SessionManagerErrorKind::CapacityExhausted`] only for a transient hard
+    /// capacity limit; Streamable HTTP maps that class to HTTP 503.
+    fn classify_error(&self, _error: &Self::Error) -> SessionManagerErrorKind {
+        SessionManagerErrorKind::Internal
+    }
 
     /// Create a new session and return its ID together with the transport
     /// that will be used to exchange MCP messages within this session.

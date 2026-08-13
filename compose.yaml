@@ -11,11 +11,14 @@ services:
     environment:
       MCP_TRANSPORT: http
       MCP_BIND: 0.0.0.0:8787
+      MCP_DEV_ALLOW_NON_LOOPBACK: "true"
       MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
       OZON_POSTINGS_VNEXT: "false"
       OZON_FINANCE_ACCRUALS_PREVIEW: "false"
     ports:
       - "127.0.0.1:8787:8787"
+    networks:
+      - outbound
     volumes:
       - type: bind
         source: ${MCP_ACCESS_CONFIG_HOST:-./config/access.json}
@@ -46,3 +49,11 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
+
+networks:
+  outbound:
+    name: mcp-ozon-outbound
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
