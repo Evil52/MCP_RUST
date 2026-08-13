@@ -3660,6 +3660,57 @@ mod tests {
         assert!(matches!(error, WbError::DeadlineExceeded));
     }
 
+    /// `SECURITY.md` invariant 1 disables redirects on every marketplace client,
+    /// and the WB client had no test for it while Ozon and Ozon Performance did.
+    ///
+    /// Following a redirect would defeat the read-only allowlist outright: the
+    /// allowlist is checked against the URL this process constructs, so a `307`
+    /// pointing at a mutating path would carry the original method and body to a
+    /// destination that was never allowlisted, and the `Authorization` token
+    /// along with it. The 3xx must therefore surface as a plain HTTP error.
+    #[tokio::test]
+    async fn wb_redirects_are_never_followed_so_the_allowlist_cannot_be_escaped() {
+        for status in [301_u16, 302, 303, 307, 308] {
+            let (base_url, requests, _task) = raw_http(vec![raw_response(
+                status,
+                // Port 9 (discard) is never served: reaching it would hang or
+                // fail as a network error rather than the HTTP error asserted.
+                "Location: http://127.0.0.1:9/api/v2/cards/update\r\n",
+                b"{}",
+            )]);
+            let client = client(&base_url);
+
+            let error = client
+                .ping("account")
+                .await
+                .expect_err("a 3xx must not be followed");
+
+            assert_eq!(
+                error.kind(),
+                WbErrorKind::Http,
+                "HTTP {status} must surface as an upstream HTTP error, got {error:?}"
+            );
+            assert!(
+                matches!(&error, WbError::Api { status: got, .. } if got.as_u16() == status),
+                "HTTP {status} must be reported verbatim, got {error:?}"
+            );
+
+            // Exactly one request left the process: the redirect target was
+            // never contacted.
+            let sent = requests
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the initial request must have been sent");
+            assert!(
+                String::from_utf8_lossy(&sent).starts_with("GET /ping "),
+                "only the allowlisted request may be sent"
+            );
+            assert!(
+                requests.try_recv().is_err(),
+                "a redirect must not produce a second request"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn only_allowlisted_read_only_wb_requests_can_reach_the_network() {
         // Pointed at a port nothing listens on: a denied request must fail as

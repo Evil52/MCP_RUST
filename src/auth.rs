@@ -734,6 +734,29 @@ mod tests {
         .unwrap()
     }
 
+    /// Mints an otherwise valid token under a caller-chosen `iss`.
+    fn token_from_issuer(issuer: &str) -> String {
+        let now = chrono::Utc::now().timestamp();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_owned());
+        encode(
+            &header,
+            &TestClaims {
+                iss: issuer,
+                aud: "ozonofk-mcp",
+                sub: "subject-1",
+                scope: Some("openid profile email mcp:tools"),
+                preferred_username: Some("admin"),
+                email: Some("admin@example.test"),
+                email_verified: Some(true),
+                exp: now + 3_600,
+                nbf: now - 1,
+            },
+            &test_key().encoding,
+        )
+        .unwrap()
+    }
+
     fn bearer(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -743,13 +766,26 @@ mod tests {
         headers
     }
 
+    /// A client for the loopback servers these tests spawn.
+    ///
+    /// `.no_proxy()` is not cosmetic: `reqwest` honours `HTTP_PROXY`/`ALL_PROXY`
+    /// even for `127.0.0.1`, so a developer with a proxy exported in their shell
+    /// — or a sibling test that sets one — would otherwise divert this request
+    /// away from the server under test.
+    fn loopback_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a loopback client always builds")
+    }
+
     async fn call_mcp_tool(
         endpoint: &str,
         bearer: Option<&str>,
         name: &str,
         arguments: serde_json::Value,
     ) -> serde_json::Value {
-        let mut request = reqwest::Client::new()
+        let mut request = loopback_client()
             .post(endpoint)
             .header("accept", "application/json, text/event-stream")
             .json(&json!({
@@ -1468,6 +1504,52 @@ mod tests {
         auth.authenticate(&headers).await.unwrap();
         assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
         assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
+    }
+
+    /// `SECURITY.md` lists the issuer among the claims every `tools/call`
+    /// validates, and `authenticate` pins it with `set_issuer`. Nothing else in
+    /// the suite exercised that pin: a token bearing the right audience, scope,
+    /// subject and signing key but a foreign `iss` was accepted.
+    ///
+    /// The signature still has to verify against the configured JWKS, so this is
+    /// defence in depth rather than a standalone bypass today. It stops being
+    /// defence in depth the moment a deployment shares signing keys across
+    /// realms or fronts several issuers behind one JWKS URL, which is exactly
+    /// when a silently dropped `set_issuer` would matter.
+    #[tokio::test]
+    async fn a_token_from_a_foreign_issuer_is_refused_even_with_a_valid_signature() {
+        let (base_url, _) = mock_http(vec![(200, jwks()), (200, jwks()), (200, jwks())]);
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+
+        // The configured issuer authenticates, so the fixture is known-good and
+        // a later failure cannot be blamed on the rest of the claim set.
+        assert_eq!(
+            auth.authenticate(&bearer(&token_from_issuer("http://issuer.test/realms/ofk")))
+                .await
+                .unwrap()
+                .actor_id,
+            "admin"
+        );
+
+        for foreign in [
+            "http://attacker.test/realms/ofk",
+            // Same host, different realm.
+            "http://issuer.test/realms/other",
+            // Prefix and suffix of the configured issuer, so a `starts_with` or
+            // `contains` comparison would not be enough.
+            "http://issuer.test/realms",
+            "http://issuer.test/realms/ofk/",
+            "http://issuer.test/realms/ofk.attacker.test",
+            "",
+        ] {
+            assert_eq!(
+                auth.authenticate(&bearer(&token_from_issuer(foreign)))
+                    .await
+                    .unwrap_err(),
+                JwtAuthenticationFailure::InvalidToken,
+                "a token issued by {foreign:?} must be refused"
+            );
+        }
     }
 
     /// A JWKS document whose `keys` member is absent or is not an array must
