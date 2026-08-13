@@ -221,13 +221,19 @@ jobs:
       - name: Verify minimal static musl runtime
         run: |
           test "$(docker image inspect --format '{{.Config.User}}' mcp-ozon:ci)" = "mcp"
-          docker run --rm --entrypoint /bin/sh mcp-ozon:ci -c '
+          docker run --rm --entrypoint /bin/sh mcp-ozon:ci -ec '
             test -f /etc/alpine-release
             test -r /etc/ssl/certs/ca-certificates.crt
             command -v wget >/dev/null
-            ! command -v curl >/dev/null
-            ldd /usr/local/bin/mcp-ozon 2>&1 \
-              | grep -Eq "statically linked|Not a valid dynamic program"
+            if command -v curl >/dev/null; then
+              echo "curl must not be present in the runtime image" >&2
+              exit 1
+            fi
+            if ldd /usr/local/bin/mcp-ozon 2>&1 | grep -q "=>"; then
+              echo "the runtime binary must not have dynamic dependencies" >&2
+              ldd /usr/local/bin/mcp-ozon >&2 2>&1
+              exit 1
+            fi
           '
 
       - name: Install verified Trivy
