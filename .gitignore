@@ -3,6 +3,7 @@
 /.scannerwork
 /.vscode
 .env
+.position.env
 .keycloak.env
 .sonar.env
 .sonar-stack.env

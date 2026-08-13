@@ -1,0 +1,54 @@
+name: mcp-ozon-position
+
+services:
+  position-db:
+    image: mcp-ozon-position-db:local
+    build:
+      context: ./position-monitor
+      dockerfile: Dockerfile
+    environment:
+      POSTGRES_DB: ${POSITION_DB_NAME:-ozon_positions}
+      POSTGRES_USER: ${POSITION_DB_ADMIN_USER:-position_admin}
+      POSTGRES_PASSWORD: ${POSITION_DB_ADMIN_PASSWORD:?POSITION_DB_ADMIN_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+      POSITION_COLLECTOR_DB_PASSWORD: ${POSITION_COLLECTOR_DB_PASSWORD:?POSITION_COLLECTOR_DB_PASSWORD is required}
+      POSITION_READER_DB_PASSWORD: ${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}
+    volumes:
+      - position-data:/var/lib/postgresql/data
+    networks:
+      - position-internal
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    shm_size: 64m
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+      - /var/run/postgresql:size=8m,mode=3775
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+networks:
+  position-internal:
+    name: mcp-ozon-position-internal
+    internal: true
+
+volumes:
+  position-data:
+    name: mcp-ozon-position-data
