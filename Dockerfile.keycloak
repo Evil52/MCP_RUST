@@ -1,3 +1,7 @@
 FROM quay.io/keycloak/keycloak:26.7.1@sha256:f1f1f01e472c8a78df40d8f2a49a925274eda4d3d80d5f6edbb5c880ee3c01c6
 
 COPY --chown=keycloak:keycloak config/keycloak/ofk-realm.json /opt/keycloak/data/import/ofk-realm.json
+
+# The base image already runs as uid 1000; restating it keeps the guarantee
+# visible to image scanners instead of leaving it implicit in the base.
+USER 1000
