@@ -38,6 +38,9 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: none
           queries: security-extended
+          config: |
+            paths-ignore:
+              - vendor/**
 
       - name: Analyze
         uses: github/codeql-action/analyze@db2c8fe24a75c0f28f87ed1a6fe918a5ccf7b1e6 # v4.31.10

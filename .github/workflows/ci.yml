@@ -36,9 +36,12 @@ jobs:
         run: |
           rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
       - name: Reject accidentally committed local secrets
         run: |
-          prohibited_files='(^|/)(\.env|\.keycloak\.env|\.sonar\.env|\.sonar-stack\.env|sonar\.env|config/access(\.canary)?\.json)$'
+          prohibited_files='(^|/)(\.env|\.position\.env|\.keycloak\.env|\.sonar\.env|\.sonar-stack\.env|sonar\.env|config/access(\.canary)?\.json)$'
           if git ls-files | grep -E "$prohibited_files"; then
             echo "Local secret or private configuration files must never be committed." >&2
             exit 1
@@ -59,7 +62,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends shellcheck
-          shellcheck scripts/*.sh
+          shellcheck scripts/*.sh position-monitor/initdb/*.sh
           if git grep -n -I -E -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|sqp_[[:alnum:]_-]{20,}'; then
             echo "A likely private key or Sonar token is committed." >&2
             exit 1
@@ -92,6 +95,9 @@ jobs:
       - name: Install project Rust version
         run: rustup toolchain install 1.97.1 --profile minimal
 
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
       - name: Test project Rust version
         run: cargo +1.97.1 test --locked --all-targets --all-features
 
@@ -105,10 +111,17 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install project Rust and cargo-llvm-cov
+      - name: Install project Rust
         run: |
           rustup toolchain install 1.97.1 --profile minimal --component llvm-tools-preview
-          cargo install cargo-llvm-cov --version 0.8.7 --locked
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install verified cargo-llvm-cov
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-llvm-cov@0.8.7
 
       - name: Enforce complete line coverage
         run: >-
@@ -129,11 +142,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install project Rust and security tools
-        run: |
-          rustup toolchain install 1.97.1 --profile minimal
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo install cargo-deny --version 0.19.9 --locked
+      - name: Install project Rust
+        run: rustup toolchain install 1.97.1 --profile minimal
+
+      - name: Install verified security tools
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.19.9
 
       - name: Audit Cargo.lock against RustSec
         run: cargo audit --deny warnings
