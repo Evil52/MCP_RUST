@@ -7,7 +7,7 @@ services:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - .env
+      - ${MCP_ENV_FILE:-.env}
     environment:
       MCP_TRANSPORT: http
       MCP_BIND: 0.0.0.0:8787

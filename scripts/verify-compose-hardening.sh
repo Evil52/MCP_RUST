@@ -31,7 +31,12 @@ cleanup() {
 trap cleanup EXIT
 
 interpolation_env="$scratch/interpolation.env"
+service_env="$scratch/service.env"
+printf '# Intentionally empty: Compose must not read the project .env during verification.\n' \
+  >"$service_env"
+chmod 600 "$service_env"
 printf '%s\n' \
+  "MCP_ENV_FILE=$service_env" \
   'POSITION_DB_ADMIN_PASSWORD=verify-only-admin-not-a-secret' \
   'POSITION_COLLECTOR_DB_PASSWORD=verify-only-collector-not-a-secret' \
   'POSITION_READER_DB_PASSWORD=verify-only-reader-not-a-secret' \
