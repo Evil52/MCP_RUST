@@ -8,8 +8,9 @@ use std::{
 use anyhow::Result;
 use axum::http::HeaderMap;
 use jsonwebtoken::{
-    Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind as JwtErrorKind,
-    jwk::JwkSet,
+    Algorithm, DecodingKey, Validation, decode, decode_header,
+    errors::ErrorKind as JwtErrorKind,
+    jwk::{AlgorithmParameters, JwkSet},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -144,7 +145,16 @@ fn parse_bounded_jwks(body: &[u8]) -> std::result::Result<JwkSet, JwtAuthenticat
     if keys.is_empty() || keys.len() > MAX_JWKS_KEYS || !jwks_strings_are_bounded(&value) {
         return Err(JwtAuthenticationFailure::VerifierUnavailable);
     }
-    serde_json::from_value(value).map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)
+    let jwks = serde_json::from_value::<JwkSet>(value)
+        .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
+    if jwks
+        .keys
+        .iter()
+        .any(|jwk| matches!(&jwk.algorithm, AlgorithmParameters::Other(_)))
+    {
+        return Err(JwtAuthenticationFailure::VerifierUnavailable);
+    }
+    Ok(jwks)
 }
 
 #[derive(Debug, Clone)]
@@ -1572,6 +1582,42 @@ mod tests {
                 .unwrap_err(),
             JwtAuthenticationFailure::AccessDenied
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_numeric_time_claims() {
+        let (base_url, _) = mock_http(vec![(200, jwks())]);
+        let auth = JwtAuthenticator::new(config(base_url), registry()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_owned());
+
+        for claims in [
+            json!({
+                "iss": "http://issuer.test/realms/ofk",
+                "aud": "ozonofk-mcp",
+                "sub": "subject-1",
+                "scope": "mcp:tools",
+                "preferred_username": "admin",
+                "exp": "never",
+                "nbf": now - 1
+            }),
+            json!({
+                "iss": "http://issuer.test/realms/ofk",
+                "aud": "ozonofk-mcp",
+                "sub": "subject-1",
+                "scope": "mcp:tools",
+                "preferred_username": "admin",
+                "exp": now + 3_600,
+                "nbf": "99999999999"
+            }),
+        ] {
+            let token = encode(&header, &claims, &test_key().encoding).unwrap();
+            assert_eq!(
+                auth.authenticate(&bearer(&token)).await.unwrap_err(),
+                JwtAuthenticationFailure::InvalidToken
+            );
+        }
     }
 
     #[tokio::test]

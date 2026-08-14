@@ -16,7 +16,7 @@ dotenvy = "0.15"
 http-body = "1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
-jsonwebtoken = "9.3"
+jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
 reqwest = { version = "0.13", default-features = false, features = [
     "brotli",
     "gzip",
@@ -36,7 +36,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
 flate2 = "1"
 tower = { version = "0.5", features = ["util"] }
 

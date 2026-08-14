@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::dangerous::insecure_decode;
 use rmcp::{
     schemars::JsonSchema, transport::streamable_http_server::session::local::LocalSessionManager,
 };
@@ -282,15 +282,8 @@ fn validate_wb_token_type(token: &str, env_name: &str) -> Result<()> {
         return Err(invalid_wb_token_type(env_name));
     }
 
-    let header = decode_header(token).map_err(|_| invalid_wb_token_type(env_name))?;
-    let mut validation = Validation::new(header.alg);
-    validation.insecure_disable_signature_validation();
-    validation.required_spec_claims.clear();
-    validation.validate_exp = false;
-    validation.validate_nbf = false;
-    validation.validate_aud = false;
-    let claims = decode::<WbTokenTypeClaims>(token, &DecodingKey::from_secret(&[]), &validation)
-        .map_err(|_| invalid_wb_token_type(env_name))?;
+    let claims =
+        insecure_decode::<WbTokenTypeClaims>(token).map_err(|_| invalid_wb_token_type(env_name))?;
     if claims.claims.acc != 3 {
         return Err(invalid_wb_token_type(env_name));
     }
