@@ -32,26 +32,38 @@ trap cleanup EXIT
 
 interpolation_env="$scratch/interpolation.env"
 service_env="$scratch/service.env"
+main_access="$scratch/access.json"
+canary_access="$scratch/access.canary.json"
 printf '# Intentionally empty: Compose must not read the project .env during verification.\n' \
   >"$service_env"
-chmod 600 "$service_env"
+printf '{}\n' >"$main_access"
+printf '{}\n' >"$canary_access"
+chmod 600 "$service_env" "$main_access" "$canary_access"
 printf '%s\n' \
   "MCP_ENV_FILE=$service_env" \
+  "MCP_ACCESS_CONFIG_HOST=$main_access" \
+  "MCP_CANARY_ACCESS_CONFIG=$canary_access" \
   'POSITION_DB_ADMIN_PASSWORD=verify-only-admin-not-a-secret' \
   'POSITION_COLLECTOR_DB_PASSWORD=verify-only-collector-not-a-secret' \
   'POSITION_READER_DB_PASSWORD=verify-only-reader-not-a-secret' \
   >"$interpolation_env"
 chmod 600 "$interpolation_env"
 
-# Host overrides must not mask a regression in either version-controlled
-# default source path.
-unset MCP_ACCESS_CONFIG_HOST MCP_CANARY_ACCESS_CONFIG
-
 failures=0
 check() {
   local description="$1" document="$2"
   shift 2
   if jq -e "$@" <<<"$document" >/dev/null; then
+    printf 'ok   %s\n' "$description"
+  else
+    printf 'FAIL %s\n' "$description" >&2
+    failures=$((failures + 1))
+  fi
+}
+
+check_contains() {
+  local description="$1" path="$2" expected="$3"
+  if grep -Fq -- "$expected" "$path"; then
     printf 'ok   %s\n' "$description"
   else
     printf 'FAIL %s\n' "$description" >&2
@@ -222,10 +234,30 @@ main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_compose "$project_dir/compose.position.yaml")"
 
+# Rendering uses isolated, existing placeholder files so the result is the
+# same in a clean checkout and on a developer machine with ignored secrets.
+# Keep the shipped defaults independently pinned to their expected paths.
+check_contains \
+  "main: default service env path remains .env" \
+  "$project_dir/compose.yaml" \
+  "\${MCP_ENV_FILE:-.env}"
+check_contains \
+  "canary: default service env path remains .env" \
+  "$project_dir/compose.canary.yaml" \
+  "\${MCP_ENV_FILE:-.env}"
+check_contains \
+  "main: default access registry path is fixed" \
+  "$project_dir/compose.yaml" \
+  "\${MCP_ACCESS_CONFIG_HOST:-./config/access.json}"
+check_contains \
+  "canary: default access registry path is fixed" \
+  "$project_dir/compose.canary.yaml" \
+  "\${MCP_CANARY_ACCESS_CONFIG:-./config/access.canary.json}"
+
 verify_server \
   "main" \
   "$main_rendered" \
-  "$project_dir/config/access.json" \
+  "$main_access" \
   "8787" \
   "false" \
   "unless-stopped" \
@@ -233,7 +265,7 @@ verify_server \
 verify_server \
   "canary" \
   "$canary_rendered" \
-  "$project_dir/config/access.canary.json" \
+  "$canary_access" \
   "8789" \
   "true" \
   "no" \
