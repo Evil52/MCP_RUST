@@ -142,8 +142,7 @@ verify_server() {
        and .[0].target == "/etc/mcp-ozon/access.json"
        and .[0].type == "bind"
        and .[0].source == $source
-       and .[0].read_only == true
-       and .[0].bind.create_host_path == false'
+       and .[0].read_only == true'
 
   check "$label: non-loopback container bind has an explicit dev opt-in" "$server" \
     '.environment.MCP_BIND == "0.0.0.0:8787"
@@ -253,6 +252,14 @@ check_contains \
   "canary: default access registry path is fixed" \
   "$project_dir/compose.canary.yaml" \
   "\${MCP_CANARY_ACCESS_CONFIG:-./config/access.canary.json}"
+check_contains \
+  "main: missing registry paths are never auto-created" \
+  "$project_dir/compose.yaml" \
+  'create_host_path: false'
+check_contains \
+  "canary: missing registry paths are never auto-created" \
+  "$project_dir/compose.canary.yaml" \
+  'create_host_path: false'
 
 verify_server \
   "main" \
