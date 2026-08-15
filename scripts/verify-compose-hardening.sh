@@ -71,6 +71,23 @@ check_contains() {
   fi
 }
 
+check_control_mount_source_contract() {
+  local description="$1" path="$2" expected actual
+  expected=$'    volumes:\n      - type: bind\n        source: ${CONTROL_MCP_ACCESS_CONFIG_HOST:-./config/access.example.json}\n        target: /etc/mcp-ozon/access.json\n        read_only: true\n        bind:\n          create_host_path: false\n      - type: bind\n        source: ${CONTROL_MCP_POLICY_HOST:-./config/control-policy.example.json}\n        target: /etc/mcp-ozon/control-policy.json\n        read_only: true\n        bind:\n          create_host_path: false'
+  actual="$(awk '
+    /^    volumes:$/ { capture = 1 }
+    capture && /^    restart:/ { exit }
+    capture { print }
+  ' "$path")"
+
+  if [[ "$actual" == "$expected" ]]; then
+    printf 'ok   %s\n' "$description"
+  else
+    printf 'FAIL %s\n' "$description" >&2
+    failures=$((failures + 1))
+  fi
+}
+
 render_compose() {
   local compose_file="$1"
   docker compose \
@@ -281,22 +298,24 @@ verify_control() {
   check "control: exactly two fixed read-only bind mounts are present" "$service" \
     --arg access "$project_dir/config/access.example.json" \
     --arg policy "$project_dir/config/control-policy.example.json" \
-    '(.volumes // [] | sort_by(.target)) == [
+    '((.volumes // []) | map(del(.bind)) | sort_by(.target)) == [
        {
          "type": "bind",
          "source": $access,
          "target": "/etc/mcp-ozon/access.json",
-         "read_only": true,
-         "bind": {"create_host_path": false}
+         "read_only": true
        },
        {
          "type": "bind",
          "source": $policy,
          "target": "/etc/mcp-ozon/control-policy.json",
-         "read_only": true,
-         "bind": {"create_host_path": false}
+         "read_only": true
        }
-     ]'
+     ]
+     and all((.volumes // [])[];
+       .bind == null
+       or .bind == {}
+       or .bind == {"create_host_path": false})'
 
   check "control: published port is exactly 127.0.0.1:8790" "$service" \
     '(.ports // []) == [{
@@ -385,10 +404,9 @@ check_contains \
   "control: default policy is the disabled example" \
   "$project_dir/compose.control.yaml" \
   "\${CONTROL_MCP_POLICY_HOST:-./config/control-policy.example.json}"
-check_contains \
-  "control: both bind mounts refuse implicit host-path creation" \
-  "$project_dir/compose.control.yaml" \
-  'create_host_path: false'
+check_control_mount_source_contract \
+  "control: both bind mounts exactly refuse implicit host-path creation" \
+  "$project_dir/compose.control.yaml"
 
 verify_server \
   "main" \
