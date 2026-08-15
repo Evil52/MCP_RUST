@@ -29,9 +29,15 @@ The following properties are treated as release gates:
    Compose file. Ozon Performance business egress is fixed to exactly
    `GET /api/client/campaign`, `GET /api/client/statistics/daily/json`, and
    `GET /api/client/statistics/expense/json`; its internal `POST /api/client/token` is not
-   model-callable. WB Promotion egress is fixed to `GET /adv/v1/promotion/count`,
-   `GET /api/advert/v2/adverts`, and `GET /adv/v3/fullstats`. WB egress likewise requires an
-   exact allowlisted method, path, host, and quota.
+   model-callable. WB egress contains exactly 22 fixed read operations. Its Search Report subset is
+   `POST /api/v2/search-report/product/search-texts` and
+   `POST /api/v2/search-report/product/orders`. Its Promotion subset is exactly
+   `GET /adv/v1/promotion/count`, `GET /api/advert/v2/adverts`, `GET /adv/v3/fullstats`,
+   `POST /api/advert/v1/bids/min`, `GET /api/advert/v0/bids/recommendations`, and
+   `POST /adv/v0/normquery/get-bids`; the other 14 existing listing/reporting records remain
+   enumerated and regression-tested in `src/wb.rs`. The read-only `POST` methods are allowed by
+   exact host/method/path records, never by a generic verb or path prefix. Every WB record also
+   fixes its host and quota class.
    A safe HTTP verb is never sufficient by itself.
 3. Every MCP tool rejects unknown fields and applies bounded runtime validation in addition to its
    JSON Schema. A denied role, account, endpoint, malformed input, missing credential, or exhausted
@@ -69,7 +75,15 @@ The following properties are treated as release gates:
 - Wildberries: quota is shared by token rather than account alias, funnel pacing is 20 seconds,
   ping pacing is 10 seconds, per-token concurrency is 4, global concurrency is 8, and the complete
   operation has a 60-second deadline. Promotion campaign reads share a 200 ms quota bucket and
-  full statistics has a separate 20-second bucket. Vendor retry headers are parsed conservatively.
+  full statistics has a separate 20-second bucket. Search Report reads have a separate 20-second
+  bucket and do not retry automatically; minimum bids, recommended bids, and search-cluster bids
+  use separate 3-second, 12-second, and 200-millisecond buckets. Vendor retry headers are parsed
+  conservatively. Search Reports are updated roughly once per hour, which is refresh cadence rather
+  than row granularity. Product orders requests are bounded to seven days and their `dateItems` are
+  stored as individual daily rows; period-level frequency and an unproven daily median are not copied
+  into them. Search-text reports remain one aggregate over the explicitly requested period of at most
+  31 inclusive days. Neither source has a region or organic/advertising split, and neither may be
+  represented as a live search-result position.
   Startup accepts only a syntactically valid WB Personal JWT with numeric `acc=3`; Base, Test,
   Service, missing, malformed, and unknown token types fail closed before egress without exposing
   the token or decoded payload. This local decode selects the capability/quota policy and does not
@@ -172,10 +186,14 @@ has broader vendor permissions.
   `/api/client/campaign/all_sku_promo/activate`,
   `/api/client/campaign/all_sku_promo/deactivate`, and
   `/api/client/campaign/all_sku_promo/set_bid` fail locally without credentials or network access.
-- Verify the WB Promotion namespace contains exactly `wb_promotion_campaigns`,
-  `wb_promotion_campaign_details`, and `wb_promotion_stats`. Assert that campaign start, pause,
-  stop, delete, budget deposit, bid changes, SKU-promo activation and deactivation fail locally
-  without credentials or network access, including the mutating operations that use HTTP `GET`.
+- Verify the WB Search namespace contains exactly `wb_search_product_queries` and
+  `wb_search_orders_positions`. Verify the WB Promotion namespace contains exactly
+  `wb_promotion_campaigns`, `wb_promotion_campaign_details`, `wb_promotion_stats`,
+  `wb_promotion_minimum_bids`, `wb_promotion_recommended_bids`, and
+  `wb_promotion_search_cluster_bids`. Assert that campaign start, pause, stop, delete, budget
+  deposit, `PATCH /api/advert/v1/bids`, `POST`/`DELETE /adv/v0/normquery/bids`, minus-phrase
+  changes, SKU-promo activation and deactivation fail locally without credentials or network
+  access, including the mutating operations that use HTTP `GET`.
 - Confirm the runtime registry and `.env` are ignored regular files with mode `600`; never copy their
   contents into logs, screenshots, CI artifacts, or Git.
 - Run OAuth provider integration tests only against disposable test identities. Run marketplace canaries

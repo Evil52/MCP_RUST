@@ -50,6 +50,14 @@ const MAX_PERFORMANCE_CAMPAIGNS: usize = 10;
 const MAX_PERFORMANCE_PERIOD_DAYS: i64 = 31;
 const MAX_WB_PROMOTION_CAMPAIGNS: usize = 50;
 const MAX_WB_PROMOTION_PERIOD_DAYS: i64 = 31;
+const MAX_WB_SEARCH_NM_IDS: usize = 50;
+const MAX_WB_SEARCH_TEXTS: usize = 30;
+const MAX_WB_SEARCH_TEXT_BYTES: usize = 256;
+const MAX_WB_SEARCH_REPORT_PERIOD_DAYS: i64 = 31;
+const MAX_WB_SEARCH_ORDERS_PERIOD_DAYS: i64 = 7;
+const MAX_WB_MINIMUM_BID_NM_IDS: usize = 100;
+const MAX_WB_SEARCH_CLUSTER_PAIRS: usize = 100;
+const MAX_WB_SIGNED_API_ID: u64 = i64::MAX as u64;
 const MAX_IN_FLIGHT_TOOL_CALLS: usize = 16;
 const MIN_REVIEWS_LIMIT: u32 = 20;
 const MAX_OFFSET: u32 = 1_000_000;
@@ -1338,6 +1346,188 @@ pub struct WbPromotionStatsInput {
     pub end_date: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum WbSearchTopOrderBy {
+    OpenCard,
+    AddToCart,
+    OpenToCart,
+    Orders,
+    CartToOrder,
+}
+
+impl WbSearchTopOrderBy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenCard => "openCard",
+            Self::AddToCart => "addToCart",
+            Self::OpenToCart => "openToCart",
+            Self::Orders => "orders",
+            Self::CartToOrder => "cartToOrder",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbSearchProductQueriesInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(
+        description = "Начало отчётного периода в формате YYYY-MM-DD; период не более 31 дня, данные WB обновляются примерно раз в час",
+        length(equal = 10),
+        regex(pattern = r"^\d{4}-\d{2}-\d{2}$")
+    )]
+    pub date_from: String,
+    #[schemars(
+        description = "Конец отчётного периода в формате YYYY-MM-DD; период не более 31 дня",
+        length(equal = 10),
+        regex(pattern = r"^\d{4}-\d{2}-\d{2}$")
+    )]
+    pub date_to: String,
+    #[schemars(
+        description = "От 1 до 50 уникальных положительных артикулов WB",
+        length(min = 1, max = 50),
+        inner(range(min = 1)),
+        extend("uniqueItems" = true)
+    )]
+    pub nm_ids: Vec<u64>,
+    #[schemars(description = "Метрика для отбора верхних поисковых запросов WB")]
+    pub top_order_by: WbSearchTopOrderBy,
+    #[serde(default = "default_wb_search_limit")]
+    #[schemars(
+        description = "Число запросов; безопасный предел стандартного тарифа — 30",
+        range(min = 1, max = 30)
+    )]
+    pub limit: u32,
+}
+
+fn default_wb_search_limit() -> u32 {
+    30
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbSearchOrdersPositionsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(
+        description = "Начало периода в формате YYYY-MM-DD; максимум 7 дней",
+        length(equal = 10),
+        regex(pattern = r"^\d{4}-\d{2}-\d{2}$")
+    )]
+    pub date_from: String,
+    #[schemars(
+        description = "Конец периода в формате YYYY-MM-DD; максимум 7 дней",
+        length(equal = 10),
+        regex(pattern = r"^\d{4}-\d{2}-\d{2}$")
+    )]
+    pub date_to: String,
+    #[schemars(description = "Положительный артикул WB", range(min = 1))]
+    pub nm_id: u64,
+    #[schemars(
+        description = "От 1 до 30 уникальных непустых поисковых фраз; каждая не длиннее 256 байт UTF-8 (maxLength также ограничивает число символов)",
+        length(min = 1, max = 30),
+        inner(length(min = 1, max = 256)),
+        extend("uniqueItems" = true)
+    )]
+    pub search_texts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum WbPromotionPlacementType {
+    Combined,
+    Search,
+    Recommendation,
+}
+
+impl WbPromotionPlacementType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Combined => "combined",
+            Self::Search => "search",
+            Self::Recommendation => "recommendation",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbPromotionMinimumBidsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(description = "Положительный ID рекламной кампании WB", range(min = 1))]
+    pub campaign_id: u64,
+    #[schemars(
+        description = "От 1 до 100 уникальных положительных артикулов WB",
+        length(min = 1, max = 100),
+        inner(range(min = 1)),
+        extend("uniqueItems" = true)
+    )]
+    pub nm_ids: Vec<u64>,
+    pub payment_type: WbPromotionPaymentType,
+    #[schemars(
+        description = "От 1 до 3 уникальных мест размещения: combined, search, recommendation",
+        length(min = 1, max = 3),
+        extend("uniqueItems" = true)
+    )]
+    pub placement_types: Vec<WbPromotionPlacementType>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbPromotionRecommendedBidsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(description = "Положительный ID CPM-кампании WB", range(min = 1))]
+    pub campaign_id: u64,
+    #[schemars(description = "Положительный артикул WB", range(min = 1))]
+    pub nm_id: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct WbPromotionSearchClusterPair {
+    #[schemars(description = "Положительный ID рекламной кампании WB", range(min = 1))]
+    pub campaign_id: u64,
+    #[schemars(description = "Положительный артикул WB", range(min = 1))]
+    pub nm_id: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbPromotionSearchClusterBidsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id Wildberries из wb_stores_status",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[schemars(
+        description = "От 1 до 100 уникальных пар кампания + артикул WB",
+        length(min = 1, max = 100),
+        extend("uniqueItems" = true)
+    )]
+    pub items: Vec<WbPromotionSearchClusterPair>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum SortDirection {
@@ -2470,6 +2660,177 @@ impl OzonMcp {
         Ok(Self::wb_result(account, endpoint, data))
     }
 
+    /// Возвращает официальный Search Report WB с топом запросов, средней и медианной позицией: агрегат выбранного периода до 31 дня, обновляемый примерно раз в час. Требует подписку «Джем»; не содержит региона или organic/ad split и не является live-снимком выдачи.
+    #[tool(
+        name = "wb_search_product_queries",
+        annotations(
+            title = "Поисковые запросы товаров Wildberries",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn wb_search_product_queries(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbSearchProductQueriesInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_wb_search_product_queries_input(&input)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "analytics:/api/v2/search-report/product/search-texts";
+        let data = self
+            .wb_client
+            .search_product_queries(
+                &account,
+                input.date_from,
+                input.date_to,
+                None,
+                input.nm_ids,
+                input.top_order_by.as_str().to_owned(),
+                input.limit,
+            )
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Возвращает официальный Search Report WB с дневными строками заказов и средней позиции за период до 7 дней. Отчёт обновляется примерно раз в час и требует подписку «Джем»; не содержит региона или organic/ad split и не является live-снимком выдачи.
+    #[tool(
+        name = "wb_search_orders_positions",
+        annotations(
+            title = "Заказы и позиции по запросам Wildberries",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn wb_search_orders_positions(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbSearchOrdersPositionsInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_wb_search_orders_positions_input(&input)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "analytics:/api/v2/search-report/product/orders";
+        let data = self
+            .wb_client
+            .search_orders_positions(
+                &account,
+                input.date_from,
+                input.date_to,
+                input.nm_id,
+                input.search_texts,
+            )
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Возвращает минимальные read-only ставки WB в копейках для выбранной кампании, товаров и мест размещения.
+    #[tool(
+        name = "wb_promotion_minimum_bids",
+        annotations(
+            title = "Минимальные ставки Wildberries",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn wb_promotion_minimum_bids(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbPromotionMinimumBidsInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_wb_promotion_minimum_bids_input(&input)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "promotion:/api/advert/v1/bids/min";
+        let data = self
+            .wb_client
+            .promotion_minimum_bids(
+                &account,
+                input.campaign_id,
+                input.nm_ids,
+                input.payment_type.as_str().to_owned(),
+                input
+                    .placement_types
+                    .into_iter()
+                    .map(|placement| placement.as_str().to_owned())
+                    .collect(),
+            )
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Возвращает read-only рекомендуемые ставки WB для одного товара в CPM-кампании и её поисковых кластеров.
+    #[tool(
+        name = "wb_promotion_recommended_bids",
+        annotations(
+            title = "Рекомендуемые ставки Wildberries",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn wb_promotion_recommended_bids(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbPromotionRecommendedBidsInput>,
+    ) -> Result<Json<WbResult>, String> {
+        if !(1..=MAX_WB_SIGNED_API_ID).contains(&input.campaign_id) {
+            return Err(format!(
+                "campaign_id должен быть от 1 до {MAX_WB_SIGNED_API_ID}"
+            ));
+        }
+        if !(1..=MAX_WB_SIGNED_API_ID).contains(&input.nm_id) {
+            return Err(format!("nm_id должен быть от 1 до {MAX_WB_SIGNED_API_ID}"));
+        }
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "promotion:/api/advert/v0/bids/recommendations";
+        let data = self
+            .wb_client
+            .promotion_recommended_bids(&account, input.campaign_id, input.nm_id)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
+    /// Возвращает текущие read-only ставки поисковых кластеров WB для ограниченного списка пар «кампания + товар».
+    #[tool(
+        name = "wb_promotion_search_cluster_bids",
+        annotations(
+            title = "Ставки поисковых кластеров Wildberries",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn wb_promotion_search_cluster_bids(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WbPromotionSearchClusterBidsInput>,
+    ) -> Result<Json<WbResult>, String> {
+        validate_wb_promotion_search_cluster_pairs(&input.items)?;
+        let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
+        let endpoint = "promotion:/adv/v0/normquery/get-bids";
+        let items = input
+            .items
+            .into_iter()
+            .map(|item| (item.campaign_id, item.nm_id))
+            .collect();
+        let data = self
+            .wb_client
+            .promotion_search_cluster_bids(&account, items)
+            .await
+            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+        Ok(Self::wb_result(account, endpoint, data))
+    }
+
     /// Показывает доступные текущему пользователю кабинеты Ozon и Wildberries и состояние их read-only интеграций.
     #[tool(
         name = "marketplace_accounts",
@@ -3330,6 +3691,16 @@ fn validate_unique_positive_ids(field: &str, values: &[u64]) -> Result<(), Strin
     Ok(())
 }
 
+fn validate_unique_wb_signed_ids(field: &str, values: &[u64]) -> Result<(), String> {
+    validate_unique_positive_ids(field, values)?;
+    if values.iter().any(|value| *value > MAX_WB_SIGNED_API_ID) {
+        return Err(format!(
+            "{field} не должен содержать ID больше {MAX_WB_SIGNED_API_ID}"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_wb_promotion_statuses(statuses: &[i32]) -> Result<(), String> {
     const ALLOWED_STATUSES: &[i32] = &[-1, 4, 7, 8, 9, 11];
     validate_count("statuses", statuses.len(), 1, ALLOWED_STATUSES.len())?;
@@ -3358,6 +3729,105 @@ fn validate_wb_promotion_date_range(begin_date: &str, end_date: &str) -> Result<
         return Err(format!(
             "период WB Promotion не может превышать {MAX_WB_PROMOTION_PERIOD_DAYS} день"
         ));
+    }
+    Ok(())
+}
+
+fn validate_wb_search_product_queries_input(
+    input: &WbSearchProductQueriesInput,
+) -> Result<(), String> {
+    validate_date_range(
+        &input.date_from,
+        &input.date_to,
+        MAX_WB_SEARCH_REPORT_PERIOD_DAYS,
+    )?;
+    validate_count("nm_ids", input.nm_ids.len(), 1, MAX_WB_SEARCH_NM_IDS)?;
+    validate_unique_positive_ids("nm_ids", &input.nm_ids)?;
+    validate_limit(input.limit, MAX_WB_SEARCH_TEXTS as u32)?;
+    Ok(())
+}
+
+fn validate_wb_search_texts(search_texts: &[String]) -> Result<(), String> {
+    validate_count("search_texts", search_texts.len(), 1, MAX_WB_SEARCH_TEXTS)?;
+    let mut unique = BTreeSet::new();
+    for text in search_texts {
+        validate_non_blank("search_texts", text)?;
+        validate_max_chars("search_texts", text, MAX_WB_SEARCH_TEXT_BYTES)?;
+        if text.len() > MAX_WB_SEARCH_TEXT_BYTES {
+            return Err(format!(
+                "search_texts не может быть длиннее {MAX_WB_SEARCH_TEXT_BYTES} байт"
+            ));
+        }
+        if text.trim() != text || text.chars().any(char::is_control) {
+            return Err(
+                "search_texts не должен содержать управляющие символы или пробелы по краям"
+                    .to_owned(),
+            );
+        }
+        if !unique.insert(text) {
+            return Err("search_texts не должен содержать повторяющиеся фразы".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_wb_search_orders_positions_input(
+    input: &WbSearchOrdersPositionsInput,
+) -> Result<(), String> {
+    validate_date_range(
+        &input.date_from,
+        &input.date_to,
+        MAX_WB_SEARCH_ORDERS_PERIOD_DAYS,
+    )?;
+    if input.nm_id == 0 {
+        return Err("nm_id должен быть положительным".to_owned());
+    }
+    validate_wb_search_texts(&input.search_texts)
+}
+
+fn validate_wb_promotion_minimum_bids_input(
+    input: &WbPromotionMinimumBidsInput,
+) -> Result<(), String> {
+    if !(1..=MAX_WB_SIGNED_API_ID).contains(&input.campaign_id) {
+        return Err(format!(
+            "campaign_id должен быть от 1 до {MAX_WB_SIGNED_API_ID}"
+        ));
+    }
+    validate_count("nm_ids", input.nm_ids.len(), 1, MAX_WB_MINIMUM_BID_NM_IDS)?;
+    validate_unique_wb_signed_ids("nm_ids", &input.nm_ids)?;
+    validate_count("placement_types", input.placement_types.len(), 1, 3)?;
+    let unique = input
+        .placement_types
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if unique.len() != input.placement_types.len() {
+        return Err("placement_types не должен содержать повторяющиеся значения".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_wb_promotion_search_cluster_pairs(
+    items: &[WbPromotionSearchClusterPair],
+) -> Result<(), String> {
+    validate_count("items", items.len(), 1, MAX_WB_SEARCH_CLUSTER_PAIRS)?;
+    let mut unique = BTreeSet::new();
+    for item in items {
+        if !(1..=MAX_WB_SIGNED_API_ID).contains(&item.campaign_id) {
+            return Err(format!(
+                "items.campaign_id должен быть от 1 до {MAX_WB_SIGNED_API_ID}"
+            ));
+        }
+        if !(1..=MAX_WB_SIGNED_API_ID).contains(&item.nm_id) {
+            return Err(format!(
+                "items.nm_id должен быть от 1 до {MAX_WB_SIGNED_API_ID}"
+            ));
+        }
+        if !unique.insert((item.campaign_id, item.nm_id)) {
+            return Err(
+                "items не должен содержать повторяющиеся пары campaign_id + nm_id".to_owned(),
+            );
+        }
     }
     Ok(())
 }
@@ -5455,6 +5925,597 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wb_search_and_bid_tools_send_exact_official_read_only_contracts() {
+        let payload = json!({
+            "data": [],
+            "buyer_name": "must-not-reach-model"
+        })
+        .to_string();
+        let (server, requests) = mock_wb_server_with_responses("admin", vec![(200, payload); 5]);
+
+        let queries = server
+            .wb_search_product_queries(
+                RequestIdentity::dev(),
+                Parameters(WbSearchProductQueriesInput {
+                    account: Some("account_wb".to_owned()),
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-07".to_owned(),
+                    nm_ids: vec![101, 202],
+                    top_order_by: WbSearchTopOrderBy::Orders,
+                    limit: 30,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        let positions = server
+            .wb_search_orders_positions(
+                RequestIdentity::dev(),
+                Parameters(WbSearchOrdersPositionsInput {
+                    account: Some("account_wb".to_owned()),
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-07".to_owned(),
+                    nm_id: 101,
+                    search_texts: vec!["ручка мебельная".to_owned(), "ручка кнопка".to_owned()],
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        let minimum = server
+            .wb_promotion_minimum_bids(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionMinimumBidsInput {
+                    account: Some("account_wb".to_owned()),
+                    campaign_id: 303,
+                    nm_ids: vec![101, 202],
+                    payment_type: WbPromotionPaymentType::Cpm,
+                    placement_types: vec![
+                        WbPromotionPlacementType::Search,
+                        WbPromotionPlacementType::Recommendation,
+                    ],
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        let recommended = server
+            .wb_promotion_recommended_bids(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionRecommendedBidsInput {
+                    account: Some("account_wb".to_owned()),
+                    campaign_id: 303,
+                    nm_id: 101,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        let clusters = server
+            .wb_promotion_search_cluster_bids(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionSearchClusterBidsInput {
+                    account: Some("account_wb".to_owned()),
+                    items: vec![
+                        WbPromotionSearchClusterPair {
+                            campaign_id: 303,
+                            nm_id: 101,
+                        },
+                        WbPromotionSearchClusterPair {
+                            campaign_id: 404,
+                            nm_id: 202,
+                        },
+                    ],
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+
+        for (result, endpoint) in [
+            (
+                queries,
+                "analytics:/api/v2/search-report/product/search-texts",
+            ),
+            (positions, "analytics:/api/v2/search-report/product/orders"),
+            (minimum, "promotion:/api/advert/v1/bids/min"),
+            (recommended, "promotion:/api/advert/v0/bids/recommendations"),
+            (clusters, "promotion:/adv/v0/normquery/get-bids"),
+        ] {
+            assert_eq!(result.account_id, "account_wb");
+            assert_eq!(result.endpoint, endpoint);
+            assert_eq!(result.data_classification, UNTRUSTED_DATA_CLASSIFICATION);
+            assert_eq!(result.data["buyer_name"], json!(REDACTED_VALUE));
+        }
+
+        let queries_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            queries_request
+                .starts_with("POST /api/v2/search-report/product/search-texts HTTP/1.1\r\n"),
+            "{queries_request}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(queries_request.split_once("\r\n\r\n").unwrap().1)
+                .unwrap(),
+            json!({
+                "currentPeriod": {"start": "2026-08-01", "end": "2026-08-07"},
+                "nmIds": [101, 202],
+                "topOrderBy": "orders",
+                "includeSubstitutedSKUs": true,
+                "includeSearchTexts": true,
+                "orderBy": {"field": "avgPosition", "mode": "asc"},
+                "limit": 30
+            })
+        );
+
+        let positions_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            positions_request.starts_with("POST /api/v2/search-report/product/orders HTTP/1.1\r\n"),
+            "{positions_request}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(positions_request.split_once("\r\n\r\n").unwrap().1)
+                .unwrap(),
+            json!({
+                "period": {"start": "2026-08-01", "end": "2026-08-07"},
+                "nmId": 101,
+                "searchTexts": ["ручка мебельная", "ручка кнопка"]
+            })
+        );
+
+        let minimum_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            minimum_request.starts_with("POST /api/advert/v1/bids/min HTTP/1.1\r\n"),
+            "{minimum_request}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(minimum_request.split_once("\r\n\r\n").unwrap().1)
+                .unwrap(),
+            json!({
+                "advert_id": 303,
+                "nm_ids": [101, 202],
+                "payment_type": "cpm",
+                "placement_types": ["search", "recommendation"]
+            })
+        );
+
+        let recommended_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            recommended_request.starts_with(
+                "GET /api/advert/v0/bids/recommendations?nmId=101&advertId=303 HTTP/1.1\r\n"
+            ),
+            "{recommended_request}"
+        );
+
+        let clusters_request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            clusters_request.starts_with("POST /adv/v0/normquery/get-bids HTTP/1.1\r\n"),
+            "{clusters_request}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(clusters_request.split_once("\r\n\r\n").unwrap().1)
+                .unwrap(),
+            json!({"items": [
+                {"advert_id": 303, "nm_id": 101},
+                {"advert_id": 404, "nm_id": 202}
+            ]})
+        );
+        assert!(requests.try_recv().is_err());
+
+        for (value, expected) in [
+            (WbSearchTopOrderBy::OpenCard, "openCard"),
+            (WbSearchTopOrderBy::AddToCart, "addToCart"),
+            (WbSearchTopOrderBy::OpenToCart, "openToCart"),
+            (WbSearchTopOrderBy::Orders, "orders"),
+            (WbSearchTopOrderBy::CartToOrder, "cartToOrder"),
+        ] {
+            assert_eq!(value.as_str(), expected);
+        }
+        for (value, expected) in [
+            (WbPromotionPlacementType::Combined, "combined"),
+            (WbPromotionPlacementType::Search, "search"),
+            (WbPromotionPlacementType::Recommendation, "recommendation"),
+        ] {
+            assert_eq!(value.as_str(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn wb_search_and_bid_invalid_inputs_fail_before_rbac_or_network() {
+        let (server, requests) = mock_wb_server_for("admin", 0);
+
+        for (date_from, date_to, nm_ids, limit, expected) in [
+            ("bad", "2026-08-01", vec![1], 30, "date_from"),
+            ("2026-08-02", "2026-08-01", vec![1], 30, "раньше"),
+            ("2026-07-01", "2026-08-01", vec![1], 30, "31"),
+            ("2026-08-01", "2026-08-01", vec![], 30, "nm_ids"),
+            ("2026-08-01", "2026-08-01", vec![0], 30, "nm_ids"),
+            ("2026-08-01", "2026-08-01", vec![1, 1], 30, "nm_ids"),
+            (
+                "2026-08-01",
+                "2026-08-01",
+                vec![1; MAX_WB_SEARCH_NM_IDS + 1],
+                30,
+                "nm_ids",
+            ),
+            ("2026-08-01", "2026-08-01", vec![1], 0, "limit"),
+            ("2026-08-01", "2026-08-01", vec![1], 31, "limit"),
+        ] {
+            let error = server
+                .wb_search_product_queries(
+                    RequestIdentity::dev(),
+                    Parameters(WbSearchProductQueriesInput {
+                        account: Some("account_wb".to_owned()),
+                        date_from: date_from.to_owned(),
+                        date_to: date_to.to_owned(),
+                        nm_ids,
+                        top_order_by: WbSearchTopOrderBy::Orders,
+                        limit,
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid product query report input must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        for (date_from, date_to, nm_id, search_texts, expected) in [
+            ("2026-08-01", "2026-08-08", 1, vec!["ручка".to_owned()], "7"),
+            (
+                "2026-08-01",
+                "2026-08-01",
+                0,
+                vec!["ручка".to_owned()],
+                "nm_id",
+            ),
+            ("2026-08-01", "2026-08-01", 1, vec![], "search_texts"),
+            (
+                "2026-08-01",
+                "2026-08-01",
+                1,
+                vec![" ".to_owned()],
+                "search_texts",
+            ),
+            (
+                "2026-08-01",
+                "2026-08-01",
+                1,
+                vec!["ручка ".to_owned()],
+                "search_texts",
+            ),
+            (
+                "2026-08-01",
+                "2026-08-01",
+                1,
+                vec!["ручка\nкнопка".to_owned()],
+                "search_texts",
+            ),
+            (
+                "2026-08-01",
+                "2026-08-01",
+                1,
+                vec!["я".repeat(129)],
+                "256 байт",
+            ),
+            (
+                "2026-08-01",
+                "2026-08-01",
+                1,
+                vec!["ручка".to_owned(), "ручка".to_owned()],
+                "повторяющиеся",
+            ),
+            (
+                "2026-08-01",
+                "2026-08-01",
+                1,
+                vec!["ручка".to_owned(); MAX_WB_SEARCH_TEXTS + 1],
+                "search_texts",
+            ),
+        ] {
+            let error = server
+                .wb_search_orders_positions(
+                    RequestIdentity::dev(),
+                    Parameters(WbSearchOrdersPositionsInput {
+                        account: Some("account_wb".to_owned()),
+                        date_from: date_from.to_owned(),
+                        date_to: date_to.to_owned(),
+                        nm_id,
+                        search_texts,
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid positions report input must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        for (campaign_id, nm_ids, placement_types, expected) in [
+            (
+                0,
+                vec![1],
+                vec![WbPromotionPlacementType::Search],
+                "campaign_id",
+            ),
+            (1, vec![], vec![WbPromotionPlacementType::Search], "nm_ids"),
+            (1, vec![0], vec![WbPromotionPlacementType::Search], "nm_ids"),
+            (
+                1,
+                vec![MAX_WB_SIGNED_API_ID + 1],
+                vec![WbPromotionPlacementType::Search],
+                "ID больше",
+            ),
+            (
+                1,
+                vec![1, 1],
+                vec![WbPromotionPlacementType::Search],
+                "nm_ids",
+            ),
+            (
+                1,
+                vec![1; MAX_WB_MINIMUM_BID_NM_IDS + 1],
+                vec![WbPromotionPlacementType::Search],
+                "nm_ids",
+            ),
+            (1, vec![1], vec![], "placement_types"),
+            (
+                1,
+                vec![1],
+                vec![
+                    WbPromotionPlacementType::Search,
+                    WbPromotionPlacementType::Search,
+                ],
+                "placement_types",
+            ),
+        ] {
+            let error = server
+                .wb_promotion_minimum_bids(
+                    RequestIdentity::dev(),
+                    Parameters(WbPromotionMinimumBidsInput {
+                        account: Some("account_wb".to_owned()),
+                        campaign_id,
+                        nm_ids,
+                        payment_type: WbPromotionPaymentType::Cpm,
+                        placement_types,
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid minimum bid input must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        for (campaign_id, nm_id, expected) in [
+            (0, 1, "campaign_id"),
+            (1, 0, "nm_id"),
+            (MAX_WB_SIGNED_API_ID + 1, 1, "campaign_id"),
+            (1, MAX_WB_SIGNED_API_ID + 1, "nm_id"),
+        ] {
+            let error = server
+                .wb_promotion_recommended_bids(
+                    RequestIdentity::dev(),
+                    Parameters(WbPromotionRecommendedBidsInput {
+                        account: Some("account_wb".to_owned()),
+                        campaign_id,
+                        nm_id,
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid recommended bid input must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        for (items, expected) in [
+            (vec![], "items"),
+            (
+                vec![WbPromotionSearchClusterPair {
+                    campaign_id: 0,
+                    nm_id: 1,
+                }],
+                "campaign_id",
+            ),
+            (
+                vec![WbPromotionSearchClusterPair {
+                    campaign_id: 1,
+                    nm_id: 0,
+                }],
+                "nm_id",
+            ),
+            (
+                vec![
+                    WbPromotionSearchClusterPair {
+                        campaign_id: 1,
+                        nm_id: 2,
+                    },
+                    WbPromotionSearchClusterPair {
+                        campaign_id: 1,
+                        nm_id: 2,
+                    },
+                ],
+                "повторяющиеся",
+            ),
+            (
+                (0..=MAX_WB_SEARCH_CLUSTER_PAIRS)
+                    .map(|index| WbPromotionSearchClusterPair {
+                        campaign_id: 1,
+                        nm_id: index as u64 + 1,
+                    })
+                    .collect(),
+                "items",
+            ),
+        ] {
+            let error = server
+                .wb_promotion_search_cluster_bids(
+                    RequestIdentity::dev(),
+                    Parameters(WbPromotionSearchClusterBidsInput {
+                        account: Some("account_wb".to_owned()),
+                        items,
+                    }),
+                )
+                .await
+                .err()
+                .expect("invalid search-cluster bid input must be rejected");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        // Validation deliberately precedes registry lookup and RBAC. Even an
+        // actor without access must not be able to make malformed input reach
+        // account resolution, credentials, quota gates or the network.
+        let (manager, manager_requests) = mock_wb_server_for("manager", 0);
+        let invalid_before_rbac = manager
+            .wb_search_product_queries(
+                RequestIdentity::dev(),
+                Parameters(WbSearchProductQueriesInput {
+                    account: Some("account_wb".to_owned()),
+                    date_from: "bad".to_owned(),
+                    date_to: "2026-08-01".to_owned(),
+                    nm_ids: vec![1],
+                    top_order_by: WbSearchTopOrderBy::Orders,
+                    limit: 1,
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            invalid_before_rbac.contains("date_from"),
+            "{invalid_before_rbac}"
+        );
+        assert!(!invalid_before_rbac.contains(ACCESS_DENIED));
+
+        let invalid_before_rbac = manager
+            .wb_search_orders_positions(
+                RequestIdentity::dev(),
+                Parameters(WbSearchOrdersPositionsInput {
+                    account: Some("account_wb".to_owned()),
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-01".to_owned(),
+                    nm_id: 0,
+                    search_texts: vec!["ручка".to_owned()],
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            invalid_before_rbac.contains("nm_id"),
+            "{invalid_before_rbac}"
+        );
+        assert!(!invalid_before_rbac.contains(ACCESS_DENIED));
+
+        let invalid_before_rbac = manager
+            .wb_promotion_minimum_bids(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionMinimumBidsInput {
+                    account: Some("account_wb".to_owned()),
+                    campaign_id: 0,
+                    nm_ids: vec![1],
+                    payment_type: WbPromotionPaymentType::Cpm,
+                    placement_types: vec![WbPromotionPlacementType::Search],
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            invalid_before_rbac.contains("campaign_id"),
+            "{invalid_before_rbac}"
+        );
+        assert!(!invalid_before_rbac.contains(ACCESS_DENIED));
+
+        let invalid_before_rbac = manager
+            .wb_promotion_recommended_bids(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionRecommendedBidsInput {
+                    account: Some("account_wb".to_owned()),
+                    campaign_id: 1,
+                    nm_id: 0,
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            invalid_before_rbac.contains("nm_id"),
+            "{invalid_before_rbac}"
+        );
+        assert!(!invalid_before_rbac.contains(ACCESS_DENIED));
+
+        let invalid_before_rbac = manager
+            .wb_promotion_search_cluster_bids(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionSearchClusterBidsInput {
+                    account: Some("account_wb".to_owned()),
+                    items: vec![],
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            invalid_before_rbac.contains("items"),
+            "{invalid_before_rbac}"
+        );
+        assert!(!invalid_before_rbac.contains(ACCESS_DENIED));
+        assert!(manager_requests.try_recv().is_err());
+
+        for (tool, arguments) in [
+            (
+                "wb_search_product_queries",
+                json!({
+                    "account": "account_wb",
+                    "date_from": "2026-08-01",
+                    "date_to": "2026-08-01",
+                    "nm_ids": [1],
+                    "top_order_by": "orders",
+                    "limit": 1,
+                    "raw_path": "/api/v2/search-report/report"
+                }),
+            ),
+            (
+                "wb_search_orders_positions",
+                json!({
+                    "account": "account_wb",
+                    "date_from": "2026-08-01",
+                    "date_to": "2026-08-01",
+                    "nm_id": 1,
+                    "search_texts": ["ручка"],
+                    "method": "GET"
+                }),
+            ),
+            (
+                "wb_promotion_minimum_bids",
+                json!({
+                    "account": "account_wb",
+                    "campaign_id": 1,
+                    "nm_ids": [1],
+                    "payment_type": "cpm",
+                    "placement_types": ["search"],
+                    "bid": 1000
+                }),
+            ),
+            (
+                "wb_promotion_recommended_bids",
+                json!({"account":"account_wb", "campaign_id":1, "nm_id":1, "write":true}),
+            ),
+            (
+                "wb_promotion_search_cluster_bids",
+                json!({
+                    "account": "account_wb",
+                    "items": [{"campaign_id":1, "nm_id":1, "bid":1000}]
+                }),
+            ),
+        ] {
+            let body = call_tool_over_http(server.clone(), tool, arguments).await;
+            assert!(body.contains("failed to deserialize parameters"), "{body}");
+        }
+        assert!(
+            requests.try_recv().is_err(),
+            "invalid WB search/bid inputs must never reach the upstream API"
+        );
+    }
+
+    #[tokio::test]
     async fn wb_promotion_invalid_inputs_fail_closed_before_network() {
         let (server, requests) = mock_wb_server_for("admin", 0);
 
@@ -5639,6 +6700,101 @@ mod tests {
             assert!(error.contains(endpoint), "{error}");
         }
         for _ in 0..3 {
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn wb_search_and_bid_handlers_preserve_structured_upstream_errors() {
+        let (server, requests) =
+            mock_wb_server_with_responses("admin", vec![(500, "{}".to_owned()); 5]);
+
+        let queries = server
+            .wb_search_product_queries(
+                RequestIdentity::dev(),
+                Parameters(WbSearchProductQueriesInput {
+                    account: None,
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-01".to_owned(),
+                    nm_ids: vec![1],
+                    top_order_by: WbSearchTopOrderBy::Orders,
+                    limit: 1,
+                }),
+            )
+            .await
+            .err()
+            .expect("search product queries error must propagate");
+        let positions = server
+            .wb_search_orders_positions(
+                RequestIdentity::dev(),
+                Parameters(WbSearchOrdersPositionsInput {
+                    account: None,
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-01".to_owned(),
+                    nm_id: 1,
+                    search_texts: vec!["ручка".to_owned()],
+                }),
+            )
+            .await
+            .err()
+            .expect("search orders/positions error must propagate");
+        let minimum = server
+            .wb_promotion_minimum_bids(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionMinimumBidsInput {
+                    account: None,
+                    campaign_id: 1,
+                    nm_ids: vec![1],
+                    payment_type: WbPromotionPaymentType::Cpm,
+                    placement_types: vec![WbPromotionPlacementType::Search],
+                }),
+            )
+            .await
+            .err()
+            .expect("minimum bid error must propagate");
+        let recommended = server
+            .wb_promotion_recommended_bids(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionRecommendedBidsInput {
+                    account: None,
+                    campaign_id: 1,
+                    nm_id: 1,
+                }),
+            )
+            .await
+            .err()
+            .expect("recommended bid error must propagate");
+        let clusters = server
+            .wb_promotion_search_cluster_bids(
+                RequestIdentity::dev(),
+                Parameters(WbPromotionSearchClusterBidsInput {
+                    account: None,
+                    items: vec![WbPromotionSearchClusterPair {
+                        campaign_id: 1,
+                        nm_id: 1,
+                    }],
+                }),
+            )
+            .await
+            .err()
+            .expect("search-cluster bid error must propagate");
+
+        for (error, endpoint) in [
+            (
+                queries,
+                "analytics:/api/v2/search-report/product/search-texts",
+            ),
+            (positions, "analytics:/api/v2/search-report/product/orders"),
+            (minimum, "promotion:/api/advert/v1/bids/min"),
+            (recommended, "promotion:/api/advert/v0/bids/recommendations"),
+            (clusters, "promotion:/adv/v0/normquery/get-bids"),
+        ] {
+            assert!(error.contains(WB_TOOL_FAILURE), "{error}");
+            assert!(error.contains("kind=upstream_http_error"), "{error}");
+            assert!(error.contains(endpoint), "{error}");
+        }
+        for _ in 0..5 {
             requests.recv_timeout(Duration::from_secs(2)).unwrap();
         }
         assert!(requests.try_recv().is_err());
@@ -6032,6 +7188,50 @@ mod tests {
             campaign_ids: vec![777],
             begin_date: "2026-08-01".to_owned(),
             end_date: "2026-08-01".to_owned(),
+        });
+        assert_denied_before_network!(wb_search_product_queries, |account| {
+            WbSearchProductQueriesInput {
+                account,
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-01".to_owned(),
+                nm_ids: vec![777],
+                top_order_by: WbSearchTopOrderBy::Orders,
+                limit: 10,
+            }
+        });
+        assert_denied_before_network!(wb_search_orders_positions, |account| {
+            WbSearchOrdersPositionsInput {
+                account,
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-01".to_owned(),
+                nm_id: 777,
+                search_texts: vec!["ручка".to_owned()],
+            }
+        });
+        assert_denied_before_network!(wb_promotion_minimum_bids, |account| {
+            WbPromotionMinimumBidsInput {
+                account,
+                campaign_id: 777,
+                nm_ids: vec![888],
+                payment_type: WbPromotionPaymentType::Cpm,
+                placement_types: vec![WbPromotionPlacementType::Search],
+            }
+        });
+        assert_denied_before_network!(wb_promotion_recommended_bids, |account| {
+            WbPromotionRecommendedBidsInput {
+                account,
+                campaign_id: 777,
+                nm_id: 888,
+            }
+        });
+        assert_denied_before_network!(wb_promotion_search_cluster_bids, |account| {
+            WbPromotionSearchClusterBidsInput {
+                account,
+                items: vec![WbPromotionSearchClusterPair {
+                    campaign_id: 777,
+                    nm_id: 888,
+                }],
+            }
         });
 
         assert!(
@@ -6900,7 +8100,7 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
-        assert_eq!(dev_tools.len(), 38);
+        assert_eq!(dev_tools.len(), 43);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -6911,7 +8111,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 38);
+        assert_eq!(jwt_tools.len(), 43);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -6923,7 +8123,7 @@ mod tests {
             .with_preview_features(false, true)
             .tool_router
             .list_all();
-        assert_eq!(preview_tools.len(), 41);
+        assert_eq!(preview_tools.len(), 46);
         assert_policy(
             preview_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -6954,6 +8154,11 @@ mod tests {
             "wb_promotion_campaigns",
             "wb_promotion_campaign_details",
             "wb_promotion_stats",
+            "wb_search_product_queries",
+            "wb_search_orders_positions",
+            "wb_promotion_minimum_bids",
+            "wb_promotion_recommended_bids",
+            "wb_promotion_search_cluster_bids",
             "ozon_analytics",
             "ozon_product_stocks",
             "ozon_product_prices",
@@ -6987,7 +8192,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         let default_names = names(&server());
-        assert_eq!(default_names.len(), 38);
+        assert_eq!(default_names.len(), 43);
         assert!(preview_names.is_disjoint(&default_names));
         for name in STABLE_TOOL_NAMES {
             assert!(
@@ -7002,7 +8207,7 @@ mod tests {
         assert!(preview_names.is_disjoint(&names(&authenticated)));
 
         let enabled_names = names(&server().with_preview_features(false, true));
-        assert_eq!(enabled_names.len(), 41);
+        assert_eq!(enabled_names.len(), 46);
         assert!(preview_names.is_subset(&enabled_names));
         assert_eq!(
             enabled_names
@@ -9944,6 +11149,138 @@ mod tests {
             "wb_promotion_campaigns",
             "wb_promotion_campaign_details",
             "wb_promotion_stats",
+        ] {
+            let annotations = tool(name).annotations.as_ref().unwrap();
+            assert_eq!(annotations.read_only_hint, Some(true), "{name}");
+            assert_eq!(annotations.destructive_hint, Some(false), "{name}");
+            assert_eq!(annotations.idempotent_hint, Some(true), "{name}");
+            assert_eq!(annotations.open_world_hint, Some(true), "{name}");
+        }
+    }
+
+    #[test]
+    fn wb_search_and_bid_schemas_and_annotations_are_strict() {
+        let tools = server().tool_router.list_all();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("WB search/bid tool must be registered")
+        };
+
+        let queries = tool("wb_search_product_queries");
+        let queries_schema = &queries.input_schema;
+        assert_eq!(queries_schema["additionalProperties"], json!(false));
+        let query_properties = queries_schema["properties"].as_object().unwrap();
+        for field in [
+            "account",
+            "date_from",
+            "date_to",
+            "nm_ids",
+            "top_order_by",
+            "limit",
+        ] {
+            assert!(query_properties.contains_key(field), "missing {field}");
+        }
+        for forbidden in [
+            "path",
+            "method",
+            "past_period",
+            "order_by",
+            "include_search_texts",
+            "include_substituted_skus",
+        ] {
+            assert!(!query_properties.contains_key(forbidden), "{forbidden}");
+        }
+        assert_eq!(query_properties["nm_ids"]["minItems"], json!(1));
+        assert_eq!(
+            query_properties["nm_ids"]["maxItems"],
+            json!(MAX_WB_SEARCH_NM_IDS)
+        );
+        assert_eq!(query_properties["nm_ids"]["uniqueItems"], json!(true));
+        assert_eq!(query_properties["nm_ids"]["items"]["minimum"], json!(1));
+        assert_eq!(query_properties["limit"]["minimum"], json!(1));
+        assert_eq!(
+            query_properties["limit"]["maximum"],
+            json!(MAX_WB_SEARCH_TEXTS)
+        );
+        let queries_rendered = serde_json::to_string(queries_schema).unwrap();
+        for value in [
+            "openCard",
+            "addToCart",
+            "openToCart",
+            "orders",
+            "cartToOrder",
+        ] {
+            assert!(queries_rendered.contains(&format!("\"{value}\"")));
+        }
+
+        let positions = tool("wb_search_orders_positions");
+        let positions_schema = &positions.input_schema;
+        assert_eq!(positions_schema["additionalProperties"], json!(false));
+        assert_eq!(positions_schema["properties"]["nm_id"]["minimum"], json!(1));
+        let texts = &positions_schema["properties"]["search_texts"];
+        assert_eq!(texts["minItems"], json!(1));
+        assert_eq!(texts["maxItems"], json!(MAX_WB_SEARCH_TEXTS));
+        assert_eq!(texts["uniqueItems"], json!(true));
+        assert_eq!(texts["items"]["minLength"], json!(1));
+        assert_eq!(texts["items"]["maxLength"], json!(MAX_WB_SEARCH_TEXT_BYTES));
+
+        let minimum = tool("wb_promotion_minimum_bids");
+        let minimum_schema = &minimum.input_schema;
+        assert_eq!(minimum_schema["additionalProperties"], json!(false));
+        assert_eq!(
+            minimum_schema["properties"]["campaign_id"]["minimum"],
+            json!(1)
+        );
+        let minimum_ids = &minimum_schema["properties"]["nm_ids"];
+        assert_eq!(minimum_ids["minItems"], json!(1));
+        assert_eq!(minimum_ids["maxItems"], json!(MAX_WB_MINIMUM_BID_NM_IDS));
+        assert_eq!(minimum_ids["uniqueItems"], json!(true));
+        let placements = &minimum_schema["properties"]["placement_types"];
+        assert_eq!(placements["minItems"], json!(1));
+        assert_eq!(placements["maxItems"], json!(3));
+        assert_eq!(placements["uniqueItems"], json!(true));
+        let minimum_rendered = serde_json::to_string(minimum_schema).unwrap();
+        for value in ["cpm", "cpc", "combined", "search", "recommendation"] {
+            assert!(minimum_rendered.contains(&format!("\"{value}\"")));
+        }
+
+        let recommended = tool("wb_promotion_recommended_bids");
+        assert_eq!(
+            recommended.input_schema["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(
+            recommended.input_schema["properties"]["campaign_id"]["minimum"],
+            json!(1)
+        );
+        assert_eq!(
+            recommended.input_schema["properties"]["nm_id"]["minimum"],
+            json!(1)
+        );
+
+        let clusters = tool("wb_promotion_search_cluster_bids");
+        assert_eq!(clusters.input_schema["additionalProperties"], json!(false));
+        assert_eq!(
+            clusters.input_schema["properties"]["items"]["minItems"],
+            json!(1)
+        );
+        assert_eq!(
+            clusters.input_schema["properties"]["items"]["maxItems"],
+            json!(MAX_WB_SEARCH_CLUSTER_PAIRS)
+        );
+        assert_eq!(
+            clusters.input_schema["properties"]["items"]["uniqueItems"],
+            json!(true)
+        );
+
+        for name in [
+            "wb_search_product_queries",
+            "wb_search_orders_positions",
+            "wb_promotion_minimum_bids",
+            "wb_promotion_recommended_bids",
+            "wb_promotion_search_cluster_bids",
         ] {
             let annotations = tool(name).annotations.as_ref().unwrap();
             assert_eq!(annotations.read_only_hint, Some(true), "{name}");

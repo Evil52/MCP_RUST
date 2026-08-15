@@ -9983,7 +9983,7 @@
 		},
 		{
 			"name": "Wildberries — методы MCP (строго read-only)",
-			"description": "Справочная копия всех 17 сетевых методов Wildberries, разрешённых runtime allowlist в src/wb.rs. Папка не является источником сетевых полномочий: сервер по-прежнему проверяет точную пару method/path и фиксированный host. POST-методы здесь только читают аналитику. Не добавляйте произвольные GET: у WB существуют мутирующие GET. Локальный wb_stores_status отсутствует, потому что он не обращается к WB API. Токен задавайте только через переменную wbApiToken и не сохраняйте его в коллекции.",
+			"description": "Справочная копия всех 22 сетевых методов Wildberries, разрешённых runtime allowlist в src/wb.rs. Папка не является источником сетевых полномочий: сервер по-прежнему проверяет точную пару method/path и фиксированный host. POST-методы здесь только читают аналитику. Не добавляйте произвольные GET: у WB существуют мутирующие GET. Локальный wb_stores_status отсутствует, потому что он не обращается к WB API. Токен задавайте только через переменную wbApiToken и не сохраняйте его в коллекции. Методы wb_search_* требуют категории «Аналитика» и подписки «Джем»; отчёт обновляется раз в час и не является точной live-позицией.",
 			"auth": {
 				"type": "bearer",
 				"bearer": [
@@ -10177,6 +10177,75 @@
 						"description": "Read-only статистика выбранных кампаний за период до 31 дня. Runtime: wb_promotion_stats."
 					},
 					"response": []
+				},
+				{
+					"name": "wb_search_product_queries — POST /api/v2/search-report/product/search-texts",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"currentPeriod\": { \"start\": \"{{wbDateFrom}}\", \"end\": \"{{wbDateTo}}\" },\n  \"nmIds\": [{{wbNmId}}],\n  \"topOrderBy\": \"orders\",\n  \"includeSubstitutedSKUs\": true,\n  \"includeSearchTexts\": true,\n  \"orderBy\": { \"field\": \"avgPosition\", \"mode\": \"asc\" },\n  \"limit\": 30\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://seller-analytics-api.wildberries.ru/api/v2/search-report/product/search-texts",
+						"description": "Read-only агрегат выбранного периода до 31 дня, обновляемый примерно раз в час; без региона и organic/ad split, не live. Требует подписки «Джем». Runtime: wb_search_product_queries."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_search_orders_positions — POST /api/v2/search-report/product/orders",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"period\": { \"start\": \"{{wbDateFrom}}\", \"end\": \"{{wbDateTo}}\" },\n  \"nmId\": {{wbNmId}},\n  \"searchTexts\": [\"{{wbSearchText}}\"]\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://seller-analytics-api.wildberries.ru/api/v2/search-report/product/orders",
+						"description": "Read-only дневные строки средних позиций и заказов за период до 7 дней, обновляемые примерно раз в час; без региона и organic/ad split, не live. Требует подписки «Джем». Runtime: wb_search_orders_positions."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_minimum_bids — POST /api/advert/v1/bids/min",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"advert_id\": {{wbAdvertId}},\n  \"nm_ids\": [{{wbNmId}}],\n  \"payment_type\": \"cpm\",\n  \"placement_types\": [\"search\"]\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://advert-api.wildberries.ru/api/advert/v1/bids/min",
+						"description": "Read-only минимальные ставки в копейках. Runtime: wb_promotion_minimum_bids."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_recommended_bids — GET /api/advert/v0/bids/recommendations",
+					"request": {
+						"method": "GET",
+						"url": "https://advert-api.wildberries.ru/api/advert/v0/bids/recommendations?nmId={{wbNmId}}&advertId={{wbAdvertId}}",
+						"description": "Read-only рекомендованные ставки CPM в копейках. Runtime: wb_promotion_recommended_bids."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_search_cluster_bids — POST /adv/v0/normquery/get-bids",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"items\": [\n    { \"advert_id\": {{wbAdvertId}}, \"nm_id\": {{wbNmId}} }\n  ]\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://advert-api.wildberries.ru/adv/v0/normquery/get-bids",
+						"description": "Read-only текущие ставки поисковых кластеров. Runtime: wb_promotion_search_cluster_bids."
+					},
+					"response": []
 				}
 			]
 		}
@@ -10225,6 +10294,16 @@
 		{
 			"key": "wbCampaignIds",
 			"value": "123456",
+			"type": "string"
+		},
+		{
+			"key": "wbAdvertId",
+			"value": "123456",
+			"type": "string"
+		},
+		{
+			"key": "wbSearchText",
+			"value": "ручка мебельная",
 			"type": "string"
 		}
 	],
