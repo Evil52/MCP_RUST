@@ -35,8 +35,8 @@ Rust MCP read tools
 ChatGPT analysis and on-demand Excel generation
 ```
 
-The collector and PostgreSQL are separate from the current MCP and Keycloak
-containers. PostgreSQL is reachable only on the named internal Docker network;
+The collector and PostgreSQL are separate from the current MCP containers.
+PostgreSQL is reachable only on the named internal Docker network;
 it has no host port.
 
 ## Fifteen-minute policy
@@ -86,7 +86,7 @@ copies of browser state.
 | `position_reader` | SELECT only; forced read-only transactions |
 
 Only `position_reader` may be configured in the MCP container. Database passwords
-are independent and never reuse Ozon, WB, Keycloak, or MCP secrets.
+are independent and never reuse Ozon, WB, identity-provider, or MCP secrets.
 
 ## Planned read-only MCP tools
 

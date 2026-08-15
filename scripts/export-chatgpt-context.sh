@@ -11,21 +11,17 @@ files=(
   .dockerignore
   .env.example
   .gitignore
-  .keycloak.env.example
   .sonar.env.example
   .sonar-stack.env.example
   Cargo.lock
   Cargo.toml
   Dockerfile
-  Dockerfile.keycloak
   README.md
   SECURITY.md
-  compose.auth.yaml
   compose.canary.yaml
   compose.dev.yaml
   compose.yaml
   config/access.example.json
-  config/keycloak/ofk-realm.json
   deny.toml
   sonar-project.properties
   compose.sonar.yaml
@@ -39,13 +35,6 @@ files=(
   scripts/canary-init.sh
   scripts/canary-up.sh
   scripts/install-local-runtime-agent.sh
-  scripts/keycloak-down.sh
-  scripts/keycloak-env.sh
-  scripts/keycloak-init.sh
-  scripts/keycloak-pkce-smoke.sh
-  scripts/keycloak-smoke.sh
-  scripts/keycloak-sync-config.sh
-  scripts/keycloak-up.sh
   scripts/local-ci.sh
   scripts/sonar-reports.sh
   scripts/sonar-bootstrap.sh

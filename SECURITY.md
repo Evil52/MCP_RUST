@@ -136,11 +136,9 @@ notifications, tool discovery/calls, session GET, and session DELETE — validat
 issuer, resource audience, required scope, time claims, and provisioned actor after bounded transport
 admission but before body polling or session lookup/allocation. The registry snapshot used to map the
 OIDC identity is reused for that request's tool RBAC, and identity is never cached in the MCP session.
-The current Keycloak Compose stack uses localhost, HTTP, and `start-dev`; it is an integration-test
-stack, not a production deployment.
-
-For production, use public HTTPS issuer/resource URLs, Keycloak production mode behind a correctly
-configured reverse proxy, exact redirect URIs, PKCE S256, disabled Direct Access Grants, immutable
+The repository does not bundle an identity provider. For production, use public HTTPS
+issuer/resource URLs, a correctly configured reverse proxy, exact redirect URIs, PKCE S256,
+disabled Direct Access Grants, immutable
 OIDC `sub` bindings, network ACLs, and credential rotation. Prefer vendor-side least-privilege API
 tokens where the marketplace supports them; the Rust allowlist remains mandatory even when a token
 has broader vendor permissions.
@@ -180,5 +178,5 @@ has broader vendor permissions.
   without credentials or network access, including the mutating operations that use HTTP `GET`.
 - Confirm the runtime registry and `.env` are ignored regular files with mode `600`; never copy their
   contents into logs, screenshots, CI artifacts, or Git.
-- Run OAuth/Keycloak smoke tests only against disposable test identities. Run marketplace canaries
+- Run OAuth provider integration tests only against disposable test identities. Run marketplace canaries
   sequentially, read-only, on isolated configuration, and never as part of routine CI.

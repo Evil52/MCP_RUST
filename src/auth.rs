@@ -172,7 +172,6 @@ impl JwtAuthenticator {
             .redirect(reqwest::redirect::Policy::none())
             // JWKS is an authentication trust anchor. Fetch it directly so a
             // process-wide HTTP(S)_PROXY cannot observe or rewrite signing keys.
-            // This also keeps the local Keycloak hostname/port path unchanged.
             .no_proxy()
             .build()?;
         Ok(Self {
@@ -991,7 +990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jwks_fetch_is_direct_does_not_follow_redirects_and_supports_local_keycloak() {
+    async fn jwks_fetch_is_direct_does_not_follow_redirects_and_supports_local_issuers() {
         let (target_url, target_requests) = mock_http(vec![(200, jwks())]);
         let (redirect_url, redirect_requests) = one_shot_jwks_http(
             302,

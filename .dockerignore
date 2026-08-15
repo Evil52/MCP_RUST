@@ -3,7 +3,6 @@
 !Cargo.toml
 !Cargo.lock
 !Dockerfile
-!Dockerfile.keycloak
 
 !src/
 !src/**
@@ -19,5 +18,3 @@
 
 !config/
 !config/access.example.json
-!config/keycloak/
-!config/keycloak/ofk-realm.json

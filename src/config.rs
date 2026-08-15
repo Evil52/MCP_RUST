@@ -48,7 +48,7 @@ impl FromStr for AuthMode {
     fn from_str(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "dev" | "trusted" => Ok(Self::Dev),
-            "jwt" | "oidc" | "keycloak" => Ok(Self::Jwt),
+            "jwt" | "oidc" => Ok(Self::Jwt),
             other => bail!("неизвестный MCP_AUTH_MODE={other:?}; используйте dev или jwt"),
         }
     }
@@ -2479,22 +2479,22 @@ mod tests {
         let values = BTreeMap::from([
             ("MCP_AUTH_MODE", "jwt"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-            ("MCP_JWT_ISSUER", "http://localhost:8180/realms/ofk/"),
-            ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
+            ("MCP_JWT_ISSUER", "https://issuer.example.com/"),
+            ("MCP_JWT_AUDIENCE", "https://mcp.example.com/mcp"),
             (
                 "MCP_JWT_JWKS_URL",
-                "http://keycloak:8080/realms/ofk/protocol/openid-connect/certs",
+                "https://issuer.example.com/.well-known/jwks.json",
             ),
-            ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
+            ("MCP_PUBLIC_URL", "https://mcp.example.com/mcp"),
             ("MCP_JWKS_CACHE_TTL_SECONDS", "600"),
         ]);
         let config =
             AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned())).unwrap();
         let rendered = format!("{:?}", config.auth);
-        assert!(rendered.contains("http://localhost:8180/realms/ofk"));
-        assert!(rendered.contains("audience: \"http://localhost:8788/mcp\""));
-        assert!(rendered.contains("http://localhost:8788/mcp"));
-        assert!(rendered.contains("http://localhost:8788/.well-known/oauth-protected-resource"));
+        assert!(rendered.contains("https://issuer.example.com"));
+        assert!(rendered.contains("audience: \"https://mcp.example.com/mcp\""));
+        assert!(rendered.contains("https://mcp.example.com/mcp"));
+        assert!(rendered.contains("https://mcp.example.com/.well-known/oauth-protected-resource"));
         assert!(rendered.contains("mcp:tools"));
         assert!(rendered.contains("600s"));
 
@@ -2509,9 +2509,9 @@ mod tests {
         let custom_values = BTreeMap::from([
             ("MCP_AUTH_MODE", "jwt"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-            ("MCP_JWT_ISSUER", "http://localhost:8180/realms/ofk"),
-            ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
-            ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
+            ("MCP_JWT_ISSUER", "https://issuer.example.com"),
+            ("MCP_JWT_AUDIENCE", "https://mcp.example.com/mcp"),
+            ("MCP_PUBLIC_URL", "https://mcp.example.com/mcp"),
             (
                 "MCP_JWT_REQUIRED_SCOPES",
                 " mcp:tools analytics:read mcp:tools ",

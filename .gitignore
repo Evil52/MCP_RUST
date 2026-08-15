@@ -4,7 +4,6 @@
 /.vscode
 .env
 .position.env
-.keycloak.env
 .sonar.env
 .sonar-stack.env
 sonar.env
