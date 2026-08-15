@@ -42,6 +42,11 @@ const ACCEPTANCE_COEFFICIENTS_PATH: &str = "/api/tariffs/v1/acceptance/coefficie
 pub(crate) const PROMOTION_CAMPAIGNS_PATH: &str = "/adv/v1/promotion/count";
 pub(crate) const PROMOTION_DETAILS_PATH: &str = "/api/advert/v2/adverts";
 pub(crate) const PROMOTION_STATS_PATH: &str = "/adv/v3/fullstats";
+pub(crate) const SEARCH_PRODUCT_QUERIES_PATH: &str = "/api/v2/search-report/product/search-texts";
+pub(crate) const SEARCH_ORDERS_POSITIONS_PATH: &str = "/api/v2/search-report/product/orders";
+pub(crate) const PROMOTION_MINIMUM_BIDS_PATH: &str = "/api/advert/v1/bids/min";
+pub(crate) const PROMOTION_RECOMMENDATIONS_PATH: &str = "/api/advert/v0/bids/recommendations";
+pub(crate) const PROMOTION_CLUSTER_BIDS_PATH: &str = "/adv/v0/normquery/get-bids";
 const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
 const MAX_ATTEMPTS: usize = 3;
@@ -59,8 +64,21 @@ const LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const ACCEPTANCE_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
 const PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(200);
 const PROMOTION_STATS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
+const SEARCH_REPORT_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
+const PROMOTION_MINIMUM_BIDS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
+const PROMOTION_RECOMMENDATIONS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(12);
+const PROMOTION_CLUSTER_BIDS_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(200);
 const MAX_PROMOTION_CAMPAIGN_IDS: usize = 50;
 const MAX_PROMOTION_STATS_IDS: usize = 50;
+const MAX_SEARCH_REPORT_NM_IDS: usize = 50;
+const MAX_SEARCH_REPORT_TEXTS: usize = 30;
+const MAX_SEARCH_REPORT_LIMIT: u32 = 30;
+const MAX_SEARCH_PRODUCT_PERIOD_DAYS: i64 = 31;
+const MAX_SEARCH_ORDERS_PERIOD_DAYS: i64 = 7;
+const MAX_PROMOTION_BID_NM_IDS: usize = 100;
+const MAX_PROMOTION_CLUSTER_BID_ITEMS: usize = 100;
+const MAX_WB_SIGNED_ID: u64 = i64::MAX as u64;
+const MAX_SEARCH_TEXT_BYTES: usize = 256;
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const MAX_LOGICAL_REQUEST_DURATION: Duration = Duration::from_secs(60);
@@ -91,6 +109,10 @@ enum RequestClass {
     AcceptanceTariff,
     PromotionCampaign,
     PromotionStats,
+    SearchReport,
+    PromotionMinimumBids,
+    PromotionRecommendedBids,
+    PromotionClusterBids,
 }
 
 /// Single source of truth for every request that may leave this process.
@@ -231,6 +253,41 @@ const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
         host: ApiHost::Promotion,
         request_class: RequestClass::PromotionStats,
     },
+    EndpointPolicy {
+        method: Method::POST,
+        path: SEARCH_PRODUCT_QUERIES_PATH,
+        label: "analytics:/api/v2/search-report/product/search-texts",
+        host: ApiHost::Analytics,
+        request_class: RequestClass::SearchReport,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: SEARCH_ORDERS_POSITIONS_PATH,
+        label: "analytics:/api/v2/search-report/product/orders",
+        host: ApiHost::Analytics,
+        request_class: RequestClass::SearchReport,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: PROMOTION_MINIMUM_BIDS_PATH,
+        label: "promotion:/api/advert/v1/bids/min",
+        host: ApiHost::Promotion,
+        request_class: RequestClass::PromotionMinimumBids,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: PROMOTION_RECOMMENDATIONS_PATH,
+        label: "promotion:/api/advert/v0/bids/recommendations",
+        host: ApiHost::Promotion,
+        request_class: RequestClass::PromotionRecommendedBids,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: PROMOTION_CLUSTER_BIDS_PATH,
+        label: "promotion:/adv/v0/normquery/get-bids",
+        host: ApiHost::Promotion,
+        request_class: RequestClass::PromotionClusterBids,
+    },
 ];
 
 #[derive(Clone)]
@@ -254,6 +311,7 @@ pub enum WbErrorKind {
     MissingCredentials,
     Unauthorized,
     Forbidden,
+    SubscriptionRequired,
     RateLimited,
     Http,
     Timeout,
@@ -271,6 +329,7 @@ impl WbErrorKind {
             Self::MissingCredentials => "missing_credentials",
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
+            Self::SubscriptionRequired => "subscription_required",
             Self::RateLimited => "rate_limited",
             Self::Http => "upstream_http_error",
             Self::Timeout => "timeout",
@@ -286,7 +345,7 @@ impl WbErrorKind {
 pub enum WbError {
     #[error("запрос {method} {path} отсутствует в read-only allowlist Wildberries API")]
     EndpointNotAllowed { method: Method, path: String },
-    #[error("некорректные параметры read-only запроса WB Promotion API: {field}")]
+    #[error("некорректные параметры read-only запроса WB API: {field}")]
     InvalidArguments { field: &'static str },
     #[error("для кабинета WB {0} не настроен API token")]
     MissingCredentials(String),
@@ -294,6 +353,10 @@ pub enum WbError {
     Unauthorized { request_id: Option<String> },
     #[error("доступ к WB API запрещён (HTTP 403, request-id: {request_id:?})")]
     Forbidden { request_id: Option<String> },
+    #[error(
+        "для этого read-only отчёта требуется платная возможность или подписка WB (HTTP 402, request-id: {request_id:?})"
+    )]
+    SubscriptionRequired { request_id: Option<String> },
     #[error(
         "WB API ограничил частоту запросов (HTTP 429, request-id: {request_id:?}, retry-after: {retry_after:?})"
     )]
@@ -361,6 +424,7 @@ impl WbError {
             Self::MissingCredentials(_) => WbErrorKind::MissingCredentials,
             Self::Unauthorized { .. } => WbErrorKind::Unauthorized,
             Self::Forbidden { .. } => WbErrorKind::Forbidden,
+            Self::SubscriptionRequired { .. } => WbErrorKind::SubscriptionRequired,
             Self::RateLimited { .. } | Self::LocalRateLimited { .. } => WbErrorKind::RateLimited,
             Self::Api { .. } => WbErrorKind::Http,
             Self::Timeout { .. } | Self::DeadlineExceeded => WbErrorKind::Timeout,
@@ -375,6 +439,7 @@ impl WbError {
         match self {
             Self::Unauthorized { request_id }
             | Self::Forbidden { request_id }
+            | Self::SubscriptionRequired { request_id }
             | Self::RateLimited { request_id, .. }
             | Self::Api { request_id, .. }
             | Self::Timeout { request_id, .. }
@@ -401,7 +466,10 @@ impl EndpointPolicy {
 
 impl RequestClass {
     const fn allows_automatic_retry(self) -> bool {
-        !matches!(self, Self::StatisticsReport | Self::CommissionTariff)
+        !matches!(
+            self,
+            Self::StatisticsReport | Self::CommissionTariff | Self::SearchReport
+        )
     }
 
     #[cfg(test)]
@@ -422,6 +490,10 @@ struct ClientPolicy {
     acceptance_interval: Duration,
     promotion_campaign_interval: Duration,
     promotion_stats_interval: Duration,
+    search_report_interval: Duration,
+    promotion_minimum_bids_interval: Duration,
+    promotion_recommendations_interval: Duration,
+    promotion_cluster_bids_interval: Duration,
     max_attempts: usize,
     base_retry_delay: Duration,
     max_retry_delay: Duration,
@@ -441,6 +513,10 @@ impl ClientPolicy {
             acceptance_interval: ACCEPTANCE_MIN_REQUEST_INTERVAL,
             promotion_campaign_interval: PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL,
             promotion_stats_interval: PROMOTION_STATS_MIN_REQUEST_INTERVAL,
+            search_report_interval: SEARCH_REPORT_MIN_REQUEST_INTERVAL,
+            promotion_minimum_bids_interval: PROMOTION_MINIMUM_BIDS_MIN_REQUEST_INTERVAL,
+            promotion_recommendations_interval: PROMOTION_RECOMMENDATIONS_MIN_REQUEST_INTERVAL,
+            promotion_cluster_bids_interval: PROMOTION_CLUSTER_BIDS_MIN_REQUEST_INTERVAL,
             max_attempts: MAX_ATTEMPTS,
             base_retry_delay: BASE_RETRY_DELAY,
             max_retry_delay: MAX_RETRY_DELAY,
@@ -463,6 +539,10 @@ impl ClientPolicy {
             acceptance_interval: Duration::ZERO,
             promotion_campaign_interval: Duration::ZERO,
             promotion_stats_interval: Duration::ZERO,
+            search_report_interval: Duration::ZERO,
+            promotion_minimum_bids_interval: Duration::ZERO,
+            promotion_recommendations_interval: Duration::ZERO,
+            promotion_cluster_bids_interval: Duration::ZERO,
             max_attempts: 1,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -482,6 +562,10 @@ impl ClientPolicy {
             RequestClass::AcceptanceTariff => self.acceptance_interval,
             RequestClass::PromotionCampaign => self.promotion_campaign_interval,
             RequestClass::PromotionStats => self.promotion_stats_interval,
+            RequestClass::SearchReport => self.search_report_interval,
+            RequestClass::PromotionMinimumBids => self.promotion_minimum_bids_interval,
+            RequestClass::PromotionRecommendedBids => self.promotion_recommendations_interval,
+            RequestClass::PromotionClusterBids => self.promotion_cluster_bids_interval,
         }
     }
 }
@@ -569,6 +653,10 @@ struct TokenLimiter {
     acceptance_tariffs: PacingGate,
     promotion_campaigns: PacingGate,
     promotion_stats: PacingGate,
+    search_reports: PacingGate,
+    promotion_minimum_bids: PacingGate,
+    promotion_recommendations: PacingGate,
+    promotion_cluster_bids: PacingGate,
 }
 
 impl TokenLimiter {
@@ -585,6 +673,10 @@ impl TokenLimiter {
             acceptance_tariffs: PacingGate::new(),
             promotion_campaigns: PacingGate::new(),
             promotion_stats: PacingGate::new(),
+            search_reports: PacingGate::new(),
+            promotion_minimum_bids: PacingGate::new(),
+            promotion_recommendations: PacingGate::new(),
+            promotion_cluster_bids: PacingGate::new(),
         }
     }
 
@@ -600,6 +692,10 @@ impl TokenLimiter {
             RequestClass::AcceptanceTariff => &self.acceptance_tariffs,
             RequestClass::PromotionCampaign => &self.promotion_campaigns,
             RequestClass::PromotionStats => &self.promotion_stats,
+            RequestClass::SearchReport => &self.search_reports,
+            RequestClass::PromotionMinimumBids => &self.promotion_minimum_bids,
+            RequestClass::PromotionRecommendedBids => &self.promotion_recommendations,
+            RequestClass::PromotionClusterBids => &self.promotion_cluster_bids,
         }
     }
 
@@ -612,7 +708,9 @@ impl TokenLimiter {
         if !retry
             && matches!(
                 request_class,
-                RequestClass::CommissionTariff | RequestClass::PromotionStats
+                RequestClass::CommissionTariff
+                    | RequestClass::PromotionStats
+                    | RequestClass::SearchReport
             )
         {
             gate.ensure_ready_now()
@@ -1035,6 +1133,186 @@ impl WbClient {
         .await
     }
 
+    /// Returns the bounded top search texts for selected products.
+    ///
+    /// This deployment intentionally enables the Analytics/Jam report only for
+    /// Personal tokens. WB also documents other token classes with different
+    /// quotas; production configuration rejects those unsupported policies,
+    /// while this client keeps the selected report quota isolated and fail-fast.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_product_queries(
+        &self,
+        account: &str,
+        current_start: String,
+        current_end: String,
+        past_period: Option<(String, String)>,
+        nm_ids: Vec<u64>,
+        top_order_by: String,
+        limit: u32,
+    ) -> Result<Value, WbError> {
+        let current_days = validate_search_period(
+            &current_start,
+            &current_end,
+            "current_start",
+            "current_end",
+            MAX_SEARCH_PRODUCT_PERIOD_DAYS,
+        )?;
+        validate_positive_unique_ids(&nm_ids, MAX_SEARCH_REPORT_NM_IDS, "nm_ids", None)?;
+        validate_top_order_by(&top_order_by)?;
+        if !(1..=MAX_SEARCH_REPORT_LIMIT).contains(&limit) {
+            return Err(WbError::InvalidArguments { field: "limit" });
+        }
+
+        let mut payload = serde_json::json!({
+            "currentPeriod": {"start": current_start, "end": current_end},
+            "nmIds": nm_ids,
+            "topOrderBy": top_order_by,
+            "includeSubstitutedSKUs": true,
+            "includeSearchTexts": true,
+            "orderBy": {"field": "avgPosition", "mode": "asc"},
+            "limit": limit,
+        });
+        if let Some((past_start, past_end)) = past_period {
+            let past_days = validate_search_period(
+                &past_start,
+                &past_end,
+                "past_start",
+                "past_end",
+                MAX_SEARCH_PRODUCT_PERIOD_DAYS,
+            )?;
+            if past_days > current_days {
+                return Err(WbError::InvalidArguments {
+                    field: "past_period",
+                });
+            }
+            payload
+                .as_object_mut()
+                .expect("fixed search payload is an object")
+                .insert(
+                    "pastPeriod".to_owned(),
+                    serde_json::json!({"start": past_start, "end": past_end}),
+                );
+        }
+
+        self.request(
+            account,
+            Method::POST,
+            SEARCH_PRODUCT_QUERIES_PATH,
+            None,
+            Some(payload),
+        )
+        .await
+    }
+
+    /// Returns orders and average positions for an explicit bounded set of
+    /// search texts. This deployment requires its Personal Analytics/Jam policy.
+    pub async fn search_orders_positions(
+        &self,
+        account: &str,
+        start: String,
+        end: String,
+        nm_id: u64,
+        search_texts: Vec<String>,
+    ) -> Result<Value, WbError> {
+        validate_search_period(&start, &end, "start", "end", MAX_SEARCH_ORDERS_PERIOD_DAYS)?;
+        validate_unsigned_id(nm_id, "nm_id", None)?;
+        validate_search_texts(&search_texts)?;
+        self.request(
+            account,
+            Method::POST,
+            SEARCH_ORDERS_POSITIONS_PATH,
+            None,
+            Some(serde_json::json!({
+                "period": {"start": start, "end": end},
+                "nmId": nm_id,
+                "searchTexts": search_texts,
+            })),
+        )
+        .await
+    }
+
+    /// Returns the minimum read-only campaign bids for the requested products
+    /// and placements. It cannot reach the neighboring bid mutation route.
+    pub async fn promotion_minimum_bids(
+        &self,
+        account: &str,
+        advert_id: u64,
+        nm_ids: Vec<u64>,
+        payment_type: String,
+        placement_types: Vec<String>,
+    ) -> Result<Value, WbError> {
+        validate_unsigned_id(advert_id, "advert_id", Some(MAX_WB_SIGNED_ID))?;
+        validate_positive_unique_ids(
+            &nm_ids,
+            MAX_PROMOTION_BID_NM_IDS,
+            "nm_ids",
+            Some(MAX_WB_SIGNED_ID),
+        )?;
+        validate_payment_type(Some(&payment_type))?;
+        validate_placement_types(&placement_types)?;
+        self.request(
+            account,
+            Method::POST,
+            PROMOTION_MINIMUM_BIDS_PATH,
+            None,
+            Some(serde_json::json!({
+                "advert_id": advert_id,
+                "nm_ids": nm_ids,
+                "payment_type": payment_type,
+                "placement_types": placement_types,
+            })),
+        )
+        .await
+    }
+
+    /// Returns recommended bids for one campaign/product pair.
+    pub async fn promotion_recommended_bids(
+        &self,
+        account: &str,
+        advert_id: u64,
+        nm_id: u64,
+    ) -> Result<Value, WbError> {
+        validate_unsigned_id(advert_id, "advert_id", Some(MAX_WB_SIGNED_ID))?;
+        validate_unsigned_id(nm_id, "nm_id", Some(MAX_WB_SIGNED_ID))?;
+        self.request(
+            account,
+            Method::GET,
+            PROMOTION_RECOMMENDATIONS_PATH,
+            Some(vec![
+                ("nmId", nm_id.to_string()),
+                ("advertId", advert_id.to_string()),
+            ]),
+            None,
+        )
+        .await
+    }
+
+    /// Returns existing bids for a bounded set of campaign/product pairs.
+    pub async fn promotion_search_cluster_bids(
+        &self,
+        account: &str,
+        items: Vec<(u64, u64)>,
+    ) -> Result<Value, WbError> {
+        validate_bid_items(&items)?;
+        let items = items
+            .into_iter()
+            .map(|(advert_id, nm_id)| {
+                serde_json::json!({
+                    "advert_id": advert_id,
+                    "nm_id": nm_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.request(
+            account,
+            Method::POST,
+            PROMOTION_CLUSTER_BIDS_PATH,
+            None,
+            Some(serde_json::json!({"items": items})),
+        )
+        .await
+    }
+
     async fn dated_tariff(
         &self,
         account: &str,
@@ -1108,11 +1386,7 @@ impl WbClient {
             .limiters
             .get(account)
             .expect("configured WB account has a limiter");
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", credentials.token))
-            .map_err(|_| WbError::Unauthorized { request_id: None })?;
-        // Prevent accidental disclosure if reqwest headers are ever formatted
-        // by future middleware or debug instrumentation.
-        authorization.set_sensitive(true);
+        let authorization = bearer_authorization(&credentials.token)?;
 
         let deadline = TokioInstant::now() + self.logical_timeout;
         self.request_with_retries(
@@ -1370,6 +1644,7 @@ fn classify_http_status(
 ) -> WbError {
     match status {
         StatusCode::UNAUTHORIZED => WbError::Unauthorized { request_id },
+        StatusCode::PAYMENT_REQUIRED => WbError::SubscriptionRequired { request_id },
         StatusCode::FORBIDDEN => WbError::Forbidden { request_id },
         StatusCode::TOO_MANY_REQUESTS => WbError::RateLimited {
             request_id,
@@ -1420,6 +1695,15 @@ fn comma_separated<T: ToString>(values: impl IntoIterator<Item = T>) -> String {
         .join(",")
 }
 
+fn bearer_authorization(token: &str) -> Result<HeaderValue, WbError> {
+    let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| WbError::Unauthorized { request_id: None })?;
+    // Prevent accidental disclosure if reqwest headers are ever formatted by
+    // future middleware or debug instrumentation.
+    authorization.set_sensitive(true);
+    Ok(authorization)
+}
+
 fn validate_promotion_ids(ids: &[u64], maximum: usize) -> Result<(), WbError> {
     let unique = ids.iter().collect::<BTreeSet<_>>().len();
     if ids.is_empty() || ids.len() > maximum || ids.contains(&0) || unique != ids.len() {
@@ -1450,6 +1734,98 @@ fn validate_payment_type(payment_type: Option<&str>) -> Result<(), WbError> {
     Ok(())
 }
 
+fn validate_unsigned_id(
+    value: u64,
+    field: &'static str,
+    maximum: Option<u64>,
+) -> Result<(), WbError> {
+    if value == 0 || maximum.is_some_and(|maximum| value > maximum) {
+        return Err(WbError::InvalidArguments { field });
+    }
+    Ok(())
+}
+
+fn validate_positive_unique_ids(
+    values: &[u64],
+    maximum_count: usize,
+    field: &'static str,
+    maximum_value: Option<u64>,
+) -> Result<(), WbError> {
+    let unique = values.iter().collect::<BTreeSet<_>>().len();
+    if values.is_empty()
+        || values.len() > maximum_count
+        || unique != values.len()
+        || values
+            .iter()
+            .any(|value| validate_unsigned_id(*value, field, maximum_value).is_err())
+    {
+        return Err(WbError::InvalidArguments { field });
+    }
+    Ok(())
+}
+
+fn validate_top_order_by(value: &str) -> Result<(), WbError> {
+    if !matches!(
+        value,
+        "openCard" | "addToCart" | "openToCart" | "orders" | "cartToOrder"
+    ) {
+        return Err(WbError::InvalidArguments {
+            field: "top_order_by",
+        });
+    }
+    Ok(())
+}
+
+fn validate_search_texts(values: &[String]) -> Result<(), WbError> {
+    let unique = values.iter().collect::<BTreeSet<_>>().len();
+    if values.is_empty()
+        || values.len() > MAX_SEARCH_REPORT_TEXTS
+        || unique != values.len()
+        || values.iter().any(|value| {
+            value.is_empty()
+                || value.len() > MAX_SEARCH_TEXT_BYTES
+                || value.trim() != value
+                || value.chars().any(char::is_control)
+        })
+    {
+        return Err(WbError::InvalidArguments {
+            field: "search_texts",
+        });
+    }
+    Ok(())
+}
+
+fn validate_placement_types(values: &[String]) -> Result<(), WbError> {
+    let unique = values.iter().collect::<BTreeSet<_>>().len();
+    if values.is_empty()
+        || values.len() > 3
+        || unique != values.len()
+        || values
+            .iter()
+            .any(|value| !matches!(value.as_str(), "combined" | "search" | "recommendation"))
+    {
+        return Err(WbError::InvalidArguments {
+            field: "placement_types",
+        });
+    }
+    Ok(())
+}
+
+fn validate_bid_items(items: &[(u64, u64)]) -> Result<(), WbError> {
+    let unique = items.iter().collect::<BTreeSet<_>>().len();
+    if items.is_empty()
+        || items.len() > MAX_PROMOTION_CLUSTER_BID_ITEMS
+        || unique != items.len()
+        || items.iter().any(|(advert_id, nm_id)| {
+            validate_unsigned_id(*advert_id, "items", Some(MAX_WB_SIGNED_ID)).is_err()
+                || validate_unsigned_id(*nm_id, "items", Some(MAX_WB_SIGNED_ID)).is_err()
+        })
+    {
+        return Err(WbError::InvalidArguments { field: "items" });
+    }
+    Ok(())
+}
+
 fn parse_strict_date(value: &str, field: &'static str) -> Result<NaiveDate, WbError> {
     let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .map_err(|_| WbError::InvalidArguments { field })?;
@@ -1457,6 +1833,24 @@ fn parse_strict_date(value: &str, field: &'static str) -> Result<NaiveDate, WbEr
         return Err(WbError::InvalidArguments { field });
     }
     Ok(date)
+}
+
+fn validate_search_period(
+    start: &str,
+    end: &str,
+    start_field: &'static str,
+    end_field: &'static str,
+    maximum_days: i64,
+) -> Result<i64, WbError> {
+    let start = parse_strict_date(start, start_field)?;
+    let end = parse_strict_date(end, end_field)?;
+    let span = end.signed_duration_since(start).num_days();
+    if !(0..maximum_days).contains(&span) {
+        return Err(WbError::InvalidArguments {
+            field: "date_range",
+        });
+    }
+    Ok(span + 1)
 }
 
 fn validate_promotion_period(begin_date: &str, end_date: &str) -> Result<(), WbError> {
@@ -1812,6 +2206,22 @@ mod tests {
             policy.interval(RequestClass::PromotionStats),
             Duration::from_secs(20)
         );
+        assert_eq!(
+            policy.interval(RequestClass::SearchReport),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::PromotionMinimumBids),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::PromotionRecommendedBids),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            policy.interval(RequestClass::PromotionClusterBids),
+            Duration::from_millis(200)
+        );
         assert_eq!(policy.max_attempts, 3);
         assert_eq!(policy.logical_timeout, Duration::from_secs(10));
         for request_class in [
@@ -1823,12 +2233,16 @@ mod tests {
             RequestClass::AcceptanceTariff,
             RequestClass::PromotionCampaign,
             RequestClass::PromotionStats,
+            RequestClass::PromotionMinimumBids,
+            RequestClass::PromotionRecommendedBids,
+            RequestClass::PromotionClusterBids,
         ] {
             assert!(request_class.allows_automatic_retry());
         }
         for request_class in [
             RequestClass::StatisticsReport,
             RequestClass::CommissionTariff,
+            RequestClass::SearchReport,
         ] {
             assert!(!request_class.allows_automatic_retry());
         }
@@ -1875,6 +2289,24 @@ mod tests {
         assert_eq!(
             RequestClass::for_request(&Method::GET, PROMOTION_STATS_PATH),
             Some(RequestClass::PromotionStats)
+        );
+        for path in [SEARCH_PRODUCT_QUERIES_PATH, SEARCH_ORDERS_POSITIONS_PATH] {
+            assert_eq!(
+                RequestClass::for_request(&Method::POST, path),
+                Some(RequestClass::SearchReport)
+            );
+        }
+        assert_eq!(
+            RequestClass::for_request(&Method::POST, PROMOTION_MINIMUM_BIDS_PATH),
+            Some(RequestClass::PromotionMinimumBids)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, PROMOTION_RECOMMENDATIONS_PATH),
+            Some(RequestClass::PromotionRecommendedBids)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::POST, PROMOTION_CLUSTER_BIDS_PATH),
+            Some(RequestClass::PromotionClusterBids)
         );
         assert_eq!(
             RequestClass::for_request(&Method::GET, "/not-allowed"),
@@ -2040,6 +2472,41 @@ mod tests {
                 ApiHost::Promotion,
                 RequestClass::PromotionStats,
             ),
+            (
+                Method::POST,
+                SEARCH_PRODUCT_QUERIES_PATH,
+                "analytics:/api/v2/search-report/product/search-texts",
+                ApiHost::Analytics,
+                RequestClass::SearchReport,
+            ),
+            (
+                Method::POST,
+                SEARCH_ORDERS_POSITIONS_PATH,
+                "analytics:/api/v2/search-report/product/orders",
+                ApiHost::Analytics,
+                RequestClass::SearchReport,
+            ),
+            (
+                Method::POST,
+                PROMOTION_MINIMUM_BIDS_PATH,
+                "promotion:/api/advert/v1/bids/min",
+                ApiHost::Promotion,
+                RequestClass::PromotionMinimumBids,
+            ),
+            (
+                Method::GET,
+                PROMOTION_RECOMMENDATIONS_PATH,
+                "promotion:/api/advert/v0/bids/recommendations",
+                ApiHost::Promotion,
+                RequestClass::PromotionRecommendedBids,
+            ),
+            (
+                Method::POST,
+                PROMOTION_CLUSTER_BIDS_PATH,
+                "promotion:/adv/v0/normquery/get-bids",
+                ApiHost::Promotion,
+                RequestClass::PromotionClusterBids,
+            ),
         ];
         assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), expected.len());
         for (policy, (method, path, label, host, request_class)) in
@@ -2170,6 +2637,173 @@ mod tests {
         assert!(sales.starts_with(
             "GET /api/v1/supplier/sales?dateFrom=2026-08-01T00%3A00%3A00Z&flag=1 HTTP/1.1\r\n"
         ));
+    }
+
+    #[tokio::test]
+    async fn search_and_bid_reads_have_exact_wire_contracts() {
+        let (base_url, requests) = mock_http(vec![
+            (200, r#"{"data":{"items":[]}}"#.to_owned()),
+            (200, r#"{"data":{"items":[]}}"#.to_owned()),
+            (200, r#"{"data":[]}"#.to_owned()),
+            (200, r#"{"bids":[]}"#.to_owned()),
+            (200, r#"{"normQueries":[]}"#.to_owned()),
+            (200, r#"{"bids":[]}"#.to_owned()),
+        ]);
+        let client = client(&base_url);
+
+        assert!(
+            client
+                .search_product_queries(
+                    "account",
+                    "2026-08-10".to_owned(),
+                    "2026-08-12".to_owned(),
+                    Some(("2026-08-01".to_owned(), "2026-08-03".to_owned())),
+                    vec![162_579_635, 166_699_779],
+                    "openToCart".to_owned(),
+                    30,
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .search_orders_positions(
+                    "account",
+                    "2026-08-06".to_owned(),
+                    "2026-08-12".to_owned(),
+                    162_579_635,
+                    vec!["костюм".to_owned(), "костюм мужской".to_owned()],
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .search_product_queries(
+                    "account",
+                    "2026-08-01".to_owned(),
+                    "2026-08-31".to_owned(),
+                    None,
+                    vec![162_579_635],
+                    "orders".to_owned(),
+                    1,
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .promotion_minimum_bids(
+                    "account",
+                    98_765_432,
+                    vec![12_345_678, 87_654_321],
+                    "cpm".to_owned(),
+                    vec![
+                        "combined".to_owned(),
+                        "search".to_owned(),
+                        "recommendation".to_owned(),
+                    ],
+                )
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .promotion_recommended_bids("account", 987_654_321, 123_456_789)
+                .await
+                .is_ok()
+        );
+        assert!(
+            client
+                .promotion_search_cluster_bids(
+                    "account",
+                    vec![(1_825_035, 983_512_347), (1_825_036, 983_512_348)],
+                )
+                .await
+                .is_ok()
+        );
+
+        let expected = [
+            (
+                format!("POST {SEARCH_PRODUCT_QUERIES_PATH} HTTP/1.1\r\n"),
+                Some(json!({
+                    "currentPeriod": {"start": "2026-08-10", "end": "2026-08-12"},
+                    "pastPeriod": {"start": "2026-08-01", "end": "2026-08-03"},
+                    "nmIds": [162_579_635, 166_699_779],
+                    "topOrderBy": "openToCart",
+                    "includeSubstitutedSKUs": true,
+                    "includeSearchTexts": true,
+                    "orderBy": {"field": "avgPosition", "mode": "asc"},
+                    "limit": 30,
+                })),
+            ),
+            (
+                format!("POST {SEARCH_ORDERS_POSITIONS_PATH} HTTP/1.1\r\n"),
+                Some(json!({
+                    "period": {"start": "2026-08-06", "end": "2026-08-12"},
+                    "nmId": 162_579_635,
+                    "searchTexts": ["костюм", "костюм мужской"],
+                })),
+            ),
+            (
+                format!("POST {SEARCH_PRODUCT_QUERIES_PATH} HTTP/1.1\r\n"),
+                Some(json!({
+                    "currentPeriod": {"start": "2026-08-01", "end": "2026-08-31"},
+                    "nmIds": [162_579_635],
+                    "topOrderBy": "orders",
+                    "includeSubstitutedSKUs": true,
+                    "includeSearchTexts": true,
+                    "orderBy": {"field": "avgPosition", "mode": "asc"},
+                    "limit": 1,
+                })),
+            ),
+            (
+                format!("POST {PROMOTION_MINIMUM_BIDS_PATH} HTTP/1.1\r\n"),
+                Some(json!({
+                    "advert_id": 98_765_432,
+                    "nm_ids": [12_345_678, 87_654_321],
+                    "payment_type": "cpm",
+                    "placement_types": ["combined", "search", "recommendation"],
+                })),
+            ),
+            (
+                format!(
+                    "GET {PROMOTION_RECOMMENDATIONS_PATH}?nmId=123456789&advertId=987654321 HTTP/1.1\r\n"
+                ),
+                None,
+            ),
+            (
+                format!("POST {PROMOTION_CLUSTER_BIDS_PATH} HTTP/1.1\r\n"),
+                Some(json!({
+                    "items": [
+                        {"advert_id": 1_825_035, "nm_id": 983_512_347},
+                        {"advert_id": 1_825_036, "nm_id": 983_512_348},
+                    ],
+                })),
+            ),
+        ];
+
+        for (request_line, body) in expected {
+            let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(request.starts_with(&request_line), "{request}");
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token")
+            );
+            match body {
+                Some(expected) => assert_eq!(
+                    serde_json::from_str::<Value>(request.split_once("\r\n\r\n").unwrap().1)
+                        .unwrap(),
+                    expected
+                ),
+                None => {
+                    assert!(request.ends_with("\r\n\r\n"));
+                    assert!(!request.to_ascii_lowercase().contains("content-type:"));
+                }
+            }
+        }
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2442,6 +3076,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_reports_and_bid_reads_use_only_their_fixed_hosts() {
+        let (analytics, analytics_requests) = mock_http(vec![
+            (200, r#"{"data":{"items":[]}}"#.to_owned()),
+            (200, r#"{"data":[]}"#.to_owned()),
+        ]);
+        let (promotion, promotion_requests) = mock_http(vec![
+            (200, r#"{"bids":[]}"#.to_owned()),
+            (200, r#"{"normQueries":[]}"#.to_owned()),
+            (200, r#"{"bids":[]}"#.to_owned()),
+        ]);
+        let unreachable = "http://127.0.0.1:1".to_owned();
+        let client = WbClient::build(
+            Duration::from_secs(2),
+            credentials(),
+            BaseUrls {
+                analytics,
+                statistics: unreachable.clone(),
+                content: unreachable.clone(),
+                prices: unreachable.clone(),
+                common: unreachable,
+                promotion,
+            },
+            ClientPolicy::immediate_single_attempt(Duration::from_secs(2)),
+        );
+
+        client
+            .search_product_queries(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-10".to_owned(),
+                None,
+                vec![1],
+                "orders".to_owned(),
+                1,
+            )
+            .await
+            .unwrap();
+        client
+            .search_orders_positions(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-10".to_owned(),
+                1,
+                vec!["ручка".to_owned()],
+            )
+            .await
+            .unwrap();
+        client
+            .promotion_minimum_bids(
+                "account",
+                1,
+                vec![2],
+                "cpc".to_owned(),
+                vec!["search".to_owned()],
+            )
+            .await
+            .unwrap();
+        client
+            .promotion_recommended_bids("account", 1, 2)
+            .await
+            .unwrap();
+        client
+            .promotion_search_cluster_bids("account", vec![(1, 2)])
+            .await
+            .unwrap();
+
+        for expected in [
+            format!("POST {SEARCH_PRODUCT_QUERIES_PATH} HTTP/1.1\r\n"),
+            format!("POST {SEARCH_ORDERS_POSITIONS_PATH} HTTP/1.1\r\n"),
+        ] {
+            let request = analytics_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            assert!(request.starts_with(&expected), "{request}");
+        }
+        assert!(analytics_requests.try_recv().is_err());
+        for expected in [
+            format!("POST {PROMOTION_MINIMUM_BIDS_PATH} HTTP/1.1\r\n"),
+            format!("GET {PROMOTION_RECOMMENDATIONS_PATH}?nmId=2&advertId=1 HTTP/1.1\r\n"),
+            format!("POST {PROMOTION_CLUSTER_BIDS_PATH} HTTP/1.1\r\n"),
+        ] {
+            let request = promotion_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            assert!(request.starts_with(&expected), "{request}");
+        }
+        assert!(promotion_requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn same_token_aliases_share_the_exact_same_quota() {
         let accounts = BTreeMap::from([
             (
@@ -2483,6 +3207,66 @@ mod tests {
             client.ping("alias").await.unwrap_err().kind(),
             WbErrorKind::Overloaded
         );
+    }
+
+    #[tokio::test]
+    async fn new_endpoint_quota_gates_are_per_token_shared_and_per_class_separate() {
+        let accounts = BTreeMap::from([
+            (
+                "primary".to_owned(),
+                WbCredentials {
+                    token: "shared-token".to_owned(),
+                },
+            ),
+            (
+                "alias".to_owned(),
+                WbCredentials {
+                    token: "shared-token".to_owned(),
+                },
+            ),
+            (
+                "other".to_owned(),
+                WbCredentials {
+                    token: "other-token".to_owned(),
+                },
+            ),
+        ]);
+        let client = WbClient::new_for_test(
+            Duration::from_secs(1),
+            accounts,
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
+        let primary = client.limiters.get("primary").unwrap();
+        let alias = client.limiters.get("alias").unwrap();
+        let other = client.limiters.get("other").unwrap();
+        let classes = [
+            RequestClass::SearchReport,
+            RequestClass::PromotionMinimumBids,
+            RequestClass::PromotionRecommendedBids,
+            RequestClass::PromotionClusterBids,
+        ];
+
+        for (index, selected) in classes.iter().copied().enumerate() {
+            for request_class in classes {
+                *primary.gate(request_class).next_allowed.lock().await = Instant::now();
+            }
+            *primary.gate(selected).next_allowed.lock().await =
+                Instant::now() + Duration::from_secs(2);
+
+            assert!(std::ptr::eq(primary.gate(selected), alias.gate(selected)));
+            assert!(!std::ptr::eq(primary.gate(selected), other.gate(selected)));
+            assert!(alias.ready_in(selected).await > Duration::from_secs(1));
+            assert!(other.ready_in(selected).await.is_zero());
+            for (other_index, request_class) in classes.iter().copied().enumerate() {
+                if other_index != index {
+                    assert!(
+                        alias.ready_in(request_class).await.is_zero(),
+                        "{selected:?} must not consume the {request_class:?} gate"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -3890,6 +4674,392 @@ mod tests {
         assert_eq!(error.request_id(), Some("safe-id"));
     }
 
+    #[test]
+    fn bearer_authorization_is_always_marked_sensitive() {
+        let authorization = bearer_authorization("secret-token").unwrap();
+        assert_eq!(authorization.as_bytes(), b"Bearer secret-token");
+        assert!(authorization.is_sensitive());
+
+        let error = bearer_authorization("invalid\nheader").unwrap_err();
+        assert_eq!(error.kind(), WbErrorKind::Unauthorized);
+        assert!(!format!("{error:?}").contains("invalid"));
+    }
+
+    #[tokio::test]
+    async fn search_report_arguments_fail_closed_before_network() {
+        let client = WbClient::new_for_test(
+            Duration::from_millis(50),
+            credentials(),
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
+
+        macro_rules! assert_invalid {
+            ($future:expr, $field:literal) => {{
+                let error = $future.await.unwrap_err();
+                assert!(
+                    matches!(error, WbError::InvalidArguments { field } if field == $field),
+                    "expected invalid {}, got {error:?}",
+                    $field
+                );
+            }};
+        }
+
+        assert_invalid!(
+            client.search_product_queries(
+                "account",
+                "2026-8-10".to_owned(),
+                "2026-08-10".to_owned(),
+                None,
+                vec![1],
+                "orders".to_owned(),
+                1,
+            ),
+            "current_start"
+        );
+        assert_invalid!(
+            client.search_product_queries(
+                "account",
+                "2026-08-10".to_owned(),
+                "bad".to_owned(),
+                None,
+                vec![1],
+                "orders".to_owned(),
+                1,
+            ),
+            "current_end"
+        );
+        assert_invalid!(
+            client.search_product_queries(
+                "account",
+                "2026-08-01".to_owned(),
+                "2026-09-01".to_owned(),
+                None,
+                vec![1],
+                "orders".to_owned(),
+                1,
+            ),
+            "date_range"
+        );
+        assert_invalid!(
+            client.search_product_queries(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-10".to_owned(),
+                Some(("bad".to_owned(), "2026-08-01".to_owned())),
+                vec![1],
+                "orders".to_owned(),
+                1,
+            ),
+            "past_start"
+        );
+        assert_invalid!(
+            client.search_product_queries(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-10".to_owned(),
+                Some(("2026-08-01".to_owned(), "2026-08-02".to_owned())),
+                vec![1],
+                "orders".to_owned(),
+                1,
+            ),
+            "past_period"
+        );
+        for nm_ids in [Vec::new(), vec![0], vec![1, 1], (1..=51).collect()] {
+            assert_invalid!(
+                client.search_product_queries(
+                    "account",
+                    "2026-08-10".to_owned(),
+                    "2026-08-10".to_owned(),
+                    None,
+                    nm_ids,
+                    "orders".to_owned(),
+                    1,
+                ),
+                "nm_ids"
+            );
+        }
+        assert_invalid!(
+            client.search_product_queries(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-10".to_owned(),
+                None,
+                vec![1],
+                "Orders".to_owned(),
+                1,
+            ),
+            "top_order_by"
+        );
+        for limit in [0, MAX_SEARCH_REPORT_LIMIT + 1] {
+            assert_invalid!(
+                client.search_product_queries(
+                    "account",
+                    "2026-08-10".to_owned(),
+                    "2026-08-10".to_owned(),
+                    None,
+                    vec![1],
+                    "orders".to_owned(),
+                    limit,
+                ),
+                "limit"
+            );
+        }
+
+        assert_invalid!(
+            client.search_orders_positions(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-09".to_owned(),
+                1,
+                vec!["ручка".to_owned()],
+            ),
+            "date_range"
+        );
+        assert_invalid!(
+            client.search_orders_positions(
+                "account",
+                "2026-08-01".to_owned(),
+                "2026-08-08".to_owned(),
+                1,
+                vec!["ручка".to_owned()],
+            ),
+            "date_range"
+        );
+        assert_invalid!(
+            client.search_orders_positions(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-10".to_owned(),
+                0,
+                vec!["ручка".to_owned()],
+            ),
+            "nm_id"
+        );
+        for search_texts in [
+            Vec::new(),
+            vec!["ручка".to_owned(), "ручка".to_owned()],
+            vec![" ручка".to_owned()],
+            vec!["ручка\nкнопка".to_owned()],
+            vec!["я".repeat(129)],
+            (1..=31).map(|index| format!("ручка {index}")).collect(),
+        ] {
+            assert_invalid!(
+                client.search_orders_positions(
+                    "account",
+                    "2026-08-10".to_owned(),
+                    "2026-08-10".to_owned(),
+                    1,
+                    search_texts,
+                ),
+                "search_texts"
+            );
+        }
+
+        assert_eq!(
+            validate_search_period(
+                "2026-08-01",
+                "2026-08-31",
+                "start",
+                "end",
+                MAX_SEARCH_PRODUCT_PERIOD_DAYS,
+            )
+            .unwrap(),
+            31
+        );
+        assert!(matches!(
+            validate_search_period(
+                "2026-08-01",
+                "2026-09-01",
+                "start",
+                "end",
+                MAX_SEARCH_PRODUCT_PERIOD_DAYS,
+            ),
+            Err(WbError::InvalidArguments {
+                field: "date_range"
+            })
+        ));
+        assert_eq!(
+            validate_search_period(
+                "2026-08-01",
+                "2026-08-07",
+                "start",
+                "end",
+                MAX_SEARCH_ORDERS_PERIOD_DAYS,
+            )
+            .unwrap(),
+            7
+        );
+        assert!(matches!(
+            validate_search_period(
+                "2026-08-01",
+                "2026-08-08",
+                "start",
+                "end",
+                MAX_SEARCH_ORDERS_PERIOD_DAYS,
+            ),
+            Err(WbError::InvalidArguments {
+                field: "date_range"
+            })
+        ));
+        assert!(
+            validate_positive_unique_ids(&(1..=50).collect::<Vec<_>>(), 50, "nm_ids", None).is_ok()
+        );
+        for value in [
+            "openCard",
+            "addToCart",
+            "openToCart",
+            "orders",
+            "cartToOrder",
+        ] {
+            assert!(validate_top_order_by(value).is_ok(), "{value}");
+        }
+        assert!(validate_search_texts(&vec!["я".repeat(128); 1]).is_ok());
+        assert!(
+            validate_search_texts(
+                &(1..=MAX_SEARCH_REPORT_TEXTS)
+                    .map(|index| format!("phrase-{index}"))
+                    .collect::<Vec<_>>()
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn bid_read_arguments_fail_closed_before_network() {
+        let client = WbClient::new_for_test(
+            Duration::from_millis(50),
+            credentials(),
+            "http://127.0.0.1:1",
+            "http://127.0.0.1:1",
+        );
+
+        macro_rules! assert_invalid {
+            ($future:expr, $field:literal) => {{
+                let error = $future.await.unwrap_err();
+                assert!(
+                    matches!(error, WbError::InvalidArguments { field } if field == $field),
+                    "expected invalid {}, got {error:?}",
+                    $field
+                );
+            }};
+        }
+
+        for advert_id in [0, MAX_WB_SIGNED_ID + 1] {
+            assert_invalid!(
+                client.promotion_minimum_bids(
+                    "account",
+                    advert_id,
+                    vec![1],
+                    "cpm".to_owned(),
+                    vec!["search".to_owned()],
+                ),
+                "advert_id"
+            );
+        }
+        for nm_ids in [
+            Vec::new(),
+            vec![0],
+            vec![MAX_WB_SIGNED_ID + 1],
+            vec![1, 1],
+            (1..=101).collect(),
+        ] {
+            assert_invalid!(
+                client.promotion_minimum_bids(
+                    "account",
+                    1,
+                    nm_ids,
+                    "cpm".to_owned(),
+                    vec!["search".to_owned()],
+                ),
+                "nm_ids"
+            );
+        }
+        assert_invalid!(
+            client.promotion_minimum_bids(
+                "account",
+                1,
+                vec![1],
+                "CPM".to_owned(),
+                vec!["search".to_owned()],
+            ),
+            "payment_type"
+        );
+        for placements in [
+            Vec::new(),
+            vec!["search".to_owned(), "search".to_owned()],
+            vec!["recommendations".to_owned()],
+            vec![
+                "combined".to_owned(),
+                "search".to_owned(),
+                "recommendation".to_owned(),
+                "extra".to_owned(),
+            ],
+        ] {
+            assert_invalid!(
+                client.promotion_minimum_bids("account", 1, vec![1], "cpm".to_owned(), placements,),
+                "placement_types"
+            );
+        }
+
+        for (advert_id, nm_id, field) in [
+            (0, 1, "advert_id"),
+            (MAX_WB_SIGNED_ID + 1, 1, "advert_id"),
+            (1, 0, "nm_id"),
+            (1, MAX_WB_SIGNED_ID + 1, "nm_id"),
+        ] {
+            let error = client
+                .promotion_recommended_bids("account", advert_id, nm_id)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                WbError::InvalidArguments { field: actual } if actual == field
+            ));
+        }
+
+        for items in [
+            Vec::new(),
+            vec![(0, 1)],
+            vec![(1, 0)],
+            vec![(MAX_WB_SIGNED_ID + 1, 1)],
+            vec![(1, MAX_WB_SIGNED_ID + 1)],
+            vec![(1, 2), (1, 2)],
+            (1..=101).map(|value| (value, value)).collect(),
+        ] {
+            assert_invalid!(
+                client.promotion_search_cluster_bids("account", items),
+                "items"
+            );
+        }
+
+        assert!(
+            validate_positive_unique_ids(
+                &(1..=100).collect::<Vec<_>>(),
+                100,
+                "nm_ids",
+                Some(MAX_WB_SIGNED_ID),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_placement_types(&[
+                "combined".to_owned(),
+                "search".to_owned(),
+                "recommendation".to_owned(),
+            ])
+            .is_ok()
+        );
+        assert!(
+            validate_bid_items(
+                &(1..=MAX_PROMOTION_CLUSTER_BID_ITEMS as u64)
+                    .map(|value| (value, value))
+                    .collect::<Vec<_>>()
+            )
+            .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn promotion_arguments_fail_closed_before_any_network_attempt() {
         let client = WbClient::new_for_test(
@@ -3965,6 +5135,108 @@ mod tests {
             WbError::InvalidArguments { field: "ids" }.kind(),
             WbErrorKind::InvalidArguments
         );
+    }
+
+    #[tokio::test]
+    async fn search_reports_are_single_attempt_and_quota_fails_fast() {
+        let (base_url, requests, task) = raw_http(vec![raw_response(
+            503,
+            "X-Request-Id: search-unavailable\r\n",
+            b"{}",
+        )]);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_millis(200),
+            credentials(),
+            &base_url,
+            retrying_policy(Duration::from_secs(1)),
+        );
+        let error = client
+            .search_product_queries(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-10".to_owned(),
+                None,
+                vec![1],
+                "orders".to_owned(),
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WbError::Api {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                ..
+            }
+        ));
+        let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let expected = format!("POST {SEARCH_PRODUCT_QUERIES_PATH} HTTP/1.1\r\n");
+        assert!(request.starts_with(expected.as_bytes()));
+        assert!(requests.try_recv().is_err(), "search report must not retry");
+        task.join().unwrap();
+
+        let mut policy = ClientPolicy::immediate_single_attempt(Duration::from_millis(20));
+        policy.search_report_interval = SEARCH_REPORT_MIN_REQUEST_INTERVAL;
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_millis(100),
+            credentials(),
+            "http://127.0.0.1:1",
+            policy,
+        );
+        let limiter = client.limiters.get("account").unwrap();
+        *limiter.search_reports.next_allowed.lock().await =
+            Instant::now() + SEARCH_REPORT_MIN_REQUEST_INTERVAL;
+        let started = Instant::now();
+        let error = client
+            .search_orders_positions(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-10".to_owned(),
+                1,
+                vec!["ручка".to_owned()],
+            )
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(matches!(
+            error,
+            WbError::LocalRateLimited { retry_after }
+                if retry_after > Duration::from_secs(19)
+                    && retry_after <= SEARCH_REPORT_MIN_REQUEST_INTERVAL
+        ));
+    }
+
+    #[tokio::test]
+    async fn search_report_http_402_is_a_non_retryable_subscription_error() {
+        let (base_url, requests, task) = raw_http(vec![raw_response(
+            402,
+            "X-Request-Id: jam-required\r\n",
+            b"{}",
+        )]);
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_millis(200),
+            credentials(),
+            &base_url,
+            retrying_policy(Duration::from_secs(1)),
+        );
+        let error = client
+            .search_orders_positions(
+                "account",
+                "2026-08-10".to_owned(),
+                "2026-08-10".to_owned(),
+                1,
+                vec!["ручка".to_owned()],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), WbErrorKind::SubscriptionRequired);
+        assert_eq!(error.request_id(), Some("jam-required"));
+        assert!(error.to_string().contains("подписка WB"));
+        let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let expected = format!("POST {SEARCH_ORDERS_POSITIONS_PATH} HTTP/1.1\r\n");
+        assert!(request.starts_with(expected.as_bytes()));
+        assert!(requests.try_recv().is_err(), "HTTP 402 must not retry");
+        task.join().unwrap();
     }
 
     #[tokio::test]
@@ -4098,6 +5370,8 @@ mod tests {
             (Method::POST, "/adv/v2/seacat/save-ad"),
             (Method::POST, "/adv/v1/budget/deposit"),
             (Method::POST, "/adv/v0/normquery/set-minus"),
+            (Method::POST, "/adv/v0/normquery/bids"),
+            (Method::DELETE, "/adv/v0/normquery/bids"),
             (Method::PATCH, "/api/advert/v1/bids"),
             (Method::PATCH, "/adv/v0/auction/nms"),
             (Method::PUT, "/adv/v0/auction/placements"),
@@ -4108,12 +5382,24 @@ mod tests {
             (Method::POST, PROMOTION_CAMPAIGNS_PATH),
             (Method::POST, PROMOTION_DETAILS_PATH),
             (Method::POST, PROMOTION_STATS_PATH),
+            (Method::GET, SEARCH_PRODUCT_QUERIES_PATH),
+            (Method::GET, SEARCH_ORDERS_POSITIONS_PATH),
+            (Method::GET, PROMOTION_MINIMUM_BIDS_PATH),
+            (Method::POST, PROMOTION_RECOMMENDATIONS_PATH),
+            (Method::GET, PROMOTION_CLUSTER_BIDS_PATH),
             // Near-misses of allowlisted paths.
             (Method::GET, "/ping/"),
             (Method::GET, "/api/v1/tariffs/commission/"),
             (Method::GET, "/adv/v1/promotion/count/"),
             (Method::GET, "/api/advert/v2/adverts/"),
             (Method::GET, "/adv/v3/fullstats/"),
+            (Method::POST, "/api/v2/search-report/product/search-texts/"),
+            (Method::POST, "/api/v2/search-report/product/orders/"),
+            (Method::POST, "/api/advert/v1/bids/min/"),
+            (Method::GET, "/api/advert/v0/bids/recommendations/"),
+            (Method::POST, "/adv/v0/normquery/get-bids/"),
+            // Deprecated and neighboring read paths are not implicitly trusted.
+            (Method::POST, "/adv/v0/bids/min"),
             (Method::GET, ""),
         ] {
             let error = client
@@ -4199,6 +5485,24 @@ mod tests {
             RequestClass::for_request(&Method::GET, PROMOTION_STATS_PATH),
             Some(RequestClass::PromotionStats)
         );
+        for path in [SEARCH_PRODUCT_QUERIES_PATH, SEARCH_ORDERS_POSITIONS_PATH] {
+            assert_eq!(
+                RequestClass::for_request(&Method::POST, path),
+                Some(RequestClass::SearchReport)
+            );
+        }
+        assert_eq!(
+            RequestClass::for_request(&Method::POST, PROMOTION_MINIMUM_BIDS_PATH),
+            Some(RequestClass::PromotionMinimumBids)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, PROMOTION_RECOMMENDATIONS_PATH),
+            Some(RequestClass::PromotionRecommendedBids)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::POST, PROMOTION_CLUSTER_BIDS_PATH),
+            Some(RequestClass::PromotionClusterBids)
+        );
         assert_eq!(
             client.ping("account").await.unwrap_err().kind(),
             WbErrorKind::Network
@@ -4213,6 +5517,7 @@ mod tests {
             (WbErrorKind::MissingCredentials, "missing_credentials"),
             (WbErrorKind::Unauthorized, "unauthorized"),
             (WbErrorKind::Forbidden, "forbidden"),
+            (WbErrorKind::SubscriptionRequired, "subscription_required"),
             (WbErrorKind::RateLimited, "rate_limited"),
             (WbErrorKind::Http, "upstream_http_error"),
             (WbErrorKind::Timeout, "timeout"),
@@ -4232,6 +5537,7 @@ mod tests {
             WbError::InvalidArguments { field: "ids" },
             WbError::Unauthorized { request_id: None },
             WbError::Forbidden { request_id: None },
+            WbError::SubscriptionRequired { request_id: None },
             WbError::RateLimited {
                 request_id: None,
                 retry_after: None,

@@ -64,7 +64,7 @@ expect_exact_validation_failure \
   POSTGRES_DB=ozon_positions \
   POSITION_COLLECTOR_DB_PASSWORD="$collector_password" \
   POSITION_READER_DB_PASSWORD="$reader_password" \
-  "$project_root/position-monitor/initdb/002_roles.sh"
+  "$project_root/position-monitor/initdb/003_roles.sh"
 
 expect_exact_validation_failure \
   "admin/application role-collision validation" \
@@ -75,7 +75,7 @@ expect_exact_validation_failure \
   POSTGRES_DB=ozon_positions \
   POSITION_COLLECTOR_DB_PASSWORD="$collector_password" \
   POSITION_READER_DB_PASSWORD="$reader_password" \
-  "$project_root/position-monitor/initdb/002_roles.sh"
+  "$project_root/position-monitor/initdb/003_roles.sh"
 
 docker build --pull --tag "$image" --file "$project_root/position-monitor/Dockerfile" \
   "$project_root/position-monitor"
@@ -124,6 +124,80 @@ reader_psql=(
   --no-psqlrc --set ON_ERROR_STOP=1
 )
 
+# Prove that the additive WB migration can be applied safely to an existing
+# database initialized with the original Ozon-only schema and existing roles.
+"${admin_psql[@]}" --command 'CREATE DATABASE wb_migration_probe' >/dev/null
+migration_admin_psql=(
+  docker exec --env PGPASSWORD="$admin_password" "$container"
+  psql --host 127.0.0.1 --username position_admin --dbname wb_migration_probe
+  --no-psqlrc --set ON_ERROR_STOP=1
+)
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/001_schema.sql >/dev/null
+"${admin_psql[@]}" --command '
+  GRANT CONNECT ON DATABASE wb_migration_probe
+      TO position_collector, position_reader
+' >/dev/null
+"${migration_admin_psql[@]}" --command '
+  GRANT USAGE ON SCHEMA search_position
+      TO position_collector, position_reader;
+  GRANT SELECT ON search_position.monitors TO position_collector;
+  GRANT SELECT ON ALL TABLES IN SCHEMA search_position TO position_reader;
+  ALTER DEFAULT PRIVILEGES IN SCHEMA search_position
+      GRANT SELECT ON TABLES TO position_reader;
+' >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/002_wb_official_history.sql >/dev/null
+"${migration_admin_psql[@]}" --command '
+  CREATE TABLE search_position.reader_default_acl_probe (id integer)
+' >/dev/null
+migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT
+      to_regclass('search_position.wb_search_snapshots') IS NOT NULL,
+      has_table_privilege(
+          'position_collector',
+          'search_position.wb_search_targets',
+          'SELECT'
+      ),
+      NOT has_table_privilege(
+          'position_collector',
+          'search_position.wb_search_targets',
+          'INSERT'
+      ),
+      has_table_privilege(
+          'position_collector',
+          'search_position.wb_search_snapshots',
+          'INSERT'
+      ),
+      has_table_privilege(
+          'position_reader',
+          'search_position.latest_wb_search_snapshots',
+          'SELECT'
+      ),
+      NOT has_table_privilege(
+          'position_reader',
+          'search_position.wb_collection_runs',
+          'SELECT'
+      ),
+      NOT has_table_privilege(
+          'position_reader',
+          'search_position.wb_search_snapshots',
+          'SELECT'
+      ),
+      NOT has_table_privilege(
+          'position_reader',
+          'search_position.reader_default_acl_probe',
+          'SELECT'
+      )
+  "; } | tr -d '\r')"
+if [[ "$migration_acl" != "t:t:t:t:t:t:t:t" ]]; then
+  echo "existing-volume WB migration did not install the expected schema/ACL" >&2
+  printf '%s\n' "$migration_acl" >&2
+  exit 1
+fi
+"${admin_psql[@]}" --command 'DROP DATABASE wb_migration_probe' >/dev/null
+
 # Prove that a failure after password/role mutations rolls the entire bootstrap
 # back. Hiding one grant target forces a deterministic mid-transaction error.
 rollback_collector_password="position-collector-rollback-test"
@@ -141,7 +215,7 @@ expect_failure_containing \
   --env POSITION_COLLECTOR_DB_PASSWORD="$rollback_collector_password" \
   --env POSITION_READER_DB_PASSWORD="$rollback_reader_password" \
   "$container" \
-  /docker-entrypoint-initdb.d/002_roles.sh
+  /docker-entrypoint-initdb.d/003_roles.sh
 "${admin_psql[@]}" \
   --command 'ALTER TABLE search_position.alerts_rollback_probe RENAME TO alerts' \
   >/dev/null
@@ -245,6 +319,899 @@ if [[ "$latest_diagnostics" != "123:transport:502" ]]; then
   exit 1
 fi
 
+# WB Search Analytics is a separate source-aware aggregate dataset. Exercise its
+# provenance, identity, idempotency and append-only role boundary end-to-end.
+"${admin_psql[@]}" --command "
+  INSERT INTO search_position.wb_search_targets
+      (account_id, store_id, nm_id, search_phrase)
+  VALUES
+      ('wb-account-a', 'wb-store-a', 3411079879, 'ручка мебельная'),
+      ('wb-account-a', 'wb-store-a', 3388722638, 'ручка кнопка');
+
+  INSERT INTO search_position.wb_bid_targets
+      (
+          account_id,
+          store_id,
+          source,
+          campaign_id,
+          nm_id,
+          payment_type,
+          placement
+      )
+  VALUES
+      (
+          'wb-account-a', 'wb-store-a', 'promotion_cluster_bids',
+          7001, 3411079879, NULL, NULL
+      ),
+      (
+          'wb-account-a', 'wb-store-a', 'promotion_minimum_bids',
+          7002, 3388722638, 'cpc', 'search'
+      ),
+      (
+          'wb-account-a', 'wb-store-a', 'promotion_bid_recommendations',
+          7003, 3411079879, 'cpm', NULL
+      );
+" >/dev/null
+
+expect_failure_containing \
+  "WB cluster target with invented payment/placement" \
+  "violates check constraint" \
+  "${admin_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_bid_targets (
+        account_id, store_id, source, campaign_id, nm_id,
+        payment_type, placement
+    ) VALUES (
+        'wb-account-a', 'wb-store-a', 'promotion_cluster_bids',
+        7991, 3411079879, 'cpm', 'search'
+    )
+  "
+
+expect_failure_containing \
+  "WB recommendation target with CPC" \
+  "violates check constraint" \
+  "${admin_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_bid_targets (
+        account_id, store_id, source, campaign_id, nm_id, payment_type
+    ) VALUES (
+        'wb-account-a', 'wb-store-a', 'promotion_bid_recommendations',
+        7992, 3411079879, 'cpc'
+    )
+  "
+
+"${collector_psql[@]}" --command "
+  INSERT INTO search_position.wb_collection_runs (
+      account_id,
+      store_id,
+      source,
+      source_host,
+      source_method,
+      source_path,
+      scheduled_for,
+      started_at,
+      status,
+      collector_version
+  ) VALUES (
+      'wb-account-a',
+      'wb-store-a',
+      'search_product_orders',
+      'seller-analytics-api.wildberries.ru',
+      'POST',
+      '/api/v2/search-report/product/orders',
+      '2026-08-15 10:00:00+00',
+      '2026-08-15 10:00:01+00',
+      'running',
+      'schema-test'
+  );
+
+  INSERT INTO search_position.wb_search_snapshots (
+      run_id,
+      target_id,
+      source,
+      account_id,
+      store_id,
+      nm_id,
+      search_phrase,
+      period_start,
+      period_end,
+      observed_at,
+      source_updated_at,
+      data_granularity,
+      average_position,
+      orders
+  ) VALUES (
+      (SELECT id FROM search_position.wb_collection_runs
+       WHERE source = 'search_product_orders'),
+      1,
+      'search_product_orders',
+      'wb-account-a',
+      'wb-store-a',
+      3411079879,
+      'ручка мебельная',
+      '2026-08-14',
+      '2026-08-14',
+      '2026-08-15 10:00:05+00',
+      '2026-08-15 09:59:00+00',
+      'daily',
+      32.4,
+      4
+  );
+
+  UPDATE search_position.wb_collection_runs
+  SET finished_at = '2026-08-15 10:00:10+00',
+      source_updated_at = '2026-08-15 09:59:00+00',
+      status = 'succeeded',
+      targets_attempted = 1,
+      targets_succeeded = 1
+  WHERE source = 'search_product_orders';
+
+  INSERT INTO search_position.wb_collection_runs (
+      account_id,
+      store_id,
+      source,
+      source_host,
+      source_method,
+      source_path,
+      scheduled_for,
+      started_at,
+      status,
+      collector_version
+  ) VALUES (
+      'wb-account-a',
+      'wb-store-a',
+      'promotion_cluster_bids',
+      'advert-api.wildberries.ru',
+      'POST',
+      '/adv/v0/normquery/get-bids',
+      '2026-08-15 10:00:00+00',
+      '2026-08-15 10:00:01+00',
+      'running',
+      'schema-test'
+  );
+
+  INSERT INTO search_position.wb_bid_snapshots (
+      run_id,
+      target_id,
+      source,
+      account_id,
+      store_id,
+      campaign_id,
+      nm_id,
+      scope,
+      query_phrase,
+      bid_kind,
+      bid_kopecks,
+      observed_at
+  ) VALUES (
+      (SELECT id FROM search_position.wb_collection_runs
+       WHERE source = 'promotion_cluster_bids'),
+      1,
+      'promotion_cluster_bids',
+      'wb-account-a',
+      'wb-store-a',
+      7001,
+      3411079879,
+      'search_cluster',
+      'ручка мебельная',
+      'current',
+      10500,
+      '2026-08-15 10:00:05+00'
+  );
+
+  UPDATE search_position.wb_collection_runs
+  SET finished_at = '2026-08-15 10:00:09+00',
+      status = 'succeeded',
+      targets_attempted = 1,
+      targets_succeeded = 1
+  WHERE source = 'promotion_cluster_bids';
+
+  INSERT INTO search_position.wb_collection_runs (
+      account_id, store_id, source, source_host, source_method, source_path,
+      scheduled_for, started_at, status, collector_version
+  ) VALUES (
+      'wb-account-a', 'wb-store-a', 'promotion_minimum_bids',
+      'advert-api.wildberries.ru', 'POST', '/api/advert/v1/bids/min',
+      '2026-08-15 10:00:00+00', '2026-08-15 10:00:01+00',
+      'running', 'schema-test'
+  );
+  INSERT INTO search_position.wb_bid_snapshots (
+      run_id, target_id, source, account_id, store_id, campaign_id, nm_id,
+      payment_type, placement, scope, bid_kind, bid_kopecks, observed_at
+  ) VALUES (
+      (SELECT id FROM search_position.wb_collection_runs
+       WHERE source = 'promotion_minimum_bids'),
+      2, 'promotion_minimum_bids', 'wb-account-a', 'wb-store-a',
+      7002, 3388722638, 'cpc', 'search', 'product', 'minimum', 250,
+      '2026-08-15 10:00:05+00'
+  );
+  UPDATE search_position.wb_collection_runs
+  SET finished_at = '2026-08-15 10:00:09+00', status = 'succeeded',
+      targets_attempted = 1, targets_succeeded = 1
+  WHERE source = 'promotion_minimum_bids';
+
+  INSERT INTO search_position.wb_collection_runs (
+      account_id, store_id, source, source_host, source_method, source_path,
+      scheduled_for, started_at, status, collector_version
+  ) VALUES (
+      'wb-account-a', 'wb-store-a', 'promotion_bid_recommendations',
+      'advert-api.wildberries.ru', 'GET',
+      '/api/advert/v0/bids/recommendations',
+      '2026-08-15 10:00:00+00', '2026-08-15 10:00:01+00',
+      'running', 'schema-test'
+  );
+  INSERT INTO search_position.wb_bid_snapshots (
+      run_id, target_id, source, account_id, store_id, campaign_id, nm_id,
+      payment_type, scope, bid_kind, bid_kopecks, observed_at
+  ) VALUES (
+      (SELECT id FROM search_position.wb_collection_runs
+       WHERE source = 'promotion_bid_recommendations'),
+      3, 'promotion_bid_recommendations', 'wb-account-a', 'wb-store-a',
+      7003, 3411079879, 'cpm', 'product', 'competitive', 39500,
+      '2026-08-15 10:00:05+00'
+  );
+  UPDATE search_position.wb_collection_runs
+  SET finished_at = '2026-08-15 10:00:09+00', status = 'succeeded',
+      targets_attempted = 1, targets_succeeded = 1
+  WHERE source = 'promotion_bid_recommendations';
+" >/dev/null
+
+wb_search_snapshot="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT source,
+           data_granularity,
+           is_live_position,
+           coalesce(region, 'NULL'),
+           placement_split_available,
+           average_position,
+           coalesce(median_position::text, 'NULL'),
+           orders,
+           frequency,
+           run_status,
+           is_partial
+    FROM search_position.latest_wb_search_snapshots
+    WHERE target_id = 1
+  "; } | tr -d '\r')"
+if [[ "$wb_search_snapshot" != \
+  "search_product_orders:daily:f:NULL:f:32.4000:NULL:4::succeeded:f" ]]; then
+  echo "WB Search Analytics snapshot or semantic flags are incorrect" >&2
+  printf '%s\n' "$wb_search_snapshot" >&2
+  exit 1
+fi
+
+wb_bid_snapshot="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT source,
+           coalesce(payment_type, 'NULL'),
+           coalesce(placement, 'NULL'),
+           scope,
+           query_phrase,
+           bid_kind,
+           bid_kopecks,
+           run_status,
+           is_partial
+    FROM search_position.latest_wb_bid_snapshots
+    WHERE target_id = 1
+  "; } | tr -d '\r')"
+if [[ "$wb_bid_snapshot" != \
+  "promotion_cluster_bids:NULL:NULL:search_cluster:ручка мебельная:current:10500:succeeded:f" ]]; then
+  echo "WB bid snapshot lost source or query-level provenance" >&2
+  printf '%s\n' "$wb_bid_snapshot" >&2
+  exit 1
+fi
+
+wb_other_bid_snapshots="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT target_id,
+           source,
+           payment_type,
+           coalesce(placement, 'NULL'),
+           bid_kind,
+           bid_kopecks
+    FROM search_position.latest_wb_bid_snapshots
+    WHERE target_id IN (2, 3)
+    ORDER BY target_id
+  "; } | tr -d '\r')"
+expected_other_bids=$'2:promotion_minimum_bids:cpc:search:minimum:250\n3:promotion_bid_recommendations:cpm:NULL:competitive:39500'
+if [[ "$wb_other_bid_snapshots" != "$expected_other_bids" ]]; then
+  echo "WB minimum/recommendation snapshots lost source-specific semantics" >&2
+  printf '%s\n' "$wb_other_bid_snapshots" >&2
+  exit 1
+fi
+
+wb_forbidden_position_columns="$({ "${admin_psql[@]}" --tuples-only --no-align \
+  --command "
+    SELECT count(*)
+    FROM information_schema.columns
+    WHERE table_schema = 'search_position'
+      AND table_name = 'wb_search_snapshots'
+      AND column_name IN (
+          'region',
+          'region_code',
+          'organic_position',
+          'sponsored_position',
+          'live_position'
+      )
+  "; } | tr -d '\r')"
+if [[ "$wb_forbidden_position_columns" != 0 ]]; then
+  echo "WB search aggregates expose unsupported live/region/placement columns" >&2
+  exit 1
+fi
+
+"${admin_psql[@]}" --command "
+  UPDATE search_position.wb_search_targets
+  SET active = false, updated_at = to_timestamp(0)
+  WHERE id = 1;
+  UPDATE search_position.wb_bid_targets
+  SET active = false, updated_at = to_timestamp(0)
+  WHERE id = 1;
+" >/dev/null
+wb_target_timestamps="$({ "${admin_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT
+      (SELECT updated_at >= created_at
+       FROM search_position.wb_search_targets WHERE id = 1),
+      (SELECT updated_at >= created_at
+       FROM search_position.wb_bid_targets WHERE id = 1)
+  "; } | tr -d '\r')"
+if [[ "$wb_target_timestamps" != "t:t" ]]; then
+  echo "WB target updated_at is not maintained by its database trigger" >&2
+  exit 1
+fi
+
+expect_failure_containing \
+  "immutable WB search target identity" \
+  "WB search target identity is immutable" \
+  "${admin_psql[@]}" \
+  --command 'UPDATE search_position.wb_search_targets SET nm_id = 1 WHERE id = 1'
+
+expect_failure_containing \
+  "immutable WB bid target identity" \
+  "WB bid target identity is immutable" \
+  "${admin_psql[@]}" \
+  --command 'UPDATE search_position.wb_bid_targets SET campaign_id = 1 WHERE id = 1'
+
+expect_failure_containing \
+  "WB succeeded run changed to failed" \
+  "terminal WB collection run is immutable" \
+  "${admin_psql[@]}" \
+  --command "
+    UPDATE search_position.wb_collection_runs
+    SET status = 'failed'
+    WHERE source = 'search_product_orders'
+      AND scheduled_for = '2026-08-15 10:00:00+00'
+  "
+
+expect_failure_containing \
+  "WB succeeded run reopened" \
+  "terminal WB collection run is immutable" \
+  "${admin_psql[@]}" \
+  --command "
+    UPDATE search_position.wb_collection_runs
+    SET status = 'running', finished_at = NULL
+    WHERE source = 'search_product_orders'
+      AND scheduled_for = '2026-08-15 10:00:00+00'
+  "
+
+expect_failure_containing \
+  "hourly WB run idempotency" \
+  "duplicate key value violates unique constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_collection_runs (
+        account_id, store_id, source, source_host, source_method, source_path,
+        scheduled_for, started_at, status, collector_version
+    ) VALUES (
+        'wb-account-a', 'wb-store-a', 'search_product_orders',
+        'seller-analytics-api.wildberries.ru', 'POST',
+        '/api/v2/search-report/product/orders',
+        '2026-08-15 10:00:00+00', '2026-08-15 10:00:02+00',
+        'running', 'schema-test'
+    )
+  "
+
+expect_failure_containing \
+  "WB run scheduled outside an hour boundary" \
+  "violates check constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_collection_runs (
+        account_id, store_id, source, source_host, source_method, source_path,
+        scheduled_for, started_at, status, collector_version
+    ) VALUES (
+        'wb-account-a', 'wb-store-a', 'search_product_texts',
+        'seller-analytics-api.wildberries.ru', 'POST',
+        '/api/v2/search-report/product/search-texts',
+        '2026-08-15 10:15:00+00', '2026-08-15 10:15:01+00',
+        'running', 'schema-test'
+    )
+  "
+
+"${collector_psql[@]}" --command "
+  INSERT INTO search_position.wb_collection_runs (
+      account_id, store_id, source, source_host, source_method, source_path,
+      scheduled_for, started_at, status, collector_version
+  ) VALUES
+      (
+          'wb-account-a', 'wb-store-a', 'search_product_orders',
+          'seller-analytics-api.wildberries.ru', 'POST',
+          '/api/v2/search-report/product/orders',
+          '2026-08-15 11:00:00+00', '2026-08-15 11:00:01+00',
+          'running', 'schema-test'
+      ),
+      (
+          'wb-account-a', 'wb-store-a', 'search_product_texts',
+          'seller-analytics-api.wildberries.ru', 'POST',
+          '/api/v2/search-report/product/search-texts',
+          '2026-08-15 11:00:00+00', '2026-08-15 11:00:01+00',
+          'running', 'schema-test'
+      ),
+      (
+          'wb-account-a', 'wb-store-a', 'promotion_cluster_bids',
+          'advert-api.wildberries.ru', 'POST',
+          '/adv/v0/normquery/get-bids',
+          '2026-08-15 11:00:00+00', '2026-08-15 11:00:01+00',
+          'running', 'schema-test'
+      ),
+      (
+          'wb-account-a', 'wb-store-a', 'promotion_minimum_bids',
+          'advert-api.wildberries.ru', 'POST',
+          '/api/advert/v1/bids/min',
+          '2026-08-15 11:00:00+00', '2026-08-15 11:00:01+00',
+          'running', 'schema-test'
+      ),
+      (
+          'wb-account-a', 'wb-store-a', 'promotion_bid_recommendations',
+          'advert-api.wildberries.ru', 'GET',
+          '/api/advert/v0/bids/recommendations',
+          '2026-08-15 11:00:00+00', '2026-08-15 11:00:01+00',
+          'running', 'schema-test'
+      );
+" >/dev/null
+
+expect_failure_containing \
+  "WB search snapshot source/run mismatch" \
+  "violates foreign key constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_search_snapshots (
+        run_id, target_id, source, account_id, store_id, nm_id, search_phrase,
+        period_start, period_end, observed_at, data_granularity,
+        average_position
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'search_product_orders'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'search_product_texts', 'wb-account-a', 'wb-store-a', 3388722638,
+        'ручка кнопка', '2026-08-14', '2026-08-14',
+        '2026-08-15 11:00:05+00', 'period_aggregate', 20
+    )
+  "
+
+expect_failure_containing \
+  "WB orders snapshot with a multi-day period" \
+  "violates check constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_search_snapshots (
+        run_id, target_id, source, account_id, store_id, nm_id, search_phrase,
+        period_start, period_end, observed_at, data_granularity,
+        average_position
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'search_product_orders'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'search_product_orders', 'wb-account-a', 'wb-store-a', 3388722638,
+        'ручка кнопка', '2026-08-13', '2026-08-14',
+        '2026-08-15 11:00:05+00', 'daily', 20
+    )
+  "
+
+expect_failure_containing \
+  "WB orders snapshot with period granularity" \
+  "violates check constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_search_snapshots (
+        run_id, target_id, source, account_id, store_id, nm_id, search_phrase,
+        period_start, period_end, observed_at, data_granularity,
+        average_position
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'search_product_orders'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'search_product_orders', 'wb-account-a', 'wb-store-a', 3388722638,
+        'ручка кнопка', '2026-08-14', '2026-08-14',
+        '2026-08-15 11:00:05+00', 'period_aggregate', 20
+    )
+  "
+
+expect_failure_containing \
+  "WB orders row with period-level frequency" \
+  "violates check constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_search_snapshots (
+        run_id, target_id, source, account_id, store_id, nm_id, search_phrase,
+        period_start, period_end, observed_at, data_granularity,
+        average_position, frequency
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'search_product_orders'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'search_product_orders', 'wb-account-a', 'wb-store-a', 3388722638,
+        'ручка кнопка', '2026-08-14', '2026-08-14',
+        '2026-08-15 11:00:05+00', 'daily', 20, 100
+    )
+  "
+
+expect_failure_containing \
+  "WB orders row with unsupported daily median" \
+  "violates check constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_search_snapshots (
+        run_id, target_id, source, account_id, store_id, nm_id, search_phrase,
+        period_start, period_end, observed_at, data_granularity,
+        average_position, median_position
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'search_product_orders'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'search_product_orders', 'wb-account-a', 'wb-store-a', 3388722638,
+        'ручка кнопка', '2026-08-14', '2026-08-14',
+        '2026-08-15 11:00:05+00', 'daily', 20, 21
+    )
+  "
+
+expect_failure_containing \
+  "WB search-text snapshot beyond the 31-day contract" \
+  "violates check constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_search_snapshots (
+        run_id, target_id, source, account_id, store_id, nm_id, search_phrase,
+        period_start, period_end, observed_at, data_granularity,
+        average_position
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'search_product_texts'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'search_product_texts', 'wb-account-a', 'wb-store-a', 3388722638,
+        'ручка кнопка', '2026-07-14', '2026-08-14',
+        '2026-08-15 11:00:05+00', 'period_aggregate', 20
+    )
+  "
+
+expect_failure_containing \
+  "WB search-text snapshot with daily granularity" \
+  "violates check constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_search_snapshots (
+        run_id, target_id, source, account_id, store_id, nm_id, search_phrase,
+        period_start, period_end, observed_at, data_granularity,
+        average_position
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'search_product_texts'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'search_product_texts', 'wb-account-a', 'wb-store-a', 3388722638,
+        'ручка кнопка', '2026-08-14', '2026-08-14',
+        '2026-08-15 11:00:05+00', 'daily', 20
+    )
+  "
+
+expect_failure_containing \
+  "WB cluster snapshot with invented payment/placement" \
+  "violates check constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_bid_snapshots (
+        run_id, target_id, source, account_id, store_id, campaign_id, nm_id,
+        payment_type, placement, scope, query_phrase, bid_kind, bid_kopecks,
+        observed_at
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'promotion_cluster_bids'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        1, 'promotion_cluster_bids', 'wb-account-a', 'wb-store-a',
+        7001, 3411079879, 'cpm', 'search', 'search_cluster',
+        'ручка мебельная', 'current', 100, '2026-08-15 11:00:05+00'
+    )
+  "
+
+expect_failure_containing \
+  "WB minimum-bid target metadata mismatch" \
+  "violates foreign key constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_bid_snapshots (
+        run_id, target_id, source, account_id, store_id, campaign_id, nm_id,
+        payment_type, placement, scope, bid_kind, bid_kopecks, observed_at
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'promotion_minimum_bids'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'promotion_minimum_bids', 'wb-account-a', 'wb-store-a',
+        7002, 3388722638, 'cpm', 'search', 'product', 'minimum', 100,
+        '2026-08-15 11:00:05+00'
+    )
+  "
+
+expect_failure_containing \
+  "WB recommendation snapshot with CPC" \
+  "violates check constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_bid_snapshots (
+        run_id, target_id, source, account_id, store_id, campaign_id, nm_id,
+        payment_type, scope, bid_kind, bid_kopecks, observed_at
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'promotion_bid_recommendations'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        3, 'promotion_bid_recommendations', 'wb-account-a', 'wb-store-a',
+        7003, 3411079879, 'cpc', 'product', 'competitive', 100,
+        '2026-08-15 11:00:05+00'
+    )
+  "
+
+expect_failure_containing \
+  "WB bid snapshot cross-source target" \
+  "violates foreign key constraint" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_bid_snapshots (
+        run_id, target_id, source, account_id, store_id, campaign_id, nm_id,
+        scope, query_phrase, bid_kind, bid_kopecks, observed_at
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'promotion_cluster_bids'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'promotion_cluster_bids', 'wb-account-a', 'wb-store-a',
+        7002, 3388722638, 'search_cluster', 'ручка кнопка', 'current', 100,
+        '2026-08-15 11:00:05+00'
+    )
+  "
+
+expect_failure_containing \
+  "WB run inserted directly as terminal" \
+  "WB collection run must start clean in running" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_collection_runs (
+        account_id, store_id, source, source_host, source_method, source_path,
+        scheduled_for, started_at, finished_at, status, collector_version
+    ) VALUES (
+        'wb-account-a', 'wb-store-a', 'search_product_texts',
+        'seller-analytics-api.wildberries.ru', 'POST',
+        '/api/v2/search-report/product/search-texts',
+        '2026-08-15 13:00:00+00', '2026-08-15 13:00:01+00',
+        '2026-08-15 13:00:02+00', 'failed', 'schema-test'
+    )
+  "
+
+expect_failure_containing \
+  "WB running-run provenance mutation" \
+  "WB collection run provenance is immutable" \
+  "${admin_psql[@]}" \
+  --command "
+    UPDATE search_position.wb_collection_runs
+    SET source_path = '/not-the-requested-endpoint'
+    WHERE source = 'promotion_minimum_bids'
+      AND scheduled_for = '2026-08-15 11:00:00+00'
+  "
+
+expect_failure_containing \
+  "WB running-run started_at mutation" \
+  "WB collection run provenance is immutable" \
+  "${admin_psql[@]}" \
+  --command "
+    UPDATE search_position.wb_collection_runs
+    SET started_at = '2026-08-15 11:00:02+00'
+    WHERE source = 'promotion_minimum_bids'
+      AND scheduled_for = '2026-08-15 11:00:00+00'
+  "
+
+"${collector_psql[@]}" --command "
+  UPDATE search_position.wb_collection_runs
+  SET targets_attempted = 2, targets_succeeded = 1
+  WHERE source = 'promotion_minimum_bids'
+    AND scheduled_for = '2026-08-15 11:00:00+00';
+" >/dev/null
+expect_failure_containing \
+  "WB running-run counter decrease" \
+  "WB collection run counters cannot decrease" \
+  "${collector_psql[@]}" \
+  --command "
+    UPDATE search_position.wb_collection_runs
+    SET targets_attempted = 1
+    WHERE source = 'promotion_minimum_bids'
+      AND scheduled_for = '2026-08-15 11:00:00+00'
+  "
+
+# A newer failed Search Report run remains forensic-only and cannot displace
+# the previous succeeded snapshot in the reader projection.
+"${collector_psql[@]}" --command "
+  INSERT INTO search_position.wb_search_snapshots (
+      run_id, target_id, source, account_id, store_id, nm_id, search_phrase,
+      period_start, period_end, observed_at, data_granularity,
+      average_position, orders
+  ) VALUES (
+      (SELECT id FROM search_position.wb_collection_runs
+       WHERE source = 'search_product_orders'
+         AND scheduled_for = '2026-08-15 11:00:00+00'),
+      1, 'search_product_orders', 'wb-account-a', 'wb-store-a', 3411079879,
+      'ручка мебельная', '2026-08-14', '2026-08-14',
+      '2026-08-15 11:00:05+00', 'daily', 99, 0
+  );
+  UPDATE search_position.wb_collection_runs
+  SET finished_at = '2026-08-15 11:00:10+00', status = 'failed',
+      targets_attempted = 1, error_class = 'upstream', http_status = 502
+  WHERE source = 'search_product_orders'
+    AND scheduled_for = '2026-08-15 11:00:00+00';
+" >/dev/null
+wb_search_after_failed="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT average_position, run_status
+    FROM search_position.latest_wb_search_snapshots
+    WHERE target_id = 1
+  "; } | tr -d '\r')"
+if [[ "$wb_search_after_failed" != "32.4000:succeeded" ]]; then
+  echo "a failed WB run displaced the last published search snapshot" >&2
+  printf '%s\n' "$wb_search_after_failed" >&2
+  exit 1
+fi
+
+expect_failure_containing \
+  "WB failed run changed to succeeded" \
+  "terminal WB collection run is immutable" \
+  "${admin_psql[@]}" \
+  --command "
+    UPDATE search_position.wb_collection_runs
+    SET status = 'succeeded'
+    WHERE source = 'search_product_orders'
+      AND scheduled_for = '2026-08-15 11:00:00+00'
+  "
+
+expect_failure_containing \
+  "WB snapshot appended after terminal run" \
+  "WB snapshots can only be appended to a running run" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.wb_search_snapshots (
+        run_id, target_id, source, account_id, store_id, nm_id, search_phrase,
+        period_start, period_end, observed_at, data_granularity,
+        average_position
+    ) VALUES (
+        (SELECT id FROM search_position.wb_collection_runs
+         WHERE source = 'search_product_orders'
+           AND scheduled_for = '2026-08-15 11:00:00+00'),
+        2, 'search_product_orders', 'wb-account-a', 'wb-store-a', 3388722638,
+        'ручка кнопка', '2026-08-14', '2026-08-14',
+        '2026-08-15 11:00:06+00', 'daily', 20
+    )
+  "
+
+# Running facts are not published. Once the same run becomes partial, the
+# projection exposes both the newer bid and bounded partial diagnostics.
+"${collector_psql[@]}" --command "
+  INSERT INTO search_position.wb_bid_snapshots (
+      run_id, target_id, source, account_id, store_id, campaign_id, nm_id,
+      scope, query_phrase, bid_kind, bid_kopecks, observed_at
+  ) VALUES (
+      (SELECT id FROM search_position.wb_collection_runs
+       WHERE source = 'promotion_cluster_bids'
+         AND scheduled_for = '2026-08-15 11:00:00+00'),
+      1, 'promotion_cluster_bids', 'wb-account-a', 'wb-store-a',
+      7001, 3411079879, 'search_cluster', 'ручка мебельная', 'current',
+      11000, '2026-08-15 11:00:05+00'
+  );
+" >/dev/null
+wb_bid_while_running="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT bid_kopecks, run_status
+    FROM search_position.latest_wb_bid_snapshots
+    WHERE target_id = 1
+  "; } | tr -d '\r')"
+if [[ "$wb_bid_while_running" != "10500:succeeded" ]]; then
+  echo "a running WB run displaced the last published bid snapshot" >&2
+  exit 1
+fi
+
+"${collector_psql[@]}" --command "
+  UPDATE search_position.wb_collection_runs
+  SET finished_at = '2026-08-15 11:00:10+00', status = 'partial',
+      targets_attempted = 2, targets_succeeded = 1,
+      error_class = 'upstream', http_status = 502
+  WHERE source = 'promotion_cluster_bids'
+    AND scheduled_for = '2026-08-15 11:00:00+00';
+" >/dev/null
+wb_partial_bid="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT bid_kopecks, run_status, is_partial, targets_attempted,
+           targets_succeeded, run_error_class, run_http_status
+    FROM search_position.latest_wb_bid_snapshots
+    WHERE target_id = 1
+  "; } | tr -d '\r')"
+if [[ "$wb_partial_bid" != "11000:partial:t:2:1:upstream:502" ]]; then
+  echo "partial WB publication omitted its bounded diagnostics" >&2
+  printf '%s\n' "$wb_partial_bid" >&2
+  exit 1
+fi
+
+expect_failure_containing \
+  "WB partial run changed to succeeded" \
+  "terminal WB collection run is immutable" \
+  "${admin_psql[@]}" \
+  --command "
+    UPDATE search_position.wb_collection_runs
+    SET status = 'succeeded'
+    WHERE source = 'promotion_cluster_bids'
+      AND scheduled_for = '2026-08-15 11:00:00+00'
+  "
+
+"${collector_psql[@]}" --command "
+  UPDATE search_position.wb_collection_runs
+  SET finished_at = '2026-08-15 11:00:10+00', status = 'failed',
+      targets_attempted = 2, targets_succeeded = 1,
+      error_class = 'upstream', http_status = 502
+  WHERE source = 'promotion_minimum_bids'
+    AND scheduled_for = '2026-08-15 11:00:00+00';
+  UPDATE search_position.wb_collection_runs
+  SET finished_at = '2026-08-15 11:00:10+00', status = 'failed',
+      targets_attempted = 1, error_class = 'upstream', http_status = 502
+  WHERE source = 'promotion_bid_recommendations'
+    AND scheduled_for = '2026-08-15 11:00:00+00';
+  UPDATE search_position.wb_collection_runs
+  SET finished_at = '2026-08-15 11:00:10+00', status = 'failed',
+      targets_attempted = 1, error_class = 'upstream', http_status = 502
+  WHERE source = 'search_product_texts'
+    AND scheduled_for = '2026-08-15 11:00:00+00';
+" >/dev/null
+
+expect_failure_containing \
+  "position_collector WB target UPDATE" \
+  "permission denied for table wb_search_targets" \
+  "${collector_psql[@]}" \
+  --command 'UPDATE search_position.wb_search_targets SET active = true WHERE id = 1'
+
+expect_failure_containing \
+  "position_collector WB snapshot UPDATE" \
+  "permission denied for table wb_search_snapshots" \
+  "${collector_psql[@]}" \
+  --command 'UPDATE search_position.wb_search_snapshots SET orders = 5 WHERE id = 1'
+
+expect_failure_containing \
+  "position_collector WB snapshot DELETE" \
+  "permission denied for table wb_bid_snapshots" \
+  "${collector_psql[@]}" \
+  --command 'DELETE FROM search_position.wb_bid_snapshots WHERE id = 1'
+
+expect_failure_containing \
+  "position_collector WB scheduled-hour UPDATE" \
+  "permission denied for table wb_collection_runs" \
+  "${collector_psql[@]}" \
+  --command "
+    UPDATE search_position.wb_collection_runs
+    SET scheduled_for = '2026-08-15 11:00:00+00'
+    WHERE source = 'search_product_orders'
+  "
+
+expect_failure_containing \
+  "position_reader raw WB run access" \
+  "permission denied for table wb_collection_runs" \
+  "${reader_psql[@]}" \
+  --command 'SELECT count(*) FROM search_position.wb_collection_runs'
+
+expect_failure_containing \
+  "position_reader WB snapshot write access" \
+  "permission denied for table wb_search_snapshots" \
+  "${reader_psql[@]}" \
+  --command 'SET default_transaction_read_only=off' \
+  --command 'UPDATE search_position.wb_search_snapshots SET orders = 5 WHERE id = 1'
+
 expect_failure_containing \
   "position_reader TEMPORARY privilege" \
   "permission denied to create temporary tables in database" \
@@ -283,12 +1250,19 @@ for role in position_collector position_reader; do
 done
 
 "${admin_psql[@]}" --command "
+  CREATE TABLE search_position.future_table_default_acl_probe (id integer);
   CREATE FUNCTION search_position.default_acl_probe()
   RETURNS integer
   LANGUAGE sql
   IMMUTABLE
   AS 'SELECT 1';
 " >/dev/null
+
+expect_failure_containing \
+  "position_reader future-table SELECT privilege" \
+  "permission denied for table future_table_default_acl_probe" \
+  "${reader_psql[@]}" \
+  --command 'SELECT count(*) FROM search_position.future_table_default_acl_probe'
 
 expect_failure_containing \
   "position_reader future-function EXECUTE privilege" \

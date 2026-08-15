@@ -78,15 +78,50 @@ WHERE datallowconn
 GRANT CONNECT ON DATABASE :"db_name" TO position_collector, position_reader;
 GRANT USAGE ON SCHEMA search_position TO position_collector, position_reader;
 
+-- Make re-running this role bootstrap converge to the exact ACL instead of
+-- retaining stale grants from an older schema revision.
+REVOKE ALL ON ALL TABLES IN SCHEMA search_position
+    FROM position_collector, position_reader;
+REVOKE ALL ON ALL SEQUENCES IN SCHEMA search_position
+    FROM position_collector, position_reader;
+
 GRANT SELECT ON search_position.monitors TO position_collector;
 GRANT SELECT, INSERT, UPDATE ON search_position.collection_runs TO position_collector;
 GRANT SELECT, INSERT ON search_position.measurements TO position_collector;
 GRANT SELECT, INSERT ON search_position.alerts TO position_collector;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA search_position TO position_collector;
+GRANT SELECT ON search_position.wb_search_targets TO position_collector;
+GRANT SELECT ON search_position.wb_bid_targets TO position_collector;
+GRANT SELECT, INSERT ON search_position.wb_collection_runs TO position_collector;
+GRANT UPDATE (
+    finished_at,
+    source_updated_at,
+    status,
+    targets_attempted,
+    targets_succeeded,
+    error_class,
+    http_status
+) ON search_position.wb_collection_runs TO position_collector;
+GRANT INSERT ON search_position.wb_search_snapshots TO position_collector;
+GRANT INSERT ON search_position.wb_bid_snapshots TO position_collector;
+GRANT USAGE, SELECT ON SEQUENCE search_position.collection_runs_id_seq,
+    search_position.measurements_id_seq,
+    search_position.alerts_id_seq,
+    search_position.wb_collection_runs_id_seq,
+    search_position.wb_search_snapshots_id_seq,
+    search_position.wb_bid_snapshots_id_seq TO position_collector;
 
-GRANT SELECT ON ALL TABLES IN SCHEMA search_position TO position_reader;
+GRANT SELECT ON search_position.monitors,
+    search_position.collection_runs,
+    search_position.measurements,
+    search_position.alerts,
+    search_position.latest_measurements,
+    search_position.hourly_position_summary,
+    search_position.wb_search_targets,
+    search_position.wb_bid_targets,
+    search_position.latest_wb_search_snapshots,
+    search_position.latest_wb_bid_snapshots TO position_reader;
 ALTER DEFAULT PRIVILEGES IN SCHEMA search_position
-    GRANT SELECT ON TABLES TO position_reader;
+    REVOKE SELECT ON TABLES FROM position_reader;
 
 COMMIT;
 SQL
