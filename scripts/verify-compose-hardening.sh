@@ -71,6 +71,18 @@ check_contains() {
   fi
 }
 
+check_line_count() {
+  local description="$1" path="$2" pattern="$3" expected="$4" actual
+  actual="$(grep -Ec -- "$pattern" "$path" || true)"
+  if [[ "$actual" == "$expected" ]]; then
+    printf 'ok   %s\n' "$description"
+  else
+    printf 'FAIL %s (expected %s, found %s)\n' \
+      "$description" "$expected" "$actual" >&2
+    failures=$((failures + 1))
+  fi
+}
+
 render_compose() {
   local compose_file="$1"
   docker compose \
@@ -281,7 +293,12 @@ verify_control() {
   check "control: exactly two fixed read-only bind mounts are present" "$service" \
     --arg access "$project_dir/config/access.example.json" \
     --arg policy "$project_dir/config/control-policy.example.json" \
-    '(.volumes // [] | sort_by(.target)) == [
+    '(.volumes // []
+     | map(if .bind == {}
+           then .bind = {"create_host_path": false}
+           else .
+           end)
+     | sort_by(.target)) == [
        {
          "type": "bind",
          "source": $access,
@@ -385,10 +402,11 @@ check_contains \
   "control: default policy is the disabled example" \
   "$project_dir/compose.control.yaml" \
   "\${CONTROL_MCP_POLICY_HOST:-./config/control-policy.example.json}"
-check_contains \
-  "control: both bind mounts refuse implicit host-path creation" \
+check_line_count \
+  "control: both bind mounts explicitly refuse implicit host-path creation" \
   "$project_dir/compose.control.yaml" \
-  'create_host_path: false'
+  '^[[:space:]]+create_host_path:[[:space:]]+false[[:space:]]*$' \
+  '2'
 
 verify_server \
   "main" \
