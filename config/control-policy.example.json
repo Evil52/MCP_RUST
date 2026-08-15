@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "mode": "disabled",
+  "actors": [
+    {
+      "actor_id": "admin",
+      "targets": []
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "ozonofk-control",
+  "version": "0.1.0",
+  "description": "Fail-closed local scaffold for explicit Ozon advertising control policy",
+  "author": {
+    "name": "OFK"
+  },
+  "interface": {
+    "displayName": "OzonOFK Control",
+    "shortDescription": "Inspect the disabled advertising-control policy.",
+    "longDescription": "A fail-closed local scaffold that exposes policy status and scope without loading marketplace credentials or changing advertising.",
+    "developerName": "OFK",
+    "category": "Productivity",
+    "capabilities": ["Read-only", "Local policy"],
+    "defaultPrompt": [
+      "Show the Control MCP status.",
+      "Show my explicitly allowed advertising scope."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

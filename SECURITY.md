@@ -50,6 +50,11 @@ The following properties are treated as release gates:
 7. Store clients, JWT/JWKS verification, OAuth wire behavior, session limits, schemas, request bodies,
    negative write-paths, retries, compression limits, and RBAC are covered by local mock tests. No
    live marketplace request is part of CI.
+8. The separate `mcp-ozon-control` scaffold is disabled and credentialless. It loads only
+   `CONTROL_MCP_*`, has no marketplace client or endpoint, exposes only local read-only status/scope,
+   and runs on an internal Docker network without Internet egress. No analytics admin receives an
+   implicit Control scope. Adding a key, egress, plan/apply tool, or marketplace write path requires
+   a separate threat-model and release-gate review.
 
 ## Resource and availability controls
 

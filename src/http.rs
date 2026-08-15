@@ -26,6 +26,7 @@ use axum::{
     routing::get,
 };
 use http_body::{Frame, SizeHint};
+use rmcp::ServerHandler;
 use rmcp::transport::{
     StreamableHttpServerConfig, StreamableHttpService,
     streamable_http_server::{
@@ -37,9 +38,29 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    auth::{JwtAuthenticationFailure, JwtAuthenticator},
+    auth::{JwtAuthenticationFailure, JwtAuthenticator, ProtectedResourceMetadata},
     server::OzonMcp,
 };
+
+/// Security metadata required by the shared hardened MCP HTTP surface.
+///
+/// Implementations remain responsible for their own tool-level authorization.
+/// The transport uses this trait only to authenticate every HTTP request and
+/// publish the corresponding OAuth protected-resource document.
+pub trait HttpMcpServer: ServerHandler + Clone {
+    fn protected_resource_metadata(&self) -> Option<ProtectedResourceMetadata>;
+    fn transport_authenticator(&self) -> Option<&JwtAuthenticator>;
+}
+
+impl HttpMcpServer for OzonMcp {
+    fn protected_resource_metadata(&self) -> Option<ProtectedResourceMetadata> {
+        self.protected_resource_metadata()
+    }
+
+    fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
+        self.transport_authenticator()
+    }
+}
 
 /// Maximum JSON body accepted by the MCP endpoint.
 ///
@@ -975,6 +996,28 @@ pub fn build_router_with_cancellation_and_session_idle_timeout(
     session_idle_timeout: Duration,
     cancellation_token: CancellationToken,
 ) -> Router {
+    build_router_for_server_with_cancellation_and_session_idle_timeout(
+        server,
+        max_sessions,
+        session_idle_timeout,
+        cancellation_token,
+    )
+}
+
+/// Builds the same hardened HTTP surface for another isolated MCP server.
+///
+/// This is intentionally generic only over the MCP handler. Host/origin
+/// validation, per-request authentication, body/session limits and bounded
+/// response lifetimes remain identical to the analytics production router.
+pub fn build_router_for_server_with_cancellation_and_session_idle_timeout<S>(
+    server: S,
+    max_sessions: NonZeroUsize,
+    session_idle_timeout: Duration,
+    cancellation_token: CancellationToken,
+) -> Router
+where
+    S: HttpMcpServer,
+{
     let protected_resource_metadata = server.protected_resource_metadata();
     let protected_resource_url = protected_resource_metadata
         .as_ref()
@@ -996,7 +1039,7 @@ pub fn build_router_with_cancellation_and_session_idle_timeout(
             .with_max_sessions(max_sessions)
             .with_session_idle_timeout(session_idle_timeout),
     );
-    let service: StreamableHttpService<OzonMcp, LocalSessionManager> = StreamableHttpService::new(
+    let service: StreamableHttpService<S, LocalSessionManager> = StreamableHttpService::new(
         move || Ok((*server).clone()),
         session_manager,
         transport_config,

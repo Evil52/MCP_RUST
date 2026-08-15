@@ -39,7 +39,7 @@ cargo llvm-cov \
   --locked \
   --all-targets \
   --all-features \
-  --ignore-filename-regex 'src/main\.rs$' \
+  --ignore-filename-regex 'src/(main|bin/mcp-ozon-control)\.rs$' \
   --fail-under-lines 100
 
 echo "Local CI passed."

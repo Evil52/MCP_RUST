@@ -79,6 +79,19 @@ render_compose() {
     config --no-env-resolution --format json
 }
 
+render_control_compose() {
+  # Shell variables take precedence over `--env-file` in Compose. Pin both
+  # interpolated bind sources explicitly so an operator's ambient environment
+  # cannot make this release-gate inspect a different file. The shipped
+  # defaults are checked independently below.
+  CONTROL_MCP_ACCESS_CONFIG_HOST="$project_dir/config/access.example.json" \
+    CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.example.json" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.control.yaml" \
+      config --no-env-resolution --format json
+}
+
 # The dollar-prefixed names below are jq variables supplied with `--arg`; the
 # single quotes deliberately prevent the shell from expanding them.
 # shellcheck disable=SC2016
@@ -229,9 +242,113 @@ verify_position() {
        and (.healthcheck.start_period == "10s")'
 }
 
+# The disabled Control MCP is intentionally a separate, credentialless service
+# with no Internet route. Its exact environment is allowlisted here: adding a
+# marketplace credential name or any new service setting must fail review.
+# shellcheck disable=SC2016
+verify_control() {
+  local rendered="$1"
+  local service
+  service="$(jq -c '.services.control' <<<"$rendered")"
+
+  check "control: service exists" "$service" 'type == "object"'
+  check "control: no env_file, secrets, or configs are attached" "$service" \
+    '(has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)'
+  check "control: no top-level secrets, configs, or named volumes exist" "$rendered" \
+    '((.secrets // {}) | length == 0)
+     and ((.configs // {}) | length == 0)
+     and ((.volumes // {}) | length == 0)'
+
+  check "control: environment is credentialless and exactly allowlisted" "$service" \
+    '.environment == {
+       "CONTROL_MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
+       "CONTROL_MCP_ACTOR_ID": "admin",
+       "CONTROL_MCP_AUTH_MODE": "dev",
+       "CONTROL_MCP_BIND": "0.0.0.0:8790",
+       "CONTROL_MCP_DEV_ALLOW_NON_LOOPBACK": "true",
+       "CONTROL_MCP_MAX_SESSIONS": "64",
+       "CONTROL_MCP_POLICY": "/etc/mcp-ozon/control-policy.json",
+       "CONTROL_MCP_SESSION_IDLE_TIMEOUT_SECONDS": "120",
+       "CONTROL_MCP_TRANSPORT": "http",
+       "RUST_LOG": "mcp_ozon::control=info,rmcp=info"
+     }
+     and ([.environment | keys[]
+           | select(test("(?i)(api[_-]?(key|token)|client[_-]?secret|seller[_-]?token|wb[_-]?token|performance[_-]?client[_-]?id)"))]
+          | length == 0)'
+
+  check "control: exactly two fixed read-only bind mounts are present" "$service" \
+    --arg access "$project_dir/config/access.example.json" \
+    --arg policy "$project_dir/config/control-policy.example.json" \
+    '(.volumes // [] | sort_by(.target)) == [
+       {
+         "type": "bind",
+         "source": $access,
+         "target": "/etc/mcp-ozon/access.json",
+         "read_only": true,
+         "bind": {"create_host_path": false}
+       },
+       {
+         "type": "bind",
+         "source": $policy,
+         "target": "/etc/mcp-ozon/control-policy.json",
+         "read_only": true,
+         "bind": {"create_host_path": false}
+       }
+     ]'
+
+  check "control: published port is exactly 127.0.0.1:8790" "$service" \
+    '(.ports // []) == [{
+       "mode": "ingress",
+       "host_ip": "127.0.0.1",
+       "target": 8790,
+       "published": "8790",
+       "protocol": "tcp"
+     }]'
+  check "control: only the internal isolated bridge is attached" "$rendered" \
+    '(.services.control.networks | keys) == ["control_isolated"]
+     and (.services.control.network_mode? == null)
+     and (.networks | keys) == ["control_isolated"]
+     and .networks.control_isolated.name == "mcp-ozon-control_control_isolated"
+     and .networks.control_isolated.driver == "bridge"
+     and .networks.control_isolated.internal == true
+     and .networks.control_isolated.driver_opts == {
+       "com.docker.network.bridge.enable_icc": "false",
+       "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1"
+     }'
+
+  check "control: filesystem and privilege hardening match the contract" "$service" \
+    '.read_only == true
+     and .cap_drop == ["ALL"]
+     and ((.cap_add // []) | length == 0)
+     and ((.security_opt // []) | index("no-new-privileges:true") != null)
+     and (.privileged // false) == false
+     and (.tmpfs // []) == ["/tmp:size=8m,mode=1777"]'
+  check "control: resource and graceful-stop limits match the contract" "$service" \
+    '.mem_limit == "268435456"
+     and .cpus == 1
+     and .pids_limit == 128
+     and .stop_grace_period == "1m10s"'
+  check "control: restart and bounded logging match the contract" "$service" \
+    '.restart == "unless-stopped"
+     and .logging == {
+       "driver": "json-file",
+       "options": {"max-file": "2", "max-size": "5m"}
+     }'
+  check "control: healthcheck is local, bounded, and exact" "$service" \
+    '.healthcheck == {
+       "test": ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null",
+                "http://127.0.0.1:8790/health"],
+       "timeout": "3s", "interval": "10s", "retries": 5,
+       "start_period": "10s"
+     }'
+}
+
 main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_compose "$project_dir/compose.position.yaml")"
+control_rendered="$(render_control_compose)"
 
 # Rendering uses isolated, existing placeholder files so the result is the
 # same in a clean checkout and on a developer machine with ignored secrets.
@@ -260,6 +377,18 @@ check_contains \
   "canary: missing registry paths are never auto-created" \
   "$project_dir/compose.canary.yaml" \
   'create_host_path: false'
+check_contains \
+  "control: default access registry is the credentialless example" \
+  "$project_dir/compose.control.yaml" \
+  "\${CONTROL_MCP_ACCESS_CONFIG_HOST:-./config/access.example.json}"
+check_contains \
+  "control: default policy is the disabled example" \
+  "$project_dir/compose.control.yaml" \
+  "\${CONTROL_MCP_POLICY_HOST:-./config/control-policy.example.json}"
+check_contains \
+  "control: both bind mounts refuse implicit host-path creation" \
+  "$project_dir/compose.control.yaml" \
+  'create_host_path: false'
 
 verify_server \
   "main" \
@@ -278,10 +407,11 @@ verify_server \
   "no" \
   "mcp-ozon-canary-outbound"
 verify_position "$position_rendered"
+verify_control "$control_rendered"
 
 if (( failures > 0 )); then
   echo "compose hardening verification failed with $failures problem(s)" >&2
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, and position database: exact resource/mount/health contracts, loopback-only publication, isolated egress, and an internal database network."
+echo "Compose hardening verified for main, canary, Control, and position database: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal no-egress/database networks."
