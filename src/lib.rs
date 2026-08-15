@@ -6,6 +6,7 @@ pub mod control;
 pub mod http;
 pub mod ozon;
 pub mod ozon_performance;
+pub mod position_collector;
 pub mod runtime;
 pub mod server;
 pub mod wb;

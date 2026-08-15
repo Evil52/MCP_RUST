@@ -21,10 +21,43 @@ or an organic-versus-sponsored placement split. The reader view exposes these
 limitations explicitly through `is_live_position = false`, a null `region`,
 and `placement_split_available = false`.
 
-This directory deliberately contains no store configuration, API token,
-cookie, authorization header, browser profile, collector implementation or
-scheduler. The database schema and least-privilege roles are ready, but no WB
-collection job is deployed by this change.
+This directory deliberately contains no store credential, API token, cookie,
+authorization header, or browser profile. A provider-independent Ozon
+collector core now exists in `src/position_collector`, but it has only a
+`DisabledSource`. It also has a pure validated persistence payload and a
+`DisabledRepository`, but there is still no browser/provider adapter,
+PostgreSQL repository implementation, scheduler process, or deployed
+collection job. The database schema and least-privilege roles remain the
+storage boundary. The additive Ozon
+collector migration now persists an overall position with an honest
+`placement = unknown`, exact half-hour slots and terminal-only publication.
+No runtime repository writes this contract yet.
+
+The current core circuit breaker is in-memory only. The database migration adds
+a durable circuit row and fail-closed per-region daily-budget claim function,
+but the future persistence adapter must wire both into every provider request
+before a real provider can be enabled.
+
+## Planned daily reporting layer
+
+No `Поисковая видимость за сутки` Dashboard, task registry, email job, or Excel
+generation process is implemented in this directory. These are later consumers
+of persisted history. The planned compact view contains collection status and
+completeness, visibility rate, comparisons of complete reporting days, critical
+products, at most five priority problems, manager tasks, and a link to the
+bounded detailed report.
+
+`found` and `not_found` are valid visibility observations. Blocked, failed and
+missing slots reduce completeness and cannot be treated as product invisibility.
+Responsibility, priority, deadlines and result checks come from versioned
+application rules and server-side mappings, not from model inference. Existing
+collector alerts are data-quality and position signals; they are not a manager
+task workflow.
+
+Detailed Excel workbooks are generated on demand from the same frozen report
+run. They are exports rather than the system of record and are never stored in
+PostgreSQL. See `docs/search-position-monitoring.md` for the complete reporting
+contract.
 
 The initial architecture has three security principals:
 
@@ -96,9 +129,33 @@ Do not start this stack until implementation phase 2. When ready:
    ```
 
 The init scripts run only when the named volume is empty. A fresh database
-applies the base schema, the additive WB migration, then restricted role grants.
-Password rotation and schema migration after initial deployment must use an
-explicit migration, never volume deletion.
+applies the base schema, the additive Ozon collector contract, the additive WB
+migration, then restricted role grants. Password rotation and schema migration
+after initial deployment must use an explicit migration, never volume deletion.
+
+### Existing-volume Ozon collector migration
+
+Do not apply this migration to production merely because it exists in the
+image. First create and verify an encrypted backup. The migration is
+transactional and fails without deleting or coercing rows if an existing
+monitor uses an interval other than 30 minutes, searches beyond top 100, has a
+non-numeric Ozon product ID, or if multiple existing runs map to one half-hour
+slot.
+
+After reviewing those preconditions, apply the migration without deleting or
+recreating the named volume:
+
+```bash
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/002_ozon_collector_contract.sql
+```
+
+The migration adds exact slot idempotency, the one-way Ozon run state machine,
+non-lossy placement, published reader views, a durable circuit and request
+budget tables/functions. It revokes reader access to raw Ozon runs,
+measurements and alerts. Applying the migration does not start a collector or
+make a marketplace request.
 
 ### Existing-volume WB migration
 

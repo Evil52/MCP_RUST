@@ -86,9 +86,23 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA search_position
     FROM position_collector, position_reader;
 
 GRANT SELECT ON search_position.monitors TO position_collector;
-GRANT SELECT, INSERT, UPDATE ON search_position.collection_runs TO position_collector;
-GRANT SELECT, INSERT ON search_position.measurements TO position_collector;
-GRANT SELECT, INSERT ON search_position.alerts TO position_collector;
+GRANT SELECT, INSERT ON search_position.collection_runs TO position_collector;
+GRANT UPDATE (
+    finished_at,
+    status,
+    monitors_attempted,
+    monitors_succeeded,
+    queries_attempted,
+    queries_succeeded,
+    error_class,
+    http_status
+) ON search_position.collection_runs TO position_collector;
+GRANT INSERT ON search_position.measurements TO position_collector;
+GRANT INSERT ON search_position.alerts TO position_collector;
+GRANT EXECUTE ON FUNCTION
+    search_position.open_ozon_collector_circuit(bigint, text),
+    search_position.claim_ozon_request_budget(text, timestamptz)
+    TO position_collector;
 GRANT SELECT ON search_position.wb_search_targets TO position_collector;
 GRANT SELECT ON search_position.wb_bid_targets TO position_collector;
 GRANT SELECT, INSERT ON search_position.wb_collection_runs TO position_collector;
@@ -111,9 +125,8 @@ GRANT USAGE, SELECT ON SEQUENCE search_position.collection_runs_id_seq,
     search_position.wb_bid_snapshots_id_seq TO position_collector;
 
 GRANT SELECT ON search_position.monitors,
-    search_position.collection_runs,
-    search_position.measurements,
-    search_position.alerts,
+    search_position.published_measurements,
+    search_position.published_alerts,
     search_position.latest_measurements,
     search_position.hourly_position_summary,
     search_position.wb_search_targets,
