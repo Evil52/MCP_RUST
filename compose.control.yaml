@@ -1,0 +1,67 @@
+name: mcp-ozon-control
+
+services:
+  control:
+    container_name: mcp-ozon-control
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+    environment:
+      CONTROL_MCP_TRANSPORT: http
+      CONTROL_MCP_BIND: 0.0.0.0:8790
+      CONTROL_MCP_AUTH_MODE: dev
+      CONTROL_MCP_ACTOR_ID: admin
+      CONTROL_MCP_DEV_ALLOW_NON_LOOPBACK: "true"
+      CONTROL_MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
+      CONTROL_MCP_POLICY: /etc/mcp-ozon/control-policy.json
+      CONTROL_MCP_MAX_SESSIONS: "64"
+      CONTROL_MCP_SESSION_IDLE_TIMEOUT_SECONDS: "120"
+      RUST_LOG: mcp_ozon::control=info,rmcp=info
+    ports:
+      - "127.0.0.1:8790:8790"
+    networks:
+      - control_isolated
+    volumes:
+      - type: bind
+        source: ${CONTROL_MCP_ACCESS_CONFIG_HOST:-./config/access.example.json}
+        target: /etc/mcp-ozon/access.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CONTROL_MCP_POLICY_HOST:-./config/control-policy.example.json}
+        target: /etc/mcp-ozon/control-policy.json
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 128
+    stop_grace_period: 70s
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8790/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+networks:
+  control_isolated:
+    driver: bridge
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+      com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"

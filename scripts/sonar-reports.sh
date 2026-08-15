@@ -65,7 +65,7 @@ cargo llvm-cov \
   --locked \
   --all-targets \
   --all-features \
-  --ignore-filename-regex 'src/main\.rs$' \
+  --ignore-filename-regex 'src/(main|bin/mcp-ozon-control)\.rs$' \
   --lcov \
   --output-path "$coverage_report_tmp"
 sed -i.bak "s#SF:$project_root/#SF:#" "$coverage_report_tmp"

@@ -4,6 +4,17 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.97.1"
 publish = false
+default-run = "mcp-ozon"
+
+[[bin]]
+name = "mcp-ozon"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "mcp-ozon-control"
+path = "src/bin/mcp-ozon-control.rs"
+test = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }

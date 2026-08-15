@@ -9,7 +9,10 @@ use std::{
     convert::Infallible,
     num::NonZeroUsize,
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -31,9 +34,18 @@ use mcp_ozon::{
         build_router_with_cancellation, build_router_with_session_idle_timeout,
     },
     ozon::OzonClient,
+    runtime::{
+        HTTP_CANCELLED_DRAIN_TIMEOUT, HTTP_HEADER_READ_TIMEOUT, HTTP_NATURAL_DRAIN_TIMEOUT,
+        run_http_until_bounded_shutdown, serve_hardened_http,
+    },
     server::OzonMcp,
 };
 use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::Semaphore,
+};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
@@ -965,4 +977,70 @@ async fn mcp_rejects_unauthenticated_initialize_in_jwt_mode() {
         body, "Требуется авторизация: access token не передан.",
         "{status}"
     );
+}
+
+#[tokio::test]
+async fn hardened_runtime_serves_and_boundedly_drains_the_real_tcp_path() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("runtime integration listener binds");
+    let address = listener.local_addr().expect("listener has an address");
+    let router = Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+    let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel();
+    let serve = serve_hardened_http(
+        listener,
+        router,
+        graceful_rx,
+        Arc::new(Semaphore::new(2)),
+        HTTP_HEADER_READ_TIMEOUT,
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let runtime = tokio::spawn(run_http_until_bounded_shutdown(
+        Box::pin(serve),
+        Box::pin(async move {
+            let _ = shutdown_rx.await;
+        }),
+        graceful_tx,
+        CancellationToken::new(),
+        HTTP_NATURAL_DRAIN_TIMEOUT,
+        HTTP_CANCELLED_DRAIN_TIMEOUT,
+    ));
+
+    let mut rejected = TcpStream::connect(address)
+        .await
+        .expect("HTTP/2 probe connects through the real accept loop");
+    rejected
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .expect("HTTP/2 prior-knowledge probe writes");
+    let mut rejected_response = Vec::new();
+    rejected
+        .read_to_end(&mut rejected_response)
+        .await
+        .expect("rejected protocol response closes");
+    assert!(!String::from_utf8_lossy(&rejected_response).contains("200 OK"));
+
+    let mut client = TcpStream::connect(address)
+        .await
+        .expect("client connects through the real accept loop");
+    client
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("request writes");
+    let mut response = Vec::new();
+    client
+        .read_to_end(&mut response)
+        .await
+        .expect("response reads");
+    assert!(
+        response.windows(6).any(|window| window == b"200 OK"),
+        "health response must traverse the hardened TCP runtime"
+    );
+
+    shutdown_tx.send(()).expect("shutdown signal sends");
+    let result = tokio::time::timeout(Duration::from_secs(2), runtime)
+        .await
+        .expect("runtime drains before the test deadline")
+        .expect("runtime task joins");
+    assert!(matches!(result, Some(Ok(()))));
 }
