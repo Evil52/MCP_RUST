@@ -22,7 +22,11 @@ The first disabled-only phase provides:
   bounded attempts, `FOR UPDATE SKIP LOCKED` claims and append-only delivery
   audit; and
 - a dedicated least-privilege `report_worker` role that cannot read the raw
-  marketplace-history schema.
+  marketplace-history schema; and
+- a frozen snapshot-manifest contract requiring exactly one sales,
+  advertising, stock and price source per scoped account, with source-specific
+  freshness limits and fail-closed recommendation suppression for partial or
+  stale data.
 
 The pilot example is disabled and scopes the temporary owner report to Diana's
 Ozon account and Anna Agzamova's Wildberries account. Sender and recipient
@@ -31,9 +35,11 @@ tokens and actual addresses must not be committed.
 
 ## Not implemented yet
 
-No scheduler process, marketplace snapshot job, HTML/XLSX generator, S3 writer
-or mail provider is wired. Consequently this phase cannot send email and
-cannot affect a marketplace. Search-position collection remains disabled.
+The snapshot manifest is currently a validated in-memory domain contract; its
+PostgreSQL tables and collector are not wired yet. No scheduler process,
+marketplace snapshot job, HTML/XLSX generator, S3 writer or mail provider is
+wired. Consequently this phase cannot send email and cannot affect a
+marketplace. Search-position collection remains disabled.
 
 The persistence layer transactionally stores report occurrences, delivery
 coverage and attempts. Its unique occurrence key is
