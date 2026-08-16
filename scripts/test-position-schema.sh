@@ -172,6 +172,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/002_ozon_collector_contract.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/002_wb_official_history.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/004_ozon_postgres_adapter.sql >/dev/null
 "${migration_admin_psql[@]}" --command '
   CREATE TABLE search_position.reader_default_acl_probe (id integer)
 ' >/dev/null
@@ -202,6 +204,11 @@ migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
       (
           SELECT overall_position = 7 AND placement = 'organic'
           FROM search_position.measurements
+          WHERE id = 1
+      ),
+      (
+          SELECT payload_digest = repeat('0', 64)
+          FROM search_position.collection_runs
           WHERE id = 1
       ),
       to_regclass('search_position.wb_search_snapshots') IS NOT NULL,
@@ -241,7 +248,7 @@ migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
           'SELECT'
       )
   "; } | tr -d '\r')"
-if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
+if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
   echo "existing-volume migrations did not install the expected schema/ACL" >&2
   printf '%s\n' "$migration_acl" >&2
   exit 1
@@ -327,12 +334,12 @@ expect_failure_containing \
   INSERT INTO search_position.collection_runs
       (
           scheduled_for, started_at, status, monitors_planned,
-          queries_planned, collector_version
+          queries_planned, collector_version, payload_digest
       )
   VALUES
       (
           '2026-08-16 00:00:00+00', '2026-08-16 00:05:00+00',
-          'running', 2, 1, 'schema-test'
+          'running', 2, 1, 'schema-test', repeat('1', 64)
       );
   INSERT INTO search_position.measurements
       (run_id, monitor_id, observed_at, outcome, response_ms, error_class, http_status)
@@ -351,12 +358,12 @@ expect_failure_containing \
   INSERT INTO search_position.collection_runs
       (
           scheduled_for, started_at, status, monitors_planned,
-          queries_planned, collector_version
+          queries_planned, collector_version, payload_digest
       )
   VALUES
       (
           '2026-08-16 00:30:00+00', '2026-08-16 00:35:00+00',
-          'running', 1, 1, 'schema-test'
+          'running', 1, 1, 'schema-test', repeat('2', 64)
       );
   INSERT INTO search_position.measurements
       (
@@ -374,12 +381,12 @@ expect_failure_containing \
   INSERT INTO search_position.collection_runs
       (
           scheduled_for, started_at, status, monitors_planned,
-          queries_planned, collector_version
+          queries_planned, collector_version, payload_digest
       )
   VALUES
       (
           '2026-08-16 01:00:00+00', '2026-08-16 01:05:00+00',
-          'running', 1, 1, 'schema-test'
+          'running', 1, 1, 'schema-test', repeat('3', 64)
       );
   INSERT INTO search_position.measurements
       (run_id, monitor_id, observed_at, outcome, response_ms, error_class)
@@ -443,12 +450,12 @@ if "${admin_psql[@]}" --command "
       INSERT INTO search_position.collection_runs
           (
               scheduled_for, started_at, status, monitors_planned,
-              queries_planned, collector_version
+              queries_planned, collector_version, payload_digest
           )
       VALUES
           (
               '2026-08-16 01:30:00+00', '2026-08-16 01:35:00+00',
-              'running', 1, 1, 'schema-test'
+              'running', 1, 1, 'schema-test', repeat('4', 64)
           )
       RETURNING id
   )
@@ -500,12 +507,12 @@ expect_failure_containing \
     INSERT INTO search_position.collection_runs
         (
             scheduled_for, started_at, status, monitors_planned,
-            queries_planned, collector_version
+            queries_planned, collector_version, payload_digest
         )
     VALUES
         (
             '2026-08-16 00:30:00+00', '2026-08-16 00:35:30+00',
-            'running', 1, 1, 'schema-test'
+            'running', 1, 1, 'schema-test', repeat('5', 64)
         )
   "
 
@@ -533,15 +540,25 @@ open_run_id="$({ "${collector_psql[@]}" --tuples-only --no-align --quiet --comma
   INSERT INTO search_position.collection_runs
       (
           scheduled_for, started_at, status, monitors_planned,
-          queries_planned, collector_version
+          queries_planned, collector_version, payload_digest
       )
   VALUES
       (
           '2026-08-16 02:00:00+00', '2026-08-16 02:05:00+00',
-          'running', 1, 1, 'schema-test'
+          'running', 1, 1, 'schema-test', repeat('6', 64)
       )
   RETURNING id;
 "; } | tr -d '\r')"
+
+expect_failure_containing \
+  "Ozon payload digest mutation" \
+  "Ozon collection payload digest is immutable" \
+  "${admin_psql[@]}" \
+  --command "
+    UPDATE search_position.collection_runs
+    SET payload_digest = repeat('f', 64)
+    WHERE id = $open_run_id
+  "
 
 expect_failure_containing \
   "Ozon measurement outside its logical slot" \

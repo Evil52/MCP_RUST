@@ -370,6 +370,12 @@ pub enum RepositoryError {
     Unavailable,
 }
 
+impl From<tokio_postgres::Error> for RepositoryError {
+    fn from(_error: tokio_postgres::Error) -> Self {
+        Self::Unavailable
+    }
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum PersistenceError {
     #[error("collector_version must contain 1..=64 non-whitespace ASCII bytes")]

@@ -50,6 +50,9 @@ SELECT
         'search_position.claim_ozon_request_budget(text,timestamp with time zone)'
     ) IS NOT NULL
     AND to_regprocedure(
+        'search_position.enforce_ozon_payload_digest_immutable()'
+    ) IS NOT NULL
+    AND to_regprocedure(
         'search_position.enforce_wb_bid_target_update()'
     ) IS NOT NULL
     AND to_regprocedure(
@@ -71,10 +74,11 @@ SELECT
           AND NOT tgisinternal
     )
     AND (
-        SELECT count(*) = 3
+        SELECT count(*) = 4
         FROM pg_trigger
         WHERE tgname IN (
             'collection_runs_enforce_state',
+            'collection_runs_payload_digest_immutable',
             'measurements_require_running_run',
             'alerts_require_running_run'
         )
@@ -88,7 +92,7 @@ SELECT
           AND column_name IN ('overall_position', 'placement')
     )
     AND (
-        SELECT count(*) = 5
+        SELECT count(*) = 6
         FROM information_schema.columns
         WHERE table_schema = 'search_position'
           AND table_name = 'collection_runs'
@@ -97,7 +101,8 @@ SELECT
               'queries_planned',
               'queries_attempted',
               'queries_succeeded',
-              'monitors_planned'
+              'monitors_planned',
+              'payload_digest'
           )
     )
     AND (

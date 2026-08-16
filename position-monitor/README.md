@@ -25,18 +25,19 @@ This directory deliberately contains no store credential, API token, cookie,
 authorization header, or browser profile. A provider-independent Ozon
 collector core now exists in `src/position_collector`, but it has only a
 `DisabledSource`. It also has a pure validated persistence payload and a
-`DisabledRepository`, but there is still no browser/provider adapter,
-PostgreSQL repository implementation, scheduler process, or deployed
-collection job. The database schema and least-privilege roles remain the
-storage boundary. The additive Ozon
+`DisabledRepository`. A transactional `PostgresRepository` is implemented and
+verified against an ephemeral least-privilege database, but there is still no
+browser/provider adapter, scheduler process, or deployed collection job. The
+database schema and least-privilege roles remain the storage boundary. The additive Ozon
 collector migration now persists an overall position with an honest
 `placement = unknown`, exact half-hour slots and terminal-only publication.
-No runtime repository writes this contract yet.
+No runtime process invokes the repository yet.
 
 The current core circuit breaker is in-memory only. The database migration adds
 a durable circuit row and fail-closed per-region daily-budget claim function,
-but the future persistence adapter must wire both into every provider request
-before a real provider can be enabled.
+and the persistence adapter opens that circuit atomically for protective batch
+results. A future provider runner must claim the durable budget before every
+request and refuse collection while the circuit is open.
 
 ## Planned daily reporting layer
 
@@ -130,7 +131,8 @@ Do not start this stack until implementation phase 2. When ready:
 
 The init scripts run only when the named volume is empty. A fresh database
 applies the base schema, the additive Ozon collector contract, the additive WB
-migration, then restricted role grants. Password rotation and schema migration
+migration, restricted role grants, then the Ozon adapter digest migration.
+Password rotation and schema migration
 after initial deployment must use an explicit migration, never volume deletion.
 
 ### Existing-volume Ozon collector migration
@@ -156,6 +158,18 @@ non-lossy placement, published reader views, a durable circuit and request
 budget tables/functions. It revokes reader access to raw Ozon runs,
 measurements and alerts. Applying the migration does not start a collector or
 make a marketplace request.
+
+After the collector contract is present, apply the adapter digest migration in
+the same reviewed maintenance window:
+
+```bash
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/004_ozon_postgres_adapter.sql
+```
+
+It adds an immutable SHA-256 payload digest. Existing historical rows receive a
+non-replayable zero marker; no measurement or terminal run is mutated.
 
 ### Existing-volume WB migration
 

@@ -61,7 +61,7 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo "cargo-llvm-cov is missing. Install it with: cargo install cargo-llvm-cov --locked" >&2
   exit 1
 fi
-cargo llvm-cov \
+./scripts/with-position-test-db.sh cargo llvm-cov \
   --locked \
   --all-targets \
   --all-features \
