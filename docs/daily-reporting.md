@@ -48,6 +48,10 @@ The first disabled-only phase provides:
 - a bounded six-sheet XLSX renderer for summary, SKU sales, advertising,
   inventory/prices, recommendations and source quality; calculations remain
   server-side, identifiers are written as literal text and no images are used;
+- a single deterministic report-bundle constructor that derives the interval,
+  account scope and quality from the immutable report key and frozen dataset,
+  renders matching HTML/XLSX output and assigns a content SHA-256 plus a stable
+  object key; its dry-run inspection performs no filesystem or network I/O;
 - a frozen snapshot-manifest contract requiring exactly one sales,
   advertising, stock and price source per scoped account, with source-specific
   freshness limits and fail-closed recommendation suppression for partial or
@@ -63,8 +67,10 @@ tokens and actual addresses must not be committed.
 The snapshot manifest, normalized PostgreSQL storage contract, bounded fact
 reader and report dataset are present, but no marketplace report collector is
 wired yet. No scheduler process, marketplace snapshot job, S3 writer or mail
-provider is wired. The HTML/XLSX renderers are pure functions and are not
-connected to delivery.
+provider is wired. The HTML/XLSX bundle is generated in memory but is not yet
+persisted or connected to the delivery outbox. Consolidated two-period
+catch-up rendering remains fail-closed until it has an explicit two-section
+template rather than silently presenting one interval as two reports.
 Consequently this phase cannot send email and cannot affect a
 marketplace. Search-position collection remains disabled.
 
@@ -79,12 +85,11 @@ an ambiguous provider result is never retried automatically.
 ## Planned pilot
 
 1. Wire read-only marketplace collectors into the normalized snapshot contract.
-2. Connect the assembled frozen dataset to one deterministic HTML/XLSX batch.
-3. Add the scheduler/runtime around the persisted PostgreSQL outbox.
-4. Run dry mode for Diana and Anna with delivery disabled.
-5. Connect S3-compatible artifact storage and one service mailbox.
-6. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
-7. Reconcile figures for five to seven days before enabling other managers.
+2. Add the scheduler/runtime around the persisted PostgreSQL outbox.
+3. Run dry mode for Diana and Anna with delivery disabled.
+4. Connect S3-compatible artifact storage and one service mailbox.
+5. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
+6. Reconcile figures for five to seven days before enabling other managers.
 
 ChatGPT remains the interactive analytics interface. Scheduled collection,
 calculation, artifact generation and delivery must remain server-side so they
