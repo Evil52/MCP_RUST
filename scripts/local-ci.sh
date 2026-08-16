@@ -39,7 +39,7 @@ fi
   --locked \
   --all-targets \
   --all-features \
-  --ignore-filename-regex 'src/(main|bin/mcp-ozon-control)\.rs$' \
+  --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector))\.rs$' \
   --fail-under-lines 100
 
 echo "Local CI passed."

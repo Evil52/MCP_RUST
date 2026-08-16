@@ -2,9 +2,9 @@ use std::{future::Future, pin::Pin, str::FromStr, time::Duration};
 
 use chrono::{TimeZone, Utc};
 use mcp_ozon::position_collector::{
-    BatchPlan, Collector, MonitorTarget, PersistOutcome, PersistenceBatch, PlacementKind,
-    PositionRepository, PositionSource, PostgresRepository, QueryRequest, QueryScan,
-    RepositoryError, SearchHit, SourceError,
+    BatchPlan, Collector, CollectorRuntimeConfig, CollectorRuntimeMode, MonitorTarget,
+    PersistOutcome, PersistenceBatch, PlacementKind, PositionRepository, PositionSource,
+    PostgresRepository, QueryRequest, QueryScan, RepositoryError, SearchHit, SourceError,
 };
 use tokio_postgres::{Client, Config, NoTls};
 
@@ -91,6 +91,12 @@ async fn postgres_repository_is_atomic_idempotent_and_fail_closed() {
     };
     let collector_url = std::env::var("POSITION_REPOSITORY_TEST_COLLECTOR_URL")
         .expect("collector URL accompanies the admin URL");
+
+    let runtime = CollectorRuntimeConfig::from_env().unwrap();
+    assert_eq!(runtime.mode(), CollectorRuntimeMode::Disabled);
+    let runtime_repository = runtime.connect_repository().await.unwrap();
+    runtime_repository.verify_runtime_contract().await.unwrap();
+
     let admin = connect(&admin_url).await;
     let rows = admin
         .query(
@@ -112,6 +118,7 @@ async fn postgres_repository_is_atomic_idempotent_and_fail_closed() {
     let repository = PostgresRepository::connect(&collector_config)
         .await
         .unwrap();
+    repository.verify_runtime_contract().await.unwrap();
     let plan = BatchPlan::new(
         slot(7, 30),
         vec![
@@ -249,5 +256,11 @@ async fn postgres_repository_is_atomic_idempotent_and_fail_closed() {
     assert_eq!(
         from_client.persist(&batch).await,
         Ok(PersistOutcome::AlreadyExists)
+    );
+
+    let admin_repository = PostgresRepository::from_client(connect(&admin_url).await);
+    assert_eq!(
+        admin_repository.verify_runtime_contract().await,
+        Err(RepositoryError::Unavailable)
     );
 }
