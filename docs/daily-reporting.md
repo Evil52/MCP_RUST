@@ -36,6 +36,9 @@ The first disabled-only phase provides:
 - a bounded deterministic rule engine for stockouts, low stock cover,
   advertising without stock, spend without attributed orders and high DRR;
   incomplete manifests suppress actions and only five ranked problems survive;
+- a bounded, dependency-free HTML email renderer with no images or external
+  resources; it escapes display data and suppresses actions when source quality
+  is not complete;
 - a frozen snapshot-manifest contract requiring exactly one sales,
   advertising, stock and price source per scoped account, with source-specific
   freshness limits and fail-closed recommendation suppression for partial or
@@ -50,8 +53,9 @@ tokens and actual addresses must not be committed.
 
 The snapshot manifest and normalized PostgreSQL storage contract are present,
 but no marketplace report collector is wired yet. No scheduler process,
-marketplace snapshot job, HTML/XLSX generator, S3 writer or mail provider is
-wired. Consequently this phase cannot send email and cannot affect a
+marketplace snapshot job, XLSX generator, S3 writer or mail provider is wired.
+The HTML renderer is a pure function and is not connected to delivery.
+Consequently this phase cannot send email and cannot affect a
 marketplace. Search-position collection remains disabled.
 
 The persistence layer transactionally stores report occurrences, delivery
