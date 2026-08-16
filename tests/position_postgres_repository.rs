@@ -114,6 +114,65 @@ async fn postgres_repository_is_atomic_idempotent_and_fail_closed() {
     let first_id: i64 = rows[0].get(0);
     let second_id: i64 = rows[1].get(0);
 
+    assert_eq!(
+        runtime_repository.load_canary_plan(slot(7, 30)).await,
+        Err(RepositoryError::CanaryTargetCount)
+    );
+    admin
+        .execute("UPDATE search_position.monitors SET active = false", &[])
+        .await
+        .unwrap();
+    let canary_id: i64 = admin
+        .query_one(
+            "INSERT INTO search_position.monitors (\
+                store_id, product_id, search_phrase, region_code, region_name, \
+                interval_minutes, max_position, active\
+             ) VALUES ('store-canary', '3411079879', 'ручка кнопка', 'moscow', \
+                       'Москва', 30, 100, true) \
+             RETURNING id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let canary = runtime_repository
+        .load_canary_plan(slot(7, 30))
+        .await
+        .unwrap();
+    assert_eq!(canary.target_count(), 1);
+    assert_eq!(canary.queries().len(), 1);
+    assert_eq!(canary.queries()[0].targets()[0].monitor_id(), canary_id);
+    admin
+        .execute(
+            "UPDATE search_position.monitors SET search_phrase = E'bad\\nphrase' WHERE id = $1",
+            &[&canary_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime_repository.load_canary_plan(slot(7, 30)).await,
+        Err(RepositoryError::InvalidCanaryTarget)
+    );
+    admin
+        .execute(
+            "UPDATE search_position.monitors \
+             SET search_phrase = 'ручка кнопка', active = false WHERE id = $1",
+            &[&canary_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime_repository.load_canary_plan(slot(7, 30)).await,
+        Err(RepositoryError::CanaryTargetCount)
+    );
+    admin
+        .execute(
+            "UPDATE search_position.monitors SET active = true WHERE id IN ($1, $2)",
+            &[&first_id, &second_id],
+        )
+        .await
+        .unwrap();
+
     let collector_config = Config::from_str(&collector_url).unwrap();
     let repository = PostgresRepository::connect(&collector_config)
         .await

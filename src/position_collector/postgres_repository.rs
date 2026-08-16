@@ -6,8 +6,8 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, Config, NoTls, Transaction, types::ToSql};
 
 use super::{
-    BatchStatus, CircuitReason, MeasurementRecord, PersistOutcome, PersistedOutcome,
-    PersistenceBatch, PlacementKind, PositionRepository, RepositoryError,
+    BatchPlan, BatchStatus, CircuitReason, MeasurementRecord, MonitorTarget, PersistOutcome,
+    PersistedOutcome, PersistenceBatch, PlacementKind, PositionRepository, RepositoryError,
 };
 
 const SOURCE: &str = "ozon_public_search";
@@ -63,6 +63,44 @@ impl PostgresRepository {
         } else {
             Err(RepositoryError::Unavailable)
         }
+    }
+
+    /// Loads the single active monitor allowed during the manual canary phase.
+    ///
+    /// This method performs no marketplace request and returns no raw database
+    /// row. More than one active monitor fails closed so a canary cannot
+    /// accidentally expand into a scheduled batch.
+    pub async fn load_canary_plan(
+        &self,
+        slot: DateTime<Utc>,
+    ) -> Result<BatchPlan, RepositoryError> {
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                "SELECT id, store_id, product_id, search_phrase, region_code, \
+                        region_name, interval_minutes, max_position \
+                 FROM search_position.monitors \
+                 WHERE active \
+                 ORDER BY id \
+                 LIMIT 2",
+                &[],
+            )
+            .await?;
+        if rows.len() != 1 {
+            return Err(RepositoryError::CanaryTargetCount);
+        }
+        let row = &rows[0];
+        build_canary_plan(
+            slot,
+            row.get::<_, i64>(0),
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+            row.get::<_, String>(3),
+            row.get::<_, String>(4),
+            row.get::<_, String>(5),
+            row.get::<_, i16>(6),
+            row.get::<_, i16>(7),
+        )
     }
 
     async fn persist_inner(
@@ -132,6 +170,36 @@ impl PostgresRepository {
         transaction.commit().await?;
         Ok(PersistOutcome::Inserted)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_canary_plan(
+    slot: DateTime<Utc>,
+    monitor_id: i64,
+    store_id: String,
+    product_id: String,
+    search_phrase: String,
+    region_code: String,
+    region_name: String,
+    interval_minutes: i16,
+    max_position: i16,
+) -> Result<BatchPlan, RepositoryError> {
+    if interval_minutes != 30 {
+        return Err(RepositoryError::InvalidCanaryTarget);
+    }
+    let max_position =
+        u16::try_from(max_position).map_err(|_| RepositoryError::InvalidCanaryTarget)?;
+    let target = MonitorTarget::new(
+        monitor_id,
+        store_id,
+        product_id,
+        search_phrase,
+        region_code,
+        region_name,
+        max_position,
+    )
+    .map_err(|_| RepositoryError::InvalidCanaryTarget)?;
+    BatchPlan::new(slot, vec![target]).map_err(|_| RepositoryError::InvalidCanaryTarget)
 }
 
 impl PositionRepository for PostgresRepository {
@@ -314,8 +382,12 @@ fn hash_u64(digest: &mut Sha256, value: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{outcome_text, placement_text, status_text, to_i32};
-    use crate::position_collector::{BatchStatus, PersistedOutcome, PlacementKind};
+    use chrono::{TimeZone, Utc};
+
+    use super::{build_canary_plan, outcome_text, placement_text, status_text, to_i32};
+    use crate::position_collector::{
+        BatchStatus, PersistedOutcome, PlacementKind, RepositoryError,
+    };
 
     #[test]
     fn database_enums_and_integer_bounds_are_exact() {
@@ -330,5 +402,36 @@ mod tests {
         assert_eq!(placement_text(PlacementKind::Unknown), "unknown");
         assert_eq!(to_i32(i32::MAX as usize), Ok(i32::MAX));
         assert!(to_i32(i32::MAX as usize + 1).is_err());
+    }
+
+    #[test]
+    fn canary_row_conversion_enforces_the_fixed_contract() {
+        let slot = Utc.with_ymd_and_hms(2026, 8, 16, 7, 30, 0).unwrap();
+        let build = |interval, max_position, phrase: &str| {
+            build_canary_plan(
+                slot,
+                1,
+                "store-1".to_owned(),
+                "3411079879".to_owned(),
+                phrase.to_owned(),
+                "moscow".to_owned(),
+                "Москва".to_owned(),
+                interval,
+                max_position,
+            )
+        };
+        assert_eq!(build(30, 100, "ручка кнопка").unwrap().target_count(), 1);
+        assert_eq!(
+            build(15, 100, "ручка кнопка"),
+            Err(RepositoryError::InvalidCanaryTarget)
+        );
+        assert_eq!(
+            build(30, -1, "ручка кнопка"),
+            Err(RepositoryError::InvalidCanaryTarget)
+        );
+        assert_eq!(
+            build(30, 100, "bad\nphrase"),
+            Err(RepositoryError::InvalidCanaryTarget)
+        );
     }
 }

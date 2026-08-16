@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, FixedOffset, Utc};
 use mcp_ozon::position_collector::{CollectorRuntimeConfig, CollectorRuntimeMode};
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -15,16 +16,40 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    let healthcheck = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
-        [] => false,
-        [argument] if argument == "healthcheck" => true,
-        _ => bail!("usage: position-collector [healthcheck]"),
+    enum Command {
+        Serve,
+        Healthcheck,
+        CanaryPlan(DateTime<FixedOffset>),
+    }
+    let command = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => Command::Serve,
+        [argument] if argument == "healthcheck" => Command::Healthcheck,
+        [argument, slot] if argument == "canary-plan" => Command::CanaryPlan(
+            slot.parse()
+                .map_err(|_| anyhow!("canary slot must be RFC3339 UTC"))?,
+        ),
+        _ => bail!("usage: position-collector [healthcheck|canary-plan <UTC-slot>]"),
     };
     let config = CollectorRuntimeConfig::from_env()?;
     let repository = config.connect_repository().await?;
     repository.verify_runtime_contract().await?;
-    if healthcheck {
-        return Ok(());
+    match command {
+        Command::Healthcheck => return Ok(()),
+        Command::CanaryPlan(slot) => {
+            if slot.offset().local_minus_utc() != 0 {
+                bail!("canary slot must use UTC offset Z");
+            }
+            let slot = slot.with_timezone(&Utc);
+            let plan = repository.load_canary_plan(slot).await?;
+            tracing::info!(
+                slot = %plan.slot(),
+                targets = plan.target_count(),
+                queries = plan.queries().len(),
+                "manual canary plan is valid; no marketplace request was made"
+            );
+            return Ok(());
+        }
+        Command::Serve => {}
     }
     if config.mode() != CollectorRuntimeMode::Disabled {
         return Err(anyhow!("collector runtime mode is unavailable"));

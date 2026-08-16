@@ -199,7 +199,9 @@ provider is enabled and valid history exists, any consumer must show
    least-privilege database connection, but accepts only `disabled` mode and
    does not schedule or persist runs. No live provider is enabled.
 4. **Collector canary:** one product, one phrase, one region, manually triggered;
-   confirm selectors and whether Ozon permits the workflow.
+   the runtime can now validate this exact database plan without network I/O;
+   a separately reviewed provider is still required to confirm selectors and
+   whether Ozon permits the workflow.
 5. **Scheduled pilot:** one product and three to five phrases every 30 minutes;
    observe blocking/error rate for seven days.
 6. **MCP reader:** implement and test the five SELECT-only tools against fixture

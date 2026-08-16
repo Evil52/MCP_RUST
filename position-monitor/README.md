@@ -30,8 +30,11 @@ verified against an ephemeral least-privilege database. A separate hardened
 `position-collector` runtime now verifies that database contract, but its only
 accepted mode is `disabled`: it neither schedules runs nor calls a source. There
 is still no browser/provider adapter or deployed live collection job. The
-database schema and least-privilege roles remain the storage boundary. The additive Ozon
-collector migration now persists an overall position with an honest
+`canary-plan <UTC-slot>` command only loads and validates exactly one active
+30-minute/top-100 monitor and reports aggregate plan counts; it performs no
+marketplace request and writes no collection result. The
+database schema and least-privilege roles remain the storage boundary. The
+additive Ozon collector migration now persists an overall position with an honest
 `placement = unknown`, exact half-hour slots and terminal-only publication.
 The disabled runtime invokes only the repository health contract and never
 persists a business run.
