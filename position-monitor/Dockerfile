@@ -4,6 +4,7 @@ COPY --chmod=0644 initdb/001_schema.sql /docker-entrypoint-initdb.d/001_schema.s
 COPY --chmod=0644 initdb/002_ozon_collector_contract.sql /docker-entrypoint-initdb.d/002_ozon_collector_contract.sql
 COPY --chmod=0644 initdb/002_wb_official_history.sql /docker-entrypoint-initdb.d/002_wb_official_history.sql
 COPY --chmod=0755 initdb/003_roles.sh /docker-entrypoint-initdb.d/003_roles.sh
+COPY --chmod=0644 initdb/004_ozon_postgres_adapter.sql /docker-entrypoint-initdb.d/004_ozon_postgres_adapter.sql
 COPY --chmod=0755 healthcheck.sh /usr/local/bin/position-db-healthcheck
 
 # This image always runs as postgres, so the root-only privilege-drop helper is

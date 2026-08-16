@@ -5,6 +5,7 @@
 //! adapters must satisfy before a real collector is enabled.
 
 mod model;
+mod postgres_repository;
 mod repository;
 mod runner;
 mod schedule;
@@ -13,6 +14,7 @@ pub use model::{
     BatchPlan, MonitorTarget, Observation, ObservationOutcome, PlacementKind, QueryPlan,
     QueryRequest, QueryScan, SearchHit, ValidationError,
 };
+pub use postgres_repository::PostgresRepository;
 pub use repository::{
     CircuitReason, DisabledRepository, ErrorClass, MeasurementRecord, PersistOutcome,
     PersistedOutcome, PersistenceBatch, PersistenceError, PositionRepository, RepositoryError,

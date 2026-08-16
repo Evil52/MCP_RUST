@@ -74,6 +74,11 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
+      - name: Verify PostgreSQL repository transaction contract
+        run: >-
+          ./scripts/with-position-test-db.sh
+          cargo test --locked --test position_postgres_repository
+
       - name: Run Clippy with warnings denied
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
@@ -125,6 +130,7 @@ jobs:
 
       - name: Enforce complete line coverage
         run: >-
+          ./scripts/with-position-test-db.sh
           cargo llvm-cov
           --locked
           --all-targets

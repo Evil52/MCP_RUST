@@ -35,7 +35,7 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo "cargo-llvm-cov is required: cargo install cargo-llvm-cov --version 0.8.7 --locked" >&2
   exit 1
 fi
-cargo llvm-cov \
+./scripts/with-position-test-db.sh cargo llvm-cov \
   --locked \
   --all-targets \
   --all-features \
