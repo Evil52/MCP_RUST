@@ -366,6 +366,10 @@ pub enum RepositoryError {
     Disabled,
     #[error("a different payload already exists for this collection slot")]
     SlotConflict,
+    #[error("manual canary requires exactly one active monitor")]
+    CanaryTargetCount,
+    #[error("the active canary monitor violates the fixed 30-minute top-100 contract")]
+    InvalidCanaryTarget,
     #[error("position repository is unavailable")]
     Unavailable,
 }
