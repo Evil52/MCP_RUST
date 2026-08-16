@@ -58,6 +58,8 @@ fi
 
 export POSITION_REPOSITORY_TEST_ADMIN_URL="postgresql://position_admin:${admin_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export POSITION_REPOSITORY_TEST_COLLECTOR_URL="postgresql://position_collector:${collector_password}@127.0.0.1:${mapped_port}/ozon_positions"
+export POSITION_COLLECTOR_MODE=disabled
+export POSITION_COLLECTOR_DATABASE_URL="$POSITION_REPOSITORY_TEST_COLLECTOR_URL"
 
 cd "$project_root"
 "$@"

@@ -75,9 +75,7 @@ jobs:
         run: cargo test --locked --all-targets --all-features
 
       - name: Verify PostgreSQL repository transaction contract
-        run: >-
-          ./scripts/with-position-test-db.sh
-          cargo test --locked --test position_postgres_repository
+        run: ./scripts/with-position-test-db.sh ./scripts/test-position-runtime.sh
 
       - name: Run Clippy with warnings denied
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -135,7 +133,7 @@ jobs:
           --locked
           --all-targets
           --all-features
-          --ignore-filename-regex 'src/(main|bin/mcp-ozon-control)\.rs$'
+          --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector))\.rs$'
           --fail-under-lines 100
 
   dependency-security:
@@ -182,7 +180,10 @@ jobs:
         run: ./scripts/test-position-schema.sh
 
       - name: Build image
-        run: docker build --pull --tag mcp-ozon:ci .
+        run: |
+          docker build --pull --tag mcp-ozon:ci .
+          docker build --pull --tag mcp-ozon-position-collector:ci \
+            --file Dockerfile.position-collector .
 
       - name: Verify minimal static musl runtime
         run: |
@@ -198,6 +199,15 @@ jobs:
             if ldd /usr/local/bin/mcp-ozon 2>&1 | grep -q "=>"; then
               echo "the runtime binary must not have dynamic dependencies" >&2
               ldd /usr/local/bin/mcp-ozon >&2 2>&1
+              exit 1
+            fi
+          '
+          test "$(docker image inspect --format '{{.Config.User}}' mcp-ozon-position-collector:ci)" = "collector"
+          docker run --rm --entrypoint /bin/sh mcp-ozon-position-collector:ci -ec '
+            test -f /etc/alpine-release
+            if ldd /usr/local/bin/position-collector 2>&1 | grep -q "=>"; then
+              echo "the collector runtime binary must not have dynamic dependencies" >&2
+              ldd /usr/local/bin/position-collector >&2 2>&1
               exit 1
             fi
           '
@@ -239,6 +249,15 @@ jobs:
           --ignore-unfixed
           --exit-code 1
           mcp-ozon-position-db:ci
+
+      - name: Scan position collector image for fixable high and critical vulnerabilities
+        run: >-
+          trivy image
+          --scanners vuln,secret
+          --severity HIGH,CRITICAL
+          --ignore-unfixed
+          --exit-code 1
+          mcp-ozon-position-collector:ci
 
       - name: Start hardened container and verify health
         run: |

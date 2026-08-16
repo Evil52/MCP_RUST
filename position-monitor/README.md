@@ -26,12 +26,15 @@ authorization header, or browser profile. A provider-independent Ozon
 collector core now exists in `src/position_collector`, but it has only a
 `DisabledSource`. It also has a pure validated persistence payload and a
 `DisabledRepository`. A transactional `PostgresRepository` is implemented and
-verified against an ephemeral least-privilege database, but there is still no
-browser/provider adapter, scheduler process, or deployed collection job. The
+verified against an ephemeral least-privilege database. A separate hardened
+`position-collector` runtime now verifies that database contract, but its only
+accepted mode is `disabled`: it neither schedules runs nor calls a source. There
+is still no browser/provider adapter or deployed live collection job. The
 database schema and least-privilege roles remain the storage boundary. The additive Ozon
 collector migration now persists an overall position with an honest
 `placement = unknown`, exact half-hour slots and terminal-only publication.
-No runtime process invokes the repository yet.
+The disabled runtime invokes only the repository health contract and never
+persists a business run.
 
 The current core circuit breaker is in-memory only. The database migration adds
 a durable circuit row and fail-closed per-region daily-budget claim function,
@@ -111,7 +114,8 @@ there is no runtime bind mount from the macOS `Documents` directory.
 
 ## Bootstrap
 
-Do not start this stack until implementation phase 2. When ready:
+The stack can now be started as an inert infrastructure check. It cannot collect
+positions until a separately reviewed live-source phase is shipped. When ready:
 
 1. Copy `.position.env.example` to `.position.env`.
 2. Generate three different random passwords of at least 24 characters and keep the file mode
@@ -123,7 +127,7 @@ Do not start this stack until implementation phase 2. When ready:
    docker compose --env-file .position.env -f compose.position.yaml config --quiet
    ```
 
-4. Start only the database:
+4. Start the database and disabled collector runtime:
 
    ```bash
    docker compose --env-file .position.env -f compose.position.yaml up -d --wait

@@ -9,6 +9,7 @@ mod postgres_repository;
 mod repository;
 mod runner;
 mod schedule;
+mod service;
 
 pub use model::{
     BatchPlan, MonitorTarget, Observation, ObservationOutcome, PlacementKind, QueryPlan,
@@ -28,3 +29,4 @@ pub use schedule::{
     COLLECTION_INTERVAL_MINUTES, EXECUTION_OFFSET_MINUTES, ScheduleError, next_execution_after,
     slot_for_planned_execution,
 };
+pub use service::{CollectorRuntimeConfig, CollectorRuntimeMode, RuntimeConfigError};

@@ -188,15 +188,16 @@ provider is enabled and valid history exists, any consumer must show
 2. **Safe core (implemented):** strict target validation, deterministic
    half-hour scheduling, query coalescing, unknown-placement support, local
    overlap guard, disabled provider, no-retry execution, and protection stop.
-3. **Persistence contract (implemented, not deployed):** exact slot idempotency,
+3. **Persistence/runtime contract (implemented, live source disabled):** exact slot idempotency,
    non-lossy unknown placement, one-way run finalization, published reader views,
    durable circuit and request-budget claims. Rust validates and converts a
    batch into a payload-free atomic persistence payload. The PostgreSQL adapter
    commits the run, measurements and protective circuit change in one transaction;
    an exact digest makes slot retries idempotent without granting raw-history
    SELECT access. A containerized fixture verifies insert, replay, conflict and
-   rollback paths without marketplace traffic. No scheduler or live provider is
-   enabled.
+   rollback paths without marketplace traffic. A hardened runtime verifies its
+   least-privilege database connection, but accepts only `disabled` mode and
+   does not schedule or persist runs. No live provider is enabled.
 4. **Collector canary:** one product, one phrase, one region, manually triggered;
    confirm selectors and whether Ozon permits the workflow.
 5. **Scheduled pilot:** one product and three to five phrases every 30 minutes;

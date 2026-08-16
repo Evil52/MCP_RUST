@@ -35,6 +35,36 @@ impl PostgresRepository {
         }
     }
 
+    /// Verifies the exact least-privilege database contract required by the
+    /// disabled runtime without reading marketplace history.
+    pub async fn verify_runtime_contract(&self) -> Result<(), RepositoryError> {
+        let client = self.client.lock().await;
+        let row = client
+            .query_one(
+                "SELECT current_user = 'position_collector', \
+                        has_table_privilege(current_user, \
+                            'search_position.monitors', 'SELECT'), \
+                        has_table_privilege(current_user, \
+                            'search_position.collection_runs', 'INSERT'), \
+                        NOT has_table_privilege(current_user, \
+                            'search_position.measurements', 'SELECT'), \
+                        EXISTS ( \
+                            SELECT 1 FROM information_schema.columns \
+                            WHERE table_schema = 'search_position' \
+                              AND table_name = 'collection_runs' \
+                              AND column_name = 'payload_digest' \
+                        )",
+                &[],
+            )
+            .await?;
+        let valid = (0..5).all(|index| row.get::<_, bool>(index));
+        if valid {
+            Ok(())
+        } else {
+            Err(RepositoryError::Unavailable)
+        }
+    }
+
     async fn persist_inner(
         &self,
         batch: &PersistenceBatch,

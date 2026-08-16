@@ -259,6 +259,58 @@ verify_position() {
        and (.healthcheck.start_period == "10s")'
 }
 
+verify_position_collector() {
+  local rendered="$1"
+  local service expected_database_url
+  service="$(jq -c '.services["position-collector"]' <<<"$rendered")"
+  expected_database_url='postgresql://position_collector:verify-only-collector-not-a-secret@position-db:5432/ozon_positions'
+
+  check "position collector: service exists" "$service" 'type == "object"'
+  check "position collector: no host ingress or mutable mounts exist" "$service" \
+    '((.ports // []) | length == 0)
+     and ((.volumes // []) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)'
+  # The jq expression intentionally references the --arg variable.
+  # shellcheck disable=SC2016
+  check "position collector: disabled credential-isolated environment is exact" "$service" \
+    --arg database_url "$expected_database_url" \
+    '.environment == {
+       "POSITION_COLLECTOR_DATABASE_URL": $database_url,
+       "POSITION_COLLECTOR_MODE": "disabled",
+       "RUST_LOG": "mcp_ozon::position_collector=info"
+     }'
+  check "position collector: waits for the authenticated database healthcheck" "$service" \
+    '.depends_on == {
+       "position-db": {"condition": "service_healthy", "required": true}
+     }'
+  check "position collector: only the internal database network is attached" "$service" \
+    '(.networks | keys) == ["position-internal"]'
+  check "position collector: filesystem and privilege hardening are exact" "$service" \
+    '.read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false'
+  check "position collector: bounded resources and shutdown are exact" "$service" \
+    '.mem_limit == "134217728"
+     and .cpus == 0.25
+     and .pids_limit == 64
+     and .stop_grace_period == "10s"'
+  check "position collector: restart and logs are bounded" "$service" \
+    '.restart == "unless-stopped"
+     and .logging == {
+       "driver": "json-file",
+       "options": {"max-file": "2", "max-size": "5m"}
+     }'
+  check "position collector: healthcheck is local and exact" "$service" \
+    '.healthcheck == {
+       "test": ["CMD", "/usr/local/bin/position-collector", "healthcheck"],
+       "timeout": "8s", "interval": "30s", "retries": 3,
+       "start_period": "10s"
+     }'
+}
+
 # The disabled Control MCP is intentionally a separate, credentialless service
 # with no Internet route. Its exact environment is allowlisted here: adding a
 # marketplace credential name or any new service setting must fail review.
@@ -425,6 +477,7 @@ verify_server \
   "no" \
   "mcp-ozon-canary-outbound"
 verify_position "$position_rendered"
+verify_position_collector "$position_rendered"
 verify_control "$control_rendered"
 
 if (( failures > 0 )); then
@@ -432,4 +485,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, Control, and position database: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal no-egress/database networks."
+echo "Compose hardening verified for main, canary, Control, position database, and disabled collector runtime: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal no-egress/database networks."
