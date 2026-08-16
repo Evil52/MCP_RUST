@@ -33,7 +33,7 @@ pub enum HtmlReportError {
 }
 
 pub fn render_html(report: HtmlReport<'_>) -> Result<String, HtmlReportError> {
-    validate(&report)?;
+    validate_report(&report)?;
     let mut html = String::with_capacity(8_192);
     write!(
         html,
@@ -74,7 +74,7 @@ pub fn render_html(report: HtmlReport<'_>) -> Result<String, HtmlReportError> {
     Ok(html)
 }
 
-fn validate(report: &HtmlReport<'_>) -> Result<(), HtmlReportError> {
+pub(super) fn validate_report(report: &HtmlReport<'_>) -> Result<(), HtmlReportError> {
     if !valid_text(report.manager_name, MAX_MANAGER_NAME_BYTES)
         || report.account_ids.is_empty()
         || report.account_ids.len() > MAX_ACCOUNTS

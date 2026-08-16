@@ -39,6 +39,9 @@ The first disabled-only phase provides:
 - a bounded, dependency-free HTML email renderer with no images or external
   resources; it escapes display data and suppresses actions when source quality
   is not complete;
+- a bounded six-sheet XLSX renderer for summary, SKU sales, advertising,
+  inventory/prices, recommendations and source quality; calculations remain
+  server-side, identifiers are written as literal text and no images are used;
 - a frozen snapshot-manifest contract requiring exactly one sales,
   advertising, stock and price source per scoped account, with source-specific
   freshness limits and fail-closed recommendation suppression for partial or
@@ -53,7 +56,7 @@ tokens and actual addresses must not be committed.
 
 The snapshot manifest and normalized PostgreSQL storage contract are present,
 but no marketplace report collector is wired yet. No scheduler process,
-marketplace snapshot job, XLSX generator, S3 writer or mail provider is wired.
+marketplace snapshot job, S3 writer or mail provider is wired.
 The HTML renderer is a pure function and is not connected to delivery.
 Consequently this phase cannot send email and cannot affect a
 marketplace. Search-position collection remains disabled.
