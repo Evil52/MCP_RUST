@@ -124,18 +124,40 @@ reader_psql=(
   --no-psqlrc --set ON_ERROR_STOP=1
 )
 
-# Prove that the additive WB migration can be applied safely to an existing
+# Prove that both additive migrations can be applied safely to an existing
 # database initialized with the original Ozon-only schema and existing roles.
-"${admin_psql[@]}" --command 'CREATE DATABASE wb_migration_probe' >/dev/null
+"${admin_psql[@]}" --command 'CREATE DATABASE migration_probe' >/dev/null
 migration_admin_psql=(
   docker exec --env PGPASSWORD="$admin_password" "$container"
-  psql --host 127.0.0.1 --username position_admin --dbname wb_migration_probe
+  psql --host 127.0.0.1 --username position_admin --dbname migration_probe
   --no-psqlrc --set ON_ERROR_STOP=1
 )
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/001_schema.sql >/dev/null
+"${migration_admin_psql[@]}" --command "
+  INSERT INTO search_position.monitors
+      (
+          store_id, product_id, search_phrase, region_code, region_name,
+          interval_minutes, max_position
+      )
+  VALUES ('legacy-store', '9001', 'legacy phrase', 'legacy-region',
+      'Legacy Region', 30, 100);
+  INSERT INTO search_position.collection_runs
+      (
+          started_at, finished_at, status, monitors_attempted,
+          monitors_succeeded, collector_version
+      )
+  VALUES
+      (
+          '2026-08-15 00:05:00+00', '2026-08-15 00:07:00+00',
+          'succeeded', 1, 1, 'legacy-schema-test'
+      );
+  INSERT INTO search_position.measurements
+      (run_id, monitor_id, observed_at, outcome, organic_position)
+  VALUES (1, 1, '2026-08-15 00:06:00+00', 'found', 7);
+" >/dev/null
 "${admin_psql[@]}" --command '
-  GRANT CONNECT ON DATABASE wb_migration_probe
+  GRANT CONNECT ON DATABASE migration_probe
       TO position_collector, position_reader
 ' >/dev/null
 "${migration_admin_psql[@]}" --command '
@@ -147,6 +169,8 @@ migration_admin_psql=(
       GRANT SELECT ON TABLES TO position_reader;
 ' >/dev/null
 "${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/002_ozon_collector_contract.sql >/dev/null
+"${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/002_wb_official_history.sql >/dev/null
 "${migration_admin_psql[@]}" --command '
   CREATE TABLE search_position.reader_default_acl_probe (id integer)
@@ -154,6 +178,32 @@ migration_admin_psql=(
 migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT
+      to_regclass('search_position.published_measurements') IS NOT NULL,
+      has_function_privilege(
+          'position_collector',
+          'search_position.claim_ozon_request_budget(text,timestamp with time zone)',
+          'EXECUTE'
+      ),
+      has_table_privilege(
+          'position_reader',
+          'search_position.published_measurements',
+          'SELECT'
+      ),
+      NOT has_table_privilege(
+          'position_reader',
+          'search_position.measurements',
+          'SELECT'
+      ),
+      (
+          SELECT scheduled_for = TIMESTAMPTZ '2026-08-15 00:00:00+00'
+          FROM search_position.collection_runs
+          WHERE id = 1
+      ),
+      (
+          SELECT overall_position = 7 AND placement = 'organic'
+          FROM search_position.measurements
+          WHERE id = 1
+      ),
       to_regclass('search_position.wb_search_snapshots') IS NOT NULL,
       has_table_privilege(
           'position_collector',
@@ -191,12 +241,51 @@ migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
           'SELECT'
       )
   "; } | tr -d '\r')"
-if [[ "$migration_acl" != "t:t:t:t:t:t:t:t" ]]; then
-  echo "existing-volume WB migration did not install the expected schema/ACL" >&2
+if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
+  echo "existing-volume migrations did not install the expected schema/ACL" >&2
   printf '%s\n' "$migration_acl" >&2
   exit 1
 fi
-"${admin_psql[@]}" --command 'DROP DATABASE wb_migration_probe' >/dev/null
+"${admin_psql[@]}" --command 'DROP DATABASE migration_probe' >/dev/null
+
+# An incompatible legacy monitor must abort the complete Ozon migration without
+# deleting or partially altering the existing schema.
+"${admin_psql[@]}" --command 'CREATE DATABASE ozon_migration_reject_probe' >/dev/null
+reject_admin_psql=(
+  docker exec --env PGPASSWORD="$admin_password" "$container"
+  psql --host 127.0.0.1 --username position_admin
+  --dbname ozon_migration_reject_probe --no-psqlrc --set ON_ERROR_STOP=1
+)
+"${reject_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/001_schema.sql >/dev/null
+"${reject_admin_psql[@]}" --command "
+  INSERT INTO search_position.monitors
+      (store_id, product_id, search_phrase, region_code, region_name)
+  VALUES ('legacy-store', '9001', 'legacy phrase', 'legacy-region', 'Legacy Region');
+" >/dev/null
+expect_failure_containing \
+  "incompatible existing Ozon monitor migration" \
+  "monitors_interval_minutes_check" \
+  "${reject_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/002_ozon_collector_contract.sql
+reject_rollback="$({ "${reject_admin_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT
+      count(*) = 1,
+      NOT EXISTS (
+          SELECT 1
+          FROM information_schema.columns
+          WHERE table_schema = 'search_position'
+            AND table_name = 'collection_runs'
+            AND column_name = 'scheduled_for'
+      )
+    FROM search_position.monitors
+  "; } | tr -d '\r')"
+if [[ "$reject_rollback" != "t:t" ]]; then
+  echo "failed Ozon migration did not roll back atomically" >&2
+  exit 1
+fi
+"${admin_psql[@]}" --command 'DROP DATABASE ozon_migration_reject_probe' >/dev/null
 
 # Prove that a failure after password/role mutations rolls the entire bootstrap
 # back. Hiding one grant target forces a deterministic mid-transaction error.
@@ -230,23 +319,78 @@ expect_failure_containing \
   INSERT INTO search_position.monitors
       (store_id, product_id, search_phrase, region_code, region_name)
   VALUES
-      ('store-a', 'product-a', 'phrase-a', 'region', 'Region'),
-      ('store-b', 'product-b', 'phrase-b', 'region', 'Region');
+      ('store-a', '1001', 'phrase-a', 'region', 'Region'),
+      ('store-b', '1002', 'phrase-b', 'region', 'Region');
 " >/dev/null
 
 "${collector_psql[@]}" --command "
-  INSERT INTO search_position.collection_runs (started_at, status, collector_version)
-  VALUES (now(), 'running', 'schema-test');
-  UPDATE search_position.collection_runs
-  SET finished_at = now(), status = 'failed', monitors_attempted = 1,
-      monitors_succeeded = 0, error_class = 'upstream', http_status = 502
-  WHERE id = 1;
+  INSERT INTO search_position.collection_runs
+      (
+          scheduled_for, started_at, status, monitors_planned,
+          queries_planned, collector_version
+      )
+  VALUES
+      (
+          '2026-08-16 00:00:00+00', '2026-08-16 00:05:00+00',
+          'running', 2, 1, 'schema-test'
+      );
   INSERT INTO search_position.measurements
       (run_id, monitor_id, observed_at, outcome, response_ms, error_class, http_status)
-  VALUES (1, 1, now(), 'error', 123, 'transport', 502);
+  VALUES
+      (1, 1, '2026-08-16 00:06:00+00', 'error', 123, 'transport', 502);
   INSERT INTO search_position.alerts
       (monitor_id, measurement_id, kind)
   VALUES (1, 1, 'collector_error');
+  UPDATE search_position.collection_runs
+  SET finished_at = '2026-08-16 00:07:00+00', status = 'failed',
+      monitors_attempted = 1, monitors_succeeded = 0,
+      queries_attempted = 1, queries_succeeded = 0,
+      error_class = 'upstream', http_status = 502
+  WHERE id = 1;
+
+  INSERT INTO search_position.collection_runs
+      (
+          scheduled_for, started_at, status, monitors_planned,
+          queries_planned, collector_version
+      )
+  VALUES
+      (
+          '2026-08-16 00:30:00+00', '2026-08-16 00:35:00+00',
+          'running', 1, 1, 'schema-test'
+      );
+  INSERT INTO search_position.measurements
+      (
+          run_id, monitor_id, observed_at, outcome, overall_position,
+          placement, response_ms
+      )
+  VALUES
+      (2, 1, '2026-08-16 00:36:00+00', 'found', 21, 'unknown', 87);
+  UPDATE search_position.collection_runs
+  SET finished_at = '2026-08-16 00:37:00+00', status = 'succeeded',
+      monitors_attempted = 1, monitors_succeeded = 1,
+      queries_attempted = 1, queries_succeeded = 1
+  WHERE id = 2;
+
+  INSERT INTO search_position.collection_runs
+      (
+          scheduled_for, started_at, status, monitors_planned,
+          queries_planned, collector_version
+      )
+  VALUES
+      (
+          '2026-08-16 01:00:00+00', '2026-08-16 01:05:00+00',
+          'running', 1, 1, 'schema-test'
+      );
+  INSERT INTO search_position.measurements
+      (run_id, monitor_id, observed_at, outcome, response_ms, error_class)
+  VALUES
+      (3, 1, '2026-08-16 01:06:00+00', 'error', 91, 'transport');
+  UPDATE search_position.collection_runs
+  SET finished_at = '2026-08-16 01:07:00+00', status = 'failed',
+      monitors_attempted = 1, monitors_succeeded = 0,
+      queries_attempted = 1, queries_succeeded = 0,
+      error_class = 'transport'
+  WHERE id = 3;
 " >/dev/null
 
 collector_run="$({ "${collector_psql[@]}" --tuples-only --no-align --field-separator=: \
@@ -295,9 +439,23 @@ if "${admin_psql[@]}" --command "
 fi
 
 if "${admin_psql[@]}" --command "
+  WITH new_run AS (
+      INSERT INTO search_position.collection_runs
+          (
+              scheduled_for, started_at, status, monitors_planned,
+              queries_planned, collector_version
+          )
+      VALUES
+          (
+              '2026-08-16 01:30:00+00', '2026-08-16 01:35:00+00',
+              'running', 1, 1, 'schema-test'
+          )
+      RETURNING id
+  )
   INSERT INTO search_position.measurements
       (run_id, monitor_id, observed_at, outcome, organic_position)
-  VALUES (1, 2, now(), 'not_found', 7);
+  SELECT id, 2, '2026-08-16 01:36:00+00', 'not_found', 7
+  FROM new_run;
 " >/dev/null 2>&1; then
   echo "a not_found measurement incorrectly retained a search position" >&2
   exit 1
@@ -308,14 +466,174 @@ fi
   | grep -Eq '^[[:space:]]*1[[:space:]]*$'
 
 latest_diagnostics="$({ "${reader_psql[@]}" --tuples-only --no-align --field-separator=: \
-  --command '
-    SELECT response_ms, error_class, http_status
+  --command "
+    SELECT
+        overall_position, placement, response_ms, run_status,
+        scheduled_for = TIMESTAMPTZ '2026-08-16 00:30:00+00'
     FROM search_position.latest_measurements
     WHERE monitor_id = 1
-  '; } | tr -d '\r')"
-if [[ "$latest_diagnostics" != "123:transport:502" ]]; then
-  echo "latest_measurements omitted collector diagnostics" >&2
+  "; } | tr -d '\r')"
+if [[ "$latest_diagnostics" != "21:unknown:87:succeeded:t" ]]; then
+  echo "latest_measurements did not preserve the last published Ozon fact" >&2
   printf '%s\n' "$latest_diagnostics" >&2
+  exit 1
+fi
+
+expect_failure_containing \
+  "Ozon monitor interval outside the reviewed collector contract" \
+  "monitors_interval_minutes_check" \
+  "${admin_psql[@]}" \
+  --command "
+    INSERT INTO search_position.monitors
+        (
+            store_id, product_id, search_phrase, region_code, region_name,
+            interval_minutes
+        )
+    VALUES ('store-c', '1003', 'phrase-c', 'region', 'Region', 15)
+  "
+
+expect_failure_containing \
+  "duplicate Ozon logical slot" \
+  "collection_runs_source_slot_key" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.collection_runs
+        (
+            scheduled_for, started_at, status, monitors_planned,
+            queries_planned, collector_version
+        )
+    VALUES
+        (
+            '2026-08-16 00:30:00+00', '2026-08-16 00:35:30+00',
+            'running', 1, 1, 'schema-test'
+        )
+  "
+
+expect_failure_containing \
+  "terminal Ozon run mutation" \
+  "terminal Ozon collection run is immutable" \
+  "${admin_psql[@]}" \
+  --command "
+    UPDATE search_position.collection_runs
+    SET status = 'failed'
+    WHERE id = 2
+  "
+
+expect_failure_containing \
+  "post-terminal Ozon measurement" \
+  "Ozon measurements can only be appended to a running run" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.measurements
+        (run_id, monitor_id, observed_at, outcome)
+    VALUES (2, 2, '2026-08-16 00:38:00+00', 'not_found')
+  "
+
+open_run_id="$({ "${collector_psql[@]}" --tuples-only --no-align --quiet --command "
+  INSERT INTO search_position.collection_runs
+      (
+          scheduled_for, started_at, status, monitors_planned,
+          queries_planned, collector_version
+      )
+  VALUES
+      (
+          '2026-08-16 02:00:00+00', '2026-08-16 02:05:00+00',
+          'running', 1, 1, 'schema-test'
+      )
+  RETURNING id;
+"; } | tr -d '\r')"
+
+expect_failure_containing \
+  "Ozon measurement outside its logical slot" \
+  "Ozon measurement is outside its logical slot" \
+  "${collector_psql[@]}" \
+  --command "
+    INSERT INTO search_position.measurements
+        (run_id, monitor_id, observed_at, outcome)
+    VALUES ($open_run_id, 2, '2026-08-16 02:30:00+00', 'not_found')
+  "
+
+"${admin_psql[@]}" --command "
+  INSERT INTO search_position.ozon_region_request_budgets
+      (region_code, daily_limit)
+  VALUES ('region', 2);
+" >/dev/null
+
+first_budget_claim="$({ "${collector_psql[@]}" --tuples-only --no-align \
+  --command "SELECT search_position.claim_ozon_request_budget(
+      'region', '2026-08-16 02:00:00+00'
+  )"; } | tr -d '\r')"
+second_budget_claim="$({ "${collector_psql[@]}" --tuples-only --no-align \
+  --command "SELECT search_position.claim_ozon_request_budget(
+      'region', '2026-08-16 02:00:00+00'
+  )"; } | tr -d '\r')"
+third_budget_claim="$({ "${collector_psql[@]}" --tuples-only --no-align \
+  --command "SELECT search_position.claim_ozon_request_budget(
+      'region', '2026-08-16 02:00:00+00'
+  )"; } | tr -d '\r')"
+if [[ "$first_budget_claim:$second_budget_claim:$third_budget_claim" != "t:t:f" ]]; then
+  echo "Ozon daily request budget was not enforced atomically" >&2
+  exit 1
+fi
+
+"${collector_psql[@]}" --command "
+  SELECT search_position.open_ozon_collector_circuit($open_run_id, 'captcha');
+" >/dev/null
+blocked_budget_claim="$({ "${collector_psql[@]}" --tuples-only --no-align \
+  --command "SELECT search_position.claim_ozon_request_budget(
+      'region', '2026-08-17 02:00:00+00'
+  )"; } | tr -d '\r')"
+if [[ "$blocked_budget_claim" != f ]]; then
+  echo "an open Ozon circuit did not stop a new request-budget claim" >&2
+  exit 1
+fi
+
+expect_failure_containing \
+  "position_collector direct Ozon circuit UPDATE" \
+  "permission denied for table ozon_collector_circuit" \
+  "${collector_psql[@]}" \
+  --command "
+    UPDATE search_position.ozon_collector_circuit
+    SET circuit_open = false
+    WHERE source = 'ozon_public_search'
+  "
+
+"${collector_psql[@]}" --command "
+  UPDATE search_position.collection_runs
+  SET finished_at = '2026-08-16 02:07:00+00', status = 'blocked',
+      monitors_attempted = 1, monitors_succeeded = 0,
+      queries_attempted = 1, queries_succeeded = 0,
+      error_class = 'captcha'
+  WHERE id = $open_run_id;
+" >/dev/null
+
+expect_failure_containing \
+  "opening the Ozon circuit from a terminal run" \
+  "Ozon collector circuit requires a running run" \
+  "${collector_psql[@]}" \
+  --command "SELECT search_position.open_ozon_collector_circuit(
+      $open_run_id, 'captcha'
+  )"
+
+"${admin_psql[@]}" --command "
+  UPDATE search_position.ozon_collector_circuit
+  SET circuit_open = false,
+      reset_at = statement_timestamp(),
+      reset_by = 'schema-test-admin'
+  WHERE source = 'ozon_public_search';
+" >/dev/null
+
+expect_failure_containing \
+  "position_reader raw Ozon measurements" \
+  "permission denied for table measurements" \
+  "${reader_psql[@]}" \
+  --command 'SELECT count(*) FROM search_position.measurements'
+
+published_count="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --command 'SELECT count(*) FROM search_position.published_measurements'; } \
+  | tr -d '\r')"
+if [[ "$published_count" != 1 ]]; then
+  echo "the Ozon publication view exposed a non-published run" >&2
   exit 1
 fi
 

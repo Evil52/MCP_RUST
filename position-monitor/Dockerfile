@@ -1,6 +1,7 @@
 FROM postgres:17-alpine@sha256:d4bb0a8c1b7bb2e29f976d099e7bfb9a5d8858cffe9e46b35cd302cd1f1f8168
 
 COPY --chmod=0644 initdb/001_schema.sql /docker-entrypoint-initdb.d/001_schema.sql
+COPY --chmod=0644 initdb/002_ozon_collector_contract.sql /docker-entrypoint-initdb.d/002_ozon_collector_contract.sql
 COPY --chmod=0644 initdb/002_wb_official_history.sql /docker-entrypoint-initdb.d/002_wb_official_history.sql
 COPY --chmod=0755 initdb/003_roles.sh /docker-entrypoint-initdb.d/003_roles.sh
 COPY --chmod=0755 healthcheck.sh /usr/local/bin/position-db-healthcheck
