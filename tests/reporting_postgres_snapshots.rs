@@ -160,6 +160,37 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(manifest.snapshots().len(), 4);
     assert_eq!(manifest.quality(), SnapshotQuality::Partial);
     assert!(!manifest.recommendations_allowed());
+    let facts = repository.load_report_facts(&manifest).await.unwrap();
+    assert_eq!(facts.sales.len(), 1);
+    assert_eq!(facts.sales[0].account_id, "snapshot_integration");
+    assert_eq!(facts.sales[0].business_date.to_string(), "2098-08-15");
+    assert_eq!(facts.sales[0].sku, 3411079879);
+    assert_eq!(facts.sales[0].ordered_units, 3);
+    assert_eq!(facts.sales[0].operational_gmv_minor, 202500);
+    assert_eq!(facts.sales[0].cancelled_units, 0);
+    assert_eq!(facts.sales[0].returned_units, 0);
+    assert_eq!(facts.advertising.len(), 1);
+    assert_eq!(facts.advertising[0].campaign_id, 35751912);
+    assert_eq!(facts.advertising[0].sku, 3411079879);
+    assert_eq!(facts.advertising[0].impressions, 1000);
+    assert_eq!(facts.advertising[0].clicks, 20);
+    assert_eq!(facts.advertising[0].spend_minor, 12000);
+    assert_eq!(facts.advertising[0].attributed_orders, 2);
+    assert_eq!(facts.advertising[0].attributed_revenue_minor, 135000);
+    assert_eq!(facts.stocks.len(), 1);
+    assert_eq!(facts.stocks[0].warehouse_id, "fbo-msk");
+    assert_eq!(facts.stocks[0].sellable_units, 19);
+    assert_eq!(
+        facts.stocks[0].observed_at,
+        timestamp("2098-08-16T02:45:00Z")
+    );
+    assert_eq!(facts.prices.len(), 1);
+    assert_eq!(facts.prices[0].price_minor, 67500);
+    assert_eq!(facts.prices[0].old_price_minor, Some(70200));
+    assert_eq!(
+        facts.prices[0].observed_at,
+        timestamp("2098-08-16T02:40:00Z")
+    );
 
     assert_eq!(
         repository

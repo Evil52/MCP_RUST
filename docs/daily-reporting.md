@@ -29,7 +29,13 @@ The first disabled-only phase provides:
   `succeeded`, `partial` or `failed`, verify their persisted row count and
   publish only terminal successful/partial projections; and
 - a bounded PostgreSQL reader that loads only published source descriptors and
-  revalidates the exact four-source manifest before report generation; and
+  revalidates the exact four-source manifest before report generation;
+- a bounded published-fact reader that selects rows only by the frozen
+  snapshot identities, rechecks every persisted row count and rejects foreign
+  account data; and
+- an account-aware report dataset that aggregates sales by `account + SKU`,
+  advertising by `account + campaign + SKU`, and stock across warehouses
+  without merging identical SKU numbers from different stores; and
 - deterministic integer KPI formulas for ordered units, operational GMV, CTR,
   CPC, advertising conversion, CPO and advertising-revenue DRR; zero
   denominators remain `N/D` and aggregation overflow fails closed; and
@@ -54,10 +60,11 @@ tokens and actual addresses must not be committed.
 
 ## Not implemented yet
 
-The snapshot manifest and normalized PostgreSQL storage contract are present,
-but no marketplace report collector is wired yet. No scheduler process,
-marketplace snapshot job, S3 writer or mail provider is wired.
-The HTML renderer is a pure function and is not connected to delivery.
+The snapshot manifest, normalized PostgreSQL storage contract, bounded fact
+reader and report dataset are present, but no marketplace report collector is
+wired yet. No scheduler process, marketplace snapshot job, S3 writer or mail
+provider is wired. The HTML/XLSX renderers are pure functions and are not
+connected to delivery.
 Consequently this phase cannot send email and cannot affect a
 marketplace. Search-position collection remains disabled.
 
@@ -72,7 +79,7 @@ an ambiguous provider result is never retried automatically.
 ## Planned pilot
 
 1. Wire read-only marketplace collectors into the normalized snapshot contract.
-2. Generate deterministic HTML and XLSX from one frozen snapshot manifest.
+2. Connect the assembled frozen dataset to one deterministic HTML/XLSX batch.
 3. Add the scheduler/runtime around the persisted PostgreSQL outbox.
 4. Run dry mode for Diana and Anna with delivery disabled.
 5. Connect S3-compatible artifact storage and one service mailbox.

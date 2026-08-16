@@ -90,6 +90,13 @@ pub(super) fn validate_report(report: &HtmlReport<'_>) -> Result<(), HtmlReportE
             return Err(HtmlReportError::InvalidInput);
         }
     }
+    if report
+        .problems
+        .iter()
+        .any(|problem| !accounts.contains(problem.account_id.as_str()))
+    {
+        return Err(HtmlReportError::InvalidInput);
+    }
     Ok(())
 }
 
@@ -158,7 +165,7 @@ fn write_problems(html: &mut String, problems: &[PriorityProblem], suppressed: b
         html.push_str("<p>Критических действий по утверждённым правилам не найдено.</p>");
     } else {
         html.push_str(
-            "<table><tr><th>Приоритет</th><th>SKU</th><th>Проблема</th><th>Действие</th></tr>",
+            "<table><tr><th>Приоритет</th><th>Кабинет</th><th>SKU</th><th>Проблема</th><th>Действие</th></tr>",
         );
         for problem in problems {
             let (severity, class) = match problem.severity {
@@ -168,8 +175,13 @@ fn write_problems(html: &mut String, problems: &[PriorityProblem], suppressed: b
             let (label, action) = problem_label(problem.kind);
             write!(
                 html,
-                "<tr><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                class, severity, problem.sku, label, action
+                "<tr><td class=\"{}\">{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                class,
+                severity,
+                escape(&problem.account_id),
+                problem.sku,
+                label,
+                action
             )
             .expect("writing to String cannot fail");
         }
@@ -257,6 +269,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, kind)| PriorityProblem {
+                account_id: "ozon_store".to_owned(),
                 sku: index as u64 + 1,
                 kind,
                 severity: if index == 0 {
@@ -349,6 +362,7 @@ mod tests {
         let excessive_manager_name = "x".repeat(MAX_MANAGER_NAME_BYTES + 1);
         let excessive_problems = vec![
             PriorityProblem {
+                account_id: "ozon_store".to_owned(),
                 sku: 1,
                 kind: ProblemKind::Stockout,
                 severity: Severity::Red,
@@ -358,6 +372,15 @@ mod tests {
             };
             MAX_PROBLEMS + 1
         ];
+        let foreign_problem = [PriorityProblem {
+            account_id: "foreign_store".to_owned(),
+            sku: 1,
+            kind: ProblemKind::Stockout,
+            severity: Severity::Red,
+            observed: 0,
+            threshold: 1,
+            impact_minor: 1,
+        }];
         for invalid in [
             HtmlReport {
                 manager_name: " ",
@@ -397,6 +420,10 @@ mod tests {
             },
             HtmlReport {
                 problems: &excessive_problems,
+                ..base
+            },
+            HtmlReport {
+                problems: &foreign_problem,
                 ..base
             },
         ] {

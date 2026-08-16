@@ -1,4 +1,6 @@
-use chrono::{DateTime, Utc};
+use std::collections::BTreeSet;
+
+use chrono::{DateTime, NaiveDate, Utc};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, Config, NoTls};
 
@@ -8,6 +10,57 @@ use super::snapshot::{
 };
 
 const MAX_MANIFEST_ACCOUNTS: usize = 64;
+const MAX_REPORT_FACT_ROWS: usize = 25_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedSalesFact {
+    pub account_id: String,
+    pub business_date: NaiveDate,
+    pub sku: u64,
+    pub ordered_units: u64,
+    pub operational_gmv_minor: u64,
+    pub cancelled_units: u64,
+    pub returned_units: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedAdvertisingFact {
+    pub account_id: String,
+    pub business_date: NaiveDate,
+    pub campaign_id: u64,
+    pub sku: u64,
+    pub impressions: u64,
+    pub clicks: u64,
+    pub spend_minor: u64,
+    pub attributed_orders: u64,
+    pub attributed_revenue_minor: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedStockFact {
+    pub account_id: String,
+    pub sku: u64,
+    pub warehouse_id: String,
+    pub sellable_units: u64,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPriceFact {
+    pub account_id: String,
+    pub sku: u64,
+    pub price_minor: u64,
+    pub old_price_minor: Option<u64>,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedReportFacts {
+    pub sales: Vec<PublishedSalesFact>,
+    pub advertising: Vec<PublishedAdvertisingFact>,
+    pub stocks: Vec<PublishedStockFact>,
+    pub prices: Vec<PublishedPriceFact>,
+}
 
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresSnapshotError {
@@ -111,6 +164,181 @@ impl PostgresSnapshotRepository {
         FrozenSnapshotManifest::new(cutoff_at, accounts, snapshots)
             .map_err(|_| PostgresSnapshotError::InvalidManifest)
     }
+
+    /// Loads only the immutable published rows named by a frozen manifest.
+    ///
+    /// The persisted `row_count` of every source is rechecked before data is
+    /// returned. This prevents a partial query, a foreign snapshot or a future
+    /// schema mistake from silently producing a plausible-looking report.
+    pub async fn load_report_facts(
+        &self,
+        manifest: &FrozenSnapshotManifest,
+    ) -> Result<PublishedReportFacts, PostgresSnapshotError> {
+        let expected_total = expected_fact_rows(manifest)?;
+        let snapshot_ids = manifest
+            .snapshots()
+            .iter()
+            .map(SnapshotDescriptor::snapshot_id)
+            .collect::<Vec<_>>();
+        let expected_accounts = manifest
+            .snapshots()
+            .iter()
+            .map(|snapshot| snapshot.account_id())
+            .collect::<BTreeSet<_>>();
+        let client = self.client.lock().await;
+        let sales_rows = client
+            .query(
+                "SELECT account_id, business_date, sku, ordered_units, \
+                        operational_gmv_minor, cancelled_units, returned_units \
+                 FROM daily_reporting.published_sales_facts \
+                 WHERE snapshot_id = ANY($1::bigint[]) \
+                 ORDER BY account_id, business_date, sku",
+                &[&snapshot_ids],
+            )
+            .await
+            .map_err(|_| PostgresSnapshotError::Unavailable)?;
+        let advertising_rows = client
+            .query(
+                "SELECT account_id, business_date, campaign_id, sku, impressions, clicks, \
+                        spend_minor, attributed_orders, attributed_revenue_minor \
+                 FROM daily_reporting.published_advertising_facts \
+                 WHERE snapshot_id = ANY($1::bigint[]) \
+                 ORDER BY account_id, business_date, campaign_id, sku",
+                &[&snapshot_ids],
+            )
+            .await
+            .map_err(|_| PostgresSnapshotError::Unavailable)?;
+        let stock_rows = client
+            .query(
+                "SELECT account_id, sku, warehouse_id, sellable_units, source_as_of \
+                 FROM daily_reporting.published_stock_facts \
+                 WHERE snapshot_id = ANY($1::bigint[]) \
+                 ORDER BY account_id, sku, warehouse_id",
+                &[&snapshot_ids],
+            )
+            .await
+            .map_err(|_| PostgresSnapshotError::Unavailable)?;
+        let price_rows = client
+            .query(
+                "SELECT account_id, sku, price_minor, old_price_minor, source_as_of \
+                 FROM daily_reporting.published_price_facts \
+                 WHERE snapshot_id = ANY($1::bigint[]) \
+                 ORDER BY account_id, sku",
+                &[&snapshot_ids],
+            )
+            .await
+            .map_err(|_| PostgresSnapshotError::Unavailable)?;
+
+        let actual_total = sales_rows
+            .len()
+            .checked_add(advertising_rows.len())
+            .and_then(|value| value.checked_add(stock_rows.len()))
+            .and_then(|value| value.checked_add(price_rows.len()))
+            .ok_or(PostgresSnapshotError::InvalidManifest)?;
+        validate_actual_total(expected_total, actual_total)?;
+        let sales = sales_rows
+            .into_iter()
+            .map(|row| {
+                Ok(PublishedSalesFact {
+                    account_id: checked_account(row.get(0), &expected_accounts)?,
+                    business_date: row.get(1),
+                    sku: nonnegative_i64(row.get(2))?,
+                    ordered_units: nonnegative_i32(row.get(3))?,
+                    operational_gmv_minor: nonnegative_i64(row.get(4))?,
+                    cancelled_units: nonnegative_i32(row.get(5))?,
+                    returned_units: nonnegative_i32(row.get(6))?,
+                })
+            })
+            .collect::<Result<Vec<_>, PostgresSnapshotError>>()?;
+        let advertising = advertising_rows
+            .into_iter()
+            .map(|row| {
+                Ok(PublishedAdvertisingFact {
+                    account_id: checked_account(row.get(0), &expected_accounts)?,
+                    business_date: row.get(1),
+                    campaign_id: nonnegative_i64(row.get(2))?,
+                    sku: nonnegative_i64(row.get(3))?,
+                    impressions: nonnegative_i64(row.get(4))?,
+                    clicks: nonnegative_i64(row.get(5))?,
+                    spend_minor: nonnegative_i64(row.get(6))?,
+                    attributed_orders: nonnegative_i32(row.get(7))?,
+                    attributed_revenue_minor: nonnegative_i64(row.get(8))?,
+                })
+            })
+            .collect::<Result<Vec<_>, PostgresSnapshotError>>()?;
+        let stocks = stock_rows
+            .into_iter()
+            .map(|row| {
+                Ok(PublishedStockFact {
+                    account_id: checked_account(row.get(0), &expected_accounts)?,
+                    sku: nonnegative_i64(row.get(1))?,
+                    warehouse_id: row.get(2),
+                    sellable_units: nonnegative_i32(row.get(3))?,
+                    observed_at: row.get(4),
+                })
+            })
+            .collect::<Result<Vec<_>, PostgresSnapshotError>>()?;
+        let prices = price_rows
+            .into_iter()
+            .map(|row| {
+                Ok(PublishedPriceFact {
+                    account_id: checked_account(row.get(0), &expected_accounts)?,
+                    sku: nonnegative_i64(row.get(1))?,
+                    price_minor: nonnegative_i64(row.get(2))?,
+                    old_price_minor: row
+                        .get::<_, Option<i64>>(3)
+                        .map(nonnegative_i64)
+                        .transpose()?,
+                    observed_at: row.get(4),
+                })
+            })
+            .collect::<Result<Vec<_>, PostgresSnapshotError>>()?;
+        Ok(PublishedReportFacts {
+            sales,
+            advertising,
+            stocks,
+            prices,
+        })
+    }
+}
+
+fn checked_account(
+    value: String,
+    expected: &BTreeSet<&str>,
+) -> Result<String, PostgresSnapshotError> {
+    expected
+        .contains(value.as_str())
+        .then_some(value)
+        .ok_or(PostgresSnapshotError::InvalidManifest)
+}
+
+fn expected_fact_rows(manifest: &FrozenSnapshotManifest) -> Result<usize, PostgresSnapshotError> {
+    let total = manifest
+        .snapshots()
+        .iter()
+        .map(|snapshot| snapshot.row_count() as usize)
+        .sum();
+    validate_fact_row_limit(total)
+}
+
+fn validate_fact_row_limit(total: usize) -> Result<usize, PostgresSnapshotError> {
+    (total <= MAX_REPORT_FACT_ROWS)
+        .then_some(total)
+        .ok_or(PostgresSnapshotError::InvalidManifest)
+}
+
+fn validate_actual_total(expected: usize, actual: usize) -> Result<(), PostgresSnapshotError> {
+    (expected == actual)
+        .then_some(())
+        .ok_or(PostgresSnapshotError::InvalidManifest)
+}
+
+fn nonnegative_i32(value: i32) -> Result<u64, PostgresSnapshotError> {
+    u64::try_from(value).map_err(|_| PostgresSnapshotError::InvalidManifest)
+}
+
+fn nonnegative_i64(value: i64) -> Result<u64, PostgresSnapshotError> {
+    u64::try_from(value).map_err(|_| PostgresSnapshotError::InvalidManifest)
 }
 
 fn parse_marketplace(value: &str) -> Result<Marketplace, PostgresSnapshotError> {
@@ -142,8 +370,9 @@ fn parse_status(value: &str) -> Result<SnapshotStatus, PostgresSnapshotError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Marketplace, PostgresSnapshotError, SnapshotSource, SnapshotStatus, parse_marketplace,
-        parse_source, parse_status,
+        MAX_REPORT_FACT_ROWS, Marketplace, PostgresSnapshotError, SnapshotSource, SnapshotStatus,
+        checked_account, nonnegative_i32, nonnegative_i64, parse_marketplace, parse_source,
+        parse_status, validate_actual_total, validate_fact_row_limit,
     };
 
     #[test]
@@ -167,5 +396,41 @@ mod tests {
             };
             assert_eq!(error, Err(PostgresSnapshotError::InvalidManifest));
         }
+    }
+
+    #[test]
+    fn database_scalar_mappings_reject_foreign_or_negative_values() {
+        let accounts = ["expected"].into_iter().collect();
+        assert_eq!(
+            checked_account("expected".to_owned(), &accounts),
+            Ok("expected".to_owned())
+        );
+        assert_eq!(
+            checked_account("foreign".to_owned(), &accounts),
+            Err(PostgresSnapshotError::InvalidManifest)
+        );
+        assert_eq!(nonnegative_i32(7), Ok(7));
+        assert_eq!(nonnegative_i64(9), Ok(9));
+        assert_eq!(
+            nonnegative_i32(-1),
+            Err(PostgresSnapshotError::InvalidManifest)
+        );
+        assert_eq!(
+            nonnegative_i64(-1),
+            Err(PostgresSnapshotError::InvalidManifest)
+        );
+        assert_eq!(validate_actual_total(4, 4), Ok(()));
+        assert_eq!(
+            validate_actual_total(4, 3),
+            Err(PostgresSnapshotError::InvalidManifest)
+        );
+        assert_eq!(
+            validate_fact_row_limit(MAX_REPORT_FACT_ROWS),
+            Ok(MAX_REPORT_FACT_ROWS)
+        );
+        assert_eq!(
+            validate_fact_row_limit(MAX_REPORT_FACT_ROWS + 1),
+            Err(PostgresSnapshotError::InvalidManifest)
+        );
     }
 }

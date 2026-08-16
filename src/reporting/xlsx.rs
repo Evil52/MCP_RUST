@@ -433,7 +433,14 @@ fn write_recommendations(
         sheet,
         formats,
         header_row,
-        &["Приоритет", "SKU", "Проблема", "Действие", "Влияние"],
+        &[
+            "Приоритет",
+            "Кабинет",
+            "SKU",
+            "Проблема",
+            "Действие",
+            "Влияние",
+        ],
     )?;
     for (index, item) in rows.iter().enumerate() {
         let row = header_row
@@ -447,12 +454,13 @@ fn write_recommendations(
         sheet
             .write_string_with_format(row, 0, severity, format)
             .map_err(map_xlsx)?;
-        write_u64(sheet, row, 1, item.sku)?;
-        sheet.write_string(row, 2, problem).map_err(map_xlsx)?;
-        sheet.write_string(row, 3, action).map_err(map_xlsx)?;
-        write_minor(sheet, row, 4, item.impact_minor, formats)?;
+        write_text(sheet, row, 1, &item.account_id)?;
+        write_u64(sheet, row, 2, item.sku)?;
+        sheet.write_string(row, 3, problem).map_err(map_xlsx)?;
+        sheet.write_string(row, 4, action).map_err(map_xlsx)?;
+        write_minor(sheet, row, 5, item.impact_minor, formats)?;
     }
-    finish_table(sheet, &[14, 20, 42, 44, 16])
+    finish_table(sheet, &[14, 20, 20, 42, 44, 16])
 }
 
 fn write_quality(
@@ -685,6 +693,7 @@ mod tests {
 
     fn problem(sku: u64, kind: ProblemKind, severity: Severity) -> PriorityProblem {
         PriorityProblem {
+            account_id: "ozon_store".to_owned(),
             sku,
             kind,
             severity,

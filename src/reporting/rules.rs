@@ -20,6 +20,7 @@ pub enum ProblemKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleInput {
+    pub account_id: String,
     pub sku: u64,
     pub sellable_stock: u64,
     pub sold_units: u64,
@@ -36,6 +37,7 @@ pub struct RuleInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriorityProblem {
+    pub account_id: String,
     pub sku: u64,
     pub kind: ProblemKind,
     pub severity: Severity,
@@ -48,7 +50,7 @@ pub struct PriorityProblem {
 pub enum RuleError {
     #[error("daily report rule input is invalid")]
     InvalidInput,
-    #[error("daily report rule input contains duplicate SKU")]
+    #[error("daily report rule input contains a duplicate account/SKU pair")]
     DuplicateSku,
 }
 
@@ -67,7 +69,7 @@ pub fn priority_problems(
     let mut problems = Vec::new();
     for input in inputs {
         validate(input)?;
-        if !seen.insert(input.sku) {
+        if !seen.insert((input.account_id.as_str(), input.sku)) {
             return Err(RuleError::DuplicateSku);
         }
         stock_problem(input)
@@ -84,6 +86,7 @@ pub fn priority_problems(
         (
             Reverse(problem.severity),
             Reverse(problem.impact_minor),
+            problem.account_id.clone(),
             problem.sku,
             problem.kind,
         )
@@ -93,7 +96,8 @@ pub fn priority_problems(
 }
 
 fn validate(input: &RuleInput) -> Result<(), RuleError> {
-    if input.sku == 0
+    if !valid_account_id(&input.account_id)
+        || input.sku == 0
         || !(1..=31).contains(&input.sales_window_days)
         || input.attributed_orders > input.ad_clicks
         || input.lead_time_days == Some(0)
@@ -106,6 +110,14 @@ fn validate(input: &RuleInput) -> Result<(), RuleError> {
     }
 }
 
+fn valid_account_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn stock_problem(input: &RuleInput) -> Option<PriorityProblem> {
     if input.sellable_stock == 0 && input.sold_units >= 3 {
         let kind = if input.ad_spend_minor > 0 {
@@ -114,6 +126,7 @@ fn stock_problem(input: &RuleInput) -> Option<PriorityProblem> {
             ProblemKind::Stockout
         };
         return Some(PriorityProblem {
+            account_id: input.account_id.clone(),
             sku: input.sku,
             kind,
             severity: Severity::Red,
@@ -137,6 +150,7 @@ fn stock_problem(input: &RuleInput) -> Option<PriorityProblem> {
         return None;
     };
     Some(PriorityProblem {
+        account_id: input.account_id.clone(),
         sku: input.sku,
         kind: ProblemKind::LowStockCover,
         severity,
@@ -163,6 +177,7 @@ fn spend_without_orders(input: &RuleInput, minimum: u64) -> Option<PriorityProbl
         return None;
     };
     Some(PriorityProblem {
+        account_id: input.account_id.clone(),
         sku: input.sku,
         kind: ProblemKind::SpendWithoutOrders,
         severity,
@@ -196,6 +211,7 @@ fn high_drr(input: &RuleInput) -> Option<PriorityProblem> {
         return None;
     };
     Some(PriorityProblem {
+        account_id: input.account_id.clone(),
         sku: input.sku,
         kind: ProblemKind::HighDrr,
         severity,
@@ -211,6 +227,7 @@ mod tests {
 
     fn input(sku: u64) -> RuleInput {
         RuleInput {
+            account_id: "ozon_store".to_owned(),
             sku,
             sellable_stock: 100,
             sold_units: 10,
@@ -238,6 +255,7 @@ mod tests {
         let problems = priority_problems(&values, true, 500).unwrap();
         assert_eq!(problems.len(), 5);
         assert_eq!(problems[0].sku, 7);
+        assert_eq!(problems[0].account_id, "ozon_store");
         assert_eq!(problems[0].kind, ProblemKind::AdvertisedWithoutStock);
         assert_eq!(problems[0].severity, Severity::Red);
         assert_eq!(problems[0].observed, 0);
@@ -312,7 +330,21 @@ mod tests {
             priority_problems(&[input(1), input(1)], true, 1),
             Err(RuleError::DuplicateSku)
         );
+        let same_sku_different_account = RuleInput {
+            account_id: "second_store".to_owned(),
+            ..input(1)
+        };
+        assert_eq!(
+            priority_problems(&[input(1), same_sku_different_account], true, 1)
+                .unwrap()
+                .len(),
+            0
+        );
         for invalid in [
+            RuleInput {
+                account_id: "bad account".to_owned(),
+                ..input(1)
+            },
             RuleInput { sku: 0, ..input(1) },
             RuleInput {
                 sales_window_days: 0,
