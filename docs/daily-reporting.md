@@ -28,6 +28,8 @@ The first disabled-only phase provides:
 - transactional source snapshots that start as `running`, become immutable at
   `succeeded`, `partial` or `failed`, verify their persisted row count and
   publish only terminal successful/partial projections; and
+- a bounded PostgreSQL reader that loads only published source descriptors and
+  revalidates the exact four-source manifest before report generation; and
 - a frozen snapshot-manifest contract requiring exactly one sales,
   advertising, stock and price source per scoped account, with source-specific
   freshness limits and fail-closed recommendation suppression for partial or
