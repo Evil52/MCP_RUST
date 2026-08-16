@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "enabled": false,
+  "timezone": "Asia/Yekaterinburg",
+  "sender_email_env": "DAILY_REPORT_SENDER_EMAIL",
+  "audiences": [
+    {
+      "id": "pilot_owner",
+      "email_env": "DAILY_REPORT_PILOT_RECIPIENT_EMAIL",
+      "managers": [
+        {
+          "actor_id": "diana_serafimovich",
+          "account_ids": ["furnitura_dlya_doma"]
+        },
+        {
+          "actor_id": "anna_agzamova",
+          "account_ids": ["ofk_region_wb"]
+        }
+      ]
+    }
+  ]
+}
