@@ -47,10 +47,13 @@ request and refuse collection while the circuit is open.
 
 ## Daily reporting persistence layer
 
-The database includes a separate `daily_reporting` outbox for the planned
+The database includes a separate `daily_reporting` boundary for the planned
 08:00/17:00 EKB reports. It stores immutable report occurrences, consolidated
-coverage, bounded delivery state and append-only provider attempts under a
-dedicated `report_worker` role. It does not store email bodies or credentials.
+coverage, bounded delivery state, append-only provider attempts and normalized
+sales, advertising, stock and price snapshots. A dedicated `report_collector`
+can append and finalize snapshots; `report_worker` can read only terminal
+published projections and operate the outbox. It does not store email bodies,
+credentials or marketplace payloads.
 There is still no `Поисковая видимость за сутки` Dashboard, task registry,
 email job, or Excel generation process. These are later consumers of persisted
 history. The planned compact view contains collection status and completeness,
@@ -70,7 +73,7 @@ run. They are exports rather than the system of record and are never stored in
 PostgreSQL. See `docs/search-position-monitoring.md` for the complete reporting
 contract.
 
-The initial architecture has four security principals:
+The initial architecture has five security principals:
 
 - `position_admin` owns the database and manages Ozon monitors and WB targets;
 - `position_collector` may read target definitions and append runs and
@@ -78,7 +81,9 @@ The initial architecture has four security principals:
 - `position_reader` is forced into read-only transactions and is the only role
   that the Rust MCP server may use;
 - `report_worker` can use only the reporting outbox and cannot read raw Ozon or
-  WB position history.
+  WB position history. It can read only published reporting snapshot views;
+- `report_collector` can append normalized report facts and finalize their
+  source snapshots. It cannot use the outbox or modify published facts.
 
 For WB, target identity fields are immutable at the database layer. On update,
 an admin may only pause/resume a target via `active`; a trigger owns
@@ -127,7 +132,7 @@ The stack can now be started as an inert infrastructure check. It cannot collect
 positions until a separately reviewed live-source phase is shipped. When ready:
 
 1. Copy `.position.env.example` to `.position.env`.
-2. Generate four different random passwords of at least 24 characters and keep the file mode
+2. Generate five different random passwords of at least 24 characters and keep the file mode
    `0600`. Bootstrap rejects the example placeholders, short values, reused passwords, and an
    admin username that collides with any restricted application role.
 3. Validate the Compose model:
@@ -145,14 +150,15 @@ positions until a separately reviewed live-source phase is shipped. When ready:
 The init scripts run only when the named volume is empty. A fresh database
 applies the base schema, the additive Ozon collector contract, the additive WB
 migration, restricted role grants, the Ozon adapter digest migration, then the
-daily reporting outbox migration.
+daily reporting outbox migration and normalized snapshot migration.
 Password rotation and schema migration after initial deployment must use an
 explicit migration, never volume deletion.
 
 ### Existing-volume daily reporting migration
 
 Back up the initialized database first. Create or rotate the restricted
-`report_worker` role by running the current `003_roles.sh` with all four
+`report_worker` and `report_collector` roles by running the current
+`003_roles.sh` with all five
 password environment variables, then apply the reporting migration exactly
 once as the database owner:
 
@@ -162,6 +168,9 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
   sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
   < position-monitor/initdb/005_daily_reporting_outbox.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/006_daily_report_snapshots.sql
 ```
 
 The migration is transactional. It creates no scheduler and sends no email.

@@ -35,6 +35,16 @@ SELECT
     AND to_regclass('daily_reporting.delivery_coverage') IS NOT NULL
     AND to_regclass('daily_reporting.delivery_attempts') IS NOT NULL
     AND to_regclass('daily_reporting.claimable_deliveries') IS NOT NULL
+    AND to_regclass('daily_reporting.source_snapshots') IS NOT NULL
+    AND to_regclass('daily_reporting.sales_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.advertising_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.stock_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.price_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.published_source_snapshots') IS NOT NULL
+    AND to_regclass('daily_reporting.published_sales_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.published_advertising_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.published_stock_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.published_price_facts') IS NOT NULL
     AND to_regprocedure(
         'daily_reporting.enforce_delivery_batch_state()'
     ) IS NOT NULL
@@ -43,6 +53,12 @@ SELECT
     ) IS NOT NULL
     AND to_regprocedure(
         'daily_reporting.require_active_delivery_attempt()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.enforce_source_snapshot_state()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.require_running_fact_snapshot()'
     ) IS NOT NULL
     AND (
         SELECT count(*) = 5
@@ -423,6 +439,36 @@ SELECT
     )
     AND NOT has_function_privilege(
         'report_worker', 'daily_reporting.enforce_delivery_batch_state()', 'EXECUTE'
+    )
+    AND has_database_privilege('report_collector', current_database(), 'CONNECT')
+    AND NOT has_database_privilege('report_collector', current_database(), 'TEMP')
+    AND has_schema_privilege('report_collector', 'daily_reporting', 'USAGE')
+    AND has_table_privilege(
+        'report_collector', 'daily_reporting.source_snapshots', 'SELECT,INSERT'
+    )
+    AND has_column_privilege(
+        'report_collector', 'daily_reporting.source_snapshots', 'status', 'UPDATE'
+    )
+    AND has_table_privilege(
+        'report_collector', 'daily_reporting.sales_facts', 'INSERT'
+    )
+    AND NOT has_table_privilege(
+        'report_collector', 'daily_reporting.delivery_batches', 'SELECT'
+    )
+    AND has_table_privilege(
+        'report_worker', 'daily_reporting.published_source_snapshots', 'SELECT'
+    )
+    AND has_table_privilege(
+        'report_worker', 'daily_reporting.published_sales_facts', 'SELECT'
+    )
+    AND NOT has_table_privilege(
+        'report_worker', 'daily_reporting.source_snapshots', 'SELECT'
+    )
+    AND NOT has_table_privilege(
+        'position_reader', 'daily_reporting.published_source_snapshots', 'SELECT'
+    )
+    AND NOT has_function_privilege(
+        'report_collector', 'daily_reporting.enforce_source_snapshot_state()', 'EXECUTE'
     )
     AND (
         SELECT rolconfig @> ARRAY['default_transaction_read_only=on']
