@@ -45,14 +45,18 @@ and the persistence adapter opens that circuit atomically for protective batch
 results. A future provider runner must claim the durable budget before every
 request and refuse collection while the circuit is open.
 
-## Planned daily reporting layer
+## Daily reporting persistence layer
 
-No `Поисковая видимость за сутки` Dashboard, task registry, email job, or Excel
-generation process is implemented in this directory. These are later consumers
-of persisted history. The planned compact view contains collection status and
-completeness, visibility rate, comparisons of complete reporting days, critical
-products, at most five priority problems, manager tasks, and a link to the
-bounded detailed report.
+The database includes a separate `daily_reporting` outbox for the planned
+08:00/17:00 EKB reports. It stores immutable report occurrences, consolidated
+coverage, bounded delivery state and append-only provider attempts under a
+dedicated `report_worker` role. It does not store email bodies or credentials.
+There is still no `Поисковая видимость за сутки` Dashboard, task registry,
+email job, or Excel generation process. These are later consumers of persisted
+history. The planned compact view contains collection status and completeness,
+visibility rate, comparisons of complete reporting days, critical products, at
+most five priority problems, manager tasks, and a link to the bounded detailed
+report.
 
 `found` and `not_found` are valid visibility observations. Blocked, failed and
 missing slots reduce completeness and cannot be treated as product invisibility.
@@ -66,13 +70,15 @@ run. They are exports rather than the system of record and are never stored in
 PostgreSQL. See `docs/search-position-monitoring.md` for the complete reporting
 contract.
 
-The initial architecture has three security principals:
+The initial architecture has four security principals:
 
 - `position_admin` owns the database and manages Ozon monitors and WB targets;
 - `position_collector` may read target definitions and append runs and
   snapshots. It cannot change target identity or update/delete WB snapshots;
 - `position_reader` is forced into read-only transactions and is the only role
-  that the Rust MCP server may use.
+  that the Rust MCP server may use;
+- `report_worker` can use only the reporting outbox and cannot read raw Ozon or
+  WB position history.
 
 For WB, target identity fields are immutable at the database layer. On update,
 an admin may only pause/resume a target via `active`; a trigger owns
@@ -121,9 +127,9 @@ The stack can now be started as an inert infrastructure check. It cannot collect
 positions until a separately reviewed live-source phase is shipped. When ready:
 
 1. Copy `.position.env.example` to `.position.env`.
-2. Generate three different random passwords of at least 24 characters and keep the file mode
+2. Generate four different random passwords of at least 24 characters and keep the file mode
    `0600`. Bootstrap rejects the example placeholders, short values, reused passwords, and an
-   admin username that collides with either restricted application role.
+   admin username that collides with any restricted application role.
 3. Validate the Compose model:
 
    ```bash
@@ -138,9 +144,29 @@ positions until a separately reviewed live-source phase is shipped. When ready:
 
 The init scripts run only when the named volume is empty. A fresh database
 applies the base schema, the additive Ozon collector contract, the additive WB
-migration, restricted role grants, then the Ozon adapter digest migration.
-Password rotation and schema migration
-after initial deployment must use an explicit migration, never volume deletion.
+migration, restricted role grants, the Ozon adapter digest migration, then the
+daily reporting outbox migration.
+Password rotation and schema migration after initial deployment must use an
+explicit migration, never volume deletion.
+
+### Existing-volume daily reporting migration
+
+Back up the initialized database first. Create or rotate the restricted
+`report_worker` role by running the current `003_roles.sh` with all four
+password environment variables, then apply the reporting migration exactly
+once as the database owner:
+
+```bash
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" REPORT_WORKER_DB_PASSWORD="$REPORT_WORKER_DB_PASSWORD" exec /docker-entrypoint-initdb.d/003_roles.sh'
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/005_daily_reporting_outbox.sql
+```
+
+The migration is transactional. It creates no scheduler and sends no email.
+Rebuild/recreate only `position-db` afterward to install the matching
+healthcheck, while retaining the named volume.
 
 ### Existing-volume Ozon collector migration
 

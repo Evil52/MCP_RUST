@@ -31,6 +31,31 @@ SELECT
     AND to_regclass('search_position.wb_bid_snapshots') IS NOT NULL
     AND to_regclass('search_position.latest_wb_search_snapshots') IS NOT NULL
     AND to_regclass('search_position.latest_wb_bid_snapshots') IS NOT NULL
+    AND to_regclass('daily_reporting.delivery_batches') IS NOT NULL
+    AND to_regclass('daily_reporting.delivery_coverage') IS NOT NULL
+    AND to_regclass('daily_reporting.delivery_attempts') IS NOT NULL
+    AND to_regclass('daily_reporting.claimable_deliveries') IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.enforce_delivery_batch_state()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.require_planned_delivery_coverage()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.require_active_delivery_attempt()'
+    ) IS NOT NULL
+    AND (
+        SELECT count(*) = 5
+        FROM pg_trigger
+        WHERE tgname IN (
+            'delivery_batches_enforce_state',
+            'delivery_coverage_requires_planned_batch',
+            'delivery_coverage_is_append_only',
+            'delivery_attempts_require_active_send',
+            'delivery_attempts_are_append_only'
+        )
+          AND NOT tgisinternal
+    )
     AND to_regprocedure(
         'search_position.enforce_wb_search_target_update()'
     ) IS NOT NULL
@@ -359,6 +384,45 @@ SELECT
         'position_reader',
         'search_position.require_running_wb_snapshot_run()',
         'EXECUTE'
+    )
+    AND has_database_privilege('report_worker', current_database(), 'CONNECT')
+    AND NOT has_database_privilege('report_worker', current_database(), 'TEMP')
+    AND has_schema_privilege('report_worker', 'daily_reporting', 'USAGE')
+    AND has_table_privilege(
+        'report_worker', 'daily_reporting.delivery_batches', 'SELECT,INSERT'
+    )
+    AND has_column_privilege(
+        'report_worker', 'daily_reporting.delivery_batches', 'status', 'UPDATE'
+    )
+    AND NOT has_table_privilege(
+        'report_worker', 'daily_reporting.delivery_batches', 'DELETE'
+    )
+    AND has_table_privilege(
+        'report_worker', 'daily_reporting.delivery_coverage', 'SELECT,INSERT'
+    )
+    AND NOT has_table_privilege(
+        'report_worker', 'daily_reporting.delivery_coverage', 'UPDATE'
+    )
+    AND has_table_privilege(
+        'report_worker', 'daily_reporting.delivery_attempts', 'SELECT,INSERT'
+    )
+    AND NOT has_table_privilege(
+        'report_worker', 'daily_reporting.delivery_attempts', 'UPDATE'
+    )
+    AND has_table_privilege(
+        'report_worker', 'daily_reporting.claimable_deliveries', 'SELECT'
+    )
+    AND NOT has_table_privilege(
+        'report_worker', 'search_position.monitors', 'SELECT'
+    )
+    AND NOT has_table_privilege(
+        'position_collector', 'daily_reporting.delivery_batches', 'SELECT'
+    )
+    AND NOT has_table_privilege(
+        'position_reader', 'daily_reporting.delivery_batches', 'SELECT'
+    )
+    AND NOT has_function_privilege(
+        'report_worker', 'daily_reporting.enforce_delivery_batch_state()', 'EXECUTE'
     )
     AND (
         SELECT rolconfig @> ARRAY['default_transaction_read_only=on']

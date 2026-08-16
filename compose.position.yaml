@@ -13,6 +13,7 @@ services:
       POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
       POSITION_COLLECTOR_DB_PASSWORD: ${POSITION_COLLECTOR_DB_PASSWORD:?POSITION_COLLECTOR_DB_PASSWORD is required}
       POSITION_READER_DB_PASSWORD: ${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}
+      REPORT_WORKER_DB_PASSWORD: ${REPORT_WORKER_DB_PASSWORD:?REPORT_WORKER_DB_PASSWORD is required}
     volumes:
       - position-data:/var/lib/postgresql/data
     networks:

@@ -10,6 +10,7 @@ container="mcp-ozon-position-schema-test-${suffix}"
 admin_password="position-admin-schema-test"
 collector_password="position-collector-schema-test"
 reader_password="position-reader-schema-test"
+report_worker_password="report-worker-schema-test"
 
 case "$keep_image" in
   true | false) ;;
@@ -64,6 +65,7 @@ expect_exact_validation_failure \
   POSTGRES_DB=ozon_positions \
   POSITION_COLLECTOR_DB_PASSWORD="$collector_password" \
   POSITION_READER_DB_PASSWORD="$reader_password" \
+  REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
 
 expect_exact_validation_failure \
@@ -75,6 +77,7 @@ expect_exact_validation_failure \
   POSTGRES_DB=ozon_positions \
   POSITION_COLLECTOR_DB_PASSWORD="$collector_password" \
   POSITION_READER_DB_PASSWORD="$reader_password" \
+  REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
 
 docker build --pull --tag "$image" --file "$project_root/position-monitor/Dockerfile" \
@@ -92,6 +95,7 @@ docker run --detach --rm --name "$container" \
   --env 'POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256' \
   --env POSITION_COLLECTOR_DB_PASSWORD="$collector_password" \
   --env POSITION_READER_DB_PASSWORD="$reader_password" \
+  --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   "$image" >/dev/null
 
 ready=false
@@ -121,6 +125,11 @@ collector_psql=(
 reader_psql=(
   docker exec --env PGPASSWORD="$reader_password" "$container"
   psql --host 127.0.0.1 --username position_reader --dbname ozon_positions
+  --no-psqlrc --set ON_ERROR_STOP=1
+)
+report_worker_psql=(
+  docker exec --env PGPASSWORD="$report_worker_password" "$container"
+  psql --host 127.0.0.1 --username report_worker --dbname ozon_positions
   --no-psqlrc --set ON_ERROR_STOP=1
 )
 
@@ -158,7 +167,7 @@ migration_admin_psql=(
 " >/dev/null
 "${admin_psql[@]}" --command '
   GRANT CONNECT ON DATABASE migration_probe
-      TO position_collector, position_reader
+      TO position_collector, position_reader, report_worker
 ' >/dev/null
 "${migration_admin_psql[@]}" --command '
   GRANT USAGE ON SCHEMA search_position
@@ -174,6 +183,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/002_wb_official_history.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/004_ozon_postgres_adapter.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/005_daily_reporting_outbox.sql >/dev/null
 "${migration_admin_psql[@]}" --command '
   CREATE TABLE search_position.reader_default_acl_probe (id integer)
 ' >/dev/null
@@ -246,9 +257,20 @@ migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
           'position_reader',
           'search_position.reader_default_acl_probe',
           'SELECT'
+      ),
+      to_regclass('daily_reporting.delivery_batches') IS NOT NULL,
+      has_table_privilege(
+          'report_worker',
+          'daily_reporting.delivery_batches',
+          'INSERT'
+      ),
+      NOT has_table_privilege(
+          'position_reader',
+          'daily_reporting.delivery_batches',
+          'SELECT'
       )
   "; } | tr -d '\r')"
-if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
+if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
   echo "existing-volume migrations did not install the expected schema/ACL" >&2
   printf '%s\n' "$migration_acl" >&2
   exit 1
@@ -310,6 +332,7 @@ expect_failure_containing \
   --env POSTGRES_DB=ozon_positions \
   --env POSITION_COLLECTOR_DB_PASSWORD="$rollback_collector_password" \
   --env POSITION_READER_DB_PASSWORD="$rollback_reader_password" \
+  --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   "$container" \
   /docker-entrypoint-initdb.d/003_roles.sh
 "${admin_psql[@]}" \
@@ -1547,6 +1570,135 @@ expect_failure_containing \
   --command 'SET default_transaction_read_only=off' \
   --command 'UPDATE search_position.wb_search_snapshots SET orders = 5 WHERE id = 1'
 
+# Reporting outbox: two missed occurrences are atomically covered by one
+# delivery, provider attempts are append-only, and terminal delivery is frozen.
+"${report_worker_psql[@]}" --command "
+  INSERT INTO daily_reporting.delivery_batches
+      (recipient_id, report_version, scheduled_for, delayed)
+  VALUES ('pilot_owner', 1, '2099-08-16 12:00:00+00', true);
+  INSERT INTO daily_reporting.delivery_coverage
+      (
+          batch_id, recipient_id, report_version, local_date, report_kind,
+          scheduled_for, deadline_at
+      )
+  VALUES
+      (
+          1, 'pilot_owner', 1, '2099-08-16', 'morning',
+          '2099-08-16 03:00:00+00', '2099-08-16 09:00:00+00'
+      ),
+      (
+          1, 'pilot_owner', 1, '2099-08-16', 'evening',
+          '2099-08-16 12:00:00+00', '2099-08-16 18:00:00+00'
+      );
+  UPDATE daily_reporting.delivery_batches
+  SET status = 'generating', updated_at = updated_at + interval '1 second'
+  WHERE id = 1;
+  UPDATE daily_reporting.delivery_batches
+  SET status = 'ready',
+      artifact_object_key = 'reports/2099-08-16/pilot-owner.xlsx',
+      artifact_sha256 = repeat('a', 64),
+      updated_at = updated_at + interval '1 second'
+  WHERE id = 1;
+  UPDATE daily_reporting.delivery_batches
+  SET status = 'sending', attempts = 1,
+      updated_at = updated_at + interval '1 second'
+  WHERE id = 1;
+  INSERT INTO daily_reporting.delivery_attempts
+      (
+          batch_id, attempt_no, started_at, finished_at, outcome,
+          provider_message_id
+      )
+  VALUES
+      (
+          1, 1, '2099-08-16 12:01:00+00', '2099-08-16 12:01:01+00',
+          'sent', 'gmail-message-1'
+      );
+  UPDATE daily_reporting.delivery_batches
+  SET status = 'sent', provider_message_id = 'gmail-message-1',
+      sent_at = '2099-08-16 12:01:01+00',
+      updated_at = updated_at + interval '1 second'
+  WHERE id = 1;
+" >/dev/null
+
+report_delivery="$({ "${report_worker_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT batch.status, batch.delayed, batch.attempts,
+           count(coverage.report_kind), min(coverage.report_kind),
+           max(coverage.report_kind), count(attempt.id)
+    FROM daily_reporting.delivery_batches AS batch
+    JOIN daily_reporting.delivery_coverage AS coverage
+      ON coverage.batch_id = batch.id
+    JOIN daily_reporting.delivery_attempts AS attempt
+      ON attempt.batch_id = batch.id
+    WHERE batch.id = 1
+    GROUP BY batch.id
+  "; } | tr -d '\r')"
+if [[ "$report_delivery" != "sent:t:1:2:evening:morning:2" ]]; then
+  echo "consolidated report delivery was not persisted exactly" >&2
+  printf '%s\n' "$report_delivery" >&2
+  exit 1
+fi
+
+expect_failure_containing \
+  "duplicate report occurrence coverage" \
+  "duplicate key value violates unique constraint" \
+  "${report_worker_psql[@]}" \
+  --command "
+    INSERT INTO daily_reporting.delivery_batches
+        (recipient_id, report_version, scheduled_for)
+    VALUES ('pilot_owner', 1, '2099-08-16 03:00:00+00');
+    INSERT INTO daily_reporting.delivery_coverage
+        (
+            batch_id, recipient_id, report_version, local_date, report_kind,
+            scheduled_for, deadline_at
+        )
+    VALUES
+        (
+            2, 'pilot_owner', 1, '2099-08-16', 'morning',
+            '2099-08-16 03:00:00+00', '2099-08-16 09:00:00+00'
+        )
+  "
+
+expect_failure_containing \
+  "terminal report mutation" \
+  "terminal report delivery is immutable" \
+  "${report_worker_psql[@]}" \
+  --command "
+    UPDATE daily_reporting.delivery_batches
+    SET status = 'expired', updated_at = updated_at + interval '1 second'
+    WHERE id = 1
+  "
+
+expect_failure_containing \
+  "report coverage mutation" \
+  "permission denied for table delivery_coverage" \
+  "${report_worker_psql[@]}" \
+  --command "
+    UPDATE daily_reporting.delivery_coverage
+    SET deadline_at = deadline_at + interval '1 minute'
+    WHERE batch_id = 1
+  "
+
+expect_failure_containing \
+  "report attempt mutation" \
+  "permission denied for table delivery_attempts" \
+  "${report_worker_psql[@]}" \
+  --command "
+    DELETE FROM daily_reporting.delivery_attempts WHERE batch_id = 1
+  "
+
+expect_failure_containing \
+  "report worker marketplace-history access" \
+  "permission denied for schema search_position" \
+  "${report_worker_psql[@]}" \
+  --command 'SELECT count(*) FROM search_position.monitors'
+
+expect_failure_containing \
+  "position reader report-outbox access" \
+  "permission denied for schema daily_reporting" \
+  "${reader_psql[@]}" \
+  --command 'SELECT count(*) FROM daily_reporting.delivery_batches'
+
 expect_failure_containing \
   "position_reader TEMPORARY privilege" \
   "permission denied to create temporary tables in database" \
@@ -1561,6 +1713,12 @@ expect_failure_containing \
   --command 'CREATE TEMP TABLE must_be_denied(id integer)'
 
 expect_failure_containing \
+  "report_worker TEMPORARY privilege" \
+  "permission denied to create temporary tables in database" \
+  "${report_worker_psql[@]}" \
+  --command 'CREATE TEMP TABLE must_be_denied(id integer)'
+
+expect_failure_containing \
   "position_reader write access" \
   "permission denied for table monitors" \
   "${reader_psql[@]}" \
@@ -1571,10 +1729,11 @@ expect_failure_containing \
     VALUES ('denied', 'denied', 'denied', 'denied', 'denied')
   "
 
-for role in position_collector position_reader; do
+for role in position_collector position_reader report_worker; do
   case "$role" in
     position_collector) role_password="$collector_password" ;;
     position_reader) role_password="$reader_password" ;;
+    report_worker) role_password="$report_worker_password" ;;
   esac
   expect_failure_containing \
     "$role connection to the postgres database" \
@@ -1616,10 +1775,10 @@ role_attributes="$("${admin_psql[@]}" --tuples-only --no-align --field-separator
     SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, rolinherit,
            rolreplication, rolbypassrls, rolconnlimit
     FROM pg_roles
-    WHERE rolname IN ('position_collector', 'position_reader')
+    WHERE rolname IN ('position_collector', 'position_reader', 'report_worker')
     ORDER BY rolname
   ")"
-expected_attributes=$'position_collector:f:f:f:f:f:f:4\nposition_reader:f:f:f:f:f:f:16'
+expected_attributes=$'position_collector:f:f:f:f:f:f:4\nposition_reader:f:f:f:f:f:f:16\nreport_worker:f:f:f:f:f:f:4'
 if [[ "$role_attributes" != "$expected_attributes" ]]; then
   echo "restricted database role attributes differ from the expected policy" >&2
   printf '%s\n' "$role_attributes" >&2

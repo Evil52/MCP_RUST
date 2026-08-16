@@ -17,7 +17,12 @@ The first disabled-only phase provides:
   transient error classes;
 - artifact SHA-256 and provider-message identities without storing message
   bodies or credentials in the state machine; and
-- a strict routing policy validated against the authoritative access registry.
+- a strict routing policy validated against the authoritative access registry;
+- a transactional PostgreSQL outbox with immutable occurrence coverage,
+  bounded attempts, `FOR UPDATE SKIP LOCKED` claims and append-only delivery
+  audit; and
+- a dedicated least-privilege `report_worker` role that cannot read the raw
+  marketplace-history schema.
 
 The pilot example is disabled and scopes the temporary owner report to Diana's
 Ozon account and Anna Agzamova's Wildberries account. Sender and recipient
@@ -26,26 +31,27 @@ tokens and actual addresses must not be committed.
 
 ## Not implemented yet
 
-No scheduler process, PostgreSQL outbox adapter, marketplace snapshot job,
-HTML/XLSX generator, S3 writer or mail provider is wired. Consequently this
-phase cannot send email and cannot affect a marketplace. Search-position
-collection remains disabled.
+No scheduler process, marketplace snapshot job, HTML/XLSX generator, S3 writer
+or mail provider is wired. Consequently this phase cannot send email and
+cannot affect a marketplace. Search-position collection remains disabled.
 
-The next persistence phase must transactionally store report occurrences,
-delivery coverage and attempts. A unique occurrence key is
+The persistence layer transactionally stores report occurrences, delivery
+coverage and attempts. Its unique occurrence key is
 `(local_date, kind, recipient_id, report_version)`. Consolidated mail covers two
 such keys in one delivery; either both keys are committed or neither is. A
-crash/restart must recover pending work without creating a second provider
-message.
+crash before a provider call leaves work claimable. A crash after a delivery is
+claimed deliberately leaves the batch in `sending` for operator reconciliation:
+an ambiguous provider result is never retried automatically.
 
 ## Planned pilot
 
 1. Persist normalized snapshots for sales, advertising, stocks and prices.
-2. Add a PostgreSQL outbox adapter and restart recovery tests.
-3. Generate deterministic HTML and XLSX from one frozen snapshot manifest.
+2. Generate deterministic HTML and XLSX from one frozen snapshot manifest.
+3. Add the scheduler/runtime around the persisted PostgreSQL outbox.
 4. Run dry mode for Diana and Anna with delivery disabled.
-5. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
-6. Reconcile figures for five to seven days before enabling other managers.
+5. Connect S3-compatible artifact storage and one service mailbox.
+6. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
+7. Reconcile figures for five to seven days before enabling other managers.
 
 ChatGPT remains the interactive analytics interface. Scheduled collection,
 calculation, artifact generation and delivery must remain server-side so they

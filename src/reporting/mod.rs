@@ -11,6 +11,7 @@ use thiserror::Error;
 
 pub mod outbox;
 pub mod policy;
+pub mod postgres_outbox;
 
 const YEKATERINBURG_OFFSET_SECONDS: i32 = 5 * 60 * 60;
 const MORNING_HOUR: u32 = 8;

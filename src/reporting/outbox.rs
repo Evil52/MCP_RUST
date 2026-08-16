@@ -190,14 +190,7 @@ impl DeliveryRecord {
         if self.status != DeliveryStatus::Sending {
             return Err(OutboxError::InvalidTransition);
         }
-        if provider_message_id.is_empty()
-            || provider_message_id.len() > 512
-            || !provider_message_id.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'@')
-            })
-        {
-            return Err(OutboxError::InvalidProviderMessageId);
-        }
+        validate_provider_message_id(&provider_message_id)?;
         self.provider_message_id = Some(provider_message_id);
         self.last_error = None;
         self.status = DeliveryStatus::Sent;
@@ -257,13 +250,25 @@ fn deadline(keys: &[ReportKey]) -> Result<DateTime<Utc>, OutboxError> {
     maximum.ok_or(OutboxError::InvalidSchedule)
 }
 
-fn validate_artifact(artifact: &ArtifactIdentity) -> Result<(), OutboxError> {
+pub(super) fn validate_artifact(artifact: &ArtifactIdentity) -> Result<(), OutboxError> {
     if artifact.object_key.is_empty()
         || artifact.object_key.len() > 512
         || artifact.sha256.len() != 64
         || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(OutboxError::InvalidArtifact);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_provider_message_id(value: &str) -> Result<(), OutboxError> {
+    if value.is_empty()
+        || value.len() > 512
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'@')
+        })
+    {
+        return Err(OutboxError::InvalidProviderMessageId);
     }
     Ok(())
 }

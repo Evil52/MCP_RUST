@@ -46,6 +46,7 @@ printf '%s\n' \
   'POSITION_DB_ADMIN_PASSWORD=verify-only-admin-not-a-secret' \
   'POSITION_COLLECTOR_DB_PASSWORD=verify-only-collector-not-a-secret' \
   'POSITION_READER_DB_PASSWORD=verify-only-reader-not-a-secret' \
+  'REPORT_WORKER_DB_PASSWORD=verify-only-report-worker-not-a-secret' \
   >"$interpolation_env"
 chmod 600 "$interpolation_env"
 
