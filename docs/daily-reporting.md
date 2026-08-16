@@ -30,6 +30,9 @@ The first disabled-only phase provides:
   publish only terminal successful/partial projections; and
 - a bounded PostgreSQL reader that loads only published source descriptors and
   revalidates the exact four-source manifest before report generation; and
+- deterministic integer KPI formulas for ordered units, operational GMV, CTR,
+  CPC, advertising conversion, CPO and advertising-revenue DRR; zero
+  denominators remain `N/D` and aggregation overflow fails closed; and
 - a frozen snapshot-manifest contract requiring exactly one sales,
   advertising, stock and price source per scoped account, with source-specific
   freshness limits and fail-closed recommendation suppression for partial or
