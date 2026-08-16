@@ -14,6 +14,7 @@ pub mod outbox;
 pub mod policy;
 pub mod postgres_outbox;
 pub mod postgres_snapshot;
+pub mod rules;
 pub mod snapshot;
 
 const YEKATERINBURG_OFFSET_SECONDS: i32 = 5 * 60 * 60;

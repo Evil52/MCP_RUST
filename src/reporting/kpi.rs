@@ -91,11 +91,11 @@ pub fn calculate_kpis(
         )?;
     }
 
-    summary.ctr = percentage(summary.ad_clicks, summary.ad_impressions);
+    summary.ctr = percentage(summary.ad_clicks, summary.ad_impressions)?;
     summary.cpc_minor = per_event(summary.ad_spend_minor, summary.ad_clicks);
-    summary.ad_conversion = percentage(summary.attributed_orders, summary.ad_clicks);
+    summary.ad_conversion = percentage(summary.attributed_orders, summary.ad_clicks)?;
     summary.cpo_minor = per_event(summary.ad_spend_minor, summary.attributed_orders);
-    summary.drr = percentage(summary.ad_spend_minor, summary.attributed_revenue_minor);
+    summary.drr = percentage(summary.ad_spend_minor, summary.attributed_revenue_minor)?;
     Ok(summary)
 }
 
@@ -103,12 +103,15 @@ fn checked_sum(total: u64, value: u64) -> Result<u64, KpiError> {
     total.checked_add(value).ok_or(KpiError::Overflow)
 }
 
-fn percentage(numerator: u64, denominator: u64) -> Option<BasisPoints> {
-    (denominator != 0).then(|| {
-        let scaled = u128::from(numerator) * 10_000;
-        let rounded = (scaled + u128::from(denominator / 2)) / u128::from(denominator);
-        BasisPoints(u64::try_from(rounded).expect("u64 percentage scaled by 10,000 fits u64"))
-    })
+fn percentage(numerator: u64, denominator: u64) -> Result<Option<BasisPoints>, KpiError> {
+    if denominator == 0 {
+        return Ok(None);
+    }
+    let scaled = u128::from(numerator) * 10_000;
+    let rounded = (scaled + u128::from(denominator / 2)) / u128::from(denominator);
+    Ok(Some(BasisPoints(
+        u64::try_from(rounded).map_err(|_| KpiError::Overflow)?,
+    )))
 }
 
 fn per_event(amount_minor: u64, events: u64) -> Option<u64> {
@@ -281,5 +284,18 @@ mod tests {
                 Err(KpiError::Overflow)
             );
         }
+        assert_eq!(
+            calculate_kpis(
+                &[],
+                &[AdvertisingMetricInput {
+                    impressions: 1,
+                    clicks: 0,
+                    spend_minor: u64::MAX,
+                    attributed_orders: 0,
+                    attributed_revenue_minor: 1,
+                }]
+            ),
+            Err(KpiError::Overflow)
+        );
     }
 }

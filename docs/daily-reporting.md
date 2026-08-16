@@ -33,6 +33,9 @@ The first disabled-only phase provides:
 - deterministic integer KPI formulas for ordered units, operational GMV, CTR,
   CPC, advertising conversion, CPO and advertising-revenue DRR; zero
   denominators remain `N/D` and aggregation overflow fails closed; and
+- a bounded deterministic rule engine for stockouts, low stock cover,
+  advertising without stock, spend without attributed orders and high DRR;
+  incomplete manifests suppress actions and only five ranked problems survive;
 - a frozen snapshot-manifest contract requiring exactly one sales,
   advertising, stock and price source per scoped account, with source-specific
   freshness limits and fail-closed recommendation suppression for partial or
