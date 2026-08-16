@@ -134,6 +134,7 @@ jobs:
           --all-targets
           --all-features
           --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector))\.rs$'
+          --show-missing-lines
           --fail-under-lines 100
 
   dependency-security:

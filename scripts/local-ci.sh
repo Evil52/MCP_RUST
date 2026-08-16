@@ -37,9 +37,10 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
 fi
 ./scripts/with-position-test-db.sh cargo llvm-cov \
   --locked \
-  --all-targets \
-  --all-features \
-  --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector))\.rs$' \
-  --fail-under-lines 100
+    --all-targets \
+    --all-features \
+    --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector))\.rs$' \
+    --show-missing-lines \
+    --fail-under-lines 100
 
 echo "Local CI passed."
