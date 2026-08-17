@@ -150,7 +150,7 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         date_from: NaiveDate,
         date_to: NaiveDate,
     ) -> Result<OzonCollectedFacts, OzonReportSourceError> {
-        let sales = self.sales_page(date_from, date_to, 0).await?;
+        let sales = self.collect_sales_pages(date_from, date_to).await?;
         let stocks = self.collect_stock_pages().await?;
         let prices = self.collect_price_pages().await?;
         Ok(OzonCollectedFacts {
@@ -170,6 +170,30 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             .map_err(|_| OzonReportSourceError::InvalidResponse)?;
         let response = self.transport.post(request).await?;
         parse_sales_page(&response).map_err(parse_error)
+    }
+
+    /// Collects offset-paginated sales rows with the same hard bound used for
+    /// the cursor sources. A full-size final page is not accepted as complete
+    /// because the upstream response has no trustworthy total-row contract.
+    pub async fn collect_sales_pages(
+        &self,
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<Vec<CollectedSalesFact>, OzonReportSourceError> {
+        let mut facts = Vec::new();
+        for page in 0..MAX_PAGES_PER_SOURCE {
+            let offset = u32::try_from(page)
+                .ok()
+                .and_then(|page| page.checked_mul(1_000))
+                .ok_or(OzonReportSourceError::PaginationLimit)?;
+            let rows = self.sales_page(date_from, date_to, offset).await?;
+            let complete = rows.len() < 1_000;
+            facts.extend(rows);
+            if complete {
+                return Ok(facts);
+            }
+        }
+        Err(OzonReportSourceError::PaginationLimit)
     }
 
     pub async fn stock_page(
@@ -354,6 +378,21 @@ mod tests {
                 stocks: vec![],
                 prices: vec![]
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn sales_collection_stops_at_a_short_page() {
+        let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([Ok(
+            json!({"result":{"data":[]}}),
+        )]))));
+        let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
+        assert!(
+            source
+                .collect_sales_pages(day, day)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
