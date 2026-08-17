@@ -1,9 +1,12 @@
-use std::{fs, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use tokio_postgres::{Config, config::Host};
 
-use crate::config::{AccessRegistry, RegistrySource};
+use crate::{
+    config::{AccessRegistry, Marketplace, RegistrySource, StoreCredentials, StoreId},
+    ozon::OzonClient,
+};
 
 use super::{
     collector_plan::{CollectionPlanError, CollectionTarget, build_collection_plan},
@@ -17,10 +20,18 @@ const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
 const MODE_ENV: &str = "REPORT_COLLECTOR_MODE";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const OZON_DRY_RUN_TIMEOUT: Duration = Duration::from_secs(20);
+const OZON_SELLER_API_BASE_URL: &str = "https://api-seller.ozon.ru";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportCollectorMode {
     Disabled,
+    /// Explicit preparation mode for the Ozon Seller dry-run adapter.
+    ///
+    /// The binary still refuses to execute collection until its separate
+    /// source/persistence implementation is enabled. This mode only permits
+    /// constructing a narrowly scoped read-only client for that future step.
+    OzonDryRun,
 }
 
 /// Credential-free configuration for the initial report collector runtime.
@@ -33,13 +44,15 @@ pub struct ReportCollectorConfig {
     mode: ReportCollectorMode,
     policy: DailyReportPolicy,
     registry: Arc<AccessRegistry>,
+    ozon_dry_run_stores: BTreeMap<StoreId, StoreCredentials>,
 }
 
 impl ReportCollectorConfig {
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
         let mode = match lookup(MODE_ENV).as_deref().unwrap_or("disabled") {
             "disabled" => ReportCollectorMode::Disabled,
-            _ => bail!("only the disabled report-collector runtime mode is available"),
+            "ozon_dry_run" => ReportCollectorMode::OzonDryRun,
+            _ => bail!("report-collector mode is unsupported"),
         };
         let raw_database =
             lookup(DATABASE_URL_ENV).context("REPORT_COLLECTOR_DATABASE_URL is required")?;
@@ -60,11 +73,18 @@ impl ReportCollectorConfig {
             .context("MCP_ACCESS_CONFIG cannot be loaded")?;
         let policy = DailyReportPolicy::from_slice(&policy_bytes, &registry)
             .context("DAILY_REPORT_POLICY is invalid")?;
+        let ozon_dry_run_stores = match mode {
+            ReportCollectorMode::Disabled => BTreeMap::new(),
+            ReportCollectorMode::OzonDryRun => {
+                resolve_ozon_dry_run_stores(&registry, &policy, &mut lookup)?
+            }
+        };
         Ok(Self {
             database,
             mode,
             policy,
             registry,
+            ozon_dry_run_stores,
         })
     }
 
@@ -85,6 +105,65 @@ impl ReportCollectorConfig {
             .await
             .context("daily report snapshot writer is unavailable")
     }
+
+    /// Builds a read-only Ozon client containing only accounts selected by
+    /// the report policy. It is unavailable in normal disabled mode.
+    pub fn ozon_dry_run_client(&self) -> Result<OzonClient> {
+        ensure!(
+            self.mode == ReportCollectorMode::OzonDryRun && !self.ozon_dry_run_stores.is_empty(),
+            "Ozon dry-run credentials are unavailable in disabled mode"
+        );
+        Ok(OzonClient::new(
+            OZON_SELLER_API_BASE_URL.to_owned(),
+            OZON_DRY_RUN_TIMEOUT,
+            self.ozon_dry_run_stores.clone(),
+        )?)
+    }
+}
+
+fn resolve_ozon_dry_run_stores(
+    registry: &AccessRegistry,
+    policy: &DailyReportPolicy,
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<BTreeMap<StoreId, StoreCredentials>> {
+    let plan = build_collection_plan(policy, registry)
+        .map_err(|error| anyhow::anyhow!("daily report collection plan is invalid: {error}"))?;
+    let mut stores = BTreeMap::new();
+    for target in plan
+        .into_iter()
+        .filter(|target| target.marketplace == super::snapshot::Marketplace::Ozon)
+    {
+        let account = registry
+            .accounts
+            .iter()
+            .find(|account| {
+                account.id == target.account_id && account.marketplace == Marketplace::Ozon
+            })
+            .context("Ozon report account is unavailable")?;
+        let binding = account
+            .ozon
+            .as_ref()
+            .context("Ozon report binding is unavailable")?;
+        let client_id = lookup(&binding.client_id_env)
+            .with_context(|| format!("{} is required for Ozon dry-run", binding.client_id_env))?;
+        let api_key = lookup(&binding.api_key_env)
+            .with_context(|| format!("{} is required for Ozon dry-run", binding.api_key_env))?;
+        ensure!(
+            !client_id.is_empty() && !api_key.is_empty(),
+            "Ozon dry-run credentials must not be empty"
+        );
+        // AccessRegistry validates store_id uniqueness before this point, so
+        // insertion cannot silently replace credentials for another account.
+        stores.insert(
+            binding.store_id.clone(),
+            StoreCredentials { client_id, api_key },
+        );
+    }
+    ensure!(
+        !stores.is_empty(),
+        "the report policy contains no Ozon account for Ozon dry-run"
+    );
+    Ok(stores)
 }
 
 fn validate_database(config: &Config) -> Result<()> {
@@ -137,7 +216,7 @@ mod tests {
     fn entries() -> Vec<(&'static str, String)> {
         let registry = file(
             "registry",
-            r#"{"version":1,"actors":[{"id":"diana","name":"Diana","role":"manager","oidc":{"username":"diana"}}],"accounts":[{"id":"ozon","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana","ozon":{"store_id":"1","client_id_env":"ID","api_key_env":"KEY","performance":{"client_id_env":"PERF_ID","client_secret_env":"PERF_SECRET"}}}]}"#,
+            r#"{"version":1,"actors":[{"id":"diana","name":"Diana","role":"manager","oidc":{"username":"diana"}},{"id":"wb","name":"WB","role":"manager","oidc":{"username":"wb"}}],"accounts":[{"id":"ozon","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana","ozon":{"store_id":"1","client_id_env":"ID","api_key_env":"KEY","performance":{"client_id_env":"PERF_ID","client_secret_env":"PERF_SECRET"}}},{"id":"wb","organization":"WB","marketplace":"wildberries","seller_client_id":"2","manager_id":"wb","wildberries":{"api_token_env":"WB_TOKEN"}}]}"#,
         );
         let policy = file(
             "policy",
@@ -188,6 +267,45 @@ mod tests {
         assert!(config(&values).is_err());
         let mut values = entries();
         values[2] = (POLICY_PATH_ENV, values[1].1.clone());
+        assert!(config(&values).is_err());
+    }
+
+    #[test]
+    fn explicit_ozon_dry_run_resolves_only_the_policy_scoped_seller_binding() {
+        let disabled = config(&entries()).unwrap();
+        assert!(disabled.ozon_dry_run_client().is_err());
+
+        let mut values = entries();
+        values.extend([
+            (MODE_ENV, "ozon_dry_run".to_owned()),
+            ("ID", "client-id".to_owned()),
+            ("KEY", "api-key".to_owned()),
+            // This unrelated credential is deliberately not resolved: the
+            // selected policy contains no WB dry-run source in this phase.
+            ("WB_TOKEN", "unrelated-wb-token".to_owned()),
+        ]);
+        let dry_run = config(&values).unwrap();
+        assert_eq!(dry_run.mode(), ReportCollectorMode::OzonDryRun);
+        assert!(
+            dry_run
+                .ozon_dry_run_client()
+                .unwrap()
+                .is_configured(&StoreId::from("1"))
+        );
+
+        let mixed_policy = file(
+            "mixed-policy",
+            r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]},{"actor_id":"wb","account_ids":["wb"]}]}]}"#,
+        );
+        values[2] = (POLICY_PATH_ENV, mixed_policy.display().to_string());
+        // The WB plan target is intentionally skipped rather than causing its
+        // token to be read by the Ozon-only dry-run client.
+        assert!(config(&values).unwrap().ozon_dry_run_client().is_ok());
+
+        let mut missing_id = values.clone();
+        missing_id.retain(|(key, _)| *key != "ID");
+        assert!(config(&missing_id).is_err());
+        values.retain(|(key, _)| *key != "KEY");
         assert!(config(&values).is_err());
     }
 }
