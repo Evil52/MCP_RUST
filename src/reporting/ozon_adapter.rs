@@ -17,6 +17,17 @@ use super::postgres_collector::{CollectedPriceFact, CollectedSalesFact, Collecte
 
 const MAX_PAGE_ROWS: usize = 1_000;
 const MAX_WAREHOUSE_KIND_BYTES: usize = 64;
+const MAX_CURSOR_BYTES: usize = 4_096;
+
+/// One exact Seller API request approved for the daily-report Ozon source.
+///
+/// The network runtime must submit it through [`crate::ozon::OzonClient`],
+/// whose fixed read-only allowlist is the final egress control.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OzonReportRequest {
+    pub path: &'static str,
+    pub payload: Value,
+}
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum OzonReportParseError {
@@ -28,6 +39,57 @@ pub enum OzonReportParseError {
     TooManyRows,
     #[error("Ozon report response has an unsupported currency")]
     Currency,
+}
+
+/// Builds the only sales request accepted by the daily-report normalizer.
+///
+/// It requires a non-empty, inclusive UTC business-date window and preserves
+/// a fixed positional metrics contract for [`parse_sales_page`].
+pub fn sales_request(
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+    offset: u32,
+) -> Result<OzonReportRequest, OzonReportParseError> {
+    if date_from > date_to {
+        return Err(OzonReportParseError::Value);
+    }
+    Ok(OzonReportRequest {
+        path: "/v1/analytics/data",
+        payload: serde_json::json!({
+            "date_from": date_from.format("%Y-%m-%d").to_string(),
+            "date_to": date_to.format("%Y-%m-%d").to_string(),
+            "metrics": ["revenue", "ordered_units", "cancellations", "returns"],
+            "dimension": ["sku", "day"],
+            "filters": [],
+            "sort": [],
+            "limit": MAX_PAGE_ROWS,
+            "offset": offset,
+        }),
+    })
+}
+
+/// Builds the shared product-page request for current stocks or prices.
+pub fn product_page_request(
+    path: &'static str,
+    cursor: Option<&str>,
+) -> Result<OzonReportRequest, OzonReportParseError> {
+    if !matches!(path, "/v4/product/info/stocks" | "/v5/product/info/prices")
+        || cursor.is_some_and(|cursor| {
+            cursor.is_empty()
+                || cursor.len() > MAX_CURSOR_BYTES
+                || cursor.bytes().any(|byte| byte.is_ascii_control())
+        })
+    {
+        return Err(OzonReportParseError::Value);
+    }
+    Ok(OzonReportRequest {
+        path,
+        payload: serde_json::json!({
+            "cursor": cursor.unwrap_or_default(),
+            "filter": {"offer_id": [], "product_id": [], "visibility": "ALL"},
+            "limit": MAX_PAGE_ROWS,
+        }),
+    })
 }
 
 /// Normalizes `/v1/analytics/data` for dimensions `["sku", "day"]` and
@@ -261,6 +323,41 @@ mod tests {
         .unwrap();
         assert_eq!(prices[0].price_minor, 9_995);
         assert_eq!(prices[0].old_price_minor, None);
+    }
+
+    #[test]
+    fn report_requests_are_exact_and_fail_closed() {
+        let from = NaiveDate::from_ymd_opt(2026, 8, 15).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
+        assert_eq!(
+            sales_request(from, to, 7).unwrap(),
+            OzonReportRequest {
+                path: "/v1/analytics/data",
+                payload: json!({
+                    "date_from": "2026-08-15", "date_to": "2026-08-16",
+                    "metrics": ["revenue", "ordered_units", "cancellations", "returns"],
+                    "dimension": ["sku", "day"], "filters": [], "sort": [],
+                    "limit": 1_000, "offset": 7,
+                }),
+            }
+        );
+        assert_eq!(sales_request(to, from, 0), Err(OzonReportParseError::Value));
+
+        assert_eq!(
+            product_page_request("/v4/product/info/stocks", Some("opaque-cursor"))
+                .unwrap()
+                .payload,
+            json!({
+                "cursor": "opaque-cursor",
+                "filter": {"offer_id": [], "product_id": [], "visibility": "ALL"},
+                "limit": 1_000,
+            })
+        );
+        let oversized = "x".repeat(MAX_CURSOR_BYTES + 1);
+        for cursor in [Some(""), Some("unsafe\n"), Some(oversized.as_str())] {
+            assert!(product_page_request("/v5/product/info/prices", cursor).is_err());
+        }
+        assert!(product_page_request("/v1/product/update", None).is_err());
     }
 
     #[test]
