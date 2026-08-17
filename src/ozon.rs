@@ -7,7 +7,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use reqwest::{
-    Client, Response, StatusCode,
+    Client, Proxy, Response, StatusCode,
     header::{HeaderMap, RETRY_AFTER},
     redirect::Policy,
 };
@@ -325,11 +325,41 @@ impl OzonClient {
         )
     }
 
+    /// Builds a client which uses one explicitly supplied HTTPS forward proxy.
+    ///
+    /// This is for a deployment-owned egress gateway, not a user-configurable
+    /// proxy setting. The regular constructor remains immune to ambient proxy
+    /// variables. Callers must validate and pin the proxy address themselves.
+    pub fn new_with_https_proxy(
+        base_url: String,
+        timeout: Duration,
+        stores: BTreeMap<StoreId, StoreCredentials>,
+        proxy_url: &str,
+    ) -> Result<Self, reqwest::Error> {
+        Self::new_with_user_agent_and_proxy(
+            base_url,
+            timeout,
+            stores,
+            concat!("mcp-ozon/", env!("CARGO_PKG_VERSION")),
+            Some(proxy_url),
+        )
+    }
+
     fn new_with_user_agent(
         base_url: String,
         timeout: Duration,
         stores: BTreeMap<StoreId, StoreCredentials>,
         user_agent: &str,
+    ) -> Result<Self, reqwest::Error> {
+        Self::new_with_user_agent_and_proxy(base_url, timeout, stores, user_agent, None)
+    }
+
+    fn new_with_user_agent_and_proxy(
+        base_url: String,
+        timeout: Duration,
+        stores: BTreeMap<StoreId, StoreCredentials>,
+        user_agent: &str,
+        explicit_https_proxy: Option<&str>,
     ) -> Result<Self, reqwest::Error> {
         let http = Client::builder()
             .timeout(timeout)
@@ -348,7 +378,16 @@ impl OzonClient {
             .http2_adaptive_window(true)
             .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
             .http2_keep_alive_while_idle(true)
-            .build()?;
+            // First remove every ambient HTTP(S)_PROXY configuration. An
+            // optional deployment-owned proxy is installed below only after
+            // that reset, so marketplace credentials cannot be diverted by
+            // a process environment variable.
+            .no_proxy();
+        let http = match explicit_https_proxy {
+            Some(proxy_url) => http.proxy(Proxy::https(proxy_url)?),
+            None => http,
+        }
+        .build()?;
         let mut limiters_by_client_id = BTreeMap::new();
         let rate_limiters = stores
             .iter()

@@ -80,6 +80,46 @@ services:
       retries: 3
       start_period: 10s
 
+  # The only component with external connectivity in the reporting stack.
+  # Its in-image Squid policy permits a CONNECT tunnel solely to the Ozon
+  # Seller host; report-collector stays off this outbound network.
+  ozon-egress:
+    image: mcp-ozon-egress:local
+    build:
+      context: .
+      dockerfile: Dockerfile.ozon-egress
+    depends_on:
+      position-db:
+        condition: service_healthy
+    networks:
+      - ozon-egress-internal
+      - outbound
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/squid:size=8m,mode=1777
+      - /var/log/squid:size=4m,mode=1777
+      - /var/run/squid:size=1m,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /var/run/squid/squid.pid && kill -0 $(cat /var/run/squid/squid.pid)"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
+
   report-collector:
     image: mcp-ozon-report-collector:local
     build:
@@ -107,8 +147,11 @@ services:
     depends_on:
       position-db:
         condition: service_healthy
+      ozon-egress:
+        condition: service_healthy
     networks:
       - position-internal
+      - ozon-egress-internal
     restart: unless-stopped
     mem_limit: 128m
     cpus: 0.25
@@ -186,6 +229,12 @@ networks:
   position-internal:
     name: mcp-ozon-position-internal
     internal: true
+  ozon-egress-internal:
+    name: mcp-ozon-egress-internal
+    internal: true
+  outbound:
+    name: mcp-ozon-outbound
+    external: true
 
 volumes:
   position-data:

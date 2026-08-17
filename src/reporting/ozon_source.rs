@@ -56,7 +56,7 @@ pub async fn collect_and_persist<T: OzonReportTransport>(
             sales_period_end,
             collector_version,
         )
-        .map_err(|_| OzonReportSourceError::InvalidResponse)?;
+        .map_err(|_| OzonReportSourceError::InvalidSnapshotInput)?;
     writer
         .persist_batch(&snapshots)
         .await
@@ -181,6 +181,14 @@ pub enum OzonReportSourceError {
     Transport,
     #[error("Ozon daily-report source response is invalid")]
     InvalidResponse,
+    #[error("Ozon daily-report sales response is invalid")]
+    InvalidSalesResponse,
+    #[error("Ozon daily-report stocks response is invalid")]
+    InvalidStocksResponse,
+    #[error("Ozon daily-report prices response is invalid")]
+    InvalidPricesResponse,
+    #[error("Ozon daily-report snapshot input is invalid")]
+    InvalidSnapshotInput,
     #[error("Ozon daily-report source pagination exceeded its fixed bound")]
     PaginationLimit,
 }
@@ -192,6 +200,10 @@ impl OzonReportSourceError {
             Self::Upstream(kind) => kind.code(),
             Self::Transport => "transport_error",
             Self::InvalidResponse => "invalid_response",
+            Self::InvalidSalesResponse => "invalid_sales_response",
+            Self::InvalidStocksResponse => "invalid_stocks_response",
+            Self::InvalidPricesResponse => "invalid_prices_response",
+            Self::InvalidSnapshotInput => "invalid_snapshot_input",
             Self::PaginationLimit => "pagination_limit",
         }
     }
@@ -222,7 +234,13 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         let request = sales_request(date_from, date_to, offset)
             .map_err(|_| OzonReportSourceError::InvalidResponse)?;
         let response = self.transport.post(request).await?;
-        parse_sales_page(&response).map_err(parse_error)
+        parse_sales_page(&response).map_err(|_| {
+            tracing::warn!(
+                shape = %sales_response_shape(&response),
+                "Ozon sales response did not match the bounded report contract"
+            );
+            OzonReportSourceError::InvalidSalesResponse
+        })
     }
 
     /// Collects offset-paginated sales rows with the same hard bound used for
@@ -253,32 +271,50 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         &self,
         cursor: Option<&str>,
     ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
-        self.product_page("/v4/product/info/stocks", cursor, parse_stock_page)
-            .await
+        self.product_page(
+            "/v4/product/info/stocks",
+            cursor,
+            parse_stock_page,
+            OzonReportSourceError::InvalidStocksResponse,
+        )
+        .await
     }
 
     /// Collects cursor-paginated stock pages with a fixed upper bound.
     pub async fn collect_stock_pages(
         &self,
     ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
-        self.collect_product_pages("/v4/product/info/stocks", parse_stock_page)
-            .await
+        self.collect_product_pages(
+            "/v4/product/info/stocks",
+            parse_stock_page,
+            OzonReportSourceError::InvalidStocksResponse,
+        )
+        .await
     }
 
     pub async fn price_page(
         &self,
         cursor: Option<&str>,
     ) -> Result<Vec<CollectedPriceFact>, OzonReportSourceError> {
-        self.product_page("/v5/product/info/prices", cursor, parse_price_page)
-            .await
+        self.product_page(
+            "/v5/product/info/prices",
+            cursor,
+            parse_price_page,
+            OzonReportSourceError::InvalidPricesResponse,
+        )
+        .await
     }
 
     /// Collects cursor-paginated price pages with a fixed upper bound.
     pub async fn collect_price_pages(
         &self,
     ) -> Result<Vec<CollectedPriceFact>, OzonReportSourceError> {
-        self.collect_product_pages("/v5/product/info/prices", parse_price_page)
-            .await
+        self.collect_product_pages(
+            "/v5/product/info/prices",
+            parse_price_page,
+            OzonReportSourceError::InvalidPricesResponse,
+        )
+        .await
     }
 
     async fn product_page<F, Fact>(
@@ -286,6 +322,7 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         path: &'static str,
         cursor: Option<&str>,
         parse: F,
+        invalid_response: OzonReportSourceError,
     ) -> Result<Vec<Fact>, OzonReportSourceError>
     where
         F: Fn(&Value) -> Result<Vec<Fact>, OzonReportParseError>,
@@ -293,13 +330,14 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         let request = product_page_request(path, cursor)
             .map_err(|_| OzonReportSourceError::InvalidResponse)?;
         let response = self.transport.post(request).await?;
-        parse(&response).map_err(parse_error)
+        parse(&response).map_err(|_| invalid_response)
     }
 
     async fn collect_product_pages<F, Fact>(
         &self,
         path: &'static str,
         parse: F,
+        invalid_response: OzonReportSourceError,
     ) -> Result<Vec<Fact>, OzonReportSourceError>
     where
         F: Fn(&Value) -> Result<Vec<Fact>, OzonReportParseError> + Copy,
@@ -310,8 +348,8 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             let request = product_page_request(path, cursor.as_deref())
                 .map_err(|_| OzonReportSourceError::InvalidResponse)?;
             let response = self.transport.post(request).await?;
-            facts.extend(parse(&response).map_err(parse_error)?);
-            cursor = next_cursor(&response)?;
+            facts.extend(parse(&response).map_err(|_| invalid_response.clone())?);
+            cursor = next_cursor(&response, invalid_response.clone())?;
             if cursor.is_none() {
                 return Ok(facts);
             }
@@ -320,21 +358,88 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
     }
 }
 
-fn parse_error(_: OzonReportParseError) -> OzonReportSourceError {
-    OzonReportSourceError::InvalidResponse
-}
-
-fn next_cursor(response: &Value) -> Result<Option<String>, OzonReportSourceError> {
+fn next_cursor(
+    response: &Value,
+    invalid_response: OzonReportSourceError,
+) -> Result<Option<String>, OzonReportSourceError> {
     let cursor = response
         .get("cursor")
         .and_then(Value::as_str)
-        .ok_or(OzonReportSourceError::InvalidResponse)?;
+        .ok_or(invalid_response)?;
     if cursor.is_empty() {
         return Ok(None);
     }
     product_page_request("/v4/product/info/stocks", Some(cursor))
         .map_err(|_| OzonReportSourceError::InvalidResponse)?;
     Ok(Some(cursor.to_owned()))
+}
+
+/// Produces a bounded, value-free structural fingerprint for a rejected sales
+/// response. It intentionally emits neither identifiers nor metric values.
+fn sales_response_shape(response: &Value) -> String {
+    let result = response.get("result").and_then(Value::as_object);
+    let data = result
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array);
+    let Some(first) = data
+        .and_then(|rows| rows.first())
+        .and_then(Value::as_object)
+    else {
+        return format!(
+            "root={},result={},data={}",
+            json_kind(response),
+            result.is_some(),
+            data.map_or("not_array".to_owned(), |rows| format!(
+                "array:{}",
+                rows.len()
+            ))
+        );
+    };
+    let dimensions = first.get("dimensions").and_then(Value::as_array);
+    let metrics = first.get("metrics").and_then(Value::as_array);
+    let dimension_kinds = dimensions.map_or_else(
+        || "not_array".to_owned(),
+        |values| {
+            values
+                .iter()
+                .take(4)
+                .map(|value| json_kind(value).to_owned())
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+    let metric_kinds = metrics.map_or_else(
+        || "not_array".to_owned(),
+        |values| {
+            values
+                .iter()
+                .take(6)
+                .map(|value| json_kind(value).to_owned())
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+    );
+    format!(
+        "root={},result={},data=array:{},dimensions={}:[{}],metrics={}:[{}]",
+        json_kind(response),
+        result.is_some(),
+        data.map_or(0, Vec::len),
+        dimensions.map_or(0, Vec::len),
+        dimension_kinds,
+        metrics.map_or(0, Vec::len),
+        metric_kinds,
+    )
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 #[cfg(test)]
@@ -392,8 +497,24 @@ mod tests {
         );
         assert_eq!(
             source.stock_page(None).await,
-            Err(OzonReportSourceError::InvalidResponse)
+            Err(OzonReportSourceError::InvalidStocksResponse)
         );
+    }
+
+    #[test]
+    fn sales_shape_fingerprint_never_includes_response_values() {
+        let shape = sales_response_shape(&json!({
+            "result": {"data": [{
+                "dimensions": [{"id": "secret-sku"}, {"id": "2026-08-16"}],
+                "metrics": [123.45, null, 7]
+            }]}
+        }));
+        assert_eq!(
+            shape,
+            "root=object,result=true,data=array:1,dimensions=2:[object,object],metrics=3:[number,null,number]"
+        );
+        assert!(!shape.contains("secret"));
+        assert!(!shape.contains("123.45"));
     }
 
     #[tokio::test]
@@ -409,7 +530,7 @@ mod tests {
         )]))));
         assert_eq!(
             invalid.collect_stock_pages().await,
-            Err(OzonReportSourceError::InvalidResponse)
+            Err(OzonReportSourceError::InvalidStocksResponse)
         );
     }
 

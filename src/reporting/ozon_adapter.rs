@@ -138,9 +138,9 @@ pub fn parse_sales_page(response: &Value) -> Result<Vec<CollectedSalesFact>, Ozo
             business_date,
             sku,
             operational_gmv_minor: parse_minor(&metrics[0])?,
-            ordered_units: parse_u64(&metrics[1])?,
-            cancelled_units: parse_u64(&metrics[2])?,
-            returned_units: parse_u64(&metrics[3])?,
+            ordered_units: parse_count(&metrics[1])?,
+            cancelled_units: parse_count(&metrics[2])?,
+            returned_units: parse_count(&metrics[3])?,
         });
     }
     Ok(facts)
@@ -293,6 +293,30 @@ fn parse_u64(value: &Value) -> Result<u64, OzonReportParseError> {
     }
 }
 
+/// Ozon documents analytics `metrics` as doubles, including count metrics.
+/// A count may therefore arrive as `5.0`, but never as a fractional or
+/// negative value in this reporting contract.
+fn parse_count(value: &Value) -> Result<u64, OzonReportParseError> {
+    match value {
+        Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                return Ok(value);
+            }
+            let value = number.as_f64().ok_or(OzonReportParseError::Value)?;
+            if !value.is_finite()
+                || value.is_sign_negative()
+                || value.fract() != 0.0
+                || value > u64::MAX as f64
+            {
+                return Err(OzonReportParseError::Value);
+            }
+            Ok(value as u64)
+        }
+        Value::String(_) => parse_u64(value),
+        _ => Err(OzonReportParseError::Value),
+    }
+}
+
 fn parse_warehouse_kind(value: &Value) -> Result<String, OzonReportParseError> {
     let value = value.as_str().ok_or(OzonReportParseError::Value)?;
     if value.is_empty()
@@ -412,6 +436,27 @@ mod tests {
         assert_eq!(performance[0].campaign_id, 35_751_912);
         assert_eq!(performance[0].spend_minor, 70_178);
         assert_eq!(performance[0].attributed_revenue_minor, 0);
+    }
+
+    #[test]
+    fn analytics_count_metrics_accept_only_integral_doubles() {
+        let accepted = parse_sales_page(&json!({
+            "result": {"data": [{
+                "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
+                "metrics": ["1.00", 2.0, 0.0, 1.0]
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(accepted[0].ordered_units, 2);
+        assert_eq!(accepted[0].returned_units, 1);
+
+        let fractional = parse_sales_page(&json!({
+            "result": {"data": [{
+                "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
+                "metrics": ["1.00", 1.5, 0.0, 0.0]
+            }]}
+        }));
+        assert_eq!(fractional, Err(OzonReportParseError::Value));
     }
 
     #[test]

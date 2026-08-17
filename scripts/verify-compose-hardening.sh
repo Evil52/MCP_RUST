@@ -236,9 +236,13 @@ verify_position() {
      and .volumes["position-data"].name == "mcp-ozon-position-data"'
   check "position: service is confined to the internal database network" "$rendered" \
     '(.services["position-db"].networks | keys) == ["position-internal"]
-     and (.networks | keys) == ["position-internal"]
+     and (.networks | keys | sort) == ["outbound", "ozon-egress-internal", "position-internal"]
      and .networks["position-internal"].name == "mcp-ozon-position-internal"
-     and .networks["position-internal"].internal == true'
+     and .networks["position-internal"].internal == true
+     and .networks["ozon-egress-internal"].name == "mcp-ozon-egress-internal"
+     and .networks["ozon-egress-internal"].internal == true
+     and .networks.outbound.name == "mcp-ozon-outbound"
+     and .networks.outbound.external == true'
   check "position: privilege escalation is blocked" "$service" \
     '.security_opt == ["no-new-privileges:true"]
      and (.privileged // false) == false'
@@ -325,11 +329,23 @@ verify_position_collector() {
 verify_reporting_service() {
   local rendered="$1" service_name="$2" binary="$3" database_user="$4"
   local database_password="$5" memory_bytes="$6" cpu_limit="$7"
-  local mode_name database_name service expected_database_url
+  local mode_name database_name service expected_database_url expected_networks expected_depends
   service="$(jq -c --arg name "$service_name" '.services[$name]' <<<"$rendered")"
   mode_name="$(tr '[:lower:]-' '[:upper:]_' <<<"${service_name}_MODE")"
   database_name="$(tr '[:lower:]-' '[:upper:]_' <<<"${service_name}_DATABASE_URL")"
   expected_database_url="postgresql://${database_user}:${database_password}@position-db:5432/ozon_positions"
+  if [[ "$service_name" == "report-collector" ]]; then
+    expected_networks='["ozon-egress-internal", "position-internal"]'
+    expected_depends='{
+      "ozon-egress": {"condition": "service_healthy", "required": true},
+      "position-db": {"condition": "service_healthy", "required": true}
+    }'
+  else
+    expected_networks='["position-internal"]'
+    expected_depends='{
+      "position-db": {"condition": "service_healthy", "required": true}
+    }'
+  fi
 
   check "$service_name: service exists" "$service" 'type == "object"'
   check "$service_name: no host ingress, env file, secrets, or configs exist" "$service" \
@@ -366,12 +382,13 @@ verify_reporting_service() {
      ]
      and all((.volumes // [])[];
        .bind == null or .bind == {} or .bind == {"create_host_path": false})'
+  # jq variables below are intentionally literal and supplied with --argjson.
+  # shellcheck disable=SC2016
   check "$service_name: waits for the authenticated database healthcheck" "$service" \
-    '.depends_on == {
-       "position-db": {"condition": "service_healthy", "required": true}
-     }'
-  check "$service_name: only the internal database network is attached" "$service" \
-    '(.networks | keys) == ["position-internal"]'
+    --argjson depends "$expected_depends" '.depends_on == $depends'
+  # shellcheck disable=SC2016
+  check "$service_name: only its exact internal networks are attached" "$service" \
+    --argjson networks "$expected_networks" '(.networks | keys | sort) == $networks'
   check "$service_name: filesystem and privilege hardening are exact" "$service" \
     '.read_only == true
      and .cap_drop == ["ALL"]
@@ -398,6 +415,44 @@ verify_reporting_service() {
        "test": ["CMD", $binary, "healthcheck"],
        "timeout": "8s", "interval": "30s", "retries": 3,
        "start_period": "10s"
+     }'
+}
+
+verify_ozon_egress() {
+  local rendered="$1" service
+  service="$(jq -c '.services["ozon-egress"]' <<<"$rendered")"
+
+  check "ozon egress: service exists" "$service" 'type == "object"'
+  check "ozon egress: no host ingress, mounts, environment, or secrets exist" "$service" \
+    '((.ports // []) | length == 0)
+     and ((.volumes // []) | length == 0)
+     and ((.environment // {}) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)'
+  check "ozon egress: bridge topology is exactly proxy-internal plus outbound" "$service" \
+    '(.networks | keys | sort) == ["outbound", "ozon-egress-internal"]'
+  check "ozon egress: filesystem and privilege hardening are exact" "$service" \
+    '.read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false
+     and (.tmpfs // [] | sort) == [
+       "/var/cache/squid:size=8m,mode=1777",
+       "/var/log/squid:size=4m,mode=1777",
+       "/var/run/squid:size=1m,mode=1777"
+     ]'
+  # The expected Compose healthcheck contains a literal shell substitution.
+  # shellcheck disable=SC2016
+  check "ozon egress: bounded resources, logs, and local healthcheck are exact" "$service" \
+    '.mem_limit == "134217728"
+     and .cpus == 0.25
+     and .pids_limit == 64
+     and .stop_grace_period == "10s"
+     and .logging == {"driver": "json-file", "options": {"max-file": "2", "max-size": "1m"}}
+     and .healthcheck == {
+       "test": ["CMD-SHELL", "test -s /var/run/squid/squid.pid && kill -0 $$(cat /var/run/squid/squid.pid)"],
+       "timeout": "8s", "interval": "30s", "retries": 3, "start_period": "10s"
      }'
 }
 
@@ -557,6 +612,14 @@ check_contains \
   "reporting: default policy path is the disabled pilot" \
   "$project_dir/compose.position.yaml" \
   "\${DAILY_REPORT_POLICY_HOST:-./config/daily-report-pilot.example.json}"
+check_contains \
+  "ozon egress: proxy only permits the Seller API host" \
+  "$project_dir/position-monitor/ozon-egress/squid.conf" \
+  "acl ozon_seller dstdomain api-seller.ozon.ru"
+check_contains \
+  "ozon egress: proxy denies every other destination" \
+  "$project_dir/position-monitor/ozon-egress/squid.conf" \
+  "http_access deny all"
 
 verify_server \
   "main" \
@@ -576,6 +639,7 @@ verify_server \
   "mcp-ozon-canary-outbound"
 verify_position "$position_rendered"
 verify_position_collector "$position_rendered"
+verify_ozon_egress "$position_rendered"
 verify_reporting_service \
   "$position_rendered" \
   "report-collector" \
@@ -599,4 +663,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, Control, position database, and disabled collector/reporting runtimes: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal no-egress/database networks."
+echo "Compose hardening verified for main, canary, Control, position database, Ozon-only egress proxy, and disabled collector/reporting runtimes: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."

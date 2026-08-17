@@ -30,6 +30,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // is still disabled and the source set is published atomically.
 const OZON_DRY_RUN_TIMEOUT: Duration = Duration::from_secs(60);
 const OZON_SELLER_API_BASE_URL: &str = "https://api-seller.ozon.ru";
+const OZON_REPORT_EGRESS_PROXY: &str = "http://ozon-egress:3128";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportCollectorMode {
@@ -127,10 +128,11 @@ impl ReportCollectorConfig {
         // failure here can only be an unrecoverable local reqwest/TLS runtime
         // construction failure; no marketplace request or snapshot write has
         // begun at this point.
-        Ok(OzonClient::new(
+        Ok(OzonClient::new_with_https_proxy(
             OZON_SELLER_API_BASE_URL.to_owned(),
             OZON_DRY_RUN_TIMEOUT,
             self.ozon_dry_run_stores.clone(),
+            OZON_REPORT_EGRESS_PROXY,
         )
         .expect("fixed Ozon dry-run client configuration is valid"))
     }
