@@ -7,7 +7,14 @@ use mcp_ozon::reporting::{
     ozon_source::{OzonClientReportTransport, OzonReportSource, collect_and_persist},
 };
 use tokio::signal;
+use tokio::time::{Duration, timeout};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// The individual Seller request limit is configured by the report collector.
+/// This bounds the entire manual account run, including pagination and the
+/// transactional snapshot publication, so a slow upstream cannot hold an
+/// operator invocation forever.
+const OZON_DRY_RUN_TOTAL_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -95,17 +102,25 @@ async fn run_ozon_dry_run(
     let client = config.ozon_dry_run_client()?;
     let source = OzonReportSource::new(OzonClientReportTransport::new(client, store));
     let cutoff_at = Utc::now();
-    let snapshot_ids = collect_and_persist(
-        &source,
-        writer,
-        account_id.to_owned(),
-        cutoff_at,
-        cutoff_at,
-        period_start,
-        period_end,
-        env!("CARGO_PKG_VERSION").to_owned(),
+    let snapshot_ids = timeout(
+        OZON_DRY_RUN_TOTAL_DEADLINE,
+        collect_and_persist(
+            &source,
+            writer,
+            account_id.to_owned(),
+            cutoff_at,
+            cutoff_at,
+            period_start,
+            period_end,
+            env!("CARGO_PKG_VERSION").to_owned(),
+        ),
     )
     .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Ozon dry-run failed (collection_deadline); no partial report snapshots were published"
+        )
+    })?
     .map_err(|error| {
         anyhow::anyhow!(
             "Ozon dry-run failed ({}); no partial report snapshots were published",
