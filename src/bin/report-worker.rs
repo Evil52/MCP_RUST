@@ -23,13 +23,18 @@ async fn main() -> Result<()> {
     let (outbox, snapshots) = config.connect().await?;
     outbox.verify_runtime_contract().await?;
     snapshots.verify_runtime_contract().await?;
+    let targets = config.collection_plan()?;
     if healthcheck {
+        tracing::info!(targets = targets.len(), "report source preflight passed");
         return Ok(());
     }
     if config.mode() != ReportWorkerMode::Disabled || config.policy().enabled {
         bail!("report delivery runtime is unavailable");
     }
-    tracing::warn!("report worker is disabled; no snapshots, artifacts, or email are generated");
+    tracing::warn!(
+        targets = targets.len(),
+        "report worker is disabled; no snapshots, artifacts, or email are generated"
+    );
     shutdown_signal().await;
     Ok(())
 }

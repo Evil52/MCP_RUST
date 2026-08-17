@@ -1,12 +1,14 @@
-use std::{fs, path::Path, str::FromStr, time::Duration};
+use std::{fs, path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use tokio_postgres::{Config, config::Host};
 
-use crate::config::RegistrySource;
+use crate::config::{AccessRegistry, RegistrySource};
 
 use super::{
-    policy::DailyReportPolicy, postgres_outbox::PostgresOutboxRepository,
+    collector_plan::{CollectionPlanError, CollectionTarget, build_collection_plan},
+    policy::DailyReportPolicy,
+    postgres_outbox::PostgresOutboxRepository,
     postgres_snapshot::PostgresSnapshotRepository,
 };
 
@@ -31,6 +33,7 @@ pub struct ReportWorkerConfig {
     database: Config,
     mode: ReportWorkerMode,
     policy: DailyReportPolicy,
+    registry: Arc<AccessRegistry>,
 }
 
 impl ReportWorkerConfig {
@@ -62,6 +65,7 @@ impl ReportWorkerConfig {
             database,
             mode,
             policy,
+            registry: snapshot,
         })
     }
 
@@ -71,6 +75,11 @@ impl ReportWorkerConfig {
 
     pub fn policy(&self) -> &DailyReportPolicy {
         &self.policy
+    }
+
+    /// Performs the credential-free source preflight used by health checks.
+    pub fn collection_plan(&self) -> Result<Vec<CollectionTarget>, CollectionPlanError> {
+        build_collection_plan(&self.policy, &self.registry)
     }
 
     pub async fn connect(&self) -> Result<(PostgresOutboxRepository, PostgresSnapshotRepository)> {
@@ -132,7 +141,7 @@ mod tests {
     }
 
     fn registry() -> &'static str {
-        r#"{"version":1,"actors":[{"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana_serafimovich","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY"}}]}"#
+        r#"{"version":1,"actors":[{"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana_serafimovich","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY","performance":{"client_id_env":"OZON_PERFORMANCE_ID","client_secret_env":"OZON_PERFORMANCE_SECRET"}}}]}"#
     }
 
     fn policy(enabled: bool) -> String {
@@ -168,6 +177,7 @@ mod tests {
         assert_eq!(config.mode(), ReportWorkerMode::Disabled);
         assert!(!config.policy().enabled);
         assert_eq!(config.policy().audiences[0].id, "pilot_owner");
+        assert_eq!(config.collection_plan().unwrap().len(), 1);
     }
 
     #[test]
