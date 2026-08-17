@@ -213,45 +213,71 @@ impl PostgresSnapshotWriter {
         &self,
         snapshot: &CollectedSnapshot,
     ) -> Result<i64, PostgresCollectorError> {
-        let payload =
-            serde_json::to_vec(snapshot).map_err(|_| PostgresCollectorError::InvalidInput)?;
-        let payload_sha256 = sha256(&payload);
-        let row_count = i32::try_from(snapshot.facts.len())
-            .map_err(|_| PostgresCollectorError::InvalidInput)?;
+        Ok(self
+            .persist_batch(std::slice::from_ref(snapshot))
+            .await?
+            .remove(0))
+    }
+
+    /// Persists a related group of report snapshots as one database unit.
+    /// A failed source can therefore never publish only sales, stocks, or
+    /// prices for one logical report cutoff.
+    pub async fn persist_batch(
+        &self,
+        snapshots: &[CollectedSnapshot],
+    ) -> Result<Vec<i64>, PostgresCollectorError> {
+        if snapshots.is_empty() {
+            return Err(PostgresCollectorError::InvalidInput);
+        }
         let mut client = self.client.lock().await;
         let transaction = client
             .transaction()
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
-        let snapshot_id = insert_snapshot(&transaction, snapshot).await?;
-        insert_facts(&transaction, snapshot_id, &snapshot.facts).await?;
-        let status = match snapshot.status {
-            SnapshotStatus::Succeeded => "succeeded",
-            SnapshotStatus::Partial => "partial",
-        };
-        transaction
-            .query_one(
-                "UPDATE daily_reporting.source_snapshots \
-                 SET status = $2, pagination_complete = $3, row_count = $4, \
-                     payload_sha256 = $5, finished_at = clock_timestamp() \
-                 WHERE id = $1 AND status = 'running' \
-                 RETURNING id",
-                &[
-                    &snapshot_id,
-                    &status,
-                    &snapshot.pagination_complete,
-                    &row_count,
-                    &payload_sha256,
-                ],
-            )
-            .await
-            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let mut snapshot_ids = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            snapshot_ids.push(persist_in_transaction(&transaction, snapshot).await?);
+        }
         transaction
             .commit()
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
-        Ok(snapshot_id)
+        Ok(snapshot_ids)
     }
+}
+
+async fn persist_in_transaction(
+    transaction: &Transaction<'_>,
+    snapshot: &CollectedSnapshot,
+) -> Result<i64, PostgresCollectorError> {
+    let payload = serde_json::to_vec(snapshot).map_err(|_| PostgresCollectorError::InvalidInput)?;
+    let payload_sha256 = sha256(&payload);
+    let row_count =
+        i32::try_from(snapshot.facts.len()).map_err(|_| PostgresCollectorError::InvalidInput)?;
+    let snapshot_id = insert_snapshot(transaction, snapshot).await?;
+    insert_facts(transaction, snapshot_id, &snapshot.facts).await?;
+    let status = match snapshot.status {
+        SnapshotStatus::Succeeded => "succeeded",
+        SnapshotStatus::Partial => "partial",
+    };
+    transaction
+        .query_one(
+            "UPDATE daily_reporting.source_snapshots \
+                 SET status = $2, pagination_complete = $3, row_count = $4, \
+                     payload_sha256 = $5, finished_at = clock_timestamp() \
+                 WHERE id = $1 AND status = 'running' \
+                 RETURNING id",
+            &[
+                &snapshot_id,
+                &status,
+                &snapshot.pagination_complete,
+                &row_count,
+                &payload_sha256,
+            ],
+        )
+        .await
+        .map_err(|_| PostgresCollectorError::Unavailable)?;
+    Ok(snapshot_id)
 }
 
 async fn insert_snapshot(

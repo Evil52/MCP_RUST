@@ -7,7 +7,7 @@
 
 use std::{future::Future, pin::Pin};
 
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -18,8 +18,14 @@ use super::{
         OzonReportParseError, OzonReportRequest, parse_price_page, parse_sales_page,
         parse_stock_page, product_page_request, sales_request,
     },
-    postgres_collector::{CollectedPriceFact, CollectedSalesFact, CollectedStockFact},
+    postgres_collector::{
+        CollectedFacts, CollectedPriceFact, CollectedSalesFact, CollectedSnapshot,
+        CollectedStockFact, PostgresCollectorError,
+    },
+    snapshot::{Marketplace, SnapshotStatus},
 };
+
+const MAX_PAGES_PER_SOURCE: usize = 25;
 
 pub trait OzonReportTransport: Send + Sync {
     fn post<'a>(
@@ -61,6 +67,67 @@ pub struct OzonReportSource<T> {
     transport: T,
 }
 
+/// Complete in-memory Ozon Seller input for one report cutoff. It is only
+/// returned after all requested sources have succeeded, so callers can pass
+/// it to the transactional PostgreSQL writer without mixing partial data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OzonCollectedFacts {
+    pub sales: Vec<CollectedSalesFact>,
+    pub stocks: Vec<CollectedStockFact>,
+    pub prices: Vec<CollectedPriceFact>,
+}
+
+impl OzonCollectedFacts {
+    #[allow(clippy::too_many_arguments)]
+    pub fn into_snapshots(
+        self,
+        account_id: String,
+        cutoff_at: DateTime<Utc>,
+        source_as_of: DateTime<Utc>,
+        sales_period_start: DateTime<Utc>,
+        sales_period_end: DateTime<Utc>,
+        collector_version: String,
+    ) -> Result<Vec<CollectedSnapshot>, PostgresCollectorError> {
+        let sales = CollectedSnapshot::new(
+            account_id.clone(),
+            Marketplace::Ozon,
+            cutoff_at,
+            source_as_of,
+            sales_period_start,
+            sales_period_end,
+            SnapshotStatus::Succeeded,
+            true,
+            collector_version.clone(),
+            CollectedFacts::Sales(self.sales),
+        )?;
+        let stocks = CollectedSnapshot::new(
+            account_id.clone(),
+            Marketplace::Ozon,
+            cutoff_at,
+            source_as_of,
+            source_as_of,
+            source_as_of,
+            SnapshotStatus::Succeeded,
+            true,
+            collector_version.clone(),
+            CollectedFacts::Stocks(self.stocks),
+        )?;
+        let prices = CollectedSnapshot::new(
+            account_id,
+            Marketplace::Ozon,
+            cutoff_at,
+            source_as_of,
+            source_as_of,
+            source_as_of,
+            SnapshotStatus::Succeeded,
+            true,
+            collector_version,
+            CollectedFacts::Prices(self.prices),
+        )?;
+        Ok(vec![sales, stocks, prices])
+    }
+}
+
 impl<T> OzonReportSource<T> {
     pub fn new(transport: T) -> Self {
         Self { transport }
@@ -73,9 +140,26 @@ pub enum OzonReportSourceError {
     Transport,
     #[error("Ozon daily-report source response is invalid")]
     InvalidResponse,
+    #[error("Ozon daily-report source pagination exceeded its fixed bound")]
+    PaginationLimit,
 }
 
 impl<T: OzonReportTransport> OzonReportSource<T> {
+    pub async fn collect_required_seller_facts(
+        &self,
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<OzonCollectedFacts, OzonReportSourceError> {
+        let sales = self.sales_page(date_from, date_to, 0).await?;
+        let stocks = self.collect_stock_pages().await?;
+        let prices = self.collect_price_pages().await?;
+        Ok(OzonCollectedFacts {
+            sales,
+            stocks,
+            prices,
+        })
+    }
+
     pub async fn sales_page(
         &self,
         date_from: NaiveDate,
@@ -96,11 +180,27 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             .await
     }
 
+    /// Collects cursor-paginated stock pages with a fixed upper bound.
+    pub async fn collect_stock_pages(
+        &self,
+    ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
+        self.collect_product_pages("/v4/product/info/stocks", parse_stock_page)
+            .await
+    }
+
     pub async fn price_page(
         &self,
         cursor: Option<&str>,
     ) -> Result<Vec<CollectedPriceFact>, OzonReportSourceError> {
         self.product_page("/v5/product/info/prices", cursor, parse_price_page)
+            .await
+    }
+
+    /// Collects cursor-paginated price pages with a fixed upper bound.
+    pub async fn collect_price_pages(
+        &self,
+    ) -> Result<Vec<CollectedPriceFact>, OzonReportSourceError> {
+        self.collect_product_pages("/v5/product/info/prices", parse_price_page)
             .await
     }
 
@@ -118,10 +218,46 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         let response = self.transport.post(request).await?;
         parse(&response).map_err(parse_error)
     }
+
+    async fn collect_product_pages<F, Fact>(
+        &self,
+        path: &'static str,
+        parse: F,
+    ) -> Result<Vec<Fact>, OzonReportSourceError>
+    where
+        F: Fn(&Value) -> Result<Vec<Fact>, OzonReportParseError> + Copy,
+    {
+        let mut cursor = None;
+        let mut facts = Vec::new();
+        for _ in 0..MAX_PAGES_PER_SOURCE {
+            let request = product_page_request(path, cursor.as_deref())
+                .map_err(|_| OzonReportSourceError::InvalidResponse)?;
+            let response = self.transport.post(request).await?;
+            facts.extend(parse(&response).map_err(parse_error)?);
+            cursor = next_cursor(&response)?;
+            if cursor.is_none() {
+                return Ok(facts);
+            }
+        }
+        Err(OzonReportSourceError::PaginationLimit)
+    }
 }
 
 fn parse_error(_: OzonReportParseError) -> OzonReportSourceError {
     OzonReportSourceError::InvalidResponse
+}
+
+fn next_cursor(response: &Value) -> Result<Option<String>, OzonReportSourceError> {
+    let cursor = response
+        .get("cursor")
+        .and_then(Value::as_str)
+        .ok_or(OzonReportSourceError::InvalidResponse)?;
+    if cursor.is_empty() {
+        return Ok(None);
+    }
+    product_page_request("/v4/product/info/stocks", Some(cursor))
+        .map_err(|_| OzonReportSourceError::InvalidResponse)?;
+    Ok(Some(cursor.to_owned()))
 }
 
 #[cfg(test)]
@@ -180,6 +316,44 @@ mod tests {
         assert_eq!(
             source.stock_page(None).await,
             Err(OzonReportSourceError::InvalidResponse)
+        );
+    }
+
+    #[tokio::test]
+    async fn product_collection_follows_cursor_and_requires_a_valid_terminal_cursor() {
+        let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(json!({"items":[{"product_id":1,"stocks":[]}],"cursor":"next"})),
+            Ok(json!({"items":[{"product_id":2,"stocks":[]}],"cursor":""})),
+        ]))));
+        assert_eq!(source.collect_stock_pages().await.unwrap().len(), 0);
+
+        let invalid = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([Ok(
+            json!({"items":[],"cursor":42}),
+        )]))));
+        assert_eq!(
+            invalid.collect_stock_pages().await,
+            Err(OzonReportSourceError::InvalidResponse)
+        );
+    }
+
+    #[tokio::test]
+    async fn required_facts_are_returned_only_after_all_sources_succeed() {
+        let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(json!({"result":{"data":[]}})),
+            Ok(json!({"items":[],"cursor":""})),
+            Ok(json!({"items":[],"cursor":""})),
+        ]))));
+        let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
+        assert_eq!(
+            source
+                .collect_required_seller_facts(day, day)
+                .await
+                .unwrap(),
+            OzonCollectedFacts {
+                sales: vec![],
+                stocks: vec![],
+                prices: vec![]
+            }
         );
     }
 

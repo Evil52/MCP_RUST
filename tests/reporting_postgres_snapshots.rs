@@ -116,6 +116,38 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         writer.persist(&sales).await,
         Err(PostgresCollectorError::Conflict)
     );
+
+    let rollback_account = format!("snapshot_batch_{}", std::process::id());
+    let batch_stock = collected(
+        &rollback_account,
+        timestamp("2098-08-16T02:45:00Z"),
+        timestamp("2098-08-16T02:45:00Z"),
+        timestamp("2098-08-16T02:45:00Z"),
+        false,
+        CollectedFacts::Stocks(Vec::new()),
+    );
+    assert_eq!(
+        writer
+            .persist_batch(&[batch_stock.clone(), batch_stock])
+            .await,
+        Err(PostgresCollectorError::Conflict)
+    );
+    let (rollback_client, rollback_connection) = collector_config
+        .connect(tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(rollback_connection);
+    assert_eq!(
+        rollback_client
+            .query_one(
+                "SELECT count(*) FROM daily_reporting.source_snapshots WHERE account_id = $1",
+                &[&rollback_account],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
     writer
         .persist(&collected(
             &account_id,
