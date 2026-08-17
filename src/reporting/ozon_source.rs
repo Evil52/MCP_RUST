@@ -20,12 +20,45 @@ use super::{
     },
     postgres_collector::{
         CollectedFacts, CollectedPriceFact, CollectedSalesFact, CollectedSnapshot,
-        CollectedStockFact, PostgresCollectorError,
+        CollectedStockFact, PostgresCollectorError, PostgresSnapshotWriter,
     },
     snapshot::{Marketplace, SnapshotStatus},
 };
 
 const MAX_PAGES_PER_SOURCE: usize = 25;
+
+#[allow(clippy::too_many_arguments)]
+pub async fn collect_and_persist<T: OzonReportTransport>(
+    source: &OzonReportSource<T>,
+    writer: &PostgresSnapshotWriter,
+    account_id: String,
+    cutoff_at: DateTime<Utc>,
+    source_as_of: DateTime<Utc>,
+    sales_period_start: DateTime<Utc>,
+    sales_period_end: DateTime<Utc>,
+    collector_version: String,
+) -> Result<Vec<i64>, OzonReportSourceError> {
+    let facts = source
+        .collect_required_seller_facts(
+            sales_period_start.date_naive(),
+            sales_period_end.date_naive(),
+        )
+        .await?;
+    let snapshots = facts
+        .into_snapshots(
+            account_id,
+            cutoff_at,
+            source_as_of,
+            sales_period_start,
+            sales_period_end,
+            collector_version,
+        )
+        .map_err(|_| OzonReportSourceError::InvalidResponse)?;
+    writer
+        .persist_batch(&snapshots)
+        .await
+        .map_err(|_| OzonReportSourceError::Transport)
+}
 
 pub trait OzonReportTransport: Send + Sync {
     fn post<'a>(
