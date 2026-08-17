@@ -321,7 +321,7 @@ fn next_cursor(response: &Value) -> Result<Option<String>, OzonReportSourceError
 mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, TimeZone, Utc};
     use serde_json::json;
 
     use super::*;
@@ -411,6 +411,136 @@ mod tests {
                 stocks: vec![],
                 prices: vec![]
             }
+        );
+    }
+
+    #[test]
+    fn complete_facts_become_three_complete_source_snapshots() {
+        let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 8, 15, 19, 0, 0).unwrap();
+        let facts = OzonCollectedFacts {
+            sales: vec![CollectedSalesFact {
+                business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
+                sku: 1,
+                ordered_units: 1,
+                operational_gmv_minor: 100,
+                cancelled_units: 0,
+                returned_units: 0,
+            }],
+            stocks: vec![CollectedStockFact {
+                sku: 1,
+                warehouse_id: "fbo".to_owned(),
+                sellable_units: 1,
+            }],
+            prices: vec![CollectedPriceFact {
+                sku: 1,
+                price_minor: 100,
+                old_price_minor: None,
+            }],
+        };
+        assert_eq!(
+            facts
+                .into_snapshots(
+                    "ozon".to_owned(),
+                    as_of,
+                    as_of,
+                    start,
+                    as_of,
+                    "test-1".to_owned(),
+                )
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn invalid_fact_in_each_source_refuses_the_entire_snapshot_set() {
+        let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 8, 15, 19, 0, 0).unwrap();
+        let valid_sales = || CollectedSalesFact {
+            business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
+            sku: 1,
+            ordered_units: 1,
+            operational_gmv_minor: 100,
+            cancelled_units: 0,
+            returned_units: 0,
+        };
+        let valid_stock = || CollectedStockFact {
+            sku: 1,
+            warehouse_id: "fbo".to_owned(),
+            sellable_units: 1,
+        };
+        let invalid_sets = [
+            OzonCollectedFacts {
+                sales: vec![CollectedSalesFact {
+                    sku: 0,
+                    ..valid_sales()
+                }],
+                stocks: vec![valid_stock()],
+                prices: Vec::new(),
+            },
+            OzonCollectedFacts {
+                sales: vec![valid_sales()],
+                stocks: vec![CollectedStockFact {
+                    warehouse_id: String::new(),
+                    ..valid_stock()
+                }],
+                prices: Vec::new(),
+            },
+            OzonCollectedFacts {
+                sales: vec![valid_sales()],
+                stocks: vec![valid_stock()],
+                prices: vec![CollectedPriceFact {
+                    sku: 0,
+                    price_minor: 100,
+                    old_price_minor: None,
+                }],
+            },
+        ];
+        for facts in invalid_sets {
+            assert!(
+                facts
+                    .into_snapshots(
+                        "ozon".to_owned(),
+                        as_of,
+                        as_of,
+                        start,
+                        as_of,
+                        "test-1".to_owned(),
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pagination_limits_fail_closed_for_sales_and_cursor_sources() {
+        let full_sales_page = || {
+            json!({"result":{"data":(0..1_000).map(|index| json!({
+                "dimensions":[{"id":index.to_string()},{"id":"2026-08-16"}],
+                "metrics":["1", 1, 0, 0]
+            })).collect::<Vec<_>>()}})
+        };
+        let sales = OzonReportSource::new(FixtureTransport(Mutex::new(
+            std::iter::repeat_with(|| Ok(full_sales_page()))
+                .take(MAX_PAGES_PER_SOURCE)
+                .collect(),
+        )));
+        let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
+        assert_eq!(
+            sales.collect_sales_pages(day, day).await,
+            Err(OzonReportSourceError::PaginationLimit)
+        );
+
+        let cursor = OzonReportSource::new(FixtureTransport(Mutex::new(
+            std::iter::repeat_with(|| Ok(json!({"items":[],"cursor":"next"})))
+                .take(MAX_PAGES_PER_SOURCE)
+                .collect(),
+        )));
+        assert_eq!(
+            cursor.collect_stock_pages().await,
+            Err(OzonReportSourceError::PaginationLimit)
         );
     }
 

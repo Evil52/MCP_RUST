@@ -1,8 +1,12 @@
-use std::{fs, str::FromStr};
+use std::{collections::VecDeque, fs, future::Future, pin::Pin, str::FromStr, sync::Mutex};
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use mcp_ozon::reporting::{
     collector_service::ReportCollectorConfig,
+    ozon_adapter::OzonReportRequest,
+    ozon_source::{
+        OzonReportSource, OzonReportSourceError, OzonReportTransport, collect_and_persist,
+    },
     postgres_collector::{
         CollectedAdvertisingFact, CollectedFacts, CollectedPriceFact, CollectedSalesFact,
         CollectedSnapshot, CollectedStockFact, PostgresCollectorError, PostgresSnapshotWriter,
@@ -10,7 +14,19 @@ use mcp_ozon::reporting::{
     postgres_snapshot::{PostgresSnapshotError, PostgresSnapshotRepository},
     snapshot::{AccountScope, Marketplace, SnapshotQuality, SnapshotStatus},
 };
+use serde_json::{Value, json};
 use tokio_postgres::Config;
+
+struct FixtureTransport(Mutex<VecDeque<Result<Value, OzonReportSourceError>>>);
+
+impl OzonReportTransport for FixtureTransport {
+    fn post<'a>(
+        &'a self,
+        _request: OzonReportRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, OzonReportSourceError>> + Send + 'a>> {
+        Box::pin(async move { self.0.lock().unwrap().pop_front().unwrap() })
+    }
+}
 
 fn cutoff() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2098, 8, 16, 3, 0, 0).unwrap()
@@ -300,5 +316,44 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(
         wrong_writer.verify_runtime_contract().await,
         Err(PostgresCollectorError::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn complete_ozon_source_set_is_published_atomically() {
+    let Ok(collector_url) = std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL") else {
+        return;
+    };
+    let config = Config::from_str(&collector_url).unwrap();
+    let writer = PostgresSnapshotWriter::connect(&config).await.unwrap();
+    let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
+        Ok(json!({"result":{"data":[{
+            "dimensions":[{"id":"3411079879"},{"id":"2098-08-15"}],
+            "metrics":["675.00", 2, 0, 0]
+        }]}})),
+        Ok(json!({"items":[{"product_id":3411079879_u64,"stocks":[{
+            "type":"FBO","present":19
+        }]}],"cursor":""})),
+        Ok(json!({"items":[{"product_id":3411079879_u64,"price":{
+            "currency_code":"RUB","price":"675.00","old_price":"702.00"
+        }}],"cursor":""})),
+    ]))));
+    let account_id = format!("ozon_source_atomic_{}", std::process::id());
+    let ids = collect_and_persist(
+        &source,
+        &writer,
+        account_id,
+        timestamp("2098-08-16T19:00:00Z"),
+        timestamp("2098-08-16T03:00:00Z"),
+        timestamp("2098-08-15T19:00:00Z"),
+        timestamp("2098-08-16T19:00:00Z"),
+        "integration-test".to_owned(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids.len(), 3);
+    assert_eq!(
+        writer.persist_batch(&[]).await,
+        Err(PostgresCollectorError::InvalidInput)
     );
 }

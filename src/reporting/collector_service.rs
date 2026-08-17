@@ -113,11 +113,56 @@ impl ReportCollectorConfig {
             self.mode == ReportCollectorMode::OzonDryRun && !self.ozon_dry_run_stores.is_empty(),
             "Ozon dry-run credentials are unavailable in disabled mode"
         );
+        // These are fixed, previously validated client-builder inputs. A
+        // failure here can only be an unrecoverable local reqwest/TLS runtime
+        // construction failure; no marketplace request or snapshot write has
+        // begun at this point.
         Ok(OzonClient::new(
             OZON_SELLER_API_BASE_URL.to_owned(),
             OZON_DRY_RUN_TIMEOUT,
             self.ozon_dry_run_stores.clone(),
-        )?)
+        )
+        .expect("fixed Ozon dry-run client configuration is valid"))
+    }
+
+    /// Resolves one policy-selected Ozon account to its opaque store identity.
+    ///
+    /// This is intentionally available only for the explicit manual dry-run
+    /// mode. Callers cannot select an arbitrary registry account or borrow a
+    /// store binding from a different marketplace.
+    pub fn ozon_dry_run_store(&self, account_id: &str) -> Result<StoreId> {
+        ensure!(
+            self.mode == ReportCollectorMode::OzonDryRun,
+            "Ozon dry-run store is unavailable in disabled mode"
+        );
+        let target = self
+            .collection_plan()
+            .map_err(|error| anyhow::anyhow!("daily report collection plan is invalid: {error}"))?
+            .into_iter()
+            .find(|target| {
+                target.account_id == account_id
+                    && target.marketplace == super::snapshot::Marketplace::Ozon
+            })
+            .context("Ozon report account is not selected by the policy")?;
+        let account = self
+            .registry
+            .accounts
+            .iter()
+            .find(|account| {
+                account.id == target.account_id && account.marketplace == Marketplace::Ozon
+            })
+            .context("Ozon report account is unavailable")?;
+        let store_id = account
+            .ozon
+            .as_ref()
+            .context("Ozon report binding is unavailable")?
+            .store_id
+            .clone();
+        ensure!(
+            self.ozon_dry_run_stores.contains_key(&store_id),
+            "Ozon report credentials are unavailable"
+        );
+        Ok(store_id)
     }
 }
 
@@ -292,6 +337,11 @@ mod tests {
                 .unwrap()
                 .is_configured(&StoreId::from("1"))
         );
+        assert_eq!(
+            dry_run.ozon_dry_run_store("ozon").unwrap(),
+            StoreId::from("1")
+        );
+        assert!(dry_run.ozon_dry_run_store("wb").is_err());
 
         let mixed_policy = file(
             "mixed-policy",
