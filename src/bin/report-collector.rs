@@ -106,8 +106,11 @@ async fn run_ozon_dry_run(
         env!("CARGO_PKG_VERSION").to_owned(),
     )
     .await
-    .map_err(|_| {
-        anyhow::anyhow!("Ozon dry-run failed; no partial report snapshots were published")
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "Ozon dry-run failed ({}); no partial report snapshots were published",
+            error.code()
+        )
     })?;
     tracing::info!(
         account_id,

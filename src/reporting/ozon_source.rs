@@ -11,7 +11,10 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{config::StoreId, ozon::OzonClient};
+use crate::{
+    config::StoreId,
+    ozon::{OzonClient, OzonErrorKind},
+};
 
 use super::{
     ozon_adapter::{
@@ -91,7 +94,10 @@ impl OzonReportTransport for OzonClientReportTransport {
             self.client
                 .post(&self.store, request.path, request.payload)
                 .await
-                .map_err(|_| OzonReportSourceError::Transport)
+                // Keep only the stable, non-sensitive classification. In
+                // particular, never retain Ozon's error body in report
+                // collection diagnostics.
+                .map_err(|error| OzonReportSourceError::Upstream(error.kind()))
         })
     }
 }
@@ -170,11 +176,25 @@ impl<T> OzonReportSource<T> {
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum OzonReportSourceError {
     #[error("Ozon daily-report source request failed")]
+    Upstream(OzonErrorKind),
+    #[error("Ozon daily-report source request failed")]
     Transport,
     #[error("Ozon daily-report source response is invalid")]
     InvalidResponse,
     #[error("Ozon daily-report source pagination exceeded its fixed bound")]
     PaginationLimit,
+}
+
+impl OzonReportSourceError {
+    /// A stable, non-sensitive diagnostic code suitable for operator logs.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::Upstream(kind) => kind.code(),
+            Self::Transport => "transport_error",
+            Self::InvalidResponse => "invalid_response",
+            Self::PaginationLimit => "pagination_limit",
+        }
+    }
 }
 
 impl<T: OzonReportTransport> OzonReportSource<T> {
@@ -560,7 +580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_transport_uses_the_hardened_client_and_hides_its_error() {
+    async fn client_transport_uses_the_hardened_client_and_exposes_only_safe_error_kind() {
         let client = OzonClient::new(
             "http://127.0.0.1:1".to_owned(),
             std::time::Duration::from_millis(1),
@@ -568,11 +588,17 @@ mod tests {
         )
         .unwrap();
         let transport = OzonClientReportTransport::new(client, StoreId::from("missing"));
-        assert_eq!(
+        assert!(matches!(
             transport
                 .post(product_page_request("/v4/product/info/stocks", None).unwrap())
                 .await,
-            Err(OzonReportSourceError::Transport)
+            Err(OzonReportSourceError::Upstream(
+                OzonErrorKind::MissingCredentials
+            ))
+        ));
+        assert_eq!(
+            OzonReportSourceError::Upstream(OzonErrorKind::Forbidden).code(),
+            "forbidden"
         );
     }
 }

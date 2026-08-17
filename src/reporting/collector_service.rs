@@ -24,7 +24,11 @@ const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
 const MODE_ENV: &str = "REPORT_COLLECTOR_MODE";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const OZON_DRY_RUN_TIMEOUT: Duration = Duration::from_secs(20);
+// A completed daily snapshot needs three bounded read-only Seller requests.
+// Ozon can legitimately take longer than an interactive MCP request, so the
+// explicit manual dry-run allows one minute per request. Automatic collection
+// is still disabled and the source set is published atomically.
+const OZON_DRY_RUN_TIMEOUT: Duration = Duration::from_secs(60);
 const OZON_SELLER_API_BASE_URL: &str = "https://api-seller.ozon.ru";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
