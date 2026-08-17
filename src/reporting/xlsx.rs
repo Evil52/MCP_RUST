@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
-use rust_xlsxwriter::{Color, Format, Workbook, Worksheet, XlsxError};
+use rust_xlsxwriter::{
+    Color, DocProperties, ExcelDateTime, Format, Workbook, Worksheet, XlsxError,
+};
 
 use super::{
     html::{HtmlReport, validate_report},
@@ -77,6 +79,14 @@ pub enum XlsxReportError {
 pub fn render_xlsx(report: XlsxReport<'_>) -> Result<Vec<u8>, XlsxReportError> {
     validate(&report)?;
     let mut workbook = Workbook::new();
+    // XLSX embeds document creation time by default. Keep technical metadata
+    // fixed so the same frozen report input has one stable artifact hash; the
+    // factual generation time remains visible in the Summary sheet and email.
+    let created = ExcelDateTime::from_ymd(2000, 1, 1).map_err(|_| XlsxReportError::Generation)?;
+    let properties = DocProperties::new()
+        .set_title("Daily marketplace report")
+        .set_creation_datetime(&created);
+    workbook.set_properties(&properties);
     let formats = Formats::new();
     write_summary(&mut workbook, &formats, &report)?;
     write_sales(&mut workbook, &formats, report.sales, 0)?;

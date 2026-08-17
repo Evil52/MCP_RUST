@@ -18,6 +18,7 @@ pub mod policy;
 pub mod postgres_outbox;
 pub mod postgres_snapshot;
 pub mod rules;
+pub mod scheduler;
 pub mod service;
 pub mod snapshot;
 pub mod xlsx;
@@ -81,7 +82,7 @@ pub fn due_deliveries(
 
     let offset = yekaterinburg_offset();
     let local_now = now.with_timezone(&offset);
-    let date = local_now.date_naive();
+    let date = business_date(now);
     let morning = report_time(date, MORNING_HOUR)?;
     let morning_deadline = report_time(date, MORNING_DEADLINE_HOUR)?;
     let evening = report_time(date, EVENING_HOUR)?;
@@ -119,6 +120,11 @@ pub fn due_deliveries(
     }
 
     Ok(Vec::new())
+}
+
+/// Converts an instant to the business date used by daily-report identities.
+pub fn business_date(now: DateTime<Utc>) -> NaiveDate {
+    now.with_timezone(&yekaterinburg_offset()).date_naive()
 }
 
 fn validate_identity(recipient_id: &str, report_version: u32) -> Result<(), ReportScheduleError> {

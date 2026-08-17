@@ -4,6 +4,7 @@ use chrono::{Duration, TimeZone, Utc};
 use mcp_ozon::reporting::{
     due_deliveries,
     outbox::{ArtifactIdentity, DeliveryErrorClass},
+    policy::{AudiencePolicy, DailyReportPolicy, ManagerScope},
     postgres_outbox::{CreateOutcome, PostgresOutboxError, PostgresOutboxRepository},
     service::ReportWorkerConfig,
 };
@@ -17,6 +18,23 @@ fn artifact() -> ArtifactIdentity {
     ArtifactIdentity {
         object_key: "daily/2099-08-16/integration_owner.xlsx".to_owned(),
         sha256: "b".repeat(64),
+    }
+}
+
+fn disabled_policy(recipient_id: String) -> DailyReportPolicy {
+    DailyReportPolicy {
+        version: 1,
+        enabled: false,
+        timezone: "Asia/Yekaterinburg".to_owned(),
+        sender_email_env: "DAILY_REPORT_SENDER_EMAIL".to_owned(),
+        audiences: vec![AudiencePolicy {
+            id: recipient_id,
+            email_env: "DAILY_REPORT_PILOT_RECIPIENT_EMAIL".to_owned(),
+            managers: vec![ManagerScope {
+                actor_id: "diana_serafimovich".to_owned(),
+                account_ids: ["furnitura_dlya_doma".to_owned()].into_iter().collect(),
+            }],
+        }],
     }
 }
 
@@ -52,6 +70,43 @@ async fn report_worker_runtime_uses_only_the_restricted_database_role() {
     let (outbox, snapshots) = config.connect().await.unwrap();
     outbox.verify_runtime_contract().await.unwrap();
     snapshots.verify_runtime_contract().await.unwrap();
+}
+
+#[tokio::test]
+async fn scheduler_persists_each_daily_identity_once_without_delivery() {
+    let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
+        return;
+    };
+    let repository = PostgresOutboxRepository::connect(&Config::from_str(&url).unwrap())
+        .await
+        .unwrap();
+    let recipient = format!("scheduler_{}", std::process::id());
+    let policy = disabled_policy(recipient);
+
+    let morning = utc(3, 0);
+    let first = repository.plan_due(morning, &policy).await.unwrap();
+    assert!(matches!(
+        first.as_slice(),
+        [(_, CreateOutcome::Inserted(_))]
+    ));
+    assert!(
+        repository
+            .plan_due(morning, &policy)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let evening = repository.plan_due(utc(12, 0), &policy).await.unwrap();
+    assert!(matches!(
+        evening.as_slice(),
+        [(_, CreateOutcome::Inserted(_))]
+    ));
+    let covered = repository
+        .covered_keys(utc(12, 30), &policy.audiences[0].id, 1)
+        .await
+        .unwrap();
+    assert_eq!(covered.len(), 2);
 }
 
 #[tokio::test]

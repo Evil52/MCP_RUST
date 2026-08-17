@@ -1,13 +1,17 @@
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, Config, NoTls, Transaction};
 
 use super::{
-    PendingDelivery, ReportKey, ReportKind, delivery_deadline,
+    PendingDelivery, ReportKey, ReportKind, business_date, delivery_deadline,
     outbox::{
         ArtifactIdentity, DeliveryErrorClass, DeliveryRecord, validate_artifact,
         validate_provider_message_id,
     },
+    policy::DailyReportPolicy,
+    scheduler::{ScheduledDelivery, due_for_audience},
 };
 
 const MAX_DELIVERY_ATTEMPTS: u8 = 5;
@@ -110,6 +114,66 @@ impl PostgresOutboxRepository {
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
         Ok(outcome)
+    }
+
+    /// Returns every reserved occurrence for one recipient/business date.
+    ///
+    /// All batch states count as covered: a plan is reserved before artifact
+    /// generation starts, so an interrupted worker cannot create a duplicate
+    /// identity on recovery.
+    pub async fn covered_keys(
+        &self,
+        now: DateTime<Utc>,
+        recipient_id: &str,
+        report_version: u32,
+    ) -> Result<BTreeSet<ReportKey>, PostgresOutboxError> {
+        let version =
+            i32::try_from(report_version).map_err(|_| PostgresOutboxError::InvalidDelivery)?;
+        let date = business_date(now);
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                "SELECT report_kind FROM daily_reporting.delivery_coverage \
+                 WHERE recipient_id = $1 AND report_version = $2 AND local_date = $3",
+                &[&recipient_id, &version, &date],
+            )
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ReportKey {
+                    local_date: date,
+                    kind: parse_kind(row.get::<_, &str>(0))?,
+                    recipient_id: recipient_id.to_owned(),
+                    report_version,
+                })
+            })
+            .collect()
+    }
+
+    /// Atomically reserves all currently due report identities in the outbox.
+    ///
+    /// This only creates `planned` rows. Rendering and delivery remain separate
+    /// stages, so calling this function cannot send a message or access a
+    /// marketplace. If another worker reserves a competing occurrence between
+    /// the read and insert, the caller receives a conflict and can retry its
+    /// next normal scheduling tick without producing a duplicate.
+    pub async fn plan_due(
+        &self,
+        now: DateTime<Utc>,
+        policy: &DailyReportPolicy,
+    ) -> Result<Vec<(ScheduledDelivery, CreateOutcome)>, PostgresOutboxError> {
+        let mut outcomes = Vec::new();
+        for audience in &policy.audiences {
+            let covered = self.covered_keys(now, &audience.id, policy.version).await?;
+            for delivery in due_for_audience(now, &audience.id, policy.version, &covered)
+                .map_err(|_| PostgresOutboxError::InvalidDelivery)?
+            {
+                let outcome = self.create_planned(delivery.delivery.clone()).await?;
+                outcomes.push((delivery, outcome));
+            }
+        }
+        Ok(outcomes)
     }
 
     pub async fn start_generation(&self, batch_id: i64) -> Result<(), PostgresOutboxError> {
@@ -436,23 +500,23 @@ async fn create_planned_inner(
         .map_err(|_| PostgresOutboxError::Unavailable)?;
     if !existing.is_empty() {
         let batch_id: i64 = existing[0].get(0);
-        let mut existing_kinds = existing
+        let existing_kinds = existing
             .iter()
             .map(|row| parse_kind(row.get::<_, &str>(1)))
-            .collect::<Result<Vec<_>, _>>()?;
-        existing_kinds.sort();
-        let mut requested_kinds = record
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let requested_kinds = record
             .covered_keys()
             .iter()
             .map(|key| key.kind)
-            .collect::<Vec<_>>();
-        requested_kinds.sort();
+            .collect::<BTreeSet<_>>();
         if existing.iter().all(|row| row.get::<_, i64>(0) == batch_id)
             && existing_kinds == requested_kinds
         {
             return Ok(CreateOutcome::Existing(batch_id));
         }
-        return Err(PostgresOutboxError::Conflict);
+        if !existing_kinds.is_disjoint(&requested_kinds) {
+            return Err(PostgresOutboxError::Conflict);
+        }
     }
 
     let report_version =

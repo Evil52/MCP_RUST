@@ -56,6 +56,9 @@ The first disabled-only phase provides:
   `report_worker` PostgreSQL URL, access-registry path and strict report policy;
   it validates both least-privilege database contracts before serving and is
   disabled by default;
+- an idempotent scheduling kernel that reserves separate morning/evening
+  outbox identities per audience, treats any existing batch state as covered,
+  and permits a missed evening plan after a separate morning plan; and
 - a frozen snapshot-manifest contract requiring exactly one sales,
   advertising, stock and price source per scoped account, with source-specific
   freshness limits and fail-closed recommendation suppression for partial or
