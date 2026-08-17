@@ -52,6 +52,10 @@ The first disabled-only phase provides:
   account scope and quality from the immutable report key and frozen dataset,
   renders matching HTML/XLSX output and assigns a content SHA-256 plus a stable
   object key; its dry-run inspection performs no filesystem or network I/O;
+- an isolated `report-worker` binary that accepts only a restricted
+  `report_worker` PostgreSQL URL, access-registry path and strict report policy;
+  it validates both least-privilege database contracts before serving and is
+  disabled by default;
 - a frozen snapshot-manifest contract requiring exactly one sales,
   advertising, stock and price source per scoped account, with source-specific
   freshness limits and fail-closed recommendation suppression for partial or
@@ -73,6 +77,10 @@ catch-up rendering remains fail-closed until it has an explicit two-section
 template rather than silently presenting one interval as two reports.
 Consequently this phase cannot send email and cannot affect a
 marketplace. Search-position collection remains disabled.
+
+`report-worker` currently supports `healthcheck` and disabled idle operation
+only. It deliberately rejects enabled delivery rather than creating a report
+that cannot be persisted and reconciled.
 
 The persistence layer transactionally stores report occurrences, delivery
 coverage and attempts. Its unique occurrence key is

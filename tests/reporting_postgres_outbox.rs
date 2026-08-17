@@ -1,10 +1,11 @@
-use std::{collections::BTreeSet, str::FromStr};
+use std::{collections::BTreeSet, fs, str::FromStr};
 
 use chrono::{Duration, TimeZone, Utc};
 use mcp_ozon::reporting::{
     due_deliveries,
     outbox::{ArtifactIdentity, DeliveryErrorClass},
     postgres_outbox::{CreateOutcome, PostgresOutboxError, PostgresOutboxRepository},
+    service::ReportWorkerConfig,
 };
 use tokio_postgres::Config;
 
@@ -17,6 +18,40 @@ fn artifact() -> ArtifactIdentity {
         object_key: "daily/2099-08-16/integration_owner.xlsx".to_owned(),
         sha256: "b".repeat(64),
     }
+}
+
+#[tokio::test]
+async fn report_worker_runtime_uses_only_the_restricted_database_role() {
+    let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
+        return;
+    };
+    let directory = std::env::temp_dir().join(format!(
+        "mcp-ozon-report-worker-runtime-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let registry = directory.join("access.json");
+    let policy = directory.join("policy.json");
+    fs::write(
+        &registry,
+        r#"{"version":1,"actors":[{"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana_serafimovich","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY"}}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        &policy,
+        r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{"id":"pilot_owner","email_env":"DAILY_REPORT_PILOT_RECIPIENT_EMAIL","managers":[{"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]}]}]}"#,
+    )
+    .unwrap();
+    let config = ReportWorkerConfig::from_lookup(|key| match key {
+        "REPORT_WORKER_DATABASE_URL" => Some(url.clone()),
+        "MCP_ACCESS_CONFIG" => Some(registry.display().to_string()),
+        "DAILY_REPORT_POLICY" => Some(policy.display().to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let (outbox, snapshots) = config.connect().await.unwrap();
+    outbox.verify_runtime_contract().await.unwrap();
+    snapshots.verify_runtime_contract().await.unwrap();
 }
 
 #[tokio::test]

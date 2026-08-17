@@ -18,6 +18,7 @@ pub mod policy;
 pub mod postgres_outbox;
 pub mod postgres_snapshot;
 pub mod rules;
+pub mod service;
 pub mod snapshot;
 pub mod xlsx;
 
