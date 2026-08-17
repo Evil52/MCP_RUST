@@ -17,6 +17,7 @@ pub mod html;
 pub mod kpi;
 pub mod outbox;
 pub mod ozon_adapter;
+pub mod ozon_source;
 pub mod policy;
 pub mod postgres_collector;
 pub mod postgres_outbox;
