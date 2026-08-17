@@ -18,6 +18,23 @@ use super::postgres_collector::{CollectedPriceFact, CollectedSalesFact, Collecte
 const MAX_PAGE_ROWS: usize = 1_000;
 const MAX_WAREHOUSE_KIND_BYTES: usize = 64;
 const MAX_CURSOR_BYTES: usize = 4_096;
+const MAX_CAMPAIGN_TITLE_BYTES: usize = 512;
+
+/// One campaign-day aggregate from the verified Ozon Performance daily
+/// statistics response. This is deliberately not a `CollectedAdvertisingFact`:
+/// the endpoint has no SKU dimension, so treating a campaign aggregate as a
+/// per-SKU fact would produce a false attribution in a manager report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OzonPerformanceDailyCampaignFact {
+    pub business_date: NaiveDate,
+    pub campaign_id: u64,
+    pub campaign_title: String,
+    pub impressions: u64,
+    pub clicks: u64,
+    pub spend_minor: u64,
+    pub attributed_orders: u64,
+    pub attributed_revenue_minor: u64,
+}
 
 /// One exact Seller API request approved for the daily-report Ozon source.
 ///
@@ -190,6 +207,42 @@ pub fn parse_price_page(response: &Value) -> Result<Vec<CollectedPriceFact>, Ozo
     Ok(facts)
 }
 
+/// Normalizes the observed `/api/client/statistics/daily/json` response.
+///
+/// Ozon Performance returns campaign-day aggregates, not SKU rows. This
+/// parser therefore stays separate from the per-SKU advertising persistence
+/// contract until a verified product-level report is added. Amounts use the
+/// Russian decimal comma observed in the live read, while a decimal point is
+/// also accepted for an equivalent API representation.
+pub fn parse_performance_daily_campaigns(
+    response: &Value,
+) -> Result<Vec<OzonPerformanceDailyCampaignFact>, OzonReportParseError> {
+    let rows = array_field(response, "rows")?;
+    if rows.len() > MAX_PAGE_ROWS {
+        return Err(OzonReportParseError::TooManyRows);
+    }
+    let mut facts = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row = row.as_object().ok_or(OzonReportParseError::Shape)?;
+        let impressions = parse_u64(field(Some(row), "views")?)?;
+        let clicks = parse_u64(field(Some(row), "clicks")?)?;
+        if clicks > impressions {
+            return Err(OzonReportParseError::Value);
+        }
+        facts.push(OzonPerformanceDailyCampaignFact {
+            business_date: parse_date(field(Some(row), "date")?)?,
+            campaign_id: parse_u64(field(Some(row), "id")?)?,
+            campaign_title: parse_campaign_title(field(Some(row), "title")?)?,
+            impressions,
+            clicks,
+            spend_minor: parse_performance_minor(field(Some(row), "moneySpent")?)?,
+            attributed_orders: parse_u64(field(Some(row), "orders")?)?,
+            attributed_revenue_minor: parse_performance_minor(field(Some(row), "ordersMoney")?)?,
+        });
+    }
+    Ok(facts)
+}
+
 fn object_field<'a>(
     value: &'a Value,
     name: &str,
@@ -251,6 +304,27 @@ fn parse_warehouse_kind(value: &Value) -> Result<String, OzonReportParseError> {
         return Err(OzonReportParseError::Value);
     }
     Ok(value.to_owned())
+}
+
+fn parse_campaign_title(value: &Value) -> Result<String, OzonReportParseError> {
+    let value = value.as_str().ok_or(OzonReportParseError::Value)?;
+    if value.is_empty()
+        || value.len() > MAX_CAMPAIGN_TITLE_BYTES
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(OzonReportParseError::Value);
+    }
+    Ok(value.to_owned())
+}
+
+fn parse_performance_minor(value: &Value) -> Result<u64, OzonReportParseError> {
+    let Value::String(value) = value else {
+        return parse_minor(value);
+    };
+    if value.matches(',').count() > 1 || value.contains(',') && value.contains('.') {
+        return Err(OzonReportParseError::Value);
+    }
+    parse_minor(&Value::String(value.replace(',', ".")))
 }
 
 fn parse_minor(value: &Value) -> Result<u64, OzonReportParseError> {
@@ -323,6 +397,21 @@ mod tests {
         .unwrap();
         assert_eq!(prices[0].price_minor, 9_995);
         assert_eq!(prices[0].old_price_minor, None);
+
+        let performance = parse_performance_daily_campaigns(&json!({"rows": [{
+            "id": "35751912",
+            "title": "Реклама с Тёмой",
+            "date": "2026-08-16",
+            "views": "3764",
+            "clicks": "126",
+            "moneySpent": "701,78",
+            "orders": "0",
+            "ordersMoney": "0,00"
+        }]}))
+        .unwrap();
+        assert_eq!(performance[0].campaign_id, 35_751_912);
+        assert_eq!(performance[0].spend_minor, 70_178);
+        assert_eq!(performance[0].attributed_revenue_minor, 0);
     }
 
     #[test]
@@ -411,6 +500,32 @@ mod tests {
         }
         assert_eq!(parse_minor(&json!("0.1")), Ok(10));
         assert_eq!(parse_minor(&json!("42")), Ok(4_200));
+    }
+
+    #[test]
+    fn performance_campaign_daily_contract_is_bounded_and_fail_closed() {
+        assert_eq!(
+            parse_performance_daily_campaigns(&json!({"rows": []})),
+            Ok(Vec::new())
+        );
+        for response in [
+            json!({}),
+            json!({"rows": [{}]}),
+            json!({"rows": [{
+                "id":"1", "title":"x", "date":"2026-08-16", "views":"1",
+                "clicks":"2", "moneySpent":"0", "orders":"0", "ordersMoney":"0"
+            }]}),
+            json!({"rows": [{
+                "id":"1", "title":"x", "date":"2026-08-16", "views":"1",
+                "clicks":"1", "moneySpent":"1,000.00", "orders":"0", "ordersMoney":"0"
+            }]}),
+        ] {
+            assert!(parse_performance_daily_campaigns(&response).is_err());
+        }
+        assert_eq!(
+            parse_performance_daily_campaigns(&json!({"rows": vec![json!({}); MAX_PAGE_ROWS + 1]})),
+            Err(OzonReportParseError::TooManyRows)
+        );
     }
 
     #[test]
