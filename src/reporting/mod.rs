@@ -16,6 +16,7 @@ pub mod dataset;
 pub mod html;
 pub mod kpi;
 pub mod outbox;
+pub mod ozon_adapter;
 pub mod policy;
 pub mod postgres_collector;
 pub mod postgres_outbox;
