@@ -10,6 +10,7 @@ use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
 use thiserror::Error;
 
 pub mod bundle;
+pub mod collector_plan;
 pub mod dataset;
 pub mod html;
 pub mod kpi;
