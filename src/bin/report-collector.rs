@@ -122,9 +122,14 @@ async fn run_ozon_dry_run(
         )
     })?
     .map_err(|error| {
+        let diagnostic = error
+            .diagnostic()
+            .map(|value| format!("; shape={value}"))
+            .unwrap_or_default();
         anyhow::anyhow!(
-            "Ozon dry-run failed ({}); no partial report snapshots were published",
-            error.code()
+            "Ozon dry-run failed ({}{}); no partial report snapshots were published",
+            error.code(),
+            diagnostic,
         )
     })?;
     tracing::info!(

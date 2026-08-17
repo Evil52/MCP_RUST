@@ -232,8 +232,8 @@ mod tests {
                 sku: "10".to_owned(),
                 ordered_units: 2,
                 operational_gmv_minor: 20_000,
-                cancelled_units: 0,
-                returned_units: 0,
+                cancelled_units: Some(0),
+                returned_units: Some(0),
             }],
             advertising: vec![AdvertisingReportRow {
                 account_id: "store".to_owned(),

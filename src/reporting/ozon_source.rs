@@ -182,7 +182,7 @@ pub enum OzonReportSourceError {
     #[error("Ozon daily-report source response is invalid")]
     InvalidResponse,
     #[error("Ozon daily-report sales response is invalid")]
-    InvalidSalesResponse,
+    InvalidSalesResponse { shape: String },
     #[error("Ozon daily-report stocks response is invalid")]
     InvalidStocksResponse,
     #[error("Ozon daily-report prices response is invalid")]
@@ -200,11 +200,21 @@ impl OzonReportSourceError {
             Self::Upstream(kind) => kind.code(),
             Self::Transport => "transport_error",
             Self::InvalidResponse => "invalid_response",
-            Self::InvalidSalesResponse => "invalid_sales_response",
+            Self::InvalidSalesResponse { .. } => "invalid_sales_response",
             Self::InvalidStocksResponse => "invalid_stocks_response",
             Self::InvalidPricesResponse => "invalid_prices_response",
             Self::InvalidSnapshotInput => "invalid_snapshot_input",
             Self::PaginationLimit => "pagination_limit",
+        }
+    }
+
+    /// A value-free, bounded structural fingerprint for the one sales parse
+    /// failure that needs operator investigation. It never includes an Ozon
+    /// response value, identifier, amount, name, or credential.
+    pub fn diagnostic(&self) -> Option<&str> {
+        match self {
+            Self::InvalidSalesResponse { shape } => Some(shape),
+            _ => None,
         }
     }
 }
@@ -239,7 +249,9 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
                 shape = %sales_response_shape(&response),
                 "Ozon sales response did not match the bounded report contract"
             );
-            OzonReportSourceError::InvalidSalesResponse
+            OzonReportSourceError::InvalidSalesResponse {
+                shape: sales_response_shape(&response),
+            }
         })
     }
 
@@ -468,7 +480,7 @@ mod tests {
         let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
             Ok(json!({"result":{"data":[{
                 "dimensions":[{"id":"1"},{"id":"2026-08-16"}],
-                "metrics":["1.00", 2, 0, 0]
+                "metrics":["1.00", 2]
             }]}})),
             Ok(json!({"items":[{"product_id":1,"stocks":[{"type":"FBO","present":3}]}]})),
             Ok(
@@ -565,8 +577,8 @@ mod tests {
                 sku: 1,
                 ordered_units: 1,
                 operational_gmv_minor: 100,
-                cancelled_units: 0,
-                returned_units: 0,
+                cancelled_units: Some(0),
+                returned_units: Some(0),
             }],
             stocks: vec![CollectedStockFact {
                 sku: 1,
@@ -604,8 +616,8 @@ mod tests {
             sku: 1,
             ordered_units: 1,
             operational_gmv_minor: 100,
-            cancelled_units: 0,
-            returned_units: 0,
+            cancelled_units: Some(0),
+            returned_units: Some(0),
         };
         let valid_stock = || CollectedStockFact {
             sku: 1,
@@ -660,7 +672,7 @@ mod tests {
         let full_sales_page = || {
             json!({"result":{"data":(0..1_000).map(|index| json!({
                 "dimensions":[{"id":index.to_string()},{"id":"2026-08-16"}],
-                "metrics":["1", 1, 0, 0]
+                "metrics":["1", 1]
             })).collect::<Vec<_>>()}})
         };
         let sales = OzonReportSource::new(FixtureTransport(Mutex::new(

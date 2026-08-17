@@ -17,8 +17,10 @@ pub struct CollectedSalesFact {
     pub sku: u64,
     pub ordered_units: u64,
     pub operational_gmv_minor: u64,
-    pub cancelled_units: u64,
-    pub returned_units: u64,
+    /// `None` means the upstream Seller account did not grant this metric.
+    pub cancelled_units: Option<u64>,
+    /// `None` means the upstream Seller account did not grant this metric.
+    pub returned_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -327,6 +329,8 @@ async fn insert_facts(
     match facts {
         CollectedFacts::Sales(facts) => {
             for fact in facts {
+                let cancelled_units = fact.cancelled_units.map(as_i32).transpose()?;
+                let returned_units = fact.returned_units.map(as_i32).transpose()?;
                 transaction
                     .execute(
                         "INSERT INTO daily_reporting.sales_facts \
@@ -339,8 +343,8 @@ async fn insert_facts(
                             &as_i64(fact.sku)?,
                             &as_i32(fact.ordered_units)?,
                             &as_i64(fact.operational_gmv_minor)?,
-                            &as_i32(fact.cancelled_units)?,
-                            &as_i32(fact.returned_units)?,
+                            &cancelled_units,
+                            &returned_units,
                         ],
                     )
                     .await
@@ -421,8 +425,8 @@ fn validate_facts(facts: &CollectedFacts) -> Result<(), PostgresCollectorError> 
                 fact.sku > 0
                     && fits_i32(fact.ordered_units)
                     && fits_i64(fact.operational_gmv_minor)
-                    && fits_i32(fact.cancelled_units)
-                    && fits_i32(fact.returned_units)
+                    && fact.cancelled_units.is_none_or(fits_i32)
+                    && fact.returned_units.is_none_or(fits_i32)
             },
         ),
         CollectedFacts::Advertising(facts) => ensure_unique(
@@ -546,8 +550,8 @@ mod tests {
             sku: 1,
             ordered_units: 2,
             operational_gmv_minor: 300,
-            cancelled_units: 0,
-            returned_units: 0,
+            cancelled_units: Some(0),
+            returned_units: Some(0),
         }
     }
 

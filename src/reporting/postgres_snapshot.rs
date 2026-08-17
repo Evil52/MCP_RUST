@@ -19,8 +19,8 @@ pub struct PublishedSalesFact {
     pub sku: u64,
     pub ordered_units: u64,
     pub operational_gmv_minor: u64,
-    pub cancelled_units: u64,
-    pub returned_units: u64,
+    pub cancelled_units: Option<u64>,
+    pub returned_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,8 +245,8 @@ impl PostgresSnapshotRepository {
                     sku: nonnegative_i64(row.get(2))?,
                     ordered_units: nonnegative_i32(row.get(3))?,
                     operational_gmv_minor: nonnegative_i64(row.get(4))?,
-                    cancelled_units: nonnegative_i32(row.get(5))?,
-                    returned_units: nonnegative_i32(row.get(6))?,
+                    cancelled_units: nonnegative_optional_i32(row.get(5))?,
+                    returned_units: nonnegative_optional_i32(row.get(6))?,
                 })
             })
             .collect::<Result<Vec<_>, PostgresSnapshotError>>()?;
@@ -335,6 +335,10 @@ fn validate_actual_total(expected: usize, actual: usize) -> Result<(), PostgresS
 
 fn nonnegative_i32(value: i32) -> Result<u64, PostgresSnapshotError> {
     u64::try_from(value).map_err(|_| PostgresSnapshotError::InvalidManifest)
+}
+
+fn nonnegative_optional_i32(value: Option<i32>) -> Result<Option<u64>, PostgresSnapshotError> {
+    value.map(nonnegative_i32).transpose()
 }
 
 fn nonnegative_i64(value: i64) -> Result<u64, PostgresSnapshotError> {

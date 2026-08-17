@@ -23,8 +23,8 @@ pub struct SalesDetail<'a> {
     pub sku: &'a str,
     pub ordered_units: u64,
     pub operational_gmv_minor: u64,
-    pub cancelled_units: u64,
-    pub returned_units: u64,
+    pub cancelled_units: Option<u64>,
+    pub returned_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,12 +149,8 @@ fn validate(report: &XlsxReport<'_>) -> Result<(), XlsxReportError> {
     for row in report.sales {
         validate_id(row.account_id)?;
         validate_text(row.sku)?;
-        validate_numbers(&[
-            row.ordered_units,
-            row.operational_gmv_minor,
-            row.cancelled_units,
-            row.returned_units,
-        ])?;
+        validate_numbers(&[row.ordered_units, row.operational_gmv_minor])?;
+        validate_optional_numbers(&[row.cancelled_units, row.returned_units])?;
     }
     for row in report.advertising {
         validate_id(row.account_id)?;
@@ -224,6 +220,18 @@ fn validate_text(value: &str) -> Result<(), XlsxReportError> {
 
 fn validate_numbers(values: &[u64]) -> Result<(), XlsxReportError> {
     if values.iter().any(|value| *value > MAX_EXACT_EXCEL_INTEGER) {
+        Err(XlsxReportError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_optional_numbers(values: &[Option<u64>]) -> Result<(), XlsxReportError> {
+    if values
+        .iter()
+        .flatten()
+        .any(|value| *value > MAX_EXACT_EXCEL_INTEGER)
+    {
         Err(XlsxReportError::InvalidInput)
     } else {
         Ok(())
@@ -300,17 +308,17 @@ fn write_kpi_table(
 ) -> Result<(), XlsxReportError> {
     write_headers(sheet, formats, start_row, &["Показатель", "Значение"])?;
     let integer_rows = [
-        ("Заказано единиц", kpis.ordered_units),
+        ("Заказано единиц", Some(kpis.ordered_units)),
         ("Отменено единиц", kpis.cancelled_units),
         ("Возвращено единиц", kpis.returned_units),
-        ("Показы рекламы", kpis.ad_impressions),
-        ("Клики рекламы", kpis.ad_clicks),
+        ("Показы рекламы", Some(kpis.ad_impressions)),
+        ("Клики рекламы", Some(kpis.ad_clicks)),
     ];
     for (index, (label, value)) in integer_rows.into_iter().enumerate() {
         let row =
             start_row + u32::try_from(index + 1).map_err(|_| XlsxReportError::InvalidInput)?;
         sheet.write_string(row, 0, label).map_err(map_xlsx)?;
-        write_u64(sheet, row, 1, value)?;
+        write_optional_u64(sheet, row, 1, value)?;
     }
     let mut row = start_row + 6;
     for (label, value) in [
@@ -356,8 +364,8 @@ fn write_sales(
         write_text(sheet, row, 1, item.sku)?;
         write_u64(sheet, row, 2, item.ordered_units)?;
         write_minor(sheet, row, 3, item.operational_gmv_minor, formats)?;
-        write_u64(sheet, row, 4, item.cancelled_units)?;
-        write_u64(sheet, row, 5, item.returned_units)?;
+        write_optional_u64(sheet, row, 4, item.cancelled_units)?;
+        write_optional_u64(sheet, row, 5, item.returned_units)?;
     }
     finish_table(sheet, &[20, 20, 14, 16, 14, 14])
 }
@@ -574,6 +582,21 @@ fn write_u64(
     Ok(())
 }
 
+fn write_optional_u64(
+    sheet: &mut Worksheet,
+    row: u32,
+    column: u16,
+    value: Option<u64>,
+) -> Result<(), XlsxReportError> {
+    match value {
+        Some(value) => write_u64(sheet, row, column, value),
+        None => {
+            sheet.write_string(row, column, "N/D").map_err(map_xlsx)?;
+            Ok(())
+        }
+    }
+}
+
 fn write_minor(
     sheet: &mut Worksheet,
     row: u32,
@@ -686,8 +709,8 @@ mod tests {
         KpiSummary {
             ordered_units: 10,
             operational_gmv_minor: 100_000,
-            cancelled_units: 1,
-            returned_units: 2,
+            cancelled_units: Some(1),
+            returned_units: Some(2),
             ad_impressions: 1_000,
             ad_clicks: 20,
             ad_spend_minor: 10_000,
@@ -728,8 +751,8 @@ mod tests {
             sku: "=external",
             ordered_units: 10,
             operational_gmv_minor: 100_000,
-            cancelled_units: 1,
-            returned_units: 2,
+            cancelled_units: Some(1),
+            returned_units: Some(2),
         }];
         let advertising = [AdvertisingDetail {
             account_id: "ozon_store",
@@ -828,8 +851,8 @@ mod tests {
             sku: "sku",
             ordered_units: 1,
             operational_gmv_minor: 1,
-            cancelled_units: 0,
-            returned_units: 0,
+            cancelled_units: Some(0),
+            returned_units: Some(0),
         };
         let excessive = vec![base_sales; MAX_ROWS + 1];
         assert_eq!(

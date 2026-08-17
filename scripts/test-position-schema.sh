@@ -196,6 +196,21 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/005_daily_reporting_outbox.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/006_daily_report_snapshots.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/007_daily_reporting_optional_metrics.sql >/dev/null
+optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
+    FROM information_schema.columns
+    WHERE table_schema = 'daily_reporting'
+      AND table_name = 'sales_facts'
+      AND column_name IN ('cancelled_units', 'returned_units')
+  "; } | tr -d '\r')"
+if [[ "$optional_sales_metrics" != "cancelled_units:YES,returned_units:YES" ]]; then
+  echo "daily-report unavailable sales metrics are not nullable after migration" >&2
+  printf '%s\n' "$optional_sales_metrics" >&2
+  exit 1
+fi
 "${migration_admin_psql[@]}" --command '
   CREATE TABLE search_position.reader_default_acl_probe (id integer)
 ' >/dev/null

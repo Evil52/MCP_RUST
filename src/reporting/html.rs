@@ -149,10 +149,14 @@ fn write_kpis(html: &mut String, kpis: &KpiSummary) {
         optional_money(kpis.cpc_minor),
         rate(kpis.ad_conversion),
         optional_money(kpis.cpo_minor),
-        kpis.cancelled_units,
-        kpis.returned_units,
+        optional_quantity(kpis.cancelled_units),
+        optional_quantity(kpis.returned_units),
     )
     .expect("writing to String cannot fail");
+}
+
+fn optional_quantity(value: Option<u64>) -> String {
+    value.map_or_else(|| "N/D".to_owned(), |value| value.to_string())
 }
 
 fn write_problems(html: &mut String, problems: &[PriorityProblem], suppressed: bool) {
@@ -235,8 +239,8 @@ mod tests {
         KpiSummary {
             ordered_units: 12,
             operational_gmv_minor: 123_456,
-            cancelled_units: 1,
-            returned_units: 2,
+            cancelled_units: Some(1),
+            returned_units: Some(2),
             ad_impressions: 100,
             ad_clicks: 10,
             ad_spend_minor: 12_345,
@@ -319,6 +323,8 @@ mod tests {
         empty_kpis.ad_conversion = None;
         empty_kpis.cpo_minor = None;
         empty_kpis.drr = None;
+        empty_kpis.cancelled_units = None;
+        empty_kpis.returned_units = None;
         for quality in [
             SnapshotQuality::Partial,
             SnapshotQuality::Stale,
@@ -337,7 +343,7 @@ mod tests {
             })
             .unwrap();
             assert!(html.contains("Рекомендации отключены"));
-            assert!(html.matches("N/D").count() >= 5);
+            assert!(html.matches("N/D").count() >= 7);
         }
     }
 

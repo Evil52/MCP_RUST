@@ -123,8 +123,8 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
             sku: 3411079879,
             ordered_units: 3,
             operational_gmv_minor: 202500,
-            cancelled_units: 0,
-            returned_units: 0,
+            cancelled_units: Some(0),
+            returned_units: Some(0),
         }]),
     );
     writer.persist(&sales).await.unwrap();
@@ -255,8 +255,8 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(facts.sales[0].sku, 3411079879);
     assert_eq!(facts.sales[0].ordered_units, 3);
     assert_eq!(facts.sales[0].operational_gmv_minor, 202500);
-    assert_eq!(facts.sales[0].cancelled_units, 0);
-    assert_eq!(facts.sales[0].returned_units, 0);
+    assert_eq!(facts.sales[0].cancelled_units, Some(0));
+    assert_eq!(facts.sales[0].returned_units, Some(0));
     assert_eq!(facts.advertising.len(), 1);
     assert_eq!(facts.advertising[0].campaign_id, 35751912);
     assert_eq!(facts.advertising[0].sku, 3411079879);

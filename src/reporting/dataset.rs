@@ -17,8 +17,8 @@ pub struct SalesReportRow {
     pub sku: String,
     pub ordered_units: u64,
     pub operational_gmv_minor: u64,
-    pub cancelled_units: u64,
-    pub returned_units: u64,
+    pub cancelled_units: Option<u64>,
+    pub returned_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,13 +114,16 @@ impl ReportDataset {
 
         let mut sales = BTreeMap::new();
         for fact in facts.sales {
-            let row = sales
-                .entry((fact.account_id, fact.sku))
-                .or_insert((0u64, 0u64, 0u64, 0u64));
+            let row = sales.entry((fact.account_id, fact.sku)).or_insert((
+                0u64,
+                0u64,
+                Some(0u64),
+                Some(0u64),
+            ));
             row.0 = add(row.0, fact.ordered_units)?;
             row.1 = add(row.1, fact.operational_gmv_minor)?;
-            row.2 = add(row.2, fact.cancelled_units)?;
-            row.3 = add(row.3, fact.returned_units)?;
+            row.2 = add_available(row.2, fact.cancelled_units)?;
+            row.3 = add_available(row.3, fact.returned_units)?;
         }
         let sales = sales
             .into_iter()
@@ -328,6 +331,13 @@ fn add(left: u64, right: u64) -> Result<u64, DatasetError> {
     left.checked_add(right).ok_or(DatasetError::Overflow)
 }
 
+fn add_available(left: Option<u64>, right: Option<u64>) -> Result<Option<u64>, DatasetError> {
+    match (left, right) {
+        (Some(left), Some(right)) => add(left, right).map(Some),
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone};
@@ -404,8 +414,8 @@ mod tests {
                 sku: 10,
                 ordered_units: 2,
                 operational_gmv_minor: 20_000,
-                cancelled_units: 1,
-                returned_units: 0,
+                cancelled_units: Some(1),
+                returned_units: Some(0),
             }],
             advertising: vec![PublishedAdvertisingFact {
                 account_id: account.to_owned(),
@@ -441,8 +451,8 @@ mod tests {
         input.sales.push(PublishedSalesFact {
             ordered_units: 3,
             operational_gmv_minor: 30_000,
-            cancelled_units: 0,
-            returned_units: 1,
+            cancelled_units: Some(0),
+            returned_units: Some(1),
             ..input.sales[0].clone()
         });
         input.stocks.push(PublishedStockFact {
