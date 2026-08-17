@@ -44,6 +44,7 @@ const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
     "/v1/analytics/data",
     "/v1/analytics/turnover/stocks",
+    "/v1/product/info/warehouse/stocks",
     "/v1/question/list",
     "/v1/rating/history",
     "/v1/rating/summary",
@@ -55,6 +56,8 @@ pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
     "/v3/finance/transaction/totals",
     "/v3/posting/fbo/list",
     "/v3/posting/fbs/list",
+    "/v3/supply-order/get",
+    "/v3/supply-order/list",
     "/v4/posting/fbs/list",
     "/v4/product/info/stocks",
     "/v5/product/info/prices",

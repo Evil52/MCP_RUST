@@ -42,6 +42,9 @@ const MAX_ENUM_VALUE_CHARS: usize = 128;
 const MAX_OPAQUE_TOKEN_CHARS: usize = 4_096;
 const MAX_PRODUCT_FILTER_ITEMS: usize = 1_000;
 const MAX_SKUS: usize = 1_000;
+const MAX_SUPPLY_ORDER_DROPOFF_WAREHOUSES: usize = 1_000;
+const MAX_SUPPLY_ORDER_IDS: usize = 50;
+const MAX_SUPPLY_ORDER_STATES: usize = 11;
 const MAX_POSTING_NUMBERS: usize = 1_000;
 const MAX_GROUP_STATES: usize = 100;
 const MAX_OPERATION_TYPES: usize = 100;
@@ -62,6 +65,7 @@ const MAX_IN_FLIGHT_TOOL_CALLS: usize = 16;
 const MIN_REVIEWS_LIMIT: u32 = 20;
 const MAX_OFFSET: u32 = 1_000_000;
 const MAX_PAGE: u32 = 1_000_000;
+const MAX_OZON_SIGNED_API_ID: u64 = i64::MAX as u64;
 const OZON_TOOL_FAILURE: &str = "OZON_TOOL_CALL_FAILED";
 const OZON_PERFORMANCE_TOOL_FAILURE: &str = "OZON_PERFORMANCE_TOOL_CALL_FAILED";
 const WB_TOOL_FAILURE: &str = "WB_TOOL_CALL_FAILED";
@@ -1652,6 +1656,156 @@ fn default_product_limit() -> u32 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct WarehouseStocksInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[schemars(
+        description = "Положительный идентификатор склада FBS или rFBS",
+        range(min = 1, max = 9_223_372_036_854_775_807_u64)
+    )]
+    pub warehouse_id: u64,
+    #[serde(default = "default_product_limit")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub limit: u32,
+    #[serde(default)]
+    #[schemars(length(max = 4_096))]
+    pub cursor: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SupplyOrderState {
+    DataFilling,
+    ReadyToSupply,
+    AcceptedAtSupplyWarehouse,
+    InTransit,
+    AcceptanceAtStorageWarehouse,
+    ReportsConfirmationAwaiting,
+    ReportRejected,
+    Completed,
+    RejectedAtSupplyWarehouse,
+    Cancelled,
+    Overdue,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SupplyOrderSortBy {
+    #[default]
+    OrderCreation,
+    OrderStateUpdatedAt,
+    TimeslotFromUtc,
+    TimeslotFromLocal,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SupplyOrderSortDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SupplyOrderTimeslotFilterType {
+    ByLocalTime,
+    ByUtcTime,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SupplyOrderTimeslotRangeInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Начало диапазона таймслота в формате RFC3339",
+        length(min = 20, max = 64)
+    )]
+    pub from: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Конец диапазона таймслота в формате RFC3339",
+        length(min = 20, max = 64)
+    )]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub timeslot_filter_type: Option<SupplyOrderTimeslotFilterType>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SupplyOrderListInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(
+        description = "Уникальные статусы заявок; пустой список означает все статусы",
+        length(max = 11),
+        extend("uniqueItems" = true)
+    )]
+    pub states: Vec<SupplyOrderState>,
+    #[serde(default)]
+    #[schemars(
+        description = "До 1000 уникальных положительных ID пунктов отгрузки",
+        length(max = 1_000),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub dropoff_warehouse_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Поиск по номеру заявки: от 3 до 256 символов",
+        length(min = 3, max = 256)
+    )]
+    pub order_number_search: Option<String>,
+    #[serde(default)]
+    pub timeslot_from_range: Option<SupplyOrderTimeslotRangeInput>,
+    #[serde(default)]
+    #[schemars(length(max = 4_096))]
+    pub last_id: Option<String>,
+    #[serde(default = "default_supply_order_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: u32,
+    #[serde(default)]
+    pub sort_by: SupplyOrderSortBy,
+    #[serde(default)]
+    pub sort_dir: SupplyOrderSortDirection,
+}
+
+fn default_supply_order_limit() -> u32 {
+    100
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SupplyOrderGetInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[schemars(
+        description = "От 1 до 50 уникальных положительных ID заявок на поставку",
+        length(min = 1, max = 50),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub order_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TurnoverInput {
     #[serde(default)]
     #[schemars(
@@ -2983,6 +3137,34 @@ impl OzonMcp {
             .await
     }
 
+    /// Возвращает постраничные остатки товаров на конкретном складе FBS или rFBS.
+    #[tool(
+        name = "ozon_warehouse_stocks",
+        annotations(title = "Остатки на складе FBS/rFBS Ozon", read_only_hint = true)
+    )]
+    async fn warehouse_stocks(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WarehouseStocksInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_ozon_id("warehouse_id", input.warehouse_id)?;
+        validate_limit(input.limit, 1_000)?;
+        if let Some(cursor) = input.cursor.as_deref() {
+            validate_max_chars("cursor", cursor, MAX_OPAQUE_TOKEN_CHARS)?;
+        }
+        self.request(
+            &identity,
+            input.store,
+            "/v1/product/info/warehouse/stocks",
+            json!({
+                "cursor": input.cursor.unwrap_or_default(),
+                "limit": input.limit,
+                "warehouse_id": input.warehouse_id,
+            }),
+        )
+        .await
+    }
+
     /// Возвращает текущие цены и скидки товаров Ozon без возможности их изменить.
     #[tool(
         name = "ozon_product_prices",
@@ -3015,6 +3197,120 @@ impl OzonMcp {
             input.store,
             "/v1/analytics/turnover/stocks",
             json!({ "limit": input.limit, "offset": input.offset, "sku": input.skus }),
+        )
+        .await
+    }
+
+    /// Возвращает список идентификаторов заявок на поставку FBO по фильтрам.
+    #[tool(
+        name = "ozon_supply_order_list",
+        annotations(title = "Список заявок на поставку Ozon", read_only_hint = true)
+    )]
+    async fn supply_order_list(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<SupplyOrderListInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_count("states", input.states.len(), 0, MAX_SUPPLY_ORDER_STATES)?;
+        if input.states.iter().collect::<BTreeSet<_>>().len() != input.states.len() {
+            return Err("states должен содержать уникальные значения".to_owned());
+        }
+        validate_count(
+            "dropoff_warehouse_ids",
+            input.dropoff_warehouse_ids.len(),
+            0,
+            MAX_SUPPLY_ORDER_DROPOFF_WAREHOUSES,
+        )?;
+        validate_unique_ozon_ids("dropoff_warehouse_ids", &input.dropoff_warehouse_ids)?;
+        if let Some(search) = input.order_number_search.as_deref() {
+            validate_non_blank("order_number_search", search)?;
+            let length = search.chars().count();
+            if !(3..=MAX_IDENTIFIER_CHARS).contains(&length) {
+                return Err(format!(
+                    "order_number_search должен содержать от 3 до {MAX_IDENTIFIER_CHARS} символов"
+                ));
+            }
+        }
+        if let Some(last_id) = input.last_id.as_deref() {
+            validate_max_chars("last_id", last_id, MAX_OPAQUE_TOKEN_CHARS)?;
+        }
+        validate_limit(input.limit, 100)?;
+
+        let mut filter = serde_json::Map::from_iter([("states".to_owned(), json!(input.states))]);
+        if !input.dropoff_warehouse_ids.is_empty() {
+            filter.insert(
+                "dropoff_warehouse_ids".to_owned(),
+                json!(input.dropoff_warehouse_ids),
+            );
+        }
+        if let Some(search) = input.order_number_search {
+            filter.insert("order_number_search".to_owned(), json!(search));
+        }
+        if let Some(range) = input.timeslot_from_range {
+            let from = range
+                .from
+                .as_deref()
+                .map(|value| validate_rfc3339("timeslot_from_range.from", value))
+                .transpose()?;
+            let to = range
+                .to
+                .as_deref()
+                .map(|value| validate_rfc3339("timeslot_from_range.to", value))
+                .transpose()?;
+            if from.zip(to).is_some_and(|(from, to)| from > to) {
+                return Err(
+                    "timeslot_from_range.to не может быть раньше timeslot_from_range.from"
+                        .to_owned(),
+                );
+            }
+            let mut range_payload = serde_json::Map::new();
+            if let Some(from) = range.from {
+                range_payload.insert("from".to_owned(), json!(from));
+            }
+            if let Some(to) = range.to {
+                range_payload.insert("to".to_owned(), json!(to));
+            }
+            if let Some(filter_type) = range.timeslot_filter_type {
+                range_payload.insert("timeslot_filter_type".to_owned(), json!(filter_type));
+            }
+            filter.insert(
+                "timeslot_from_range".to_owned(),
+                Value::Object(range_payload),
+            );
+        }
+
+        self.request(
+            &identity,
+            input.store,
+            "/v3/supply-order/list",
+            json!({
+                "filter": filter,
+                "last_id": input.last_id.unwrap_or_default(),
+                "limit": input.limit,
+                "sort_by": input.sort_by,
+                "sort_dir": input.sort_dir,
+            }),
+        )
+        .await
+    }
+
+    /// Возвращает подробную информацию по идентификаторам заявок на поставку FBO.
+    #[tool(
+        name = "ozon_supply_order_get",
+        annotations(title = "Заявки на поставку Ozon", read_only_hint = true)
+    )]
+    async fn supply_order_get(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<SupplyOrderGetInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_count("order_ids", input.order_ids.len(), 1, MAX_SUPPLY_ORDER_IDS)?;
+        validate_unique_ozon_ids("order_ids", &input.order_ids)?;
+        self.request(
+            &identity,
+            input.store,
+            "/v3/supply-order/get",
+            json!({ "order_ids": input.order_ids }),
         )
         .await
     }
@@ -3689,6 +3985,34 @@ fn validate_unique_positive_ids(field: &str, values: &[u64]) -> Result<(), Strin
         return Err(format!("{field} не должен содержать повторяющиеся ID"));
     }
     Ok(())
+}
+
+fn validate_ozon_id(field: &str, value: u64) -> Result<(), String> {
+    if !(1..=MAX_OZON_SIGNED_API_ID).contains(&value) {
+        return Err(format!(
+            "{field} должен быть от 1 до {MAX_OZON_SIGNED_API_ID}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unique_ozon_ids(field: &str, values: &[u64]) -> Result<(), String> {
+    validate_unique_positive_ids(field, values)?;
+    if values.iter().any(|value| *value > MAX_OZON_SIGNED_API_ID) {
+        return Err(format!(
+            "{field} не должен содержать ID больше {MAX_OZON_SIGNED_API_ID}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rfc3339(
+    field: &str,
+    value: &str,
+) -> Result<chrono::DateTime<chrono::FixedOffset>, String> {
+    validate_max_chars(field, value, 64)?;
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|_| format!("{field} должен иметь формат RFC3339"))
 }
 
 fn validate_unique_wb_signed_ids(field: &str, values: &[u64]) -> Result<(), String> {
@@ -8100,7 +8424,7 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
-        assert_eq!(dev_tools.len(), 43);
+        assert_eq!(dev_tools.len(), 46);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -8111,7 +8435,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 43);
+        assert_eq!(jwt_tools.len(), 46);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -8123,7 +8447,7 @@ mod tests {
             .with_preview_features(false, true)
             .tool_router
             .list_all();
-        assert_eq!(preview_tools.len(), 46);
+        assert_eq!(preview_tools.len(), 49);
         assert_policy(
             preview_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -8161,8 +8485,11 @@ mod tests {
             "wb_promotion_search_cluster_bids",
             "ozon_analytics",
             "ozon_product_stocks",
+            "ozon_warehouse_stocks",
             "ozon_product_prices",
             "ozon_stock_turnover",
+            "ozon_supply_order_list",
+            "ozon_supply_order_get",
             "ozon_fbs_postings",
             "ozon_fbo_postings",
             "ozon_returns",
@@ -8192,7 +8519,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         let default_names = names(&server());
-        assert_eq!(default_names.len(), 43);
+        assert_eq!(default_names.len(), 46);
         assert!(preview_names.is_disjoint(&default_names));
         for name in STABLE_TOOL_NAMES {
             assert!(
@@ -8207,7 +8534,7 @@ mod tests {
         assert!(preview_names.is_disjoint(&names(&authenticated)));
 
         let enabled_names = names(&server().with_preview_features(false, true));
-        assert_eq!(enabled_names.len(), 46);
+        assert_eq!(enabled_names.len(), 49);
         assert!(preview_names.is_subset(&enabled_names));
         assert_eq!(
             enabled_names
@@ -8281,8 +8608,10 @@ mod tests {
 
         for (tool, maximum) in [
             ("ozon_product_stocks", 1_000),
+            ("ozon_warehouse_stocks", 1_000),
             ("ozon_product_prices", 1_000),
             ("ozon_stock_turnover", 1_000),
+            ("ozon_supply_order_list", 100),
             ("ozon_fbs_postings", 1_000),
             ("ozon_fbo_postings", 1_000),
             ("ozon_returns", 500),
@@ -8381,6 +8710,46 @@ mod tests {
             acceptance["properties"]["warehouse_ids"]["items"]["minimum"],
             json!(1)
         );
+
+        let warehouse = schema("ozon_warehouse_stocks");
+        assert_eq!(warehouse["properties"]["warehouse_id"]["minimum"], json!(1));
+        assert_eq!(
+            warehouse["properties"]["warehouse_id"]["maximum"],
+            json!(MAX_OZON_SIGNED_API_ID)
+        );
+        assert_eq!(
+            warehouse["properties"]["cursor"]["maxLength"],
+            json!(MAX_OPAQUE_TOKEN_CHARS)
+        );
+
+        let supply_list = schema("ozon_supply_order_list");
+        assert_eq!(
+            supply_list["properties"]["states"]["maxItems"],
+            json!(MAX_SUPPLY_ORDER_STATES)
+        );
+        assert_eq!(
+            supply_list["properties"]["states"]["uniqueItems"],
+            json!(true)
+        );
+        assert_eq!(
+            supply_list["properties"]["dropoff_warehouse_ids"]["maxItems"],
+            json!(MAX_SUPPLY_ORDER_DROPOFF_WAREHOUSES)
+        );
+        assert_eq!(
+            supply_list["properties"]["last_id"]["maxLength"],
+            json!(MAX_OPAQUE_TOKEN_CHARS)
+        );
+
+        let supply_get = schema("ozon_supply_order_get");
+        assert_eq!(supply_get["properties"]["order_ids"]["minItems"], json!(1));
+        assert_eq!(
+            supply_get["properties"]["order_ids"]["maxItems"],
+            json!(MAX_SUPPLY_ORDER_IDS)
+        );
+        assert_eq!(
+            supply_get["properties"]["order_ids"]["uniqueItems"],
+            json!(true)
+        );
     }
 
     #[test]
@@ -8401,8 +8770,11 @@ mod tests {
         for tool in [
             "ozon_analytics",
             "ozon_product_stocks",
+            "ozon_warehouse_stocks",
             "ozon_product_prices",
             "ozon_stock_turnover",
+            "ozon_supply_order_list",
+            "ozon_supply_order_get",
             "ozon_fbs_postings",
             "ozon_fbo_postings",
             "ozon_returns",
@@ -8678,10 +9050,30 @@ mod tests {
     }
 
     #[test]
+    fn supply_order_list_defaults_match_the_ozon_contract() {
+        let input: SupplyOrderListInput = serde_json::from_value(json!({})).unwrap();
+        assert!(input.store.is_none());
+        assert!(input.states.is_empty());
+        assert!(input.dropoff_warehouse_ids.is_empty());
+        assert!(input.order_number_search.is_none());
+        assert!(input.timeslot_from_range.is_none());
+        assert!(input.last_id.is_none());
+        assert_eq!(input.limit, 100);
+        assert_eq!(input.sort_by, SupplyOrderSortBy::OrderCreation);
+        assert_eq!(input.sort_dir, SupplyOrderSortDirection::Desc);
+        assert_eq!(
+            SupplyOrderSortDirection::default(),
+            SupplyOrderSortDirection::Desc
+        );
+        assert!(serde_json::from_value::<SupplyOrderGetInput>(json!({})).is_err());
+    }
+
+    #[test]
     fn ozon_network_endpoints_are_confined_to_explicit_read_only_allowlist() {
         const EXPECTED: &[&str] = &[
             "/v1/analytics/data",
             "/v1/analytics/turnover/stocks",
+            "/v1/product/info/warehouse/stocks",
             "/v1/question/list",
             "/v1/rating/history",
             "/v1/rating/summary",
@@ -8693,6 +9085,8 @@ mod tests {
             "/v3/finance/transaction/totals",
             "/v3/posting/fbo/list",
             "/v3/posting/fbs/list",
+            "/v3/supply-order/get",
+            "/v3/supply-order/list",
             "/v4/posting/fbs/list",
             "/v4/product/info/stocks",
             "/v5/product/info/prices",
@@ -9254,7 +9648,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_read_only_tool_sends_the_exact_ozon_contract() {
-        let (server, requests) = mock_server(14);
+        let (server, requests) = mock_server(17);
         let mut results = Vec::new();
 
         results.push(
@@ -9309,6 +9703,21 @@ mod tests {
         }
         results.push(
             server
+                .warehouse_stocks(
+                    RequestIdentity::dev(),
+                    Parameters(WarehouseStocksInput {
+                        store: Some(StoreId::from("store_a")),
+                        warehouse_id: 1_020_003_080_073_000,
+                        limit: 25,
+                        cursor: Some("warehouse-cursor".to_owned()),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
                 .stock_turnover(
                     RequestIdentity::dev(),
                     Parameters(TurnoverInput {
@@ -9316,6 +9725,43 @@ mod tests {
                         skus: vec!["sku-1".to_owned()],
                         limit: 30,
                         offset: 2,
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .supply_order_list(
+                    RequestIdentity::dev(),
+                    Parameters(SupplyOrderListInput {
+                        store: Some(StoreId::from("store_a")),
+                        states: vec![SupplyOrderState::ReadyToSupply, SupplyOrderState::Completed],
+                        dropoff_warehouse_ids: vec![101, 202],
+                        order_number_search: Some("2111140905880".to_owned()),
+                        timeslot_from_range: Some(SupplyOrderTimeslotRangeInput {
+                            from: Some("2026-02-15T09:00:00+03:00".to_owned()),
+                            to: Some("2026-02-15T10:00:00+03:00".to_owned()),
+                            timeslot_filter_type: Some(SupplyOrderTimeslotFilterType::ByLocalTime),
+                        }),
+                        last_id: Some("supply-cursor".to_owned()),
+                        limit: 75,
+                        sort_by: SupplyOrderSortBy::TimeslotFromLocal,
+                        sort_dir: SupplyOrderSortDirection::Desc,
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .supply_order_get(
+                    RequestIdentity::dev(),
+                    Parameters(SupplyOrderGetInput {
+                        store: Some(StoreId::from("store_a")),
+                        order_ids: vec![123, 456],
                     }),
                 )
                 .await
@@ -9525,9 +9971,37 @@ mod tests {
                 }),
             ),
             (
+                "/v1/product/info/warehouse/stocks",
+                json!({
+                    "cursor": "warehouse-cursor",
+                    "limit": 25,
+                    "warehouse_id": 1_020_003_080_073_000_u64,
+                }),
+            ),
+            (
                 "/v1/analytics/turnover/stocks",
                 json!({"limit": 30, "offset": 2, "sku": ["sku-1"]}),
             ),
+            (
+                "/v3/supply-order/list",
+                json!({
+                    "filter": {
+                        "states": ["READY_TO_SUPPLY", "COMPLETED"],
+                        "dropoff_warehouse_ids": [101, 202],
+                        "order_number_search": "2111140905880",
+                        "timeslot_from_range": {
+                            "from": "2026-02-15T09:00:00+03:00",
+                            "to": "2026-02-15T10:00:00+03:00",
+                            "timeslot_filter_type": "BY_LOCAL_TIME",
+                        },
+                    },
+                    "last_id": "supply-cursor",
+                    "limit": 75,
+                    "sort_by": "TIMESLOT_FROM_LOCAL",
+                    "sort_dir": "DESC",
+                }),
+            ),
+            ("/v3/supply-order/get", json!({"order_ids": [123, 456]})),
             (
                 "/v3/posting/fbs/list",
                 json!({
@@ -9658,6 +10132,284 @@ mod tests {
             assert_eq!(actual_path, expected_path);
             assert_eq!(actual_body, expected_body, "{expected_path}");
         }
+    }
+
+    #[tokio::test]
+    async fn warehouse_and_supply_order_list_omit_optional_filters_safely() {
+        let (server, requests) = mock_server(2);
+        let warehouse: WarehouseStocksInput = serde_json::from_value(json!({
+            "store": "store_a",
+            "warehouse_id": 101
+        }))
+        .unwrap();
+        let supply_list: SupplyOrderListInput = serde_json::from_value(json!({
+            "store": "store_a"
+        }))
+        .unwrap();
+
+        server
+            .warehouse_stocks(RequestIdentity::dev(), Parameters(warehouse))
+            .await
+            .unwrap();
+        server
+            .supply_order_list(RequestIdentity::dev(), Parameters(supply_list))
+            .await
+            .unwrap();
+
+        let warehouse_request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (warehouse_path, warehouse_body) = request_path_and_body(&warehouse_request);
+        assert_eq!(warehouse_path, "/v1/product/info/warehouse/stocks");
+        assert_eq!(
+            warehouse_body,
+            json!({"cursor": "", "limit": 100, "warehouse_id": 101})
+        );
+        let supply_request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (supply_path, supply_body) = request_path_and_body(&supply_request);
+        assert_eq!(supply_path, "/v3/supply-order/list");
+        assert_eq!(
+            supply_body,
+            json!({
+                "filter": {"states": []},
+                "last_id": "",
+                "limit": 100,
+                "sort_by": "ORDER_CREATION",
+                "sort_dir": "DESC",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn warehouse_and_supply_order_inputs_fail_closed_before_network() {
+        let (server, requests) = mock_server(0);
+        let identity = RequestIdentity::dev;
+
+        for input in [
+            WarehouseStocksInput {
+                store: None,
+                warehouse_id: 0,
+                limit: 100,
+                cursor: None,
+            },
+            WarehouseStocksInput {
+                store: None,
+                warehouse_id: MAX_OZON_SIGNED_API_ID + 1,
+                limit: 100,
+                cursor: None,
+            },
+        ] {
+            assert_validation_error(
+                server.warehouse_stocks(identity(), Parameters(input)).await,
+                "warehouse_id",
+            );
+        }
+        assert_validation_error(
+            server
+                .warehouse_stocks(
+                    identity(),
+                    Parameters(WarehouseStocksInput {
+                        store: None,
+                        warehouse_id: 1,
+                        limit: 0,
+                        cursor: None,
+                    }),
+                )
+                .await,
+            "limit",
+        );
+        assert_validation_error(
+            server
+                .warehouse_stocks(
+                    identity(),
+                    Parameters(WarehouseStocksInput {
+                        store: None,
+                        warehouse_id: 1,
+                        limit: 100,
+                        cursor: Some("x".repeat(MAX_OPAQUE_TOKEN_CHARS + 1)),
+                    }),
+                )
+                .await,
+            "cursor",
+        );
+
+        let supply_list = |states,
+                           dropoff_warehouse_ids,
+                           order_number_search,
+                           timeslot_from_range,
+                           last_id,
+                           limit| SupplyOrderListInput {
+            store: None,
+            states,
+            dropoff_warehouse_ids,
+            order_number_search,
+            timeslot_from_range,
+            last_id,
+            limit,
+            sort_by: SupplyOrderSortBy::OrderCreation,
+            sort_dir: SupplyOrderSortDirection::Desc,
+        };
+        for (input, expected) in [
+            (
+                supply_list(
+                    vec![SupplyOrderState::Completed; MAX_SUPPLY_ORDER_STATES + 1],
+                    vec![],
+                    None,
+                    None,
+                    None,
+                    100,
+                ),
+                "states",
+            ),
+            (
+                supply_list(
+                    vec![SupplyOrderState::Completed, SupplyOrderState::Completed],
+                    vec![],
+                    None,
+                    None,
+                    None,
+                    100,
+                ),
+                "states",
+            ),
+            (
+                supply_list(
+                    vec![],
+                    vec![1; MAX_SUPPLY_ORDER_DROPOFF_WAREHOUSES + 1],
+                    None,
+                    None,
+                    None,
+                    100,
+                ),
+                "dropoff_warehouse_ids",
+            ),
+            (
+                supply_list(vec![], vec![0], None, None, None, 100),
+                "dropoff_warehouse_ids",
+            ),
+            (
+                supply_list(vec![], vec![1, 1], None, None, None, 100),
+                "dropoff_warehouse_ids",
+            ),
+            (
+                supply_list(
+                    vec![],
+                    vec![MAX_OZON_SIGNED_API_ID + 1],
+                    None,
+                    None,
+                    None,
+                    100,
+                ),
+                "dropoff_warehouse_ids",
+            ),
+            (
+                supply_list(vec![], vec![], Some("12".to_owned()), None, None, 100),
+                "order_number_search",
+            ),
+            (
+                supply_list(vec![], vec![], Some("   ".to_owned()), None, None, 100),
+                "order_number_search",
+            ),
+            (
+                supply_list(
+                    vec![],
+                    vec![],
+                    Some("x".repeat(MAX_IDENTIFIER_CHARS + 1)),
+                    None,
+                    None,
+                    100,
+                ),
+                "order_number_search",
+            ),
+            (
+                supply_list(
+                    vec![],
+                    vec![],
+                    None,
+                    None,
+                    Some("x".repeat(MAX_OPAQUE_TOKEN_CHARS + 1)),
+                    100,
+                ),
+                "last_id",
+            ),
+            (supply_list(vec![], vec![], None, None, None, 0), "limit"),
+            (
+                supply_list(
+                    vec![],
+                    vec![],
+                    None,
+                    Some(SupplyOrderTimeslotRangeInput {
+                        from: Some("x".repeat(65)),
+                        to: None,
+                        timeslot_filter_type: None,
+                    }),
+                    None,
+                    100,
+                ),
+                "timeslot_from_range.from",
+            ),
+            (
+                supply_list(
+                    vec![],
+                    vec![],
+                    None,
+                    Some(SupplyOrderTimeslotRangeInput {
+                        from: None,
+                        to: Some("not-rfc3339".to_owned()),
+                        timeslot_filter_type: None,
+                    }),
+                    None,
+                    100,
+                ),
+                "timeslot_from_range.to",
+            ),
+            (
+                supply_list(
+                    vec![],
+                    vec![],
+                    None,
+                    Some(SupplyOrderTimeslotRangeInput {
+                        from: Some("2026-08-18T00:00:00Z".to_owned()),
+                        to: Some("2026-08-17T00:00:00Z".to_owned()),
+                        timeslot_filter_type: Some(SupplyOrderTimeslotFilterType::ByUtcTime),
+                    }),
+                    None,
+                    100,
+                ),
+                "timeslot_from_range.to",
+            ),
+        ] {
+            assert_validation_error(
+                server
+                    .supply_order_list(identity(), Parameters(input))
+                    .await,
+                expected,
+            );
+        }
+
+        for order_ids in [
+            vec![],
+            vec![1; MAX_SUPPLY_ORDER_IDS + 1],
+            vec![0],
+            vec![1, 1],
+            vec![MAX_OZON_SIGNED_API_ID + 1],
+        ] {
+            assert_validation_error(
+                server
+                    .supply_order_get(
+                        identity(),
+                        Parameters(SupplyOrderGetInput {
+                            store: None,
+                            order_ids,
+                        }),
+                    )
+                    .await,
+                "order_ids",
+            );
+        }
+
+        assert!(
+            requests.recv_timeout(Duration::from_millis(100)).is_err(),
+            "invalid warehouse and supply-order inputs must not reach Ozon"
+        );
     }
 
     #[tokio::test]
