@@ -111,6 +111,15 @@ render_control_compose() {
       config --no-env-resolution --format json
 }
 
+render_position_compose() {
+  MCP_ACCESS_CONFIG_HOST="$main_access" \
+    DAILY_REPORT_POLICY_HOST="$project_dir/config/daily-report-pilot.example.json" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.position.yaml" \
+      config --no-env-resolution --format json
+}
+
 # The dollar-prefixed names below are jq variables supplied with `--arg`; the
 # single quotes deliberately prevent the shell from expanding them.
 # shellcheck disable=SC2016
@@ -313,6 +322,85 @@ verify_position_collector() {
      }'
 }
 
+verify_reporting_service() {
+  local rendered="$1" service_name="$2" binary="$3" database_user="$4"
+  local database_password="$5" memory_bytes="$6" cpu_limit="$7"
+  local mode_name database_name service expected_database_url
+  service="$(jq -c --arg name "$service_name" '.services[$name]' <<<"$rendered")"
+  mode_name="$(tr '[:lower:]-' '[:upper:]_' <<<"${service_name}_MODE")"
+  database_name="$(tr '[:lower:]-' '[:upper:]_' <<<"${service_name}_DATABASE_URL")"
+  expected_database_url="postgresql://${database_user}:${database_password}@position-db:5432/ozon_positions"
+
+  check "$service_name: service exists" "$service" 'type == "object"'
+  check "$service_name: no host ingress, env file, secrets, or configs exist" "$service" \
+    '((.ports // []) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)'
+  # The jq expression intentionally references variables supplied with --arg.
+  # shellcheck disable=SC2016
+  check "$service_name: disabled environment is exact and credential-isolated" "$service" \
+    --arg mode_name "$mode_name" \
+    --arg database_name "$database_name" \
+    --arg database_url "$expected_database_url" \
+    '.environment == {
+       ($mode_name): "disabled",
+       ($database_name): $database_url,
+       "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
+       "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
+       "RUST_LOG": "mcp_ozon::reporting=info"
+     }'
+  # shellcheck disable=SC2016
+  check "$service_name: exactly two fixed read-only metadata mounts exist" "$service" \
+    --arg access "$main_access" \
+    --arg policy "$project_dir/config/daily-report-pilot.example.json" \
+    '((.volumes // []) | map(del(.bind)) | sort_by(.target)) == [
+       {
+         "type": "bind", "source": $access,
+         "target": "/etc/mcp-ozon/access.json", "read_only": true
+       },
+       {
+         "type": "bind", "source": $policy,
+         "target": "/etc/mcp-ozon/daily-report-policy.json", "read_only": true
+       }
+     ]
+     and all((.volumes // [])[];
+       .bind == null or .bind == {} or .bind == {"create_host_path": false})'
+  check "$service_name: waits for the authenticated database healthcheck" "$service" \
+    '.depends_on == {
+       "position-db": {"condition": "service_healthy", "required": true}
+     }'
+  check "$service_name: only the internal database network is attached" "$service" \
+    '(.networks | keys) == ["position-internal"]'
+  check "$service_name: filesystem and privilege hardening are exact" "$service" \
+    '.read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false'
+  # shellcheck disable=SC2016
+  check "$service_name: bounded resources and shutdown are exact" "$service" \
+    --arg memory "$memory_bytes" \
+    --argjson cpu "$cpu_limit" \
+    '.mem_limit == $memory
+     and .cpus == $cpu
+     and .pids_limit == 64
+     and .stop_grace_period == "10s"'
+  check "$service_name: restart and logs are bounded" "$service" \
+    '.restart == "unless-stopped"
+     and .logging == {
+       "driver": "json-file",
+       "options": {"max-file": "2", "max-size": "5m"}
+     }'
+  # shellcheck disable=SC2016
+  check "$service_name: healthcheck is local and exact" "$service" \
+    --arg binary "/usr/local/bin/$binary" \
+    '.healthcheck == {
+       "test": ["CMD", $binary, "healthcheck"],
+       "timeout": "8s", "interval": "30s", "retries": 3,
+       "start_period": "10s"
+     }'
+}
+
 # The disabled Control MCP is intentionally a separate, credentialless service
 # with no Internet route. Its exact environment is allowlisted here: adding a
 # marketplace credential name or any new service setting must fail review.
@@ -420,7 +508,7 @@ verify_control() {
 
 main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
-position_rendered="$(render_compose "$project_dir/compose.position.yaml")"
+position_rendered="$(render_position_compose)"
 control_rendered="$(render_control_compose)"
 
 # Rendering uses isolated, existing placeholder files so the result is the
@@ -461,6 +549,14 @@ check_contains \
 check_control_mount_source_contract \
   "control: both bind mounts exactly refuse implicit host-path creation" \
   "$project_dir/compose.control.yaml"
+check_contains \
+  "reporting: default access registry path is fixed" \
+  "$project_dir/compose.position.yaml" \
+  "\${MCP_ACCESS_CONFIG_HOST:-./config/access.example.json}"
+check_contains \
+  "reporting: default policy path is the disabled pilot" \
+  "$project_dir/compose.position.yaml" \
+  "\${DAILY_REPORT_POLICY_HOST:-./config/daily-report-pilot.example.json}"
 
 verify_server \
   "main" \
@@ -480,6 +576,22 @@ verify_server \
   "mcp-ozon-canary-outbound"
 verify_position "$position_rendered"
 verify_position_collector "$position_rendered"
+verify_reporting_service \
+  "$position_rendered" \
+  "report-collector" \
+  "report-collector" \
+  "report_collector" \
+  "verify-only-report-collector-not-a-secret" \
+  "134217728" \
+  "0.25"
+verify_reporting_service \
+  "$position_rendered" \
+  "report-worker" \
+  "report-worker" \
+  "report_worker" \
+  "verify-only-report-worker-not-a-secret" \
+  "201326592" \
+  "0.5"
 verify_control "$control_rendered"
 
 if (( failures > 0 )); then
@@ -487,4 +599,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, Control, position database, and disabled collector runtime: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal no-egress/database networks."
+echo "Compose hardening verified for main, canary, Control, position database, and disabled collector/reporting runtimes: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal no-egress/database networks."

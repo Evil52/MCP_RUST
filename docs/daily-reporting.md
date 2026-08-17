@@ -62,6 +62,10 @@ The first disabled-only phase provides:
   `report_worker` PostgreSQL URL, access-registry path and strict report policy;
   it validates both least-privilege database contracts before serving and is
   disabled by default;
+- hardened `report-collector` and `report-worker` images in
+  `compose.position.yaml`; both run as the established non-root UID, have no
+  published ports, mount only registry/policy metadata read-only and attach
+  only to the internal database network while disabled;
 - an idempotent scheduling kernel that reserves separate morning/evening
   outbox identities per audience, treats any existing batch state as covered,
   and permits a missed evening plan after a separate morning plan; and

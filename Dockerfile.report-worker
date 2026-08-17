@@ -1,0 +1,23 @@
+FROM rust:1.97.1-alpine3.23@sha256:c4a364ddbf684fe038e6fa6a4f25b30c8dc85247423e0e660676ece0d17be4a2 AS builder
+
+RUN apk add --no-cache clang cmake
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
+COPY src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --locked --release --bin report-worker \
+    && cp /build/target/release/report-worker /build/report-worker
+
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS runtime
+
+RUN addgroup -S -g 10001 reporting \
+    && adduser -S -D -H -u 10001 -G reporting reporting
+
+COPY --from=builder /build/report-worker /usr/local/bin/report-worker
+
+USER reporting
+ENTRYPOINT ["/usr/local/bin/report-worker"]
