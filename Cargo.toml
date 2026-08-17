@@ -26,6 +26,11 @@ name = "report-worker"
 path = "src/bin/report-worker.rs"
 test = false
 
+[[bin]]
+name = "report-collector"
+path = "src/bin/report-collector.rs"
+test = false
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 

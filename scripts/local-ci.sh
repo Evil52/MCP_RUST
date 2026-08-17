@@ -39,7 +39,7 @@ fi
   --locked \
     --all-targets \
     --all-features \
-    --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector|report-worker))\.rs$' \
+    --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector|report-collector|report-worker))\.rs$' \
     --show-missing-lines \
     --fail-under-lines 100
 

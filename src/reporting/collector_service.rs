@@ -1,0 +1,193 @@
+use std::{fs, path::Path, str::FromStr, sync::Arc, time::Duration};
+
+use anyhow::{Context, Result, bail, ensure};
+use tokio_postgres::{Config, config::Host};
+
+use crate::config::{AccessRegistry, RegistrySource};
+
+use super::{
+    collector_plan::{CollectionPlanError, CollectionTarget, build_collection_plan},
+    policy::DailyReportPolicy,
+    postgres_collector::PostgresSnapshotWriter,
+};
+
+const DATABASE_URL_ENV: &str = "REPORT_COLLECTOR_DATABASE_URL";
+const POLICY_PATH_ENV: &str = "DAILY_REPORT_POLICY";
+const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
+const MODE_ENV: &str = "REPORT_COLLECTOR_MODE";
+const MAX_POLICY_BYTES: u64 = 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportCollectorMode {
+    Disabled,
+}
+
+/// Credential-free configuration for the initial report collector runtime.
+///
+/// Marketplace credentials and network adapters are deliberately absent from
+/// this phase. The process can validate its exact pilot scope and its
+/// least-privilege PostgreSQL writer, but cannot call Ozon or Wildberries.
+pub struct ReportCollectorConfig {
+    database: Config,
+    mode: ReportCollectorMode,
+    policy: DailyReportPolicy,
+    registry: Arc<AccessRegistry>,
+}
+
+impl ReportCollectorConfig {
+    pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
+        let mode = match lookup(MODE_ENV).as_deref().unwrap_or("disabled") {
+            "disabled" => ReportCollectorMode::Disabled,
+            _ => bail!("only the disabled report-collector runtime mode is available"),
+        };
+        let raw_database =
+            lookup(DATABASE_URL_ENV).context("REPORT_COLLECTOR_DATABASE_URL is required")?;
+        let mut database = Config::from_str(&raw_database)
+            .context("REPORT_COLLECTOR_DATABASE_URL must be a PostgreSQL URL")?;
+        validate_database(&database)?;
+        database.connect_timeout(CONNECT_TIMEOUT);
+        database.application_name("mcp-ozon-report-collector");
+
+        let registry_path = lookup(ACCESS_CONFIG_ENV).context("MCP_ACCESS_CONFIG is required")?;
+        let registry = RegistrySource::new(registry_path)
+            .context("MCP_ACCESS_CONFIG must contain a valid access registry")?;
+        let policy_path = lookup(POLICY_PATH_ENV).context("DAILY_REPORT_POLICY is required")?;
+        let policy_bytes = read_bounded_file(Path::new(&policy_path), MAX_POLICY_BYTES)
+            .context("DAILY_REPORT_POLICY cannot be read")?;
+        let registry = registry
+            .load()
+            .context("MCP_ACCESS_CONFIG cannot be loaded")?;
+        let policy = DailyReportPolicy::from_slice(&policy_bytes, &registry)
+            .context("DAILY_REPORT_POLICY is invalid")?;
+        Ok(Self {
+            database,
+            mode,
+            policy,
+            registry,
+        })
+    }
+
+    pub fn mode(&self) -> ReportCollectorMode {
+        self.mode
+    }
+
+    pub fn policy(&self) -> &DailyReportPolicy {
+        &self.policy
+    }
+
+    pub fn collection_plan(&self) -> Result<Vec<CollectionTarget>, CollectionPlanError> {
+        build_collection_plan(&self.policy, &self.registry)
+    }
+
+    pub async fn connect_writer(&self) -> Result<PostgresSnapshotWriter> {
+        PostgresSnapshotWriter::connect(&self.database)
+            .await
+            .context("daily report snapshot writer is unavailable")
+    }
+}
+
+fn validate_database(config: &Config) -> Result<()> {
+    ensure!(
+        config.get_user() == Some("report_collector")
+            && config
+                .get_password()
+                .is_some_and(|password| !password.is_empty())
+            && config.get_dbname().is_some_and(|value| !value.is_empty())
+            && config.get_hosts().len() == 1
+            && matches!(config.get_hosts(), [Host::Tcp(host)] if !host.trim().is_empty())
+            && config.get_options().is_none(),
+        "REPORT_COLLECTOR_DATABASE_URL must use the restricted report_collector identity"
+    );
+    Ok(())
+}
+
+fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= limit,
+        "policy file is invalid"
+    );
+    let bytes = fs::read(path)?;
+    ensure!(bytes.len() as u64 <= limit, "policy file is too large");
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use super::*;
+
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(1);
+
+    fn file(label: &str, body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "mcp-ozon-report-collector-{label}-{}",
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn entries() -> Vec<(&'static str, String)> {
+        let registry = file(
+            "registry",
+            r#"{"version":1,"actors":[{"id":"diana","name":"Diana","role":"manager","oidc":{"username":"diana"}}],"accounts":[{"id":"ozon","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana","ozon":{"store_id":"1","client_id_env":"ID","api_key_env":"KEY","performance":{"client_id_env":"PERF_ID","client_secret_env":"PERF_SECRET"}}}]}"#,
+        );
+        let policy = file(
+            "policy",
+            r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]}]}]}"#,
+        );
+        vec![
+            (
+                DATABASE_URL_ENV,
+                "postgresql://report_collector:password@position-db/ozon_positions".to_owned(),
+            ),
+            (ACCESS_CONFIG_ENV, registry.display().to_string()),
+            (POLICY_PATH_ENV, policy.display().to_string()),
+        ]
+    }
+
+    fn config(entries: &[(&str, String)]) -> Result<ReportCollectorConfig> {
+        ReportCollectorConfig::from_lookup(|key| {
+            entries
+                .iter()
+                .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
+        })
+    }
+
+    #[test]
+    fn disabled_config_has_exact_pilot_plan_and_restricted_database() {
+        let config = config(&entries()).unwrap();
+        assert_eq!(config.mode(), ReportCollectorMode::Disabled);
+        assert!(!config.policy().enabled);
+        assert_eq!(config.collection_plan().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invalid_mode_database_and_required_files_fail_closed() {
+        assert!(config(&[]).is_err());
+        for url in [
+            "not-a-url",
+            "postgresql://report_worker:password@position-db/ozon_positions",
+            "postgresql://report_collector@position-db/ozon_positions",
+            "postgresql://report_collector:password@/ozon_positions",
+            "postgresql://report_collector:password@position-db/ozon_positions?options=-csearch_path%3Dpublic",
+        ] {
+            let mut values = entries();
+            values[0] = (DATABASE_URL_ENV, url.to_owned());
+            assert!(config(&values).is_err());
+        }
+        let mut values = entries();
+        values.push((MODE_ENV, "live".to_owned()));
+        assert!(config(&values).is_err());
+        let mut values = entries();
+        values[2] = (POLICY_PATH_ENV, values[1].1.clone());
+        assert!(config(&values).is_err());
+    }
+}

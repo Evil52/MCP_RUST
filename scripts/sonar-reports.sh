@@ -65,7 +65,7 @@ fi
   --locked \
   --all-targets \
   --all-features \
-  --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector|report-worker))\.rs$' \
+  --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector|report-collector|report-worker))\.rs$' \
   --lcov \
   --output-path "$coverage_report_tmp"
 sed -i.bak "s#SF:$project_root/#SF:#" "$coverage_report_tmp"

@@ -28,6 +28,12 @@ The first disabled-only phase provides:
 - transactional source snapshots that start as `running`, become immutable at
   `succeeded`, `partial` or `failed`, verify their persisted row count and
   publish only terminal successful/partial projections; and
+- a least-privilege PostgreSQL snapshot writer that validates bounded normalized
+  facts before I/O, appends facts and publishes one source snapshot atomically,
+  and rejects duplicate account/source/cutoff identities without overwriting; and
+- a separate disabled `report-collector` runtime that validates the exact pilot
+  account/source plan and the `report_collector` database role without loading
+  marketplace credentials or making network requests; and
 - a bounded PostgreSQL reader that loads only published source descriptors and
   revalidates the exact four-source manifest before report generation;
 - a bounded published-fact reader that selects rows only by the frozen
@@ -65,15 +71,15 @@ The first disabled-only phase provides:
   stale data.
 
 The pilot example is disabled and scopes the temporary owner report to Diana's
-Ozon account and Anna Agzamova's Wildberries account. Sender and recipient
+Ozon account and the Vahrusheva/Torsunova Wildberries account. Sender and recipient
 addresses are referenced only by environment-variable names. Passwords, OAuth
 tokens and actual addresses must not be committed.
 
 ## Not implemented yet
 
-The snapshot manifest, normalized PostgreSQL storage contract, bounded fact
-reader and report dataset are present, but no marketplace report collector is
-wired yet. No scheduler process, marketplace snapshot job, S3 writer or mail
+The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
+writer, bounded fact reader and report dataset are present, but no marketplace
+report collector adapter is wired yet. No enabled scheduler process, marketplace snapshot job, S3 writer or mail
 provider is wired. The HTML/XLSX bundle is generated in memory but is not yet
 persisted or connected to the delivery outbox. Consolidated two-period
 catch-up rendering remains fail-closed until it has an explicit two-section
@@ -97,7 +103,7 @@ an ambiguous provider result is never retried automatically.
 
 1. Wire read-only marketplace collectors into the normalized snapshot contract.
 2. Add the scheduler/runtime around the persisted PostgreSQL outbox.
-3. Run dry mode for Diana and Anna with delivery disabled.
+3. Run dry mode for Diana and Vahrusheva/Torsunova with delivery disabled.
 4. Connect S3-compatible artifact storage and one service mailbox.
 5. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
 6. Reconcile figures for five to seven days before enabling other managers.

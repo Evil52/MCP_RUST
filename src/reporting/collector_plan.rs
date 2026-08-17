@@ -122,18 +122,28 @@ mod tests {
 
     #[test]
     fn absent_bindings_fail_closed() {
-        let mut registry = registry();
-        registry.accounts[0].ozon.as_mut().unwrap().performance = None;
-        let policy = policy(
+        let mut ozon_registry = registry();
+        ozon_registry.accounts[0].ozon.as_mut().unwrap().performance = None;
+        let ozon_policy = policy(
             json!({"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]}]}]}),
         );
         assert_eq!(
-            build_collection_plan(&policy, &registry),
+            build_collection_plan(&ozon_policy, &ozon_registry),
             Err(CollectionPlanError::MissingAdvertisingBinding)
         );
-        registry.accounts[0].ozon = None;
+        ozon_registry.accounts[0].ozon = None;
         assert_eq!(
-            build_collection_plan(&policy, &registry),
+            build_collection_plan(&ozon_policy, &ozon_registry),
+            Err(CollectionPlanError::MissingMarketplaceBinding)
+        );
+
+        let mut wb_registry = registry();
+        wb_registry.accounts[1].wildberries = None;
+        let wb_policy = policy(
+            json!({"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"anna","account_ids":["wb"]}]}]}),
+        );
+        assert_eq!(
+            build_collection_plan(&wb_policy, &wb_registry),
             Err(CollectionPlanError::MissingMarketplaceBinding)
         );
     }

@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
 use thiserror::Error;
 
 const MAX_ACCOUNTS: usize = 64;
 const MAX_IDENTIFIER_BYTES: usize = 128;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Marketplace {
     Ozon,
     Wildberries,
@@ -36,7 +38,8 @@ impl SnapshotSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SnapshotStatus {
     Succeeded,
     Partial,

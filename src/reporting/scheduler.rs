@@ -51,14 +51,15 @@ pub fn due_for_audience(
 /// The caller supplies coverage separately for each audience. This keeps the
 /// pure scheduling policy independent of PostgreSQL and makes recovery logic
 /// testable without a clock, mail account, or marketplace credentials.
-pub fn due_for_policy<F>(
+pub fn due_for_policy(
     now: DateTime<Utc>,
     policy: &DailyReportPolicy,
-    mut covered_for: F,
-) -> Result<Vec<ScheduledDelivery>, SchedulerError>
-where
-    F: FnMut(&str, chrono::NaiveDate, u32) -> std::collections::BTreeSet<super::ReportKey>,
-{
+    covered_for: &mut dyn FnMut(
+        &str,
+        chrono::NaiveDate,
+        u32,
+    ) -> std::collections::BTreeSet<super::ReportKey>,
+) -> Result<Vec<ScheduledDelivery>, SchedulerError> {
     let date = business_date(now);
     let mut planned = Vec::new();
     for audience in &policy.audiences {
@@ -155,7 +156,7 @@ mod tests {
                 },
             ],
         };
-        let plans = due_for_policy(utc(3), &policy, |_, _, _| BTreeSet::new()).unwrap();
+        let plans = due_for_policy(utc(3), &policy, &mut |_, _, _| BTreeSet::new()).unwrap();
         assert_eq!(plans.len(), 2);
         assert_eq!(plans[0].recipient_id, "diana");
         assert_eq!(plans[1].recipient_id, "owner");
@@ -177,6 +178,6 @@ mod tests {
                 }],
             }],
         };
-        assert!(due_for_policy(utc(3), &policy, |_, _, _| BTreeSet::new()).is_err());
+        assert!(due_for_policy(utc(3), &policy, &mut |_, _, _| BTreeSet::new()).is_err());
     }
 }

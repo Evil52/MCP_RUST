@@ -11,11 +11,13 @@ use thiserror::Error;
 
 pub mod bundle;
 pub mod collector_plan;
+pub mod collector_service;
 pub mod dataset;
 pub mod html;
 pub mod kpi;
 pub mod outbox;
 pub mod policy;
+pub mod postgres_collector;
 pub mod postgres_outbox;
 pub mod postgres_snapshot;
 pub mod rules;

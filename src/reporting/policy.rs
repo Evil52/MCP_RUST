@@ -174,7 +174,7 @@ mod tests {
             "version": 1,
             "actors": [
                 {"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}},
-                {"id":"anna_agzamova","name":"Anna","role":"manager","oidc":{"username":"anna"}},
+                {"id":"wb6","name":"Vahrusheva / Torsunova","role":"manager","oidc":{"username":"wb6"}},
                 {"id":"admin","name":"Admin","role":"admin","oidc":{"username":"admin"}}
             ],
             "accounts": [
@@ -184,8 +184,8 @@ mod tests {
                     "ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY"}
                 },
                 {
-                    "id":"ofk_region_wb","organization":"WB store","marketplace":"wildberries",
-                    "seller_client_id":"2","manager_id":"anna_agzamova",
+                    "id":"ip_domnyshev_wb","organization":"WB store","marketplace":"wildberries",
+                    "seller_client_id":"2","manager_id":"wb6",
                     "wildberries":{"api_token_env":"WB_TOKEN"}
                 }
             ]
@@ -204,7 +204,7 @@ mod tests {
                 "email_env": "DAILY_REPORT_PILOT_RECIPIENT_EMAIL",
                 "managers": [
                     {"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]},
-                    {"actor_id":"anna_agzamova","account_ids":["ofk_region_wb"]}
+                    {"actor_id":"wb6","account_ids":["ip_domnyshev_wb"]}
                 ]
             }]
         })
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn pilot_policy_contains_diana_and_anna_but_stays_disabled() {
+    fn pilot_policy_contains_diana_and_vahrusheva_but_stays_disabled() {
         let policy = parse(&policy_json()).unwrap();
         assert!(!policy.enabled);
         assert_eq!(policy.audiences[0].managers.len(), 2);
@@ -311,7 +311,7 @@ mod tests {
         empty_accounts["audiences"][0]["managers"][0]["account_ids"] = json!([]);
         assert!(parse(&empty_accounts).is_err());
 
-        for account in ["missing", "ofk_region_wb", "bad account"] {
+        for account in ["missing", "ip_domnyshev_wb", "bad account"] {
             let mut invalid = policy_json();
             invalid["audiences"][0]["managers"][0]["account_ids"] = json!([account]);
             assert!(parse(&invalid).is_err());
