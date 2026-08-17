@@ -131,10 +131,12 @@ there is no runtime bind mount from the macOS `Documents` directory.
 The stack can now be started as an inert infrastructure check. It cannot collect
 positions until a separately reviewed live-source phase is shipped. When ready:
 
-1. Copy `.position.env.example` to `.position.env`.
-2. Generate five different random passwords of at least 24 characters and keep the file mode
-   `0600`. Bootstrap rejects the example placeholders, short values, reused passwords, and an
-   admin username that collides with any restricted application role.
+1. Generate the ignored local secret file with
+   `./scripts/bootstrap-position-env.sh .position.env`, or copy
+   `.position.env.example` to `.position.env` and generate five different random passwords of at
+   least 24 characters. Keep the file mode `0600`. Bootstrap rejects example placeholders, short
+   values, reused passwords, and an admin username that collides with any restricted application
+   role. The helper never prints generated passwords and refuses to overwrite an existing file.
 3. Validate the Compose model:
 
    ```bash

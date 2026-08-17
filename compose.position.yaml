@@ -34,7 +34,9 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:size=32m,mode=1777
-      - /var/run/postgresql:size=8m,mode=3775
+      # PostgreSQL runs as the image's unprivileged postgres user (70:70), so
+      # its socket directory must be owned by that user on Docker Desktop too.
+      - /var/run/postgresql:size=8m,mode=3775,uid=70,gid=70
     healthcheck:
       test: ["CMD", "/usr/local/bin/position-db-healthcheck"]
       interval: 10s

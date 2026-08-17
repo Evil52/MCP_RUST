@@ -251,7 +251,7 @@ verify_position() {
   check "position: writable tmpfs mounts match the deployment contract" "$service" \
     '(.tmpfs // [] | sort) == [
        "/tmp:size=32m,mode=1777",
-       "/var/run/postgresql:size=8m,mode=3775"
+       "/var/run/postgresql:size=8m,mode=3775,uid=70,gid=70"
      ]'
   check "position: restart and logging limits match the deployment contract" "$service" \
     '.restart == "unless-stopped"
