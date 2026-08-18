@@ -288,7 +288,7 @@ mod tests {
         vec![
             (
                 DATABASE_URL_ENV,
-                "postgresql://report_worker:fixture-password@position-db/ozon_positions".to_owned(),
+                "postgresql://report_worker:password@position-db/ozon_positions".to_owned(),
             ),
             (ACCESS_CONFIG_ENV, registry.display().to_string()),
             (POLICY_PATH_ENV, policy.display().to_string()),

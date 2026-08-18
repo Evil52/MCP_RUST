@@ -92,7 +92,7 @@ mod tests {
     fn disabled_config_accepts_only_the_restricted_database_identity() {
         let value = config(&[(
             DATABASE_URL_ENV,
-            "postgresql://position_collector:fixture-password@position-db/ozon_positions",
+            "postgresql://position_collector:password@position-db/ozon_positions",
         )])
         .unwrap();
         assert_eq!(value.mode(), CollectorRuntimeMode::Disabled);

@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use thiserror::Error;
 
 use super::{
-    model::{BatchPlan, Observation, QueryRequest, QueryScan, ValidationError},
+    model::{BatchPlan, Observation, QueryPlan, QueryRequest, QueryScan, ValidationError},
     schedule::{COLLECTION_INTERVAL_MINUTES, EXECUTION_OFFSET_MINUTES},
 };
 
@@ -116,6 +116,11 @@ pub enum QueryResult {
     },
 }
 
+enum QueryScanError {
+    Source(SourceError),
+    BatchDeadline,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchResult {
     status: BatchStatus,
@@ -216,28 +221,7 @@ async fn collect_batch(
             .iter()
             .map(|target| target.monitor_id())
             .collect::<Vec<_>>();
-        let page_deadline = tokio::time::Instant::now()
-            .checked_add(Duration::from_secs(PAGE_TIMEOUT_SECONDS))
-            .expect("fixed page timeout fits Tokio Instant");
-        let effective_deadline = page_deadline.min(batch_deadline);
-        let result =
-            match tokio::time::timeout_at(effective_deadline, source.scan(request.clone())).await {
-                Ok(Ok(scan)) => scan
-                    .into_observations(query)
-                    .map_err(SourceError::InvalidObservation),
-                Ok(Err(error)) => Err(error),
-                Err(_) if effective_deadline == batch_deadline => {
-                    results.push(QueryResult::DeadlineExceeded {
-                        request,
-                        monitor_ids,
-                    });
-                    stop_reason = BatchStopReason::Deadline;
-                    break;
-                }
-                Err(_) => Err(SourceError::Timeout),
-            };
-
-        match result {
+        match scan_query(source, query, &request, batch_deadline).await {
             Ok(observations) => {
                 succeeded_queries += 1;
                 consecutive_failures = 0;
@@ -246,7 +230,15 @@ async fn collect_batch(
                     observations,
                 });
             }
-            Err(error) => {
+            Err(QueryScanError::BatchDeadline) => {
+                results.push(QueryResult::DeadlineExceeded {
+                    request,
+                    monitor_ids,
+                });
+                stop_reason = BatchStopReason::Deadline;
+                break;
+            }
+            Err(QueryScanError::Source(error)) => {
                 circuit_break = error.is_protective()
                     || matches!(
                         &error,
@@ -271,15 +263,7 @@ async fn collect_batch(
         }
     }
 
-    let status = if blocked {
-        BatchStatus::Blocked
-    } else if succeeded_queries == planned_queries {
-        BatchStatus::Succeeded
-    } else if succeeded_queries == 0 {
-        BatchStatus::Failed
-    } else {
-        BatchStatus::Partial
-    };
+    let status = batch_status(blocked, succeeded_queries, planned_queries);
 
     BatchResult {
         status,
@@ -290,6 +274,39 @@ async fn collect_batch(
         stop_reason,
         circuit_break,
         results,
+    }
+}
+
+fn batch_status(blocked: bool, succeeded_queries: usize, planned_queries: usize) -> BatchStatus {
+    if blocked {
+        BatchStatus::Blocked
+    } else if succeeded_queries == planned_queries {
+        BatchStatus::Succeeded
+    } else if succeeded_queries == 0 {
+        BatchStatus::Failed
+    } else {
+        BatchStatus::Partial
+    }
+}
+
+async fn scan_query(
+    source: &dyn PositionSource,
+    query: &QueryPlan,
+    request: &QueryRequest,
+    batch_deadline: tokio::time::Instant,
+) -> Result<Vec<Observation>, QueryScanError> {
+    let page_deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(PAGE_TIMEOUT_SECONDS))
+        .expect("fixed page timeout fits Tokio Instant");
+    let effective_deadline = page_deadline.min(batch_deadline);
+    match tokio::time::timeout_at(effective_deadline, source.scan(request.clone())).await {
+        Ok(Ok(scan)) => scan
+            .into_observations(query)
+            .map_err(SourceError::InvalidObservation)
+            .map_err(QueryScanError::Source),
+        Ok(Err(error)) => Err(QueryScanError::Source(error)),
+        Err(_) if effective_deadline == batch_deadline => Err(QueryScanError::BatchDeadline),
+        Err(_) => Err(QueryScanError::Source(SourceError::Timeout)),
     }
 }
 

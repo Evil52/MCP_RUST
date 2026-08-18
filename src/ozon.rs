@@ -462,74 +462,10 @@ impl OzonClient {
             // One absolute deadline covers admission, transport, response body,
             // and every retry wait. Returning from this block releases both
             // network permits before the outer loop sleeps.
-            let outcome = timeout_at(deadline, async {
-                let _permits = self.acquire_request_permits(limiter).await?;
-                let started_at = Instant::now();
-                let request_trace = RequestTrace {
-                    store,
-                    endpoint: path,
-                    started_at,
-                    attempt,
-                };
-                let response = self
-                    .http
-                    .post(format!("{}{path}", self.base_url))
-                    .header("Client-Id", &credentials.client_id)
-                    .header("Api-Key", &credentials.api_key)
-                    .json(&payload)
-                    .send()
-                    .await;
-
-                let mut response = match response {
-                    Ok(response) => response,
-                    Err(source) => {
-                        let error = classify_transport_error(source, None);
-                        let kind = error.kind();
-                        let will_retry = is_retriable_transport(kind) && attempt < MAX_ATTEMPTS;
-                        trace_transport_failure(&request_trace, kind, will_retry);
-                        if will_retry {
-                            return Ok(RequestAttempt::Retry {
-                                delay: retry_delay(attempt, None),
-                                error,
-                            });
-                        }
-                        return Err(error);
-                    }
-                };
-                let status = response.status();
-                let request_id = safe_request_id(response.headers());
-                let retry_after = parse_retry_after(response.headers(), Utc::now());
-                let planned_retry = retry_plan(status, attempt, retry_after);
-
-                if let Some(delay) = shared_retry_cooldown(status, retry_after) {
-                    // Install a vendor-directed cooldown before `_permits` is
-                    // released, closing the window in which a same-Client-Id
-                    // sibling could leave during Retry-After.
-                    limiter.extend_cooldown(delay).await;
-                }
-
-                if let Some((delay, kind)) = planned_retry {
-                    trace_response(&request_trace, status, request_id.as_deref(), true, kind);
-                    let diagnostic = read_bounded_diagnostic_body(&mut response).await;
-                    let error =
-                        classify_http_error(status, request_id, retry_after.duration(), diagnostic);
-                    return Ok(RequestAttempt::Retry { delay, error });
-                }
-
-                let result = decode_response(
-                    &mut response,
-                    status,
-                    request_id.clone(),
-                    retry_after.duration(),
-                )
-                .await;
-                let kind = result
-                    .as_ref()
-                    .err()
-                    .map_or(OzonErrorKind::Http, OzonError::kind);
-                trace_response(&request_trace, status, request_id.as_deref(), false, kind);
-                result.map(RequestAttempt::Complete)
-            })
+            let outcome = timeout_at(
+                deadline,
+                self.send_attempt(limiter, credentials, store, path, &payload, attempt),
+            )
             .await;
 
             let outcome = match outcome {
@@ -560,6 +496,81 @@ impl OzonClient {
                 }
             }
         }
+    }
+
+    async fn send_attempt(
+        &self,
+        limiter: &RateLimiter,
+        credentials: &StoreCredentials,
+        store: &StoreId,
+        path: &'static str,
+        payload: &Value,
+        attempt: usize,
+    ) -> Result<RequestAttempt, OzonError> {
+        let _permits = self.acquire_request_permits(limiter).await?;
+        let request_trace = RequestTrace {
+            store,
+            endpoint: path,
+            started_at: Instant::now(),
+            attempt,
+        };
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .header("Client-Id", &credentials.client_id)
+            .header("Api-Key", &credentials.api_key)
+            .json(payload)
+            .send()
+            .await;
+
+        let mut response = match response {
+            Ok(response) => response,
+            Err(source) => {
+                let error = classify_transport_error(source, None);
+                let kind = error.kind();
+                let will_retry = is_retriable_transport(kind) && attempt < MAX_ATTEMPTS;
+                trace_transport_failure(&request_trace, kind, will_retry);
+                if will_retry {
+                    return Ok(RequestAttempt::Retry {
+                        delay: retry_delay(attempt, None),
+                        error,
+                    });
+                }
+                return Err(error);
+            }
+        };
+        let status = response.status();
+        let request_id = safe_request_id(response.headers());
+        let retry_after = parse_retry_after(response.headers(), Utc::now());
+        let planned_retry = retry_plan(status, attempt, retry_after);
+
+        if let Some(delay) = shared_retry_cooldown(status, retry_after) {
+            // Install a vendor-directed cooldown before `_permits` is
+            // released, closing the window in which a same-Client-Id sibling
+            // could leave during Retry-After.
+            limiter.extend_cooldown(delay).await;
+        }
+
+        if let Some((delay, kind)) = planned_retry {
+            trace_response(&request_trace, status, request_id.as_deref(), true, kind);
+            let diagnostic = read_bounded_diagnostic_body(&mut response).await;
+            let error = classify_http_error(status, request_id, retry_after.duration(), diagnostic);
+            return Ok(RequestAttempt::Retry { delay, error });
+        }
+
+        let result = decode_response(
+            &mut response,
+            status,
+            request_id.clone(),
+            retry_after.duration(),
+        )
+        .await;
+        let kind = result
+            .as_ref()
+            .err()
+            .map_or(OzonErrorKind::Http, OzonError::kind);
+        trace_response(&request_trace, status, request_id.as_deref(), false, kind);
+        result.map(RequestAttempt::Complete)
     }
 
     async fn acquire_request_permits<'a>(
