@@ -1235,6 +1235,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reqwest_timeout_is_classified_before_the_outer_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 4096];
+            let _ = stream.read(&mut buffer);
+            thread::sleep(Duration::from_millis(100));
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect_err("the mock deliberately withholds its response");
+
+        assert!(error.is_timeout());
+        assert_eq!(
+            classify_transport(error).kind(),
+            PerformanceErrorKind::Timeout
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
     async fn redirects_are_not_followed_and_compressed_bodies_stay_bounded() {
         use flate2::{Compression, write::GzEncoder};
 
