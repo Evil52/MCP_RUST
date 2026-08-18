@@ -35,6 +35,9 @@ SELECT
     AND to_regclass('daily_reporting.delivery_coverage') IS NOT NULL
     AND to_regclass('daily_reporting.delivery_attempts') IS NOT NULL
     AND to_regclass('daily_reporting.claimable_deliveries') IS NOT NULL
+    AND to_regclass('daily_reporting.generation_attempts') IS NOT NULL
+    AND to_regclass('daily_reporting.generatable_batches') IS NOT NULL
+    AND to_regclass('daily_reporting.stalled_report_work') IS NOT NULL
     AND to_regclass('daily_reporting.source_snapshots') IS NOT NULL
     AND to_regclass('daily_reporting.sales_facts') IS NOT NULL
     AND to_regclass('daily_reporting.advertising_facts') IS NOT NULL
@@ -63,6 +66,12 @@ SELECT
     AND to_regprocedure(
         'daily_reporting.require_running_fact_snapshot()'
     ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.require_generatable_batch()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.reject_generation_attempt_mutation()'
+    ) IS NOT NULL
     AND (
         SELECT count(*) = 6
         FROM pg_trigger
@@ -73,6 +82,15 @@ SELECT
             'delivery_coverage_is_append_only',
             'delivery_attempts_require_active_send',
             'delivery_attempts_are_append_only'
+        )
+          AND NOT tgisinternal
+    )
+    AND (
+        SELECT count(*) = 2
+        FROM pg_trigger
+        WHERE tgname IN (
+            'generation_attempts_require_generatable_batch',
+            'generation_attempts_are_append_only'
         )
           AND NOT tgisinternal
     )
@@ -436,6 +454,15 @@ SELECT
     AND has_table_privilege(
         'report_worker', 'daily_reporting.claimable_deliveries', 'SELECT'
     )
+    AND has_table_privilege(
+        'report_worker', 'daily_reporting.generation_attempts', 'SELECT,INSERT'
+    )
+    AND NOT has_table_privilege(
+        'report_worker', 'daily_reporting.generation_attempts', 'UPDATE,DELETE'
+    )
+    AND has_table_privilege(
+        'report_worker', 'daily_reporting.generatable_batches', 'SELECT'
+    )
     AND NOT has_table_privilege(
         'report_worker', 'search_position.monitors', 'SELECT'
     )
@@ -447,6 +474,13 @@ SELECT
     )
     AND NOT has_function_privilege(
         'report_worker', 'daily_reporting.enforce_delivery_batch_state()', 'EXECUTE'
+    )
+    AND NOT has_function_privilege(
+        'report_worker', 'daily_reporting.require_generatable_batch()', 'EXECUTE'
+    )
+    AND NOT has_function_privilege(
+        'report_worker',
+        'daily_reporting.reject_generation_attempt_mutation()', 'EXECUTE'
     )
     AND has_database_privilege('report_collector', current_database(), 'CONNECT')
     AND NOT has_database_privilege('report_collector', current_database(), 'TEMP')

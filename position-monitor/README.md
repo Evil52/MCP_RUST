@@ -168,6 +168,8 @@ applies the base schema, the additive Ozon collector contract, the additive WB
 migration, restricted role grants, the Ozon adapter digest migration, then the
 daily reporting outbox, normalized snapshot, optional-metric and strict
 artifact-identity migrations.
+The final migration also adds append-only generation-attempt history, bounded
+retry backoff and an operator-only stalled-work view.
 Password rotation and schema migration after initial deployment must use an
 explicit migration, never volume deletion.
 
@@ -194,6 +196,9 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
   sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
   < position-monitor/initdb/008_daily_reporting_artifact_identity.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/009_daily_reporting_generation_backoff.sql
 ```
 
 The migration is transactional. It creates no scheduler and sends no email.

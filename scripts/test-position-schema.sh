@@ -200,6 +200,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/007_daily_reporting_optional_metrics.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/008_daily_reporting_artifact_identity.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/009_daily_reporting_generation_backoff.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -307,9 +309,20 @@ migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
           'report_worker',
           'daily_reporting.published_source_snapshots',
           'SELECT'
+      ),
+      to_regclass('daily_reporting.generation_attempts') IS NOT NULL,
+      has_table_privilege(
+          'report_worker',
+          'daily_reporting.generation_attempts',
+          'SELECT,INSERT'
+      ),
+      NOT has_table_privilege(
+          'position_reader',
+          'daily_reporting.generation_attempts',
+          'SELECT'
       )
   "; } | tr -d '\r')"
-if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
+if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
   echo "existing-volume migrations did not install the expected schema/ACL" >&2
   printf '%s\n' "$migration_acl" >&2
   exit 1
