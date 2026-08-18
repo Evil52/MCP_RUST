@@ -116,6 +116,26 @@ impl LocalArtifactStore {
         Ok(Self { root })
     }
 
+    /// Proves that the configured root is writable without leaving an
+    /// artifact behind. Used by the container health check before any report
+    /// generation is enabled.
+    pub fn verify_writable(&self) -> Result<(), ArtifactStoreError> {
+        let probe = self.root.join(format!(
+            ".artifact-store-health-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|_| ArtifactStoreError::Unavailable)?;
+        let result = file.sync_all().map_err(|_| ArtifactStoreError::Unavailable);
+        drop(file);
+        let removed = fs::remove_file(&probe).map_err(|_| ArtifactStoreError::Unavailable);
+        result.and(removed)
+    }
+
     /// Persists one rendered report without overwriting an existing artifact.
     ///
     /// A crash may leave either sibling present. Retrying completes the pair
@@ -458,6 +478,20 @@ mod tests {
         let loaded = store.load(&bundle.artifact).unwrap();
         assert_eq!(loaded.html, bundle.html);
         assert_eq!(loaded.xlsx, bundle.xlsx);
+    }
+
+    #[test]
+    fn writable_probe_is_ephemeral_and_fails_for_an_unusable_root() {
+        let root = root("writable-probe");
+        let store = LocalArtifactStore::open(&root).unwrap();
+        store.verify_writable().unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+
+        fs::remove_dir(&root).unwrap();
+        assert!(matches!(
+            store.verify_writable(),
+            Err(ArtifactStoreError::Unavailable)
+        ));
     }
 
     #[test]

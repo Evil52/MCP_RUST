@@ -59,7 +59,9 @@ XLSX object key and SHA-256.
 There is still no `Поисковая видимость за сутки` Dashboard, task registry,
 email job, or automatic report-generation process. A manual deterministic
 HTML/XLSX preview and the immutable local storage primitive are implemented,
-but the disabled worker does not invoke them automatically. The planned compact
+and the disabled worker has an isolated persistent artifact volume whose write
+access is included in its health check, but it does not generate artifacts
+automatically. The planned compact
 view contains collection status and completeness,
 visibility rate, comparisons of complete reporting days, critical products, at
 most five priority problems, manager tasks, and a link to the bounded detailed
@@ -75,8 +77,10 @@ task workflow.
 Detailed Excel workbooks are generated on demand from the same frozen report
 run. They are exports rather than the system of record and are never stored in
 PostgreSQL. Existing artifact bytes are never overwritten: a repeated stable
-identity must have the same content hash. See `docs/search-position-monitoring.md`
-for the complete reporting contract.
+identity must have the same XLSX and HTML content hashes. The dedicated
+`mcp-ozon-report-artifacts` volume is writable only by `report-worker`; no MCP,
+collector or database service mounts it. See
+`docs/search-position-monitoring.md` for the complete reporting contract.
 
 The initial architecture has five security principals:
 

@@ -6,6 +6,7 @@ use tokio_postgres::{Config, config::Host};
 use crate::config::{AccessRegistry, Marketplace as RegistryMarketplace, RegistrySource};
 
 use super::{
+    artifact_store::LocalArtifactStore,
     collector_plan::{CollectionPlanError, CollectionTarget, build_collection_plan},
     policy::DailyReportPolicy,
     postgres_outbox::PostgresOutboxRepository,
@@ -16,6 +17,7 @@ use super::{
 const DATABASE_URL_ENV: &str = "REPORT_WORKER_DATABASE_URL";
 const POLICY_PATH_ENV: &str = "DAILY_REPORT_POLICY";
 const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
+const ARTIFACT_ROOT_ENV: &str = "REPORT_ARTIFACT_ROOT";
 const MODE_ENV: &str = "REPORT_WORKER_MODE";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,6 +37,7 @@ pub struct ReportWorkerConfig {
     mode: ReportWorkerMode,
     policy: DailyReportPolicy,
     registry: Arc<AccessRegistry>,
+    artifact_store: LocalArtifactStore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,11 +73,16 @@ impl ReportWorkerConfig {
             .context("MCP_ACCESS_CONFIG cannot be loaded")?;
         let policy = DailyReportPolicy::from_slice(&policy_bytes, &snapshot)
             .context("DAILY_REPORT_POLICY is invalid")?;
+        let artifact_root =
+            lookup(ARTIFACT_ROOT_ENV).context("REPORT_ARTIFACT_ROOT is required")?;
+        let artifact_store = LocalArtifactStore::open(artifact_root)
+            .context("REPORT_ARTIFACT_ROOT must be an existing safe directory")?;
         Ok(Self {
             database,
             mode,
             policy,
             registry: snapshot,
+            artifact_store,
         })
     }
 
@@ -84,6 +92,10 @@ impl ReportWorkerConfig {
 
     pub fn policy(&self) -> &DailyReportPolicy {
         &self.policy
+    }
+
+    pub fn artifact_store(&self) -> &LocalArtifactStore {
+        &self.artifact_store
     }
 
     /// Performs the credential-free source preflight used by health checks.
@@ -217,6 +229,12 @@ mod tests {
     fn valid_entries(enabled: bool) -> Vec<(&'static str, String)> {
         let registry = file("registry", registry());
         let policy = file("policy", &policy(enabled));
+        let artifact_root = std::env::temp_dir().join(format!(
+            "mcp-ozon-report-artifacts-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&artifact_root).unwrap();
         vec![
             (
                 DATABASE_URL_ENV,
@@ -224,6 +242,7 @@ mod tests {
             ),
             (ACCESS_CONFIG_ENV, registry.display().to_string()),
             (POLICY_PATH_ENV, policy.display().to_string()),
+            (ARTIFACT_ROOT_ENV, artifact_root.display().to_string()),
         ]
     }
 
@@ -234,6 +253,7 @@ mod tests {
         assert!(!config.policy().enabled);
         assert_eq!(config.policy().audiences[0].id, "pilot_owner");
         assert_eq!(config.collection_plan().unwrap().len(), 2);
+        config.artifact_store().verify_writable().unwrap();
         assert_eq!(
             config
                 .preview_scope("pilot_owner", "diana_serafimovich")
@@ -278,6 +298,18 @@ mod tests {
         assert!(config(entries).is_err());
         let mut entries = valid_entries(false);
         entries.retain(|(key, _)| *key != POLICY_PATH_ENV);
+        assert!(config(entries).is_err());
+        let mut entries = valid_entries(false);
+        entries.retain(|(key, _)| *key != ARTIFACT_ROOT_ENV);
+        assert!(config(entries).is_err());
+        let mut entries = valid_entries(false);
+        entries
+            .iter_mut()
+            .find(|(key, _)| *key == ARTIFACT_ROOT_ENV)
+            .unwrap()
+            .1 = file("artifact-file", "not a directory")
+            .display()
+            .to_string();
         assert!(config(entries).is_err());
     }
 

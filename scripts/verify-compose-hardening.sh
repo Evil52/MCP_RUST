@@ -231,9 +231,10 @@ verify_position() {
        and .[0].source == "position-data"
        and .[0].target == "/var/lib/postgresql/data"
        and (.[0].read_only // false) == false'
-  check "position: named volume identity is fixed" "$rendered" \
-    '(.volumes | keys) == ["position-data"]
-     and .volumes["position-data"].name == "mcp-ozon-position-data"'
+  check "position: named volume identities are fixed" "$rendered" \
+    '(.volumes | keys | sort) == ["position-data", "report-artifacts"]
+     and .volumes["position-data"].name == "mcp-ozon-position-data"
+     and .volumes["report-artifacts"].name == "mcp-ozon-report-artifacts"'
   check "position: service is confined to the internal database network" "$rendered" \
     '(.services["position-db"].networks | keys) == ["position-internal"]
      and (.networks | keys | sort) == ["outbound", "ozon-egress-internal", "position-internal"]
@@ -353,35 +354,73 @@ verify_reporting_service() {
      and (has("env_file") | not)
      and ((.secrets // []) | length == 0)
      and ((.configs // []) | length == 0)'
-  # The jq expression intentionally references variables supplied with --arg.
-  # shellcheck disable=SC2016
-  check "$service_name: disabled environment is exact and credential-isolated" "$service" \
-    --arg mode_name "$mode_name" \
-    --arg database_name "$database_name" \
-    --arg database_url "$expected_database_url" \
-    '.environment == {
-       ($mode_name): "disabled",
-       ($database_name): $database_url,
-       "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
-       "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
-       "RUST_LOG": "mcp_ozon::reporting=info"
-     }'
-  # shellcheck disable=SC2016
-  check "$service_name: exactly two fixed read-only metadata mounts exist" "$service" \
-    --arg access "$main_access" \
-    --arg policy "$project_dir/config/daily-report-pilot.example.json" \
-    '((.volumes // []) | map(del(.bind)) | sort_by(.target)) == [
-       {
-         "type": "bind", "source": $access,
-         "target": "/etc/mcp-ozon/access.json", "read_only": true
-       },
-       {
-         "type": "bind", "source": $policy,
-         "target": "/etc/mcp-ozon/daily-report-policy.json", "read_only": true
-       }
-     ]
-     and all((.volumes // [])[];
-       .bind == null or .bind == {} or .bind == {"create_host_path": false})'
+  if [[ "$service_name" == "report-worker" ]]; then
+    # The jq expression intentionally references variables supplied with --arg.
+    # shellcheck disable=SC2016
+    check "$service_name: disabled environment includes only the isolated artifact root" "$service" \
+      --arg mode_name "$mode_name" \
+      --arg database_name "$database_name" \
+      --arg database_url "$expected_database_url" \
+      '.environment == {
+         ($mode_name): "disabled",
+         ($database_name): $database_url,
+         "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
+         "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
+         "REPORT_ARTIFACT_ROOT": "/var/lib/mcp-ozon/report-artifacts",
+         "RUST_LOG": "mcp_ozon::reporting=info"
+       }'
+    # shellcheck disable=SC2016
+    check "$service_name: metadata is read-only and only its artifact volume is writable" "$service" \
+      --arg access "$main_access" \
+      --arg policy "$project_dir/config/daily-report-pilot.example.json" \
+      '((.volumes // []) | map(.read_only //= false | del(.bind)) | sort_by(.target)) == [
+         {
+           "type": "bind", "source": $access,
+           "target": "/etc/mcp-ozon/access.json", "read_only": true
+         },
+         {
+           "type": "bind", "source": $policy,
+           "target": "/etc/mcp-ozon/daily-report-policy.json", "read_only": true
+         },
+         {
+           "type": "volume", "source": "report-artifacts",
+           "target": "/var/lib/mcp-ozon/report-artifacts",
+           "read_only": false
+         }
+       ]
+       and all((.volumes // [])[];
+         .bind == null or .bind == {} or .bind == {"create_host_path": false})'
+  else
+    # The jq expression intentionally references variables supplied with --arg.
+    # shellcheck disable=SC2016
+    check "$service_name: disabled environment is exact and credential-isolated" "$service" \
+      --arg mode_name "$mode_name" \
+      --arg database_name "$database_name" \
+      --arg database_url "$expected_database_url" \
+      '.environment == {
+         ($mode_name): "disabled",
+         ($database_name): $database_url,
+         "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
+         "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
+         "RUST_LOG": "mcp_ozon::reporting=info"
+       }'
+    # shellcheck disable=SC2016
+    check "$service_name: exactly two fixed read-only metadata mounts exist" "$service" \
+      --arg access "$main_access" \
+      --arg policy "$project_dir/config/daily-report-pilot.example.json" \
+      '((.volumes // []) | map(del(.bind)) | sort_by(.target)) == [
+         {
+           "type": "bind", "source": $access,
+           "target": "/etc/mcp-ozon/access.json", "read_only": true
+         },
+         {
+           "type": "bind", "source": $policy,
+           "target": "/etc/mcp-ozon/daily-report-policy.json", "read_only": true
+         }
+       ]
+       and all((.volumes // [])[];
+         .bind == null or .bind == {} or .bind == {"create_host_path": false})'
+  fi
   # jq variables below are intentionally literal and supplied with --argjson.
   # shellcheck disable=SC2016
   check "$service_name: waits for the authenticated database healthcheck" "$service" \

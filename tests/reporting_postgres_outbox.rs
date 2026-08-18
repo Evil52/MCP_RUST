@@ -75,6 +75,8 @@ async fn report_worker_runtime_uses_only_the_restricted_database_role() {
     fs::create_dir_all(&directory).unwrap();
     let registry = directory.join("access.json");
     let policy = directory.join("policy.json");
+    let artifact_root = directory.join("artifacts");
+    fs::create_dir_all(&artifact_root).unwrap();
     fs::write(
         &registry,
         r#"{"version":1,"actors":[{"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana_serafimovich","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY"}}]}"#,
@@ -89,6 +91,7 @@ async fn report_worker_runtime_uses_only_the_restricted_database_role() {
         "REPORT_WORKER_DATABASE_URL" => Some(url.clone()),
         "MCP_ACCESS_CONFIG" => Some(registry.display().to_string()),
         "DAILY_REPORT_POLICY" => Some(policy.display().to_string()),
+        "REPORT_ARTIFACT_ROOT" => Some(artifact_root.display().to_string()),
         _ => None,
     })
     .unwrap();

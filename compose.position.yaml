@@ -185,6 +185,7 @@ services:
       REPORT_WORKER_DATABASE_URL: postgresql://report_worker:${REPORT_WORKER_DB_PASSWORD:?REPORT_WORKER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
       MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
       DAILY_REPORT_POLICY: /etc/mcp-ozon/daily-report-policy.json
+      REPORT_ARTIFACT_ROOT: /var/lib/mcp-ozon/report-artifacts
       RUST_LOG: mcp_ozon::reporting=info
     volumes:
       - type: bind
@@ -199,6 +200,9 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: volume
+        source: report-artifacts
+        target: /var/lib/mcp-ozon/report-artifacts
     depends_on:
       position-db:
         condition: service_healthy
@@ -240,3 +244,5 @@ networks:
 volumes:
   position-data:
     name: mcp-ozon-position-data
+  report-artifacts:
+    name: mcp-ozon-report-artifacts

@@ -83,8 +83,10 @@ The first disabled-only phase provides:
   disabled by default;
 - hardened `report-collector` and `report-worker` images in
   `compose.position.yaml`; both run as the established non-root UID, have no
-  published ports, mount only registry/policy metadata read-only and attach
-  only to the internal database network while disabled;
+  published ports, mount registry/policy metadata read-only and attach only to
+  the internal database network while disabled; only `report-worker` receives
+  a dedicated writable artifact volume, and its health check proves that the
+  configured root can be written without retaining probe data;
 - an idempotent scheduling kernel that reserves separate morning/evening
   outbox identities per audience, treats any existing batch state as covered,
   and permits a missed evening plan after a separate morning plan; and
@@ -104,8 +106,9 @@ The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
 writer, bounded fact reader and report dataset are present. A manual, bounded
 Ozon Seller + Performance adapter is available for a policy-scoped canary, but
 automatic marketplace collection and every WB report adapter remain disabled.
-No enabled scheduler process, production artifact volume, S3 writer or mail
-provider is wired. Manual
+No enabled scheduler process, S3 writer or mail provider is wired. The isolated
+production artifact volume is mounted and health-checked, but generation does
+not write to it while the worker remains disabled. Manual
 HTML/XLSX previews can be generated from an already published complete
 four-source manifest. The immutable local store and outbox-publication
 primitive are covered by tests but are not invoked by the disabled production
@@ -128,8 +131,9 @@ report-worker preview <audience-id> <actor-id> <YYYY-MM-DD> \
 The command deliberately requires delivery mode and policy to remain disabled.
 It does not read recipient email values, send mail, call a marketplace or
 create an outbox occurrence. The hardened production container has a read-only
-filesystem and no artifact mount; run this preview from an operator-controlled
-host/runtime until object storage is implemented.
+root filesystem plus one dedicated artifact volume. The manual preview still
+writes only to its explicit operator-selected output directory and never marks
+an outbox batch ready.
 
 The persistence layer transactionally stores report occurrences, delivery
 coverage and attempts. Its unique occurrence key is
@@ -143,8 +147,8 @@ an ambiguous provider result is never retried automatically.
 
 1. Validate a manual Ozon four-source preview for Diana and add the
    corresponding WB read-only collector.
-2. Mount the immutable artifact volume in the hardened worker and invoke the
-   tested publication primitive from a policy-scoped generation claim.
+2. Invoke the tested artifact publication primitive from a policy-scoped
+   generation claim while delivery remains disabled.
 3. Add the scheduler/runtime around the persisted PostgreSQL outbox and run dry
    mode for Diana and Vahrusheva/Torsunova with delivery disabled.
 4. Connect S3-compatible artifact storage and one service mailbox.

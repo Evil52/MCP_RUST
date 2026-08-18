@@ -28,6 +28,7 @@ async fn main() -> Result<()> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let healthcheck = matches!(arguments.as_slice(), [argument] if argument == "healthcheck");
     let config = ReportWorkerConfig::from_lookup(|key| std::env::var(key).ok())?;
+    config.artifact_store().verify_writable()?;
     let (outbox, snapshots) = config.connect().await?;
     outbox.verify_runtime_contract().await?;
     snapshots.verify_runtime_contract().await?;
