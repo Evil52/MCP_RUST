@@ -126,6 +126,37 @@ async fn supervised_session_probe_recovers_after_the_backend_is_terminated() {
     );
     supervised.probe().await.unwrap();
 
+    // The successful reconnect reserved the same cooldown used after a failed
+    // attempt. If that replacement dies immediately, acquisition must not
+    // start a third connection inside the five-second pacing window.
+    let replacement_pid: i32 = supervised
+        .acquire()
+        .await
+        .unwrap()
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        admin
+            .query_one("SELECT pg_terminate_backend($1)", &[&replacement_pid])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let mut cooldown_observed = false;
+    for _ in 0..50 {
+        if supervised.acquire().await.is_err() {
+            cooldown_observed = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        cooldown_observed,
+        "a second terminated session must be paced by the reconnect cooldown"
+    );
+
     // An acquired session can still fail its bounds query. Keep a transaction
     // deliberately aborted so the fixed pg_settings query is rejected after
     // acquisition, and prove that startup verification fails closed there too.

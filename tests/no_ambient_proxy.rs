@@ -29,6 +29,10 @@ use mcp_ozon::{
     auth::JwtAuthenticator,
     config::{JwtConfig, RegistrySource, StoreCredentials, StoreId},
     ozon::OzonClient,
+    reporting::{
+        ozon_adapter::product_page_request,
+        ozon_source::{OzonClientReportTransport, OzonReportTransport},
+    },
 };
 use serde_json::json;
 
@@ -93,6 +97,67 @@ fn stores() -> BTreeMap<StoreId, StoreCredentials> {
             api_key: "proxy-test-key".to_owned(),
         },
     )])
+}
+
+async fn exercise_real_report_transport_overload() {
+    const HELD_REQUESTS: usize = 16;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("overload mock binds");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("overload mock has an address")
+    );
+    let (accepted_tx, mut accepted_rx) = tokio::sync::mpsc::channel(HELD_REQUESTS);
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut streams = Vec::with_capacity(HELD_REQUESTS);
+        for _ in 0..HELD_REQUESTS {
+            let (stream, _) = listener.accept().await.expect("held request connects");
+            streams.push(stream);
+            accepted_tx
+                .send(())
+                .await
+                .expect("the test still observes accepted requests");
+        }
+        release_rx.await.expect("the test releases held requests");
+    });
+
+    let client = OzonClient::new(base_url, Duration::from_secs(5), stores())
+        .expect("the overload client builds");
+    let transport = OzonClientReportTransport::new(client, StoreId::from("shop"));
+    let mut held = tokio::task::JoinSet::new();
+    for _ in 0..HELD_REQUESTS {
+        let transport = transport.clone();
+        held.spawn(async move {
+            transport
+                .post(product_page_request("/v4/product/info/stocks", None).unwrap())
+                .await
+        });
+    }
+    for _ in 0..HELD_REQUESTS {
+        tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
+            .await
+            .expect("all held requests reach the mock promptly")
+            .expect("the mock reports every held request");
+    }
+
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        transport.post(product_page_request("/v4/product/info/stocks", None).unwrap()),
+    )
+    .await
+    .expect("the bounded local-overload retry completes")
+    .expect_err("the saturated real client remains locally overloaded");
+    assert_eq!(error.code(), "local_overloaded");
+
+    release_tx
+        .send(())
+        .expect("the overload mock is still waiting");
+    held.abort_all();
+    while held.join_next().await.is_some() {}
+    server.await.expect("the overload mock exits cleanly");
 }
 
 fn registry() -> RegistrySource {
@@ -200,8 +265,12 @@ async fn no_outbound_client_follows_an_ambient_http_proxy() {
     // The Ozon client must reach the marketplace directly, credentials and all.
     let client = OzonClient::new(ozon_url, Duration::from_secs(3), stores())
         .expect("the Ozon client builds");
-    let _ = client
-        .post(&StoreId::from("shop"), "/v1/rating/summary", json!({}))
+    let transport = OzonClientReportTransport::new(client, StoreId::from("shop"));
+    let _ = transport
+        .post(
+            product_page_request("/v4/product/info/stocks", None)
+                .expect("the read-only report request builds"),
+        )
         .await;
     assert!(
         saw_request(&ozon_requests),
@@ -211,6 +280,12 @@ async fn no_outbound_client_follows_an_ambient_http_proxy() {
         !saw_request(&proxy_requests),
         "Ozon requests carry Client-Id and Api-Key and must never traverse an ambient proxy"
     );
+
+    // Drive the production report adapter through the local admission-control
+    // retry as well as the successful request above. This is deliberately a
+    // real OzonClient: the generic retry has a distinct production coverage
+    // instantiation that policy-only unit tests cannot execute.
+    exercise_real_report_transport_overload().await;
 
     // The JWKS fetch is a trust anchor: whoever answers it decides which keys
     // this process accepts, so it must not be interceptable either.
