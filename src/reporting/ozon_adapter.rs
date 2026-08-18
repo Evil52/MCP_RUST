@@ -16,7 +16,6 @@ use thiserror::Error;
 use super::postgres_collector::{CollectedPriceFact, CollectedSalesFact, CollectedStockFact};
 
 const MAX_PAGE_ROWS: usize = 1_000;
-const MAX_WAREHOUSE_KIND_BYTES: usize = 64;
 const MAX_CURSOR_BYTES: usize = 4_096;
 const MAX_CAMPAIGN_TITLE_BYTES: usize = 512;
 
@@ -319,15 +318,15 @@ fn parse_count(value: &Value) -> Result<u64, OzonReportParseError> {
 
 fn parse_warehouse_kind(value: &Value) -> Result<String, OzonReportParseError> {
     let value = value.as_str().ok_or(OzonReportParseError::Value)?;
-    if value.is_empty()
-        || value.len() > MAX_WAREHOUSE_KIND_BYTES
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err(OzonReportParseError::Value);
+    // `/v4/product/info/stocks` currently returns lowercase fulfillment types
+    // (`fbo` / `fbs`), while earlier verified fixtures used uppercase values.
+    // The API meaning is identical, so persist one canonical identifier rather
+    // than treating a casing-only upstream change as a new warehouse kind.
+    match value {
+        "fbo" | "FBO" => Ok("FBO".to_owned()),
+        "fbs" | "FBS" => Ok("FBS".to_owned()),
+        _ => Err(OzonReportParseError::Value),
     }
-    Ok(value.to_owned())
 }
 
 fn parse_campaign_title(value: &Value) -> Result<String, OzonReportParseError> {
@@ -436,6 +435,16 @@ mod tests {
         assert_eq!(performance[0].campaign_id, 35_751_912);
         assert_eq!(performance[0].spend_minor, 70_178);
         assert_eq!(performance[0].attributed_revenue_minor, 0);
+    }
+
+    #[test]
+    fn stock_fulfillment_type_is_case_normalized() {
+        let stocks = parse_stock_page(&json!({"items": [{
+            "product_id": 123,
+            "stocks": [{"type": "fbs", "present": 7}]
+        }]}))
+        .unwrap();
+        assert_eq!(stocks[0].warehouse_id, "FBS");
     }
 
     #[test]
