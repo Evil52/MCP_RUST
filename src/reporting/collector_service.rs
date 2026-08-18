@@ -4,12 +4,8 @@ use anyhow::{Context, Result, bail, ensure};
 use tokio_postgres::{Config, config::Host};
 
 use crate::{
-    config::{
-        AccessRegistry, Marketplace, PerformanceCredentials, RegistrySource, StoreCredentials,
-        StoreId,
-    },
+    config::{AccessRegistry, Marketplace, RegistrySource, StoreCredentials, StoreId},
     ozon::OzonClient,
-    ozon_performance::PerformanceClient,
 };
 
 use super::{
@@ -54,7 +50,6 @@ pub struct ReportCollectorConfig {
     policy: DailyReportPolicy,
     registry: Arc<AccessRegistry>,
     ozon_dry_run_stores: BTreeMap<StoreId, StoreCredentials>,
-    ozon_performance_dry_run_stores: BTreeMap<StoreId, PerformanceCredentials>,
 }
 
 impl ReportCollectorConfig {
@@ -83,8 +78,8 @@ impl ReportCollectorConfig {
             .context("MCP_ACCESS_CONFIG cannot be loaded")?;
         let policy = DailyReportPolicy::from_slice(&policy_bytes, &registry)
             .context("DAILY_REPORT_POLICY is invalid")?;
-        let (ozon_dry_run_stores, ozon_performance_dry_run_stores) = match mode {
-            ReportCollectorMode::Disabled => (BTreeMap::new(), BTreeMap::new()),
+        let ozon_dry_run_stores = match mode {
+            ReportCollectorMode::Disabled => BTreeMap::new(),
             ReportCollectorMode::OzonDryRun => {
                 resolve_ozon_dry_run_stores(&registry, &policy, &mut lookup)?
             }
@@ -95,7 +90,6 @@ impl ReportCollectorConfig {
             policy,
             registry,
             ozon_dry_run_stores,
-            ozon_performance_dry_run_stores,
         })
     }
 
@@ -176,36 +170,16 @@ impl ReportCollectorConfig {
         );
         Ok(store_id)
     }
-
-    /// Builds the read-only Performance client for the same policy-selected
-    /// Ozon accounts as the Seller dry-run client. It is deliberately unused
-    /// until the Performance response contract is separately verified.
-    pub fn ozon_performance_dry_run_client(&self) -> Result<PerformanceClient> {
-        ensure!(
-            self.mode == ReportCollectorMode::OzonDryRun
-                && !self.ozon_performance_dry_run_stores.is_empty(),
-            "Ozon Performance dry-run credentials are unavailable in disabled mode"
-        );
-        PerformanceClient::new(
-            OZON_DRY_RUN_TIMEOUT,
-            self.ozon_performance_dry_run_stores.clone(),
-        )
-        .map_err(|_| anyhow::anyhow!("Ozon Performance dry-run client cannot be built"))
-    }
 }
 
 fn resolve_ozon_dry_run_stores(
     registry: &AccessRegistry,
     policy: &DailyReportPolicy,
     lookup: &mut dyn FnMut(&str) -> Option<String>,
-) -> Result<(
-    BTreeMap<StoreId, StoreCredentials>,
-    BTreeMap<StoreId, PerformanceCredentials>,
-)> {
+) -> Result<BTreeMap<StoreId, StoreCredentials>> {
     let plan = build_collection_plan(policy, registry)
         .map_err(|error| anyhow::anyhow!("daily report collection plan is invalid: {error}"))?;
     let mut seller_stores = BTreeMap::new();
-    let mut performance_stores = BTreeMap::new();
     for target in plan
         .into_iter()
         .filter(|target| target.marketplace == super::snapshot::Marketplace::Ozon)
@@ -225,28 +199,8 @@ fn resolve_ozon_dry_run_stores(
             .with_context(|| format!("{} is required for Ozon dry-run", binding.client_id_env))?;
         let api_key = lookup(&binding.api_key_env)
             .with_context(|| format!("{} is required for Ozon dry-run", binding.api_key_env))?;
-        let performance = binding
-            .performance
-            .as_ref()
-            .context("Ozon Performance report binding is unavailable")?;
-        let performance_client_id = lookup(&performance.client_id_env).with_context(|| {
-            format!(
-                "{} is required for Ozon Performance dry-run",
-                performance.client_id_env
-            )
-        })?;
-        let performance_client_secret =
-            lookup(&performance.client_secret_env).with_context(|| {
-                format!(
-                    "{} is required for Ozon Performance dry-run",
-                    performance.client_secret_env
-                )
-            })?;
         ensure!(
-            !client_id.is_empty()
-                && !api_key.is_empty()
-                && !performance_client_id.is_empty()
-                && !performance_client_secret.is_empty(),
+            !client_id.is_empty() && !api_key.is_empty(),
             "Ozon dry-run credentials must not be empty"
         );
         // AccessRegistry validates store_id uniqueness before this point, so
@@ -255,19 +209,12 @@ fn resolve_ozon_dry_run_stores(
             binding.store_id.clone(),
             StoreCredentials { client_id, api_key },
         );
-        performance_stores.insert(
-            binding.store_id.clone(),
-            PerformanceCredentials {
-                client_id: performance_client_id,
-                client_secret: performance_client_secret,
-            },
-        );
     }
     ensure!(
-        !seller_stores.is_empty() && !performance_stores.is_empty(),
+        !seller_stores.is_empty(),
         "the report policy contains no Ozon account for Ozon dry-run"
     );
-    Ok((seller_stores, performance_stores))
+    Ok(seller_stores)
 }
 
 fn validate_database(config: &Config) -> Result<()> {
@@ -384,8 +331,6 @@ mod tests {
             (MODE_ENV, "ozon_dry_run".to_owned()),
             ("ID", "client-id".to_owned()),
             ("KEY", "api-key".to_owned()),
-            ("PERF_ID", "performance-client-id".to_owned()),
-            ("PERF_SECRET", "performance-client-secret".to_owned()),
             // This unrelated credential is deliberately not resolved: the
             // selected policy contains no WB dry-run source in this phase.
             ("WB_TOKEN", "unrelated-wb-token".to_owned()),
@@ -395,12 +340,6 @@ mod tests {
         assert!(
             dry_run
                 .ozon_dry_run_client()
-                .unwrap()
-                .is_configured(&StoreId::from("1"))
-        );
-        assert!(
-            dry_run
-                .ozon_performance_dry_run_client()
                 .unwrap()
                 .is_configured(&StoreId::from("1"))
         );
