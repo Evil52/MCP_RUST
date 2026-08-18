@@ -6,11 +6,17 @@
 
 use std::fmt;
 
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use sha2::{Digest, Sha256};
+
 use super::{ReportKind, artifact_store::StoredReportBundle, postgres_outbox::ClaimedDelivery};
 
 const MAX_ADDRESS_BYTES: usize = 254;
-const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
-const MAX_XLSX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HTML_BYTES: usize = 1024 * 1024;
+const MAX_XLSX_BYTES: usize = 8 * 1024 * 1024;
 
 /// One fully scoped email ready for a future provider transport.
 #[derive(Clone, PartialEq, Eq)]
@@ -60,6 +66,55 @@ impl ReportEmail {
 
     pub fn xlsx(&self) -> &[u8] {
         &self.xlsx
+    }
+
+    /// Produces the URL-safe raw RFC 5322 message required by Gmail's API.
+    ///
+    /// Every interpolated header value was validated or generated locally.
+    /// Body parts are base64 encoded and wrapped, so neither HTML nor workbook
+    /// bytes can escape their MIME section.
+    pub fn gmail_raw(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.sender.as_bytes());
+        digest.update([0]);
+        digest.update(self.recipient.as_bytes());
+        digest.update([0]);
+        digest.update(self.attachment_name.as_bytes());
+        let boundary = format!("mcp-ozon-{}", URL_SAFE_NO_PAD.encode(digest.finalize()));
+        let encoded_subject = STANDARD.encode(self.subject.as_bytes());
+        let mut message = Vec::with_capacity(
+            self.html.len().saturating_mul(2) + self.xlsx.len().saturating_mul(2) + 1_024,
+        );
+        message.extend_from_slice(
+            format!(
+                "From: {}\r\nTo: {}\r\nSubject: =?UTF-8?B?{}?=\r\n\
+             MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"{}\"\r\n\r\n\
+             --{}\r\nContent-Type: text/html; charset=UTF-8\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n",
+                self.sender, self.recipient, encoded_subject, boundary, boundary
+            )
+            .as_bytes(),
+        );
+        append_wrapped_base64(&mut message, self.html.as_bytes());
+        message.extend_from_slice(format!(
+            "\r\n--{}\r\nContent-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet; name=\"{}\"\r\n\
+             Content-Disposition: attachment; filename=\"{}\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\n",
+            boundary, self.attachment_name, self.attachment_name
+        ).as_bytes());
+        append_wrapped_base64(&mut message, &self.xlsx);
+        message.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        URL_SAFE_NO_PAD.encode(message)
+    }
+}
+
+fn append_wrapped_base64(output: &mut Vec<u8>, bytes: &[u8]) {
+    let encoded = STANDARD.encode(bytes);
+    for (index, chunk) in encoded.as_bytes().chunks(76).enumerate() {
+        if index > 0 {
+            output.extend_from_slice(b"\r\n");
+        }
+        output.extend_from_slice(chunk);
     }
 }
 
@@ -239,6 +294,12 @@ mod tests {
                 email.attachment_name(),
                 format!("ozonofk-daily-2026-08-18-{file_kind}.xlsx")
             );
+            let raw = URL_SAFE_NO_PAD.decode(email.gmail_raw()).unwrap();
+            let raw = String::from_utf8(raw).unwrap();
+            assert!(raw.contains("Content-Type: multipart/mixed"));
+            assert!(raw.contains("Content-Disposition: attachment"));
+            assert!(raw.contains("Subject: =?UTF-8?B?"));
+            assert!(!raw.contains("Ежедневный отчёт"));
             let debug = format!("{email:?}");
             assert!(!debug.contains("reports@example.test"));
             assert!(!debug.contains("owner@example.test"));
