@@ -481,8 +481,9 @@ verify_ozon_egress() {
        "/var/log/squid:size=4m,mode=1777",
        "/var/run/squid:size=1m,mode=1777"
      ]'
-  # The expected Compose healthcheck contains a literal shell substitution.
-  # shellcheck disable=SC2016
+  # The healthcheck must prove the proxy is enforcing its policy, not merely
+  # that a process exists. Pinning it here means opening the allowlist cannot
+  # pass review by quietly relaxing the probe alongside it.
   check "ozon egress: bounded resources, logs, and local healthcheck are exact" "$service" \
     '.mem_limit == "134217728"
      and .cpus == 0.25
@@ -490,7 +491,7 @@ verify_ozon_egress() {
      and .stop_grace_period == "10s"
      and .logging == {"driver": "json-file", "options": {"max-file": "2", "max-size": "1m"}}
      and .healthcheck == {
-       "test": ["CMD-SHELL", "test -s /var/run/squid/squid.pid && kill -0 $$(cat /var/run/squid/squid.pid)"],
+       "test": ["CMD-SHELL", "printf '"'"'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n'"'"' | nc -w 3 127.0.0.1 3128 | head -1 | grep -q '"'"'403 Forbidden'"'"'"],
        "timeout": "8s", "interval": "30s", "retries": 3, "start_period": "10s"
      }'
 }

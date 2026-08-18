@@ -115,8 +115,15 @@ services:
       - /var/cache/squid:size=8m,mode=1777
       - /var/log/squid:size=4m,mode=1777
       - /var/run/squid:size=1m,mode=1777
+    # A live PID proved only that a process existed. This asks the proxy for a
+    # destination outside its allowlist and requires the refusal: the port is
+    # serving, the configuration parsed, and deny-by-default is in force. It
+    # needs no external connectivity, so the check cannot pass by reaching the
+    # internet — and it fails loudly if the allowlist is ever opened up.
     healthcheck:
-      test: ["CMD-SHELL", "test -s /var/run/squid/squid.pid && kill -0 $(cat /var/run/squid/squid.pid)"]
+      test:
+        - CMD-SHELL
+        - "printf 'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 3128 | head -1 | grep -q '403 Forbidden'"
       interval: 30s
       timeout: 8s
       retries: 3
