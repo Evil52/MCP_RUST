@@ -320,6 +320,7 @@ mod tests {
             "a@example..test",
             "a b@example.test",
             "a@example.test\r\nBcc:x@example.test",
+            "a:b@example.test",
             "а@example.test",
         ] {
             assert_eq!(
@@ -416,5 +417,22 @@ mod tests {
                 Err(MailBuildError::InvalidArtifact)
             );
         }
+    }
+
+    #[test]
+    fn gmail_mime_wraps_long_base64_parts_at_seventy_six_columns() {
+        let email = build_report_email(
+            "reports@example.test",
+            "owner@example.test",
+            &claim(ReportKind::Morning),
+            StoredReportBundle {
+                html: "x".repeat(100),
+                xlsx: vec![7; 100],
+            },
+        )
+        .unwrap();
+        let raw = URL_SAFE_NO_PAD.decode(email.gmail_raw()).unwrap();
+        let raw = String::from_utf8(raw).unwrap();
+        assert!(raw.lines().any(|line| line.len() == 76));
     }
 }

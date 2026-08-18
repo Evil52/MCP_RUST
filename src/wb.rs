@@ -4387,6 +4387,30 @@ mod tests {
         task.join().unwrap();
     }
 
+    #[tokio::test]
+    async fn logical_deadline_cancels_an_in_flight_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 4_096];
+            let _ = stream.read(&mut buffer);
+            thread::sleep(Duration::from_millis(100));
+        });
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_secs(1),
+            credentials(),
+            &format!("http://{address}"),
+            ClientPolicy::immediate_single_attempt(Duration::from_millis(20)),
+        );
+
+        assert!(matches!(
+            client.ping("account").await.unwrap_err(),
+            WbError::DeadlineExceeded
+        ));
+        task.join().unwrap();
+    }
+
     /// The production case this rule exists for.
     ///
     /// `StatisticsReport` paces at 60s and the logical timeout caps at 60s, so
