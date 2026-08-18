@@ -9,6 +9,7 @@ COPY --chmod=0644 initdb/005_daily_reporting_outbox.sql /docker-entrypoint-initd
 COPY --chmod=0644 initdb/006_daily_report_snapshots.sql /docker-entrypoint-initdb.d/006_daily_report_snapshots.sql
 COPY --chmod=0644 initdb/007_daily_reporting_optional_metrics.sql /docker-entrypoint-initdb.d/007_daily_reporting_optional_metrics.sql
 COPY --chmod=0644 initdb/008_daily_reporting_artifact_identity.sql /docker-entrypoint-initdb.d/008_daily_reporting_artifact_identity.sql
+COPY --chmod=0644 initdb/009_daily_reporting_generation_backoff.sql /docker-entrypoint-initdb.d/009_daily_reporting_generation_backoff.sql
 COPY --chmod=0755 healthcheck.sh /usr/local/bin/position-db-healthcheck
 
 # This image always runs as postgres, so the root-only privilege-drop helper is

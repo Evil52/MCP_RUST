@@ -11,7 +11,7 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind,
     artifact_store::persist_and_mark_ready,
-    postgres_outbox::{GenerationStatus, PostgresOutboxRepository},
+    postgres_outbox::{GenerationErrorClass, GenerationStatus, PostgresOutboxRepository},
     postgres_snapshot::PostgresSnapshotRepository,
     preview::render_published_preview,
     reporting_interval,
@@ -208,23 +208,43 @@ async fn run_scheduler_tick(
     for batch_id in batch_ids {
         // A single unrenderable report must never stop the pass: the rest of
         // the queue is independent of it.
-        match timeout(
+        let failure = match timeout(
             GENERATION_TIMEOUT,
             generate_batch(config, outbox, snapshots, batch_id, now),
         )
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(
+            Ok(Ok(())) => continue,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    batch_id,
+                    error = %error,
+                    "daily report generation deferred; delivery remains disabled"
+                );
+                GenerationErrorClass::Failed
+            }
+            Err(_) => {
+                tracing::warn!(
+                    batch_id,
+                    timeout_seconds = GENERATION_TIMEOUT.as_secs(),
+                    "daily report generation exceeded its budget; delivery remains disabled"
+                );
+                GenerationErrorClass::Timeout
+            }
+        };
+        // Recording the failure is what holds this batch back from the next
+        // scans. If even that cannot be written the batch simply retries next
+        // tick, which is the pre-existing behaviour rather than a new risk.
+        if outbox
+            .record_generation_failure(batch_id, now, failure)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
                 batch_id,
-                error = %error,
-                "daily report generation deferred; delivery remains disabled"
-            ),
-            Err(_) => tracing::warn!(
-                batch_id,
-                timeout_seconds = GENERATION_TIMEOUT.as_secs(),
-                "daily report generation exceeded its budget; delivery remains disabled"
-            ),
+                "daily report generation failure could not be recorded; \
+                 the batch stays eligible for the next tick"
+            );
         }
     }
     Ok(())

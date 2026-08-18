@@ -10,7 +10,8 @@ use mcp_ozon::reporting::{
     outbox::{ArtifactIdentity, DeliveryErrorClass},
     policy::{AudiencePolicy, DailyReportPolicy, ManagerScope},
     postgres_outbox::{
-        CreateOutcome, GenerationStatus, PostgresOutboxError, PostgresOutboxRepository,
+        CreateOutcome, GenerationErrorClass, GenerationStatus, PostgresOutboxError,
+        PostgresOutboxRepository,
     },
     service::ReportWorkerConfig,
 };
@@ -555,3 +556,106 @@ async fn repository_rejects_invalid_delivery_inputs_before_writing() {
 }
 
 const MAX_TEST_ATTEMPTS: u8 = 5;
+
+/// A batch whose generation keeps failing must stop occupying a candidate
+/// slot. Before the backoff existed it stayed at the head of the ordering and
+/// was retried every tick forever, starving every healthy batch behind it.
+#[tokio::test]
+async fn a_failing_generation_backs_off_and_then_exhausts_its_budget() {
+    let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
+        return;
+    };
+    let _guard = DB_TEST_LOCK.lock().await;
+    let repository = PostgresOutboxRepository::connect(&Config::from_str(&url).unwrap())
+        .await
+        .unwrap();
+    let recipient = format!("backoff_{}", std::process::id());
+    let policy = disabled_policy(recipient);
+
+    let now = utc(3, 0);
+    let planned = repository.plan_due(now, &policy).await.unwrap();
+    let CreateOutcome::Inserted(batch_id) = planned[0].1 else {
+        panic!("the first planning pass inserts the batch");
+    };
+    assert!(
+        repository
+            .pending_generation_ids(now, 16)
+            .await
+            .unwrap()
+            .contains(&batch_id),
+        "a fresh batch is a generation candidate"
+    );
+
+    // One failure holds the batch back for the base delay, but not beyond it.
+    repository
+        .record_generation_failure(batch_id, now, GenerationErrorClass::Failed)
+        .await
+        .unwrap();
+    assert!(
+        !repository
+            .pending_generation_ids(now, 16)
+            .await
+            .unwrap()
+            .contains(&batch_id),
+        "a just-failed batch is held back"
+    );
+
+    // Spend the rest of the budget. Each attempt is recorded against a batch
+    // that is still generatable, so the append-only log stays consistent.
+    for attempt in 2..=5 {
+        let elapsed = now + Duration::seconds(60 * 2_i64.pow(attempt));
+        assert!(
+            repository
+                .pending_generation_ids(elapsed, 16)
+                .await
+                .unwrap()
+                .contains(&batch_id),
+            "attempt {attempt} becomes eligible once its backoff elapses"
+        );
+        repository
+            .record_generation_failure(batch_id, elapsed, GenerationErrorClass::Timeout)
+            .await
+            .unwrap();
+    }
+
+    // The budget is spent: no later time makes it a candidate again.
+    let far_future = now + Duration::days(1);
+    assert!(
+        !repository
+            .pending_generation_ids(far_future, 16)
+            .await
+            .unwrap()
+            .contains(&batch_id),
+        "an exhausted batch never returns to the queue"
+    );
+    // A sixth attempt is refused rather than silently extending the budget.
+    assert!(
+        repository
+            .record_generation_failure(batch_id, far_future, GenerationErrorClass::Failed)
+            .await
+            .is_err(),
+        "the attempt budget cannot be exceeded"
+    );
+
+    // Read as the operator role: `stalled_report_work` exists for humans
+    // triaging stuck work, and granting it to the worker would widen the
+    // worker's privileges for no runtime need.
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL").unwrap();
+    let client = repository_test_client(&Config::from_str(&admin_url).unwrap()).await;
+    let stalled = client
+        .query(
+            "SELECT stall_kind FROM daily_reporting.stalled_report_work \
+             WHERE reference = $1::text",
+            &[&batch_id.to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stalled
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>(),
+        vec!["generation_exhausted".to_owned()],
+        "an exhausted batch is visible to operators instead of vanishing"
+    );
+}

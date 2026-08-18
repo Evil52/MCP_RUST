@@ -20,6 +20,33 @@ use super::{
 const MAX_DELIVERY_ATTEMPTS: u8 = 5;
 const MAX_GENERATION_CANDIDATES: u16 = 16;
 
+/// First generation retry delay. Each further attempt doubles it, so a batch
+/// that keeps failing backs off to roughly a quarter of an hour before its
+/// budget runs out.
+const GENERATION_RETRY_BASE_SECONDS: f64 = 60.0;
+
+/// Why a report could not be generated.
+///
+/// Deliberately coarse. Only these two are knowable at the call site today;
+/// recording a more precise guess would put invented detail into an
+/// append-only audit trail. Finer classes belong with typed generation errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationErrorClass {
+    /// Generation exceeded its time budget.
+    Timeout,
+    /// Generation returned an error.
+    Failed,
+}
+
+impl GenerationErrorClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AttemptOutcome {
     Sent,
@@ -118,6 +145,10 @@ impl PostgresOutboxRepository {
                         'daily_reporting.delivery_coverage', 'SELECT,INSERT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.delivery_attempts', 'SELECT,INSERT') \
+                    AND has_table_privilege(current_user, \
+                        'daily_reporting.generation_attempts', 'SELECT,INSERT') \
+                    AND has_table_privilege(current_user, \
+                        'daily_reporting.generatable_batches', 'SELECT') \
                     AND NOT has_schema_privilege(current_user, \
                         'search_position', 'USAGE')",
                 &[],
@@ -304,21 +335,71 @@ impl PostgresOutboxRepository {
             .map_err(|_| PostgresOutboxError::Unavailable)?;
         let rows = client
             .query(
-                "SELECT batch.id \
-                 FROM daily_reporting.delivery_batches AS batch \
-                 JOIN daily_reporting.delivery_coverage AS coverage \
-                   ON coverage.batch_id = batch.id \
-                 WHERE batch.status IN ('planned', 'generating') \
-                   AND batch.scheduled_for <= $1 \
-                 GROUP BY batch.id \
-                 HAVING count(*) = 1 AND max(coverage.deadline_at) >= $1 \
-                 ORDER BY min(batch.scheduled_for), batch.id \
+                // `generatable_batches` already excludes work whose backoff has
+                // not elapsed and work that exhausted its attempt budget, so a
+                // batch that cannot be rendered stops occupying a candidate
+                // slot instead of starving every healthy batch behind it.
+                "SELECT id \
+                 FROM daily_reporting.generatable_batches \
+                 WHERE scheduled_for <= $1 \
+                   AND deadline_at >= $1 \
+                   AND (retry_after IS NULL OR retry_after <= $1) \
+                 ORDER BY scheduled_for, id \
                  LIMIT $2",
                 &[&now, &i64::from(limit)],
             )
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
         Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    }
+
+    /// Records a failed generation and holds the batch back from the next
+    /// candidate scans.
+    ///
+    /// The delay grows with the attempt number so a batch that fails for a
+    /// structural reason — a missing snapshot, an unrenderable dataset — stops
+    /// consuming a slot every tick, and stops entirely once its budget is
+    /// spent. The row is append-only: the attempt history stays auditable, and
+    /// the budget cannot be rewound by a caller.
+    pub async fn record_generation_failure(
+        &self,
+        batch_id: i64,
+        now: DateTime<Utc>,
+        error_class: GenerationErrorClass,
+    ) -> Result<(), PostgresOutboxError> {
+        let error_class = error_class.as_str();
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
+        let changed = client
+            .execute(
+                // Every parameter is cast explicitly. In an `INSERT ... SELECT`
+                // the target column types do not reach the inner select list,
+                // so an uncast parameter is inferred as `text` and the insert
+                // fails on a type it was never given.
+                "INSERT INTO daily_reporting.generation_attempts \
+                     (batch_id, attempt_no, failed_at, retry_after, error_class) \
+                 SELECT $1::bigint, \
+                        (count(*) + 1)::smallint, \
+                        $2::timestamptz, \
+                        $2::timestamptz + make_interval(secs => \
+                            $3::double precision * \
+                            power(2::double precision, count(*)::double precision)), \
+                        $4::text \
+                 FROM daily_reporting.generation_attempts \
+                 WHERE batch_id = $1::bigint",
+                &[
+                    &batch_id,
+                    &now,
+                    &GENERATION_RETRY_BASE_SECONDS,
+                    &error_class,
+                ],
+            )
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
+        exactly_one(changed)
     }
 
     pub(super) async fn verify_generation_artifact(
