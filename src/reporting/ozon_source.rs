@@ -28,7 +28,10 @@ use super::{
     snapshot::{Marketplace, SnapshotStatus},
 };
 
-const MAX_PAGES_PER_SOURCE: usize = 25;
+const MAX_SALES_PAGES: usize = 25;
+// At 100 products/page this still accommodates 10,000 products, while the
+// manual dry-run's absolute deadline bounds the total request time.
+const MAX_PRODUCT_PAGES: usize = 100;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_and_persist<T: OzonReportTransport>(
@@ -264,7 +267,7 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         date_to: NaiveDate,
     ) -> Result<Vec<CollectedSalesFact>, OzonReportSourceError> {
         let mut facts = Vec::new();
-        for page in 0..MAX_PAGES_PER_SOURCE {
+        for page in 0..MAX_SALES_PAGES {
             let offset = u32::try_from(page)
                 .ok()
                 .and_then(|page| page.checked_mul(1_000))
@@ -356,7 +359,7 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
     {
         let mut cursor = None;
         let mut facts = Vec::new();
-        for _ in 0..MAX_PAGES_PER_SOURCE {
+        for _ in 0..MAX_PRODUCT_PAGES {
             let request = product_page_request(path, cursor.as_deref())
                 .map_err(|_| OzonReportSourceError::InvalidResponse)?;
             let response = self.transport.post(request).await?;
@@ -677,7 +680,7 @@ mod tests {
         };
         let sales = OzonReportSource::new(FixtureTransport(Mutex::new(
             std::iter::repeat_with(|| Ok(full_sales_page()))
-                .take(MAX_PAGES_PER_SOURCE)
+                .take(MAX_SALES_PAGES)
                 .collect(),
         )));
         let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
@@ -688,7 +691,7 @@ mod tests {
 
         let cursor = OzonReportSource::new(FixtureTransport(Mutex::new(
             std::iter::repeat_with(|| Ok(json!({"items":[],"cursor":"next"})))
-                .take(MAX_PAGES_PER_SOURCE)
+                .take(MAX_PRODUCT_PAGES)
                 .collect(),
         )));
         assert_eq!(

@@ -16,6 +16,10 @@ use thiserror::Error;
 use super::postgres_collector::{CollectedPriceFact, CollectedSalesFact, CollectedStockFact};
 
 const MAX_PAGE_ROWS: usize = 1_000;
+// Product stocks and prices may include a much larger nested structure than
+// analytics rows. Keep their requested page small enough that a legitimate
+// response remains well below the client's 2 MiB decoded-body ceiling.
+const PRODUCT_PAGE_ROWS: usize = 100;
 const MAX_CURSOR_BYTES: usize = 4_096;
 const MAX_CAMPAIGN_TITLE_BYTES: usize = 512;
 
@@ -103,7 +107,7 @@ pub fn product_page_request(
         payload: serde_json::json!({
             "cursor": cursor.unwrap_or_default(),
             "filter": {"offer_id": [], "product_id": [], "visibility": "ALL"},
-            "limit": MAX_PAGE_ROWS,
+            "limit": PRODUCT_PAGE_ROWS,
         }),
     })
 }
@@ -153,7 +157,7 @@ pub fn parse_sales_page(response: &Value) -> Result<Vec<CollectedSalesFact>, Ozo
 /// stock sum FBO/FBS rows correctly.
 pub fn parse_stock_page(response: &Value) -> Result<Vec<CollectedStockFact>, OzonReportParseError> {
     let items = array_field(response, "items")?;
-    if items.len() > MAX_PAGE_ROWS {
+    if items.len() > PRODUCT_PAGE_ROWS {
         return Err(OzonReportParseError::TooManyRows);
     }
     let mut totals = BTreeMap::<(u64, String), u64>::new();
@@ -186,7 +190,7 @@ pub fn parse_stock_page(response: &Value) -> Result<Vec<CollectedStockFact>, Ozo
 /// integer kopecks. `old_price` of zero denotes an absent before-price.
 pub fn parse_price_page(response: &Value) -> Result<Vec<CollectedPriceFact>, OzonReportParseError> {
     let items = array_field(response, "items")?;
-    if items.len() > MAX_PAGE_ROWS {
+    if items.len() > PRODUCT_PAGE_ROWS {
         return Err(OzonReportParseError::TooManyRows);
     }
     let mut facts = Vec::with_capacity(items.len());
@@ -493,7 +497,7 @@ mod tests {
             json!({
                 "cursor": "opaque-cursor",
                 "filter": {"offer_id": [], "product_id": [], "visibility": "ALL"},
-                "limit": 1_000,
+                "limit": 100,
             })
         );
         let oversized = "x".repeat(MAX_CURSOR_BYTES + 1);
@@ -590,13 +594,13 @@ mod tests {
             Err(OzonReportParseError::TooManyRows)
         );
 
-        let too_many_stocks = vec![json!({}); MAX_PAGE_ROWS + 1];
+        let too_many_stocks = vec![json!({}); PRODUCT_PAGE_ROWS + 1];
         assert_eq!(
             parse_stock_page(&json!({"items": too_many_stocks})),
             Err(OzonReportParseError::TooManyRows)
         );
 
-        let too_many_prices = vec![json!({}); MAX_PAGE_ROWS + 1];
+        let too_many_prices = vec![json!({}); PRODUCT_PAGE_ROWS + 1];
         assert_eq!(
             parse_price_page(&json!({"items": too_many_prices})),
             Err(OzonReportParseError::TooManyRows)
