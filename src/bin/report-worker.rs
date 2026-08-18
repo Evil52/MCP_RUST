@@ -17,11 +17,21 @@ use mcp_ozon::reporting::{
     reporting_interval,
     service::{ReportPreviewScope, ReportWorkerConfig, ReportWorkerMode},
 };
-use tokio::{signal, time::MissedTickBehavior};
+use tokio::{
+    signal,
+    time::{MissedTickBehavior, timeout},
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const DRY_RUN_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_GENERATIONS_PER_TICK: u16 = 16;
+/// Bounds the queue reads of one tick, so a stalled scheduler still
+/// advances its failure budget instead of hanging forever.
+const TICK_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Bounds one report generation, including rendering and artifact commit.
+const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Consecutive failing ticks tolerated before the process exits for restart.
+const MAX_CONSECUTIVE_TICK_FAILURES: u32 = 5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -134,6 +144,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Runs scheduled planning and generation until shutdown or sustained failure.
+///
+/// A tick that cannot read its work queue is transient by default: the
+/// database may be restarting or failing over, and the next tick re-reads from
+/// authoritative state. Only a sustained inability to make progress ends the
+/// loop, which exits the process so the supervisor restarts it with a fresh
+/// session instead of leaving a live container that silently does nothing.
 async fn run_dry_scheduler(
     config: &ReportWorkerConfig,
     outbox: &PostgresOutboxRepository,
@@ -141,30 +158,76 @@ async fn run_dry_scheduler(
 ) -> Result<()> {
     let mut timer = tokio::time::interval(DRY_RUN_TICK);
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut consecutive_failures = 0_u32;
     loop {
         timer.tick().await;
-        let now = Utc::now();
-        let planned = outbox.plan_due(now, config.policy()).await?;
-        let batch_ids = outbox
-            .pending_generation_ids(now, MAX_GENERATIONS_PER_TICK)
-            .await?;
-        tracing::info!(
-            planned = planned.len(),
-            candidates = batch_ids.len(),
-            "daily report dry-run tick"
-        );
-        for batch_id in batch_ids {
-            if generate_batch(config, outbox, snapshots, batch_id, now)
-                .await
-                .is_err()
-            {
+        match run_scheduler_tick(config, outbox, snapshots, Utc::now()).await {
+            Ok(()) => consecutive_failures = 0,
+            Err(error) => {
+                consecutive_failures += 1;
+                ensure!(
+                    consecutive_failures < MAX_CONSECUTIVE_TICK_FAILURES,
+                    "daily report scheduler failed {consecutive_failures} consecutive ticks; \
+                     exiting so the supervisor can restart it"
+                );
                 tracing::warn!(
-                    batch_id,
-                    "daily report generation deferred; delivery remains disabled"
+                    consecutive_failures,
+                    error = %error,
+                    "daily report scheduler tick failed; retrying on the next tick"
                 );
             }
         }
     }
+}
+
+/// Executes exactly one planning and generation pass.
+///
+/// The queue reads are bounded so a stalled tick cannot hold the loop open
+/// past the failure budget, and each generation is bounded separately so one
+/// slow report cannot consume the whole pass.
+async fn run_scheduler_tick(
+    config: &ReportWorkerConfig,
+    outbox: &PostgresOutboxRepository,
+    snapshots: &PostgresSnapshotRepository,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let (planned, batch_ids) = timeout(TICK_QUERY_TIMEOUT, async {
+        let planned = outbox.plan_due(now, config.policy()).await?;
+        let batch_ids = outbox
+            .pending_generation_ids(now, MAX_GENERATIONS_PER_TICK)
+            .await?;
+        anyhow::Ok((planned, batch_ids))
+    })
+    .await
+    .context("daily report scheduler queue read timed out")??;
+    tracing::info!(
+        planned = planned.len(),
+        candidates = batch_ids.len(),
+        "daily report dry-run tick"
+    );
+    for batch_id in batch_ids {
+        // A single unrenderable report must never stop the pass: the rest of
+        // the queue is independent of it.
+        match timeout(
+            GENERATION_TIMEOUT,
+            generate_batch(config, outbox, snapshots, batch_id, now),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(
+                batch_id,
+                error = %error,
+                "daily report generation deferred; delivery remains disabled"
+            ),
+            Err(_) => tracing::warn!(
+                batch_id,
+                timeout_seconds = GENERATION_TIMEOUT.as_secs(),
+                "daily report generation exceeded its budget; delivery remains disabled"
+            ),
+        }
+    }
+    Ok(())
 }
 
 async fn generate_batch(
