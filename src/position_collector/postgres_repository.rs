@@ -38,6 +38,12 @@ impl PostgresRepository {
     /// Verifies the exact least-privilege database contract required by the
     /// disabled runtime without reading marketplace history.
     pub async fn verify_runtime_contract(&self) -> Result<(), RepositoryError> {
+        // Checked before the guard is taken: the session mutex is not
+        // reentrant, and this helper acquires it in its own right.
+        self.client
+            .verify_session_bounds()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
         let client = self
             .client
             .acquire()

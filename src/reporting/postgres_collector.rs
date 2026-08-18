@@ -178,6 +178,12 @@ impl PostgresSnapshotWriter {
     }
 
     pub async fn verify_runtime_contract(&self) -> Result<(), PostgresCollectorError> {
+        // Checked before the guard is taken: the session mutex is not
+        // reentrant, and this helper acquires it in its own right.
+        self.client
+            .verify_session_bounds()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
         let client = self
             .client
             .acquire()

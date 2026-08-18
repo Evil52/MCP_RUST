@@ -91,6 +91,12 @@ impl PostgresOutboxRepository {
     }
 
     pub async fn verify_runtime_contract(&self) -> Result<(), PostgresOutboxError> {
+        // Checked before the guard is taken: the session mutex is not
+        // reentrant, and this helper acquires it in its own right.
+        self.client
+            .verify_session_bounds()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let client = self
             .client
             .acquire()

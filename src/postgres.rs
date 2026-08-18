@@ -7,9 +7,14 @@
 //!    of vanishing with a dropped `JoinHandle`.
 //! 2. A dead session is replaced on demand. Losing the connection to a
 //!    restarted or failed-over server degrades one operation, not the process.
-//! 3. Every statement is bounded server-side. Without `statement_timeout` a
-//!    half-open socket would pin the single session — and therefore every
-//!    other database operation in the process — with nothing able to break it.
+//! 3. The transport is bounded, and the server's own bounds are audited. The
+//!    schema bootstrap already gives each role a `statement_timeout` and an
+//!    `idle_in_transaction_session_timeout`, so this module does not restate
+//!    them — overriding could only weaken them. It verifies they are present
+//!    and adds what a server-side timeout cannot provide: detection of a peer
+//!    that vanished without closing the socket, which would otherwise leave
+//!    this process waiting for a reply that is never coming, holding the one
+//!    session every other database operation needs.
 
 use std::{
     ops::{Deref, DerefMut},
@@ -22,19 +27,15 @@ use tokio::{
 };
 use tokio_postgres::{Client, Config, NoTls};
 
-/// Upper bound for a single statement. Chosen well above the slowest report
-/// query and far below any operator patience for a stuck worker.
-pub const STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Ceiling accepted for the server-applied `statement_timeout`.
+///
+/// The value itself belongs to the database role, which is the authority a
+/// DBA can audit and change without a redeploy. This process only refuses to
+/// run against a session whose bound is missing or uselessly large.
+pub const MAX_STATEMENT_TIMEOUT_MILLIS: i64 = 120_000;
 
-/// Upper bound for an abandoned open transaction. A dropped future between
-/// `BEGIN` and `COMMIT` releases its locks instead of pinning them until the
-/// process restarts.
-pub const IDLE_IN_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Upper bound for waiting on a contended row or advisory lock. It fires
-/// before `STATEMENT_TIMEOUT` so lock contention is distinguishable from a
-/// slow query in operator logs.
-pub const LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+/// Ceiling accepted for the server-applied `idle_in_transaction_session_timeout`.
+pub const MAX_IDLE_IN_TRANSACTION_MILLIS: i64 = 120_000;
 
 /// TCP-level connection establishment budget.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,10 +61,14 @@ const RECONNECT_COOLDOWN: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PostgresUnavailable;
 
-/// Applies the process-wide session bounds to a parsed connection config.
+/// Applies the transport-level bounds a database role cannot express.
 ///
-/// Called after the URL is parsed, so the settings always win over anything an
-/// operator placed in `REPORT_*_DATABASE_URL`.
+/// Statement and transaction timeouts are deliberately left alone: they are
+/// already set per role in the schema bootstrap, and a client that overrode
+/// them could only ever weaken a bound the DBA chose. What no server-side
+/// timeout can cover is a peer that disappears without closing the socket —
+/// the server may well cancel its own query, but this process would wait for
+/// a reply that is never coming. That gap is what these settings close.
 pub fn harden(config: &mut Config, application_name: &str) {
     config.connect_timeout(CONNECT_TIMEOUT);
     config.application_name(application_name);
@@ -72,16 +77,6 @@ pub fn harden(config: &mut Config, application_name: &str) {
     config.keepalives_interval(KEEPALIVES_INTERVAL);
     config.keepalives_retries(KEEPALIVES_RETRIES);
     config.tcp_user_timeout(TCP_USER_TIMEOUT);
-    config.options(session_options());
-}
-
-fn session_options() -> String {
-    format!(
-        "-c statement_timeout={} -c idle_in_transaction_session_timeout={} -c lock_timeout={}",
-        STATEMENT_TIMEOUT.as_millis(),
-        IDLE_IN_TRANSACTION_TIMEOUT.as_millis(),
-        LOCK_TIMEOUT.as_millis(),
-    )
 }
 
 struct ConnectionSlot {
@@ -180,6 +175,46 @@ impl SupervisedClient {
             .map(std::mem::drop)
             .map_err(|_| PostgresUnavailable)
     }
+
+    /// Refuses a session the server left without statement or transaction
+    /// bounds.
+    ///
+    /// Those bounds live on the database role rather than in this process, so
+    /// they can be audited and retuned without a redeploy. The cost of that
+    /// choice is that dropping an `ALTER ROLE` would silently unbound every
+    /// worker; checking the effective values at startup turns that into a
+    /// refusal to start instead.
+    pub async fn verify_session_bounds(&self) -> Result<(), PostgresUnavailable> {
+        let client = self.acquire().await?;
+        // `pg_settings.setting` reports the effective value in the parameter's
+        // base unit — milliseconds here — so no unit string has to be parsed.
+        let row = client
+            .query_one(
+                "SELECT \
+                    (SELECT setting::bigint FROM pg_settings \
+                       WHERE name = 'statement_timeout'), \
+                    (SELECT setting::bigint FROM pg_settings \
+                       WHERE name = 'idle_in_transaction_session_timeout')",
+                &[],
+            )
+            .await
+            .map_err(|_| PostgresUnavailable)?;
+        let statement_timeout: i64 = row.get(0);
+        let idle_in_transaction: i64 = row.get(1);
+        let bounded = |value: i64, ceiling: i64| value > 0 && value <= ceiling;
+        if bounded(statement_timeout, MAX_STATEMENT_TIMEOUT_MILLIS)
+            && bounded(idle_in_transaction, MAX_IDLE_IN_TRANSACTION_MILLIS)
+        {
+            return Ok(());
+        }
+        tracing::error!(
+            component = self.component,
+            statement_timeout_millis = statement_timeout,
+            idle_in_transaction_millis = idle_in_transaction,
+            "PostgreSQL role is missing a bounded statement or transaction timeout"
+        );
+        Err(PostgresUnavailable)
+    }
 }
 
 async fn connect_supervised(
@@ -233,37 +268,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_options_bound_statements_idle_transactions_and_lock_waits() {
-        let options = session_options();
-        assert_eq!(
-            options,
-            "-c statement_timeout=30000 -c idle_in_transaction_session_timeout=60000 \
-             -c lock_timeout=15000"
-        );
-    }
-
-    #[test]
-    fn lock_timeout_fires_before_the_statement_timeout() {
-        assert!(LOCK_TIMEOUT < STATEMENT_TIMEOUT);
-    }
-
-    #[test]
-    fn hardening_overrides_session_settings_supplied_through_the_url() {
+    fn hardening_applies_transport_bounds_and_pins_the_application_name() {
         let mut config: Config = "postgresql://report_worker:secret@db/reports\
-             ?options=-c%20statement_timeout%3D0&application_name=spoofed"
+             ?application_name=spoofed"
             .parse()
             .expect("the fixture URL parses");
-        assert_eq!(config.get_options(), Some("-c statement_timeout=0"));
         harden(&mut config, "mcp-ozon-report-worker");
-        assert_eq!(config.get_options(), Some(session_options().as_str()));
         assert_eq!(
             config.get_application_name(),
             Some("mcp-ozon-report-worker")
         );
         assert_eq!(config.get_connect_timeout(), Some(&CONNECT_TIMEOUT));
         assert_eq!(config.get_keepalives_idle(), KEEPALIVES_IDLE);
+        assert_eq!(config.get_keepalives_interval(), Some(KEEPALIVES_INTERVAL));
+        assert_eq!(config.get_keepalives_retries(), Some(KEEPALIVES_RETRIES));
         assert_eq!(config.get_tcp_user_timeout(), Some(&TCP_USER_TIMEOUT));
     }
+
+    #[test]
+    fn hardening_leaves_server_side_session_bounds_to_the_database_role() {
+        // Overriding these could only ever weaken the role's own values, so a
+        // URL that carries them is left exactly as supplied and audited by
+        // `verify_session_bounds` instead.
+        let mut config: Config = "postgresql://report_worker:secret@db/reports\
+             ?options=-c%20statement_timeout%3D9000"
+            .parse()
+            .expect("the fixture URL parses");
+        harden(&mut config, "mcp-ozon-report-worker");
+        assert_eq!(config.get_options(), Some("-c statement_timeout=9000"));
+    }
+
+    /// The schema bootstrap sets 60s and 30s; a compliant deployment must
+    /// never be refused by the ceilings this module accepts.
+    const _: () = {
+        assert!(MAX_STATEMENT_TIMEOUT_MILLIS >= 60_000);
+        assert!(MAX_IDLE_IN_TRANSACTION_MILLIS >= 30_000);
+    };
 
     #[tokio::test]
     async fn a_preconnected_session_is_never_silently_replaced() {
