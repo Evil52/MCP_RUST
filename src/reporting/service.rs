@@ -6,6 +6,7 @@ use tokio_postgres::{Config, config::Host};
 use crate::config::{AccessRegistry, Marketplace as RegistryMarketplace, RegistrySource};
 
 use super::{
+    ReportKey,
     artifact_store::LocalArtifactStore,
     collector_plan::{CollectionPlanError, CollectionTarget, build_collection_plan},
     policy::DailyReportPolicy,
@@ -45,6 +46,13 @@ pub struct ReportPreviewScope {
     pub audience_id: String,
     pub actor_id: String,
     pub manager_name: String,
+    pub accounts: Vec<AccountScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportGenerationScope {
+    pub audience_id: String,
+    pub report_name: String,
     pub accounts: Vec<AccountScope>,
 }
 
@@ -124,9 +132,57 @@ impl ReportWorkerConfig {
             .registry
             .actor(actor_id)
             .context("daily report manager is unavailable")?;
-        let accounts = manager
-            .account_ids
+        let accounts = self.account_scopes(manager.account_ids.iter())?;
+        Ok(ReportPreviewScope {
+            audience_id: audience.id.clone(),
+            actor_id: actor.id.clone(),
+            manager_name: actor.name.clone(),
+            accounts,
+        })
+    }
+
+    /// Resolves the complete audience attached to a persisted report key.
+    ///
+    /// Unlike manual preview, generation never accepts an actor or account
+    /// list from the caller. Every account comes from the validated policy and
+    /// access registry, and the persisted report version must match exactly.
+    pub fn generation_scope(&self, key: &ReportKey) -> Result<ReportGenerationScope> {
+        ensure!(
+            key.report_version == self.policy.version,
+            "report batch version does not match the active policy"
+        );
+        let audience = self
+            .policy
+            .audiences
             .iter()
+            .find(|audience| audience.id == key.recipient_id)
+            .context("report batch recipient is outside the active policy")?;
+        let account_ids = audience
+            .managers
+            .iter()
+            .flat_map(|manager| manager.account_ids.iter());
+        let accounts = self.account_scopes(account_ids)?;
+        let report_name = if let [manager] = audience.managers.as_slice() {
+            self.registry
+                .actor(&manager.actor_id)
+                .context("daily report manager is unavailable")?
+                .name
+                .clone()
+        } else {
+            format!("Сводный отчёт ({})", audience.id)
+        };
+        Ok(ReportGenerationScope {
+            audience_id: audience.id.clone(),
+            report_name,
+            accounts,
+        })
+    }
+
+    fn account_scopes<'a>(
+        &self,
+        account_ids: impl Iterator<Item = &'a String>,
+    ) -> Result<Vec<AccountScope>> {
+        account_ids
             .map(|account_id| {
                 let account = self
                     .registry
@@ -141,13 +197,7 @@ impl ReportWorkerConfig {
                 AccountScope::new(account.id.clone(), marketplace)
                     .context("daily report account scope is invalid")
             })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(ReportPreviewScope {
-            audience_id: audience.id.clone(),
-            actor_id: actor.id.clone(),
-            manager_name: actor.name.clone(),
-            accounts,
-        })
+            .collect()
     }
 
     pub async fn connect(&self) -> Result<(PostgresOutboxRepository, PostgresSnapshotRepository)> {
@@ -277,6 +327,35 @@ mod tests {
         let wb = config.preview_scope("pilot_owner", "wb6").unwrap();
         assert_eq!(wb.manager_name, "Vahrusheva / Torsunova");
         assert_eq!(wb.accounts[0].marketplace(), Marketplace::Wildberries);
+
+        let generation = config
+            .generation_scope(&ReportKey {
+                local_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+                kind: super::super::ReportKind::Morning,
+                recipient_id: "pilot_owner".to_owned(),
+                report_version: 1,
+            })
+            .unwrap();
+        assert_eq!(generation.audience_id, "pilot_owner");
+        assert_eq!(generation.report_name, "Сводный отчёт (pilot_owner)");
+        assert_eq!(generation.accounts.len(), 2);
+        assert_eq!(generation.accounts[0].marketplace(), Marketplace::Ozon);
+        assert_eq!(
+            generation.accounts[1].marketplace(),
+            Marketplace::Wildberries
+        );
+        for (recipient_id, report_version) in [("unknown", 1), ("pilot_owner", 2)] {
+            assert!(
+                config
+                    .generation_scope(&ReportKey {
+                        local_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+                        kind: super::super::ReportKind::Morning,
+                        recipient_id: recipient_id.to_owned(),
+                        report_version,
+                    })
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -311,6 +390,32 @@ mod tests {
             .display()
             .to_string();
         assert!(config(entries).is_err());
+    }
+
+    #[test]
+    fn single_manager_generation_uses_the_authoritative_actor_name() {
+        let mut entries = valid_entries(false);
+        let policy_path = entries
+            .iter()
+            .find(|(key, _)| *key == POLICY_PATH_ENV)
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        fs::write(
+            policy_path,
+            r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{"id":"diana","email_env":"DIANA_EMAIL","managers":[{"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]}]}]}"#,
+        )
+        .unwrap();
+        let config = config(std::mem::take(&mut entries)).unwrap();
+        let scope = config
+            .generation_scope(&ReportKey {
+                local_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
+                kind: super::super::ReportKind::Evening,
+                recipient_id: "diana".to_owned(),
+                report_version: 1,
+            })
+            .unwrap();
+        assert_eq!(scope.report_name, "Diana");
+        assert_eq!(scope.accounts.len(), 1);
     }
 
     #[test]

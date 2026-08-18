@@ -41,6 +41,25 @@ pub struct ClaimedDelivery {
     pub covered_keys: Vec<ReportKey>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationStatus {
+    Planned,
+    Generating,
+    Ready,
+}
+
+/// Immutable database context required to render one report artifact.
+///
+/// The key, recipient and generation timestamp are loaded from PostgreSQL;
+/// callers cannot inject them through a command line or model request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationCandidate {
+    pub batch_id: i64,
+    pub key: ReportKey,
+    pub generated_at: DateTime<Utc>,
+    pub status: GenerationStatus,
+}
+
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresOutboxError {
     #[error("report outbox is unavailable")]
@@ -190,6 +209,60 @@ impl PostgresOutboxRepository {
              WHERE id = $1 AND status = 'planned'",
         )
         .await
+    }
+
+    /// Loads one due, non-expired single-section batch for deterministic
+    /// rendering or recovery.
+    ///
+    /// Consolidated morning+evening batches are deliberately rejected until
+    /// a renderer with two explicit report sections exists. `ready` batches
+    /// are accepted so an operator can verify an ambiguous post-persistence
+    /// outcome without creating another delivery identity.
+    pub async fn generation_candidate(
+        &self,
+        batch_id: i64,
+        now: DateTime<Utc>,
+    ) -> Result<GenerationCandidate, PostgresOutboxError> {
+        if batch_id <= 0 {
+            return Err(PostgresOutboxError::InvalidDelivery);
+        }
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                "SELECT batch.status, batch.recipient_id, batch.report_version, \
+                        batch.created_at, coverage.local_date, coverage.report_kind \
+                 FROM daily_reporting.delivery_batches AS batch \
+                 JOIN daily_reporting.delivery_coverage AS coverage \
+                   ON coverage.batch_id = batch.id \
+                 WHERE batch.id = $1 \
+                   AND batch.status IN ('planned', 'generating', 'ready') \
+                   AND batch.scheduled_for <= $2 \
+                   AND EXISTS ( \
+                       SELECT 1 FROM daily_reporting.delivery_coverage AS due \
+                       WHERE due.batch_id = batch.id AND due.deadline_at >= $2 \
+                   ) \
+                 ORDER BY coverage.report_kind",
+                &[&batch_id, &now],
+            )
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
+        let [row] = rows.as_slice() else {
+            return Err(PostgresOutboxError::Conflict);
+        };
+        let status = parse_generation_status(row.get(0))?;
+        let report_version =
+            u32::try_from(row.get::<_, i32>(2)).map_err(|_| PostgresOutboxError::Unavailable)?;
+        Ok(GenerationCandidate {
+            batch_id,
+            key: ReportKey {
+                local_date: row.get(4),
+                kind: parse_kind(row.get(5))?,
+                recipient_id: row.get(1),
+                report_version,
+            },
+            generated_at: row.get(3),
+            status,
+        })
     }
 
     pub(super) async fn verify_generation_artifact(
@@ -678,6 +751,15 @@ fn parse_kind(value: &str) -> Result<ReportKind, PostgresOutboxError> {
     }
 }
 
+fn parse_generation_status(value: &str) -> Result<GenerationStatus, PostgresOutboxError> {
+    match value {
+        "planned" => Ok(GenerationStatus::Planned),
+        "generating" => Ok(GenerationStatus::Generating),
+        "ready" => Ok(GenerationStatus::Ready),
+        _ => Err(PostgresOutboxError::Unavailable),
+    }
+}
+
 fn transient_error_text(class: DeliveryErrorClass) -> Result<&'static str, PostgresOutboxError> {
     match class {
         DeliveryErrorClass::RateLimited => Ok("rate_limited"),
@@ -723,8 +805,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        PostgresOutboxError, exactly_one, parse_kind, permanent_error_text, transient_error_text,
-        validate_attempt_times,
+        GenerationStatus, PostgresOutboxError, exactly_one, parse_generation_status, parse_kind,
+        permanent_error_text, transient_error_text, validate_attempt_times,
     };
     use crate::{reporting::ReportKind, reporting::outbox::DeliveryErrorClass};
 
@@ -733,6 +815,17 @@ mod tests {
         assert_eq!(parse_kind("morning").unwrap(), ReportKind::Morning);
         assert_eq!(parse_kind("evening").unwrap(), ReportKind::Evening);
         assert_eq!(parse_kind("unknown"), Err(PostgresOutboxError::Unavailable));
+        for (value, expected) in [
+            ("planned", GenerationStatus::Planned),
+            ("generating", GenerationStatus::Generating),
+            ("ready", GenerationStatus::Ready),
+        ] {
+            assert_eq!(parse_generation_status(value), Ok(expected));
+        }
+        assert_eq!(
+            parse_generation_status("sent"),
+            Err(PostgresOutboxError::Unavailable)
+        );
         assert_eq!(exactly_one(1), Ok(()));
         for changed in [0, 2] {
             assert_eq!(exactly_one(changed), Err(PostgresOutboxError::Conflict));

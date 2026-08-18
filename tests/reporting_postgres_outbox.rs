@@ -9,11 +9,15 @@ use mcp_ozon::reporting::{
     due_deliveries,
     outbox::{ArtifactIdentity, DeliveryErrorClass},
     policy::{AudiencePolicy, DailyReportPolicy, ManagerScope},
-    postgres_outbox::{CreateOutcome, PostgresOutboxError, PostgresOutboxRepository},
+    postgres_outbox::{
+        CreateOutcome, GenerationStatus, PostgresOutboxError, PostgresOutboxRepository,
+    },
     service::ReportWorkerConfig,
 };
 use sha2::{Digest, Sha256};
 use tokio_postgres::Config;
+
+static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn utc(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2099, 8, 16, hour, minute, 0).unwrap()
@@ -24,8 +28,12 @@ fn artifact() -> ArtifactIdentity {
 }
 
 fn artifact_for(date: &str, recipient: &str) -> ArtifactIdentity {
+    artifact_for_kind(date, recipient, "evening")
+}
+
+fn artifact_for_kind(date: &str, recipient: &str, kind: &str) -> ArtifactIdentity {
     ArtifactIdentity {
-        object_key: format!("daily-reports/{date}/{recipient}/v1/evening.xlsx"),
+        object_key: format!("daily-reports/{date}/{recipient}/v1/{kind}.xlsx"),
         sha256: Sha256::digest(b"integration-xlsx")
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -63,11 +71,7 @@ fn disabled_policy(recipient_id: String) -> DailyReportPolicy {
     }
 }
 
-#[tokio::test]
-async fn report_worker_runtime_uses_only_the_restricted_database_role() {
-    let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
-        return;
-    };
+async fn verify_report_worker_runtime(url: &str) {
     let directory = std::env::temp_dir().join(format!(
         "mcp-ozon-report-worker-runtime-{}",
         std::process::id()
@@ -88,7 +92,7 @@ async fn report_worker_runtime_uses_only_the_restricted_database_role() {
     )
     .unwrap();
     let config = ReportWorkerConfig::from_lookup(|key| match key {
-        "REPORT_WORKER_DATABASE_URL" => Some(url.clone()),
+        "REPORT_WORKER_DATABASE_URL" => Some(url.to_owned()),
         "MCP_ACCESS_CONFIG" => Some(registry.display().to_string()),
         "DAILY_REPORT_POLICY" => Some(policy.display().to_string()),
         "REPORT_ARTIFACT_ROOT" => Some(artifact_root.display().to_string()),
@@ -105,6 +109,7 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
     let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
         return;
     };
+    let _guard = DB_TEST_LOCK.lock().await;
     let repository = PostgresOutboxRepository::connect(&Config::from_str(&url).unwrap())
         .await
         .unwrap();
@@ -135,6 +140,79 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
         .await
         .unwrap();
     assert_eq!(covered.len(), 2);
+
+    assert_eq!(
+        repository.generation_candidate(0, utc(3, 1)).await,
+        Err(PostgresOutboxError::InvalidDelivery)
+    );
+
+    let recipient = format!("generation_{}", std::process::id());
+    let delivery = due_deliveries(utc(3, 0), &recipient, 1, &BTreeSet::new())
+        .unwrap()
+        .remove(0);
+    let batch_id = match repository.create_planned(delivery).await.unwrap() {
+        CreateOutcome::Inserted(id) => id,
+        CreateOutcome::Existing(_) => unreachable!(),
+    };
+    assert_eq!(
+        repository.generation_candidate(batch_id, utc(2, 59)).await,
+        Err(PostgresOutboxError::Conflict)
+    );
+    let planned = repository
+        .generation_candidate(batch_id, utc(3, 1))
+        .await
+        .unwrap();
+    assert_eq!(planned.status, GenerationStatus::Planned);
+    assert_eq!(planned.batch_id, batch_id);
+    assert_eq!(planned.key.recipient_id, recipient);
+    assert_eq!(planned.key.kind, mcp_ozon::reporting::ReportKind::Morning);
+    assert!(planned.generated_at <= utc(3, 1));
+
+    repository.start_generation(batch_id).await.unwrap();
+    assert_eq!(
+        repository
+            .generation_candidate(batch_id, utc(3, 2))
+            .await
+            .unwrap()
+            .status,
+        GenerationStatus::Generating
+    );
+    repository
+        .mark_ready(
+            batch_id,
+            &artifact_for_kind("2099/08/16", &recipient, "morning"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .generation_candidate(batch_id, utc(3, 3))
+            .await
+            .unwrap()
+            .status,
+        GenerationStatus::Ready
+    );
+
+    let consolidated_recipient = format!("consolidated_{}", std::process::id());
+    let consolidated = due_deliveries(utc(13, 30), &consolidated_recipient, 1, &BTreeSet::new())
+        .unwrap()
+        .remove(0);
+    let consolidated_id = match repository.create_planned(consolidated).await.unwrap() {
+        CreateOutcome::Inserted(id) => id,
+        CreateOutcome::Existing(_) => unreachable!(),
+    };
+    assert_eq!(
+        repository
+            .generation_candidate(consolidated_id, utc(13, 31))
+            .await,
+        Err(PostgresOutboxError::Conflict)
+    );
+    assert_eq!(
+        repository.generation_candidate(batch_id, utc(9, 1)).await,
+        Err(PostgresOutboxError::Conflict)
+    );
+    drop(repository);
+    verify_report_worker_runtime(&url).await;
 }
 
 #[tokio::test]
@@ -142,6 +220,7 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
     let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
         return;
     };
+    let _guard = DB_TEST_LOCK.lock().await;
     let config = Config::from_str(&url).expect("report worker URL must be valid");
     let repository = PostgresOutboxRepository::connect(&config).await.unwrap();
     let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL").unwrap();
@@ -307,6 +386,7 @@ async fn repository_rejects_invalid_delivery_inputs_before_writing() {
     let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
         return;
     };
+    let _guard = DB_TEST_LOCK.lock().await;
     let config = Config::from_str(&url).unwrap();
     let repository = PostgresOutboxRepository::connect(&config).await.unwrap();
 

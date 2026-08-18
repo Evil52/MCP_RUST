@@ -7,10 +7,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind,
+    artifact_store::persist_and_mark_ready,
+    postgres_outbox::GenerationStatus,
     preview::render_published_preview,
+    reporting_interval,
     service::{ReportPreviewScope, ReportWorkerConfig, ReportWorkerMode},
 };
 use tokio::signal;
@@ -83,6 +86,51 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if let [command, batch_id] = arguments.as_slice() {
+        if command != "generate" {
+            return usage();
+        }
+        ensure!(
+            config.mode() == ReportWorkerMode::Disabled && !config.policy().enabled,
+            "artifact generation requires disabled delivery mode"
+        );
+        let batch_id = batch_id
+            .parse::<i64>()
+            .context("generation batch id must be a positive integer")?;
+        let candidate = outbox.generation_candidate(batch_id, Utc::now()).await?;
+        let scope = config.generation_scope(&candidate.key)?;
+        let cutoff = report_cutoff(&candidate.key)?;
+        let manifest = snapshots
+            .load_manifest(cutoff, scope.accounts.clone())
+            .await?;
+        let facts = snapshots.load_report_facts(&manifest).await?;
+        let report = render_published_preview(
+            &candidate.key,
+            &scope.report_name,
+            candidate.generated_at,
+            &manifest,
+            facts,
+        )?;
+        if candidate.status == GenerationStatus::Planned {
+            outbox.start_generation(candidate.batch_id).await?;
+        }
+        let receipt = persist_and_mark_ready(
+            config.artifact_store(),
+            &outbox,
+            candidate.batch_id,
+            &report.bundle,
+        )
+        .await?;
+        tracing::info!(
+            batch_id = candidate.batch_id,
+            audience_id = scope.audience_id,
+            object_key = receipt.artifact.object_key,
+            xlsx_bytes = receipt.xlsx_size_bytes,
+            html_bytes = receipt.html_size_bytes,
+            "daily report artifact generated; delivery remains disabled"
+        );
+        return Ok(());
+    }
     if !arguments.is_empty() {
         return usage();
     }
@@ -99,8 +147,18 @@ async fn main() -> Result<()> {
 
 fn usage() -> Result<()> {
     bail!(
-        "usage: report-worker [healthcheck | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
+        "usage: report-worker [healthcheck | generate <batch-id> | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
     )
+}
+
+fn report_cutoff(key: &ReportKey) -> Result<DateTime<Utc>> {
+    let (_, interval_end) = reporting_interval(key)?;
+    match key.kind {
+        ReportKind::Morning => interval_end
+            .checked_add_signed(Duration::hours(8))
+            .context("morning report cutoff is outside the supported range"),
+        ReportKind::Evening => Ok(interval_end),
+    }
 }
 
 fn parse_kind(value: &str) -> Result<ReportKind> {

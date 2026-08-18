@@ -107,12 +107,11 @@ writer, bounded fact reader and report dataset are present. A manual, bounded
 Ozon Seller + Performance adapter is available for a policy-scoped canary, but
 automatic marketplace collection and every WB report adapter remain disabled.
 No enabled scheduler process, S3 writer or mail provider is wired. The isolated
-production artifact volume is mounted and health-checked, but generation does
-not write to it while the worker remains disabled. Manual
+production artifact volume is mounted and health-checked. Manual
 HTML/XLSX previews can be generated from an already published complete
 four-source manifest. The immutable local store and outbox-publication
-primitive are covered by tests but are not invoked by the disabled production
-worker yet. Consolidated two-period
+primitive can now be invoked explicitly for one already-planned outbox batch
+while delivery remains disabled. Consolidated two-period
 catch-up rendering remains fail-closed until it has an explicit two-section
 template rather than silently presenting one interval as two reports.
 Consequently this phase cannot send email and cannot affect a
@@ -126,14 +125,20 @@ supplied on the command line. Existing output files are never overwritten.
 ```text
 report-worker preview <audience-id> <actor-id> <YYYY-MM-DD> \
   <morning|evening> <cutoff-rfc3339> <existing-output-dir>
+
+report-worker generate <batch-id>
 ```
 
-The command deliberately requires delivery mode and policy to remain disabled.
-It does not read recipient email values, send mail, call a marketplace or
-create an outbox occurrence. The hardened production container has a read-only
-root filesystem plus one dedicated artifact volume. The manual preview still
-writes only to its explicit operator-selected output directory and never marks
-an outbox batch ready.
+Both commands deliberately require delivery mode and policy to remain
+disabled. Neither reads recipient email values, sends mail or calls a
+marketplace. `preview` accepts an operator-selected manager and output path but
+never creates or changes an outbox occurrence. `generate` accepts only a
+positive batch ID: recipient, manager/account scope, report date, kind and
+cutoff are loaded from PostgreSQL plus the validated policy. It renders with
+the immutable batch creation timestamp, commits both files to the dedicated
+artifact volume and only then marks that exact batch ready. Repeating it can
+only reproduce or reuse the same bytes. The hardened production container has
+a read-only root filesystem plus one dedicated artifact volume.
 
 The persistence layer transactionally stores report occurrences, delivery
 coverage and attempts. Its unique occurrence key is
@@ -147,13 +152,11 @@ an ambiguous provider result is never retried automatically.
 
 1. Validate a manual Ozon four-source preview for Diana and add the
    corresponding WB read-only collector.
-2. Invoke the tested artifact publication primitive from a policy-scoped
-   generation claim while delivery remains disabled.
-3. Add the scheduler/runtime around the persisted PostgreSQL outbox and run dry
+2. Add the scheduler/runtime around the persisted PostgreSQL outbox and run dry
    mode for Diana and Vahrusheva/Torsunova with delivery disabled.
-4. Connect S3-compatible artifact storage and one service mailbox.
-5. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
-6. Reconcile figures for five to seven days before enabling other managers.
+3. Connect S3-compatible artifact storage and one service mailbox.
+4. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
+5. Reconcile figures for five to seven days before enabling other managers.
 
 ChatGPT remains the interactive analytics interface. Scheduled collection,
 calculation, artifact generation and delivery must remain server-side so they
