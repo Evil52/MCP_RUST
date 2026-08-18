@@ -22,6 +22,7 @@ pub mod policy;
 pub mod postgres_collector;
 pub mod postgres_outbox;
 pub mod postgres_snapshot;
+pub mod preview;
 pub mod rules;
 pub mod scheduler;
 pub mod service;

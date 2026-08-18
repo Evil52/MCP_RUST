@@ -249,6 +249,7 @@ mod tests {
                 account_id: "store".to_owned(),
                 sku: "10".to_owned(),
                 sellable_stock: 3,
+                stock_observed: true,
                 price_minor: Some(12_345),
                 observed_at: utc(11),
             }],

@@ -38,6 +38,7 @@ pub struct InventoryReportRow {
     pub account_id: String,
     pub sku: String,
     pub sellable_stock: u64,
+    pub stock_observed: bool,
     pub price_minor: Option<u64>,
     pub observed_at: DateTime<Utc>,
 }
@@ -182,15 +183,18 @@ impl ReportDataset {
                 0u64,
                 None,
                 fact.observed_at,
+                true,
             ));
             row.0 = add(row.0, fact.sellable_units)?;
             row.2 = row.2.max(fact.observed_at);
+            row.3 = true;
         }
         for fact in facts.prices {
             let row = inventory.entry((fact.account_id, fact.sku)).or_insert((
                 0u64,
                 None,
                 fact.observed_at,
+                false,
             ));
             if row.1.replace(fact.price_minor).is_some() {
                 return Err(DatasetError::InvalidFacts);
@@ -200,12 +204,15 @@ impl ReportDataset {
         let inventory = inventory
             .into_iter()
             .map(
-                |((account_id, sku), (stock, price, observed_at))| InventoryReportRow {
-                    account_id,
-                    sku: sku.to_string(),
-                    sellable_stock: stock,
-                    price_minor: price,
-                    observed_at,
+                |((account_id, sku), (stock, price, observed_at, stock_observed))| {
+                    InventoryReportRow {
+                        account_id,
+                        sku: sku.to_string(),
+                        sellable_stock: stock,
+                        stock_observed,
+                        price_minor: price,
+                        observed_at,
+                    }
                 },
             )
             .collect();
@@ -474,6 +481,7 @@ mod tests {
         assert_eq!(dataset.kpis.ordered_units, 5);
         assert_eq!(dataset.sales[0].operational_gmv_minor, 50_000);
         assert_eq!(dataset.inventory[0].sellable_stock, 7);
+        assert!(dataset.inventory[0].stock_observed);
         assert_eq!(dataset.inventory[0].price_minor, Some(12_345));
         assert_eq!(
             dataset.inventory[0].observed_at,
@@ -493,6 +501,18 @@ mod tests {
         assert_eq!(dataset.advertising[0].sku, "N/D");
         assert_eq!(dataset.advertising_details()[0].sku, "N/D");
         assert_eq!(add_available(None, Some(1)), Ok(None));
+    }
+
+    #[test]
+    fn price_only_inventory_does_not_claim_a_stock_observation() {
+        let mut input = facts("store");
+        input.stocks.clear();
+        let dataset =
+            ReportDataset::from_published(&manifest_with_counts(&["store"], [1, 1, 0, 1]), input)
+                .unwrap();
+        assert_eq!(dataset.inventory.len(), 1);
+        assert!(!dataset.inventory[0].stock_observed);
+        assert_eq!(dataset.inventory[0].sellable_stock, 0);
     }
 
     #[test]

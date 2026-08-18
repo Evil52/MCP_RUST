@@ -3,13 +3,14 @@ use std::{fs, path::Path, str::FromStr, sync::Arc, time::Duration};
 use anyhow::{Context, Result, bail, ensure};
 use tokio_postgres::{Config, config::Host};
 
-use crate::config::{AccessRegistry, RegistrySource};
+use crate::config::{AccessRegistry, Marketplace as RegistryMarketplace, RegistrySource};
 
 use super::{
     collector_plan::{CollectionPlanError, CollectionTarget, build_collection_plan},
     policy::DailyReportPolicy,
     postgres_outbox::PostgresOutboxRepository,
     postgres_snapshot::PostgresSnapshotRepository,
+    snapshot::{AccountScope, Marketplace},
 };
 
 const DATABASE_URL_ENV: &str = "REPORT_WORKER_DATABASE_URL";
@@ -34,6 +35,14 @@ pub struct ReportWorkerConfig {
     mode: ReportWorkerMode,
     policy: DailyReportPolicy,
     registry: Arc<AccessRegistry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportPreviewScope {
+    pub audience_id: String,
+    pub actor_id: String,
+    pub manager_name: String,
+    pub accounts: Vec<AccountScope>,
 }
 
 impl ReportWorkerConfig {
@@ -80,6 +89,53 @@ impl ReportWorkerConfig {
     /// Performs the credential-free source preflight used by health checks.
     pub fn collection_plan(&self) -> Result<Vec<CollectionTarget>, CollectionPlanError> {
         build_collection_plan(&self.policy, &self.registry)
+    }
+
+    /// Resolves one manager preview exclusively through the validated policy.
+    ///
+    /// Callers cannot inject account identifiers. This is intentionally more
+    /// restrictive than an audience-level report while the WB collector is
+    /// unavailable and the pilot audience spans two marketplaces.
+    pub fn preview_scope(&self, audience_id: &str, actor_id: &str) -> Result<ReportPreviewScope> {
+        let audience = self
+            .policy
+            .audiences
+            .iter()
+            .find(|audience| audience.id == audience_id)
+            .context("unknown daily report audience")?;
+        let manager = audience
+            .managers
+            .iter()
+            .find(|manager| manager.actor_id == actor_id)
+            .context("manager is outside the selected daily report audience")?;
+        let actor = self
+            .registry
+            .actor(actor_id)
+            .context("daily report manager is unavailable")?;
+        let accounts = manager
+            .account_ids
+            .iter()
+            .map(|account_id| {
+                let account = self
+                    .registry
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == *account_id)
+                    .context("daily report account is unavailable")?;
+                let marketplace = match account.marketplace {
+                    RegistryMarketplace::Ozon => Marketplace::Ozon,
+                    RegistryMarketplace::Wildberries => Marketplace::Wildberries,
+                };
+                AccountScope::new(account.id.clone(), marketplace)
+                    .context("daily report account scope is invalid")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ReportPreviewScope {
+            audience_id: audience.id.clone(),
+            actor_id: actor.id.clone(),
+            manager_name: actor.name.clone(),
+            accounts,
+        })
     }
 
     pub async fn connect(&self) -> Result<(PostgresOutboxRepository, PostgresSnapshotRepository)> {
@@ -141,12 +197,12 @@ mod tests {
     }
 
     fn registry() -> &'static str {
-        r#"{"version":1,"actors":[{"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana_serafimovich","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY","performance":{"client_id_env":"OZON_PERFORMANCE_ID","client_secret_env":"OZON_PERFORMANCE_SECRET"}}}]}"#
+        r#"{"version":1,"actors":[{"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}},{"id":"wb6","name":"Vahrusheva / Torsunova","role":"manager","oidc":{"username":"wb6"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana_serafimovich","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY","performance":{"client_id_env":"OZON_PERFORMANCE_ID","client_secret_env":"OZON_PERFORMANCE_SECRET"}}},{"id":"ip_domnyshev_wb","organization":"WB","marketplace":"wildberries","seller_client_id":"2","manager_id":"wb6","wildberries":{"api_token_env":"WB_TOKEN"}}]}"#
     }
 
     fn policy(enabled: bool) -> String {
         format!(
-            r#"{{"version":1,"enabled":{enabled},"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{{"id":"pilot_owner","email_env":"DAILY_REPORT_PILOT_RECIPIENT_EMAIL","managers":[{{"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]}}]}}]}}"#
+            r#"{{"version":1,"enabled":{enabled},"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{{"id":"pilot_owner","email_env":"DAILY_REPORT_PILOT_RECIPIENT_EMAIL","managers":[{{"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]}},{{"actor_id":"wb6","account_ids":["ip_domnyshev_wb"]}}]}}]}}"#
         )
     }
 
@@ -177,7 +233,30 @@ mod tests {
         assert_eq!(config.mode(), ReportWorkerMode::Disabled);
         assert!(!config.policy().enabled);
         assert_eq!(config.policy().audiences[0].id, "pilot_owner");
-        assert_eq!(config.collection_plan().unwrap().len(), 1);
+        assert_eq!(config.collection_plan().unwrap().len(), 2);
+        assert_eq!(
+            config
+                .preview_scope("pilot_owner", "diana_serafimovich")
+                .unwrap(),
+            ReportPreviewScope {
+                audience_id: "pilot_owner".to_owned(),
+                actor_id: "diana_serafimovich".to_owned(),
+                manager_name: "Diana".to_owned(),
+                accounts: vec![
+                    AccountScope::new("furnitura_dlya_doma".to_owned(), Marketplace::Ozon,)
+                        .unwrap()
+                ],
+            }
+        );
+        assert!(
+            config
+                .preview_scope("unknown", "diana_serafimovich")
+                .is_err()
+        );
+        assert!(config.preview_scope("pilot_owner", "unknown").is_err());
+        let wb = config.preview_scope("pilot_owner", "wb6").unwrap();
+        assert_eq!(wb.manager_name, "Vahrusheva / Torsunova");
+        assert_eq!(wb.accounts[0].marketplace(), Marketplace::Wildberries);
     }
 
     #[test]

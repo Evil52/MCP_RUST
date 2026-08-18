@@ -2,6 +2,7 @@ use std::{collections::VecDeque, fs, future::Future, pin::Pin, str::FromStr, syn
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use mcp_ozon::reporting::{
+    ReportKey, ReportKind,
     collector_service::ReportCollectorConfig,
     ozon_adapter::OzonReportRequest,
     ozon_source::{OzonReportSourceError, OzonReportTransport, collect_complete_snapshots},
@@ -10,6 +11,7 @@ use mcp_ozon::reporting::{
         CollectedSnapshot, CollectedStockFact, PostgresCollectorError, PostgresSnapshotWriter,
     },
     postgres_snapshot::{PostgresSnapshotError, PostgresSnapshotRepository},
+    preview::render_published_preview,
     snapshot::{AccountScope, Marketplace, SnapshotQuality, SnapshotStatus},
 };
 use serde_json::{Value, json};
@@ -318,7 +320,10 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
 
 #[tokio::test]
 async fn complete_ozon_source_set_is_published_atomically() {
-    let Ok(collector_url) = std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL") else {
+    let (Ok(collector_url), Ok(worker_url)) = (
+        std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL"),
+        std::env::var("REPORT_OUTBOX_TEST_WORKER_URL"),
+    ) else {
         return;
     };
     let config = Config::from_str(&collector_url).unwrap();
@@ -348,9 +353,9 @@ async fn complete_ozon_source_set_is_published_atomically() {
             attributed_orders: 1,
             attributed_revenue_minor: 10_000,
         }],
-        account_id,
-        timestamp("2098-08-16T19:00:00Z"),
-        timestamp("2098-08-16T03:00:00Z"),
+        account_id.clone(),
+        timestamp("2098-08-17T03:00:00Z"),
+        timestamp("2098-08-17T02:30:00Z"),
         timestamp("2098-08-15T19:00:00Z"),
         timestamp("2098-08-16T19:00:00Z"),
         "integration-test".to_owned(),
@@ -359,6 +364,37 @@ async fn complete_ozon_source_set_is_published_atomically() {
     .unwrap();
     let ids = writer.persist_batch(&snapshots).await.unwrap();
     assert_eq!(ids.len(), 4);
+    let worker_config = Config::from_str(&worker_url).unwrap();
+    let repository = PostgresSnapshotRepository::connect(&worker_config)
+        .await
+        .unwrap();
+    let manifest = repository
+        .load_manifest(
+            timestamp("2098-08-17T03:00:00Z"),
+            vec![AccountScope::new(account_id, Marketplace::Ozon).unwrap()],
+        )
+        .await
+        .unwrap();
+    let facts = repository.load_report_facts(&manifest).await.unwrap();
+    let key = ReportKey {
+        local_date: NaiveDate::from_ymd_opt(2098, 8, 17).unwrap(),
+        kind: ReportKind::Morning,
+        recipient_id: "diana".to_owned(),
+        report_version: 1,
+    };
+    let preview = render_published_preview(
+        &key,
+        "Диана",
+        timestamp("2098-08-17T03:00:00Z"),
+        &manifest,
+        facts,
+    )
+    .unwrap();
+    assert!(preview.bundle.html.contains("Диана"));
+    assert!(preview.bundle.html.contains("N/D"));
+    assert!(preview.bundle.xlsx.starts_with(b"PK"));
+    assert_eq!(preview.receipt.size_bytes, preview.bundle.xlsx.len());
+    assert!(!preview.receipt.persisted);
     assert_eq!(
         writer.persist_batch(&[]).await,
         Err(PostgresCollectorError::InvalidInput)

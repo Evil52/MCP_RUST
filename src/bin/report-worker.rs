@@ -1,7 +1,18 @@
 #![forbid(unsafe_code)]
 
-use anyhow::{Result, bail};
-use mcp_ozon::reporting::service::{ReportWorkerConfig, ReportWorkerMode};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use chrono::{DateTime, NaiveDate, Utc};
+use mcp_ozon::reporting::{
+    ReportKey, ReportKind,
+    preview::render_published_preview,
+    service::{ReportPreviewScope, ReportWorkerConfig, ReportWorkerMode},
+};
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -16,9 +27,6 @@ async fn main() -> Result<()> {
         .init();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let healthcheck = matches!(arguments.as_slice(), [argument] if argument == "healthcheck");
-    if !healthcheck && !arguments.is_empty() {
-        bail!("usage: report-worker [healthcheck]");
-    }
     let config = ReportWorkerConfig::from_lookup(|key| std::env::var(key).ok())?;
     let (outbox, snapshots) = config.connect().await?;
     outbox.verify_runtime_contract().await?;
@@ -27,6 +35,55 @@ async fn main() -> Result<()> {
     if healthcheck {
         tracing::info!(targets = targets.len(), "report source preflight passed");
         return Ok(());
+    }
+    if let [
+        command,
+        audience_id,
+        actor_id,
+        local_date,
+        kind,
+        cutoff,
+        output_dir,
+    ] = arguments.as_slice()
+    {
+        if command != "preview" {
+            return usage();
+        }
+        ensure!(
+            config.mode() == ReportWorkerMode::Disabled && !config.policy().enabled,
+            "manual preview requires disabled delivery mode"
+        );
+        let scope = config.preview_scope(audience_id, actor_id)?;
+        let key = ReportKey {
+            local_date: NaiveDate::parse_from_str(local_date, "%Y-%m-%d")
+                .context("preview date must use YYYY-MM-DD")?,
+            kind: parse_kind(kind)?,
+            recipient_id: scope.actor_id.clone(),
+            report_version: config.policy().version,
+        };
+        let cutoff = DateTime::parse_from_rfc3339(cutoff)
+            .context("preview cutoff must be RFC3339")?
+            .with_timezone(&Utc);
+        let manifest = snapshots
+            .load_manifest(cutoff, scope.accounts.clone())
+            .await?;
+        let facts = snapshots.load_report_facts(&manifest).await?;
+        let preview =
+            render_published_preview(&key, &scope.manager_name, Utc::now(), &manifest, facts)?;
+        let (html_path, xlsx_path) = write_preview(Path::new(output_dir), &scope, &key, &preview)?;
+        tracing::info!(
+            audience_id = scope.audience_id,
+            actor_id = scope.actor_id,
+            html = %html_path.display(),
+            xlsx = %xlsx_path.display(),
+            xlsx_bytes = preview.receipt.size_bytes,
+            sha256 = preview.receipt.artifact.sha256,
+            "manual report preview generated without delivery"
+        );
+        return Ok(());
+    }
+    if !arguments.is_empty() {
+        return usage();
     }
     if config.mode() != ReportWorkerMode::Disabled || config.policy().enabled {
         bail!("report delivery runtime is unavailable");
@@ -37,6 +94,62 @@ async fn main() -> Result<()> {
     );
     shutdown_signal().await;
     Ok(())
+}
+
+fn usage() -> Result<()> {
+    bail!(
+        "usage: report-worker [healthcheck | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
+    )
+}
+
+fn parse_kind(value: &str) -> Result<ReportKind> {
+    match value {
+        "morning" => Ok(ReportKind::Morning),
+        "evening" => Ok(ReportKind::Evening),
+        _ => bail!("preview kind must be morning or evening"),
+    }
+}
+
+fn write_preview(
+    output_dir: &Path,
+    scope: &ReportPreviewScope,
+    key: &ReportKey,
+    preview: &mcp_ozon::reporting::preview::ReportPreview,
+) -> Result<(PathBuf, PathBuf)> {
+    ensure!(
+        output_dir
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_dir()),
+        "preview output directory must already exist"
+    );
+    let kind = match key.kind {
+        ReportKind::Morning => "morning",
+        ReportKind::Evening => "evening",
+    };
+    let stem = format!(
+        "daily-report-{}-{}-{}",
+        scope.actor_id, key.local_date, kind
+    );
+    let html_path = output_dir.join(format!("{stem}.html"));
+    let xlsx_path = output_dir.join(format!("{stem}.xlsx"));
+    write_new(&html_path, preview.bundle.html.as_bytes())?;
+    if let Err(error) = write_new(&xlsx_path, &preview.bundle.xlsx) {
+        let _ = fs::remove_file(&html_path);
+        return Err(error);
+    }
+    Ok((html_path, xlsx_path))
+}
+
+fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("preview output {} cannot be created", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("preview output {} cannot be written", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("preview output {} cannot be synchronized", path.display()))
 }
 
 async fn shutdown_signal() {

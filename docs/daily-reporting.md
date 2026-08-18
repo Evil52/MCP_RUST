@@ -65,6 +65,10 @@ The first disabled-only phase provides:
   account scope and quality from the immutable report key and frozen dataset,
   renders matching HTML/XLSX output and assigns a content SHA-256 plus a stable
   object key; its dry-run inspection performs no filesystem or network I/O;
+- a manual `report-worker preview` path that resolves one manager only through
+  the validated audience policy, loads an exact published cutoff, verifies the
+  requested morning/evening interval, renders both artifacts and writes them
+  with create-new semantics to an existing operator-selected directory;
 - an isolated `report-worker` binary that accepts only a restricted
   `report_worker` PostgreSQL URL, access-registry path and strict report policy;
   it validates both least-privilege database contracts before serving and is
@@ -92,16 +96,30 @@ The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
 writer, bounded fact reader and report dataset are present. A manual, bounded
 Ozon Seller + Performance adapter is available for a policy-scoped canary, but
 automatic marketplace collection and every WB report adapter remain disabled.
-No enabled scheduler process, S3 writer or mail provider is wired. The HTML/XLSX bundle is generated in memory but is not yet
-persisted or connected to the delivery outbox. Consolidated two-period
+No enabled scheduler process, S3 writer or mail provider is wired. Manual
+HTML/XLSX previews can be generated from an already published complete
+four-source manifest, but they are not uploaded, persisted as delivery
+artifacts or connected to the outbox. Consolidated two-period
 catch-up rendering remains fail-closed until it has an explicit two-section
 template rather than silently presenting one interval as two reports.
 Consequently this phase cannot send email and cannot affect a
 marketplace. Search-position collection remains disabled.
 
-`report-worker` currently supports `healthcheck` and disabled idle operation
-only. It deliberately rejects enabled delivery rather than creating a report
-that cannot be persisted and reconciled.
+`report-worker` supports `healthcheck`, disabled idle operation and the
+operator-only command below. The selected actor must belong to the selected
+audience; its account scope comes from the validated policy and cannot be
+supplied on the command line. Existing output files are never overwritten.
+
+```text
+report-worker preview <audience-id> <actor-id> <YYYY-MM-DD> \
+  <morning|evening> <cutoff-rfc3339> <existing-output-dir>
+```
+
+The command deliberately requires delivery mode and policy to remain disabled.
+It does not read recipient email values, send mail, call a marketplace or
+create an outbox occurrence. The hardened production container has a read-only
+filesystem and no artifact mount; run this preview from an operator-controlled
+host/runtime until object storage is implemented.
 
 The persistence layer transactionally stores report occurrences, delivery
 coverage and attempts. Its unique occurrence key is
@@ -113,10 +131,11 @@ an ambiguous provider result is never retried automatically.
 
 ## Planned pilot
 
-1. Validate the manual Ozon four-source snapshot and add the corresponding WB
-   read-only collector.
-2. Add the scheduler/runtime around the persisted PostgreSQL outbox.
-3. Run dry mode for Diana and Vahrusheva/Torsunova with delivery disabled.
+1. Validate a manual Ozon four-source preview for Diana and add the
+   corresponding WB read-only collector.
+2. Add immutable object storage and connect the validated bundle to the outbox.
+3. Add the scheduler/runtime around the persisted PostgreSQL outbox and run dry
+   mode for Diana and Vahrusheva/Torsunova with delivery disabled.
 4. Connect S3-compatible artifact storage and one service mailbox.
 5. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
 6. Reconcile figures for five to seven days before enabling other managers.
