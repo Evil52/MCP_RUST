@@ -28,6 +28,19 @@ use super::{
     snapshot::{Marketplace, SnapshotStatus},
 };
 
+/// How many times a locally-refused page request is re-offered.
+///
+/// `Overloaded` is the one Ozon error that never reached the marketplace:
+/// `OzonClient` returns it from permit acquisition, before anything is sent,
+/// and suppresses it in favour of the causal error once an upstream attempt
+/// has been made. Retrying it therefore cannot duplicate a request.
+///
+/// Without this, one transient burst of local contention aborted an entire
+/// account's collection and discarded every page already gathered — the whole
+/// run has to be re-done because snapshots are published atomically.
+const OVERLOAD_RETRY_ATTEMPTS: usize = 4;
+const OVERLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 const MAX_SALES_PAGES: usize = 25;
 // At 100 products/page this still accommodates 10,000 products, while the
 // manual dry-run's absolute deadline bounds the total request time.
@@ -119,15 +132,50 @@ impl OzonReportTransport for OzonClientReportTransport {
         &'a self,
         request: OzonReportRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, OzonReportSourceError>> + Send + 'a>> {
+        let path = request.path;
         Box::pin(async move {
-            self.client
-                .post(&self.store, request.path, request.payload)
-                .await
-                // Keep only the stable, non-sensitive classification. In
-                // particular, never retain Ozon's error body in report
-                // collection diagnostics.
-                .map_err(|error| OzonReportSourceError::Upstream(error.kind()))
+            retry_local_overload(path, || async {
+                self.client
+                    .post(&self.store, path, request.payload.clone())
+                    .await
+                    // Keep only the stable, non-sensitive classification. In
+                    // particular, never retain Ozon's error body in report
+                    // collection diagnostics.
+                    .map_err(|error| error.kind())
+            })
+            .await
         })
+    }
+}
+
+/// Re-offers a page request that local admission control refused.
+///
+/// Extracted from the transport so the policy is testable without saturating
+/// a real client's semaphores, which are private to `OzonClient` for good
+/// reason.
+async fn retry_local_overload<F, Fut>(
+    path: &'static str,
+    mut attempt_once: F,
+) -> Result<Value, OzonReportSourceError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Value, OzonErrorKind>>,
+{
+    let mut attempt = 1;
+    loop {
+        match attempt_once().await {
+            Ok(value) => return Ok(value),
+            Err(OzonErrorKind::Overloaded) if attempt < OVERLOAD_RETRY_ATTEMPTS => {
+                tracing::debug!(
+                    endpoint = path,
+                    attempt,
+                    "report collection deferred by local admission control"
+                );
+                attempt += 1;
+                tokio::time::sleep(OVERLOAD_RETRY_DELAY).await;
+            }
+            Err(kind) => return Err(OzonReportSourceError::Upstream(kind)),
+        }
     }
 }
 
@@ -478,6 +526,61 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A local admission refusal never reached Ozon, so re-offering the page
+    /// cannot duplicate a marketplace request. Before this, one transient
+    /// burst of contention aborted the whole account run and discarded every
+    /// page already collected, because snapshots publish atomically.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_local_overload_does_not_discard_the_run() {
+        let calls = std::cell::Cell::new(0_usize);
+        let value = retry_local_overload("/v3/posting/fbo/list", || async {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(OzonErrorKind::Overloaded)
+            } else {
+                Ok(serde_json::json!({"result": "ok"}))
+            }
+        })
+        .await
+        .expect("a transient local refusal must not fail the page");
+        assert_eq!(value["result"], "ok");
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sustained_local_overload_still_fails_the_page() {
+        let calls = std::cell::Cell::new(0_usize);
+        let error = retry_local_overload("/v3/posting/fbo/list", || async {
+            calls.set(calls.get() + 1);
+            Err(OzonErrorKind::Overloaded)
+        })
+        .await
+        .expect_err("the retry budget is bounded");
+        assert!(matches!(
+            error,
+            OzonReportSourceError::Upstream(OzonErrorKind::Overloaded)
+        ));
+        assert_eq!(calls.get(), OVERLOAD_RETRY_ATTEMPTS);
+    }
+
+    /// Only the local refusal is retried. An upstream failure has already
+    /// reached Ozon, so repeating it would be a second marketplace request.
+    #[tokio::test(start_paused = true)]
+    async fn an_upstream_failure_is_never_retried() {
+        let calls = std::cell::Cell::new(0_usize);
+        let error = retry_local_overload("/v3/posting/fbo/list", || async {
+            calls.set(calls.get() + 1);
+            Err(OzonErrorKind::RateLimited)
+        })
+        .await
+        .expect_err("an upstream failure is surfaced");
+        assert!(matches!(
+            error,
+            OzonReportSourceError::Upstream(OzonErrorKind::RateLimited)
+        ));
+        assert_eq!(calls.get(), 1);
+    }
 
     struct FixtureTransport(Mutex<VecDeque<Result<Value, OzonReportSourceError>>>);
 
