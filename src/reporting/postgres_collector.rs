@@ -3,8 +3,9 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
-use tokio_postgres::{Client, Config, NoTls, Transaction};
+use tokio_postgres::{Client, Config, Transaction};
+
+use crate::postgres::SupervisedClient;
 
 use super::snapshot::{Marketplace, SnapshotDescriptor, SnapshotSource, SnapshotStatus};
 
@@ -17,8 +18,10 @@ pub struct CollectedSalesFact {
     pub sku: u64,
     pub ordered_units: u64,
     pub operational_gmv_minor: u64,
-    pub cancelled_units: u64,
-    pub returned_units: u64,
+    /// `None` means the upstream Seller account did not grant this metric.
+    pub cancelled_units: Option<u64>,
+    /// `None` means the upstream Seller account did not grant this metric.
+    pub returned_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,27 +160,35 @@ pub enum PostgresCollectorError {
 }
 
 pub struct PostgresSnapshotWriter {
-    client: Mutex<Client>,
+    client: SupervisedClient,
 }
 
 impl PostgresSnapshotWriter {
     pub async fn connect(config: &Config) -> Result<Self, PostgresCollectorError> {
-        let (client, connection) = config
-            .connect(NoTls)
+        let client = SupervisedClient::connect(config, "mcp-ozon-report-collector")
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
-        std::mem::drop(tokio::spawn(connection));
-        Ok(Self::from_client(client))
+        Ok(Self { client })
     }
 
     pub fn from_client(client: Client) -> Self {
         Self {
-            client: Mutex::new(client),
+            client: SupervisedClient::preconnected(client, "mcp-ozon-report-collector"),
         }
     }
 
     pub async fn verify_runtime_contract(&self) -> Result<(), PostgresCollectorError> {
-        let client = self.client.lock().await;
+        // Checked before the guard is taken: the session mutex is not
+        // reentrant, and this helper acquires it in its own right.
+        self.client
+            .verify_session_bounds()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
         let row = client
             .query_one(
                 "SELECT current_user = 'report_collector' \
@@ -229,7 +240,11 @@ impl PostgresSnapshotWriter {
         if snapshots.is_empty() {
             return Err(PostgresCollectorError::InvalidInput);
         }
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
         let transaction = client
             .transaction()
             .await
@@ -327,6 +342,8 @@ async fn insert_facts(
     match facts {
         CollectedFacts::Sales(facts) => {
             for fact in facts {
+                let cancelled_units = fact.cancelled_units.map(as_i32).transpose()?;
+                let returned_units = fact.returned_units.map(as_i32).transpose()?;
                 transaction
                     .execute(
                         "INSERT INTO daily_reporting.sales_facts \
@@ -339,8 +356,8 @@ async fn insert_facts(
                             &as_i64(fact.sku)?,
                             &as_i32(fact.ordered_units)?,
                             &as_i64(fact.operational_gmv_minor)?,
-                            &as_i32(fact.cancelled_units)?,
-                            &as_i32(fact.returned_units)?,
+                            &cancelled_units,
+                            &returned_units,
                         ],
                     )
                     .await
@@ -421,8 +438,8 @@ fn validate_facts(facts: &CollectedFacts) -> Result<(), PostgresCollectorError> 
                 fact.sku > 0
                     && fits_i32(fact.ordered_units)
                     && fits_i64(fact.operational_gmv_minor)
-                    && fits_i32(fact.cancelled_units)
-                    && fits_i32(fact.returned_units)
+                    && fact.cancelled_units.is_none_or(fits_i32)
+                    && fact.returned_units.is_none_or(fits_i32)
             },
         ),
         CollectedFacts::Advertising(facts) => ensure_unique(
@@ -546,8 +563,8 @@ mod tests {
             sku: 1,
             ordered_units: 2,
             operational_gmv_minor: 300,
-            cancelled_units: 0,
-            returned_units: 0,
+            cancelled_units: Some(0),
+            returned_units: Some(0),
         }
     }
 

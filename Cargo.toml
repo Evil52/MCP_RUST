@@ -37,6 +37,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 http-body = "1"
@@ -65,7 +66,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-base64 = "0.23"
 flate2 = "1"
 tower = { version = "0.5", features = ["util"] }
 

@@ -34,6 +34,18 @@ The first disabled-only phase provides:
 - a separate disabled `report-collector` runtime that validates the exact pilot
   account/source plan and the `report_collector` database role without loading
   marketplace credentials or making network requests; and
+- an explicit operator-only `ozon-dry-run` command which loads only the
+  policy-scoped Ozon Seller and Performance read credentials, reaches the two
+  fixed API hosts through the deployment-owned CONNECT proxy, normalizes one
+  completed EKB business day and publishes all four sources atomically; and
+- an explicit operator-only `wb-dry-run` command which loads only one
+  policy-scoped Personal WB token, collects the documented daily sales-funnel,
+  current warehouse-stock, current price and eligible-campaign statistics
+  endpoints through the exact-host CONNECT proxy, and publishes all four
+  normalized sources atomically; and
+- campaign-level Ozon Performance daily rows stored with the explicit
+  unavailable-SKU sentinel and rendered as `N/D`, never as a fabricated
+  product attribution; and
 - a bounded PostgreSQL reader that loads only published source descriptors and
   revalidates the exact four-source manifest before report generation;
 - a bounded published-fact reader that selects rows only by the frozen
@@ -58,14 +70,28 @@ The first disabled-only phase provides:
   account scope and quality from the immutable report key and frozen dataset,
   renders matching HTML/XLSX output and assigns a content SHA-256 plus a stable
   object key; its dry-run inspection performs no filesystem or network I/O;
+- a manual `report-worker preview` path that resolves one manager only through
+  the validated audience policy, loads an exact published cutoff, verifies the
+  requested morning/evening interval, renders both artifacts and writes them
+  with create-new semantics to an existing operator-selected directory;
+- a local immutable artifact-store boundary that persists the deterministic
+  XLSX and HTML siblings under the stable report identity, verifies content
+  hashes on every retry, refuses path traversal and symbolic links, and never
+  overwrites different bytes; and
+- an idempotent publication operation that validates an artifact against the
+  exact outbox recipient/date/version/coverage, commits files before changing
+  the batch to `ready`, and safely reuses the same files after an ambiguous
+  database response;
 - an isolated `report-worker` binary that accepts only a restricted
   `report_worker` PostgreSQL URL, access-registry path and strict report policy;
   it validates both least-privilege database contracts before serving and is
   disabled by default;
 - hardened `report-collector` and `report-worker` images in
   `compose.position.yaml`; both run as the established non-root UID, have no
-  published ports, mount only registry/policy metadata read-only and attach
-  only to the internal database network while disabled;
+  published ports, mount registry/policy metadata read-only and attach only to
+  the internal database network while disabled; only `report-worker` receives
+  a dedicated writable artifact volume, and its health check proves that the
+  configured root can be written without retaining probe data;
 - an idempotent scheduling kernel that reserves separate morning/evening
   outbox identities per audience, treats any existing batch state as covered,
   and permits a missed evening plan after a separate morning plan; and
@@ -82,18 +108,77 @@ tokens and actual addresses must not be committed.
 ## Not implemented yet
 
 The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
-writer, bounded fact reader and report dataset are present, but no marketplace
-report collector adapter is wired yet. No enabled scheduler process, marketplace snapshot job, S3 writer or mail
-provider is wired. The HTML/XLSX bundle is generated in memory but is not yet
-persisted or connected to the delivery outbox. Consolidated two-period
+writer, bounded fact reader and report dataset are present. Manual bounded Ozon
+and WB adapters are available for policy-scoped canaries, but automatic
+marketplace collection remains disabled.
+No scheduler is enabled in the shipped Compose configuration, and no S3 writer
+or mail provider is wired. A provider-independent email envelope now validates
+one server-resolved sender and recipient, one exact claimed report scope, and
+the bounded HTML/XLSX artifact without reading environment variables or using
+the network. An opt-in `REPORT_WORKER_MODE=dry_run` runtime ticks
+once per minute, plans due 08:00/17:00 EKB occurrences and retries only
+single-section `planned`/`generating` artifact work inside its delivery window.
+It never claims a ready delivery. The isolated
+production artifact volume is mounted and health-checked. Manual
+HTML/XLSX previews can be generated from an already published complete
+four-source manifest. The immutable local store and outbox-publication
+primitive can now be invoked explicitly for one already-planned outbox batch
+while delivery remains disabled. Consolidated two-period
 catch-up rendering remains fail-closed until it has an explicit two-section
 template rather than silently presenting one interval as two reports.
 Consequently this phase cannot send email and cannot affect a
 marketplace. Search-position collection remains disabled.
 
-`report-worker` currently supports `healthcheck` and disabled idle operation
-only. It deliberately rejects enabled delivery rather than creating a report
-that cannot be persisted and reconciled.
+`report-worker` supports `healthcheck`, disabled idle operation and the
+operator-only command below. The selected actor must belong to the selected
+audience; its account scope comes from the validated policy and cannot be
+supplied on the command line. Existing output files are never overwritten.
+
+```text
+report-worker preview <audience-id> <actor-id> <YYYY-MM-DD> \
+  <morning|evening> <cutoff-rfc3339> <existing-output-dir>
+
+report-worker generate <batch-id>
+```
+
+Both commands deliberately require delivery mode and policy to remain
+disabled. Neither reads recipient email values, sends mail or calls a
+marketplace. `preview` accepts an operator-selected manager and output path but
+never creates or changes an outbox occurrence. `generate` accepts only a
+positive batch ID: recipient, manager/account scope, report date, kind and
+cutoff are loaded from PostgreSQL plus the validated policy. It renders with
+the immutable batch creation timestamp, commits both files to the dedicated
+artifact volume and only then marks that exact batch ready. Repeating it can
+only reproduce or reuse the same bytes. The hardened production container has
+a read-only root filesystem plus one dedicated artifact volume.
+
+The separate collector has two explicit one-account canary commands:
+
+```text
+REPORT_COLLECTOR_MODE=ozon_dry_run report-collector \
+  ozon-dry-run <account-id> <completed-YYYY-MM-DD>
+
+REPORT_COLLECTOR_MODE=wb_dry_run report-collector \
+  wb-dry-run <account-id> <completed-YYYY-MM-DD>
+```
+
+The account must already belong to the validated disabled report policy. Ozon
+mode resolves only that account's Seller and Performance bindings; WB mode
+resolves only that account's Personal token. Secret values must be injected by
+the runtime under the environment-variable names from the access registry,
+never placed in a command line or committed file. Each invocation is bounded
+to ten minutes and publishes the exact four-source snapshot set in one database
+transaction. A timeout or malformed/incomplete source publishes nothing. The
+shipped Compose mode remains `disabled`, so neither command runs on a schedule.
+
+Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
+enabled validated policy. The shipped Compose value remains `disabled`. Every
+tick is bounded to 16 generation candidates; missed timer ticks are skipped,
+and an unavailable or incomplete snapshot leaves the batch unmodified for a
+later tick. Recovery after a server restart therefore continues within the
+existing 14:00/23:00 EKB safety deadlines without creating duplicate report
+identities. Email remains impossible because no provider or recipient-value
+loader exists.
 
 The persistence layer transactionally stores report occurrences, delivery
 coverage and attempts. Its unique occurrence key is
@@ -105,12 +190,13 @@ an ambiguous provider result is never retried automatically.
 
 ## Planned pilot
 
-1. Wire read-only marketplace collectors into the normalized snapshot contract.
-2. Add the scheduler/runtime around the persisted PostgreSQL outbox.
-3. Run dry mode for Diana and Vahrusheva/Torsunova with delivery disabled.
-4. Connect S3-compatible artifact storage and one service mailbox.
-5. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
-6. Reconcile figures for five to seven days before enabling other managers.
+1. Validate a manual Ozon four-source preview for Diana and add the
+   corresponding manual WB four-source preview for Vahrusheva/Torsunova.
+2. Run the opt-in scheduler dry mode for Diana and Vahrusheva/Torsunova after
+   both marketplace collectors publish complete manifests.
+3. Connect S3-compatible artifact storage and one service mailbox.
+4. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
+5. Reconcile figures for five to seven days before enabling other managers.
 
 ChatGPT remains the interactive analytics interface. Scheduled collection,
 calculation, artifact generation and delivery must remain server-side so they

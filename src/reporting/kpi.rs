@@ -2,8 +2,10 @@
 pub struct SalesMetricInput {
     pub ordered_units: u64,
     pub operational_gmv_minor: u64,
-    pub cancelled_units: u64,
-    pub returned_units: u64,
+    /// `None` means this source did not provide the metric; it is never a zero.
+    pub cancelled_units: Option<u64>,
+    /// `None` means this source did not provide the metric; it is never a zero.
+    pub returned_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,8 +28,8 @@ pub struct BasisPoints(pub u64);
 pub struct KpiSummary {
     pub ordered_units: u64,
     pub operational_gmv_minor: u64,
-    pub cancelled_units: u64,
-    pub returned_units: u64,
+    pub cancelled_units: Option<u64>,
+    pub returned_units: Option<u64>,
     pub ad_impressions: u64,
     pub ad_clicks: u64,
     pub ad_spend_minor: u64,
@@ -55,8 +57,8 @@ pub fn calculate_kpis(
     let mut summary = KpiSummary {
         ordered_units: 0,
         operational_gmv_minor: 0,
-        cancelled_units: 0,
-        returned_units: 0,
+        cancelled_units: Some(0),
+        returned_units: Some(0),
         ad_impressions: 0,
         ad_clicks: 0,
         ad_spend_minor: 0,
@@ -73,8 +75,10 @@ pub fn calculate_kpis(
         summary.ordered_units = checked_sum(summary.ordered_units, input.ordered_units)?;
         summary.operational_gmv_minor =
             checked_sum(summary.operational_gmv_minor, input.operational_gmv_minor)?;
-        summary.cancelled_units = checked_sum(summary.cancelled_units, input.cancelled_units)?;
-        summary.returned_units = checked_sum(summary.returned_units, input.returned_units)?;
+        summary.cancelled_units =
+            checked_optional_sum(summary.cancelled_units, input.cancelled_units)?;
+        summary.returned_units =
+            checked_optional_sum(summary.returned_units, input.returned_units)?;
     }
     for input in advertising {
         if input.clicks > input.impressions || input.attributed_orders > input.clicks {
@@ -101,6 +105,13 @@ pub fn calculate_kpis(
 
 fn checked_sum(total: u64, value: u64) -> Result<u64, KpiError> {
     total.checked_add(value).ok_or(KpiError::Overflow)
+}
+
+fn checked_optional_sum(total: Option<u64>, value: Option<u64>) -> Result<Option<u64>, KpiError> {
+    match (total, value) {
+        (Some(total), Some(value)) => checked_sum(total, value).map(Some),
+        _ => Ok(None),
+    }
 }
 
 fn percentage(numerator: u64, denominator: u64) -> Result<Option<BasisPoints>, KpiError> {
@@ -132,14 +143,14 @@ mod tests {
                 SalesMetricInput {
                     ordered_units: 5,
                     operational_gmv_minor: 100_000,
-                    cancelled_units: 1,
-                    returned_units: 0,
+                    cancelled_units: Some(1),
+                    returned_units: Some(0),
                 },
                 SalesMetricInput {
                     ordered_units: 2,
                     operational_gmv_minor: 45_000,
-                    cancelled_units: 0,
-                    returned_units: 1,
+                    cancelled_units: Some(0),
+                    returned_units: Some(1),
                 },
             ],
             &[AdvertisingMetricInput {
@@ -153,8 +164,8 @@ mod tests {
         .unwrap();
         assert_eq!(summary.ordered_units, 7);
         assert_eq!(summary.operational_gmv_minor, 145_000);
-        assert_eq!(summary.cancelled_units, 1);
-        assert_eq!(summary.returned_units, 1);
+        assert_eq!(summary.cancelled_units, Some(1));
+        assert_eq!(summary.returned_units, Some(1));
         assert_eq!(summary.ad_impressions, 3);
         assert_eq!(summary.ad_clicks, 2);
         assert_eq!(summary.ad_spend_minor, 101);
@@ -188,6 +199,31 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_sales_metrics_remain_unavailable_in_the_summary() {
+        let summary = calculate_kpis(
+            &[
+                SalesMetricInput {
+                    ordered_units: 3,
+                    operational_gmv_minor: 10_000,
+                    cancelled_units: None,
+                    returned_units: Some(1),
+                },
+                SalesMetricInput {
+                    ordered_units: 2,
+                    operational_gmv_minor: 5_000,
+                    cancelled_units: Some(0),
+                    returned_units: None,
+                },
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(summary.ordered_units, 5);
+        assert_eq!(summary.cancelled_units, None);
+        assert_eq!(summary.returned_units, None);
+    }
+
+    #[test]
     fn impossible_counters_and_every_aggregate_overflow_fail_closed() {
         for input in [
             AdvertisingMetricInput {
@@ -214,33 +250,33 @@ mod tests {
         let maximal_sale = SalesMetricInput {
             ordered_units: u64::MAX,
             operational_gmv_minor: u64::MAX,
-            cancelled_units: u64::MAX,
-            returned_units: u64::MAX,
+            cancelled_units: Some(u64::MAX),
+            returned_units: Some(u64::MAX),
         };
         for second in [
             SalesMetricInput {
                 ordered_units: 1,
                 operational_gmv_minor: 0,
-                cancelled_units: 0,
-                returned_units: 0,
+                cancelled_units: Some(0),
+                returned_units: Some(0),
             },
             SalesMetricInput {
                 ordered_units: 0,
                 operational_gmv_minor: 1,
-                cancelled_units: 0,
-                returned_units: 0,
+                cancelled_units: Some(0),
+                returned_units: Some(0),
             },
             SalesMetricInput {
                 ordered_units: 0,
                 operational_gmv_minor: 0,
-                cancelled_units: 1,
-                returned_units: 0,
+                cancelled_units: Some(1),
+                returned_units: Some(0),
             },
             SalesMetricInput {
                 ordered_units: 0,
                 operational_gmv_minor: 0,
-                cancelled_units: 0,
-                returned_units: 1,
+                cancelled_units: Some(0),
+                returned_units: Some(1),
             },
         ] {
             assert_eq!(

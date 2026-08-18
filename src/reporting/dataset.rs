@@ -17,8 +17,8 @@ pub struct SalesReportRow {
     pub sku: String,
     pub ordered_units: u64,
     pub operational_gmv_minor: u64,
-    pub cancelled_units: u64,
-    pub returned_units: u64,
+    pub cancelled_units: Option<u64>,
+    pub returned_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub struct InventoryReportRow {
     pub account_id: String,
     pub sku: String,
     pub sellable_stock: u64,
+    pub stock_observed: bool,
     pub price_minor: Option<u64>,
     pub observed_at: DateTime<Utc>,
 }
@@ -114,13 +115,16 @@ impl ReportDataset {
 
         let mut sales = BTreeMap::new();
         for fact in facts.sales {
-            let row = sales
-                .entry((fact.account_id, fact.sku))
-                .or_insert((0u64, 0u64, 0u64, 0u64));
+            let row = sales.entry((fact.account_id, fact.sku)).or_insert((
+                0u64,
+                0u64,
+                Some(0u64),
+                Some(0u64),
+            ));
             row.0 = add(row.0, fact.ordered_units)?;
             row.1 = add(row.1, fact.operational_gmv_minor)?;
-            row.2 = add(row.2, fact.cancelled_units)?;
-            row.3 = add(row.3, fact.returned_units)?;
+            row.2 = add_available(row.2, fact.cancelled_units)?;
+            row.3 = add_available(row.3, fact.returned_units)?;
         }
         let sales = sales
             .into_iter()
@@ -156,7 +160,14 @@ impl ReportDataset {
                 )| AdvertisingReportRow {
                     account_id,
                     campaign_id: campaign_id.to_string(),
-                    sku: sku.to_string(),
+                    // Ozon Performance daily statistics is campaign-level.
+                    // Persistence uses zero as an explicit unavailable-SKU
+                    // sentinel; never render it as if product 0 existed.
+                    sku: if sku == 0 {
+                        "N/D".to_owned()
+                    } else {
+                        sku.to_string()
+                    },
                     impressions,
                     clicks,
                     spend_minor: spend,
@@ -172,15 +183,18 @@ impl ReportDataset {
                 0u64,
                 None,
                 fact.observed_at,
+                true,
             ));
             row.0 = add(row.0, fact.sellable_units)?;
             row.2 = row.2.max(fact.observed_at);
+            row.3 = true;
         }
         for fact in facts.prices {
             let row = inventory.entry((fact.account_id, fact.sku)).or_insert((
                 0u64,
                 None,
                 fact.observed_at,
+                false,
             ));
             if row.1.replace(fact.price_minor).is_some() {
                 return Err(DatasetError::InvalidFacts);
@@ -190,12 +204,15 @@ impl ReportDataset {
         let inventory = inventory
             .into_iter()
             .map(
-                |((account_id, sku), (stock, price, observed_at))| InventoryReportRow {
-                    account_id,
-                    sku: sku.to_string(),
-                    sellable_stock: stock,
-                    price_minor: price,
-                    observed_at,
+                |((account_id, sku), (stock, price, observed_at, stock_observed))| {
+                    InventoryReportRow {
+                        account_id,
+                        sku: sku.to_string(),
+                        sellable_stock: stock,
+                        stock_observed,
+                        price_minor: price,
+                        observed_at,
+                    }
                 },
             )
             .collect();
@@ -328,6 +345,13 @@ fn add(left: u64, right: u64) -> Result<u64, DatasetError> {
     left.checked_add(right).ok_or(DatasetError::Overflow)
 }
 
+fn add_available(left: Option<u64>, right: Option<u64>) -> Result<Option<u64>, DatasetError> {
+    match (left, right) {
+        (Some(left), Some(right)) => add(left, right).map(Some),
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone};
@@ -404,8 +428,8 @@ mod tests {
                 sku: 10,
                 ordered_units: 2,
                 operational_gmv_minor: 20_000,
-                cancelled_units: 1,
-                returned_units: 0,
+                cancelled_units: Some(1),
+                returned_units: Some(0),
             }],
             advertising: vec![PublishedAdvertisingFact {
                 account_id: account.to_owned(),
@@ -441,8 +465,8 @@ mod tests {
         input.sales.push(PublishedSalesFact {
             ordered_units: 3,
             operational_gmv_minor: 30_000,
-            cancelled_units: 0,
-            returned_units: 1,
+            cancelled_units: Some(0),
+            returned_units: Some(1),
             ..input.sales[0].clone()
         });
         input.stocks.push(PublishedStockFact {
@@ -457,6 +481,7 @@ mod tests {
         assert_eq!(dataset.kpis.ordered_units, 5);
         assert_eq!(dataset.sales[0].operational_gmv_minor, 50_000);
         assert_eq!(dataset.inventory[0].sellable_stock, 7);
+        assert!(dataset.inventory[0].stock_observed);
         assert_eq!(dataset.inventory[0].price_minor, Some(12_345));
         assert_eq!(
             dataset.inventory[0].observed_at,
@@ -466,6 +491,28 @@ mod tests {
         assert_eq!(dataset.advertising_details()[0].campaign_id, "20");
         assert_eq!(dataset.inventory_details()[0].sellable_stock, 7);
         assert_eq!(dataset.quality_details().len(), 4);
+    }
+
+    #[test]
+    fn campaign_level_advertising_never_claims_a_product_sku() {
+        let mut input = facts("store");
+        input.advertising[0].sku = 0;
+        let dataset = ReportDataset::from_published(&manifest(&["store"]), input).unwrap();
+        assert_eq!(dataset.advertising[0].sku, "N/D");
+        assert_eq!(dataset.advertising_details()[0].sku, "N/D");
+        assert_eq!(add_available(None, Some(1)), Ok(None));
+    }
+
+    #[test]
+    fn price_only_inventory_does_not_claim_a_stock_observation() {
+        let mut input = facts("store");
+        input.stocks.clear();
+        let dataset =
+            ReportDataset::from_published(&manifest_with_counts(&["store"], [1, 1, 0, 1]), input)
+                .unwrap();
+        assert_eq!(dataset.inventory.len(), 1);
+        assert!(!dataset.inventory[0].stock_observed);
+        assert_eq!(dataset.inventory[0].sellable_stock, 0);
     }
 
     #[test]

@@ -9,12 +9,14 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
 use thiserror::Error;
 
+pub mod artifact_store;
 pub mod bundle;
 pub mod collector_plan;
 pub mod collector_service;
 pub mod dataset;
 pub mod html;
 pub mod kpi;
+pub mod mail;
 pub mod outbox;
 pub mod ozon_adapter;
 pub mod ozon_source;
@@ -22,10 +24,13 @@ pub mod policy;
 pub mod postgres_collector;
 pub mod postgres_outbox;
 pub mod postgres_snapshot;
+pub mod preview;
 pub mod rules;
 pub mod scheduler;
 pub mod service;
 pub mod snapshot;
+pub mod wb_adapter;
+pub mod wb_source;
 pub mod xlsx;
 
 const YEKATERINBURG_OFFSET_SECONDS: i32 = 5 * 60 * 60;

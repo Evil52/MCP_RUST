@@ -3,6 +3,7 @@
 !Cargo.toml
 !Cargo.lock
 !Dockerfile
+!Dockerfile.ozon-egress
 
 !src/
 !src/**
@@ -18,3 +19,8 @@
 
 !config/
 !config/access.example.json
+
+# The restricted reporting egress image needs only its static allowlist.
+!position-monitor/
+!position-monitor/ozon-egress/
+!position-monitor/ozon-egress/squid.conf

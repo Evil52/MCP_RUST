@@ -3211,73 +3211,8 @@ impl OzonMcp {
         identity: RequestIdentity,
         Parameters(input): Parameters<SupplyOrderListInput>,
     ) -> Result<Json<OzonResult>, String> {
-        validate_count("states", input.states.len(), 0, MAX_SUPPLY_ORDER_STATES)?;
-        if input.states.iter().collect::<BTreeSet<_>>().len() != input.states.len() {
-            return Err("states должен содержать уникальные значения".to_owned());
-        }
-        validate_count(
-            "dropoff_warehouse_ids",
-            input.dropoff_warehouse_ids.len(),
-            0,
-            MAX_SUPPLY_ORDER_DROPOFF_WAREHOUSES,
-        )?;
-        validate_unique_ozon_ids("dropoff_warehouse_ids", &input.dropoff_warehouse_ids)?;
-        if let Some(search) = input.order_number_search.as_deref() {
-            validate_non_blank("order_number_search", search)?;
-            let length = search.chars().count();
-            if !(3..=MAX_IDENTIFIER_CHARS).contains(&length) {
-                return Err(format!(
-                    "order_number_search должен содержать от 3 до {MAX_IDENTIFIER_CHARS} символов"
-                ));
-            }
-        }
-        if let Some(last_id) = input.last_id.as_deref() {
-            validate_max_chars("last_id", last_id, MAX_OPAQUE_TOKEN_CHARS)?;
-        }
-        validate_limit(input.limit, 100)?;
-
-        let mut filter = serde_json::Map::from_iter([("states".to_owned(), json!(input.states))]);
-        if !input.dropoff_warehouse_ids.is_empty() {
-            filter.insert(
-                "dropoff_warehouse_ids".to_owned(),
-                json!(input.dropoff_warehouse_ids),
-            );
-        }
-        if let Some(search) = input.order_number_search {
-            filter.insert("order_number_search".to_owned(), json!(search));
-        }
-        if let Some(range) = input.timeslot_from_range {
-            let from = range
-                .from
-                .as_deref()
-                .map(|value| validate_rfc3339("timeslot_from_range.from", value))
-                .transpose()?;
-            let to = range
-                .to
-                .as_deref()
-                .map(|value| validate_rfc3339("timeslot_from_range.to", value))
-                .transpose()?;
-            if from.zip(to).is_some_and(|(from, to)| from > to) {
-                return Err(
-                    "timeslot_from_range.to не может быть раньше timeslot_from_range.from"
-                        .to_owned(),
-                );
-            }
-            let mut range_payload = serde_json::Map::new();
-            if let Some(from) = range.from {
-                range_payload.insert("from".to_owned(), json!(from));
-            }
-            if let Some(to) = range.to {
-                range_payload.insert("to".to_owned(), json!(to));
-            }
-            if let Some(filter_type) = range.timeslot_filter_type {
-                range_payload.insert("timeslot_filter_type".to_owned(), json!(filter_type));
-            }
-            filter.insert(
-                "timeslot_from_range".to_owned(),
-                Value::Object(range_payload),
-            );
-        }
+        validate_supply_order_list_input(&input)?;
+        let filter = build_supply_order_filter(&input);
 
         self.request(
             &identity,
@@ -4013,6 +3948,99 @@ fn validate_rfc3339(
     validate_max_chars(field, value, 64)?;
     chrono::DateTime::parse_from_rfc3339(value)
         .map_err(|_| format!("{field} должен иметь формат RFC3339"))
+}
+
+fn validate_supply_order_list_input(input: &SupplyOrderListInput) -> Result<(), String> {
+    validate_count("states", input.states.len(), 0, MAX_SUPPLY_ORDER_STATES)?;
+    if input.states.iter().collect::<BTreeSet<_>>().len() != input.states.len() {
+        return Err("states должен содержать уникальные значения".to_owned());
+    }
+    validate_count(
+        "dropoff_warehouse_ids",
+        input.dropoff_warehouse_ids.len(),
+        0,
+        MAX_SUPPLY_ORDER_DROPOFF_WAREHOUSES,
+    )?;
+    validate_unique_ozon_ids("dropoff_warehouse_ids", &input.dropoff_warehouse_ids)?;
+    validate_supply_order_search(input.order_number_search.as_deref())?;
+    if let Some(last_id) = input.last_id.as_deref() {
+        validate_max_chars("last_id", last_id, MAX_OPAQUE_TOKEN_CHARS)?;
+    }
+    validate_supply_order_timeslot(input.timeslot_from_range.as_ref())?;
+    validate_limit(input.limit, 100)
+}
+
+fn validate_supply_order_search(search: Option<&str>) -> Result<(), String> {
+    let Some(search) = search else {
+        return Ok(());
+    };
+    validate_non_blank("order_number_search", search)?;
+    if !(3..=MAX_IDENTIFIER_CHARS).contains(&search.chars().count()) {
+        return Err(format!(
+            "order_number_search должен содержать от 3 до {MAX_IDENTIFIER_CHARS} символов"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_supply_order_timeslot(
+    range: Option<&SupplyOrderTimeslotRangeInput>,
+) -> Result<(), String> {
+    let Some(range) = range else {
+        return Ok(());
+    };
+    let from = range
+        .from
+        .as_deref()
+        .map(|value| validate_rfc3339("timeslot_from_range.from", value))
+        .transpose()?;
+    let to = range
+        .to
+        .as_deref()
+        .map(|value| validate_rfc3339("timeslot_from_range.to", value))
+        .transpose()?;
+    if from.zip(to).is_some_and(|(from, to)| from > to) {
+        return Err(
+            "timeslot_from_range.to не может быть раньше timeslot_from_range.from".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn build_supply_order_filter(input: &SupplyOrderListInput) -> serde_json::Map<String, Value> {
+    let mut filter = serde_json::Map::from_iter([("states".to_owned(), json!(&input.states))]);
+    if !input.dropoff_warehouse_ids.is_empty() {
+        filter.insert(
+            "dropoff_warehouse_ids".to_owned(),
+            json!(&input.dropoff_warehouse_ids),
+        );
+    }
+    if let Some(search) = input.order_number_search.as_deref() {
+        filter.insert("order_number_search".to_owned(), json!(search));
+    }
+    if let Some(range) = input.timeslot_from_range.as_ref() {
+        filter.insert(
+            "timeslot_from_range".to_owned(),
+            Value::Object(build_supply_order_timeslot(range)),
+        );
+    }
+    filter
+}
+
+fn build_supply_order_timeslot(
+    range: &SupplyOrderTimeslotRangeInput,
+) -> serde_json::Map<String, Value> {
+    let mut payload = serde_json::Map::new();
+    if let Some(from) = range.from.as_deref() {
+        payload.insert("from".to_owned(), json!(from));
+    }
+    if let Some(to) = range.to.as_deref() {
+        payload.insert("to".to_owned(), json!(to));
+    }
+    if let Some(filter_type) = range.timeslot_filter_type {
+        payload.insert("timeslot_filter_type".to_owned(), json!(filter_type));
+    }
+    payload
 }
 
 fn validate_unique_wb_signed_ids(field: &str, values: &[u64]) -> Result<(), String> {

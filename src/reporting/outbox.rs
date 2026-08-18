@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use thiserror::Error;
 
 use super::{PendingDelivery, ReportKey, delivery_deadline};
@@ -46,6 +46,7 @@ impl DeliveryErrorClass {
 pub struct ArtifactIdentity {
     pub object_key: String,
     pub sha256: String,
+    pub html_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,14 +252,48 @@ fn deadline(keys: &[ReportKey]) -> Result<DateTime<Utc>, OutboxError> {
 }
 
 pub(super) fn validate_artifact(artifact: &ArtifactIdentity) -> Result<(), OutboxError> {
-    if artifact.object_key.is_empty()
-        || artifact.object_key.len() > 512
+    if !valid_artifact_key(&artifact.object_key)
         || artifact.sha256.len() != 64
-        || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || artifact.html_sha256.len() != 64
+        || !artifact
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        || !artifact
+            .html_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         return Err(OutboxError::InvalidArtifact);
     }
     Ok(())
+}
+
+fn valid_artifact_key(value: &str) -> bool {
+    if value.len() > 512 {
+        return false;
+    }
+    let parts = value.split('/').collect::<Vec<_>>();
+    if let ["daily-reports", year, month, day, recipient, version, file] = parts.as_slice() {
+        let date = format!("{year}-{month}-{day}");
+        let recipient_valid = !recipient.is_empty()
+            && recipient.len() <= 128
+            && recipient
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+        let version_valid = version
+            .strip_prefix('v')
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some_and(|value| value > 0);
+        return year.len() == 4
+            && month.len() == 2
+            && day.len() == 2
+            && NaiveDate::parse_from_str(&date, "%Y-%m-%d").is_ok()
+            && recipient_valid
+            && version_valid
+            && matches!(*file, "morning.xlsx" | "evening.xlsx");
+    }
+    false
 }
 
 pub(super) fn validate_provider_message_id(value: &str) -> Result<(), OutboxError> {
@@ -297,8 +332,9 @@ mod tests {
 
     fn artifact() -> ArtifactIdentity {
         ArtifactIdentity {
-            object_key: "reports/2026-08-16/pilot_owner.xlsx".to_owned(),
+            object_key: "daily-reports/2026/08/16/pilot_owner/v1/morning.xlsx".to_owned(),
             sha256: "a".repeat(64),
+            html_sha256: "b".repeat(64),
         }
     }
 
@@ -404,18 +440,52 @@ mod tests {
             ArtifactIdentity {
                 object_key: String::new(),
                 sha256: "a".repeat(64),
+                html_sha256: "b".repeat(64),
             },
             ArtifactIdentity {
                 object_key: "x".repeat(513),
                 sha256: "a".repeat(64),
+                html_sha256: "b".repeat(64),
             },
             ArtifactIdentity {
-                object_key: "x".to_owned(),
+                object_key: artifact().object_key,
                 sha256: "g".repeat(64),
+                html_sha256: "b".repeat(64),
             },
             ArtifactIdentity {
-                object_key: "x".to_owned(),
+                object_key: artifact().object_key,
                 sha256: "a".repeat(63),
+                html_sha256: "b".repeat(64),
+            },
+            ArtifactIdentity {
+                object_key: "daily-reports/2026/02/30/pilot_owner/v1/morning.xlsx".to_owned(),
+                sha256: "a".repeat(64),
+                html_sha256: "b".repeat(64),
+            },
+            ArtifactIdentity {
+                object_key: "daily-reports/2026/08/16/pilot_owner/v0/morning.xlsx".to_owned(),
+                sha256: "a".repeat(64),
+                html_sha256: "b".repeat(64),
+            },
+            ArtifactIdentity {
+                object_key: "daily-reports/2026/08/16/bad recipient/v1/morning.xlsx".to_owned(),
+                sha256: "a".repeat(64),
+                html_sha256: "b".repeat(64),
+            },
+            ArtifactIdentity {
+                object_key: "daily-reports/2026/08/16/pilot_owner/v1/report.xlsx".to_owned(),
+                sha256: "a".repeat(64),
+                html_sha256: "b".repeat(64),
+            },
+            ArtifactIdentity {
+                object_key: "daily-reports/2026/08/16/pilot_owner/v1/morning.xlsx".to_owned(),
+                sha256: "A".repeat(64),
+                html_sha256: "b".repeat(64),
+            },
+            ArtifactIdentity {
+                object_key: "daily-reports/2026/08/16/pilot_owner/v1/morning.xlsx".to_owned(),
+                sha256: "a".repeat(64),
+                html_sha256: "G".repeat(64),
             },
         ];
         for invalid in invalid_artifacts {

@@ -60,8 +60,8 @@ jobs:
 
       - name: Check shell scripts
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends shellcheck
+          command -v shellcheck >/dev/null
+          shellcheck --version
           shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
           if git grep -n -I -E -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|sqp_[[:alnum:]_-]{20,}'; then
             echo "A likely private key or Sonar token is committed." >&2

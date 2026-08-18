@@ -2,16 +2,16 @@ use std::{collections::VecDeque, fs, future::Future, pin::Pin, str::FromStr, syn
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use mcp_ozon::reporting::{
+    ReportKey, ReportKind,
     collector_service::ReportCollectorConfig,
     ozon_adapter::OzonReportRequest,
-    ozon_source::{
-        OzonReportSource, OzonReportSourceError, OzonReportTransport, collect_and_persist,
-    },
+    ozon_source::{OzonReportSourceError, OzonReportTransport, collect_complete_snapshots},
     postgres_collector::{
         CollectedAdvertisingFact, CollectedFacts, CollectedPriceFact, CollectedSalesFact,
         CollectedSnapshot, CollectedStockFact, PostgresCollectorError, PostgresSnapshotWriter,
     },
     postgres_snapshot::{PostgresSnapshotError, PostgresSnapshotRepository},
+    preview::render_published_preview,
     snapshot::{AccountScope, Marketplace, SnapshotQuality, SnapshotStatus},
 };
 use serde_json::{Value, json};
@@ -97,15 +97,14 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]}]}]}"#,
     )
     .unwrap();
-    let runtime_config = ReportCollectorConfig::from_lookup(|key| match key {
+    let runtime_config = ReportCollectorConfig::from_lookup(&mut |key| match key {
         "REPORT_COLLECTOR_DATABASE_URL" => Some(collector_url.clone()),
         "MCP_ACCESS_CONFIG" => Some(runtime_registry.display().to_string()),
         "DAILY_REPORT_POLICY" => Some(runtime_policy.display().to_string()),
         _ => None,
     })
     .unwrap();
-    runtime_config
-        .connect_writer()
+    PostgresSnapshotWriter::connect(runtime_config.database_config())
         .await
         .unwrap()
         .verify_runtime_contract()
@@ -123,8 +122,8 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
             sku: 3411079879,
             ordered_units: 3,
             operational_gmv_minor: 202500,
-            cancelled_units: 0,
-            returned_units: 0,
+            cancelled_units: Some(0),
+            returned_units: Some(0),
         }]),
     );
     writer.persist(&sales).await.unwrap();
@@ -255,8 +254,8 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(facts.sales[0].sku, 3411079879);
     assert_eq!(facts.sales[0].ordered_units, 3);
     assert_eq!(facts.sales[0].operational_gmv_minor, 202500);
-    assert_eq!(facts.sales[0].cancelled_units, 0);
-    assert_eq!(facts.sales[0].returned_units, 0);
+    assert_eq!(facts.sales[0].cancelled_units, Some(0));
+    assert_eq!(facts.sales[0].returned_units, Some(0));
     assert_eq!(facts.advertising.len(), 1);
     assert_eq!(facts.advertising[0].campaign_id, 35751912);
     assert_eq!(facts.advertising[0].sku, 3411079879);
@@ -321,15 +320,18 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
 
 #[tokio::test]
 async fn complete_ozon_source_set_is_published_atomically() {
-    let Ok(collector_url) = std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL") else {
+    let (Ok(collector_url), Ok(worker_url)) = (
+        std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL"),
+        std::env::var("REPORT_OUTBOX_TEST_WORKER_URL"),
+    ) else {
         return;
     };
     let config = Config::from_str(&collector_url).unwrap();
     let writer = PostgresSnapshotWriter::connect(&config).await.unwrap();
-    let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
+    let transport = FixtureTransport(Mutex::new(VecDeque::from([
         Ok(json!({"result":{"data":[{
             "dimensions":[{"id":"3411079879"},{"id":"2098-08-15"}],
-            "metrics":["675.00", 2, 0, 0]
+            "metrics":["675.00", 2]
         }]}})),
         Ok(json!({"items":[{"product_id":3411079879_u64,"stocks":[{
             "type":"FBO","present":19
@@ -337,21 +339,62 @@ async fn complete_ozon_source_set_is_published_atomically() {
         Ok(json!({"items":[{"product_id":3411079879_u64,"price":{
             "currency_code":"RUB","price":"675.00","old_price":"702.00"
         }}],"cursor":""})),
-    ]))));
+    ])));
     let account_id = format!("ozon_source_atomic_{}", std::process::id());
-    let ids = collect_and_persist(
-        &source,
-        &writer,
-        account_id,
-        timestamp("2098-08-16T19:00:00Z"),
-        timestamp("2098-08-16T03:00:00Z"),
+    let snapshots = collect_complete_snapshots(
+        &transport,
+        vec![CollectedAdvertisingFact {
+            business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+            campaign_id: 35_751_912,
+            sku: 0,
+            impressions: 100,
+            clicks: 10,
+            spend_minor: 1_000,
+            attributed_orders: 1,
+            attributed_revenue_minor: 10_000,
+        }],
+        account_id.clone(),
+        timestamp("2098-08-17T03:00:00Z"),
+        timestamp("2098-08-17T02:30:00Z"),
         timestamp("2098-08-15T19:00:00Z"),
         timestamp("2098-08-16T19:00:00Z"),
         "integration-test".to_owned(),
     )
     .await
     .unwrap();
-    assert_eq!(ids.len(), 3);
+    let ids = writer.persist_batch(&snapshots).await.unwrap();
+    assert_eq!(ids.len(), 4);
+    let worker_config = Config::from_str(&worker_url).unwrap();
+    let repository = PostgresSnapshotRepository::connect(&worker_config)
+        .await
+        .unwrap();
+    let manifest = repository
+        .load_manifest(
+            timestamp("2098-08-17T03:00:00Z"),
+            vec![AccountScope::new(account_id, Marketplace::Ozon).unwrap()],
+        )
+        .await
+        .unwrap();
+    let facts = repository.load_report_facts(&manifest).await.unwrap();
+    let key = ReportKey {
+        local_date: NaiveDate::from_ymd_opt(2098, 8, 17).unwrap(),
+        kind: ReportKind::Morning,
+        recipient_id: "diana".to_owned(),
+        report_version: 1,
+    };
+    let preview = render_published_preview(
+        &key,
+        "Диана",
+        timestamp("2098-08-17T03:00:00Z"),
+        &manifest,
+        facts,
+    )
+    .unwrap();
+    assert!(preview.bundle.html.contains("Диана"));
+    assert!(preview.bundle.html.contains("N/D"));
+    assert!(preview.bundle.xlsx.starts_with(b"PK"));
+    assert_eq!(preview.receipt.size_bytes, preview.bundle.xlsx.len());
+    assert!(!preview.receipt.persisted);
     assert_eq!(
         writer.persist_batch(&[]).await,
         Err(PostgresCollectorError::InvalidInput)

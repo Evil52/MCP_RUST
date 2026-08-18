@@ -34,7 +34,9 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:size=32m,mode=1777
-      - /var/run/postgresql:size=8m,mode=3775
+      # PostgreSQL runs as the image's unprivileged postgres user (70:70), so
+      # its socket directory must be owned by that user on Docker Desktop too.
+      - /var/run/postgresql:size=8m,mode=3775,uid=70,gid=70
     healthcheck:
       test: ["CMD", "/usr/local/bin/position-db-healthcheck"]
       interval: 10s
@@ -78,6 +80,55 @@ services:
       retries: 3
       start_period: 10s
 
+  # The only component with external connectivity in the reporting stack.
+  # Its in-image Squid policy permits CONNECT tunnels solely to the exact Ozon
+  # Seller/Performance and WB Analytics/Prices/Promotion hosts. Marketplace
+  # credentials remain in report-collector; the proxy receives no secret
+  # environment and cannot select any additional destination.
+  ozon-egress:
+    image: mcp-ozon-egress:local
+    build:
+      context: .
+      dockerfile: Dockerfile.ozon-egress
+    depends_on:
+      position-db:
+        condition: service_healthy
+    networks:
+      - ozon-egress-internal
+      - outbound
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/squid:size=8m,mode=1777
+      - /var/log/squid:size=4m,mode=1777
+      - /var/run/squid:size=1m,mode=1777
+    # A live PID proved only that a process existed. This asks the proxy for a
+    # destination outside its allowlist and requires the refusal: the port is
+    # serving, the configuration parsed, and deny-by-default is in force. It
+    # needs no external connectivity, so the check cannot pass by reaching the
+    # internet — and it fails loudly if the allowlist is ever opened up.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "printf 'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 3128 | head -1 | grep -q '403 Forbidden'"
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
+
   report-collector:
     image: mcp-ozon-report-collector:local
     build:
@@ -105,8 +156,11 @@ services:
     depends_on:
       position-db:
         condition: service_healthy
+      ozon-egress:
+        condition: service_healthy
     networks:
       - position-internal
+      - ozon-egress-internal
     restart: unless-stopped
     mem_limit: 128m
     cpus: 0.25
@@ -139,6 +193,7 @@ services:
       REPORT_WORKER_DATABASE_URL: postgresql://report_worker:${REPORT_WORKER_DB_PASSWORD:?REPORT_WORKER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
       MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
       DAILY_REPORT_POLICY: /etc/mcp-ozon/daily-report-policy.json
+      REPORT_ARTIFACT_ROOT: /var/lib/mcp-ozon/report-artifacts
       RUST_LOG: mcp_ozon::reporting=info
     volumes:
       - type: bind
@@ -153,6 +208,9 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      - type: volume
+        source: report-artifacts
+        target: /var/lib/mcp-ozon/report-artifacts
     depends_on:
       position-db:
         condition: service_healthy
@@ -184,7 +242,15 @@ networks:
   position-internal:
     name: mcp-ozon-position-internal
     internal: true
+  ozon-egress-internal:
+    name: mcp-ozon-egress-internal
+    internal: true
+  outbound:
+    name: mcp-ozon-outbound
+    external: true
 
 volumes:
   position-data:
     name: mcp-ozon-position-data
+  report-artifacts:
+    name: mcp-ozon-report-artifacts

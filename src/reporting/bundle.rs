@@ -90,8 +90,9 @@ pub fn render_bundle(request: ReportBundleRequest<'_>) -> Result<ReportBundle, B
     })
     .map_err(map_xlsx)?;
     let artifact = ArtifactIdentity {
-        object_key: object_key(request.key),
+        object_key: artifact_object_key(request.key),
         sha256: sha256(&xlsx),
+        html_sha256: sha256(html.as_bytes()),
     };
     Ok(ReportBundle {
         html,
@@ -112,6 +113,7 @@ pub fn inspect_dry_run(bundle: &ReportBundle) -> Result<DryRunReceipt, BundleErr
         || bundle.artifact.object_key.trim().is_empty()
         || bundle.artifact.object_key.len() > 512
         || bundle.artifact.sha256 != sha256(&bundle.xlsx)
+        || bundle.artifact.html_sha256 != sha256(bundle.html.as_bytes())
     {
         return Err(BundleError::Integrity);
     }
@@ -155,7 +157,7 @@ fn validate_dataset_scope(dataset: &ReportDataset, accounts: &[&str]) -> Result<
     }
 }
 
-fn object_key(key: &ReportKey) -> String {
+pub(super) fn artifact_object_key(key: &ReportKey) -> String {
     format!(
         "daily-reports/{}/{:02}/{:02}/{}/v{}/{}.xlsx",
         key.local_date.format("%Y"),
@@ -232,8 +234,8 @@ mod tests {
                 sku: "10".to_owned(),
                 ordered_units: 2,
                 operational_gmv_minor: 20_000,
-                cancelled_units: 0,
-                returned_units: 0,
+                cancelled_units: Some(0),
+                returned_units: Some(0),
             }],
             advertising: vec![AdvertisingReportRow {
                 account_id: "store".to_owned(),
@@ -249,6 +251,7 @@ mod tests {
                 account_id: "store".to_owned(),
                 sku: "10".to_owned(),
                 sellable_stock: 3,
+                stock_observed: true,
                 price_minor: Some(12_345),
                 observed_at: utc(11),
             }],

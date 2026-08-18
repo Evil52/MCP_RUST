@@ -13,10 +13,15 @@ use chrono::NaiveDate;
 use serde_json::Value;
 use thiserror::Error;
 
-use super::postgres_collector::{CollectedPriceFact, CollectedSalesFact, CollectedStockFact};
+use super::postgres_collector::{
+    CollectedAdvertisingFact, CollectedPriceFact, CollectedSalesFact, CollectedStockFact,
+};
 
 const MAX_PAGE_ROWS: usize = 1_000;
-const MAX_WAREHOUSE_KIND_BYTES: usize = 64;
+// Product stocks and prices may include a much larger nested structure than
+// analytics rows. Keep their requested page small enough that a legitimate
+// response remains well below the client's 2 MiB decoded-body ceiling.
+const PRODUCT_PAGE_ROWS: usize = 100;
 const MAX_CURSOR_BYTES: usize = 4_096;
 const MAX_CAMPAIGN_TITLE_BYTES: usize = 512;
 
@@ -75,7 +80,7 @@ pub fn sales_request(
         payload: serde_json::json!({
             "date_from": date_from.format("%Y-%m-%d").to_string(),
             "date_to": date_to.format("%Y-%m-%d").to_string(),
-            "metrics": ["revenue", "ordered_units", "cancellations", "returns"],
+            "metrics": ["revenue", "ordered_units"],
             "dimension": ["sku", "day"],
             "filters": [],
             "sort": [],
@@ -104,13 +109,13 @@ pub fn product_page_request(
         payload: serde_json::json!({
             "cursor": cursor.unwrap_or_default(),
             "filter": {"offer_id": [], "product_id": [], "visibility": "ALL"},
-            "limit": MAX_PAGE_ROWS,
+            "limit": PRODUCT_PAGE_ROWS,
         }),
     })
 }
 
 /// Normalizes `/v1/analytics/data` for dimensions `["sku", "day"]` and
-/// metrics `["revenue", "ordered_units", "cancellations", "returns"]`.
+/// metrics `["revenue", "ordered_units"]`.
 ///
 /// The metric order is part of this local contract. A different query must
 /// not be parsed by this function because positional metric arrays otherwise
@@ -131,16 +136,16 @@ pub fn parse_sales_page(response: &Value) -> Result<Vec<CollectedSalesFact>, Ozo
         let sku = parse_u64(field(dimensions[0].as_object(), "id")?)?;
         let business_date = parse_date(field(dimensions[1].as_object(), "id")?)?;
         let metrics = array_field_value(row.get("metrics"))?;
-        if metrics.len() != 4 {
+        if metrics.len() != 2 {
             return Err(OzonReportParseError::Shape);
         }
         facts.push(CollectedSalesFact {
             business_date,
             sku,
             operational_gmv_minor: parse_minor(&metrics[0])?,
-            ordered_units: parse_u64(&metrics[1])?,
-            cancelled_units: parse_u64(&metrics[2])?,
-            returned_units: parse_u64(&metrics[3])?,
+            ordered_units: parse_count(&metrics[1])?,
+            cancelled_units: None,
+            returned_units: None,
         });
     }
     Ok(facts)
@@ -154,7 +159,7 @@ pub fn parse_sales_page(response: &Value) -> Result<Vec<CollectedSalesFact>, Ozo
 /// stock sum FBO/FBS rows correctly.
 pub fn parse_stock_page(response: &Value) -> Result<Vec<CollectedStockFact>, OzonReportParseError> {
     let items = array_field(response, "items")?;
-    if items.len() > MAX_PAGE_ROWS {
+    if items.len() > PRODUCT_PAGE_ROWS {
         return Err(OzonReportParseError::TooManyRows);
     }
     let mut totals = BTreeMap::<(u64, String), u64>::new();
@@ -187,7 +192,7 @@ pub fn parse_stock_page(response: &Value) -> Result<Vec<CollectedStockFact>, Ozo
 /// integer kopecks. `old_price` of zero denotes an absent before-price.
 pub fn parse_price_page(response: &Value) -> Result<Vec<CollectedPriceFact>, OzonReportParseError> {
     let items = array_field(response, "items")?;
-    if items.len() > MAX_PAGE_ROWS {
+    if items.len() > PRODUCT_PAGE_ROWS {
         return Err(OzonReportParseError::TooManyRows);
     }
     let mut facts = Vec::with_capacity(items.len());
@@ -243,6 +248,29 @@ pub fn parse_performance_daily_campaigns(
     Ok(facts)
 }
 
+/// Converts the verified campaign-level Performance response into the
+/// persistence contract. `sku = 0` is the explicit campaign-wide sentinel in
+/// `daily_reporting.advertising_facts`; it must be rendered as unavailable,
+/// never as a real product identifier.
+pub fn parse_performance_daily_advertising(
+    response: &Value,
+) -> Result<Vec<CollectedAdvertisingFact>, OzonReportParseError> {
+    parse_performance_daily_campaigns(response).map(|rows| {
+        rows.into_iter()
+            .map(|row| CollectedAdvertisingFact {
+                business_date: row.business_date,
+                campaign_id: row.campaign_id,
+                sku: 0,
+                impressions: row.impressions,
+                clicks: row.clicks,
+                spend_minor: row.spend_minor,
+                attributed_orders: row.attributed_orders,
+                attributed_revenue_minor: row.attributed_revenue_minor,
+            })
+            .collect()
+    })
+}
+
 fn object_field<'a>(
     value: &'a Value,
     name: &str,
@@ -293,17 +321,41 @@ fn parse_u64(value: &Value) -> Result<u64, OzonReportParseError> {
     }
 }
 
+/// Ozon documents analytics `metrics` as doubles, including count metrics.
+/// A count may therefore arrive as `5.0`, but never as a fractional or
+/// negative value in this reporting contract.
+fn parse_count(value: &Value) -> Result<u64, OzonReportParseError> {
+    match value {
+        Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                return Ok(value);
+            }
+            let value = number.as_f64().ok_or(OzonReportParseError::Value)?;
+            if !value.is_finite()
+                || value.is_sign_negative()
+                || value.fract() != 0.0
+                || value > u64::MAX as f64
+            {
+                return Err(OzonReportParseError::Value);
+            }
+            Ok(value as u64)
+        }
+        Value::String(_) => parse_u64(value),
+        _ => Err(OzonReportParseError::Value),
+    }
+}
+
 fn parse_warehouse_kind(value: &Value) -> Result<String, OzonReportParseError> {
     let value = value.as_str().ok_or(OzonReportParseError::Value)?;
-    if value.is_empty()
-        || value.len() > MAX_WAREHOUSE_KIND_BYTES
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err(OzonReportParseError::Value);
+    // `/v4/product/info/stocks` currently returns lowercase fulfillment types
+    // (`fbo` / `fbs`), while earlier verified fixtures used uppercase values.
+    // The API meaning is identical, so persist one canonical identifier rather
+    // than treating a casing-only upstream change as a new warehouse kind.
+    match value {
+        "fbo" | "FBO" => Ok("FBO".to_owned()),
+        "fbs" | "FBS" => Ok("FBS".to_owned()),
+        _ => Err(OzonReportParseError::Value),
     }
-    Ok(value.to_owned())
 }
 
 fn parse_campaign_title(value: &Value) -> Result<String, OzonReportParseError> {
@@ -370,7 +422,7 @@ mod tests {
         let sales = parse_sales_page(&json!({
             "result": {"data": [{
                 "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
-                "metrics": ["12.34", 5, 1, 2]
+                "metrics": ["12.34", 5]
             }]}
         }))
         .unwrap();
@@ -412,6 +464,68 @@ mod tests {
         assert_eq!(performance[0].campaign_id, 35_751_912);
         assert_eq!(performance[0].spend_minor, 70_178);
         assert_eq!(performance[0].attributed_revenue_minor, 0);
+        let persisted = parse_performance_daily_advertising(&json!({"rows": [{
+            "id": "35751912",
+            "title": "Реклама с Тёмой",
+            "date": "2026-08-16",
+            "views": "3764",
+            "clicks": "126",
+            "moneySpent": "701,78",
+            "orders": "0",
+            "ordersMoney": "0,00"
+        }]}))
+        .unwrap();
+        assert_eq!(persisted[0].campaign_id, 35_751_912);
+        assert_eq!(persisted[0].sku, 0);
+        assert_eq!(persisted[0].spend_minor, 70_178);
+    }
+
+    #[test]
+    fn stock_fulfillment_type_is_case_normalized() {
+        let stocks = parse_stock_page(&json!({"items": [{
+            "product_id": 123,
+            "stocks": [{"type": "fbs", "present": 7}]
+        }]}))
+        .unwrap();
+        assert_eq!(stocks[0].warehouse_id, "FBS");
+    }
+
+    #[test]
+    fn analytics_count_metrics_accept_only_integral_doubles() {
+        let accepted = parse_sales_page(&json!({
+            "result": {"data": [{
+                "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
+                "metrics": ["1.00", 2.0]
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(accepted[0].ordered_units, 2);
+        assert_eq!(accepted[0].returned_units, None);
+
+        let fractional = parse_sales_page(&json!({
+            "result": {"data": [{
+                "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
+                "metrics": ["1.00", 1.5]
+            }]}
+        }));
+        assert_eq!(fractional, Err(OzonReportParseError::Value));
+
+        let invalid_kind = parse_sales_page(&json!({
+            "result": {"data": [{
+                "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
+                "metrics": ["1.00", true]
+            }]}
+        }));
+        assert_eq!(invalid_kind, Err(OzonReportParseError::Value));
+
+        let string_count = parse_sales_page(&json!({
+            "result": {"data": [{
+                "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
+                "metrics": ["1.00", "2"]
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(string_count[0].ordered_units, 2);
     }
 
     #[test]
@@ -424,7 +538,7 @@ mod tests {
                 path: "/v1/analytics/data",
                 payload: json!({
                     "date_from": "2026-08-15", "date_to": "2026-08-16",
-                    "metrics": ["revenue", "ordered_units", "cancellations", "returns"],
+                    "metrics": ["revenue", "ordered_units"],
                     "dimension": ["sku", "day"], "filters": [], "sort": [],
                     "limit": 1_000, "offset": 7,
                 }),
@@ -439,7 +553,7 @@ mod tests {
             json!({
                 "cursor": "opaque-cursor",
                 "filter": {"offer_id": [], "product_id": [], "visibility": "ALL"},
-                "limit": 1_000,
+                "limit": 100,
             })
         );
         let oversized = "x".repeat(MAX_CURSOR_BYTES + 1);
@@ -519,9 +633,19 @@ mod tests {
                 "id":"1", "title":"x", "date":"2026-08-16", "views":"1",
                 "clicks":"1", "moneySpent":"1,000.00", "orders":"0", "ordersMoney":"0"
             }]}),
+            json!({"rows": [{
+                "id":"1", "title":"", "date":"2026-08-16", "views":"1",
+                "clicks":"1", "moneySpent":"0", "orders":"0", "ordersMoney":"0"
+            }]}),
         ] {
             assert!(parse_performance_daily_campaigns(&response).is_err());
         }
+        let numeric_money = parse_performance_daily_campaigns(&json!({"rows": [{
+            "id":"1", "title":"x", "date":"2026-08-16", "views":"1",
+            "clicks":"1", "moneySpent":1, "orders":"0", "ordersMoney":0
+        }]}))
+        .unwrap();
+        assert_eq!(numeric_money[0].spend_minor, 100);
         assert_eq!(
             parse_performance_daily_campaigns(&json!({"rows": vec![json!({}); MAX_PAGE_ROWS + 1]})),
             Err(OzonReportParseError::TooManyRows)
@@ -536,13 +660,13 @@ mod tests {
             Err(OzonReportParseError::TooManyRows)
         );
 
-        let too_many_stocks = vec![json!({}); MAX_PAGE_ROWS + 1];
+        let too_many_stocks = vec![json!({}); PRODUCT_PAGE_ROWS + 1];
         assert_eq!(
             parse_stock_page(&json!({"items": too_many_stocks})),
             Err(OzonReportParseError::TooManyRows)
         );
 
-        let too_many_prices = vec![json!({}); MAX_PAGE_ROWS + 1];
+        let too_many_prices = vec![json!({}); PRODUCT_PAGE_ROWS + 1];
         assert_eq!(
             parse_price_page(&json!({"items": too_many_prices})),
             Err(OzonReportParseError::TooManyRows)

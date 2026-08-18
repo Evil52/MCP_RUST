@@ -53,10 +53,21 @@ coverage, bounded delivery state, append-only provider attempts and normalized
 sales, advertising, stock and price snapshots. A dedicated `report_collector`
 can append and finalize snapshots; `report_worker` can read only terminal
 published projections and operate the outbox. It does not store email bodies,
-credentials or marketplace payloads.
-There is still no `Поисковая видимость за сутки` Dashboard, task registry,
-email job, or Excel generation process. These are later consumers of persisted
-history. The planned compact view contains collection status and completeness,
+credentials or marketplace payloads. Rendered HTML/XLSX bytes live outside
+PostgreSQL in an immutable artifact store; the outbox keeps only the stable
+XLSX object key and SHA-256.
+There is still no `Поисковая видимость за сутки` Dashboard, task registry or
+email job. A manual deterministic
+HTML/XLSX preview and a policy-scoped `report-worker generate <batch-id>` path
+are implemented. Generation accepts no recipient/account/cutoff input, writes
+only to the immutable local store, and can mark one pre-existing single-section
+outbox batch ready while delivery remains disabled. Mixed morning+evening
+batches remain rejected. The worker has an isolated persistent artifact volume
+whose write access is included in its health check. An opt-in, non-delivery
+`dry_run` mode plans due occurrences once per minute and recovers at most 16
+single-section artifact batches per tick; the shipped Compose configuration
+keeps the worker `disabled`. The planned compact
+view contains collection status and completeness,
 visibility rate, comparisons of complete reporting days, critical products, at
 most five priority problems, manager tasks, and a link to the bounded detailed
 report.
@@ -70,8 +81,11 @@ task workflow.
 
 Detailed Excel workbooks are generated on demand from the same frozen report
 run. They are exports rather than the system of record and are never stored in
-PostgreSQL. See `docs/search-position-monitoring.md` for the complete reporting
-contract.
+PostgreSQL. Existing artifact bytes are never overwritten: a repeated stable
+identity must have the same XLSX and HTML content hashes. The dedicated
+`mcp-ozon-report-artifacts` volume is writable only by `report-worker`; no MCP,
+collector or database service mounts it. See
+`docs/search-position-monitoring.md` for the complete reporting contract.
 
 The initial architecture has five security principals:
 
@@ -131,10 +145,12 @@ there is no runtime bind mount from the macOS `Documents` directory.
 The stack can now be started as an inert infrastructure check. It cannot collect
 positions until a separately reviewed live-source phase is shipped. When ready:
 
-1. Copy `.position.env.example` to `.position.env`.
-2. Generate five different random passwords of at least 24 characters and keep the file mode
-   `0600`. Bootstrap rejects the example placeholders, short values, reused passwords, and an
-   admin username that collides with any restricted application role.
+1. Generate the ignored local secret file with
+   `./scripts/bootstrap-position-env.sh .position.env`, or copy
+   `.position.env.example` to `.position.env` and generate five different random passwords of at
+   least 24 characters. Keep the file mode `0600`. Bootstrap rejects example placeholders, short
+   values, reused passwords, and an admin username that collides with any restricted application
+   role. The helper never prints generated passwords and refuses to overwrite an existing file.
 3. Validate the Compose model:
 
    ```bash
@@ -150,7 +166,10 @@ positions until a separately reviewed live-source phase is shipped. When ready:
 The init scripts run only when the named volume is empty. A fresh database
 applies the base schema, the additive Ozon collector contract, the additive WB
 migration, restricted role grants, the Ozon adapter digest migration, then the
-daily reporting outbox migration and normalized snapshot migration.
+daily reporting outbox, normalized snapshot, optional-metric and strict
+artifact-identity migrations.
+The final migration also adds append-only generation-attempt history, bounded
+retry backoff and an operator-only stalled-work view.
 Password rotation and schema migration after initial deployment must use an
 explicit migration, never volume deletion.
 
@@ -171,6 +190,15 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
   sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
   < position-monitor/initdb/006_daily_report_snapshots.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/007_daily_reporting_optional_metrics.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/008_daily_reporting_artifact_identity.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/009_daily_reporting_generation_backoff.sql
 ```
 
 The migration is transactional. It creates no scheduler and sends no email.

@@ -90,49 +90,55 @@ impl ControlPolicy {
             if !actor_ids.insert(actor_policy.actor_id.as_str()) {
                 bail!("control policy содержит повтор actor_id");
             }
-            let actor = registry.actor(&actor_policy.actor_id)?;
-            if actor_policy.targets.len() > MAX_TARGETS_PER_ACTOR {
-                bail!("control policy содержит слишком много targets для actor");
-            }
-
-            let mut targets = BTreeSet::new();
-            for target in &actor_policy.targets {
-                validate_identifier("account_id", &target.account_id)?;
-                if target.campaign_id == 0 {
-                    bail!("campaign_id должен быть положительным");
-                }
-                if !targets.insert((target.account_id.as_str(), target.campaign_id)) {
-                    bail!("control policy содержит повтор account_id/campaign_id");
-                }
-                let account = registry
-                    .accounts
-                    .iter()
-                    .find(|account| account.id == target.account_id)
-                    .with_context(|| {
-                        format!(
-                            "control policy ссылается на неизвестный account_id {}",
-                            target.account_id
-                        )
-                    })?;
-                if !matches!(account.marketplace, Marketplace::Ozon)
-                    || account
-                        .ozon
-                        .as_ref()
-                        .and_then(|ozon| ozon.performance.as_ref())
-                        .is_none()
-                {
-                    bail!(
-                        "control policy target должен ссылаться на Ozon account с Performance binding"
-                    );
-                }
-                if !actor.can_access_account(account) {
-                    bail!("actor не имеет базового доступа к account из control policy");
-                }
-                validate_target(target)?;
-            }
+            validate_actor_policy(actor_policy, registry)?;
         }
         Ok(())
     }
+}
+
+fn validate_actor_policy(
+    actor_policy: &ActorControlPolicy,
+    registry: &AccessRegistry,
+) -> Result<()> {
+    let actor = registry.actor(&actor_policy.actor_id)?;
+    if actor_policy.targets.len() > MAX_TARGETS_PER_ACTOR {
+        bail!("control policy содержит слишком много targets для actor");
+    }
+
+    let mut targets = BTreeSet::new();
+    for target in &actor_policy.targets {
+        validate_identifier("account_id", &target.account_id)?;
+        if target.campaign_id == 0 {
+            bail!("campaign_id должен быть положительным");
+        }
+        if !targets.insert((target.account_id.as_str(), target.campaign_id)) {
+            bail!("control policy содержит повтор account_id/campaign_id");
+        }
+        let account = registry
+            .accounts
+            .iter()
+            .find(|account| account.id == target.account_id)
+            .with_context(|| {
+                format!(
+                    "control policy ссылается на неизвестный account_id {}",
+                    target.account_id
+                )
+            })?;
+        if !matches!(account.marketplace, Marketplace::Ozon)
+            || account
+                .ozon
+                .as_ref()
+                .and_then(|ozon| ozon.performance.as_ref())
+                .is_none()
+        {
+            bail!("control policy target должен ссылаться на Ozon account с Performance binding");
+        }
+        if !actor.can_access_account(account) {
+            bail!("actor не имеет базового доступа к account из control policy");
+        }
+        validate_target(target)?;
+    }
+    Ok(())
 }
 
 fn read_policy_bytes(path: &Path) -> Result<Vec<u8>> {

@@ -1,4 +1,4 @@
-use std::{str::FromStr, time::Duration};
+use std::str::FromStr;
 
 use thiserror::Error;
 use tokio_postgres::{Config, config::Host};
@@ -7,7 +7,6 @@ use super::{PostgresRepository, RepositoryError};
 
 const DATABASE_URL_ENV: &str = "POSITION_COLLECTOR_DATABASE_URL";
 const MODE_ENV: &str = "POSITION_COLLECTOR_MODE";
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CollectorRuntimeMode {
@@ -39,8 +38,7 @@ impl CollectorRuntimeConfig {
         let mut database =
             Config::from_str(&raw).map_err(|_| RuntimeConfigError::InvalidDatabaseUrl)?;
         validate_database_config(&database)?;
-        database.connect_timeout(CONNECT_TIMEOUT);
-        database.application_name("mcp-ozon-position-collector");
+        crate::postgres::harden(&mut database, "mcp-ozon-position-collector");
         Ok(Self { database, mode })
     }
 
@@ -94,7 +92,7 @@ mod tests {
     fn disabled_config_accepts_only_the_restricted_database_identity() {
         let value = config(&[(
             DATABASE_URL_ENV,
-            "postgresql://position_collector:fixture-password@position-db/ozon_positions",
+            "postgresql://position_collector:password@position-db/ozon_positions",
         )])
         .unwrap();
         assert_eq!(value.mode(), CollectorRuntimeMode::Disabled);

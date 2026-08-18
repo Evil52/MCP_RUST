@@ -7,6 +7,7 @@ pub mod http;
 pub mod ozon;
 pub mod ozon_performance;
 pub mod position_collector;
+pub mod postgres;
 pub mod reporting;
 pub mod runtime;
 pub mod server;

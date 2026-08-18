@@ -256,7 +256,7 @@ fn invalid_wb_token_type(env_name: &str) -> anyhow::Error {
 /// used for Base, Test or Service tokens. Service tokens additionally require
 /// an `X-Client-Secret` and `asid` binding that this owner-operated client does
 /// not currently configure.
-fn validate_wb_token_type(token: &str, env_name: &str) -> Result<()> {
+pub(crate) fn validate_wb_token_type(token: &str, env_name: &str) -> Result<()> {
     let mut segments = token.split('.');
     let (Some(header), Some(payload), Some(signature), None) = (
         segments.next(),

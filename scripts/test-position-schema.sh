@@ -196,6 +196,25 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/005_daily_reporting_outbox.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/006_daily_report_snapshots.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/007_daily_reporting_optional_metrics.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/008_daily_reporting_artifact_identity.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/009_daily_reporting_generation_backoff.sql >/dev/null
+optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
+    FROM information_schema.columns
+    WHERE table_schema = 'daily_reporting'
+      AND table_name = 'sales_facts'
+      AND column_name IN ('cancelled_units', 'returned_units')
+  "; } | tr -d '\r')"
+if [[ "$optional_sales_metrics" != "cancelled_units:YES,returned_units:YES" ]]; then
+  echo "daily-report unavailable sales metrics are not nullable after migration" >&2
+  printf '%s\n' "$optional_sales_metrics" >&2
+  exit 1
+fi
 "${migration_admin_psql[@]}" --command '
   CREATE TABLE search_position.reader_default_acl_probe (id integer)
 ' >/dev/null
@@ -290,9 +309,20 @@ migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
           'report_worker',
           'daily_reporting.published_source_snapshots',
           'SELECT'
+      ),
+      to_regclass('daily_reporting.generation_attempts') IS NOT NULL,
+      has_table_privilege(
+          'report_worker',
+          'daily_reporting.generation_attempts',
+          'SELECT,INSERT'
+      ),
+      NOT has_table_privilege(
+          'position_reader',
+          'daily_reporting.generation_attempts',
+          'SELECT'
       )
   "; } | tr -d '\r')"
-if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
+if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
   echo "existing-volume migrations did not install the expected schema/ACL" >&2
   printf '%s\n' "$migration_acl" >&2
   exit 1
@@ -1721,8 +1751,9 @@ expect_failure_containing \
   WHERE id = 1;
   UPDATE daily_reporting.delivery_batches
   SET status = 'ready',
-      artifact_object_key = 'reports/2099-08-16/pilot-owner.xlsx',
+      artifact_object_key = 'daily-reports/2099/08/16/pilot_owner/v1/evening.xlsx',
       artifact_sha256 = repeat('a', 64),
+      artifact_html_sha256 = repeat('b', 64),
       updated_at = updated_at + interval '1 second'
   WHERE id = 1;
   UPDATE daily_reporting.delivery_batches
@@ -1766,6 +1797,36 @@ if [[ "$report_delivery" != "sent:t:1:2:evening:morning:2" ]]; then
 fi
 
 expect_failure_containing \
+  "report artifact identity outside delivery coverage" \
+  "report artifact identity does not match delivery coverage" \
+  "${report_worker_psql[@]}" \
+  --command "
+    INSERT INTO daily_reporting.delivery_batches
+        (recipient_id, report_version, scheduled_for)
+    VALUES ('artifact_probe', 1, '2099-08-17 12:00:00+00');
+    INSERT INTO daily_reporting.delivery_coverage
+        (
+            batch_id, recipient_id, report_version, local_date, report_kind,
+            scheduled_for, deadline_at
+        )
+    SELECT id, recipient_id, report_version, '2099-08-17', 'evening',
+           '2099-08-17 12:00:00+00', '2099-08-17 18:00:00+00'
+    FROM daily_reporting.delivery_batches
+    WHERE recipient_id = 'artifact_probe';
+    UPDATE daily_reporting.delivery_batches
+    SET status = 'generating', updated_at = updated_at + interval '1 second'
+    WHERE recipient_id = 'artifact_probe';
+    UPDATE daily_reporting.delivery_batches
+    SET status = 'ready',
+        artifact_object_key =
+            'daily-reports/2099/08/17/artifact_probe/v1/morning.xlsx',
+        artifact_sha256 = repeat('a', 64),
+        artifact_html_sha256 = repeat('b', 64),
+        updated_at = updated_at + interval '1 second'
+    WHERE recipient_id = 'artifact_probe';
+  "
+
+expect_failure_containing \
   "duplicate report occurrence coverage" \
   "duplicate key value violates unique constraint" \
   "${report_worker_psql[@]}" \
@@ -1778,11 +1839,10 @@ expect_failure_containing \
             batch_id, recipient_id, report_version, local_date, report_kind,
             scheduled_for, deadline_at
         )
-    VALUES
-        (
-            2, 'pilot_owner', 1, '2099-08-16', 'morning',
-            '2099-08-16 03:00:00+00', '2099-08-16 09:00:00+00'
-        )
+    SELECT id, recipient_id, report_version, '2099-08-16', 'morning',
+           '2099-08-16 03:00:00+00', '2099-08-16 09:00:00+00'
+    FROM daily_reporting.delivery_batches
+    WHERE recipient_id = 'pilot_owner' AND status = 'planned'
   "
 
 expect_failure_containing \
