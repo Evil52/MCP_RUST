@@ -28,6 +28,14 @@ const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1_024;
 const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(86_400);
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_SKEW: Duration = Duration::from_secs(60);
+/// How long a failed token request suppresses further attempts.
+///
+/// The OAuth endpoint sits outside the pacing gate and both in-flight
+/// semaphores, because holding scarce capacity while a single-flight refresh
+/// waits would be worse. That exemption is only safe with a cooldown: without
+/// one, a token endpoint returning 429 or 5xx is re-attempted once per API
+/// call for as long as the failure lasts.
+const TOKEN_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_IN_FLIGHT_PER_CLIENT: usize = 2;
 const MAX_GLOBAL_IN_FLIGHT: usize = 8;
@@ -77,6 +85,7 @@ pub enum PerformanceErrorKind {
     Overloaded,
     InvalidJson,
     InvalidToken,
+    TokenUnavailable,
     ResponseTooLarge,
 }
 
@@ -102,6 +111,7 @@ impl PerformanceErrorKind {
             Self::Overloaded => "local_overloaded",
             Self::InvalidJson => "invalid_json",
             Self::InvalidToken => "invalid_token_response",
+            Self::TokenUnavailable => "token_endpoint_cooldown",
             Self::ResponseTooLarge => "response_too_large",
         }
     }
@@ -141,6 +151,11 @@ pub enum PerformanceError {
     #[error("Ozon Performance API вернул некорректный OAuth token response")]
     InvalidToken,
     #[error(
+        "запрос токена Ozon Performance API отложен после недавней ошибки \
+         ({previous})"
+    )]
+    TokenUnavailable { previous: &'static str },
+    #[error(
         "ответ Ozon Performance API превышает лимит {limit_bytes} байт (получено: {actual_bytes:?}, request-id: {request_id:?})"
     )]
     ResponseTooLarge {
@@ -174,6 +189,7 @@ impl PerformanceError {
             Self::Overloaded => PerformanceErrorKind::Overloaded,
             Self::InvalidJson { .. } => PerformanceErrorKind::InvalidJson,
             Self::InvalidToken => PerformanceErrorKind::InvalidToken,
+            Self::TokenUnavailable { .. } => PerformanceErrorKind::TokenUnavailable,
             Self::ResponseTooLarge { .. } => PerformanceErrorKind::ResponseTooLarge,
         }
     }
@@ -191,7 +207,8 @@ impl PerformanceError {
             | Self::Timeout
             | Self::Network
             | Self::Overloaded
-            | Self::InvalidToken => None,
+            | Self::InvalidToken
+            | Self::TokenUnavailable { .. } => None,
         }
     }
 }
@@ -212,9 +229,24 @@ impl fmt::Debug for CachedToken {
 }
 
 #[derive(Debug)]
+/// Suppresses token requests for a while after one fails.
+struct TokenCooldown {
+    until: Instant,
+    /// The stable code of the failure that opened the cooldown, reported to
+    /// callers refused during it so the cause is never guessed at.
+    previous: &'static str,
+}
+
+#[derive(Debug, Default)]
+struct TokenSlot {
+    cached: Option<CachedToken>,
+    cooldown: Option<TokenCooldown>,
+}
+
+#[derive(Debug)]
 struct AccountState {
     credentials: PerformanceCredentials,
-    token: Mutex<Option<CachedToken>>,
+    token: Mutex<TokenSlot>,
     next_allowed: Mutex<Instant>,
     in_flight: Semaphore,
     statistics_in_flight: Semaphore,
@@ -224,7 +256,7 @@ impl AccountState {
     fn new(credentials: PerformanceCredentials) -> Self {
         Self {
             credentials,
-            token: Mutex::new(None),
+            token: Mutex::new(TokenSlot::default()),
             next_allowed: Mutex::new(Instant::now()),
             in_flight: Semaphore::new(MAX_IN_FLIGHT_PER_CLIENT),
             statistics_in_flight: Semaphore::new(1),
@@ -570,22 +602,60 @@ impl PerformanceClient {
     }
 
     async fn invalidate_token_if_current(&self, state: &AccountState, used_token: &str) {
-        let mut cache = state.token.lock().await;
-        if cache
+        let mut slot = state.token.lock().await;
+        if slot
+            .cached
             .as_ref()
             .is_some_and(|cached| cached.value == used_token)
         {
-            *cache = None;
+            slot.cached = None;
         }
     }
 
     async fn access_token(&self, state: &AccountState) -> Result<String, PerformanceError> {
-        let mut cache = state.token.lock().await;
-        if let Some(token) = cache.as_ref()
-            && token.refresh_at > Instant::now()
+        let mut slot = state.token.lock().await;
+        let now = Instant::now();
+        if let Some(token) = slot.cached.as_ref()
+            && token.refresh_at > now
         {
             return Ok(token.value.clone());
         }
+        // Holding the lock across the request is what makes this single-flight,
+        // so a queued caller must not simply repeat an attempt that just failed.
+        if let Some(cooldown) = slot.cooldown.as_ref() {
+            if cooldown.until > now {
+                return Err(PerformanceError::TokenUnavailable {
+                    previous: cooldown.previous,
+                });
+            }
+            slot.cooldown = None;
+        }
+        match self.request_token(state).await {
+            Ok((value, refresh_at)) => {
+                slot.cached = Some(CachedToken {
+                    value: value.clone(),
+                    refresh_at,
+                });
+                Ok(value)
+            }
+            Err(error) => {
+                slot.cooldown = Some(TokenCooldown {
+                    until: Instant::now() + TOKEN_FAILURE_COOLDOWN,
+                    previous: error.kind().code(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Performs one OAuth client-credentials exchange and validates it.
+    ///
+    /// Returns the token together with the instant it must be refreshed, so
+    /// the caller can cache both without re-deriving the lifetime.
+    async fn request_token(
+        &self,
+        state: &AccountState,
+    ) -> Result<(String, Instant), PerformanceError> {
         let response = self
             .http
             .post(format!("{}{}", self.base_url, TOKEN_PATH))
@@ -621,12 +691,7 @@ impl PerformanceClient {
         let refresh_at = Instant::now()
             .checked_add(refresh_after)
             .ok_or(PerformanceError::InvalidToken)?;
-        let value = token.access_token;
-        *cache = Some(CachedToken {
-            value: value.clone(),
-            refresh_at,
-        });
-        Ok(value)
+        Ok((token.access_token, refresh_at))
     }
 }
 
@@ -760,7 +825,7 @@ mod tests {
         value: &str,
     ) -> Arc<AccountState> {
         let state = Arc::clone(client.accounts.get(store).unwrap());
-        *state.token.lock().await = Some(CachedToken {
+        state.token.lock().await.cached = Some(CachedToken {
             value: value.to_owned(),
             refresh_at: Instant::now() + Duration::from_secs(60),
         });
@@ -937,6 +1002,69 @@ mod tests {
             .expect_err("credentials must be required");
         assert_eq!(missing.kind(), PerformanceErrorKind::MissingCredentials);
         assert!(!is_read_only_request_allowed(&Method::POST, CAMPAIGNS_PATH));
+    }
+
+    /// The OAuth endpoint is exempt from pacing and both in-flight semaphores.
+    /// Without a cooldown that exemption turns a failing token endpoint into
+    /// one token request per API call, for as long as the failure lasts.
+    #[tokio::test]
+    async fn a_failed_token_request_is_not_repeated_by_the_next_caller() {
+        let (base_url, requests) = mock_http(vec![
+            (500, "token-endpoint-down".to_owned()),
+            (200, token(1_800)),
+            (200, json!({"list": []}).to_string()),
+        ]);
+        let client =
+            PerformanceClient::new_for_test(base_url, Duration::from_secs(3), credentials());
+        let store = StoreId::from("shop");
+
+        let first = client
+            .campaigns(&store, campaigns_query())
+            .await
+            .expect_err("the token endpoint is failing");
+        assert_eq!(first.kind(), PerformanceErrorKind::Http);
+
+        let second = client
+            .campaigns(&store, campaigns_query())
+            .await
+            .expect_err("the cooldown refuses the next caller");
+        assert_eq!(second.kind(), PerformanceErrorKind::TokenUnavailable);
+        assert_eq!(second.kind().code(), "token_endpoint_cooldown");
+        // The refusal names the failure that opened the cooldown rather than
+        // inventing a fresh cause.
+        assert!(second.to_string().contains("upstream_http_error"));
+        assert!(second.request_id().is_none());
+        assert!(!format!("{second:?}").contains("performance-secret"));
+
+        assert!(
+            requests.recv().is_ok(),
+            "the first caller reaches the token endpoint"
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "the cooled-down caller must not reach the token endpoint"
+        );
+
+        // Expiry reopens the single-flight token path. Mutating the private
+        // clock boundary keeps this unit test deterministic and instant.
+        let state = client.accounts.get(&store).unwrap();
+        state.token.lock().await.cooldown.as_mut().unwrap().until = Instant::now();
+        assert_eq!(
+            client.campaigns(&store, campaigns_query()).await.unwrap(),
+            json!({"list": []})
+        );
+        assert!(
+            requests
+                .recv()
+                .unwrap()
+                .starts_with("POST /api/client/token")
+        );
+        assert!(
+            requests
+                .recv()
+                .unwrap()
+                .starts_with("GET /api/client/campaign?")
+        );
     }
 
     #[tokio::test]
@@ -1198,7 +1326,7 @@ mod tests {
             credentials(),
         );
         let state = client.accounts.get(&StoreId::from("shop")).unwrap();
-        *state.token.lock().await = Some(CachedToken {
+        state.token.lock().await.cached = Some(CachedToken {
             value: "new-token".to_owned(),
             refresh_at: Instant::now() + Duration::from_secs(60),
         });
@@ -1208,6 +1336,7 @@ mod tests {
                 .token
                 .lock()
                 .await
+                .cached
                 .as_ref()
                 .map(|token| token.value.as_str()),
             Some("new-token")
@@ -1224,7 +1353,7 @@ mod tests {
         );
 
         client.invalidate_token_if_current(state, "new-token").await;
-        assert!(state.token.lock().await.is_none());
+        assert!(state.token.lock().await.cached.is_none());
     }
 
     #[tokio::test]
