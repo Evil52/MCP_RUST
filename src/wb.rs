@@ -703,23 +703,43 @@ impl TokenLimiter {
         &self,
         request_class: RequestClass,
         retry: bool,
+        deadline: TokioInstant,
     ) -> Result<(), WbError> {
         let gate = self.gate(request_class);
+        // Classes whose quota slot is minute-scale are never queued for: a
+        // caller that missed the slot is told when to come back instead of
+        // parking on it. `StatisticsReport` paces at a full 60s — the same as
+        // `CommissionTariff` — but was absent here, so its callers queued for
+        // an entire interval only to expire against the 60s logical timeout.
         if !retry
             && matches!(
                 request_class,
                 RequestClass::CommissionTariff
+                    | RequestClass::StatisticsReport
                     | RequestClass::PromotionStats
                     | RequestClass::SearchReport
             )
         {
-            gate.ensure_ready_now()
+            return gate
+                .ensure_ready_now()
                 .await
-                .map_err(|retry_after| WbError::LocalRateLimited { retry_after })
-        } else {
-            gate.wait_until_ready().await;
-            Ok(())
+                .map_err(|retry_after| WbError::LocalRateLimited { retry_after });
         }
+        // A wait that cannot end before the caller's deadline is not a wait,
+        // it is a timeout dressed as one — and an expensive one, because the
+        // MCP request slot and the HTTP connection stay held for its whole
+        // duration before failing. `StatisticsReport` paces at exactly the
+        // logical timeout, so a second concurrent caller was guaranteed to
+        // spend a full minute reaching `Timeout`. Refuse now instead, naming
+        // the instant a retry could actually succeed.
+        let ready_in = gate.ready_in().await;
+        if TokioInstant::now() + ready_in >= deadline {
+            return Err(WbError::LocalRateLimited {
+                retry_after: ready_in,
+            });
+        }
+        gate.wait_until_ready().await;
+        Ok(())
     }
 
     async fn try_claim(
@@ -800,6 +820,9 @@ pub struct WbClient {
 #[derive(Clone, Copy)]
 struct AttemptContext<'a> {
     account: &'a str,
+    /// The logical deadline for the whole call, used to refuse a pacing wait
+    /// that could never finish inside it.
+    deadline: TokioInstant,
     method: &'a Method,
     endpoint: &'static str,
     request_class: RequestClass,
@@ -1452,6 +1475,7 @@ impl WbClient {
     ) -> Result<Value, WbError> {
         let context = AttemptContext {
             account,
+            deadline,
             method: &method,
             endpoint,
             request_class,
@@ -1508,13 +1532,16 @@ impl WbClient {
         limiter: &'a TokenLimiter,
         request_class: RequestClass,
         retry: bool,
+        deadline: TokioInstant,
     ) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>), WbError> {
         let interval = self.policy.interval(request_class);
         loop {
             // Readiness does not consume quota. Queued callers therefore hold
             // no network capacity, and a fail-fast permit rejection cannot
             // postpone the next real WB request by 20 or 60s.
-            limiter.wait_until_ready(request_class, retry).await?;
+            limiter
+                .wait_until_ready(request_class, retry, deadline)
+                .await?;
             let global_permit = self
                 .global_in_flight
                 .try_acquire()
@@ -1547,7 +1574,12 @@ impl WbClient {
         // Both permits are released when this helper returns, before the retry
         // loop performs any backoff sleep.
         let (_global_permit, _token_permit) = self
-            .acquire_request_permits(context.limiter, context.request_class, retry)
+            .acquire_request_permits(
+                context.limiter,
+                context.request_class,
+                retry,
+                context.deadline,
+            )
             .await?;
         let mut request = self
             .http
@@ -4355,8 +4387,51 @@ mod tests {
         task.join().unwrap();
     }
 
+    /// The production case this rule exists for.
+    ///
+    /// `StatisticsReport` paces at 60s and the logical timeout caps at 60s, so
+    /// a second concurrent caller could never win its slot in time: it was
+    /// guaranteed to sleep a full minute — holding an MCP request slot and an
+    /// HTTP connection throughout — and then fail with a bare `Timeout`.
     #[tokio::test]
-    async fn total_deadline_includes_waiting_for_the_local_quota() {
+    async fn a_statistics_caller_behind_a_full_interval_is_refused_not_queued() {
+        let client = WbClient::new_for_test_with_policy(
+            Duration::from_secs(30),
+            credentials(),
+            "http://127.0.0.1:1",
+            ClientPolicy::production(Duration::from_secs(30)),
+        );
+        let limiter = client.limiters.get("account").unwrap();
+        // Exactly the state a sibling call leaves behind after claiming.
+        *limiter.statistics_reports.next_allowed.lock().await =
+            Instant::now() + STATISTICS_MIN_REQUEST_INTERVAL;
+
+        let started = Instant::now();
+        let error = client
+            .orders("account", "2026-08-01T00:00:00".to_owned(), 0)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the caller must be refused, not parked for the whole interval"
+        );
+        assert!(matches!(
+            error,
+            WbError::LocalRateLimited { retry_after }
+                if retry_after > Duration::from_secs(59)
+                    && retry_after <= STATISTICS_MIN_REQUEST_INTERVAL
+        ));
+    }
+
+    /// The logical deadline still governs a local quota wait — but it now
+    /// decides the wait up front instead of being consumed by it.
+    ///
+    /// Entering a wait that cannot end in time produced `DeadlineExceeded`
+    /// only once it expired, holding the caller's request slot and its HTTP
+    /// connection for the whole duration and saying nothing about when a
+    /// retry could succeed.
+    #[tokio::test]
+    async fn a_quota_wait_that_cannot_fit_the_deadline_is_refused_immediately() {
         let mut policy = ClientPolicy::immediate_single_attempt(Duration::from_millis(5));
         policy.ping_interval = Duration::from_secs(1);
         let client = WbClient::new_for_test_with_policy(
@@ -4369,11 +4444,18 @@ mod tests {
         *limiter.analytics_ping.next_allowed.lock().await =
             Instant::now() + Duration::from_millis(100);
 
+        let started = Instant::now();
         let error = client.ping("account").await.unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "исчерпан общий лимит времени read-only запроса к WB API"
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "the refusal must not spend the wait it declined to make"
         );
+        assert!(matches!(
+            error,
+            WbError::LocalRateLimited { retry_after }
+                if retry_after > Duration::from_millis(50)
+                    && retry_after <= Duration::from_millis(100)
+        ));
     }
 
     #[tokio::test]
@@ -5309,13 +5391,22 @@ mod tests {
 
         // Both campaign list and details use this exact gate. A pending slot
         // therefore blocks details before any connection can be attempted.
+        // The 200ms slot cannot fit the 20ms deadline, so it is refused with
+        // the retry instant rather than waited out into a timeout.
         *limiter.promotion_campaigns.next_allowed.lock().await =
             Instant::now() + Duration::from_millis(200);
+        let started = Instant::now();
         let error = client
             .promotion_campaign_details("account", vec![1], Vec::new(), Some("cpc".to_owned()))
             .await
             .unwrap_err();
-        assert!(matches!(error, WbError::DeadlineExceeded));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(matches!(
+            error,
+            WbError::LocalRateLimited { retry_after }
+                if retry_after > Duration::from_millis(100)
+                    && retry_after <= Duration::from_millis(200)
+        ));
     }
 
     /// `SECURITY.md` invariant 1 disables redirects on every marketplace client,
