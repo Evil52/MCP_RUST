@@ -106,7 +106,11 @@ The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
 writer, bounded fact reader and report dataset are present. A manual, bounded
 Ozon Seller + Performance adapter is available for a policy-scoped canary, but
 automatic marketplace collection and every WB report adapter remain disabled.
-No enabled scheduler process, S3 writer or mail provider is wired. The isolated
+No scheduler is enabled in the shipped Compose configuration, and no S3 writer
+or mail provider is wired. An opt-in `REPORT_WORKER_MODE=dry_run` runtime ticks
+once per minute, plans due 08:00/17:00 EKB occurrences and retries only
+single-section `planned`/`generating` artifact work inside its delivery window.
+It never claims a ready delivery. The isolated
 production artifact volume is mounted and health-checked. Manual
 HTML/XLSX previews can be generated from an already published complete
 four-source manifest. The immutable local store and outbox-publication
@@ -140,6 +144,15 @@ artifact volume and only then marks that exact batch ready. Repeating it can
 only reproduce or reuse the same bytes. The hardened production container has
 a read-only root filesystem plus one dedicated artifact volume.
 
+Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
+enabled validated policy. The shipped Compose value remains `disabled`. Every
+tick is bounded to 16 generation candidates; missed timer ticks are skipped,
+and an unavailable or incomplete snapshot leaves the batch unmodified for a
+later tick. Recovery after a server restart therefore continues within the
+existing 14:00/23:00 EKB safety deadlines without creating duplicate report
+identities. Email remains impossible because no provider or recipient-value
+loader exists.
+
 The persistence layer transactionally stores report occurrences, delivery
 coverage and attempts. Its unique occurrence key is
 `(local_date, kind, recipient_id, report_version)`. Consolidated mail covers two
@@ -152,8 +165,8 @@ an ambiguous provider result is never retried automatically.
 
 1. Validate a manual Ozon four-source preview for Diana and add the
    corresponding WB read-only collector.
-2. Add the scheduler/runtime around the persisted PostgreSQL outbox and run dry
-   mode for Diana and Vahrusheva/Torsunova with delivery disabled.
+2. Run the opt-in scheduler dry mode for Diana and Vahrusheva/Torsunova after
+   both marketplace collectors publish complete manifests.
 3. Connect S3-compatible artifact storage and one service mailbox.
 4. Send previews to the temporary owner recipient at 08:00 and 17:00 EKB.
 5. Reconcile figures for five to seven days before enabling other managers.

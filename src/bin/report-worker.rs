@@ -11,13 +11,17 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind,
     artifact_store::persist_and_mark_ready,
-    postgres_outbox::GenerationStatus,
+    postgres_outbox::{GenerationStatus, PostgresOutboxRepository},
+    postgres_snapshot::PostgresSnapshotRepository,
     preview::render_published_preview,
     reporting_interval,
     service::{ReportPreviewScope, ReportWorkerConfig, ReportWorkerMode},
 };
-use tokio::signal;
+use tokio::{signal, time::MissedTickBehavior};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const DRY_RUN_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_GENERATIONS_PER_TICK: u16 = 16;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -91,57 +95,117 @@ async fn main() -> Result<()> {
             return usage();
         }
         ensure!(
-            config.mode() == ReportWorkerMode::Disabled && !config.policy().enabled,
-            "artifact generation requires disabled delivery mode"
+            matches!(
+                (config.mode(), config.policy().enabled),
+                (ReportWorkerMode::Disabled, false) | (ReportWorkerMode::DryRun, true)
+            ),
+            "artifact generation requires a consistent non-delivery mode"
         );
         let batch_id = batch_id
             .parse::<i64>()
             .context("generation batch id must be a positive integer")?;
-        let candidate = outbox.generation_candidate(batch_id, Utc::now()).await?;
-        let scope = config.generation_scope(&candidate.key)?;
-        let cutoff = report_cutoff(&candidate.key)?;
-        let manifest = snapshots
-            .load_manifest(cutoff, scope.accounts.clone())
-            .await?;
-        let facts = snapshots.load_report_facts(&manifest).await?;
-        let report = render_published_preview(
-            &candidate.key,
-            &scope.report_name,
-            candidate.generated_at,
-            &manifest,
-            facts,
-        )?;
-        if candidate.status == GenerationStatus::Planned {
-            outbox.start_generation(candidate.batch_id).await?;
-        }
-        let receipt = persist_and_mark_ready(
-            config.artifact_store(),
-            &outbox,
-            candidate.batch_id,
-            &report.bundle,
-        )
-        .await?;
-        tracing::info!(
-            batch_id = candidate.batch_id,
-            audience_id = scope.audience_id,
-            object_key = receipt.artifact.object_key,
-            xlsx_bytes = receipt.xlsx_size_bytes,
-            html_bytes = receipt.html_size_bytes,
-            "daily report artifact generated; delivery remains disabled"
-        );
+        generate_batch(&config, &outbox, &snapshots, batch_id, Utc::now()).await?;
         return Ok(());
     }
     if !arguments.is_empty() {
         return usage();
     }
-    if config.mode() != ReportWorkerMode::Disabled || config.policy().enabled {
-        bail!("report delivery runtime is unavailable");
+    match (config.mode(), config.policy().enabled) {
+        (ReportWorkerMode::Disabled, false) => {
+            tracing::warn!(
+                targets = targets.len(),
+                "report worker is disabled; no snapshots, artifacts, or email are generated"
+            );
+            shutdown_signal().await;
+        }
+        (ReportWorkerMode::DryRun, true) => {
+            tracing::info!(
+                targets = targets.len(),
+                tick_seconds = DRY_RUN_TICK.as_secs(),
+                "report dry-run scheduler started; email delivery is unavailable"
+            );
+            tokio::select! {
+                result = run_dry_scheduler(&config, &outbox, &snapshots) => result?,
+                _ = shutdown_signal() => {}
+            }
+        }
+        _ => bail!("report-worker mode and policy enabled flag are inconsistent"),
     }
-    tracing::warn!(
-        targets = targets.len(),
-        "report worker is disabled; no snapshots, artifacts, or email are generated"
+    Ok(())
+}
+
+async fn run_dry_scheduler(
+    config: &ReportWorkerConfig,
+    outbox: &PostgresOutboxRepository,
+    snapshots: &PostgresSnapshotRepository,
+) -> Result<()> {
+    let mut timer = tokio::time::interval(DRY_RUN_TICK);
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        let now = Utc::now();
+        let planned = outbox.plan_due(now, config.policy()).await?;
+        let batch_ids = outbox
+            .pending_generation_ids(now, MAX_GENERATIONS_PER_TICK)
+            .await?;
+        tracing::info!(
+            planned = planned.len(),
+            candidates = batch_ids.len(),
+            "daily report dry-run tick"
+        );
+        for batch_id in batch_ids {
+            if generate_batch(config, outbox, snapshots, batch_id, now)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    batch_id,
+                    "daily report generation deferred; delivery remains disabled"
+                );
+            }
+        }
+    }
+}
+
+async fn generate_batch(
+    config: &ReportWorkerConfig,
+    outbox: &PostgresOutboxRepository,
+    snapshots: &PostgresSnapshotRepository,
+    batch_id: i64,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let candidate = outbox.generation_candidate(batch_id, now).await?;
+    let scope = config.generation_scope(&candidate.key)?;
+    let cutoff = report_cutoff(&candidate.key)?;
+    let manifest = snapshots
+        .load_manifest(cutoff, scope.accounts.clone())
+        .await?;
+    let facts = snapshots.load_report_facts(&manifest).await?;
+    let report = render_published_preview(
+        &candidate.key,
+        &scope.report_name,
+        candidate.generated_at,
+        &manifest,
+        facts,
+    )?;
+    if candidate.status == GenerationStatus::Planned {
+        outbox.start_generation(candidate.batch_id).await?;
+    }
+    let receipt = persist_and_mark_ready(
+        config.artifact_store(),
+        outbox,
+        candidate.batch_id,
+        &report.bundle,
+    )
+    .await?;
+    tracing::info!(
+        batch_id = candidate.batch_id,
+        audience_id = scope.audience_id,
+        object_key = receipt.artifact.object_key,
+        xlsx_bytes = receipt.xlsx_size_bytes,
+        html_bytes = receipt.html_size_bytes,
+        "daily report artifact generated; delivery remains disabled"
     );
-    shutdown_signal().await;
     Ok(())
 }
 

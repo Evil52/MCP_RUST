@@ -154,6 +154,19 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
         CreateOutcome::Inserted(id) => id,
         CreateOutcome::Existing(_) => unreachable!(),
     };
+    assert!(
+        repository
+            .pending_generation_ids(utc(3, 1), 16)
+            .await
+            .unwrap()
+            .contains(&batch_id)
+    );
+    for limit in [0, 17] {
+        assert_eq!(
+            repository.pending_generation_ids(utc(3, 1), limit).await,
+            Err(PostgresOutboxError::InvalidDelivery)
+        );
+    }
     assert_eq!(
         repository.generation_candidate(batch_id, utc(2, 59)).await,
         Err(PostgresOutboxError::Conflict)
@@ -192,6 +205,13 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
             .status,
         GenerationStatus::Ready
     );
+    assert!(
+        !repository
+            .pending_generation_ids(utc(3, 3), 16)
+            .await
+            .unwrap()
+            .contains(&batch_id)
+    );
 
     let consolidated_recipient = format!("consolidated_{}", std::process::id());
     let consolidated = due_deliveries(utc(13, 30), &consolidated_recipient, 1, &BTreeSet::new())
@@ -206,6 +226,13 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
             .generation_candidate(consolidated_id, utc(13, 31))
             .await,
         Err(PostgresOutboxError::Conflict)
+    );
+    assert!(
+        !repository
+            .pending_generation_ids(utc(13, 31), 16)
+            .await
+            .unwrap()
+            .contains(&consolidated_id)
     );
     assert_eq!(
         repository.generation_candidate(batch_id, utc(9, 1)).await,

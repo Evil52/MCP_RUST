@@ -17,6 +17,7 @@ use super::{
 };
 
 const MAX_DELIVERY_ATTEMPTS: u8 = 5;
+const MAX_GENERATION_CANDIDATES: u16 = 16;
 
 #[derive(Clone, Copy)]
 enum AttemptOutcome {
@@ -263,6 +264,36 @@ impl PostgresOutboxRepository {
             generated_at: row.get(3),
             status,
         })
+    }
+
+    /// Returns a bounded set of due single-section batches that still need an
+    /// artifact. This is a recovery scan, not a delivery claim.
+    pub async fn pending_generation_ids(
+        &self,
+        now: DateTime<Utc>,
+        limit: u16,
+    ) -> Result<Vec<i64>, PostgresOutboxError> {
+        if limit == 0 || limit > MAX_GENERATION_CANDIDATES {
+            return Err(PostgresOutboxError::InvalidDelivery);
+        }
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                "SELECT batch.id \
+                 FROM daily_reporting.delivery_batches AS batch \
+                 JOIN daily_reporting.delivery_coverage AS coverage \
+                   ON coverage.batch_id = batch.id \
+                 WHERE batch.status IN ('planned', 'generating') \
+                   AND batch.scheduled_for <= $1 \
+                 GROUP BY batch.id \
+                 HAVING count(*) = 1 AND max(coverage.deadline_at) >= $1 \
+                 ORDER BY min(batch.scheduled_for), batch.id \
+                 LIMIT $2",
+                &[&now, &i64::from(limit)],
+            )
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
+        Ok(rows.into_iter().map(|row| row.get(0)).collect())
     }
 
     pub(super) async fn verify_generation_artifact(

@@ -26,6 +26,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportWorkerMode {
     Disabled,
+    DryRun,
 }
 
 /// Credential-isolated configuration for the reporting runtime.
@@ -60,7 +61,8 @@ impl ReportWorkerConfig {
     pub fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
         let mode = match lookup(MODE_ENV).as_deref().unwrap_or("disabled") {
             "disabled" => ReportWorkerMode::Disabled,
-            _ => bail!("only the disabled report-worker runtime mode is available"),
+            "dry_run" => ReportWorkerMode::DryRun,
+            _ => bail!("report-worker mode must be disabled or dry_run"),
         };
         let raw_database =
             lookup(DATABASE_URL_ENV).context("REPORT_WORKER_DATABASE_URL is required")?;
@@ -416,6 +418,15 @@ mod tests {
             .unwrap();
         assert_eq!(scope.report_name, "Diana");
         assert_eq!(scope.accounts.len(), 1);
+    }
+
+    #[test]
+    fn explicit_dry_run_mode_is_available_without_mail_configuration() {
+        let mut entries = valid_entries(true);
+        entries.push((MODE_ENV, "dry_run".to_owned()));
+        let config = config(entries).unwrap();
+        assert_eq!(config.mode(), ReportWorkerMode::DryRun);
+        assert!(config.policy().enabled);
     }
 
     #[test]

@@ -56,14 +56,17 @@ published projections and operate the outbox. It does not store email bodies,
 credentials or marketplace payloads. Rendered HTML/XLSX bytes live outside
 PostgreSQL in an immutable artifact store; the outbox keeps only the stable
 XLSX object key and SHA-256.
-There is still no `Поисковая видимость за сутки` Dashboard, task registry,
-email job, or automatic report-generation process. A manual deterministic
+There is still no `Поисковая видимость за сутки` Dashboard, task registry or
+email job. A manual deterministic
 HTML/XLSX preview and a policy-scoped `report-worker generate <batch-id>` path
 are implemented. Generation accepts no recipient/account/cutoff input, writes
 only to the immutable local store, and can mark one pre-existing single-section
 outbox batch ready while delivery remains disabled. Mixed morning+evening
 batches remain rejected. The worker has an isolated persistent artifact volume
-whose write access is included in its health check. The planned compact
+whose write access is included in its health check. An opt-in, non-delivery
+`dry_run` mode plans due occurrences once per minute and recovers at most 16
+single-section artifact batches per tick; the shipped Compose configuration
+keeps the worker `disabled`. The planned compact
 view contains collection status and completeness,
 visibility rate, comparisons of complete reporting days, critical products, at
 most five priority problems, manager tasks, and a link to the bounded detailed
