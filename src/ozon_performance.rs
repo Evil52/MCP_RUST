@@ -6,7 +6,7 @@ use std::{
 };
 
 use reqwest::{
-    Client, Method, Response, StatusCode,
+    Client, Method, Proxy, Response, StatusCode,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
     redirect::Policy,
 };
@@ -287,6 +287,27 @@ impl PerformanceClient {
             MIN_REQUEST_INTERVAL,
             credentials,
             concat!("mcp-ozon/", env!("CARGO_PKG_VERSION")),
+            None,
+        )
+    }
+
+    /// Builds a client using one deployment-owned HTTPS forward proxy.
+    ///
+    /// Ambient proxy variables remain disabled. This constructor is reserved
+    /// for the isolated report collector whose network namespace can reach
+    /// only the fixed egress gateway.
+    pub fn new_with_https_proxy(
+        timeout: Duration,
+        credentials: BTreeMap<StoreId, PerformanceCredentials>,
+        proxy_url: &str,
+    ) -> Result<Self, PerformanceClientBuildError> {
+        Self::build(
+            PERFORMANCE_API_BASE_URL.to_owned(),
+            timeout,
+            MIN_REQUEST_INTERVAL,
+            credentials,
+            concat!("mcp-ozon/", env!("CARGO_PKG_VERSION")),
+            Some(proxy_url),
         )
     }
 
@@ -300,6 +321,7 @@ impl PerformanceClient {
         interval: Duration,
         credentials: BTreeMap<StoreId, PerformanceCredentials>,
         user_agent: &str,
+        explicit_https_proxy: Option<&str>,
     ) -> Result<Self, PerformanceClientBuildError> {
         let http = Client::builder()
             .timeout(timeout)
@@ -310,9 +332,15 @@ impl PerformanceClient {
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(MAX_GLOBAL_IN_FLIGHT)
             .tcp_keepalive(Duration::from_secs(60))
-            .http2_adaptive_window(true)
-            .build()
-            .map_err(PerformanceClientBuildError::Http)?;
+            .http2_adaptive_window(true);
+        let http = match explicit_https_proxy {
+            Some(proxy_url) => {
+                http.proxy(Proxy::https(proxy_url).map_err(PerformanceClientBuildError::Http)?)
+            }
+            None => http,
+        }
+        .build()
+        .map_err(PerformanceClientBuildError::Http)?;
         let mut client_ids = std::collections::BTreeSet::new();
         let mut accounts = BTreeMap::new();
         for (store, credentials) in credentials {
@@ -343,6 +371,7 @@ impl PerformanceClient {
             Duration::ZERO,
             credentials,
             "mcp-ozon-test",
+            None,
         )
         .unwrap()
     }
@@ -1207,6 +1236,7 @@ mod tests {
             Duration::from_secs(1),
             credentials_for(&["noisy-a", "noisy-b", "noisy-c", "noisy-d", "quiet"]),
             "mcp-ozon-test",
+            None,
         )
         .unwrap();
         let noisy_states = noisy_stores
@@ -1531,6 +1561,7 @@ mod tests {
             Duration::ZERO,
             BTreeMap::new(),
             "invalid\nuser-agent",
+            None,
         )
         .expect_err("invalid HTTP client configuration must fail");
         assert!(matches!(error, PerformanceClientBuildError::Http(_)));

@@ -34,6 +34,13 @@ The first disabled-only phase provides:
 - a separate disabled `report-collector` runtime that validates the exact pilot
   account/source plan and the `report_collector` database role without loading
   marketplace credentials or making network requests; and
+- an explicit operator-only `ozon-dry-run` command which loads only the
+  policy-scoped Ozon Seller and Performance read credentials, reaches the two
+  fixed API hosts through the deployment-owned CONNECT proxy, normalizes one
+  completed EKB business day and publishes all four sources atomically; and
+- campaign-level Ozon Performance daily rows stored with the explicit
+  unavailable-SKU sentinel and rendered as `N/D`, never as a fabricated
+  product attribution; and
 - a bounded PostgreSQL reader that loads only published source descriptors and
   revalidates the exact four-source manifest before report generation;
 - a bounded published-fact reader that selects rows only by the frozen
@@ -82,9 +89,10 @@ tokens and actual addresses must not be committed.
 ## Not implemented yet
 
 The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
-writer, bounded fact reader and report dataset are present, but no marketplace
-report collector adapter is wired yet. No enabled scheduler process, marketplace snapshot job, S3 writer or mail
-provider is wired. The HTML/XLSX bundle is generated in memory but is not yet
+writer, bounded fact reader and report dataset are present. A manual, bounded
+Ozon Seller + Performance adapter is available for a policy-scoped canary, but
+automatic marketplace collection and every WB report adapter remain disabled.
+No enabled scheduler process, S3 writer or mail provider is wired. The HTML/XLSX bundle is generated in memory but is not yet
 persisted or connected to the delivery outbox. Consolidated two-period
 catch-up rendering remains fail-closed until it has an explicit two-section
 template rather than silently presenting one interval as two reports.
@@ -105,7 +113,8 @@ an ambiguous provider result is never retried automatically.
 
 ## Planned pilot
 
-1. Wire read-only marketplace collectors into the normalized snapshot contract.
+1. Validate the manual Ozon four-source snapshot and add the corresponding WB
+   read-only collector.
 2. Add the scheduler/runtime around the persisted PostgreSQL outbox.
 3. Run dry mode for Diana and Vahrusheva/Torsunova with delivery disabled.
 4. Connect S3-compatible artifact storage and one service mailbox.

@@ -832,9 +832,17 @@ mod tests {
             price_minor: None,
             observed_at: generated_at(),
         }];
+        let sales = [SalesDetail {
+            account_id: "ozon_store",
+            sku: "sku",
+            ordered_units: 1,
+            operational_gmv_minor: 100,
+            cancelled_units: None,
+            returned_units: None,
+        }];
         let bytes = render_xlsx(XlsxReport {
             summary: summary(&no_rates, &[]),
-            sales: &[],
+            sales: &sales,
             advertising: &[],
             inventory: &inventory,
             source_quality: &[],
@@ -859,6 +867,20 @@ mod tests {
             render_xlsx(XlsxReport {
                 summary: summary(&kpis, &[]),
                 sales: &excessive,
+                advertising: &[],
+                inventory: &[],
+                source_quality: &[],
+            }),
+            Err(XlsxReportError::InvalidInput)
+        );
+        let invalid_optional = [SalesDetail {
+            cancelled_units: Some(MAX_EXACT_EXCEL_INTEGER + 1),
+            ..base_sales
+        }];
+        assert_eq!(
+            render_xlsx(XlsxReport {
+                summary: summary(&kpis, &[]),
+                sales: &invalid_optional,
                 advertising: &[],
                 inventory: &[],
                 source_quality: &[],

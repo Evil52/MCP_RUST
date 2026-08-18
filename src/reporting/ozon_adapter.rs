@@ -13,7 +13,9 @@ use chrono::NaiveDate;
 use serde_json::Value;
 use thiserror::Error;
 
-use super::postgres_collector::{CollectedPriceFact, CollectedSalesFact, CollectedStockFact};
+use super::postgres_collector::{
+    CollectedAdvertisingFact, CollectedPriceFact, CollectedSalesFact, CollectedStockFact,
+};
 
 const MAX_PAGE_ROWS: usize = 1_000;
 // Product stocks and prices may include a much larger nested structure than
@@ -246,6 +248,29 @@ pub fn parse_performance_daily_campaigns(
     Ok(facts)
 }
 
+/// Converts the verified campaign-level Performance response into the
+/// persistence contract. `sku = 0` is the explicit campaign-wide sentinel in
+/// `daily_reporting.advertising_facts`; it must be rendered as unavailable,
+/// never as a real product identifier.
+pub fn parse_performance_daily_advertising(
+    response: &Value,
+) -> Result<Vec<CollectedAdvertisingFact>, OzonReportParseError> {
+    parse_performance_daily_campaigns(response).map(|rows| {
+        rows.into_iter()
+            .map(|row| CollectedAdvertisingFact {
+                business_date: row.business_date,
+                campaign_id: row.campaign_id,
+                sku: 0,
+                impressions: row.impressions,
+                clicks: row.clicks,
+                spend_minor: row.spend_minor,
+                attributed_orders: row.attributed_orders,
+                attributed_revenue_minor: row.attributed_revenue_minor,
+            })
+            .collect()
+    })
+}
+
 fn object_field<'a>(
     value: &'a Value,
     name: &str,
@@ -439,6 +464,20 @@ mod tests {
         assert_eq!(performance[0].campaign_id, 35_751_912);
         assert_eq!(performance[0].spend_minor, 70_178);
         assert_eq!(performance[0].attributed_revenue_minor, 0);
+        let persisted = parse_performance_daily_advertising(&json!({"rows": [{
+            "id": "35751912",
+            "title": "Реклама с Тёмой",
+            "date": "2026-08-16",
+            "views": "3764",
+            "clicks": "126",
+            "moneySpent": "701,78",
+            "orders": "0",
+            "ordersMoney": "0,00"
+        }]}))
+        .unwrap();
+        assert_eq!(persisted[0].campaign_id, 35_751_912);
+        assert_eq!(persisted[0].sku, 0);
+        assert_eq!(persisted[0].spend_minor, 70_178);
     }
 
     #[test]
@@ -470,6 +509,23 @@ mod tests {
             }]}
         }));
         assert_eq!(fractional, Err(OzonReportParseError::Value));
+
+        let invalid_kind = parse_sales_page(&json!({
+            "result": {"data": [{
+                "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
+                "metrics": ["1.00", true]
+            }]}
+        }));
+        assert_eq!(invalid_kind, Err(OzonReportParseError::Value));
+
+        let string_count = parse_sales_page(&json!({
+            "result": {"data": [{
+                "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
+                "metrics": ["1.00", "2"]
+            }]}
+        }))
+        .unwrap();
+        assert_eq!(string_count[0].ordered_units, 2);
     }
 
     #[test]
@@ -577,9 +633,19 @@ mod tests {
                 "id":"1", "title":"x", "date":"2026-08-16", "views":"1",
                 "clicks":"1", "moneySpent":"1,000.00", "orders":"0", "ordersMoney":"0"
             }]}),
+            json!({"rows": [{
+                "id":"1", "title":"", "date":"2026-08-16", "views":"1",
+                "clicks":"1", "moneySpent":"0", "orders":"0", "ordersMoney":"0"
+            }]}),
         ] {
             assert!(parse_performance_daily_campaigns(&response).is_err());
         }
+        let numeric_money = parse_performance_daily_campaigns(&json!({"rows": [{
+            "id":"1", "title":"x", "date":"2026-08-16", "views":"1",
+            "clicks":"1", "moneySpent":1, "orders":"0", "ordersMoney":0
+        }]}))
+        .unwrap();
+        assert_eq!(numeric_money[0].spend_minor, 100);
         assert_eq!(
             parse_performance_daily_campaigns(&json!({"rows": vec![json!({}); MAX_PAGE_ROWS + 1]})),
             Err(OzonReportParseError::TooManyRows)

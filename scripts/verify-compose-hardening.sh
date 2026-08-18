@@ -613,9 +613,13 @@ check_contains \
   "$project_dir/compose.position.yaml" \
   "\${DAILY_REPORT_POLICY_HOST:-./config/daily-report-pilot.example.json}"
 check_contains \
-  "ozon egress: proxy only permits the Seller API host" \
+  "ozon egress: proxy permits the exact Seller and Performance API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
-  "acl ozon_seller dstdomain api-seller.ozon.ru"
+  "acl ozon_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru"
+check_contains \
+  "ozon egress: proxy applies the exact read API host allowlist" \
+  "$project_dir/position-monitor/ozon-egress/squid.conf" \
+  "http_access allow connect ozon_read_api tls_port"
 check_contains \
   "ozon egress: proxy denies every other destination" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
@@ -663,4 +667,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, Control, position database, Ozon-only egress proxy, and disabled collector/reporting runtimes: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."
+echo "Compose hardening verified for main, canary, Control, position database, Ozon read-API egress proxy, and disabled collector/reporting runtimes: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."

@@ -1,13 +1,13 @@
 //! Bounded read-only Ozon report source.
 //!
-//! This module is deliberately transport-agnostic. A future runtime adapter
-//! may delegate to `OzonClient`, but every request is first built by the exact
-//! request contract in `ozon_adapter` and every response is normalized before
-//! it can reach report persistence.
+//! This module keeps collection transport-agnostic for tests and delegates the
+//! explicit canary runtime to `OzonClient`. Every request is first built by the
+//! exact contract in `ozon_adapter` and every response is normalized before it
+//! can reach report persistence.
 
 use std::{future::Future, pin::Pin};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -22,8 +22,8 @@ use super::{
         parse_stock_page, product_page_request, sales_request,
     },
     postgres_collector::{
-        CollectedFacts, CollectedPriceFact, CollectedSalesFact, CollectedSnapshot,
-        CollectedStockFact, PostgresCollectorError, PostgresSnapshotWriter,
+        CollectedAdvertisingFact, CollectedFacts, CollectedPriceFact, CollectedSalesFact,
+        CollectedSnapshot, CollectedStockFact, PostgresCollectorError,
     },
     snapshot::{Marketplace, SnapshotStatus},
 };
@@ -33,25 +33,27 @@ const MAX_SALES_PAGES: usize = 25;
 // manual dry-run's absolute deadline bounds the total request time.
 const MAX_PRODUCT_PAGES: usize = 100;
 
+/// Collects the three Seller sources and atomically publishes them together
+/// with a separately verified Performance campaign snapshot.
 #[allow(clippy::too_many_arguments)]
-pub async fn collect_and_persist<T: OzonReportTransport>(
-    source: &OzonReportSource<T>,
-    writer: &PostgresSnapshotWriter,
+pub async fn collect_complete_snapshots(
+    transport: &dyn OzonReportTransport,
+    advertising: Vec<CollectedAdvertisingFact>,
     account_id: String,
     cutoff_at: DateTime<Utc>,
     source_as_of: DateTime<Utc>,
     sales_period_start: DateTime<Utc>,
     sales_period_end: DateTime<Utc>,
     collector_version: String,
-) -> Result<Vec<i64>, OzonReportSourceError> {
+) -> Result<Vec<CollectedSnapshot>, OzonReportSourceError> {
+    let source = OzonReportSource::new(transport);
+    let (date_from, date_to) = report_business_dates(sales_period_start, sales_period_end)?;
     let facts = source
-        .collect_required_seller_facts(
-            sales_period_start.date_naive(),
-            sales_period_end.date_naive(),
-        )
+        .collect_required_seller_facts(date_from, date_to)
         .await?;
     let snapshots = facts
-        .into_snapshots(
+        .into_complete_snapshots(
+            advertising,
             account_id,
             cutoff_at,
             source_as_of,
@@ -60,10 +62,25 @@ pub async fn collect_and_persist<T: OzonReportTransport>(
             collector_version,
         )
         .map_err(|_| OzonReportSourceError::InvalidSnapshotInput)?;
-    writer
-        .persist_batch(&snapshots)
-        .await
-        .map_err(|_| OzonReportSourceError::Transport)
+    Ok(snapshots)
+}
+
+fn report_business_dates(
+    period_start: DateTime<Utc>,
+    period_end: DateTime<Utc>,
+) -> Result<(NaiveDate, NaiveDate), OzonReportSourceError> {
+    if period_end <= period_start {
+        return Err(OzonReportSourceError::InvalidSnapshotInput);
+    }
+    let offset =
+        FixedOffset::east_opt(5 * 60 * 60).expect("the fixed Yekaterinburg UTC offset is valid");
+    let inclusive_end = period_end
+        .checked_sub_signed(Duration::nanoseconds(1))
+        .ok_or(OzonReportSourceError::InvalidSnapshotInput)?;
+    Ok((
+        period_start.with_timezone(&offset).date_naive(),
+        inclusive_end.with_timezone(&offset).date_naive(),
+    ))
 }
 
 pub trait OzonReportTransport: Send + Sync {
@@ -71,6 +88,15 @@ pub trait OzonReportTransport: Send + Sync {
         &'a self,
         request: OzonReportRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Value, OzonReportSourceError>> + Send + 'a>>;
+}
+
+impl<T: OzonReportTransport + ?Sized> OzonReportTransport for &T {
+    fn post<'a>(
+        &'a self,
+        request: OzonReportRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, OzonReportSourceError>> + Send + 'a>> {
+        (**self).post(request)
+    }
 }
 
 /// Production transport adapter. It deliberately owns no credential material:
@@ -168,6 +194,41 @@ impl OzonCollectedFacts {
         )?;
         Ok(vec![sales, stocks, prices])
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn into_complete_snapshots(
+        self,
+        advertising: Vec<CollectedAdvertisingFact>,
+        account_id: String,
+        cutoff_at: DateTime<Utc>,
+        source_as_of: DateTime<Utc>,
+        sales_period_start: DateTime<Utc>,
+        sales_period_end: DateTime<Utc>,
+        collector_version: String,
+    ) -> Result<Vec<CollectedSnapshot>, PostgresCollectorError> {
+        let advertising = CollectedSnapshot::new(
+            account_id.clone(),
+            Marketplace::Ozon,
+            cutoff_at,
+            source_as_of,
+            sales_period_start,
+            sales_period_end,
+            SnapshotStatus::Succeeded,
+            true,
+            collector_version.clone(),
+            CollectedFacts::Advertising(advertising),
+        )?;
+        let mut snapshots = self.into_snapshots(
+            account_id,
+            cutoff_at,
+            source_as_of,
+            sales_period_start,
+            sales_period_end,
+            collector_version,
+        )?;
+        snapshots.insert(1, advertising);
+        Ok(snapshots)
+    }
 }
 
 impl<T> OzonReportSource<T> {
@@ -247,14 +308,8 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         let request = sales_request(date_from, date_to, offset)
             .map_err(|_| OzonReportSourceError::InvalidResponse)?;
         let response = self.transport.post(request).await?;
-        parse_sales_page(&response).map_err(|_| {
-            tracing::warn!(
-                shape = %sales_response_shape(&response),
-                "Ozon sales response did not match the bounded report contract"
-            );
-            OzonReportSourceError::InvalidSalesResponse {
-                shape: sales_response_shape(&response),
-            }
+        parse_sales_page(&response).map_err(|_| OzonReportSourceError::InvalidSalesResponse {
+            shape: sales_response_shape(&response),
         })
     }
 
@@ -282,19 +337,6 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         Err(OzonReportSourceError::PaginationLimit)
     }
 
-    pub async fn stock_page(
-        &self,
-        cursor: Option<&str>,
-    ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
-        self.product_page(
-            "/v4/product/info/stocks",
-            cursor,
-            parse_stock_page,
-            OzonReportSourceError::InvalidStocksResponse,
-        )
-        .await
-    }
-
     /// Collects cursor-paginated stock pages with a fixed upper bound.
     pub async fn collect_stock_pages(
         &self,
@@ -303,19 +345,6 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             "/v4/product/info/stocks",
             parse_stock_page,
             OzonReportSourceError::InvalidStocksResponse,
-        )
-        .await
-    }
-
-    pub async fn price_page(
-        &self,
-        cursor: Option<&str>,
-    ) -> Result<Vec<CollectedPriceFact>, OzonReportSourceError> {
-        self.product_page(
-            "/v5/product/info/prices",
-            cursor,
-            parse_price_page,
-            OzonReportSourceError::InvalidPricesResponse,
         )
         .await
     }
@@ -330,22 +359,6 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             OzonReportSourceError::InvalidPricesResponse,
         )
         .await
-    }
-
-    async fn product_page<F, Fact>(
-        &self,
-        path: &'static str,
-        cursor: Option<&str>,
-        parse: F,
-        invalid_response: OzonReportSourceError,
-    ) -> Result<Vec<Fact>, OzonReportSourceError>
-    where
-        F: Fn(&Value) -> Result<Vec<Fact>, OzonReportParseError>,
-    {
-        let request = product_page_request(path, cursor)
-            .map_err(|_| OzonReportSourceError::InvalidResponse)?;
-        let response = self.transport.post(request).await?;
-        parse(&response).map_err(|_| invalid_response)
     }
 
     async fn collect_product_pages<F, Fact>(
@@ -485,9 +498,11 @@ mod tests {
                 "dimensions":[{"id":"1"},{"id":"2026-08-16"}],
                 "metrics":["1.00", 2]
             }]}})),
-            Ok(json!({"items":[{"product_id":1,"stocks":[{"type":"FBO","present":3}]}]})),
             Ok(
-                json!({"items":[{"product_id":1,"price":{"currency_code":"RUB","price":"2","old_price":"0"}}]}),
+                json!({"items":[{"product_id":1,"stocks":[{"type":"FBO","present":3}]}],"cursor":""}),
+            ),
+            Ok(
+                json!({"items":[{"product_id":1,"price":{"currency_code":"RUB","price":"2","old_price":"0"}}],"cursor":""}),
             ),
         ]))));
         let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
@@ -495,8 +510,14 @@ mod tests {
             source.sales_page(day, day, 0).await.unwrap()[0].ordered_units,
             2
         );
-        assert_eq!(source.stock_page(None).await.unwrap()[0].sellable_units, 3);
-        assert_eq!(source.price_page(None).await.unwrap()[0].price_minor, 200);
+        assert_eq!(
+            source.collect_stock_pages().await.unwrap()[0].sellable_units,
+            3
+        );
+        assert_eq!(
+            source.collect_price_pages().await.unwrap()[0].price_minor,
+            200
+        );
     }
 
     #[tokio::test]
@@ -504,6 +525,7 @@ mod tests {
         let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
             Err(OzonReportSourceError::Transport),
             Ok(json!({"items":"invalid"})),
+            Ok(json!({"result":{"data":[{"dimensions":[],"metrics":[]}]}})),
         ]))));
         let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
         assert_eq!(
@@ -511,9 +533,13 @@ mod tests {
             Err(OzonReportSourceError::Transport)
         );
         assert_eq!(
-            source.stock_page(None).await,
+            source.collect_stock_pages().await,
             Err(OzonReportSourceError::InvalidStocksResponse)
         );
+        assert!(matches!(
+            source.sales_page(day, day, 0).await,
+            Err(OzonReportSourceError::InvalidSalesResponse { .. })
+        ));
     }
 
     #[test]
@@ -530,6 +556,20 @@ mod tests {
         );
         assert!(!shape.contains("secret"));
         assert!(!shape.contains("123.45"));
+        assert_eq!(
+            sales_response_shape(&json!(true)),
+            "root=bool,result=false,data=not_array"
+        );
+        assert_eq!(
+            sales_response_shape(&json!({"result":{"data":[{"dimensions":true}]}})),
+            "root=object,result=true,data=array:1,dimensions=0:[not_array],metrics=0:[not_array]"
+        );
+        assert_eq!(
+            sales_response_shape(&json!({"result":{"data":[]}})),
+            "root=object,result=true,data=array:0"
+        );
+        assert_eq!(json_kind(&json!("value")), "string");
+        assert_eq!(json_kind(&json!([])), "array");
     }
 
     #[tokio::test]
@@ -570,8 +610,75 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn complete_collection_builds_four_validated_snapshots_without_database_io() {
+        let transport = FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(json!({"result":{"data":[]}})),
+            Ok(json!({"items":[],"cursor":""})),
+            Ok(json!({"items":[],"cursor":""})),
+        ])));
+        let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
+        let period_start = Utc.with_ymd_and_hms(2026, 8, 15, 19, 0, 0).unwrap();
+        let snapshots = collect_complete_snapshots(
+            &transport,
+            vec![CollectedAdvertisingFact {
+                business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
+                campaign_id: 7,
+                sku: 0,
+                impressions: 10,
+                clicks: 1,
+                spend_minor: 100,
+                attributed_orders: 0,
+                attributed_revenue_minor: 0,
+            }],
+            "ozon".to_owned(),
+            as_of,
+            as_of,
+            period_start,
+            as_of,
+            "test-1".to_owned(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshots.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn complete_collection_refuses_an_invalid_performance_fact_atomically() {
+        let transport = FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(json!({"result":{"data":[]}})),
+            Ok(json!({"items":[],"cursor":""})),
+            Ok(json!({"items":[],"cursor":""})),
+        ])));
+        let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
+        let period_start = Utc.with_ymd_and_hms(2026, 8, 15, 19, 0, 0).unwrap();
+        assert_eq!(
+            collect_complete_snapshots(
+                &transport,
+                vec![CollectedAdvertisingFact {
+                    business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
+                    campaign_id: 0,
+                    sku: 0,
+                    impressions: 0,
+                    clicks: 0,
+                    spend_minor: 0,
+                    attributed_orders: 0,
+                    attributed_revenue_minor: 0,
+                }],
+                "ozon".to_owned(),
+                as_of,
+                as_of,
+                period_start,
+                as_of,
+                "test-1".to_owned(),
+            )
+            .await,
+            Err(OzonReportSourceError::InvalidSnapshotInput)
+        );
+    }
+
     #[test]
-    fn complete_facts_become_three_complete_source_snapshots() {
+    fn complete_facts_become_atomic_seller_and_performance_snapshots() {
         let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
         let start = Utc.with_ymd_and_hms(2026, 8, 15, 19, 0, 0).unwrap();
         let facts = OzonCollectedFacts {
@@ -594,19 +701,55 @@ mod tests {
                 old_price_minor: None,
             }],
         };
+        let seller_only = facts
+            .clone()
+            .into_snapshots(
+                "ozon".to_owned(),
+                as_of,
+                as_of,
+                start,
+                as_of,
+                "test-1".to_owned(),
+            )
+            .unwrap();
+        assert_eq!(seller_only.len(), 3);
+        let complete = facts
+            .into_complete_snapshots(
+                vec![CollectedAdvertisingFact {
+                    business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
+                    campaign_id: 7,
+                    sku: 0,
+                    impressions: 10,
+                    clicks: 1,
+                    spend_minor: 100,
+                    attributed_orders: 0,
+                    attributed_revenue_minor: 0,
+                }],
+                "ozon".to_owned(),
+                as_of,
+                as_of,
+                start,
+                as_of,
+                "test-1".to_owned(),
+            )
+            .unwrap();
+        assert_eq!(complete.len(), 4);
+    }
+
+    #[test]
+    fn utc_period_is_mapped_to_the_same_yekaterinburg_business_date() {
+        let start = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 8, 17, 19, 0, 0).unwrap();
         assert_eq!(
-            facts
-                .into_snapshots(
-                    "ozon".to_owned(),
-                    as_of,
-                    as_of,
-                    start,
-                    as_of,
-                    "test-1".to_owned(),
-                )
-                .unwrap()
-                .len(),
-            3
+            report_business_dates(start, end).unwrap(),
+            (
+                NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()
+            )
+        );
+        assert_eq!(
+            report_business_dates(end, start),
+            Err(OzonReportSourceError::InvalidSnapshotInput)
         );
     }
 
@@ -668,6 +811,57 @@ mod tests {
                     .is_err()
             );
         }
+
+        let valid_advertising = || CollectedAdvertisingFact {
+            business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
+            campaign_id: 7,
+            sku: 0,
+            impressions: 10,
+            clicks: 1,
+            spend_minor: 100,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        };
+        assert!(
+            OzonCollectedFacts {
+                sales: vec![valid_sales()],
+                stocks: vec![valid_stock()],
+                prices: Vec::new(),
+            }
+            .into_complete_snapshots(
+                vec![CollectedAdvertisingFact {
+                    campaign_id: 0,
+                    ..valid_advertising()
+                }],
+                "ozon".to_owned(),
+                as_of,
+                as_of,
+                start,
+                as_of,
+                "test-1".to_owned(),
+            )
+            .is_err()
+        );
+        assert!(
+            OzonCollectedFacts {
+                sales: vec![CollectedSalesFact {
+                    sku: 0,
+                    ..valid_sales()
+                }],
+                stocks: vec![valid_stock()],
+                prices: Vec::new(),
+            }
+            .into_complete_snapshots(
+                vec![valid_advertising()],
+                "ozon".to_owned(),
+                as_of,
+                as_of,
+                start,
+                as_of,
+                "test-1".to_owned(),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -736,5 +930,34 @@ mod tests {
             OzonReportSourceError::Upstream(OzonErrorKind::Forbidden).code(),
             "forbidden"
         );
+        for (error, code) in [
+            (OzonReportSourceError::Transport, "transport_error"),
+            (OzonReportSourceError::InvalidResponse, "invalid_response"),
+            (
+                OzonReportSourceError::InvalidSalesResponse {
+                    shape: "bounded".to_owned(),
+                },
+                "invalid_sales_response",
+            ),
+            (
+                OzonReportSourceError::InvalidStocksResponse,
+                "invalid_stocks_response",
+            ),
+            (
+                OzonReportSourceError::InvalidPricesResponse,
+                "invalid_prices_response",
+            ),
+            (
+                OzonReportSourceError::InvalidSnapshotInput,
+                "invalid_snapshot_input",
+            ),
+            (OzonReportSourceError::PaginationLimit, "pagination_limit"),
+        ] {
+            assert_eq!(error.code(), code);
+            assert_eq!(
+                error.diagnostic(),
+                (code == "invalid_sales_response").then_some("bounded")
+            );
+        }
     }
 }

@@ -2,9 +2,12 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
+use mcp_ozon::ozon_performance::StatisticsQuery;
 use mcp_ozon::reporting::{
     collector_service::{ReportCollectorConfig, ReportCollectorMode},
-    ozon_source::{OzonClientReportTransport, OzonReportSource, collect_and_persist},
+    ozon_adapter::parse_performance_daily_advertising,
+    ozon_source::{OzonClientReportTransport, collect_complete_snapshots},
+    postgres_collector::PostgresSnapshotWriter,
 };
 use tokio::signal;
 use tokio::time::{Duration, timeout};
@@ -27,10 +30,12 @@ async fn main() -> Result<()> {
         .init();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let command = parse_command(&arguments)?;
-    let config = ReportCollectorConfig::from_lookup(|key| std::env::var(key).ok())?;
-    let writer = config.connect_writer().await?;
+    let config = ReportCollectorConfig::from_lookup(&mut |key| std::env::var(key).ok())?;
+    let writer = PostgresSnapshotWriter::connect(config.database_config())
+        .await
+        .context("daily report snapshot writer is unavailable")?;
     writer.verify_runtime_contract().await?;
-    let targets = config.collection_plan()?;
+    let targets = config.collection_plan();
     if matches!(&command, Command::Healthcheck) {
         tracing::info!(targets = targets.len(), "report collector preflight passed");
         return Ok(());
@@ -100,21 +105,42 @@ async fn run_ozon_dry_run(
     let (period_start, period_end) = complete_yekaterinburg_day(date, Utc::now())?;
     let store = config.ozon_dry_run_store(account_id)?;
     let client = config.ozon_dry_run_client()?;
-    let source = OzonReportSource::new(OzonClientReportTransport::new(client, store));
+    let performance = config.ozon_dry_run_performance_client()?;
+    let performance_store = store.clone();
+    let transport = OzonClientReportTransport::new(client, store);
     let cutoff_at = Utc::now();
-    let snapshot_ids = timeout(
-        OZON_DRY_RUN_TOTAL_DEADLINE,
-        collect_and_persist(
-            &source,
-            writer,
+    let date_string = date.format("%Y-%m-%d").to_string();
+    let snapshot_ids = timeout(OZON_DRY_RUN_TOTAL_DEADLINE, async {
+        let advertising = performance
+            .daily_statistics(
+                &performance_store,
+                StatisticsQuery {
+                    campaign_ids: Vec::new(),
+                    date_from: date_string.clone(),
+                    date_to: date_string,
+                },
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("performance_{}", error.kind().code()))?;
+        let advertising = parse_performance_daily_advertising(&advertising)
+            .map_err(|_| anyhow::anyhow!("invalid_performance_daily_response"))?;
+        let snapshots = collect_complete_snapshots(
+            &transport,
+            advertising,
             account_id.to_owned(),
             cutoff_at,
             cutoff_at,
             period_start,
             period_end,
             env!("CARGO_PKG_VERSION").to_owned(),
-        ),
-    )
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+        writer
+            .persist_batch(&snapshots)
+            .await
+            .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
+    })
     .await
     .map_err(|_| {
         anyhow::anyhow!(
@@ -122,14 +148,8 @@ async fn run_ozon_dry_run(
         )
     })?
     .map_err(|error| {
-        let diagnostic = error
-            .diagnostic()
-            .map(|value| format!("; shape={value}"))
-            .unwrap_or_default();
         anyhow::anyhow!(
-            "Ozon dry-run failed ({}{}); no partial report snapshots were published",
-            error.code(),
-            diagnostic,
+            "Ozon dry-run failed ({error:#}); no partial report snapshots were published"
         )
     })?;
     tracing::info!(

@@ -159,7 +159,14 @@ impl ReportDataset {
                 )| AdvertisingReportRow {
                     account_id,
                     campaign_id: campaign_id.to_string(),
-                    sku: sku.to_string(),
+                    // Ozon Performance daily statistics is campaign-level.
+                    // Persistence uses zero as an explicit unavailable-SKU
+                    // sentinel; never render it as if product 0 existed.
+                    sku: if sku == 0 {
+                        "N/D".to_owned()
+                    } else {
+                        sku.to_string()
+                    },
                     impressions,
                     clicks,
                     spend_minor: spend,
@@ -476,6 +483,16 @@ mod tests {
         assert_eq!(dataset.advertising_details()[0].campaign_id, "20");
         assert_eq!(dataset.inventory_details()[0].sellable_stock, 7);
         assert_eq!(dataset.quality_details().len(), 4);
+    }
+
+    #[test]
+    fn campaign_level_advertising_never_claims_a_product_sku() {
+        let mut input = facts("store");
+        input.advertising[0].sku = 0;
+        let dataset = ReportDataset::from_published(&manifest(&["store"]), input).unwrap();
+        assert_eq!(dataset.advertising[0].sku, "N/D");
+        assert_eq!(dataset.advertising_details()[0].sku, "N/D");
+        assert_eq!(add_available(None, Some(1)), Ok(None));
     }
 
     #[test]
