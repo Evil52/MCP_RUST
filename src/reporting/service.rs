@@ -1,4 +1,4 @@
-use std::{fs, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{fs, path::Path, str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
 use tokio_postgres::{Config, config::Host};
@@ -21,7 +21,6 @@ const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
 const ARTIFACT_ROOT_ENV: &str = "REPORT_ARTIFACT_ROOT";
 const MODE_ENV: &str = "REPORT_WORKER_MODE";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportWorkerMode {
@@ -69,8 +68,7 @@ impl ReportWorkerConfig {
         let mut database = Config::from_str(&raw_database)
             .context("REPORT_WORKER_DATABASE_URL must be a PostgreSQL URL")?;
         validate_database(&database)?;
-        database.connect_timeout(CONNECT_TIMEOUT);
-        database.application_name("mcp-ozon-report-worker");
+        crate::postgres::harden(&mut database, "mcp-ozon-report-worker");
 
         let registry_path = lookup(ACCESS_CONFIG_ENV).context("MCP_ACCESS_CONFIG is required")?;
         let registry = RegistrySource::new(registry_path)

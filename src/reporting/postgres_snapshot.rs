@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, NaiveDate, Utc};
-use tokio::sync::Mutex;
-use tokio_postgres::{Client, Config, NoTls};
+use tokio_postgres::{Client, Config};
+
+use crate::postgres::SupervisedClient;
 
 use super::snapshot::{
     AccountScope, FrozenSnapshotManifest, Marketplace, SnapshotDescriptor, SnapshotSource,
@@ -71,27 +72,29 @@ pub enum PostgresSnapshotError {
 }
 
 pub struct PostgresSnapshotRepository {
-    client: Mutex<Client>,
+    client: SupervisedClient,
 }
 
 impl PostgresSnapshotRepository {
     pub async fn connect(config: &Config) -> Result<Self, PostgresSnapshotError> {
-        let (client, connection) = config
-            .connect(NoTls)
+        let client = SupervisedClient::connect(config, "mcp-ozon-report-worker")
             .await
             .map_err(|_| PostgresSnapshotError::Unavailable)?;
-        std::mem::drop(tokio::spawn(connection));
-        Ok(Self::from_client(client))
+        Ok(Self { client })
     }
 
     pub fn from_client(client: Client) -> Self {
         Self {
-            client: Mutex::new(client),
+            client: SupervisedClient::preconnected(client, "mcp-ozon-report-worker"),
         }
     }
 
     pub async fn verify_runtime_contract(&self) -> Result<(), PostgresSnapshotError> {
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresSnapshotError::Unavailable)?;
         let row = client
             .query_one(
                 "SELECT current_user = 'report_worker' \
@@ -128,7 +131,11 @@ impl PostgresSnapshotRepository {
             .iter()
             .map(|account| account.account_id().to_owned())
             .collect::<Vec<_>>();
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresSnapshotError::Unavailable)?;
         let rows = client
             .query(
                 "SELECT id, account_id, marketplace, source, cutoff_at, source_as_of, \
@@ -185,7 +192,11 @@ impl PostgresSnapshotRepository {
             .iter()
             .map(|snapshot| snapshot.account_id())
             .collect::<BTreeSet<_>>();
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresSnapshotError::Unavailable)?;
         let sales_rows = client
             .query(
                 "SELECT account_id, business_date, sku, ordered_units, \

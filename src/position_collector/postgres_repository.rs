@@ -2,8 +2,9 @@ use std::{future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
-use tokio_postgres::{Client, Config, NoTls, Transaction, types::ToSql};
+use tokio_postgres::{Client, Config, Transaction, types::ToSql};
+
+use crate::postgres::SupervisedClient;
 
 use super::{
     BatchPlan, BatchStatus, CircuitReason, MeasurementRecord, MonitorTarget, PersistOutcome,
@@ -17,28 +18,31 @@ const SOURCE: &str = "ozon_public_search";
 /// The connection is deliberately supplied as a parsed `Config`, so this type
 /// never logs or returns a database URL containing credentials.
 pub struct PostgresRepository {
-    client: Mutex<Client>,
+    client: SupervisedClient,
 }
 
 impl PostgresRepository {
     pub async fn connect(config: &Config) -> Result<Self, RepositoryError> {
-        let (client, connection) = config.connect(NoTls).await?;
-        std::mem::drop(tokio::spawn(connection));
-        Ok(Self {
-            client: Mutex::new(client),
-        })
+        let client = SupervisedClient::connect(config, "mcp-ozon-position-collector")
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
+        Ok(Self { client })
     }
 
     pub fn from_client(client: Client) -> Self {
         Self {
-            client: Mutex::new(client),
+            client: SupervisedClient::preconnected(client, "mcp-ozon-position-collector"),
         }
     }
 
     /// Verifies the exact least-privilege database contract required by the
     /// disabled runtime without reading marketplace history.
     pub async fn verify_runtime_contract(&self) -> Result<(), RepositoryError> {
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
         let row = client
             .query_one(
                 "SELECT current_user = 'position_collector', \
@@ -74,7 +78,11 @@ impl PostgresRepository {
         &self,
         slot: DateTime<Utc>,
     ) -> Result<BatchPlan, RepositoryError> {
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
         let rows = client
             .query(
                 "SELECT id, store_id, product_id, search_phrase, region_code, \
@@ -108,7 +116,11 @@ impl PostgresRepository {
         batch: &PersistenceBatch,
     ) -> Result<PersistOutcome, RepositoryError> {
         let digest = payload_digest(batch);
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| RepositoryError::Unavailable)?;
         let transaction = client.transaction().await?;
 
         let inserted = transaction

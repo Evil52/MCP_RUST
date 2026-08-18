@@ -22,7 +22,6 @@ const POLICY_PATH_ENV: &str = "DAILY_REPORT_POLICY";
 const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
 const MODE_ENV: &str = "REPORT_COLLECTOR_MODE";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // A completed daily snapshot needs bounded read-only Seller and Performance requests.
 // Ozon can legitimately take longer than an interactive MCP request, so the
 // explicit manual dry-run allows one minute per request. Automatic collection
@@ -66,8 +65,7 @@ impl ReportCollectorConfig {
         let mut database = Config::from_str(&raw_database)
             .context("REPORT_COLLECTOR_DATABASE_URL must be a PostgreSQL URL")?;
         validate_database(&database)?;
-        database.connect_timeout(CONNECT_TIMEOUT);
-        database.application_name("mcp-ozon-report-collector");
+        crate::postgres::harden(&mut database, "mcp-ozon-report-collector");
 
         let registry_path = lookup(ACCESS_CONFIG_ENV).context("MCP_ACCESS_CONFIG is required")?;
         let registry = RegistrySource::new(registry_path)

@@ -7,7 +7,7 @@ use std::{
 
 use chrono::{DateTime, NaiveDate, Utc};
 use reqwest::{
-    Client, Method, Response, StatusCode, Url,
+    Client, Method, Proxy, Response, StatusCode, Url,
     header::{AUTHORIZATION, HeaderMap, HeaderValue, RETRY_AFTER},
     redirect::Policy,
 };
@@ -824,6 +824,25 @@ impl WbClient {
         )
     }
 
+    /// Builds a client which uses one deployment-owned HTTPS forward proxy.
+    ///
+    /// Ambient proxy variables remain disabled. This constructor is reserved
+    /// for the isolated report collector; the proxy itself pins the exact WB
+    /// read-only API hosts that the central endpoint allowlist can reach.
+    pub fn new_with_https_proxy(
+        timeout: Duration,
+        accounts: BTreeMap<String, WbCredentials>,
+        proxy_url: &str,
+    ) -> Result<Self, reqwest::Error> {
+        Self::try_build(
+            timeout,
+            accounts,
+            BaseUrls::production(),
+            ClientPolicy::production(timeout),
+            Some(proxy_url),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(
         timeout: Duration,
@@ -860,6 +879,17 @@ impl WbClient {
         base_urls: BaseUrls,
         policy: ClientPolicy,
     ) -> Self {
+        Self::try_build(timeout, accounts, base_urls, policy, None)
+            .expect("static WB HTTP client configuration must be valid")
+    }
+
+    fn try_build(
+        timeout: Duration,
+        accounts: BTreeMap<String, WbCredentials>,
+        base_urls: BaseUrls,
+        policy: ClientPolicy,
+        explicit_https_proxy: Option<&str>,
+    ) -> Result<Self, reqwest::Error> {
         let http = Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
@@ -875,8 +905,12 @@ impl WbClient {
             .http2_adaptive_window(true)
             .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
             .http2_keep_alive_while_idle(true)
-            .build()
-            .expect("static WB HTTP client configuration must be valid");
+            .no_proxy();
+        let http = match explicit_https_proxy {
+            Some(proxy_url) => http.proxy(Proxy::https(proxy_url)?),
+            None => http,
+        }
+        .build()?;
         // WB enforces quotas per seller token, not per local account alias.
         // Reusing the same Arc makes aliases consume one shared quota without
         // ever logging or returning the token used as the temporary map key.
@@ -890,7 +924,7 @@ impl WbClient {
                 (account.clone(), Arc::clone(limiter))
             })
             .collect();
-        Self {
+        Ok(Self {
             http,
             base_urls,
             accounts: Arc::new(accounts),
@@ -898,7 +932,7 @@ impl WbClient {
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT_REQUESTS)),
             logical_timeout: policy.logical_timeout,
             policy,
-        }
+        })
     }
 
     pub fn empty(timeout: Duration) -> Self {

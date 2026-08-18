@@ -1,8 +1,9 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
-use tokio::sync::Mutex;
-use tokio_postgres::{Client, Config, NoTls, Transaction};
+use tokio_postgres::{Client, Config, Transaction};
+
+use crate::postgres::SupervisedClient;
 
 use super::{
     PendingDelivery, ReportKey, ReportKind,
@@ -72,27 +73,29 @@ pub enum PostgresOutboxError {
 }
 
 pub struct PostgresOutboxRepository {
-    client: Mutex<Client>,
+    client: SupervisedClient,
 }
 
 impl PostgresOutboxRepository {
     pub async fn connect(config: &Config) -> Result<Self, PostgresOutboxError> {
-        let (client, connection) = config
-            .connect(NoTls)
+        let client = SupervisedClient::connect(config, "mcp-ozon-report-worker")
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
-        std::mem::drop(tokio::spawn(connection));
-        Ok(Self::from_client(client))
+        Ok(Self { client })
     }
 
     pub fn from_client(client: Client) -> Self {
         Self {
-            client: Mutex::new(client),
+            client: SupervisedClient::preconnected(client, "mcp-ozon-report-worker"),
         }
     }
 
     pub async fn verify_runtime_contract(&self) -> Result<(), PostgresOutboxError> {
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let row = client
             .query_one(
                 "SELECT current_user = 'report_worker' \
@@ -128,7 +131,11 @@ impl PostgresOutboxRepository {
     ) -> Result<CreateOutcome, PostgresOutboxError> {
         let record =
             DeliveryRecord::planned(delivery).map_err(|_| PostgresOutboxError::InvalidDelivery)?;
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let transaction = client
             .transaction()
             .await
@@ -155,7 +162,11 @@ impl PostgresOutboxRepository {
         let version =
             i32::try_from(report_version).map_err(|_| PostgresOutboxError::InvalidDelivery)?;
         let date = business_date(now);
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let rows = client
             .query(
                 "SELECT report_kind FROM daily_reporting.delivery_coverage \
@@ -227,7 +238,11 @@ impl PostgresOutboxRepository {
         if batch_id <= 0 {
             return Err(PostgresOutboxError::InvalidDelivery);
         }
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let rows = client
             .query(
                 "SELECT batch.status, batch.recipient_id, batch.report_version, \
@@ -276,7 +291,11 @@ impl PostgresOutboxRepository {
         if limit == 0 || limit > MAX_GENERATION_CANDIDATES {
             return Err(PostgresOutboxError::InvalidDelivery);
         }
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let rows = client
             .query(
                 "SELECT batch.id \
@@ -302,7 +321,11 @@ impl PostgresOutboxRepository {
         artifact: &ArtifactIdentity,
     ) -> Result<(), PostgresOutboxError> {
         validate_artifact(artifact).map_err(|_| PostgresOutboxError::InvalidDelivery)?;
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let rows = client
             .query(
                 "SELECT batch.status, batch.recipient_id, batch.report_version, \
@@ -354,7 +377,11 @@ impl PostgresOutboxRepository {
         artifact: &ArtifactIdentity,
     ) -> Result<(), PostgresOutboxError> {
         validate_artifact(artifact).map_err(|_| PostgresOutboxError::InvalidDelivery)?;
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let changed = client
             .execute(
                 "UPDATE daily_reporting.delivery_batches \
@@ -403,7 +430,11 @@ impl PostgresOutboxRepository {
         &self,
         now: DateTime<Utc>,
     ) -> Result<Option<ClaimedDelivery>, PostgresOutboxError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let transaction = client
             .transaction()
             .await
@@ -584,7 +615,11 @@ impl PostgresOutboxRepository {
     }
 
     async fn transition(&self, batch_id: i64, sql: &str) -> Result<(), PostgresOutboxError> {
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let changed = client
             .execute(sql, &[&batch_id])
             .await
@@ -603,7 +638,11 @@ impl PostgresOutboxRepository {
         provider_message_id: Option<&str>,
         retry_at: Option<DateTime<Utc>>,
     ) -> Result<(), PostgresOutboxError> {
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
         let transaction = client
             .transaction()
             .await

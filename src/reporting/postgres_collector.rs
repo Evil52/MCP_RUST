@@ -3,8 +3,9 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
-use tokio_postgres::{Client, Config, NoTls, Transaction};
+use tokio_postgres::{Client, Config, Transaction};
+
+use crate::postgres::SupervisedClient;
 
 use super::snapshot::{Marketplace, SnapshotDescriptor, SnapshotSource, SnapshotStatus};
 
@@ -159,27 +160,29 @@ pub enum PostgresCollectorError {
 }
 
 pub struct PostgresSnapshotWriter {
-    client: Mutex<Client>,
+    client: SupervisedClient,
 }
 
 impl PostgresSnapshotWriter {
     pub async fn connect(config: &Config) -> Result<Self, PostgresCollectorError> {
-        let (client, connection) = config
-            .connect(NoTls)
+        let client = SupervisedClient::connect(config, "mcp-ozon-report-collector")
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
-        std::mem::drop(tokio::spawn(connection));
-        Ok(Self::from_client(client))
+        Ok(Self { client })
     }
 
     pub fn from_client(client: Client) -> Self {
         Self {
-            client: Mutex::new(client),
+            client: SupervisedClient::preconnected(client, "mcp-ozon-report-collector"),
         }
     }
 
     pub async fn verify_runtime_contract(&self) -> Result<(), PostgresCollectorError> {
-        let client = self.client.lock().await;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
         let row = client
             .query_one(
                 "SELECT current_user = 'report_collector' \
@@ -231,7 +234,11 @@ impl PostgresSnapshotWriter {
         if snapshots.is_empty() {
             return Err(PostgresCollectorError::InvalidInput);
         }
-        let mut client = self.client.lock().await;
+        let mut client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
         let transaction = client
             .transaction()
             .await
