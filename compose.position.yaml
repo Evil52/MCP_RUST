@@ -81,9 +81,10 @@ services:
       start_period: 10s
 
   # The only component with external connectivity in the reporting stack.
-  # Its in-image Squid policy permits CONNECT tunnels solely to the Ozon
-  # Seller and Performance hosts; report-collector stays off this outbound
-  # network.
+  # Its in-image Squid policy permits CONNECT tunnels solely to the exact Ozon
+  # Seller/Performance and WB Analytics/Prices/Promotion hosts. Marketplace
+  # credentials remain in report-collector; the proxy receives no secret
+  # environment and cannot select any additional destination.
   ozon-egress:
     image: mcp-ozon-egress:local
     build:

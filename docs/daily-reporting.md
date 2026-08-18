@@ -38,6 +38,11 @@ The first disabled-only phase provides:
   policy-scoped Ozon Seller and Performance read credentials, reaches the two
   fixed API hosts through the deployment-owned CONNECT proxy, normalizes one
   completed EKB business day and publishes all four sources atomically; and
+- an explicit operator-only `wb-dry-run` command which loads only one
+  policy-scoped Personal WB token, collects the documented daily sales-funnel,
+  current warehouse-stock, current price and eligible-campaign statistics
+  endpoints through the exact-host CONNECT proxy, and publishes all four
+  normalized sources atomically; and
 - campaign-level Ozon Performance daily rows stored with the explicit
   unavailable-SKU sentinel and rendered as `N/D`, never as a fabricated
   product attribution; and
@@ -103,9 +108,9 @@ tokens and actual addresses must not be committed.
 ## Not implemented yet
 
 The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
-writer, bounded fact reader and report dataset are present. A manual, bounded
-Ozon Seller + Performance adapter is available for a policy-scoped canary, but
-automatic marketplace collection and every WB report adapter remain disabled.
+writer, bounded fact reader and report dataset are present. Manual bounded Ozon
+and WB adapters are available for policy-scoped canaries, but automatic
+marketplace collection remains disabled.
 No scheduler is enabled in the shipped Compose configuration, and no S3 writer
 or mail provider is wired. An opt-in `REPORT_WORKER_MODE=dry_run` runtime ticks
 once per minute, plans due 08:00/17:00 EKB occurrences and retries only
@@ -144,6 +149,25 @@ artifact volume and only then marks that exact batch ready. Repeating it can
 only reproduce or reuse the same bytes. The hardened production container has
 a read-only root filesystem plus one dedicated artifact volume.
 
+The separate collector has two explicit one-account canary commands:
+
+```text
+REPORT_COLLECTOR_MODE=ozon_dry_run report-collector \
+  ozon-dry-run <account-id> <completed-YYYY-MM-DD>
+
+REPORT_COLLECTOR_MODE=wb_dry_run report-collector \
+  wb-dry-run <account-id> <completed-YYYY-MM-DD>
+```
+
+The account must already belong to the validated disabled report policy. Ozon
+mode resolves only that account's Seller and Performance bindings; WB mode
+resolves only that account's Personal token. Secret values must be injected by
+the runtime under the environment-variable names from the access registry,
+never placed in a command line or committed file. Each invocation is bounded
+to ten minutes and publishes the exact four-source snapshot set in one database
+transaction. A timeout or malformed/incomplete source publishes nothing. The
+shipped Compose mode remains `disabled`, so neither command runs on a schedule.
+
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every
 tick is bounded to 16 generation candidates; missed timer ticks are skipped,
@@ -164,7 +188,7 @@ an ambiguous provider result is never retried automatically.
 ## Planned pilot
 
 1. Validate a manual Ozon four-source preview for Diana and add the
-   corresponding WB read-only collector.
+   corresponding manual WB four-source preview for Vahrusheva/Torsunova.
 2. Run the opt-in scheduler dry mode for Diana and Vahrusheva/Torsunova after
    both marketplace collectors publish complete manifests.
 3. Connect S3-compatible artifact storage and one service mailbox.

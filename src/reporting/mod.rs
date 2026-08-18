@@ -28,6 +28,8 @@ pub mod rules;
 pub mod scheduler;
 pub mod service;
 pub mod snapshot;
+pub mod wb_adapter;
+pub mod wb_source;
 pub mod xlsx;
 
 const YEKATERINBURG_OFFSET_SECONDS: i32 = 5 * 60 * 60;

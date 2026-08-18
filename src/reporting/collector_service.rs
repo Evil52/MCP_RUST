@@ -6,10 +6,11 @@ use tokio_postgres::{Config, config::Host};
 use crate::{
     config::{
         AccessRegistry, Marketplace, PerformanceCredentials, RegistrySource, StoreCredentials,
-        StoreId,
+        StoreId, validate_wb_token_type,
     },
     ozon::OzonClient,
     ozon_performance::PerformanceClient,
+    wb::{WbClient, WbCredentials},
 };
 
 use super::{
@@ -28,7 +29,7 @@ const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 // is still disabled and the source set is published atomically.
 const OZON_DRY_RUN_TIMEOUT: Duration = Duration::from_secs(60);
 const OZON_SELLER_API_BASE_URL: &str = "https://api-seller.ozon.ru";
-const OZON_REPORT_EGRESS_PROXY: &str = "http://ozon-egress:3128";
+const REPORT_EGRESS_PROXY: &str = "http://ozon-egress:3128";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportCollectorMode {
@@ -36,13 +37,16 @@ pub enum ReportCollectorMode {
     /// Explicit operator-only mode for one atomic Ozon Seller + Performance
     /// canary snapshot. Automatic scheduling remains unavailable.
     OzonDryRun,
+    /// Explicit operator-only mode for one atomic Wildberries report canary.
+    /// It loads only policy-scoped WB read credentials and never schedules.
+    WbDryRun,
 }
 
 /// Configuration for the disabled runtime and explicit Ozon canary command.
 ///
 /// Disabled mode never resolves marketplace credentials. Ozon dry-run resolves
-/// only the exact Seller and Performance bindings selected by the validated
-/// policy. Wildberries credentials are never loaded in this phase.
+/// only the exact marketplace bindings selected by the validated policy and
+/// the explicit mode. Credentials for the other marketplace are never loaded.
 pub struct ReportCollectorConfig {
     database: Config,
     mode: ReportCollectorMode,
@@ -51,6 +55,7 @@ pub struct ReportCollectorConfig {
     collection_plan: Vec<CollectionTarget>,
     ozon_dry_run_stores: BTreeMap<StoreId, StoreCredentials>,
     ozon_dry_run_performance: BTreeMap<StoreId, PerformanceCredentials>,
+    wb_dry_run_accounts: BTreeMap<String, WbCredentials>,
 }
 
 impl ReportCollectorConfig {
@@ -58,6 +63,7 @@ impl ReportCollectorConfig {
         let mode = match lookup(MODE_ENV).as_deref().unwrap_or("disabled") {
             "disabled" => ReportCollectorMode::Disabled,
             "ozon_dry_run" => ReportCollectorMode::OzonDryRun,
+            "wb_dry_run" => ReportCollectorMode::WbDryRun,
             _ => bail!("report-collector mode is unsupported"),
         };
         let raw_database =
@@ -80,11 +86,18 @@ impl ReportCollectorConfig {
             .context("DAILY_REPORT_POLICY is invalid")?;
         let collection_plan = build_collection_plan(&policy, &registry)
             .context("daily report collection plan is invalid")?;
-        let (ozon_dry_run_stores, ozon_dry_run_performance) = match mode {
-            ReportCollectorMode::Disabled => (BTreeMap::new(), BTreeMap::new()),
+        let (ozon_dry_run_stores, ozon_dry_run_performance, wb_dry_run_accounts) = match mode {
+            ReportCollectorMode::Disabled => (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
             ReportCollectorMode::OzonDryRun => {
-                resolve_ozon_dry_run_stores(&registry, &collection_plan, lookup)?
+                let (seller, performance) =
+                    resolve_ozon_dry_run_stores(&registry, &collection_plan, lookup)?;
+                (seller, performance, BTreeMap::new())
             }
+            ReportCollectorMode::WbDryRun => (
+                BTreeMap::new(),
+                BTreeMap::new(),
+                resolve_wb_dry_run_accounts(&registry, &collection_plan, lookup)?,
+            ),
         };
         Ok(Self {
             database,
@@ -94,6 +107,7 @@ impl ReportCollectorConfig {
             collection_plan,
             ozon_dry_run_stores,
             ozon_dry_run_performance,
+            wb_dry_run_accounts,
         })
     }
 
@@ -128,7 +142,7 @@ impl ReportCollectorConfig {
             OZON_SELLER_API_BASE_URL.to_owned(),
             OZON_DRY_RUN_TIMEOUT,
             self.ozon_dry_run_stores.clone(),
-            OZON_REPORT_EGRESS_PROXY,
+            REPORT_EGRESS_PROXY,
         )
         .expect("fixed Ozon dry-run client configuration is valid"))
     }
@@ -144,7 +158,7 @@ impl ReportCollectorConfig {
         PerformanceClient::new_with_https_proxy(
             OZON_DRY_RUN_TIMEOUT,
             self.ozon_dry_run_performance.clone(),
-            OZON_REPORT_EGRESS_PROXY,
+            REPORT_EGRESS_PROXY,
         )
         .context("fixed Ozon Performance dry-run client configuration is invalid")
     }
@@ -186,6 +200,39 @@ impl ReportCollectorConfig {
             "Ozon report credentials are unavailable"
         );
         Ok(store_id)
+    }
+
+    /// Builds a WB client containing only policy-selected accounts. It uses
+    /// the deployment-owned egress proxy and is unavailable in every other
+    /// collector mode.
+    pub fn wb_dry_run_client(&self) -> Result<WbClient> {
+        ensure!(
+            self.mode == ReportCollectorMode::WbDryRun && !self.wb_dry_run_accounts.is_empty(),
+            "WB dry-run credentials are unavailable outside WB dry-run mode"
+        );
+        WbClient::new_with_https_proxy(
+            OZON_DRY_RUN_TIMEOUT,
+            self.wb_dry_run_accounts.clone(),
+            REPORT_EGRESS_PROXY,
+        )
+        .context("fixed WB dry-run client configuration is invalid")
+    }
+
+    /// Resolves a caller-supplied account only after matching the validated
+    /// policy plan and the exact WB credential map.
+    pub fn wb_dry_run_account(&self, account_id: &str) -> Result<String> {
+        ensure!(
+            self.mode == ReportCollectorMode::WbDryRun,
+            "WB dry-run account is unavailable outside WB dry-run mode"
+        );
+        ensure!(
+            self.collection_plan.iter().any(|target| {
+                target.account_id == account_id
+                    && target.marketplace == super::snapshot::Marketplace::Wildberries
+            }) && self.wb_dry_run_accounts.contains_key(account_id),
+            "WB report account is not selected by the policy"
+        );
+        Ok(account_id.to_owned())
     }
 }
 
@@ -264,6 +311,39 @@ fn resolve_ozon_dry_run_stores(
     Ok((seller_stores, performance_stores))
 }
 
+fn resolve_wb_dry_run_accounts(
+    registry: &AccessRegistry,
+    plan: &[CollectionTarget],
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<BTreeMap<String, WbCredentials>> {
+    let mut accounts = BTreeMap::new();
+    for target in plan
+        .iter()
+        .filter(|target| target.marketplace == super::snapshot::Marketplace::Wildberries)
+    {
+        let account = registry
+            .accounts
+            .iter()
+            .find(|account| {
+                account.id == target.account_id && account.marketplace == Marketplace::Wildberries
+            })
+            .context("WB report account is unavailable")?;
+        let binding = account
+            .wildberries
+            .as_ref()
+            .context("WB report binding is unavailable")?;
+        let token = lookup(&binding.api_token_env)
+            .with_context(|| format!("{} is required for WB dry-run", binding.api_token_env))?;
+        validate_wb_token_type(&token, &binding.api_token_env)?;
+        accounts.insert(account.id.clone(), WbCredentials { token });
+    }
+    ensure!(
+        !accounts.is_empty(),
+        "the report policy contains no WB account for WB dry-run"
+    );
+    Ok(accounts)
+}
+
 fn validate_database(config: &Config) -> Result<()> {
     ensure!(
         config.get_user() == Some("report_collector")
@@ -297,6 +377,8 @@ mod tests {
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     use super::*;
 
@@ -336,6 +418,13 @@ mod tests {
                 .iter()
                 .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
         })
+    }
+
+    fn personal_wb_token() -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+        let claims = URL_SAFE_NO_PAD.encode(br#"{"acc":3}"#);
+        let signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
+        format!("{header}.{claims}.{signature}")
     }
 
     #[test]
@@ -426,5 +515,47 @@ mod tests {
             missing.retain(|(entry, _)| *entry != key);
             assert!(config(&missing).is_err(), "missing {key}");
         }
+    }
+
+    #[test]
+    fn explicit_wb_dry_run_resolves_only_policy_scoped_personal_token() {
+        let mixed_policy = file(
+            "wb-policy",
+            r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]},{"actor_id":"wb","account_ids":["wb"]}]}]}"#,
+        );
+        let mut values = entries();
+        values[2] = (POLICY_PATH_ENV, mixed_policy.display().to_string());
+        values.extend([
+            (MODE_ENV, "wb_dry_run".to_owned()),
+            ("WB_TOKEN", personal_wb_token()),
+            // Ozon credentials are deliberately absent: WB mode must not
+            // resolve or require bindings for the other marketplace.
+        ]);
+        let dry_run = config(&values).unwrap();
+        assert_eq!(dry_run.mode(), ReportCollectorMode::WbDryRun);
+        assert!(dry_run.wb_dry_run_client().unwrap().is_configured("wb"));
+        assert_eq!(dry_run.wb_dry_run_account("wb").unwrap(), "wb");
+        assert!(dry_run.wb_dry_run_account("ozon").is_err());
+        assert!(dry_run.ozon_dry_run_client().is_err());
+
+        let mut missing = values.clone();
+        missing.retain(|(key, _)| *key != "WB_TOKEN");
+        assert!(config(&missing).is_err());
+        let mut wrong_type = values;
+        wrong_type
+            .iter_mut()
+            .find(|(key, _)| *key == "WB_TOKEN")
+            .unwrap()
+            .1 = {
+            let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+            let claims = URL_SAFE_NO_PAD.encode(br#"{"acc":1}"#);
+            let signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
+            format!("{header}.{claims}.{signature}")
+        };
+        assert!(config(&wrong_type).is_err());
+
+        let disabled = config(&entries()).unwrap();
+        assert!(disabled.wb_dry_run_client().is_err());
+        assert!(disabled.wb_dry_run_account("wb").is_err());
     }
 }

@@ -652,13 +652,13 @@ check_contains \
   "$project_dir/compose.position.yaml" \
   "\${DAILY_REPORT_POLICY_HOST:-./config/daily-report-pilot.example.json}"
 check_contains \
-  "ozon egress: proxy permits the exact Seller and Performance API hosts" \
+  "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
-  "acl ozon_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru"
+  "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"
 check_contains \
-  "ozon egress: proxy applies the exact read API host allowlist" \
+  "report egress: proxy applies the exact read API host allowlist" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
-  "http_access allow connect ozon_read_api tls_port"
+  "http_access allow connect marketplace_read_api tls_port"
 check_contains \
   "ozon egress: proxy denies every other destination" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
