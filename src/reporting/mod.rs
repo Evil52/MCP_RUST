@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
 use thiserror::Error;
 
+pub mod artifact_store;
 pub mod bundle;
 pub mod collector_plan;
 pub mod collector_service;

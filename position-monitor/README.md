@@ -53,10 +53,14 @@ coverage, bounded delivery state, append-only provider attempts and normalized
 sales, advertising, stock and price snapshots. A dedicated `report_collector`
 can append and finalize snapshots; `report_worker` can read only terminal
 published projections and operate the outbox. It does not store email bodies,
-credentials or marketplace payloads.
+credentials or marketplace payloads. Rendered HTML/XLSX bytes live outside
+PostgreSQL in an immutable artifact store; the outbox keeps only the stable
+XLSX object key and SHA-256.
 There is still no `Поисковая видимость за сутки` Dashboard, task registry,
-email job, or Excel generation process. These are later consumers of persisted
-history. The planned compact view contains collection status and completeness,
+email job, or automatic report-generation process. A manual deterministic
+HTML/XLSX preview and the immutable local storage primitive are implemented,
+but the disabled worker does not invoke them automatically. The planned compact
+view contains collection status and completeness,
 visibility rate, comparisons of complete reporting days, critical products, at
 most five priority problems, manager tasks, and a link to the bounded detailed
 report.
@@ -70,8 +74,9 @@ task workflow.
 
 Detailed Excel workbooks are generated on demand from the same frozen report
 run. They are exports rather than the system of record and are never stored in
-PostgreSQL. See `docs/search-position-monitoring.md` for the complete reporting
-contract.
+PostgreSQL. Existing artifact bytes are never overwritten: a repeated stable
+identity must have the same content hash. See `docs/search-position-monitoring.md`
+for the complete reporting contract.
 
 The initial architecture has five security principals:
 
@@ -152,7 +157,8 @@ positions until a separately reviewed live-source phase is shipped. When ready:
 The init scripts run only when the named volume is empty. A fresh database
 applies the base schema, the additive Ozon collector contract, the additive WB
 migration, restricted role grants, the Ozon adapter digest migration, then the
-daily reporting outbox migration and normalized snapshot migration.
+daily reporting outbox, normalized snapshot, optional-metric and strict
+artifact-identity migrations.
 Password rotation and schema migration after initial deployment must use an
 explicit migration, never volume deletion.
 
@@ -173,6 +179,12 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
   sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
   < position-monitor/initdb/006_daily_report_snapshots.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/007_daily_reporting_optional_metrics.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/008_daily_reporting_artifact_identity.sql
 ```
 
 The migration is transactional. It creates no scheduler and sends no email.

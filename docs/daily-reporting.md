@@ -69,6 +69,14 @@ The first disabled-only phase provides:
   the validated audience policy, loads an exact published cutoff, verifies the
   requested morning/evening interval, renders both artifacts and writes them
   with create-new semantics to an existing operator-selected directory;
+- a local immutable artifact-store boundary that persists the deterministic
+  XLSX and HTML siblings under the stable report identity, verifies content
+  hashes on every retry, refuses path traversal and symbolic links, and never
+  overwrites different bytes; and
+- an idempotent publication operation that validates an artifact against the
+  exact outbox recipient/date/version/coverage, commits files before changing
+  the batch to `ready`, and safely reuses the same files after an ambiguous
+  database response;
 - an isolated `report-worker` binary that accepts only a restricted
   `report_worker` PostgreSQL URL, access-registry path and strict report policy;
   it validates both least-privilege database contracts before serving and is
@@ -96,10 +104,12 @@ The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
 writer, bounded fact reader and report dataset are present. A manual, bounded
 Ozon Seller + Performance adapter is available for a policy-scoped canary, but
 automatic marketplace collection and every WB report adapter remain disabled.
-No enabled scheduler process, S3 writer or mail provider is wired. Manual
+No enabled scheduler process, production artifact volume, S3 writer or mail
+provider is wired. Manual
 HTML/XLSX previews can be generated from an already published complete
-four-source manifest, but they are not uploaded, persisted as delivery
-artifacts or connected to the outbox. Consolidated two-period
+four-source manifest. The immutable local store and outbox-publication
+primitive are covered by tests but are not invoked by the disabled production
+worker yet. Consolidated two-period
 catch-up rendering remains fail-closed until it has an explicit two-section
 template rather than silently presenting one interval as two reports.
 Consequently this phase cannot send email and cannot affect a
@@ -133,7 +143,8 @@ an ambiguous provider result is never retried automatically.
 
 1. Validate a manual Ozon four-source preview for Diana and add the
    corresponding WB read-only collector.
-2. Add immutable object storage and connect the validated bundle to the outbox.
+2. Mount the immutable artifact volume in the hardened worker and invoke the
+   tested publication primitive from a policy-scoped generation claim.
 3. Add the scheduler/runtime around the persisted PostgreSQL outbox and run dry
    mode for Diana and Vahrusheva/Torsunova with delivery disabled.
 4. Connect S3-compatible artifact storage and one service mailbox.

@@ -5,7 +5,9 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, Config, NoTls, Transaction};
 
 use super::{
-    PendingDelivery, ReportKey, ReportKind, business_date, delivery_deadline,
+    PendingDelivery, ReportKey, ReportKind,
+    bundle::artifact_object_key,
+    business_date, delivery_deadline,
     outbox::{
         ArtifactIdentity, DeliveryErrorClass, DeliveryRecord, validate_artifact,
         validate_provider_message_id,
@@ -80,6 +82,9 @@ impl PostgresOutboxRepository {
                         'daily_reporting.delivery_batches', 'INSERT') \
                     AND has_column_privilege(current_user, \
                         'daily_reporting.delivery_batches', 'status', 'UPDATE') \
+                    AND has_column_privilege(current_user, \
+                        'daily_reporting.delivery_batches', \
+                        'artifact_html_sha256', 'UPDATE') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.delivery_coverage', 'SELECT,INSERT') \
                     AND has_table_privilege(current_user, \
@@ -187,6 +192,58 @@ impl PostgresOutboxRepository {
         .await
     }
 
+    pub(super) async fn verify_generation_artifact(
+        &self,
+        batch_id: i64,
+        artifact: &ArtifactIdentity,
+    ) -> Result<(), PostgresOutboxError> {
+        validate_artifact(artifact).map_err(|_| PostgresOutboxError::InvalidDelivery)?;
+        let client = self.client.lock().await;
+        let rows = client
+            .query(
+                "SELECT batch.status, batch.recipient_id, batch.report_version, \
+                        coverage.local_date, coverage.report_kind \
+                 FROM daily_reporting.delivery_batches AS batch \
+                 JOIN daily_reporting.delivery_coverage AS coverage \
+                   ON coverage.batch_id = batch.id \
+                 WHERE batch.id = $1 ORDER BY coverage.report_kind",
+                &[&batch_id],
+            )
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
+        let first = rows.first().ok_or(PostgresOutboxError::Conflict)?;
+        let status: &str = first.get(0);
+        if !matches!(status, "generating" | "ready")
+            || rows.iter().any(|row| {
+                row.get::<_, &str>(0) != status
+                    || row.get::<_, &str>(1) != first.get::<_, &str>(1)
+                    || row.get::<_, i32>(2) != first.get::<_, i32>(2)
+                    || row.get::<_, chrono::NaiveDate>(3) != first.get::<_, chrono::NaiveDate>(3)
+            })
+        {
+            return Err(PostgresOutboxError::Conflict);
+        }
+        let kind = rows
+            .iter()
+            .map(|row| parse_kind(row.get(4)))
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .max()
+            .ok_or(PostgresOutboxError::Unavailable)?;
+        let report_version =
+            u32::try_from(first.get::<_, i32>(2)).map_err(|_| PostgresOutboxError::Unavailable)?;
+        let key = ReportKey {
+            local_date: first.get(3),
+            kind,
+            recipient_id: first.get(1),
+            report_version,
+        };
+        if artifact.object_key != artifact_object_key(&key) {
+            return Err(PostgresOutboxError::Conflict);
+        }
+        Ok(())
+    }
+
     pub async fn mark_ready(
         &self,
         batch_id: i64,
@@ -198,14 +255,41 @@ impl PostgresOutboxRepository {
             .execute(
                 "UPDATE daily_reporting.delivery_batches \
                  SET status = 'ready', artifact_object_key = $2, artifact_sha256 = $3, \
+                     artifact_html_sha256 = $4, \
                      next_attempt_at = NULL, \
                      updated_at = greatest(clock_timestamp(), updated_at + interval '1 microsecond') \
                  WHERE id = $1 AND status = 'generating'",
-                &[&batch_id, &artifact.object_key, &artifact.sha256],
+                &[
+                    &batch_id,
+                    &artifact.object_key,
+                    &artifact.sha256,
+                    &artifact.html_sha256,
+                ],
             )
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
-        exactly_one(changed)
+        if changed == 1 {
+            return Ok(());
+        }
+        let existing = client
+            .query_opt(
+                "SELECT status = 'ready' AND artifact_object_key = $2 \
+                        AND artifact_sha256 = $3 AND artifact_html_sha256 = $4 \
+                 FROM daily_reporting.delivery_batches WHERE id = $1",
+                &[
+                    &batch_id,
+                    &artifact.object_key,
+                    &artifact.sha256,
+                    &artifact.html_sha256,
+                ],
+            )
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
+        if existing.is_some_and(|row| row.get::<_, bool>(0)) {
+            Ok(())
+        } else {
+            Err(PostgresOutboxError::Conflict)
+        }
     }
 
     /// Claims one ready delivery. A process crash after this point deliberately
@@ -223,7 +307,8 @@ impl PostgresOutboxRepository {
         let row = transaction
             .query_opt(
                 "SELECT batch.id, batch.recipient_id, batch.report_version, \
-                        batch.attempts, batch.artifact_object_key, batch.artifact_sha256 \
+                        batch.attempts, batch.artifact_object_key, batch.artifact_sha256, \
+                        batch.artifact_html_sha256 \
                  FROM daily_reporting.delivery_batches AS batch \
                  WHERE batch.status = 'ready' \
                    AND batch.attempts < 5 \
@@ -253,6 +338,7 @@ impl PostgresOutboxRepository {
             u8::try_from(row.get::<_, i16>(3) + 1).map_err(|_| PostgresOutboxError::Unavailable)?;
         let object_key: String = row.get(4);
         let sha256: String = row.get(5);
+        let html_sha256: String = row.get(6);
         let coverage = transaction
             .query(
                 "SELECT local_date, report_kind \
@@ -294,7 +380,11 @@ impl PostgresOutboxRepository {
             recipient_id,
             report_version,
             attempt_no,
-            artifact: ArtifactIdentity { object_key, sha256 },
+            artifact: ArtifactIdentity {
+                object_key,
+                sha256,
+                html_sha256,
+            },
             covered_keys,
         }))
     }

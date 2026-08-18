@@ -55,16 +55,20 @@ SELECT
         'daily_reporting.require_active_delivery_attempt()'
     ) IS NOT NULL
     AND to_regprocedure(
+        'daily_reporting.enforce_delivery_artifact_identity()'
+    ) IS NOT NULL
+    AND to_regprocedure(
         'daily_reporting.enforce_source_snapshot_state()'
     ) IS NOT NULL
     AND to_regprocedure(
         'daily_reporting.require_running_fact_snapshot()'
     ) IS NOT NULL
     AND (
-        SELECT count(*) = 5
+        SELECT count(*) = 6
         FROM pg_trigger
         WHERE tgname IN (
             'delivery_batches_enforce_state',
+            'delivery_batches_enforce_artifact_identity',
             'delivery_coverage_requires_planned_batch',
             'delivery_coverage_is_append_only',
             'delivery_attempts_require_active_send',
@@ -409,6 +413,10 @@ SELECT
     )
     AND has_column_privilege(
         'report_worker', 'daily_reporting.delivery_batches', 'status', 'UPDATE'
+    )
+    AND has_column_privilege(
+        'report_worker', 'daily_reporting.delivery_batches',
+        'artifact_html_sha256', 'UPDATE'
     )
     AND NOT has_table_privilege(
         'report_worker', 'daily_reporting.delivery_batches', 'DELETE'

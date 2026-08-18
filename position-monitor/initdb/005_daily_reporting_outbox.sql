@@ -21,6 +21,7 @@ CREATE TABLE daily_reporting.delivery_batches (
     attempts smallint NOT NULL DEFAULT 0,
     artifact_object_key varchar(512),
     artifact_sha256 char(64),
+    artifact_html_sha256 char(64),
     next_attempt_at timestamptz,
     provider_message_id varchar(512),
     last_error_class text,
@@ -36,10 +37,15 @@ CREATE TABLE daily_reporting.delivery_batches (
     )),
     CHECK (attempts BETWEEN 0 AND 5),
     CHECK (
-        (artifact_object_key IS NULL AND artifact_sha256 IS NULL)
+        (
+            artifact_object_key IS NULL
+            AND artifact_sha256 IS NULL
+            AND artifact_html_sha256 IS NULL
+        )
         OR (
             length(artifact_object_key) BETWEEN 1 AND 512
             AND artifact_sha256 ~ '^[0-9A-Fa-f]{64}$'
+            AND artifact_html_sha256 ~ '^[0-9A-Fa-f]{64}$'
         )
     ),
     CHECK (
@@ -332,7 +338,8 @@ SELECT
     batch.artifact_object_key,
     batch.artifact_sha256,
     batch.next_attempt_at,
-    max(coverage.deadline_at) AS deadline_at
+    max(coverage.deadline_at) AS deadline_at,
+    batch.artifact_html_sha256
 FROM daily_reporting.delivery_batches AS batch
 JOIN daily_reporting.delivery_coverage AS coverage
     ON coverage.batch_id = batch.id
@@ -356,6 +363,7 @@ GRANT UPDATE (
     attempts,
     artifact_object_key,
     artifact_sha256,
+    artifact_html_sha256,
     next_attempt_at,
     provider_message_id,
     last_error_class,

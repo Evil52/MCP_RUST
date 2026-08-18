@@ -2,12 +2,17 @@ use std::{collections::BTreeSet, fs, str::FromStr};
 
 use chrono::{Duration, TimeZone, Utc};
 use mcp_ozon::reporting::{
+    artifact_store::{
+        ArtifactPublicationError, LocalArtifactStore, PersistDisposition, persist_and_mark_ready,
+    },
+    bundle::ReportBundle,
     due_deliveries,
     outbox::{ArtifactIdentity, DeliveryErrorClass},
     policy::{AudiencePolicy, DailyReportPolicy, ManagerScope},
     postgres_outbox::{CreateOutcome, PostgresOutboxError, PostgresOutboxRepository},
     service::ReportWorkerConfig,
 };
+use sha2::{Digest, Sha256};
 use tokio_postgres::Config;
 
 fn utc(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
@@ -15,9 +20,29 @@ fn utc(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
 }
 
 fn artifact() -> ArtifactIdentity {
+    artifact_for("2099/08/16", "integration_owner")
+}
+
+fn artifact_for(date: &str, recipient: &str) -> ArtifactIdentity {
     ArtifactIdentity {
-        object_key: "daily/2099-08-16/integration_owner.xlsx".to_owned(),
-        sha256: "b".repeat(64),
+        object_key: format!("daily-reports/{date}/{recipient}/v1/evening.xlsx"),
+        sha256: Sha256::digest(b"integration-xlsx")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        html_sha256: Sha256::digest(b"<html><body>integration report</body></html>")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    }
+}
+
+fn artifact_bundle() -> ReportBundle {
+    ReportBundle {
+        html: "<html><body>integration report</body></html>".to_owned(),
+        xlsx: b"integration-xlsx".to_vec(),
+        attachment_name: "daily-report-2099-08-16-evening.xlsx".to_owned(),
+        artifact: artifact(),
     }
 }
 
@@ -132,6 +157,7 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
                     has_table_privilege(current_user, 'daily_reporting.delivery_batches', 'SELECT'), \
                     has_table_privilege(current_user, 'daily_reporting.delivery_batches', 'INSERT'), \
                     has_column_privilege(current_user, 'daily_reporting.delivery_batches', 'status', 'UPDATE'), \
+                    has_column_privilege(current_user, 'daily_reporting.delivery_batches', 'artifact_html_sha256', 'UPDATE'), \
                     has_table_privilege(current_user, 'daily_reporting.delivery_coverage', 'SELECT,INSERT'), \
                     has_table_privilege(current_user, 'daily_reporting.delivery_attempts', 'SELECT,INSERT'), \
                     NOT has_schema_privilege(current_user, 'search_position', 'USAGE')",
@@ -139,7 +165,7 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
         )
         .await
         .unwrap();
-    let privilege_values = (0..7)
+    let privilege_values = (0..8)
         .map(|index| privileges.get::<_, bool>(index))
         .collect::<Vec<_>>();
     assert!(
@@ -169,8 +195,46 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
         Err(PostgresOutboxError::Conflict)
     );
 
+    let artifact_root =
+        std::env::temp_dir().join(format!("mcp-ozon-report-artifacts-{}", std::process::id()));
+    fs::create_dir_all(&artifact_root).unwrap();
+    let store = LocalArtifactStore::open(&artifact_root).unwrap();
+    assert!(matches!(
+        persist_and_mark_ready(&store, &repository, batch_id, &artifact_bundle()).await,
+        Err(ArtifactPublicationError::Outbox)
+    ));
     repository.start_generation(batch_id).await.unwrap();
-    repository.mark_ready(batch_id, &artifact()).await.unwrap();
+    let first_receipt = persist_and_mark_ready(&store, &repository, batch_id, &artifact_bundle())
+        .await
+        .unwrap();
+    assert!(matches!(
+        first_receipt.disposition,
+        PersistDisposition::Created | PersistDisposition::Reused
+    ));
+    let retry_receipt = persist_and_mark_ready(&store, &repository, batch_id, &artifact_bundle())
+        .await
+        .unwrap();
+    assert_eq!(retry_receipt.disposition, PersistDisposition::Reused);
+    let mut wrong_bundle = artifact_bundle();
+    wrong_bundle.artifact.object_key =
+        "daily-reports/2099/08/16/foreign/v1/evening.xlsx".to_owned();
+    assert!(matches!(
+        persist_and_mark_ready(&store, &repository, batch_id, &wrong_bundle).await,
+        Err(ArtifactPublicationError::Outbox)
+    ));
+    assert_eq!(
+        repository
+            .mark_ready(
+                batch_id,
+                &ArtifactIdentity {
+                    object_key: artifact().object_key,
+                    sha256: "c".repeat(64),
+                    html_sha256: artifact().html_sha256,
+                }
+            )
+            .await,
+        Err(PostgresOutboxError::Conflict)
+    );
     let first = repository.claim_ready(utc(13, 31)).await.unwrap().unwrap();
     assert_eq!(first.batch_id, batch_id);
     assert_eq!(first.attempt_no, 1);
@@ -263,12 +327,16 @@ async fn repository_rejects_invalid_delivery_inputs_before_writing() {
                 &ArtifactIdentity {
                     object_key: String::new(),
                     sha256: "x".repeat(64),
+                    html_sha256: "x".repeat(64),
                 }
             )
             .await,
         Err(PostgresOutboxError::InvalidDelivery)
     );
-    repository.mark_ready(batch_id, &artifact()).await.unwrap();
+    repository
+        .mark_ready(batch_id, &artifact_for("2099/08/17", "invalid_probe"))
+        .await
+        .unwrap();
     let claim = repository
         .claim_ready(utc(13, 31) + Duration::days(1))
         .await
@@ -322,7 +390,10 @@ async fn repository_rejects_invalid_delivery_inputs_before_writing() {
     };
     repository.start_generation(budget_batch).await.unwrap();
     repository
-        .mark_ready(budget_batch, &artifact())
+        .mark_ready(
+            budget_batch,
+            &artifact_for("2099/08/18", "retry_budget_probe"),
+        )
         .await
         .unwrap();
     for attempt in 1..MAX_TEST_ATTEMPTS {

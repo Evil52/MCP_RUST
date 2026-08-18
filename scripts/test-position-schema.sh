@@ -198,6 +198,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/006_daily_report_snapshots.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/007_daily_reporting_optional_metrics.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/008_daily_reporting_artifact_identity.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -1736,8 +1738,9 @@ expect_failure_containing \
   WHERE id = 1;
   UPDATE daily_reporting.delivery_batches
   SET status = 'ready',
-      artifact_object_key = 'reports/2099-08-16/pilot-owner.xlsx',
+      artifact_object_key = 'daily-reports/2099/08/16/pilot_owner/v1/evening.xlsx',
       artifact_sha256 = repeat('a', 64),
+      artifact_html_sha256 = repeat('b', 64),
       updated_at = updated_at + interval '1 second'
   WHERE id = 1;
   UPDATE daily_reporting.delivery_batches
@@ -1781,6 +1784,36 @@ if [[ "$report_delivery" != "sent:t:1:2:evening:morning:2" ]]; then
 fi
 
 expect_failure_containing \
+  "report artifact identity outside delivery coverage" \
+  "report artifact identity does not match delivery coverage" \
+  "${report_worker_psql[@]}" \
+  --command "
+    INSERT INTO daily_reporting.delivery_batches
+        (recipient_id, report_version, scheduled_for)
+    VALUES ('artifact_probe', 1, '2099-08-17 12:00:00+00');
+    INSERT INTO daily_reporting.delivery_coverage
+        (
+            batch_id, recipient_id, report_version, local_date, report_kind,
+            scheduled_for, deadline_at
+        )
+    SELECT id, recipient_id, report_version, '2099-08-17', 'evening',
+           '2099-08-17 12:00:00+00', '2099-08-17 18:00:00+00'
+    FROM daily_reporting.delivery_batches
+    WHERE recipient_id = 'artifact_probe';
+    UPDATE daily_reporting.delivery_batches
+    SET status = 'generating', updated_at = updated_at + interval '1 second'
+    WHERE recipient_id = 'artifact_probe';
+    UPDATE daily_reporting.delivery_batches
+    SET status = 'ready',
+        artifact_object_key =
+            'daily-reports/2099/08/17/artifact_probe/v1/morning.xlsx',
+        artifact_sha256 = repeat('a', 64),
+        artifact_html_sha256 = repeat('b', 64),
+        updated_at = updated_at + interval '1 second'
+    WHERE recipient_id = 'artifact_probe';
+  "
+
+expect_failure_containing \
   "duplicate report occurrence coverage" \
   "duplicate key value violates unique constraint" \
   "${report_worker_psql[@]}" \
@@ -1793,11 +1826,10 @@ expect_failure_containing \
             batch_id, recipient_id, report_version, local_date, report_kind,
             scheduled_for, deadline_at
         )
-    VALUES
-        (
-            2, 'pilot_owner', 1, '2099-08-16', 'morning',
-            '2099-08-16 03:00:00+00', '2099-08-16 09:00:00+00'
-        )
+    SELECT id, recipient_id, report_version, '2099-08-16', 'morning',
+           '2099-08-16 03:00:00+00', '2099-08-16 09:00:00+00'
+    FROM daily_reporting.delivery_batches
+    WHERE recipient_id = 'pilot_owner' AND status = 'planned'
   "
 
 expect_failure_containing \
