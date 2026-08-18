@@ -126,6 +126,24 @@ async fn supervised_session_probe_recovers_after_the_backend_is_terminated() {
     );
     supervised.probe().await.unwrap();
 
+    // An acquired session can still fail its bounds query. Keep a transaction
+    // deliberately aborted so the fixed pg_settings query is rejected after
+    // acquisition, and prove that startup verification fails closed there too.
+    let aborted_client = connect(&worker_url).await;
+    aborted_client.batch_execute("BEGIN").await.unwrap();
+    assert!(
+        aborted_client
+            .batch_execute("SELECT column_that_does_not_exist")
+            .await
+            .is_err()
+    );
+    let aborted =
+        SupervisedClient::preconnected(aborted_client, "postgres-aborted-hardening-integration");
+    assert_eq!(
+        aborted.verify_session_bounds().await,
+        Err(mcp_ozon::postgres::PostgresUnavailable)
+    );
+
     // A caller-supplied session has deliberately no reconnect configuration.
     // Once it closes, even the health probe must fail closed at acquisition.
     let preconnected_client = connect(&worker_url).await;

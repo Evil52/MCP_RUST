@@ -198,7 +198,8 @@ impl SupervisedClient {
                 &[],
             )
             .await
-            .map_err(|_| PostgresUnavailable)?;
+            .ok()
+            .ok_or(PostgresUnavailable)?;
         let statement_timeout: i64 = row.get(0);
         let idle_in_transaction: i64 = row.get(1);
         let bounded = |value: i64, ceiling: i64| value > 0 && value <= ceiling;

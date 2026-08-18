@@ -520,12 +520,17 @@ fn json_kind(value: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        sync::Mutex,
+    };
 
     use chrono::{NaiveDate, TimeZone, Utc};
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::config::StoreCredentials;
 
     /// A local admission refusal never reached Ozon, so re-offering the page
     /// cannot duplicate a marketplace request. Before this, one transient
@@ -1021,14 +1026,47 @@ mod tests {
         )
         .unwrap();
         let transport = OzonClientReportTransport::new(client, StoreId::from("missing"));
-        assert!(matches!(
-            transport
-                .post(product_page_request("/v4/product/info/stocks", None).unwrap())
-                .await,
-            Err(OzonReportSourceError::Upstream(
-                OzonErrorKind::MissingCredentials
-            ))
-        ));
+        let error = transport
+            .post(product_page_request("/v4/product/info/stocks", None).unwrap())
+            .await
+            .expect_err("an unknown store must fail before network access");
+        assert_eq!(error.code(), "missing_credentials");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4_096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let body = br#"{"result":"ok"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let store = StoreId::from("configured");
+        let client = OzonClient::new(
+            base_url,
+            std::time::Duration::from_secs(1),
+            BTreeMap::from([(
+                store.clone(),
+                StoreCredentials {
+                    client_id: "test-client".to_owned(),
+                    api_key: "test-key".to_owned(),
+                },
+            )]),
+        )
+        .unwrap();
+        let transport = OzonClientReportTransport::new(client, store);
+        let value = transport
+            .post(product_page_request("/v4/product/info/stocks", None).unwrap())
+            .await
+            .expect("the hardened transport must pass through a bounded success response");
+        assert_eq!(value["result"], "ok");
+        server.await.unwrap();
+
         assert_eq!(
             OzonReportSourceError::Upstream(OzonErrorKind::Forbidden).code(),
             "forbidden"
