@@ -16,6 +16,7 @@ pub mod collector_service;
 pub mod dataset;
 pub mod html;
 pub mod kpi;
+pub mod mail;
 pub mod outbox;
 pub mod ozon_adapter;
 pub mod ozon_source;
