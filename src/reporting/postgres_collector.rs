@@ -237,9 +237,7 @@ impl PostgresSnapshotWriter {
         &self,
         snapshots: &[CollectedSnapshot],
     ) -> Result<Vec<i64>, PostgresCollectorError> {
-        if snapshots.is_empty() {
-            return Err(PostgresCollectorError::InvalidInput);
-        }
+        validate_batch(snapshots)?;
         let mut client = self
             .client
             .acquire()
@@ -258,6 +256,14 @@ impl PostgresSnapshotWriter {
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         Ok(snapshot_ids)
+    }
+}
+
+fn validate_batch(snapshots: &[CollectedSnapshot]) -> Result<(), PostgresCollectorError> {
+    if snapshots.is_empty() {
+        Err(PostgresCollectorError::InvalidInput)
+    } else {
+        Ok(())
     }
 }
 
@@ -686,6 +692,14 @@ mod tests {
         );
         assert_eq!(
             as_i64(i64::MAX as u64 + 1),
+            Err(PostgresCollectorError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn empty_batch_fails_before_database_access() {
+        assert_eq!(
+            validate_batch(&[]),
             Err(PostgresCollectorError::InvalidInput)
         );
     }

@@ -20,16 +20,25 @@ Production credentials must never be used in CI; tests use local mocks only.
 
 The following properties are treated as release gates:
 
-1. Marketplace egress is read-only. `OzonClient::post`, `PerformanceClient::get`, and
+1. Marketplace egress is read-only. `OzonClient::post`, `PerformanceClient::request`, and
    `WbClient::request` enforce exact allowlists before credentials are selected and before any
    socket is opened. Chat input cannot supply a host, HTTP method, or path. Redirects and ambient
    HTTP proxies are disabled.
-2. Production Ozon Seller egress uses 16 stable reporting/list/info paths. Three finance-accrual
-   preview paths require an explicit client capability and remain disabled in the production
-   Compose file. Ozon Performance business egress is fixed to exactly
-   `GET /api/client/campaign`, `GET /api/client/statistics/daily/json`, and
-   `GET /api/client/statistics/expense/json`; its internal `POST /api/client/token` is not
-   model-callable. WB egress contains exactly 22 fixed read operations. Its Search Report subset is
+2. Production Ozon Seller egress uses 34 stable reporting/list/info paths, including the three
+   finance-accrual reads promoted after canary validation. Posting lists use only
+   `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list`; the superseded
+   `/v2/posting/fbo/list` and `/v3/posting/fbs/list` are denied. Reviews use only
+   `POST /v2/review/list`; the superseded `/v1/review/list` is denied. Warehouse discovery uses
+   `POST /v2/warehouse/list` with a bounded limit and optional cursor/warehouse-ID filters.
+   Ozon Performance business
+   egress is fixed to exactly `GET /api/client/campaign`,
+   `GET /api/client/statistics/daily`, `GET /api/client/statistics/expense`,
+   `GET /api/client/limits/list`, `GET /api/client/campaign/{campaignId}/objects`,
+   `GET /api/client/campaign/{campaignId}/v2/products`, and
+   `POST /api/client/statistics/products/sku`. Dynamic routes require one canonical positive
+   numeric campaign ID and an exact suffix; they are not prefix allowlists. The internal
+   `POST /api/client/token` is not model-callable. WB egress contains exactly 22 fixed read
+   operations. Its Search Report subset is
    `POST /api/v2/search-report/product/search-texts` and
    `POST /api/v2/search-report/product/orders`. Its Promotion subset is exactly
    `GET /adv/v1/promotion/count`, `GET /api/advert/v2/adverts`, `GET /adv/v3/fullstats`,
@@ -47,16 +56,22 @@ The following properties are treated as release gates:
    selection and cannot reach those endpoints even if the underlying API credential is broad.
    A Performance Client ID may belong to only one configured store; startup rejects reuse across
    stores because an organization-wide advertising response cannot be safely partitioned by ACL.
+   Vendor subscription is not inferred from configured credentials: realization data may require
+   Ozon Plus/Pro and reviews may require paid access. Missing entitlement is returned as a bounded
+   upstream failure and never triggers a fallback to another account or endpoint.
 5. Marketplace responses are bounded after decompression, obvious PII fields are redacted, and the
    result is labelled `untrusted_external_marketplace_data`. Marketplace text must never be treated
    as model instructions or forwarded to another tool without a new explicit user request.
-6. Credentials, request bodies, response diagnostics, JWTs, and marketplace payloads are not written
+6. Ozon Seller Analytics departures are paced at one request per 60 seconds per shared Client-Id.
+   The wait happens before global and per-client network permits are acquired; report pagination is
+   capped at ten pages so the quota cannot turn a daily run into an unbounded backfill.
+7. Credentials, request bodies, response diagnostics, JWTs, and marketplace payloads are not written
    to application logs. Structured upstream errors contain only safe kind/status/account/endpoint and
    a strictly sanitized request ID.
-7. Store clients, JWT/JWKS verification, OAuth wire behavior, session limits, schemas, request bodies,
+8. Store clients, JWT/JWKS verification, OAuth wire behavior, session limits, schemas, request bodies,
    negative write-paths, retries, compression limits, and RBAC are covered by local mock tests. No
    live marketplace request is part of CI.
-8. The separate `mcp-ozon-control` scaffold is disabled and credentialless. It loads only
+9. The separate `mcp-ozon-control` scaffold is disabled and credentialless. It loads only
    `CONTROL_MCP_*`, has no marketplace client or endpoint, exposes only local read-only status/scope,
    and runs on an internal Docker network without Internet egress. No analytics admin receives an
    implicit Control scope. Adding a key, egress, plan/apply tool, or marketplace write path requires
@@ -64,8 +79,9 @@ The following properties are treated as release gates:
 
 ## Resource and availability controls
 
-- Ozon: per-Client-Id pacing, per-client concurrency 16, global concurrency 32, at most three
-  attempts for explicitly transient failures, and a logical deadline covering rate waits/retries.
+- Ozon: ordinary per-Client-Id pacing plus a dedicated 60-second Analytics gate, per-client
+  concurrency 16, global concurrency 32, at most three attempts for explicitly transient failures,
+  and a logical deadline covering rate waits/retries.
   Pacing and retry backoff hold no network permit, and retry permit races preserve the preceding
   causal upstream error rather than replacing it with a local overload.
 - Ozon Performance: fixed official host, one-second per-Client-Id pacing, per-client concurrency 2,
@@ -179,10 +195,16 @@ has broader vendor permissions.
 
 - Run `./scripts/local-ci.sh`, require 100% line coverage, Clippy/rustdoc warnings as errors,
   RustSec/cargo-deny, CodeQL, dependency review, secret scanning, and the hardened-container job.
-- Verify the production tool list contains no preview tools and every tool advertises
-  `readOnlyHint=true`, `destructiveHint=false`, and the expected OAuth/noauth policy.
+- Verify the production tool list contains exactly 67 stable tools, no preview tools, and every
+  tool advertises `readOnlyHint=true`, `destructiveHint=false`, and the expected OAuth/noauth policy.
+- Verify the Ozon Seller allowlist contains exactly 34 stable paths. Assert that
+  `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list` are admitted while their superseded
+  list versions fail locally without credentials or network access.
 - Verify the Ozon Performance namespace contains exactly `ozon_performance_campaigns`,
-  `ozon_performance_daily`, and `ozon_performance_expenses`. Assert that the mutating GET paths
+  `ozon_performance_daily`, `ozon_performance_expenses`, `ozon_performance_limits`,
+  `ozon_performance_campaign_objects`, `ozon_performance_campaign_products`, and
+  `ozon_performance_sku_statistics`. Assert that zero, signed, padded, encoded, extra-segment and
+  otherwise non-canonical campaign IDs fail locally. Assert also that the mutating GET paths
   `/api/client/campaign/all_sku_promo/activate`,
   `/api/client/campaign/all_sku_promo/deactivate`, and
   `/api/client/campaign/all_sku_promo/set_bid` fail locally without credentials or network access.

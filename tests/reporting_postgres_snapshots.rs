@@ -248,6 +248,8 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(manifest.quality(), SnapshotQuality::Partial);
     assert!(!manifest.recommendations_allowed());
     let facts = repository.load_report_facts(&manifest).await.unwrap();
+    assert_eq!(facts.advertising.len(), 1);
+    assert_eq!(facts.advertising[0].sku, 3_411_079_879);
     assert_eq!(facts.sales.len(), 1);
     assert_eq!(facts.sales[0].account_id, account_id);
     assert_eq!(facts.sales[0].business_date.to_string(), "2098-08-15");
@@ -331,11 +333,19 @@ async fn complete_ozon_source_set_is_published_atomically() {
     let transport = FixtureTransport(Mutex::new(VecDeque::from([
         Ok(json!({"result":{"data":[{
             "dimensions":[{"id":"3411079879"},{"id":"2098-08-15"}],
-            "metrics":["675.00", 2]
+            "metrics":["675.00", 2, 1, 0]
         }]}})),
-        Ok(json!({"items":[{"product_id":3411079879_u64,"stocks":[{
-            "type":"FBO","present":19
-        }]}],"cursor":""})),
+        Ok(json!({
+            "products":[{
+                "sku":3411079879_u64,
+                "warehouse_id":1001,
+                "present":21,
+                "reserved":2
+            }],
+            "cursor":"",
+            "has_next":false
+        })),
+        Ok(json!({"products":[],"cursor":"","has_next":false})),
         Ok(json!({"items":[{"product_id":3411079879_u64,"price":{
             "currency_code":"RUB","price":"675.00","old_price":"702.00"
         }}],"cursor":""})),
@@ -346,7 +356,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
         vec![CollectedAdvertisingFact {
             business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
             campaign_id: 35_751_912,
-            sku: 0,
+            sku: 3_411_079_879,
             impressions: 100,
             clicks: 10,
             spend_minor: 1_000,
@@ -391,7 +401,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
     )
     .unwrap();
     assert!(preview.bundle.html.contains("Диана"));
-    assert!(preview.bundle.html.contains("N/D"));
+    assert!(!preview.bundle.html.contains("N/D"));
     assert!(preview.bundle.xlsx.starts_with(b"PK"));
     assert_eq!(preview.receipt.size_bytes, preview.bundle.xlsx.len());
     assert!(!preview.receipt.persisted);

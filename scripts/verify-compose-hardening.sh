@@ -128,9 +128,8 @@ verify_server() {
   local rendered="$2"
   local expected_access_source="$3"
   local expected_published_port="$4"
-  local expected_preview="$5"
-  local expected_restart="$6"
-  local expected_network_name="$7"
+  local expected_restart="$5"
+  local expected_network_name="$6"
   local server
   server="$(jq -c '.services.server' <<<"$rendered")"
 
@@ -208,10 +207,9 @@ verify_server() {
   check "$label: no environment override redirects Ozon egress" "$server" \
     '(.environment.OZON_API_BASE_URL // "https://api-seller.ozon.ru")
      == "https://api-seller.ozon.ru"'
-  check "$label: preview flags match the deployment contract" "$server" \
-    --arg preview "$expected_preview" \
-    '.environment.OZON_POSTINGS_VNEXT == $preview
-     and .environment.OZON_FINANCE_ACCRUALS_PREVIEW == $preview'
+  check "$label: legacy preview flags remain disabled" "$server" \
+    '.environment.OZON_POSTINGS_VNEXT == "false"
+     and .environment.OZON_FINANCE_ACCRUALS_PREVIEW == "false"'
   check "$label: restart policy matches the deployment contract" "$server" \
     --arg restart "$expected_restart" '.restart == $restart'
 }
@@ -670,7 +668,6 @@ verify_server \
   "$main_rendered" \
   "$main_access" \
   "8787" \
-  "false" \
   "unless-stopped" \
   "mcp-ozon-outbound"
 verify_server \
@@ -678,7 +675,6 @@ verify_server \
   "$canary_rendered" \
   "$canary_access" \
   "8789" \
-  "true" \
   "no" \
   "mcp-ozon-canary-outbound"
 verify_position "$position_rendered"

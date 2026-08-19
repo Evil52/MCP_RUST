@@ -27,6 +27,7 @@ const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT_REQUESTS_PER_CLIENT: usize = 16;
 const MAX_GLOBAL_IN_FLIGHT_REQUESTS: usize = 32;
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(20);
+const ANALYTICS_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_TOTAL_RETRY_OVERHEAD: Duration = Duration::from_secs(5);
@@ -41,44 +42,54 @@ const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// enforced by [`OzonClient::post`] itself, at the only place where an HTTP
 /// request can leave the process, so no caller — present or future — can reach
 /// a mutating Ozon endpoint even if a higher layer forgets to check.
+pub const ANALYTICS_DATA_PATH: &str = "/v1/analytics/data";
+
 pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
-    "/v1/analytics/data",
+    ANALYTICS_DATA_PATH,
     "/v1/analytics/turnover/stocks",
+    "/v1/finance/accrual/by-day",
+    "/v1/finance/accrual/postings",
+    "/v1/finance/accrual/types",
+    "/v1/finance/cash-flow-statement/list",
+    "/v1/finance/mutual-settlement",
+    "/v1/finance/realization/by-day",
+    "/v1/posting/fbo/cancel-reason/list",
+    "/v1/product/info/stocks-by-warehouse/fbo",
     "/v1/product/info/warehouse/stocks",
     "/v1/question/list",
     "/v1/rating/history",
     "/v1/rating/summary",
     "/v1/returns/list",
-    "/v1/review/list",
-    "/v2/posting/fbo/list",
+    "/v2/posting/fbo/get",
+    "/v2/posting/fbs/cancel-reason/list",
+    "/v2/product/info/stocks-by-warehouse/fbs",
     "/v2/returns/rfbs/list",
+    "/v2/review/list",
+    "/v2/warehouse/list",
     "/v3/finance/transaction/list",
     "/v3/finance/transaction/totals",
     "/v3/posting/fbo/list",
-    "/v3/posting/fbs/list",
+    "/v3/posting/fbs/get",
+    "/v3/product/info/list",
+    "/v3/product/list",
     "/v3/supply-order/get",
     "/v3/supply-order/list",
     "/v4/posting/fbs/list",
+    "/v4/posting/fbs/unfulfilled/list",
+    "/v4/product/info/attributes",
     "/v4/product/info/stocks",
     "/v5/product/info/prices",
 ];
 
-/// Candidate read-only finance endpoints whose exact production contract is
-/// not yet treated as stable. They are denied unless the canary feature is
-/// explicitly enabled on both the tool router and this egress client.
-pub const PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
-    "/v1/finance/accrual/by-day",
-    "/v1/finance/accrual/postings",
-    "/v1/finance/accrual/types",
-];
+/// Reserved for future canary-only read endpoints. The finance accrual
+/// contracts have completed their canary period and now live in the stable
+/// allowlist above. The empty constant keeps the feature-flag API compatible
+/// while callers migrate away from the old preview switch.
+pub const PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[];
 
 #[must_use]
 pub fn is_read_only_endpoint_allowed(endpoint: &str) -> bool {
     READ_ONLY_ENDPOINT_ALLOWLIST.contains(&endpoint)
-}
-
-fn is_preview_read_only_endpoint(endpoint: &str) -> bool {
-    PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST.contains(&endpoint)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +244,7 @@ impl OzonError {
 #[derive(Debug)]
 struct RateLimiter {
     next_allowed: Mutex<Instant>,
+    analytics_next_allowed: Mutex<Instant>,
     in_flight: Semaphore,
     #[cfg(test)]
     before_claim: Mutex<
@@ -247,6 +259,7 @@ impl RateLimiter {
     fn new() -> Self {
         Self {
             next_allowed: Mutex::new(Instant::now()),
+            analytics_next_allowed: Mutex::new(Instant::now()),
             in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CLIENT),
             #[cfg(test)]
             before_claim: Mutex::new(None),
@@ -257,13 +270,23 @@ impl RateLimiter {
     ///
     /// Network permits are acquired only after this returns, so a paced caller
     /// cannot reserve scarce HTTP capacity while it sleeps.
-    async fn wait_until_ready(&self) {
+    async fn wait_until_ready_for(&self, path: &str) {
         loop {
-            let wait = self
+            let now = Instant::now();
+            let general_wait = self
                 .next_allowed
                 .lock()
                 .await
-                .saturating_duration_since(Instant::now());
+                .saturating_duration_since(now);
+            let analytics_wait = if path == ANALYTICS_DATA_PATH {
+                self.analytics_next_allowed
+                    .lock()
+                    .await
+                    .saturating_duration_since(now)
+            } else {
+                Duration::ZERO
+            };
+            let wait = general_wait.max(analytics_wait);
             if wait.is_zero() {
                 return;
             }
@@ -271,17 +294,40 @@ impl RateLimiter {
         }
     }
 
+    #[cfg(test)]
+    async fn wait_until_ready(&self) {
+        self.wait_until_ready_for("").await;
+    }
+
     /// Atomically consumes a departure after network permits are available.
     /// A competing ready caller may win the race; the loser releases its
     /// permits and returns to the readiness phase.
-    async fn try_claim(&self) -> Result<(), Duration> {
+    async fn try_claim_for(&self, path: &str) -> Result<(), Duration> {
+        let now = Instant::now();
         let mut next_allowed = self.next_allowed.lock().await;
-        let wait = next_allowed.saturating_duration_since(Instant::now());
+        let mut analytics_next_allowed = if path == ANALYTICS_DATA_PATH {
+            Some(self.analytics_next_allowed.lock().await)
+        } else {
+            None
+        };
+        let general_wait = next_allowed.saturating_duration_since(now);
+        let analytics_wait = analytics_next_allowed
+            .as_deref()
+            .map_or(Duration::ZERO, |next| next.saturating_duration_since(now));
+        let wait = general_wait.max(analytics_wait);
         if !wait.is_zero() {
             return Err(wait);
         }
-        *next_allowed = Instant::now() + MIN_REQUEST_INTERVAL;
+        *next_allowed = now + MIN_REQUEST_INTERVAL;
+        if let Some(next_allowed) = analytics_next_allowed.as_deref_mut() {
+            *next_allowed = now + ANALYTICS_REQUEST_INTERVAL;
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn try_claim(&self) -> Result<(), Duration> {
+        self.try_claim_for("").await
     }
 
     /// Extends the shared Client-Id cooldown without shortening an existing
@@ -305,7 +351,6 @@ pub struct OzonClient {
     http: Client,
     base_url: String,
     request_deadline: Duration,
-    finance_accruals_preview: bool,
     stores: Arc<BTreeMap<StoreId, StoreCredentials>>,
     rate_limiters: Arc<BTreeMap<StoreId, Arc<RateLimiter>>>,
     global_in_flight: Arc<Semaphore>,
@@ -402,7 +447,6 @@ impl OzonClient {
             http,
             base_url,
             request_deadline: timeout.saturating_add(MAX_TOTAL_RETRY_OVERHEAD),
-            finance_accruals_preview: false,
             stores: Arc::new(stores),
             rate_limiters: Arc::new(rate_limiters),
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT_REQUESTS)),
@@ -413,15 +457,15 @@ impl OzonClient {
         self.stores.contains_key(store)
     }
 
-    pub fn with_finance_accruals_preview(mut self, enabled: bool) -> Self {
-        self.finance_accruals_preview = enabled;
+    /// Backwards-compatible no-op retained for one release after finance
+    /// accrual methods moved into the stable read-only allowlist.
+    pub fn with_finance_accruals_preview(self, _enabled: bool) -> Self {
         self
     }
 
     #[must_use]
     pub fn is_endpoint_allowed(&self, endpoint: &str) -> bool {
         is_read_only_endpoint_allowed(endpoint)
-            || (self.finance_accruals_preview && is_preview_read_only_endpoint(endpoint))
     }
 
     pub async fn post(
@@ -435,7 +479,12 @@ impl OzonClient {
         if !self.is_endpoint_allowed(path) {
             return Err(OzonError::EndpointNotAllowed(path.to_owned()));
         }
-        let deadline = TokioInstant::now() + self.request_deadline;
+        let pacing_allowance = if path == ANALYTICS_DATA_PATH {
+            ANALYTICS_REQUEST_INTERVAL
+        } else {
+            Duration::ZERO
+        };
+        let deadline = TokioInstant::now() + self.request_deadline.saturating_add(pacing_allowance);
         self.post_within_deadline(store, path, payload, deadline)
             .await
     }
@@ -507,7 +556,7 @@ impl OzonClient {
         payload: &Value,
         attempt: usize,
     ) -> Result<RequestAttempt, OzonError> {
-        let _permits = self.acquire_request_permits(limiter).await?;
+        let _permits = self.acquire_request_permits(limiter, path).await?;
         let request_trace = RequestTrace {
             store,
             endpoint: path,
@@ -576,9 +625,10 @@ impl OzonClient {
     async fn acquire_request_permits<'a>(
         &'a self,
         limiter: &'a RateLimiter,
+        path: &str,
     ) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>), OzonError> {
         loop {
-            limiter.wait_until_ready().await;
+            limiter.wait_until_ready_for(path).await;
             let global_permit = self
                 .global_in_flight
                 .try_acquire()
@@ -595,7 +645,7 @@ impl OzonClient {
                 let _ = reached.send(());
                 let _ = resume.await;
             }
-            if limiter.try_claim().await.is_ok() {
+            if limiter.try_claim_for(path).await.is_ok() {
                 return Ok((global_permit, client_permit));
             }
 
@@ -1174,16 +1224,7 @@ mod tests {
             assert!(error.to_string().contains(endpoint), "{endpoint}");
             assert!(format!("{error:?}").contains("EndpointNotAllowed"));
         }
-        for &endpoint in PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST {
-            assert_eq!(
-                client
-                    .post(&StoreId::from("ofk"), endpoint, serde_json::json!({}))
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                OzonErrorKind::EndpointNotAllowed
-            );
-        }
+        assert!(PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST.is_empty());
 
         // The guard runs before credentials are looked up, so an unconfigured
         // store cannot be used to distinguish allowlisted from denied paths.
@@ -1202,11 +1243,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finance_preview_egress_requires_explicit_client_opt_in() {
+    async fn stable_finance_accrual_egress_does_not_require_preview_opt_in() {
         let (base_url, requests) = mock_server(vec![MockResponse::new(200, r#"{"ok":true}"#)]);
-        let client = OzonClient::new(base_url, Duration::from_secs(1), credentials())
-            .unwrap()
-            .with_finance_accruals_preview(true);
+        let client = OzonClient::new(base_url, Duration::from_secs(1), credentials()).unwrap();
 
         assert_eq!(
             client
@@ -1223,11 +1262,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_finance_preview_builder_is_a_noop() {
+        let client = OzonClient::new(
+            "https://api-seller.ozon.ru".to_owned(),
+            Duration::from_secs(1),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .with_finance_accruals_preview(true);
+
+        assert!(client.is_endpoint_allowed("/v1/finance/accrual/types"));
+        assert!(!client.is_endpoint_allowed("/v2/posting/fbo/list"));
+        assert!(!client.is_endpoint_allowed("/v3/posting/fbs/list"));
+    }
+
+    #[test]
     fn the_read_only_allowlist_is_sorted_unique_and_free_of_mutating_verbs() {
         let mut sorted = READ_ONLY_ENDPOINT_ALLOWLIST.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, READ_ONLY_ENDPOINT_ALLOWLIST);
+        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 34);
 
         for endpoint in READ_ONLY_ENDPOINT_ALLOWLIST {
             assert!(endpoint.starts_with('/'), "{endpoint}");
@@ -1236,10 +1291,51 @@ mod tests {
                 "cancel", "create", "delete", "import", "set", "ship", "update", "add", "remove",
                 "send", "activate", "archive",
             ] {
-                assert!(!endpoint.contains(verb), "{endpoint} contains {verb}");
+                if verb == "cancel"
+                    && matches!(
+                        *endpoint,
+                        "/v1/posting/fbo/cancel-reason/list" | "/v2/posting/fbs/cancel-reason/list"
+                    )
+                {
+                    continue;
+                }
+                let mutating_path_segment = format!("/{verb}");
+                assert!(
+                    !endpoint.contains(&mutating_path_segment),
+                    "{endpoint} contains mutating segment {mutating_path_segment}"
+                );
             }
         }
         assert!(!is_read_only_endpoint_allowed("/v1/product/import"));
+        assert!(!is_read_only_endpoint_allowed("/v1/review/list"));
+        assert!(!is_read_only_endpoint_allowed("/v2/posting/fbo/list"));
+        assert!(!is_read_only_endpoint_allowed("/v3/posting/fbs/list"));
+    }
+
+    #[test]
+    fn planned_seller_analytics_endpoints_are_stable_read_routes() {
+        for endpoint in [
+            "/v1/finance/accrual/by-day",
+            "/v1/finance/accrual/postings",
+            "/v1/finance/accrual/types",
+            "/v1/finance/cash-flow-statement/list",
+            "/v1/finance/mutual-settlement",
+            "/v1/finance/realization/by-day",
+            "/v1/posting/fbo/cancel-reason/list",
+            "/v1/product/info/stocks-by-warehouse/fbo",
+            "/v2/posting/fbo/get",
+            "/v2/posting/fbs/cancel-reason/list",
+            "/v2/product/info/stocks-by-warehouse/fbs",
+            "/v2/review/list",
+            "/v2/warehouse/list",
+            "/v3/posting/fbs/get",
+            "/v3/product/info/list",
+            "/v3/product/list",
+            "/v4/posting/fbs/unfulfilled/list",
+            "/v4/product/info/attributes",
+        ] {
+            assert!(is_read_only_endpoint_allowed(endpoint), "{endpoint}");
+        }
     }
 
     #[test]
@@ -1836,6 +1932,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn analytics_departures_are_spaced_once_per_minute_without_blocking_other_routes() {
+        let limiter = RateLimiter::new();
+        limiter.try_claim_for(ANALYTICS_DATA_PATH).await.unwrap();
+
+        let remaining = limiter
+            .try_claim_for(ANALYTICS_DATA_PATH)
+            .await
+            .unwrap_err();
+        assert!(remaining > Duration::from_secs(59));
+        assert!(remaining <= ANALYTICS_REQUEST_INTERVAL);
+
+        // The one-request-per-minute restriction belongs only to Analytics;
+        // an unrelated Seller read still uses the ordinary 50 req/s gate.
+        *limiter.next_allowed.lock().await = Instant::now();
+        limiter.try_claim_for("/v1/rating/summary").await.unwrap();
+        assert!(
+            limiter
+                .analytics_next_allowed
+                .lock()
+                .await
+                .saturating_duration_since(Instant::now())
+                > Duration::from_secs(59)
+        );
+    }
+
+    #[tokio::test]
     async fn claim_reports_the_remaining_delay_after_another_caller_wins() {
         let limiter = RateLimiter::new();
         *limiter.next_allowed.lock().await = Instant::now() + Duration::from_secs(1);
@@ -1876,7 +1998,10 @@ mod tests {
             let client = client.clone();
             let limiter = Arc::clone(&limiter);
             async move {
-                let permits = client.acquire_request_permits(&limiter).await.unwrap();
+                let permits = client
+                    .acquire_request_permits(&limiter, "/v1/rating/summary")
+                    .await
+                    .unwrap();
                 drop(permits);
             }
         });
@@ -1954,7 +2079,8 @@ mod tests {
             .await
             .unwrap();
 
-        let mut paced_acquisition = Box::pin(client.acquire_request_permits(&paced));
+        let mut paced_acquisition =
+            Box::pin(client.acquire_request_permits(&paced, "/v1/rating/summary"));
         std::future::poll_fn(|context| {
             assert!(matches!(
                 paced_acquisition.as_mut().poll(context),
