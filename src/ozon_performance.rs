@@ -10,7 +10,7 @@ use reqwest::{
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
     redirect::Policy,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
@@ -20,8 +20,13 @@ use crate::config::{PerformanceCredentials, StoreId};
 const PERFORMANCE_API_BASE_URL: &str = "https://api-performance.ozon.ru";
 const TOKEN_PATH: &str = "/api/client/token";
 pub const CAMPAIGNS_PATH: &str = "/api/client/campaign";
-pub const DAILY_STATS_PATH: &str = "/api/client/statistics/daily/json";
-pub const EXPENSES_PATH: &str = "/api/client/statistics/expense/json";
+pub const DAILY_STATS_PATH: &str = "/api/client/statistics/daily";
+pub const EXPENSES_PATH: &str = "/api/client/statistics/expense";
+pub const LIMITS_PATH: &str = "/api/client/limits/list";
+pub const PRODUCT_SKU_STATS_PATH: &str = "/api/client/statistics/products/sku";
+pub const CAMPAIGN_OBJECTS_PATH_TEMPLATE: &str = "/api/client/campaign/{campaignId}/objects";
+pub const CAMPAIGN_PRODUCTS_PATH_TEMPLATE: &str = "/api/client/campaign/{campaignId}/v2/products";
+const CAMPAIGN_RESOURCE_PREFIX: &str = "/api/client/campaign/";
 const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1_048_576;
 const MAX_TOKEN_BODY_BYTES: usize = 64 * 1_024;
 const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1_024;
@@ -41,12 +46,15 @@ const MAX_IN_FLIGHT_PER_CLIENT: usize = 2;
 const MAX_GLOBAL_IN_FLIGHT: usize = 8;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 
-/// Exact business endpoints that may leave this process. The OAuth token
-/// endpoint is deliberately internal and is never model-callable.
+/// Exact fixed business endpoints that may leave this process. The two
+/// campaign-ID routes are admitted separately by a structural matcher. The
+/// OAuth token endpoint is deliberately internal and is never model-callable.
 pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[(Method, &str)] = &[
     (Method::GET, CAMPAIGNS_PATH),
     (Method::GET, DAILY_STATS_PATH),
     (Method::GET, EXPENSES_PATH),
+    (Method::GET, LIMITS_PATH),
+    (Method::POST, PRODUCT_SKU_STATS_PATH),
 ];
 
 #[must_use]
@@ -54,6 +62,28 @@ pub fn is_read_only_request_allowed(method: &Method, path: &str) -> bool {
     READ_ONLY_ENDPOINT_ALLOWLIST
         .iter()
         .any(|(allowed_method, allowed_path)| allowed_method == method && *allowed_path == path)
+        || (*method == Method::GET && is_allowed_campaign_resource_path(path))
+}
+
+/// Matches only the two read-only campaign routes whose identifier is dynamic.
+///
+/// Requiring a canonical, positive `u64` segment and an exact suffix prevents
+/// path traversal, percent-encoded aliases and mutating sub-routes from being
+/// smuggled through the dynamic part of the allowlist.
+fn is_allowed_campaign_resource_path(path: &str) -> bool {
+    let Some(remainder) = path.strip_prefix(CAMPAIGN_RESOURCE_PREFIX) else {
+        return false;
+    };
+    let Some((campaign_id, resource)) = remainder.split_once('/') else {
+        return false;
+    };
+    let Ok(parsed_campaign_id) = campaign_id.parse::<u64>() else {
+        return false;
+    };
+    if parsed_campaign_id == 0 || parsed_campaign_id.to_string() != campaign_id {
+        return false;
+    }
+    matches!(resource, "objects" | "v2/products")
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +97,20 @@ pub struct CampaignsQuery {
 
 #[derive(Debug, Clone)]
 pub struct StatisticsQuery {
+    pub campaign_ids: Vec<u64>,
+    pub date_from: String,
+    pub date_to: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CampaignProductsQuery {
+    pub page: u64,
+    pub page_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkuStatisticsQuery {
     pub campaign_ids: Vec<u64>,
     pub date_from: String,
     pub date_to: String,
@@ -433,6 +477,45 @@ impl PerformanceClient {
         self.get(store, CAMPAIGNS_PATH, pairs).await
     }
 
+    pub async fn limits(&self, store: &StoreId) -> Result<Value, PerformanceError> {
+        self.get(store, LIMITS_PATH, Vec::new()).await
+    }
+
+    pub async fn campaign_objects(
+        &self,
+        store: &StoreId,
+        campaign_id: u64,
+    ) -> Result<Value, PerformanceError> {
+        let path = format!("{CAMPAIGN_RESOURCE_PREFIX}{campaign_id}/objects");
+        self.get(store, &path, Vec::new()).await
+    }
+
+    pub async fn campaign_products(
+        &self,
+        store: &StoreId,
+        campaign_id: u64,
+        query: CampaignProductsQuery,
+    ) -> Result<Value, PerformanceError> {
+        let path = format!("{CAMPAIGN_RESOURCE_PREFIX}{campaign_id}/v2/products");
+        self.get(
+            store,
+            &path,
+            vec![
+                ("page", query.page.to_string()),
+                ("pageSize", query.page_size.to_string()),
+            ],
+        )
+        .await
+    }
+
+    pub async fn sku_statistics(
+        &self,
+        store: &StoreId,
+        query: SkuStatisticsQuery,
+    ) -> Result<Value, PerformanceError> {
+        self.post(store, PRODUCT_SKU_STATS_PATH, json!(query)).await
+    }
+
     pub async fn daily_statistics(
         &self,
         store: &StoreId,
@@ -467,28 +550,51 @@ impl PerformanceClient {
     async fn get(
         &self,
         store: &StoreId,
-        path: &'static str,
+        path: &str,
         query: Vec<(&'static str, String)>,
     ) -> Result<Value, PerformanceError> {
-        if !is_read_only_request_allowed(&Method::GET, path) {
+        self.request(Method::GET, store, path, query, None).await
+    }
+
+    async fn post(
+        &self,
+        store: &StoreId,
+        path: &str,
+        body: Value,
+    ) -> Result<Value, PerformanceError> {
+        self.request(Method::POST, store, path, Vec::new(), Some(body))
+            .await
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        store: &StoreId,
+        path: &str,
+        query: Vec<(&'static str, String)>,
+        body: Option<Value>,
+    ) -> Result<Value, PerformanceError> {
+        if !is_read_only_request_allowed(&method, path) {
             return Err(PerformanceError::EndpointNotAllowed {
-                method: Method::GET,
+                method,
                 path: path.to_owned(),
             });
         }
         tokio::time::timeout(
             self.logical_timeout,
-            self.get_within_deadline(store, path, query),
+            self.request_within_deadline(method, store, path, query, body),
         )
         .await
         .map_err(|_| PerformanceError::Timeout)?
     }
 
-    async fn get_within_deadline(
+    async fn request_within_deadline(
         &self,
+        method: Method,
         store: &StoreId,
-        path: &'static str,
+        path: &str,
         query: Vec<(&'static str, String)>,
+        body: Option<Value>,
     ) -> Result<Value, PerformanceError> {
         let state = self
             .accounts
@@ -500,7 +606,10 @@ impl PerformanceClient {
         drop(self.try_request_permits(state, path)?);
 
         let token = self.access_token(state).await?;
-        match self.request_attempt(state, path, &query, &token).await? {
+        match self
+            .request_attempt(state, method.clone(), path, &query, body.as_ref(), &token)
+            .await?
+        {
             RequestAttempt::Complete(value) => return Ok(value),
             RequestAttempt::Unauthorized { .. } => {}
         }
@@ -508,7 +617,7 @@ impl PerformanceClient {
         self.invalidate_token_if_current(state, &token).await;
         let refreshed_token = self.access_token(state).await?;
         match self
-            .request_attempt(state, path, &query, &refreshed_token)
+            .request_attempt(state, method, path, &query, body.as_ref(), &refreshed_token)
             .await?
         {
             RequestAttempt::Complete(value) => Ok(value),
@@ -521,7 +630,7 @@ impl PerformanceClient {
     fn try_request_permits<'a>(
         &'a self,
         state: &'a AccountState,
-        path: &'static str,
+        path: &str,
     ) -> Result<RequestPermits<'a>, PerformanceError> {
         let global = self
             .global_in_flight
@@ -531,7 +640,10 @@ impl PerformanceClient {
             .in_flight
             .try_acquire()
             .map_err(|_| PerformanceError::Overloaded)?;
-        let statistics = if matches!(path, DAILY_STATS_PATH | EXPENSES_PATH) {
+        let statistics = if matches!(
+            path,
+            DAILY_STATS_PATH | EXPENSES_PATH | PRODUCT_SKU_STATS_PATH
+        ) {
             Some(
                 state
                     .statistics_in_flight
@@ -551,8 +663,10 @@ impl PerformanceClient {
     async fn request_attempt(
         &self,
         state: &AccountState,
-        path: &'static str,
+        method: Method,
+        path: &str,
         query: &[(&'static str, String)],
+        body: Option<&Value>,
         token: &str,
     ) -> Result<RequestAttempt, PerformanceError> {
         loop {
@@ -567,7 +681,7 @@ impl PerformanceClient {
                 continue;
             }
 
-            let response = self.send_get(path, query, token).await?;
+            let response = self.send_request(&method, path, query, body, token).await?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 let request_id = safe_request_id(response.headers());
                 drop(response);
@@ -583,22 +697,28 @@ impl PerformanceClient {
         }
     }
 
-    async fn send_get(
+    async fn send_request(
         &self,
-        path: &'static str,
+        method: &Method,
+        path: &str,
         query: &[(&'static str, String)],
+        body: Option<&Value>,
         token: &str,
     ) -> Result<Response, PerformanceError> {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| PerformanceError::InvalidToken)?;
         authorization.set_sensitive(true);
-        self.http
-            .get(format!("{}{path}", self.base_url))
-            .header(AUTHORIZATION, authorization)
-            .query(query)
-            .send()
-            .await
-            .map_err(classify_transport)
+        let mut request = self
+            .http
+            .request(method.clone(), format!("{}{path}", self.base_url))
+            .header(AUTHORIZATION, authorization);
+        if !query.is_empty() {
+            request = request.query(query);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        request.send().await.map_err(classify_transport)
     }
 
     async fn invalidate_token_if_current(&self, state: &AccountState, used_token: &str) {
@@ -859,11 +979,23 @@ mod tests {
         }
     }
 
+    fn sku_statistics_query() -> SkuStatisticsQuery {
+        SkuStatisticsQuery {
+            campaign_ids: vec![11, 22],
+            date_from: "2026-08-01".to_owned(),
+            date_to: "2026-08-09".to_owned(),
+        }
+    }
+
     #[tokio::test]
     async fn exact_read_only_contracts_reuse_one_cached_token() {
         let (base_url, requests) = mock_http(vec![
             (200, token(1_800)),
             (200, json!({"list": []}).to_string()),
+            (200, json!({"limits": []}).to_string()),
+            (200, json!({"list": []}).to_string()),
+            (200, json!({"products": []}).to_string()),
+            (200, json!({"rows": []}).to_string()),
             (200, json!({"rows": []}).to_string()),
             (200, json!({"rows": []}).to_string()),
         ]);
@@ -875,6 +1007,25 @@ mod tests {
             client.campaigns(&store, campaigns_query()).await.unwrap(),
             json!({"list": []})
         );
+        assert_eq!(client.limits(&store).await.unwrap(), json!({"limits": []}));
+        assert_eq!(
+            client.campaign_objects(&store, 42).await.unwrap(),
+            json!({"list": []})
+        );
+        assert_eq!(
+            client
+                .campaign_products(
+                    &store,
+                    42,
+                    CampaignProductsQuery {
+                        page: 3,
+                        page_size: 50,
+                    },
+                )
+                .await
+                .unwrap(),
+            json!({"products": []})
+        );
         assert_eq!(
             client
                 .daily_statistics(&store, statistics_query())
@@ -884,6 +1035,13 @@ mod tests {
         );
         assert_eq!(
             client.expenses(&store, statistics_query()).await.unwrap(),
+            json!({"rows": []})
+        );
+        assert_eq!(
+            client
+                .sku_statistics(&store, sku_statistics_query())
+                .await
+                .unwrap(),
             json!({"rows": []})
         );
         let debug = format!("{client:?}");
@@ -906,14 +1064,38 @@ mod tests {
                 .contains("authorization: bearer test-access-token")
         );
 
+        let limits = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(limits.starts_with("GET /api/client/limits/list HTTP/1.1\r\n"));
+        let objects = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(objects.starts_with("GET /api/client/campaign/42/objects HTTP/1.1\r\n"));
+        let products = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(products.starts_with(
+            "GET /api/client/campaign/42/v2/products?page=3&pageSize=50 HTTP/1.1\r\n"
+        ));
+
         let daily = requests.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(daily.starts_with(
-            "GET /api/client/statistics/daily/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1\r\n"
+            "GET /api/client/statistics/daily?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1\r\n"
         ));
         let expenses = requests.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(expenses.starts_with(
-            "GET /api/client/statistics/expense/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1\r\n"
+            "GET /api/client/statistics/expense?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1\r\n"
         ));
+        let sku = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(sku.starts_with("POST /api/client/statistics/products/sku HTTP/1.1\r\n"));
+        assert!(
+            sku.to_ascii_lowercase()
+                .contains("authorization: bearer test-access-token")
+        );
+        assert!(
+            sku.to_ascii_lowercase()
+                .contains("content-type: application/json")
+        );
+        assert!(
+            sku.ends_with(
+                r#"{"campaignIds":[11,22],"dateFrom":"2026-08-01","dateTo":"2026-08-09"}"#
+            )
+        );
         assert!(requests.try_recv().is_err());
     }
 
@@ -939,6 +1121,36 @@ mod tests {
         assert!(captured[1].starts_with("GET /api/client/campaign?"));
         assert!(captured[2].starts_with("POST /api/client/token"));
         assert!(captured[3].starts_with("GET /api/client/campaign?"));
+    }
+
+    #[tokio::test]
+    async fn data_unauthorized_refreshes_token_once_and_replays_post_body() {
+        let (base_url, requests) = mock_http(vec![
+            (200, token(1_800)),
+            (401, "{}".to_owned()),
+            (200, token(1_800)),
+            (200, json!({"rows": [1]}).to_string()),
+        ]);
+        let client =
+            PerformanceClient::new_for_test(base_url, Duration::from_secs(3), credentials());
+        let result = client
+            .sku_statistics(&StoreId::from("shop"), sku_statistics_query())
+            .await
+            .unwrap();
+        assert_eq!(result, json!({"rows": [1]}));
+
+        let captured: Vec<_> = (0..4)
+            .map(|_| requests.recv_timeout(Duration::from_secs(1)).unwrap())
+            .collect();
+        assert!(captured[0].starts_with("POST /api/client/token "));
+        assert!(captured[1].starts_with("POST /api/client/statistics/products/sku "));
+        assert!(captured[2].starts_with("POST /api/client/token "));
+        assert!(captured[3].starts_with("POST /api/client/statistics/products/sku "));
+        let expected_body =
+            r#"{"campaignIds":[11,22],"dateFrom":"2026-08-01","dateTo":"2026-08-09"}"#;
+        assert!(captured[1].ends_with(expected_body));
+        assert!(captured[3].ends_with(expected_body));
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -983,7 +1195,20 @@ mod tests {
             "/api/client/campaign/1/deactivate",
             "/api/client/campaign/1/v2/deactivate",
             "/api/client/statistics",
+            PRODUCT_SKU_STATS_PATH,
             "/api/client/campaign/",
+            "/api/client/campaign/1",
+            "/api/client/campaign/0/objects",
+            "/api/client/campaign/01/objects",
+            "/api/client/campaign/+1/objects",
+            "/api/client/campaign/18446744073709551616/objects",
+            "/api/client/campaign/%31/objects",
+            "/api/client/campaign/1/objects/",
+            "/api/client/campaign/1/objects/activate",
+            "/api/client/campaign/1/v2/products/",
+            "/api/client/campaign/1/v2/products/activate",
+            CAMPAIGN_OBJECTS_PATH_TEMPLATE,
+            CAMPAIGN_PRODUCTS_PATH_TEMPLATE,
             "/api/client//campaign",
             "/api/client/../campaign",
             "/api/client/%63ampaign",
@@ -996,11 +1221,48 @@ mod tests {
                 .expect_err("endpoint must be denied");
             assert_eq!(error.kind(), PerformanceErrorKind::EndpointNotAllowed);
         }
+        for path in [
+            CAMPAIGNS_PATH,
+            LIMITS_PATH,
+            "/api/client/campaign/1/objects",
+            "/api/client/campaign/1/v2/products",
+            TOKEN_PATH,
+        ] {
+            let error = client
+                .post(&StoreId::from("missing"), path, json!({}))
+                .await
+                .expect_err("unlisted POST endpoint must be denied");
+            assert_eq!(error.kind(), PerformanceErrorKind::EndpointNotAllowed);
+        }
         let missing = client
             .campaigns(&StoreId::from("missing"), campaigns_query())
             .await
             .expect_err("credentials must be required");
         assert_eq!(missing.kind(), PerformanceErrorKind::MissingCredentials);
+        assert_eq!(
+            client
+                .campaign_objects(&StoreId::from("missing"), 0)
+                .await
+                .expect_err("zero is not a canonical campaign ID")
+                .kind(),
+            PerformanceErrorKind::EndpointNotAllowed
+        );
+        assert_eq!(
+            client
+                .campaign_objects(&StoreId::from("missing"), 1)
+                .await
+                .expect_err("a valid dynamic route must reach the credential boundary")
+                .kind(),
+            PerformanceErrorKind::MissingCredentials
+        );
+        assert_eq!(
+            client
+                .sku_statistics(&StoreId::from("missing"), sku_statistics_query())
+                .await
+                .expect_err("the allowed POST must reach the credential boundary")
+                .kind(),
+            PerformanceErrorKind::MissingCredentials
+        );
         assert!(!is_read_only_request_allowed(&Method::POST, CAMPAIGNS_PATH));
     }
 
@@ -1232,6 +1494,14 @@ mod tests {
                 .kind(),
             PerformanceErrorKind::Overloaded
         );
+        assert_eq!(
+            client
+                .sku_statistics(&StoreId::from("shop"), sku_statistics_query())
+                .await
+                .expect_err("SKU statistics must share the statistics gate")
+                .kind(),
+            PerformanceErrorKind::Overloaded
+        );
     }
 
     #[tokio::test]
@@ -1413,8 +1683,10 @@ mod tests {
             for _ in 0..MAX_IN_FLIGHT_PER_CLIENT {
                 attempts.push(Box::pin(client.request_attempt(
                     state,
+                    Method::GET,
                     CAMPAIGNS_PATH,
                     &query,
+                    None,
                     "cached-token",
                 )));
             }
@@ -1466,8 +1738,14 @@ mod tests {
         // the request first performs its readiness check, then the competing
         // claimant takes the slot before that request can claim it itself.
         let pacing_gate = state.next_allowed.lock().await;
-        let mut request =
-            Box::pin(client.request_attempt(&state, DAILY_STATS_PATH, &query, "cached-token"));
+        let mut request = Box::pin(client.request_attempt(
+            &state,
+            Method::GET,
+            DAILY_STATS_PATH,
+            &query,
+            None,
+            "cached-token",
+        ));
         let mut winning_claim = Box::pin(state.try_claim_request_slot(Duration::from_secs(60)));
         let mut context = Context::from_waker(Waker::noop());
 
@@ -1534,8 +1812,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut first_request, _) = listener.accept().unwrap();
             assert!(
-                read_request(&mut first_request)
-                    .starts_with("GET /api/client/statistics/daily/json?")
+                read_request(&mut first_request).starts_with("GET /api/client/statistics/daily?")
             );
             write_json(&mut first_request, 401, "{}");
 
@@ -1555,8 +1832,7 @@ mod tests {
 
             let (mut replay_request, _) = listener.accept().unwrap();
             assert!(
-                read_request(&mut replay_request)
-                    .starts_with("GET /api/client/statistics/daily/json?")
+                read_request(&mut replay_request).starts_with("GET /api/client/statistics/daily?")
             );
             write_json(&mut replay_request, 200, r#"{"rows":[]}"#);
             refresh_response.join().unwrap();
@@ -1637,10 +1913,27 @@ mod tests {
         headers.insert("x-o3-trace-id", HeaderValue::from_static("bad value"));
         assert_eq!(safe_request_id(&headers), None);
 
-        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 3);
+        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 5);
+        assert_eq!(
+            READ_ONLY_ENDPOINT_ALLOWLIST,
+            &[
+                (Method::GET, CAMPAIGNS_PATH),
+                (Method::GET, DAILY_STATS_PATH),
+                (Method::GET, EXPENSES_PATH),
+                (Method::GET, LIMITS_PATH),
+                (Method::POST, PRODUCT_SKU_STATS_PATH),
+            ]
+        );
         for (method, path) in READ_ONLY_ENDPOINT_ALLOWLIST {
-            assert_eq!(*method, Method::GET);
             assert!(is_read_only_request_allowed(method, path));
+        }
+        for path in [
+            "/api/client/campaign/1/objects",
+            "/api/client/campaign/18446744073709551615/objects",
+            "/api/client/campaign/1/v2/products",
+        ] {
+            assert!(is_read_only_request_allowed(&Method::GET, path));
+            assert!(!is_read_only_request_allowed(&Method::POST, path));
         }
         for (kind, code) in [
             (

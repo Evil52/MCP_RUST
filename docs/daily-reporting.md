@@ -38,14 +38,21 @@ The first disabled-only phase provides:
   policy-scoped Ozon Seller and Performance read credentials, reaches the two
   fixed API hosts through the deployment-owned CONNECT proxy, normalizes one
   completed EKB business day and publishes all four sources atomically; and
+- Ozon sales normalization that requests revenue, ordered units, returns and
+  cancellations together, preserving the latter two as explicit unit facts;
+  Analytics pagination is paced at one request per minute per Client-Id and is
+  capped at ten pages (9,999 complete rows) inside the 12-minute dry-run deadline; and
+- warehouse-specific Ozon FBO and FBS stock collection that retains each real
+  warehouse ID with an `fbo:` or `fbs:` namespace instead of substituting a
+  synthetic channel-wide warehouse; and
 - an explicit operator-only `wb-dry-run` command which loads only one
   policy-scoped Personal WB token, collects the documented daily sales-funnel,
   current warehouse-stock, current price and eligible-campaign statistics
   endpoints through the exact-host CONNECT proxy, and publishes all four
   normalized sources atomically; and
-- campaign-level Ozon Performance daily rows stored with the explicit
-  unavailable-SKU sentinel and rendered as `N/D`, never as a fabricated
-  product attribution; and
+- Ozon Performance product statistics normalized by the real
+  `campaignId + sku + date`, so advertising facts no longer use an
+  unavailable-SKU sentinel or fabricated product attribution; and
 - a bounded PostgreSQL reader that loads only published source descriptors and
   revalidates the exact four-source manifest before report generation;
 - a bounded published-fact reader that selects rows only by the frozen

@@ -18,8 +18,9 @@ use crate::{
 
 use super::{
     ozon_adapter::{
-        OzonReportParseError, OzonReportRequest, parse_price_page, parse_sales_page,
-        parse_stock_page, product_page_request, sales_request,
+        OzonReportParseError, OzonReportRequest, next_warehouse_stock_cursor, parse_price_page,
+        parse_sales_page, parse_warehouse_stock_page, product_page_request, sales_request,
+        warehouse_stock_page_request,
     },
     postgres_collector::{
         CollectedAdvertisingFact, CollectedFacts, CollectedPriceFact, CollectedSalesFact,
@@ -41,13 +42,17 @@ use super::{
 const OVERLOAD_RETRY_ATTEMPTS: usize = 4;
 const OVERLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-const MAX_SALES_PAGES: usize = 25;
+// `/v1/analytics/data` is limited by Ozon to one request per minute. Ten
+// bounded pages cover up to 9,999 rows and keep a complete collection inside
+// the operator dry-run deadline; a tenth full page fails closed instead of
+// starting an unbounded multi-hour backfill.
+const MAX_SALES_PAGES: usize = 10;
 // At 100 products/page this still accommodates 10,000 products, while the
 // manual dry-run's absolute deadline bounds the total request time.
 const MAX_PRODUCT_PAGES: usize = 100;
 
 /// Collects the three Seller sources and atomically publishes them together
-/// with a separately verified Performance campaign snapshot.
+/// with a separately verified Performance SKU snapshot.
 #[allow(clippy::too_many_arguments)]
 pub async fn collect_complete_snapshots(
     transport: &dyn OzonReportTransport,
@@ -361,9 +366,10 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         })
     }
 
-    /// Collects offset-paginated sales rows with the same hard bound used for
-    /// the cursor sources. A full-size final page is not accepted as complete
-    /// because the upstream response has no trustworthy total-row contract.
+    /// Collects offset-paginated sales rows under the client's one-request-per-
+    /// minute Analytics gate. A full-size final page is not accepted as
+    /// complete because the upstream response has no trustworthy total-row
+    /// contract.
     pub async fn collect_sales_pages(
         &self,
         date_from: NaiveDate,
@@ -385,16 +391,46 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         Err(OzonReportSourceError::PaginationLimit)
     }
 
-    /// Collects cursor-paginated stock pages with a fixed upper bound.
+    /// Collects real warehouse-granular FBO and FBS stock pages.
+    ///
+    /// Both sources must complete. Falling back to `/v4/product/info/stocks`
+    /// would silently collapse all physical warehouses into two fulfillment
+    /// labels and make OOS/DaysCover analytics misleading.
     pub async fn collect_stock_pages(
         &self,
     ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
-        self.collect_product_pages(
-            "/v4/product/info/stocks",
-            parse_stock_page,
-            OzonReportSourceError::InvalidStocksResponse,
-        )
-        .await
+        let mut facts = self
+            .collect_warehouse_stock_pages("/v1/product/info/stocks-by-warehouse/fbo", "fbo")
+            .await?;
+        facts.extend(
+            self.collect_warehouse_stock_pages("/v2/product/info/stocks-by-warehouse/fbs", "fbs")
+                .await?,
+        );
+        Ok(facts)
+    }
+
+    async fn collect_warehouse_stock_pages(
+        &self,
+        path: &'static str,
+        scheme: &'static str,
+    ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
+        let mut cursor = None;
+        let mut facts = Vec::new();
+        for _ in 0..MAX_PRODUCT_PAGES {
+            let request = warehouse_stock_page_request(path, cursor.as_deref())
+                .map_err(|_| OzonReportSourceError::InvalidResponse)?;
+            let response = self.transport.post(request).await?;
+            facts.extend(
+                parse_warehouse_stock_page(&response, scheme)
+                    .map_err(|_| OzonReportSourceError::InvalidStocksResponse)?,
+            );
+            cursor = next_warehouse_stock_cursor(&response)
+                .map_err(|_| OzonReportSourceError::InvalidStocksResponse)?;
+            if cursor.is_none() {
+                return Ok(facts);
+            }
+        }
+        Err(OzonReportSourceError::PaginationLimit)
     }
 
     /// Collects cursor-paginated price pages with a fixed upper bound.
@@ -599,29 +635,92 @@ mod tests {
         }
     }
 
+    struct RecordingTransport {
+        responses: Mutex<VecDeque<Result<Value, OzonReportSourceError>>>,
+        paths: Mutex<Vec<&'static str>>,
+    }
+
+    impl OzonReportTransport for RecordingTransport {
+        fn post<'a>(
+            &'a self,
+            request: OzonReportRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, OzonReportSourceError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.paths.lock().unwrap().push(request.path);
+                self.responses.lock().unwrap().pop_front().unwrap()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn stock_collection_reads_both_warehouse_schemes_in_order() {
+        let transport = RecordingTransport {
+            responses: Mutex::new(VecDeque::from([
+                Ok(json!({"products":[],"cursor":"","has_next":false})),
+                Ok(json!({"products":[],"cursor":"","has_next":false})),
+            ])),
+            paths: Mutex::new(Vec::new()),
+        };
+        let source = OzonReportSource::new(&transport);
+
+        assert!(source.collect_stock_pages().await.unwrap().is_empty());
+        assert_eq!(
+            transport.paths.lock().unwrap().as_slice(),
+            [
+                "/v1/product/info/stocks-by-warehouse/fbo",
+                "/v2/product/info/stocks-by-warehouse/fbs",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stock_collection_propagates_an_fbs_failure_after_fbo_completed() {
+        let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(json!({"products": [], "cursor": "", "has_next": false})),
+            Err(OzonReportSourceError::Transport),
+        ]))));
+
+        assert_eq!(
+            source.collect_stock_pages().await,
+            Err(OzonReportSourceError::Transport)
+        );
+    }
+
     #[tokio::test]
     async fn source_normalizes_only_valid_read_only_pages() {
         let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
             Ok(json!({"result":{"data":[{
                 "dimensions":[{"id":"1"},{"id":"2026-08-16"}],
-                "metrics":["1.00", 2]
+                "metrics":["1.00", 2, 1, 1]
             }]}})),
-            Ok(
-                json!({"items":[{"product_id":1,"stocks":[{"type":"FBO","present":3}]}],"cursor":""}),
-            ),
+            Ok(json!({
+                "products":[{"sku":1,"warehouse_id":11,"present":4,"reserved":1}],
+                "cursor":"",
+                "has_next":false
+            })),
+            Ok(json!({
+                "products":[{
+                    "sku":1,"warehouse_id":22,"present":5,"reserved":1,"free_stock":2
+                }],
+                "cursor":"",
+                "has_next":false
+            })),
             Ok(
                 json!({"items":[{"product_id":1,"price":{"currency_code":"RUB","price":"2","old_price":"0"}}],"cursor":""}),
             ),
         ]))));
         let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
-        assert_eq!(
-            source.sales_page(day, day, 0).await.unwrap()[0].ordered_units,
-            2
-        );
-        assert_eq!(
-            source.collect_stock_pages().await.unwrap()[0].sellable_units,
-            3
-        );
+        let sales = source.sales_page(day, day, 0).await.unwrap();
+        assert_eq!(sales[0].ordered_units, 2);
+        assert_eq!(sales[0].returned_units, Some(1));
+        assert_eq!(sales[0].cancelled_units, Some(1));
+        let stocks = source.collect_stock_pages().await.unwrap();
+        assert_eq!(stocks.len(), 2);
+        assert_eq!(stocks[0].warehouse_id, "fbo:11");
+        assert_eq!(stocks[0].sellable_units, 3);
+        assert_eq!(stocks[1].warehouse_id, "fbs:22");
+        assert_eq!(stocks[1].sellable_units, 2);
         assert_eq!(
             source.collect_price_pages().await.unwrap()[0].price_minor,
             200
@@ -644,6 +743,43 @@ mod tests {
             source.collect_stock_pages().await,
             Err(OzonReportSourceError::InvalidStocksResponse)
         );
+        assert!(matches!(
+            source.sales_page(day, day, 0).await,
+            Err(OzonReportSourceError::InvalidSalesResponse { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn concrete_transport_classifies_an_invalid_price_response() {
+        let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([Ok(
+            json!({"items": "invalid", "cursor": ""}),
+        )]))));
+
+        assert_eq!(
+            source.collect_price_pages().await,
+            Err(OzonReportSourceError::InvalidPricesResponse)
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_transport_classifies_invalid_price_and_sales_responses() {
+        let invalid_price = FixtureTransport(Mutex::new(VecDeque::from([Ok(json!({
+            "items": "invalid",
+            "cursor": ""
+        }))])));
+        let transport: &dyn OzonReportTransport = &invalid_price;
+        let source = OzonReportSource::new(transport);
+        assert_eq!(
+            source.collect_price_pages().await,
+            Err(OzonReportSourceError::InvalidPricesResponse)
+        );
+
+        let invalid_sales = FixtureTransport(Mutex::new(VecDeque::from([Ok(json!({
+            "result": {"data": [{"dimensions": [], "metrics": []}]}
+        }))])));
+        let transport: &dyn OzonReportTransport = &invalid_sales;
+        let source = OzonReportSource::new(transport);
+        let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
         assert!(matches!(
             source.sales_page(day, day, 0).await,
             Err(OzonReportSourceError::InvalidSalesResponse { .. })
@@ -681,15 +817,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn product_collection_follows_cursor_and_requires_a_valid_terminal_cursor() {
+    async fn warehouse_collection_follows_cursor_and_requires_a_valid_terminal_cursor() {
         let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
-            Ok(json!({"items":[{"product_id":1,"stocks":[]}],"cursor":"next"})),
-            Ok(json!({"items":[{"product_id":2,"stocks":[]}],"cursor":""})),
+            Ok(json!({"products":[],"cursor":"next","has_next":true})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
         ]))));
         assert_eq!(source.collect_stock_pages().await.unwrap().len(), 0);
 
         let invalid = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([Ok(
-            json!({"items":[],"cursor":42}),
+            json!({"products":[],"cursor":42,"has_next":true}),
         )]))));
         assert_eq!(
             invalid.collect_stock_pages().await,
@@ -698,10 +835,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn price_collection_follows_valid_cursors_and_fails_closed_at_the_page_bound() {
+        let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(json!({"items": [], "cursor": "next"})),
+            Ok(json!({"items": [], "cursor": ""})),
+        ]))));
+        assert!(source.collect_price_pages().await.unwrap().is_empty());
+
+        assert_eq!(
+            next_cursor(
+                &json!({"cursor": "next"}),
+                OzonReportSourceError::InvalidPricesResponse
+            ),
+            Ok(Some("next".to_owned()))
+        );
+        assert_eq!(
+            next_cursor(
+                &json!({"cursor": "unsafe\n"}),
+                OzonReportSourceError::InvalidPricesResponse
+            ),
+            Err(OzonReportSourceError::InvalidResponse)
+        );
+
+        let bounded = OzonReportSource::new(FixtureTransport(Mutex::new(
+            std::iter::repeat_with(|| Ok(json!({"items": [], "cursor": "next"})))
+                .take(MAX_PRODUCT_PAGES)
+                .collect(),
+        )));
+        assert_eq!(
+            bounded.collect_price_pages().await,
+            Err(OzonReportSourceError::PaginationLimit)
+        );
+    }
+
+    #[tokio::test]
     async fn required_facts_are_returned_only_after_all_sources_succeed() {
         let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
             Ok(json!({"result":{"data":[]}})),
-            Ok(json!({"items":[],"cursor":""})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
             Ok(json!({"items":[],"cursor":""})),
         ]))));
         let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
@@ -722,7 +894,8 @@ mod tests {
     async fn complete_collection_builds_four_validated_snapshots_without_database_io() {
         let transport = FixtureTransport(Mutex::new(VecDeque::from([
             Ok(json!({"result":{"data":[]}})),
-            Ok(json!({"items":[],"cursor":""})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
             Ok(json!({"items":[],"cursor":""})),
         ])));
         let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
@@ -732,7 +905,7 @@ mod tests {
             vec![CollectedAdvertisingFact {
                 business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
                 campaign_id: 7,
-                sku: 0,
+                sku: 1,
                 impressions: 10,
                 clicks: 1,
                 spend_minor: 100,
@@ -752,10 +925,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_collection_propagates_a_required_seller_source_failure() {
+        let transport = FixtureTransport(Mutex::new(VecDeque::from([Err(
+            OzonReportSourceError::Transport,
+        )])));
+        let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
+        let period_start = Utc.with_ymd_and_hms(2026, 8, 15, 19, 0, 0).unwrap();
+
+        assert_eq!(
+            collect_complete_snapshots(
+                &transport,
+                Vec::new(),
+                "ozon".to_owned(),
+                as_of,
+                as_of,
+                period_start,
+                as_of,
+                "test-1".to_owned(),
+            )
+            .await,
+            Err(OzonReportSourceError::Transport)
+        );
+    }
+
+    #[tokio::test]
     async fn complete_collection_refuses_an_invalid_performance_fact_atomically() {
         let transport = FixtureTransport(Mutex::new(VecDeque::from([
             Ok(json!({"result":{"data":[]}})),
-            Ok(json!({"items":[],"cursor":""})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
             Ok(json!({"items":[],"cursor":""})),
         ])));
         let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
@@ -766,7 +964,7 @@ mod tests {
                 vec![CollectedAdvertisingFact {
                     business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
                     campaign_id: 0,
-                    sku: 0,
+                    sku: 1,
                     impressions: 0,
                     clicks: 0,
                     spend_minor: 0,
@@ -826,7 +1024,7 @@ mod tests {
                 vec![CollectedAdvertisingFact {
                     business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
                     campaign_id: 7,
-                    sku: 0,
+                    sku: 1,
                     impressions: 10,
                     clicks: 1,
                     spend_minor: 100,
@@ -923,7 +1121,7 @@ mod tests {
         let valid_advertising = || CollectedAdvertisingFact {
             business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
             campaign_id: 7,
-            sku: 0,
+            sku: 1,
             impressions: 10,
             clicks: 1,
             spend_minor: 100,
@@ -977,7 +1175,7 @@ mod tests {
         let full_sales_page = || {
             json!({"result":{"data":(0..1_000).map(|index| json!({
                 "dimensions":[{"id":index.to_string()},{"id":"2026-08-16"}],
-                "metrics":["1", 1]
+                "metrics":["1", 1, 0, 0]
             })).collect::<Vec<_>>()}})
         };
         let sales = OzonReportSource::new(FixtureTransport(Mutex::new(
@@ -992,7 +1190,7 @@ mod tests {
         );
 
         let cursor = OzonReportSource::new(FixtureTransport(Mutex::new(
-            std::iter::repeat_with(|| Ok(json!({"items":[],"cursor":"next"})))
+            std::iter::repeat_with(|| Ok(json!({"products":[],"cursor":"next","has_next":true})))
                 .take(MAX_PRODUCT_PAGES)
                 .collect(),
         )));
@@ -1027,7 +1225,10 @@ mod tests {
         .unwrap();
         let transport = OzonClientReportTransport::new(client, StoreId::from("missing"));
         let error = transport
-            .post(product_page_request("/v4/product/info/stocks", None).unwrap())
+            .post(
+                warehouse_stock_page_request("/v1/product/info/stocks-by-warehouse/fbo", None)
+                    .unwrap(),
+            )
             .await
             .expect_err("an unknown store must fail before network access");
         assert_eq!(error.code(), "missing_credentials");
@@ -1061,7 +1262,10 @@ mod tests {
         .unwrap();
         let transport = OzonClientReportTransport::new(client, store);
         let value = transport
-            .post(product_page_request("/v4/product/info/stocks", None).unwrap())
+            .post(
+                warehouse_stock_page_request("/v1/product/info/stocks-by-warehouse/fbo", None)
+                    .unwrap(),
+            )
             .await
             .expect("the hardened transport must pass through a bounded success response");
         assert_eq!(value["result"], "ok");

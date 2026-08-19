@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
 
-use chrono::{NaiveDate, NaiveDateTime, Utc};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Utc};
 use rmcp::{
     Json, RoleServer, ServerHandler,
     handler::server::{
@@ -28,8 +28,9 @@ use crate::{
     config::{AccessRegistry, Actor, Marketplace, RegistrySource, Role, StoreId},
     ozon::OzonClient,
     ozon_performance::{
-        CAMPAIGNS_PATH, CampaignsQuery, DAILY_STATS_PATH, EXPENSES_PATH, PerformanceClient,
-        StatisticsQuery,
+        CAMPAIGN_OBJECTS_PATH_TEMPLATE, CAMPAIGN_PRODUCTS_PATH_TEMPLATE, CAMPAIGNS_PATH,
+        CampaignProductsQuery, CampaignsQuery, DAILY_STATS_PATH, EXPENSES_PATH, LIMITS_PATH,
+        PRODUCT_SKU_STATS_PATH, PerformanceClient, SkuStatisticsQuery, StatisticsQuery,
     },
     wb::WbClient,
 };
@@ -74,19 +75,16 @@ const ACCESS_DENIED: &str = "ACCESS_DENIED";
 const UNKNOWN_STORE: &str = "UNKNOWN_STORE";
 const STORE_REQUIRED: &str = "STORE_REQUIRED";
 const NO_ACCESSIBLE_STORE: &str = "NO_ACCESSIBLE_STORE";
-const PREVIEW_CURSOR_REQUIRED: &str = "PREVIEW_CURSOR_REQUIRED";
-const PREVIEW_DISABLED: &str = "PREVIEW_DISABLED";
+const CURSOR_REQUIRED: &str = "CURSOR_REQUIRED";
 const READ_ONLY_ENDPOINT_DENIED: &str = "READ_ONLY_ENDPOINT_DENIED";
 const ROLE_ACCESS_DENIED: &str = "ROLE_ACCESS_DENIED";
-const FINANCE_ACCRUAL_PREVIEW_TOOLS: &[&str] = &[
-    "ozon_finance_accrual_postings",
-    "ozon_finance_accrual_types",
-    "ozon_finance_accrual_by_day",
-];
 const FINANCE_ENDPOINTS: &[&str] = &[
     "/v1/finance/accrual/by-day",
     "/v1/finance/accrual/postings",
     "/v1/finance/accrual/types",
+    "/v1/finance/cash-flow-statement/list",
+    "/v1/finance/mutual-settlement",
+    "/v1/finance/realization/by-day",
     "/v3/finance/transaction/list",
     "/v3/finance/transaction/totals",
 ];
@@ -189,8 +187,6 @@ pub struct OzonMcp {
     default_actor_id: Option<String>,
     authenticator: Option<JwtAuthenticator>,
     registry: RegistrySource,
-    postings_vnext: bool,
-    finance_accruals_preview: bool,
     tool_router: ToolRouter<Self>,
     tool_call_slots: Arc<Semaphore>,
 }
@@ -244,9 +240,6 @@ impl OzonMcp {
                 .0
                 .insert("securitySchemes".to_owned(), security_schemes_value.clone());
         }
-        for &name in FINANCE_ACCRUAL_PREVIEW_TOOLS {
-            tool_router.disable_route(name);
-        }
         tool_router
     }
 
@@ -258,8 +251,6 @@ impl OzonMcp {
             default_actor_id: Some(actor_id),
             authenticator: None,
             registry,
-            postings_vnext: false,
-            finance_accruals_preview: false,
             tool_router: Self::default_tool_router(None),
             tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
         }
@@ -278,8 +269,6 @@ impl OzonMcp {
             default_actor_id: None,
             authenticator: Some(authenticator),
             registry,
-            postings_vnext: false,
-            finance_accruals_preview: false,
             tool_router,
             tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
         }
@@ -334,32 +323,13 @@ impl OzonMcp {
 
     pub fn with_preview_features(
         mut self,
-        postings_vnext: bool,
+        _postings_vnext: bool,
         finance_accruals_preview: bool,
     ) -> Self {
-        self.postings_vnext = postings_vnext;
-        self.finance_accruals_preview = finance_accruals_preview;
         self.client = self
             .client
             .with_finance_accruals_preview(finance_accruals_preview);
-        for &name in FINANCE_ACCRUAL_PREVIEW_TOOLS {
-            if finance_accruals_preview {
-                self.tool_router.enable_route(name);
-            } else {
-                self.tool_router.disable_route(name);
-            }
-        }
         self
-    }
-
-    fn require_finance_accruals_preview(&self) -> Result<(), String> {
-        if self.finance_accruals_preview {
-            Ok(())
-        } else {
-            Err(format!(
-                "{PREVIEW_DISABLED}: экспериментальные finance accrual tools выключены; установите OZON_FINANCE_ACCRUALS_PREVIEW=true только в изолированном canary"
-            ))
-        }
     }
 
     fn access_context(
@@ -656,51 +626,29 @@ impl OzonMcp {
         }
         validate_max_u32("offset", input.offset, MAX_OFFSET)?;
         let (from, to) = validate_and_expand_dates(&input.date_from, &input.date_to, 366)?;
-        if self.postings_vnext {
-            if input.offset > 0 {
-                return Err(format!(
-                    "{PREVIEW_CURSOR_REQUIRED}: preview-методы отправлений используют cursor; offset должен быть равен 0"
-                ));
-            }
-            validate_limit(input.limit, 100)?;
-            let statuses = if input.status.is_empty() {
-                Vec::new()
-            } else {
-                vec![input.status]
-            };
-            let mut payload = json!({
-                "filter": { "since": from, "to": to, "statuses": statuses },
-                "limit": input.limit,
-                "sort_dir": input.direction,
-                "translit": false,
-                "with": kind.preview_with(),
-            });
-            if let Some(cursor) = input.cursor.filter(|cursor| !cursor.is_empty()) {
-                payload
-                    .as_object_mut()
-                    .expect("posting preview payload is an object")
-                    .insert("cursor".to_owned(), json!(cursor));
-            }
-            return self
-                .request(identity, input.store, kind.preview_endpoint(), payload)
-                .await;
+        if input.offset > 0 {
+            return Err(format!(
+                "{CURSOR_REQUIRED}: актуальные методы отправлений используют cursor; legacy offset должен быть равен 0"
+            ));
         }
-        validate_limit(input.limit, 1_000)?;
+        validate_limit(input.limit, 100)?;
+        let statuses = if input.status.is_empty() {
+            Vec::new()
+        } else {
+            vec![input.status]
+        };
         let mut payload = json!({
-            "dir": input.direction,
-            "filter": { "since": from, "to": to, "status": input.status },
+            "filter": { "since": from, "to": to, "statuses": statuses },
             "limit": input.limit,
-            "offset": input.offset,
+            "sort_dir": input.direction,
+            "translit": false,
+            "with": kind.with_fields(),
         });
-        if kind == PostingKind::Fbo {
-            let payload = payload
+        if let Some(cursor) = input.cursor.filter(|cursor| !cursor.is_empty()) {
+            payload
                 .as_object_mut()
-                .expect("posting payload is an object");
-            payload.insert("translit".to_owned(), json!(false));
-            payload.insert(
-                "with".to_owned(),
-                json!({ "analytics_data": true, "financial_data": true }),
-            );
+                .expect("posting payload is an object")
+                .insert("cursor".to_owned(), json!(cursor));
         }
         self.request(identity, input.store, kind.endpoint(), payload)
             .await
@@ -832,29 +780,22 @@ enum PostingKind {
 impl PostingKind {
     fn endpoint(self) -> &'static str {
         match self {
-            Self::Fbs => "/v3/posting/fbs/list",
-            Self::Fbo => "/v2/posting/fbo/list",
-        }
-    }
-
-    fn preview_endpoint(self) -> &'static str {
-        match self {
             Self::Fbs => "/v4/posting/fbs/list",
             Self::Fbo => "/v3/posting/fbo/list",
         }
     }
 
-    fn preview_with(self) -> Value {
+    fn with_fields(self) -> Value {
         match self {
             Self::Fbs => json!({
                 "analytics_data": true,
                 "barcodes": true,
-                "financial_data": true,
+                "financial_data": false,
                 "legal_info": false,
             }),
             Self::Fbo => json!({
                 "analytics_data": true,
-                "financial_data": true,
+                "financial_data": false,
                 "legal_info": false,
             }),
         }
@@ -1541,6 +1482,14 @@ pub enum SortDirection {
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ProductSortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Visibility {
     #[default]
@@ -1548,10 +1497,62 @@ pub enum Visibility {
     Visible,
     Invisible,
     EmptyStock,
+    NotModerated,
+    Moderated,
     ReadyToSupply,
     StateFailed,
-    Moderate,
-    Declined,
+    ValidationStatePending,
+    ValidationStateFail,
+    ValidationStateSuccess,
+    ToSupply,
+    InSale,
+    RemovedFromSale,
+    Banned,
+    Overpriced,
+    CriticallyOverpriced,
+    EmptyBarcode,
+    BarcodeExists,
+    Quarantine,
+    Archived,
+    AutoArchived,
+    ManualArchived,
+    SeasonalAutoArchived,
+    VisibleWithFboStock,
+    OverpricedWithStock,
+    PartialApproved,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CatalogVisibility {
+    #[default]
+    All,
+    Visible,
+    Invisible,
+    EmptyStock,
+    NotModerated,
+    Moderated,
+    ReadyToSupply,
+    StateFailed,
+    ValidationStatePending,
+    ValidationStateFail,
+    ValidationStateSuccess,
+    ToSupply,
+    InSale,
+    RemovedFromSale,
+    Overpriced,
+    CriticallyOverpriced,
+    EmptyBarcode,
+    BarcodeExists,
+    Quarantine,
+    Archived,
+    AutoArchived,
+    ManualArchived,
+    SeasonalAutoArchived,
+    VisibleWithFboStock,
+    OverpricedWithStock,
+    PartialApproved,
     Disabled,
 }
 
@@ -1564,8 +1565,14 @@ pub enum AnalyticsMetric {
     HitsViewSearch,
     HitsViewPdp,
     HitsTocart,
+    HitsTocartSearch,
+    HitsTocartPdp,
     SessionView,
-    ConvTocartPercent,
+    SessionViewSearch,
+    SessionViewPdp,
+    ConvTocart,
+    ConvTocartSearch,
+    ConvTocartPdp,
     Returns,
     Cancellations,
     DeliveredUnits,
@@ -1584,8 +1591,10 @@ pub enum AnalyticsDimension {
     Brand,
     Category1,
     Category2,
-    Category3,
-    Category4,
+    #[serde(rename = "modelID")]
+    ModelId,
+    #[serde(rename = "descriptionType")]
+    DescriptionType,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1604,7 +1613,7 @@ pub struct AnalyticsInput {
     pub date_from: String,
     #[schemars(description = "Конец периода в формате YYYY-MM-DD", length(equal = 10))]
     pub date_to: String,
-    #[schemars(description = "От одной до 10 метрик Ozon", length(min = 1, max = 10))]
+    #[schemars(description = "От одной до 14 метрик Ozon", length(min = 1, max = 14))]
     pub metrics: Vec<AnalyticsMetric>,
     #[schemars(
         description = "От одного до двух измерений: например sku и day",
@@ -1650,6 +1659,30 @@ pub struct ProductFilterInput {
     pub cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductPriceFilterInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000), inner(length(min = 1, max = 256)))]
+    pub offer_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000), inner(length(min = 1, max = 256)))]
+    pub product_ids: Vec<String>,
+    #[serde(default)]
+    pub visibility: CatalogVisibility,
+    #[serde(default = "default_product_limit")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub limit: u32,
+    #[schemars(length(max = 4_096))]
+    pub cursor: Option<String>,
+}
+
 fn default_product_limit() -> u32 {
     100
 }
@@ -1674,6 +1707,153 @@ pub struct WarehouseStocksInput {
     #[serde(default)]
     #[schemars(length(max = 4_096))]
     pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WarehouseStockListInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000), inner(length(min = 1, max = 256)))]
+    pub offer_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 1_000),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub skus: Vec<u64>,
+    #[serde(default = "default_product_limit")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub limit: u32,
+    #[serde(default)]
+    #[schemars(length(max = 4_096))]
+    pub cursor: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WarehouseListInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default = "default_product_limit")]
+    #[schemars(
+        description = "Локально ограниченный размер страницы; Ozon не публикует границы limit для этого метода",
+        range(min = 1, max = 1_000)
+    )]
+    pub limit: u32,
+    #[serde(default)]
+    #[schemars(
+        description = "Непрозрачный cursor из предыдущего ответа Ozon",
+        length(max = 4_096)
+    )]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 1_000),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub warehouse_ids: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductCatalogInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000), inner(length(min = 1, max = 256)))]
+    pub offer_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000), inner(length(min = 1, max = 256)))]
+    pub product_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 1_000),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub skus: Vec<u64>,
+    #[serde(default)]
+    pub visibility: CatalogVisibility,
+    #[serde(default = "default_product_limit")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub limit: u32,
+    #[serde(default)]
+    #[schemars(length(max = 4_096))]
+    pub last_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductInfoListInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000), inner(length(min = 1, max = 256)))]
+    pub offer_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000), inner(length(min = 1, max = 256)))]
+    pub product_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 1_000),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub skus: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductAttributesInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000), inner(length(min = 1, max = 256)))]
+    pub offer_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 1_000), inner(length(min = 1, max = 256)))]
+    pub product_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 1_000),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub skus: Vec<u64>,
+    #[serde(default)]
+    pub visibility: CatalogVisibility,
+    #[serde(default = "default_product_limit")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub limit: u32,
+    #[serde(default)]
+    #[schemars(length(max = 4_096))]
+    pub last_id: String,
+    #[serde(default)]
+    pub sort_direction: ProductSortDirection,
 }
 
 #[derive(
@@ -1853,14 +2033,17 @@ period_input!(
     #[schemars(length(max = 128))]
     pub status: String,
     #[serde(default = "default_posting_limit")]
-    #[schemars(range(min = 1, max = 1_000))]
+    #[schemars(range(min = 1, max = 100))]
     pub limit: u32,
     #[serde(default)]
-    #[schemars(range(max = 1_000_000))]
+    #[schemars(
+        description = "Legacy-поле со значением 0; актуальная пагинация использует cursor",
+        range(max = 0)
+    )]
     pub offset: u32,
     #[serde(default)]
     #[schemars(
-        description = "Непрозрачный cursor только для экспериментального vNext preview",
+        description = "Непрозрачный cursor из предыдущей страницы",
         length(max = 4_096)
     )]
     pub cursor: Option<String>,
@@ -1872,6 +2055,71 @@ period_input!(
 fn default_posting_limit() -> u32 {
     100
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PostingGetInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[schemars(length(min = 1, max = 256))]
+    pub posting_number: String,
+}
+
+period_input!(
+    FbsUnfulfilledInput,
+    "Начало периода изменения статуса в формате YYYY-MM-DD",
+    "Конец периода изменения статуса в формате YYYY-MM-DD",
+    {
+    #[serde(default)]
+    #[schemars(length(max = 4_096))]
+    pub cursor: String,
+    #[serde(default = "default_posting_limit")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub limit: u32,
+    #[serde(default)]
+    pub direction: SortDirection,
+    #[serde(default)]
+    #[schemars(length(max = 100), inner(length(min = 1, max = 128)))]
+    pub statuses: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 1_000),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub warehouse_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 1_000),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub provider_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 1_000),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub delivery_method_ids: Vec<u64>,
+    #[serde(default)]
+    #[schemars(length(equal = 10))]
+    pub cutoff_from: Option<String>,
+    #[serde(default)]
+    #[schemars(length(equal = 10))]
+    pub cutoff_to: Option<String>,
+    #[serde(default)]
+    #[schemars(length(equal = 10))]
+    pub delivering_date_from: Option<String>,
+    #[serde(default)]
+    #[schemars(length(equal = 10))]
+    pub delivering_date_to: Option<String>,
+    }
+);
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -1994,7 +2242,7 @@ period_input!(
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct FinanceAccrualPostingsPreviewInput {
+pub struct FinanceAccrualPostingsInput {
     #[serde(default)]
     #[schemars(
         description = "Канонический store_id или account_id из marketplace_accounts",
@@ -2002,7 +2250,7 @@ pub struct FinanceAccrualPostingsPreviewInput {
     )]
     pub store: Option<StoreId>,
     #[schemars(
-        description = "Непустой список номеров отправлений для candidate preview-контракта",
+        description = "Непустой список номеров отправлений",
         length(min = 1, max = 1_000),
         inner(length(min = 1, max = 256))
     )]
@@ -2011,7 +2259,7 @@ pub struct FinanceAccrualPostingsPreviewInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct FinanceAccrualTypesPreviewInput {
+pub struct FinanceAccrualTypesInput {
     #[serde(default)]
     #[schemars(
         description = "Канонический store_id или account_id из marketplace_accounts",
@@ -2022,7 +2270,7 @@ pub struct FinanceAccrualTypesPreviewInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct FinanceAccrualByDayPreviewInput {
+pub struct FinanceAccrualByDayInput {
     #[serde(default)]
     #[schemars(
         description = "Канонический store_id или account_id из marketplace_accounts",
@@ -2036,10 +2284,66 @@ pub struct FinanceAccrualByDayPreviewInput {
     pub date: String,
     #[serde(default)]
     #[schemars(
-        description = "Непрозрачный last_id из предыдущего preview-ответа",
+        description = "Непрозрачный last_id из предыдущего ответа; действует 15 минут",
         length(max = 4_096)
     )]
     pub last_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FinanceRealizationByDayInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[schemars(
+        description = "Дата отчёта в формате YYYY-MM-DD; Ozon хранит не более 32 дней",
+        length(equal = 10)
+    )]
+    pub date: String,
+}
+
+period_input!(
+    FinanceCashFlowInput,
+    "Начало расчётного периода Ozon в формате YYYY-MM-DD",
+    "Конец расчётного периода Ozon в формате YYYY-MM-DD",
+    {
+    #[serde(default = "default_page")]
+    #[schemars(range(min = 1, max = 1_000_000))]
+    pub page: u32,
+    #[serde(default = "default_finance_page_size")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub page_size: u32,
+    #[serde(default = "default_true")]
+    pub with_details: bool,
+    }
+);
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum FinanceLanguage {
+    #[default]
+    Default,
+    Ru,
+    En,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FinanceMutualSettlementInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[schemars(description = "Месяц отчёта в формате YYYY-MM", length(equal = 7))]
+    pub date: String,
+    #[serde(default)]
+    pub language: FinanceLanguage,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -2145,6 +2449,72 @@ pub struct PerformanceStatisticsInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct PerformanceSkuStatisticsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(
+        description = "До 10 campaign ID; пустой список означает все кампании",
+        length(max = 10),
+        inner(range(min = 1))
+    )]
+    pub campaign_ids: Vec<u64>,
+    #[schemars(
+        description = "Начало периода YYYY-MM-DD. Ozon требует дату не раньше предыдущего дня, но не публикует timezone для локальной относительной проверки",
+        length(equal = 10)
+    )]
+    pub date_from: String,
+    #[schemars(
+        description = "Конец периода статистики в формате YYYY-MM-DD",
+        length(equal = 10)
+    )]
+    pub date_to: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceCampaignResourceInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[schemars(
+        description = "Положительный ID рекламной кампании",
+        range(min = 1, max = 9_223_372_036_854_775_807_u64)
+    )]
+    pub campaign_id: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceCampaignProductsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[schemars(
+        description = "Положительный ID рекламной кампании",
+        range(min = 1, max = 9_223_372_036_854_775_807_u64)
+    )]
+    pub campaign_id: u64,
+    #[serde(default = "default_page")]
+    #[schemars(range(min = 1, max = 1_000_000))]
+    pub page: u32,
+    #[serde(default = "default_performance_page_size")]
+    #[schemars(range(min = 1, max = 100))]
+    pub page_size: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StoreOnlyInput {
     #[serde(default)]
     #[schemars(
@@ -2200,8 +2570,26 @@ pub struct ReviewsInput {
     #[schemars(length(max = 4_096))]
     pub last_id: String,
     #[serde(default = "default_all_status")]
-    #[schemars(length(min = 1, max = 128))]
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = "^(ALL|NEW|VIEWED|PROCESSED)$")
+    )]
     pub status: String,
+    #[serde(default)]
+    #[schemars(length(max = 100), inner(range(min = 1)))]
+    pub skus: Vec<u64>,
+    #[serde(default = "default_all_status")]
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = "^(ALL|DELIVERED|CANCELLED)$")
+    )]
+    pub order_status: String,
+    #[serde(default)]
+    #[schemars(length(equal = 10))]
+    pub published_from: Option<String>,
+    #[serde(default)]
+    #[schemars(length(equal = 10))]
+    pub published_to: Option<String>,
     #[serde(default)]
     pub direction: SortDirection,
 }
@@ -3096,7 +3484,7 @@ impl OzonMcp {
         Parameters(input): Parameters<AnalyticsInput>,
     ) -> Result<Json<OzonResult>, String> {
         validate_date_range(&input.date_from, &input.date_to, MAX_ANALYTICS_PERIOD_DAYS)?;
-        validate_count("metrics", input.metrics.len(), 1, 10)?;
+        validate_count("metrics", input.metrics.len(), 1, 14)?;
         validate_count("dimensions", input.dimensions.len(), 1, 2)?;
         validate_limit(input.limit, 1_000)?;
         validate_max_u32("offset", input.offset, MAX_OFFSET)?;
@@ -3165,6 +3553,95 @@ impl OzonMcp {
         .await
     }
 
+    /// Возвращает остатки товаров по каждому складу FBO.
+    #[tool(
+        name = "ozon_fbo_stocks_by_warehouse",
+        annotations(title = "Остатки FBO по складам Ozon", read_only_hint = true)
+    )]
+    async fn fbo_stocks_by_warehouse(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WarehouseStockListInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_product_identifiers(&input.offer_ids, &[], &input.skus)?;
+        validate_limit(input.limit, 1_000)?;
+        validate_max_chars("cursor", &input.cursor, MAX_OPAQUE_TOKEN_CHARS)?;
+        self.request(
+            &identity,
+            input.store,
+            "/v1/product/info/stocks-by-warehouse/fbo",
+            json!({
+                "cursor": input.cursor,
+                "limit": input.limit,
+                "offer_ids": input.offer_ids,
+                "skus": input.skus,
+            }),
+        )
+        .await
+    }
+
+    /// Возвращает остатки товаров по каждому складу FBS/rFBS.
+    #[tool(
+        name = "ozon_fbs_stocks_by_warehouse",
+        annotations(title = "Остатки FBS по складам Ozon", read_only_hint = true)
+    )]
+    async fn fbs_stocks_by_warehouse(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WarehouseStockListInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_product_identifiers(&input.offer_ids, &[], &input.skus)?;
+        validate_limit(input.limit, 1_000)?;
+        validate_max_chars("cursor", &input.cursor, MAX_OPAQUE_TOKEN_CHARS)?;
+        self.request(
+            &identity,
+            input.store,
+            "/v2/product/info/stocks-by-warehouse/fbs",
+            json!({
+                "cursor": input.cursor,
+                "limit": input.limit,
+                "offer_id": input.offer_ids,
+                "sku": input.skus,
+            }),
+        )
+        .await
+    }
+
+    /// Возвращает список складов продавца и их параметры.
+    #[tool(
+        name = "ozon_warehouses",
+        annotations(title = "Склады продавца Ozon", read_only_hint = true)
+    )]
+    async fn warehouses(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<WarehouseListInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_limit(input.limit, 1_000)?;
+        if let Some(cursor) = input.cursor.as_deref() {
+            validate_max_chars("cursor", cursor, MAX_OPAQUE_TOKEN_CHARS)?;
+        }
+        validate_count(
+            "warehouse_ids",
+            input.warehouse_ids.len(),
+            0,
+            MAX_PRODUCT_FILTER_ITEMS,
+        )?;
+        validate_unique_ozon_ids("warehouse_ids", &input.warehouse_ids)?;
+        let mut payload = json!({ "limit": input.limit });
+        let fields = payload
+            .as_object_mut()
+            .expect("warehouse list payload is an object");
+        if let Some(cursor) = input.cursor.filter(|cursor| !cursor.is_empty()) {
+            fields.insert("cursor".to_owned(), json!(cursor));
+        }
+        if !input.warehouse_ids.is_empty() {
+            fields.insert("warehouse_ids".to_owned(), json!(input.warehouse_ids));
+        }
+        self.request(&identity, input.store, "/v2/warehouse/list", payload)
+            .await
+    }
+
     /// Возвращает текущие цены и скидки товаров Ozon без возможности их изменить.
     #[tool(
         name = "ozon_product_prices",
@@ -3173,10 +3650,138 @@ impl OzonMcp {
     async fn product_prices(
         &self,
         identity: RequestIdentity,
-        Parameters(input): Parameters<ProductFilterInput>,
+        Parameters(input): Parameters<ProductPriceFilterInput>,
     ) -> Result<Json<OzonResult>, String> {
-        self.product_list(&identity, input, "/v5/product/info/prices")
-            .await
+        validate_string_list(
+            "offer_ids",
+            &input.offer_ids,
+            MAX_PRODUCT_FILTER_ITEMS,
+            MAX_IDENTIFIER_CHARS,
+        )?;
+        validate_string_list(
+            "product_ids",
+            &input.product_ids,
+            MAX_PRODUCT_FILTER_ITEMS,
+            MAX_IDENTIFIER_CHARS,
+        )?;
+        if input.offer_ids.len() + input.product_ids.len() > MAX_PRODUCT_FILTER_ITEMS {
+            return Err(format!(
+                "offer_ids и product_ids вместе должны содержать не более {MAX_PRODUCT_FILTER_ITEMS} значений"
+            ));
+        }
+        if let Some(cursor) = input.cursor.as_deref() {
+            validate_max_chars("cursor", cursor, MAX_OPAQUE_TOKEN_CHARS)?;
+        }
+        validate_limit(input.limit, 1_000)?;
+        self.request(
+            &identity,
+            input.store,
+            "/v5/product/info/prices",
+            json!({
+                "cursor": input.cursor.unwrap_or_default(),
+                "filter": {
+                    "offer_id": input.offer_ids,
+                    "product_id": input.product_ids,
+                    "visibility": input.visibility,
+                },
+                "limit": input.limit,
+            }),
+        )
+        .await
+    }
+
+    /// Возвращает постраничный каталог товаров Ozon с их видимостью.
+    #[tool(
+        name = "ozon_products",
+        annotations(title = "Каталог товаров Ozon", read_only_hint = true)
+    )]
+    async fn products(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ProductCatalogInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_product_identifiers(&input.offer_ids, &input.product_ids, &input.skus)?;
+        validate_limit(input.limit, 1_000)?;
+        validate_max_chars("last_id", &input.last_id, MAX_OPAQUE_TOKEN_CHARS)?;
+        self.request(
+            &identity,
+            input.store,
+            "/v3/product/list",
+            json!({
+                "filter": {
+                    "offer_id": input.offer_ids,
+                    "product_id": input.product_ids,
+                    "skus": input.skus,
+                    "visibility": input.visibility,
+                },
+                "last_id": input.last_id,
+                "limit": input.limit,
+            }),
+        )
+        .await
+    }
+
+    /// Возвращает карточки товаров по offer_id, product_id или SKU.
+    #[tool(
+        name = "ozon_product_info",
+        annotations(title = "Карточки товаров Ozon", read_only_hint = true)
+    )]
+    async fn product_info(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ProductInfoListInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_product_identifiers(&input.offer_ids, &input.product_ids, &input.skus)?;
+        if input.offer_ids.is_empty() && input.product_ids.is_empty() && input.skus.is_empty() {
+            return Err(
+                "offer_ids, product_ids или skus должен содержать хотя бы один идентификатор"
+                    .to_owned(),
+            );
+        }
+        self.request(
+            &identity,
+            input.store,
+            "/v3/product/info/list",
+            json!({
+                "offer_id": input.offer_ids,
+                "product_id": input.product_ids,
+                "sku": input.skus,
+            }),
+        )
+        .await
+    }
+
+    /// Возвращает описания и характеристики товаров Ozon.
+    #[tool(
+        name = "ozon_product_attributes",
+        annotations(title = "Характеристики товаров Ozon", read_only_hint = true)
+    )]
+    async fn product_attributes(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ProductAttributesInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_product_identifiers(&input.offer_ids, &input.product_ids, &input.skus)?;
+        validate_limit(input.limit, 1_000)?;
+        validate_max_chars("last_id", &input.last_id, MAX_OPAQUE_TOKEN_CHARS)?;
+        self.request(
+            &identity,
+            input.store,
+            "/v4/product/info/attributes",
+            json!({
+                "filter": {
+                    "offer_id": input.offer_ids,
+                    "product_id": input.product_ids,
+                    "sku": input.skus,
+                    "visibility": input.visibility,
+                },
+                "last_id": input.last_id,
+                "limit": input.limit,
+                "sort_by": "id",
+                "sort_dir": input.sort_direction,
+            }),
+        )
+        .await
     }
 
     /// Получает показатели оборачиваемости и запасов по SKU.
@@ -3263,7 +3868,7 @@ impl OzonMcp {
         self.posting_list(&identity, input, PostingKind::Fbs).await
     }
 
-    /// Получает список отправлений FBO за период вместе с аналитическими и финансовыми полями.
+    /// Получает список отправлений FBO за период с аналитическими полями; финансовые поля не запрашиваются.
     #[tool(
         name = "ozon_fbo_postings",
         annotations(title = "Отправления FBO Ozon", read_only_hint = true)
@@ -3274,6 +3879,198 @@ impl OzonMcp {
         Parameters(input): Parameters<PostingListInput>,
     ) -> Result<Json<OzonResult>, String> {
         self.posting_list(&identity, input, PostingKind::Fbo).await
+    }
+
+    /// Возвращает необработанные FBS/rFBS-отправления по актуальному cursor-контракту v4.
+    #[tool(
+        name = "ozon_fbs_unfulfilled",
+        annotations(title = "Неообработанные FBS-отправления Ozon", read_only_hint = true)
+    )]
+    async fn fbs_unfulfilled(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<FbsUnfulfilledInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        let (from, to) = validate_and_expand_dates(&input.date_from, &input.date_to, 366)?;
+        let cutoff = validate_optional_date_range(
+            "cutoff",
+            input.cutoff_from.as_deref(),
+            input.cutoff_to.as_deref(),
+        )?;
+        let delivering = validate_optional_date_range(
+            "delivering_date",
+            input.delivering_date_from.as_deref(),
+            input.delivering_date_to.as_deref(),
+        )?;
+        if cutoff.is_some() && delivering.is_some() {
+            return Err(
+                "cutoff и delivering_date нельзя передавать одновременно в FBS unfulfilled"
+                    .to_owned(),
+            );
+        }
+        validate_max_chars("cursor", &input.cursor, MAX_OPAQUE_TOKEN_CHARS)?;
+        validate_limit(input.limit, 1_000)?;
+        validate_string_list(
+            "statuses",
+            &input.statuses,
+            MAX_GROUP_STATES,
+            MAX_ENUM_VALUE_CHARS,
+        )?;
+        for (field, ids) in [
+            ("warehouse_ids", input.warehouse_ids.as_slice()),
+            ("provider_ids", input.provider_ids.as_slice()),
+            ("delivery_method_ids", input.delivery_method_ids.as_slice()),
+        ] {
+            validate_count(field, ids.len(), 0, MAX_PRODUCT_FILTER_ITEMS)?;
+            validate_unique_ozon_ids(field, ids)?;
+        }
+        let mut filter = json!({
+            "delivery_method_ids": input.delivery_method_ids,
+            "last_changed_status_date": { "from": from, "to": to },
+            "provider_ids": input.provider_ids,
+            "statuses": input.statuses,
+            "warehouse_ids": input.warehouse_ids,
+        });
+        if let Some((from, to)) = cutoff {
+            let filter = filter
+                .as_object_mut()
+                .expect("FBS unfulfilled filter is an object");
+            filter.insert("cutoff_from".to_owned(), json!(from));
+            filter.insert("cutoff_to".to_owned(), json!(to));
+        }
+        if let Some((from, to)) = delivering {
+            let filter = filter
+                .as_object_mut()
+                .expect("FBS unfulfilled filter is an object");
+            filter.insert("delivering_date_from".to_owned(), json!(from));
+            filter.insert("delivering_date_to".to_owned(), json!(to));
+        }
+        self.request(
+            &identity,
+            input.store,
+            "/v4/posting/fbs/unfulfilled/list",
+            json!({
+                "cursor": input.cursor,
+                "filter": filter,
+                "limit": input.limit,
+                "sort_dir": input.direction,
+                "translit": false,
+                "with": {
+                    "analytics_data": true,
+                    "barcodes": true,
+                    "financial_data": false,
+                    "legal_info": false,
+                },
+            }),
+        )
+        .await
+    }
+
+    /// Возвращает одно FBO-отправление с товарами и аналитическими полями.
+    #[tool(
+        name = "ozon_fbo_posting",
+        annotations(title = "FBO-отправление Ozon", read_only_hint = true)
+    )]
+    async fn fbo_posting(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<PostingGetInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_non_blank("posting_number", &input.posting_number)?;
+        validate_max_chars(
+            "posting_number",
+            &input.posting_number,
+            MAX_IDENTIFIER_CHARS,
+        )?;
+        self.request(
+            &identity,
+            input.store,
+            "/v2/posting/fbo/get",
+            json!({
+                "posting_number": input.posting_number,
+                "translit": false,
+                "with": {
+                    "analytics_data": true,
+                    "financial_data": false,
+                    "legal_info": false,
+                },
+            }),
+        )
+        .await
+    }
+
+    /// Возвращает одно FBS/rFBS-отправление с товарами, штрихкодами и связанными отправлениями.
+    #[tool(
+        name = "ozon_fbs_posting",
+        annotations(title = "FBS-отправление Ozon", read_only_hint = true)
+    )]
+    async fn fbs_posting(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<PostingGetInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_non_blank("posting_number", &input.posting_number)?;
+        validate_max_chars(
+            "posting_number",
+            &input.posting_number,
+            MAX_IDENTIFIER_CHARS,
+        )?;
+        self.request(
+            &identity,
+            input.store,
+            "/v3/posting/fbs/get",
+            json!({
+                "posting_number": input.posting_number,
+                "with": {
+                    "analytics_data": true,
+                    "barcodes": true,
+                    "financial_data": false,
+                    "legal_info": false,
+                    "product_exemplars": true,
+                    "related_postings": true,
+                    "translit": false,
+                },
+            }),
+        )
+        .await
+    }
+
+    /// Возвращает актуальный справочник причин отмены FBO.
+    #[tool(
+        name = "ozon_fbo_cancel_reasons",
+        annotations(title = "Причины отмены FBO Ozon", read_only_hint = true)
+    )]
+    async fn fbo_cancel_reasons(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<StoreOnlyInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        self.request(
+            &identity,
+            input.store,
+            "/v1/posting/fbo/cancel-reason/list",
+            json!({}),
+        )
+        .await
+    }
+
+    /// Возвращает актуальный справочник причин отмены FBS/rFBS.
+    #[tool(
+        name = "ozon_fbs_cancel_reasons",
+        annotations(title = "Причины отмены FBS Ozon", read_only_hint = true)
+    )]
+    async fn fbs_cancel_reasons(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<StoreOnlyInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        self.request(
+            &identity,
+            input.store,
+            "/v2/posting/fbs/cancel-reason/list",
+            json!({}),
+        )
+        .await
     }
 
     /// Получает возвраты FBO/FBS за период изменения статуса.
@@ -3356,7 +4153,7 @@ impl OzonMcp {
         .await
     }
 
-    /// Получает детальные финансовые транзакции: продажи, комиссии, логистику и услуги.
+    /// Устаревающий метод финансовых транзакций Ozon, отключение 2026-09-08. Для новых сценариев используйте методы ozon_finance_accrual_*.
     #[tool(
         name = "ozon_finance_transactions",
         annotations(title = "Финансовые транзакции Ozon", read_only_hint = true)
@@ -3410,7 +4207,7 @@ impl OzonMcp {
         .await
     }
 
-    /// Получает агрегированные финансовые итоги Ozon за период.
+    /// Устаревающий метод финансовых итогов Ozon, отключение 2026-09-08. Для новых сценариев используйте методы ozon_finance_accrual_*.
     #[tool(
         name = "ozon_finance_totals",
         annotations(title = "Финансовые итоги Ozon", read_only_hint = true)
@@ -3444,20 +4241,16 @@ impl OzonMcp {
         .await
     }
 
-    /// EXPERIMENTAL PREVIEW: получает read-only начисления по указанным отправлениям через candidate-контракт Ozon. По умолчанию выключен; схема не считается официально подтверждённой.
+    /// Получает начисления Ozon по указанным отправлениям.
     #[tool(
         name = "ozon_finance_accrual_postings",
-        annotations(
-            title = "PREVIEW: начисления по отправлениям Ozon",
-            read_only_hint = true
-        )
+        annotations(title = "Начисления по отправлениям Ozon", read_only_hint = true)
     )]
-    async fn finance_accrual_postings_preview(
+    async fn finance_accrual_postings(
         &self,
         identity: RequestIdentity,
-        Parameters(input): Parameters<FinanceAccrualPostingsPreviewInput>,
+        Parameters(input): Parameters<FinanceAccrualPostingsInput>,
     ) -> Result<Json<OzonResult>, String> {
-        self.require_finance_accruals_preview()?;
         validate_string_list(
             "posting_numbers",
             &input.posting_numbers,
@@ -3483,17 +4276,16 @@ impl OzonMcp {
         .await
     }
 
-    /// EXPERIMENTAL PREVIEW: получает read-only candidate-справочник типов начислений Ozon. По умолчанию выключен; схема не считается официально подтверждённой.
+    /// Получает справочник типов начислений Ozon.
     #[tool(
         name = "ozon_finance_accrual_types",
-        annotations(title = "PREVIEW: типы начислений Ozon", read_only_hint = true)
+        annotations(title = "Типы начислений Ozon", read_only_hint = true)
     )]
-    async fn finance_accrual_types_preview(
+    async fn finance_accrual_types(
         &self,
         identity: RequestIdentity,
-        Parameters(input): Parameters<FinanceAccrualTypesPreviewInput>,
+        Parameters(input): Parameters<FinanceAccrualTypesInput>,
     ) -> Result<Json<OzonResult>, String> {
-        self.require_finance_accruals_preview()?;
         self.request(
             &identity,
             input.store,
@@ -3503,31 +4295,93 @@ impl OzonMcp {
         .await
     }
 
-    /// EXPERIMENTAL PREVIEW: получает read-only начисления Ozon за один день через candidate-контракт с last_id. По умолчанию выключен; схема не считается официально подтверждённой.
+    /// Получает начисления Ozon за один день с пагинацией last_id.
     #[tool(
         name = "ozon_finance_accrual_by_day",
-        annotations(title = "PREVIEW: начисления Ozon за день", read_only_hint = true)
+        annotations(title = "Начисления Ozon за день", read_only_hint = true)
     )]
-    async fn finance_accrual_by_day_preview(
+    async fn finance_accrual_by_day(
         &self,
         identity: RequestIdentity,
-        Parameters(input): Parameters<FinanceAccrualByDayPreviewInput>,
+        Parameters(input): Parameters<FinanceAccrualByDayInput>,
     ) -> Result<Json<OzonResult>, String> {
-        self.require_finance_accruals_preview()?;
         parse_date(&input.date, "date")?;
         validate_max_chars("last_id", &input.last_id, MAX_OPAQUE_TOKEN_CHARS)?;
-        let mut payload = json!({ "date": input.date });
-        if !input.last_id.is_empty() {
-            payload
-                .as_object_mut()
-                .expect("finance by-day preview payload is an object")
-                .insert("last_id".to_owned(), json!(input.last_id));
-        }
         self.request(
             &identity,
             input.store,
             "/v1/finance/accrual/by-day",
-            payload,
+            json!({ "date": input.date, "last_id": input.last_id }),
+        )
+        .await
+    }
+
+    /// Получает построчный отчёт о реализации товаров за день. Метод требует Premium Plus или Premium Pro в кабинете Ozon.
+    #[tool(
+        name = "ozon_finance_realization_by_day",
+        annotations(title = "Реализация Ozon за день", read_only_hint = true)
+    )]
+    async fn finance_realization_by_day(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<FinanceRealizationByDayInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        let date = parse_date(&input.date, "date")?;
+        self.request(
+            &identity,
+            input.store,
+            "/v1/finance/realization/by-day",
+            json!({ "day": date.day(), "month": date.month(), "year": date.year() }),
+        )
+        .await
+    }
+
+    /// Получает детальный отчёт о движении денежных средств за расчётный период Ozon.
+    #[tool(
+        name = "ozon_finance_cash_flow",
+        annotations(title = "Движение денежных средств Ozon", read_only_hint = true)
+    )]
+    async fn finance_cash_flow(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<FinanceCashFlowInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        let (from, to) = validate_cash_flow_period(&input.date_from, &input.date_to)?;
+        if input.page == 0 {
+            return Err("page должен быть не меньше 1".to_owned());
+        }
+        validate_max_u32("page", input.page, MAX_PAGE)?;
+        validate_limit(input.page_size, 1_000)?;
+        self.request(
+            &identity,
+            input.store,
+            "/v1/finance/cash-flow-statement/list",
+            json!({
+                "date": { "from": from, "to": to },
+                "page": input.page,
+                "page_size": input.page_size,
+                "with_details": input.with_details,
+            }),
+        )
+        .await
+    }
+
+    /// Получает месячный отчёт Ozon о взаиморасчётах.
+    #[tool(
+        name = "ozon_finance_mutual_settlement",
+        annotations(title = "Взаиморасчёты Ozon", read_only_hint = true)
+    )]
+    async fn finance_mutual_settlement(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<FinanceMutualSettlementInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_year_month(&input.date)?;
+        self.request(
+            &identity,
+            input.store,
+            "/v1/finance/mutual-settlement",
+            json!({ "date": input.date, "language": input.language }),
         )
         .await
     }
@@ -3566,6 +4420,89 @@ impl OzonMcp {
         Ok(Self::performance_result(store, CAMPAIGNS_PATH, data))
     }
 
+    /// Возвращает текущие минимальные и максимальные ставки Ozon Performance по инструментам и категориям.
+    #[tool(
+        name = "ozon_performance_limits",
+        annotations(title = "Лимиты ставок Ozon", read_only_hint = true)
+    )]
+    async fn performance_limits(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<StoreOnlyInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        let store = self.performance_context(&identity, input.store.as_ref())?;
+        let data = self
+            .performance_client
+            .limits(&store)
+            .await
+            .map_err(|error| Self::performance_error(&store, LIMITS_PATH, error))?;
+        Ok(Self::performance_result(store, LIMITS_PATH, data))
+    }
+
+    /// Возвращает ID объектов, которые продвигает рекламная кампания Ozon.
+    #[tool(
+        name = "ozon_performance_campaign_objects",
+        annotations(title = "Объекты рекламной кампании Ozon", read_only_hint = true)
+    )]
+    async fn performance_campaign_objects(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<PerformanceCampaignResourceInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_ozon_id("campaign_id", input.campaign_id)?;
+        let store = self.performance_context(&identity, input.store.as_ref())?;
+        let data = self
+            .performance_client
+            .campaign_objects(&store, input.campaign_id)
+            .await
+            .map_err(|error| {
+                Self::performance_error(&store, CAMPAIGN_OBJECTS_PATH_TEMPLATE, error)
+            })?;
+        Ok(Self::performance_result(
+            store,
+            CAMPAIGN_OBJECTS_PATH_TEMPLATE,
+            data,
+        ))
+    }
+
+    /// Возвращает товары и ставки в конкретной рекламной кампании Ozon.
+    #[tool(
+        name = "ozon_performance_campaign_products",
+        annotations(title = "Товары рекламной кампании Ozon", read_only_hint = true)
+    )]
+    async fn performance_campaign_products(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<PerformanceCampaignProductsInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_ozon_id("campaign_id", input.campaign_id)?;
+        if input.page == 0 {
+            return Err("page должен быть не меньше 1".to_owned());
+        }
+        validate_max_u32("page", input.page, MAX_PAGE)?;
+        validate_limit(input.page_size, 100)?;
+        let store = self.performance_context(&identity, input.store.as_ref())?;
+        let data = self
+            .performance_client
+            .campaign_products(
+                &store,
+                input.campaign_id,
+                CampaignProductsQuery {
+                    page: u64::from(input.page),
+                    page_size: u64::from(input.page_size),
+                },
+            )
+            .await
+            .map_err(|error| {
+                Self::performance_error(&store, CAMPAIGN_PRODUCTS_PATH_TEMPLATE, error)
+            })?;
+        Ok(Self::performance_result(
+            store,
+            CAMPAIGN_PRODUCTS_PATH_TEMPLATE,
+            data,
+        ))
+    }
+
     /// Возвращает готовую дневную статистику рекламы: показы, клики, расходы и заказы. Период ограничен 31 днём.
     #[tool(
         name = "ozon_performance_daily",
@@ -3596,6 +4533,42 @@ impl OzonMcp {
             .await
             .map_err(|error| Self::performance_error(&store, DAILY_STATS_PATH, error))?;
         Ok(Self::performance_result(store, DAILY_STATS_PATH, data))
+    }
+
+    /// Возвращает подневную рекламную статистику с разрезом до SKU: показы, клики, корзины, расходы, заказы и выручку.
+    #[tool(
+        name = "ozon_performance_sku_statistics",
+        annotations(title = "Реклама Ozon по SKU", read_only_hint = true)
+    )]
+    async fn performance_sku_statistics(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<PerformanceSkuStatisticsInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_campaign_ids(&input.campaign_ids)?;
+        // The vendor documents a relative "not earlier than the previous day"
+        // rule for dateFrom but does not publish the timezone. Enforce the
+        // deterministic format/order locally and leave that ambiguous relative
+        // boundary to Ozon rather than silently choosing a deployment timezone.
+        validate_date_range(&input.date_from, &input.date_to, i64::MAX)?;
+        let store = self.performance_context(&identity, input.store.as_ref())?;
+        let data = self
+            .performance_client
+            .sku_statistics(
+                &store,
+                SkuStatisticsQuery {
+                    campaign_ids: input.campaign_ids,
+                    date_from: input.date_from,
+                    date_to: input.date_to,
+                },
+            )
+            .await
+            .map_err(|error| Self::performance_error(&store, PRODUCT_SKU_STATS_PATH, error))?;
+        Ok(Self::performance_result(
+            store,
+            PRODUCT_SKU_STATS_PATH,
+            data,
+        ))
     }
 
     /// Возвращает расходы рекламных кампаний Ozon и их разбивку по источникам средств. Период ограничен 31 днём.
@@ -3690,15 +4663,52 @@ impl OzonMcp {
         validate_max_chars("last_id", &input.last_id, MAX_OPAQUE_TOKEN_CHARS)?;
         validate_non_blank("status", &input.status)?;
         validate_max_chars("status", &input.status, MAX_ENUM_VALUE_CHARS)?;
+        if !matches!(
+            input.status.as_str(),
+            "ALL" | "NEW" | "VIEWED" | "PROCESSED"
+        ) {
+            return Err(
+                "status для reviews v2 должен быть ALL, NEW, VIEWED или PROCESSED".to_owned(),
+            );
+        }
+        validate_non_blank("order_status", &input.order_status)?;
+        validate_max_chars("order_status", &input.order_status, MAX_ENUM_VALUE_CHARS)?;
+        if !matches!(
+            input.order_status.as_str(),
+            "ALL" | "DELIVERED" | "CANCELLED"
+        ) {
+            return Err(
+                "order_status для reviews v2 должен быть ALL, DELIVERED или CANCELLED".to_owned(),
+            );
+        }
+        validate_count("skus", input.skus.len(), 0, 100)?;
+        validate_unique_ozon_ids("skus", &input.skus)?;
+        let published = validate_optional_date_range(
+            "published",
+            input.published_from.as_deref(),
+            input.published_to.as_deref(),
+        )?;
+        let mut filters = json!({
+            "order_status": input.order_status,
+            "skus": input.skus,
+            "status": input.status,
+        });
+        if let Some((from, to)) = published {
+            let filters = filters
+                .as_object_mut()
+                .expect("review filters are an object");
+            filters.insert("published_from".to_owned(), json!(from));
+            filters.insert("published_to".to_owned(), json!(to));
+        }
         self.request(
             &identity,
             input.store,
-            "/v1/review/list",
+            "/v2/review/list",
             json!({
+                "filters": filters,
                 "last_id": input.last_id,
                 "limit": input.limit,
                 "sort_dir": input.direction,
-                "status": input.status,
             }),
         )
         .await
@@ -3841,6 +4851,51 @@ fn validate_and_expand_dates(
     ))
 }
 
+fn validate_cash_flow_period(date_from: &str, date_to: &str) -> Result<(String, String), String> {
+    let from = parse_date(date_from, "date_from")?;
+    let to = parse_date(date_to, "date_to")?;
+    let first_half = from.day() == 1 && to.day() == 15;
+    let second_half = from.day() == 16 && to.succ_opt().is_some_and(|next_day| next_day.day() == 1);
+    if from.year() != to.year() || from.month() != to.month() || (!first_half && !second_half) {
+        return Err(
+            "период cash-flow должен быть одним расчётным интервалом Ozon: 01–15 или 16–последний день одного месяца"
+                .to_owned(),
+        );
+    }
+    Ok((
+        format!("{date_from}T00:00:00.000Z"),
+        format!("{date_to}T23:59:59.999Z"),
+    ))
+}
+
+fn validate_year_month(value: &str) -> Result<(), String> {
+    NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d")
+        .map(|_| ())
+        .map_err(|_| "date должен иметь формат YYYY-MM".to_owned())
+}
+
+fn validate_optional_date_range(
+    field: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    match (from, to) {
+        (None, None) => Ok(None),
+        (Some(from), Some(to)) => {
+            let from_date = parse_date(from, &format!("{field}_from"))?;
+            let to_date = parse_date(to, &format!("{field}_to"))?;
+            if to_date < from_date {
+                return Err(format!("{field}_to не может быть раньше {field}_from"));
+            }
+            Ok(Some((
+                format!("{from}T00:00:00.000Z"),
+                format!("{to}T23:59:59.999Z"),
+            )))
+        }
+        _ => Err(format!("{field}_from и {field}_to нужно передавать вместе")),
+    }
+}
+
 fn validate_limit(limit: u32, maximum: u32) -> Result<(), String> {
     if !(1..=maximum).contains(&limit) {
         return Err(format!("limit должен быть от 1 до {maximum}"));
@@ -3899,6 +4954,33 @@ fn validate_string_list(
     for value in values {
         validate_non_blank(field, value)?;
         validate_max_chars(field, value, maximum_chars)?;
+    }
+    Ok(())
+}
+
+fn validate_product_identifiers(
+    offer_ids: &[String],
+    product_ids: &[String],
+    skus: &[u64],
+) -> Result<(), String> {
+    validate_string_list(
+        "offer_ids",
+        offer_ids,
+        MAX_PRODUCT_FILTER_ITEMS,
+        MAX_IDENTIFIER_CHARS,
+    )?;
+    validate_string_list(
+        "product_ids",
+        product_ids,
+        MAX_PRODUCT_FILTER_ITEMS,
+        MAX_IDENTIFIER_CHARS,
+    )?;
+    validate_count("skus", skus.len(), 0, MAX_PRODUCT_FILTER_ITEMS)?;
+    validate_unique_ozon_ids("skus", skus)?;
+    if offer_ids.len() + product_ids.len() + skus.len() > MAX_PRODUCT_FILTER_ITEMS {
+        return Err(format!(
+            "offer_ids, product_ids и skus вместе должны содержать не более {MAX_PRODUCT_FILTER_ITEMS} значений"
+        ));
     }
     Ok(())
 }
@@ -7639,7 +8721,7 @@ mod tests {
         // Both ends of every analytics bound, so an off-by-one in either
         // direction is caught rather than only the obviously empty case.
         assert_rejected!(analytics, analytics(0, 1, 10), "metrics", "no metrics");
-        assert_rejected!(analytics, analytics(11, 1, 10), "metrics", "11 metrics");
+        assert_rejected!(analytics, analytics(15, 1, 10), "metrics", "15 metrics");
         assert_rejected!(
             analytics,
             analytics(1, 0, 10),
@@ -7651,7 +8733,7 @@ mod tests {
         assert_rejected!(analytics, analytics(1, 1, 1_001), "limit", "limit 1001");
         // The accepted boundary values must still pass validation, which they
         // prove by failing later, on the store lookup rather than on a bound.
-        for accepted in [analytics(10, 2, 1), analytics(1, 1, 1_000)] {
+        for accepted in [analytics(14, 2, 1), analytics(1, 1, 1_000)] {
             let error = server
                 .analytics(identity(), Parameters(accepted))
                 .await
@@ -7840,6 +8922,10 @@ mod tests {
                     limit,
                     last_id: String::new(),
                     status: "ALL".to_owned(),
+                    skus: Vec::new(),
+                    order_status: "ALL".to_owned(),
+                    published_from: None,
+                    published_to: None,
                     direction: SortDirection::Desc,
                 },
                 expected,
@@ -8286,55 +9372,50 @@ mod tests {
         );
     }
 
-    /// The experimental finance-accrual tools are opt-in. With the preview off,
-    /// each one must refuse on its own — a tool that only checked the router
-    /// route would still be reachable through a direct MCP `tools/call`.
+    /// Finance accrual methods completed canary validation and must be
+    /// available without the legacy preview switch.
     #[tokio::test]
-    async fn every_finance_accrual_preview_tool_is_closed_when_the_preview_is_off() {
-        let (server, requests) = mock_server(0);
-        assert!(!server.finance_accruals_preview);
-
-        let postings = server
-            .finance_accrual_postings_preview(
+    async fn every_finance_accrual_tool_is_stable_by_default() {
+        let (server, requests) = mock_server(3);
+        server
+            .finance_accrual_postings(
                 RequestIdentity::dev(),
-                Parameters(FinanceAccrualPostingsPreviewInput {
-                    store: None,
+                Parameters(FinanceAccrualPostingsInput {
+                    store: Some(StoreId::from("store_a")),
                     posting_numbers: vec!["12345-0001-1".to_owned()],
                 }),
             )
             .await
-            .err()
-            .expect("the postings preview must be closed by default");
-        assert!(postings.starts_with(PREVIEW_DISABLED), "{postings}");
-
-        let types = server
-            .finance_accrual_types_preview(
+            .unwrap();
+        server
+            .finance_accrual_types(
                 RequestIdentity::dev(),
-                Parameters(FinanceAccrualTypesPreviewInput { store: None }),
+                Parameters(FinanceAccrualTypesInput {
+                    store: Some(StoreId::from("store_a")),
+                }),
             )
             .await
-            .err()
-            .expect("the accrual types preview must be closed by default");
-        assert!(types.starts_with(PREVIEW_DISABLED), "{types}");
-
-        let by_day = server
-            .finance_accrual_by_day_preview(
+            .unwrap();
+        server
+            .finance_accrual_by_day(
                 RequestIdentity::dev(),
-                Parameters(FinanceAccrualByDayPreviewInput {
-                    store: None,
+                Parameters(FinanceAccrualByDayInput {
+                    store: Some(StoreId::from("store_a")),
                     date: "2026-08-01".to_owned(),
                     last_id: String::new(),
                 }),
             )
             .await
-            .err()
-            .expect("the by-day preview must be closed by default");
-        assert!(by_day.starts_with(PREVIEW_DISABLED), "{by_day}");
+            .unwrap();
 
-        assert!(
-            requests.try_recv().is_err(),
-            "a disabled preview tool must never reach the upstream API"
-        );
+        for expected in [
+            "/v1/finance/accrual/postings",
+            "/v1/finance/accrual/types",
+            "/v1/finance/accrual/by-day",
+        ] {
+            let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert_eq!(request_path_and_body(&request).0, expected);
+        }
     }
 
     /// A signed token outlives the registry entry it was issued against: an
@@ -8452,7 +9533,7 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
-        assert_eq!(dev_tools.len(), 46);
+        assert_eq!(dev_tools.len(), 67);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -8463,7 +9544,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 46);
+        assert_eq!(jwt_tools.len(), 67);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -8471,19 +9552,20 @@ mod tests {
 
         let seed = server();
         let authenticator = jwt_authenticator(&seed.registry);
-        let preview_tools = OzonMcp::new_authenticated(seed.client, seed.registry, authenticator)
-            .with_preview_features(false, true)
-            .tool_router
-            .list_all();
-        assert_eq!(preview_tools.len(), 49);
+        let legacy_flag_tools =
+            OzonMcp::new_authenticated(seed.client, seed.registry, authenticator)
+                .with_preview_features(false, true)
+                .tool_router
+                .list_all();
+        assert_eq!(legacy_flag_tools.len(), 67);
         assert_policy(
-            preview_tools,
+            legacy_flag_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
         );
     }
 
     #[test]
-    fn finance_preview_routes_are_visible_only_when_explicitly_enabled() {
+    fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
         const STABLE_TOOL_NAMES: &[&str] = &[
             "ozon_stores_status",
             "marketplace_accounts",
@@ -8514,18 +9596,39 @@ mod tests {
             "ozon_analytics",
             "ozon_product_stocks",
             "ozon_warehouse_stocks",
+            "ozon_fbo_stocks_by_warehouse",
+            "ozon_fbs_stocks_by_warehouse",
+            "ozon_warehouses",
             "ozon_product_prices",
+            "ozon_products",
+            "ozon_product_info",
+            "ozon_product_attributes",
             "ozon_stock_turnover",
             "ozon_supply_order_list",
             "ozon_supply_order_get",
             "ozon_fbs_postings",
             "ozon_fbo_postings",
+            "ozon_fbs_unfulfilled",
+            "ozon_fbo_posting",
+            "ozon_fbs_posting",
+            "ozon_fbo_cancel_reasons",
+            "ozon_fbs_cancel_reasons",
             "ozon_returns",
             "ozon_rfbs_returns",
             "ozon_finance_transactions",
             "ozon_finance_totals",
+            "ozon_finance_accrual_postings",
+            "ozon_finance_accrual_types",
+            "ozon_finance_accrual_by_day",
+            "ozon_finance_realization_by_day",
+            "ozon_finance_cash_flow",
+            "ozon_finance_mutual_settlement",
             "ozon_performance_campaigns",
+            "ozon_performance_limits",
+            "ozon_performance_campaign_objects",
+            "ozon_performance_campaign_products",
             "ozon_performance_daily",
+            "ozon_performance_sku_statistics",
             "ozon_performance_expenses",
             "ozon_seller_rating",
             "ozon_seller_rating_history",
@@ -8541,45 +9644,26 @@ mod tests {
                 .map(|tool| tool.name.to_string())
                 .collect::<BTreeSet<_>>()
         };
-        let preview_names = FINANCE_ACCRUAL_PREVIEW_TOOLS
+        let default_names = names(&server());
+        let expected_names = STABLE_TOOL_NAMES
             .iter()
             .map(|name| (*name).to_owned())
             .collect::<BTreeSet<_>>();
-
-        let default_names = names(&server());
-        assert_eq!(default_names.len(), 46);
-        assert!(preview_names.is_disjoint(&default_names));
-        for name in STABLE_TOOL_NAMES {
-            assert!(
-                default_names.contains(*name),
-                "stable tool {name} disappeared"
-            );
-        }
+        assert_eq!(default_names, expected_names);
 
         let seed = server();
         let authenticator = jwt_authenticator(&seed.registry);
         let authenticated = OzonMcp::new_authenticated(seed.client, seed.registry, authenticator);
-        assert!(preview_names.is_disjoint(&names(&authenticated)));
+        assert_eq!(names(&authenticated), default_names);
 
-        let enabled_names = names(&server().with_preview_features(false, true));
-        assert_eq!(enabled_names.len(), 49);
-        assert!(preview_names.is_subset(&enabled_names));
-        assert_eq!(
-            enabled_names
-                .difference(&default_names)
-                .cloned()
-                .collect::<BTreeSet<_>>(),
-            preview_names
-        );
-
-        let disabled_again = server()
+        let legacy_flags = server()
             .with_preview_features(false, true)
             .with_preview_features(false, false);
-        assert_eq!(names(&disabled_again), default_names);
+        assert_eq!(names(&legacy_flags), default_names);
     }
 
     #[tokio::test]
-    async fn disabled_finance_preview_route_is_rejected_before_network() {
+    async fn finance_accrual_route_remains_stable_when_legacy_flag_is_false() {
         let (server, requests) = mock_server(1);
         let server = server
             .with_preview_features(false, true)
@@ -8591,10 +9675,11 @@ mod tests {
         )
         .await;
 
-        assert!(body.contains("tool not found"), "{body}");
-        assert!(
-            requests.recv_timeout(Duration::from_millis(100)).is_err(),
-            "disabled route must not reach Ozon"
+        assert!(!body.contains("tool not found"), "{body}");
+        let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            request_path_and_body(&request).0,
+            "/v1/finance/accrual/types"
         );
     }
 
@@ -8615,7 +9700,7 @@ mod tests {
         let analytics = schema("ozon_analytics");
         let properties = analytics["properties"].as_object().unwrap();
         assert_eq!(properties["metrics"]["minItems"], json!(1));
-        assert_eq!(properties["metrics"]["maxItems"], json!(10));
+        assert_eq!(properties["metrics"]["maxItems"], json!(14));
         assert_eq!(properties["dimensions"]["minItems"], json!(1));
         assert_eq!(properties["dimensions"]["maxItems"], json!(2));
         assert_eq!(properties["limit"]["minimum"], json!(1));
@@ -8640,8 +9725,8 @@ mod tests {
             ("ozon_product_prices", 1_000),
             ("ozon_stock_turnover", 1_000),
             ("ozon_supply_order_list", 100),
-            ("ozon_fbs_postings", 1_000),
-            ("ozon_fbo_postings", 1_000),
+            ("ozon_fbs_postings", 100),
+            ("ozon_fbo_postings", 100),
             ("ozon_returns", 500),
             ("ozon_rfbs_returns", 100),
             ("ozon_reviews", 100),
@@ -8670,6 +9755,7 @@ mod tests {
 
         let postings = schema("ozon_fbs_postings");
         assert!(postings["properties"].get("cursor").is_some());
+        assert_eq!(postings["properties"]["offset"]["maximum"], json!(0));
         let accrual_postings = schema("ozon_finance_accrual_postings");
         assert_eq!(
             accrual_postings["properties"]["posting_numbers"]["minItems"],
@@ -8748,6 +9834,23 @@ mod tests {
         assert_eq!(
             warehouse["properties"]["cursor"]["maxLength"],
             json!(MAX_OPAQUE_TOKEN_CHARS)
+        );
+
+        let warehouses = schema("ozon_warehouses");
+        assert_eq!(warehouses["additionalProperties"], json!(false));
+        assert_eq!(warehouses["properties"]["limit"]["minimum"], json!(1));
+        assert_eq!(warehouses["properties"]["limit"]["maximum"], json!(1_000));
+        assert_eq!(
+            warehouses["properties"]["cursor"]["maxLength"],
+            json!(MAX_OPAQUE_TOKEN_CHARS)
+        );
+        assert_eq!(
+            warehouses["properties"]["warehouse_ids"]["maxItems"],
+            json!(MAX_PRODUCT_FILTER_ITEMS)
+        );
+        assert_eq!(
+            warehouses["properties"]["warehouse_ids"]["uniqueItems"],
+            json!(true)
         );
 
         let supply_list = schema("ozon_supply_order_list");
@@ -9015,14 +10118,19 @@ mod tests {
         for (tool, field) in [
             ("ozon_analytics", "offset"),
             ("ozon_stock_turnover", "offset"),
-            ("ozon_fbs_postings", "offset"),
-            ("ozon_fbo_postings", "offset"),
             ("wb_product_prices", "offset"),
         ] {
             assert_eq!(
                 schema(tool)["properties"][field]["maximum"],
                 json!(MAX_OFFSET),
                 "{tool}.{field}"
+            );
+        }
+        for tool in ["ozon_fbs_postings", "ozon_fbo_postings"] {
+            assert_eq!(
+                schema(tool)["properties"]["offset"]["maximum"],
+                json!(0),
+                "{tool}.offset"
             );
         }
 
@@ -9059,6 +10167,14 @@ mod tests {
         let reviews: ReviewsInput = serde_json::from_value(json!({})).unwrap();
         assert_eq!(reviews.limit, 100);
         assert_eq!(reviews.status, "ALL");
+        assert_eq!(reviews.order_status, "ALL");
+
+        let settlement: FinanceMutualSettlementInput =
+            serde_json::from_value(json!({"date": "2026-08"})).unwrap();
+        assert_eq!(
+            serde_json::to_value(settlement.language).unwrap(),
+            json!("DEFAULT")
+        );
 
         let questions: QuestionsInput = serde_json::from_value(json!({
             "date_from": "2026-08-08",
@@ -9101,29 +10217,42 @@ mod tests {
         const EXPECTED: &[&str] = &[
             "/v1/analytics/data",
             "/v1/analytics/turnover/stocks",
+            "/v1/finance/accrual/by-day",
+            "/v1/finance/accrual/postings",
+            "/v1/finance/accrual/types",
+            "/v1/finance/cash-flow-statement/list",
+            "/v1/finance/mutual-settlement",
+            "/v1/finance/realization/by-day",
+            "/v1/posting/fbo/cancel-reason/list",
+            "/v1/product/info/stocks-by-warehouse/fbo",
             "/v1/product/info/warehouse/stocks",
             "/v1/question/list",
             "/v1/rating/history",
             "/v1/rating/summary",
             "/v1/returns/list",
-            "/v1/review/list",
-            "/v2/posting/fbo/list",
+            "/v2/posting/fbo/get",
+            "/v2/posting/fbs/cancel-reason/list",
+            "/v2/product/info/stocks-by-warehouse/fbs",
             "/v2/returns/rfbs/list",
+            "/v2/review/list",
+            "/v2/warehouse/list",
             "/v3/finance/transaction/list",
             "/v3/finance/transaction/totals",
             "/v3/posting/fbo/list",
-            "/v3/posting/fbs/list",
+            "/v3/posting/fbs/get",
+            "/v3/product/info/list",
+            "/v3/product/list",
             "/v3/supply-order/get",
             "/v3/supply-order/list",
             "/v4/posting/fbs/list",
+            "/v4/posting/fbs/unfulfilled/list",
+            "/v4/product/info/attributes",
             "/v4/product/info/stocks",
             "/v5/product/info/prices",
         ];
         assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST, EXPECTED);
         for endpoint in READ_ONLY_ENDPOINT_ALLOWLIST {
-            for forbidden in [
-                "/cancel", "/create", "/delete", "/import", "/set", "/ship", "/update",
-            ] {
+            for forbidden in ["/create", "/delete", "/import", "/set", "/ship", "/update"] {
                 assert!(
                     !endpoint.contains(forbidden),
                     "{endpoint} contains {forbidden}"
@@ -9131,17 +10260,7 @@ mod tests {
             }
             assert!(is_read_only_endpoint_allowed(endpoint));
         }
-        assert_eq!(
-            PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST,
-            &[
-                "/v1/finance/accrual/by-day",
-                "/v1/finance/accrual/postings",
-                "/v1/finance/accrual/types",
-            ]
-        );
-        for endpoint in PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST {
-            assert!(!is_read_only_endpoint_allowed(endpoint));
-        }
+        assert!(PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST.is_empty());
         for endpoint in [
             "/v1/product/update",
             "/v1/order/create",
@@ -9214,8 +10333,7 @@ mod tests {
         // ...and the gate must not name paths that cannot be reached at all.
         for endpoint in FINANCE_ENDPOINTS {
             assert!(
-                READ_ONLY_ENDPOINT_ALLOWLIST.contains(endpoint)
-                    || PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST.contains(endpoint),
+                READ_ONLY_ENDPOINT_ALLOWLIST.contains(endpoint),
                 "{endpoint} is gated but unreachable"
             );
         }
@@ -9229,8 +10347,37 @@ mod tests {
     fn ozon_enum_values_are_stable() {
         assert_eq!(ReturnSchema::Fbo.as_ozon_str(), "FBO");
         assert_eq!(ReturnSchema::Fbs.as_ozon_str(), "FBS");
-        assert_eq!(PostingKind::Fbs.endpoint(), "/v3/posting/fbs/list");
-        assert_eq!(PostingKind::Fbo.endpoint(), "/v2/posting/fbo/list");
+        assert_eq!(PostingKind::Fbs.endpoint(), "/v4/posting/fbs/list");
+        assert_eq!(PostingKind::Fbo.endpoint(), "/v3/posting/fbo/list");
+    }
+
+    #[test]
+    fn supply_order_timeslot_payload_includes_all_optional_fields() {
+        let payload = build_supply_order_timeslot(&SupplyOrderTimeslotRangeInput {
+            from: Some("2026-08-19T09:00:00+05:00".to_owned()),
+            to: Some("2026-08-19T10:00:00+05:00".to_owned()),
+            timeslot_filter_type: Some(SupplyOrderTimeslotFilterType::ByLocalTime),
+        });
+
+        assert_eq!(
+            Value::Object(payload),
+            json!({
+                "from": "2026-08-19T09:00:00+05:00",
+                "to": "2026-08-19T10:00:00+05:00",
+                "timeslot_filter_type": "BY_LOCAL_TIME",
+            })
+        );
+    }
+
+    #[test]
+    fn cash_flow_second_half_accepts_the_last_day_of_the_month() {
+        assert_eq!(
+            validate_cash_flow_period("2026-04-16", "2026-04-30").unwrap(),
+            (
+                "2026-04-16T00:00:00.000Z".to_owned(),
+                "2026-04-30T23:59:59.999Z".to_owned(),
+            )
+        );
     }
 
     #[tokio::test]
@@ -9676,7 +10823,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_read_only_tool_sends_the_exact_ozon_contract() {
-        let (server, requests) = mock_server(17);
+        let (server, requests) = mock_server(31);
         let mut results = Vec::new();
 
         results.push(
@@ -9716,11 +10863,11 @@ mod tests {
             server
                 .product_prices(
                     RequestIdentity::dev(),
-                    Parameters(ProductFilterInput {
+                    Parameters(ProductPriceFilterInput {
                         store: Some(StoreId::from("store_a")),
                         offer_ids: Vec::new(),
                         product_ids: vec!["123".to_owned()],
-                        visibility: Visibility::All,
+                        visibility: CatalogVisibility::All,
                         limit: 20,
                         cursor: None,
                     }),
@@ -9738,6 +10885,105 @@ mod tests {
                         warehouse_id: 1_020_003_080_073_000,
                         limit: 25,
                         cursor: Some("warehouse-cursor".to_owned()),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .fbo_stocks_by_warehouse(
+                    RequestIdentity::dev(),
+                    Parameters(WarehouseStockListInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: vec!["offer-fbo".to_owned()],
+                        skus: vec![101],
+                        limit: 30,
+                        cursor: "fbo-cursor".to_owned(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .fbs_stocks_by_warehouse(
+                    RequestIdentity::dev(),
+                    Parameters(WarehouseStockListInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: vec!["offer-fbs".to_owned()],
+                        skus: vec![202],
+                        limit: 31,
+                        cursor: "fbs-cursor".to_owned(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .warehouses(
+                    RequestIdentity::dev(),
+                    Parameters(WarehouseListInput {
+                        store: Some(StoreId::from("store_a")),
+                        limit: 50,
+                        cursor: Some("warehouse-page".to_owned()),
+                        warehouse_ids: vec![101, 202],
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .products(
+                    RequestIdentity::dev(),
+                    Parameters(ProductCatalogInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: vec!["offer-catalog".to_owned()],
+                        product_ids: vec!["product-catalog".to_owned()],
+                        skus: vec![501],
+                        visibility: CatalogVisibility::All,
+                        limit: 60,
+                        last_id: "product-cursor".to_owned(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .product_info(
+                    RequestIdentity::dev(),
+                    Parameters(ProductInfoListInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: vec!["offer-info".to_owned()],
+                        product_ids: Vec::new(),
+                        skus: vec![502],
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .product_attributes(
+                    RequestIdentity::dev(),
+                    Parameters(ProductAttributesInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: Vec::new(),
+                        product_ids: vec!["product-attributes".to_owned()],
+                        skus: vec![503],
+                        visibility: CatalogVisibility::Visible,
+                        limit: 70,
+                        last_id: "attributes-cursor".to_owned(),
+                        sort_direction: ProductSortDirection::Desc,
                     }),
                 )
                 .await
@@ -9806,8 +11052,8 @@ mod tests {
                         date_to: "2026-02-02".to_owned(),
                         status: "awaiting_packaging".to_owned(),
                         limit: 40,
-                        offset: 3,
-                        cursor: None,
+                        offset: 0,
+                        cursor: Some("fbs-page".to_owned()),
                         direction: SortDirection::Asc,
                     }),
                 )
@@ -9824,6 +11070,69 @@ mod tests {
                         offset: 0,
                         cursor: None,
                         direction: SortDirection::Desc,
+                    }),
+                )
+                .await,
+        ] {
+            results.push(result.unwrap().0);
+        }
+        results.push(
+            server
+                .fbs_unfulfilled(
+                    RequestIdentity::dev(),
+                    Parameters(FbsUnfulfilledInput {
+                        store: Some(StoreId::from("store_a")),
+                        date_from: "2026-02-01".to_owned(),
+                        date_to: "2026-02-02".to_owned(),
+                        cursor: "unfulfilled-cursor".to_owned(),
+                        limit: 99,
+                        direction: SortDirection::Desc,
+                        statuses: vec!["awaiting_packaging".to_owned()],
+                        warehouse_ids: vec![1],
+                        provider_ids: vec![2],
+                        delivery_method_ids: vec![3],
+                        cutoff_from: Some("2026-01-31".to_owned()),
+                        cutoff_to: Some("2026-01-31".to_owned()),
+                        delivering_date_from: None,
+                        delivering_date_to: None,
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        for result in [
+            server
+                .fbo_posting(
+                    RequestIdentity::dev(),
+                    Parameters(PostingGetInput {
+                        store: Some(StoreId::from("store_a")),
+                        posting_number: "fbo-posting".to_owned(),
+                    }),
+                )
+                .await,
+            server
+                .fbs_posting(
+                    RequestIdentity::dev(),
+                    Parameters(PostingGetInput {
+                        store: Some(StoreId::from("store_a")),
+                        posting_number: "fbs-posting".to_owned(),
+                    }),
+                )
+                .await,
+            server
+                .fbo_cancel_reasons(
+                    RequestIdentity::dev(),
+                    Parameters(StoreOnlyInput {
+                        store: Some(StoreId::from("store_a")),
+                    }),
+                )
+                .await,
+            server
+                .fbs_cancel_reasons(
+                    RequestIdentity::dev(),
+                    Parameters(StoreOnlyInput {
+                        store: Some(StoreId::from("store_a")),
                     }),
                 )
                 .await,
@@ -9901,6 +11210,50 @@ mod tests {
         }
         results.push(
             server
+                .finance_realization_by_day(
+                    RequestIdentity::dev(),
+                    Parameters(FinanceRealizationByDayInput {
+                        store: Some(StoreId::from("store_a")),
+                        date: "2026-04-30".to_owned(),
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .finance_cash_flow(
+                    RequestIdentity::dev(),
+                    Parameters(FinanceCashFlowInput {
+                        store: Some(StoreId::from("store_a")),
+                        date_from: "2026-04-01".to_owned(),
+                        date_to: "2026-04-15".to_owned(),
+                        page: 2,
+                        page_size: 80,
+                        with_details: true,
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .finance_mutual_settlement(
+                    RequestIdentity::dev(),
+                    Parameters(FinanceMutualSettlementInput {
+                        store: Some(StoreId::from("store_a")),
+                        date: "2026-04".to_owned(),
+                        language: FinanceLanguage::En,
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
                 .seller_rating(
                     RequestIdentity::dev(),
                     Parameters(StoreOnlyInput {
@@ -9935,7 +11288,11 @@ mod tests {
                         store: Some(StoreId::from("store_a")),
                         limit: 80,
                         last_id: "review-cursor".to_owned(),
-                        status: "UNPROCESSED".to_owned(),
+                        status: "NEW".to_owned(),
+                        skus: Vec::new(),
+                        order_status: "ALL".to_owned(),
+                        published_from: None,
+                        published_to: None,
                         direction: SortDirection::Desc,
                     }),
                 )
@@ -10007,6 +11364,68 @@ mod tests {
                 }),
             ),
             (
+                "/v1/product/info/stocks-by-warehouse/fbo",
+                json!({
+                    "cursor": "fbo-cursor",
+                    "limit": 30,
+                    "offer_ids": ["offer-fbo"],
+                    "skus": [101],
+                }),
+            ),
+            (
+                "/v2/product/info/stocks-by-warehouse/fbs",
+                json!({
+                    "cursor": "fbs-cursor",
+                    "limit": 31,
+                    "offer_id": ["offer-fbs"],
+                    "sku": [202],
+                }),
+            ),
+            (
+                "/v2/warehouse/list",
+                json!({
+                    "cursor": "warehouse-page",
+                    "limit": 50,
+                    "warehouse_ids": [101, 202],
+                }),
+            ),
+            (
+                "/v3/product/list",
+                json!({
+                    "filter": {
+                        "offer_id": ["offer-catalog"],
+                        "product_id": ["product-catalog"],
+                        "skus": [501],
+                        "visibility": "ALL",
+                    },
+                    "last_id": "product-cursor",
+                    "limit": 60,
+                }),
+            ),
+            (
+                "/v3/product/info/list",
+                json!({
+                    "offer_id": ["offer-info"],
+                    "product_id": [],
+                    "sku": [502],
+                }),
+            ),
+            (
+                "/v4/product/info/attributes",
+                json!({
+                    "filter": {
+                        "offer_id": [],
+                        "product_id": ["product-attributes"],
+                        "sku": [503],
+                        "visibility": "VISIBLE",
+                    },
+                    "last_id": "attributes-cursor",
+                    "limit": 70,
+                    "sort_by": "id",
+                    "sort_dir": "desc",
+                }),
+            ),
+            (
                 "/v1/analytics/turnover/stocks",
                 json!({"limit": 30, "offset": 2, "sku": ["sku-1"]}),
             ),
@@ -10031,33 +11450,99 @@ mod tests {
             ),
             ("/v3/supply-order/get", json!({"order_ids": [123, 456]})),
             (
-                "/v3/posting/fbs/list",
+                "/v4/posting/fbs/list",
                 json!({
-                    "dir": "ASC",
+                    "cursor": "fbs-page",
                     "filter": {
                         "since": "2026-02-01T00:00:00.000Z",
                         "to": "2026-02-02T23:59:59.999Z",
-                        "status": "awaiting_packaging",
+                        "statuses": ["awaiting_packaging"],
                     },
                     "limit": 40,
-                    "offset": 3,
+                    "sort_dir": "ASC",
+                    "translit": false,
+                    "with": {
+                        "analytics_data": true,
+                        "barcodes": true,
+                        "financial_data": false,
+                        "legal_info": false,
+                    },
                 }),
             ),
             (
-                "/v2/posting/fbo/list",
+                "/v3/posting/fbo/list",
                 json!({
-                    "dir": "DESC",
                     "filter": {
                         "since": "2026-02-01T00:00:00.000Z",
                         "to": "2026-02-02T23:59:59.999Z",
-                        "status": "",
+                        "statuses": [],
                     },
                     "limit": 50,
-                    "offset": 0,
+                    "sort_dir": "DESC",
                     "translit": false,
-                    "with": {"analytics_data": true, "financial_data": true},
+                    "with": {
+                        "analytics_data": true,
+                        "financial_data": false,
+                        "legal_info": false,
+                    },
                 }),
             ),
+            (
+                "/v4/posting/fbs/unfulfilled/list",
+                json!({
+                    "cursor": "unfulfilled-cursor",
+                    "filter": {
+                        "cutoff_from": "2026-01-31T00:00:00.000Z",
+                        "cutoff_to": "2026-01-31T23:59:59.999Z",
+                        "delivery_method_ids": [3],
+                        "last_changed_status_date": {
+                            "from": "2026-02-01T00:00:00.000Z",
+                            "to": "2026-02-02T23:59:59.999Z",
+                        },
+                        "provider_ids": [2],
+                        "statuses": ["awaiting_packaging"],
+                        "warehouse_ids": [1],
+                    },
+                    "limit": 99,
+                    "sort_dir": "DESC",
+                    "translit": false,
+                    "with": {
+                        "analytics_data": true,
+                        "barcodes": true,
+                        "financial_data": false,
+                        "legal_info": false,
+                    },
+                }),
+            ),
+            (
+                "/v2/posting/fbo/get",
+                json!({
+                    "posting_number": "fbo-posting",
+                    "translit": false,
+                    "with": {
+                        "analytics_data": true,
+                        "financial_data": false,
+                        "legal_info": false,
+                    },
+                }),
+            ),
+            (
+                "/v3/posting/fbs/get",
+                json!({
+                    "posting_number": "fbs-posting",
+                    "with": {
+                        "analytics_data": true,
+                        "barcodes": true,
+                        "financial_data": false,
+                        "legal_info": false,
+                        "product_exemplars": true,
+                        "related_postings": true,
+                        "translit": false,
+                    },
+                }),
+            ),
+            ("/v1/posting/fbo/cancel-reason/list", json!({})),
+            ("/v2/posting/fbs/cancel-reason/list", json!({})),
             (
                 "/v1/returns/list",
                 json!({
@@ -10117,6 +11602,26 @@ mod tests {
                     "transaction_type": "all",
                 }),
             ),
+            (
+                "/v1/finance/realization/by-day",
+                json!({"day": 30, "month": 4, "year": 2026}),
+            ),
+            (
+                "/v1/finance/cash-flow-statement/list",
+                json!({
+                    "date": {
+                        "from": "2026-04-01T00:00:00.000Z",
+                        "to": "2026-04-15T23:59:59.999Z",
+                    },
+                    "page": 2,
+                    "page_size": 80,
+                    "with_details": true,
+                }),
+            ),
+            (
+                "/v1/finance/mutual-settlement",
+                json!({"date": "2026-04", "language": "EN"}),
+            ),
             ("/v1/rating/summary", json!({})),
             (
                 "/v1/rating/history",
@@ -10128,12 +11633,16 @@ mod tests {
                 }),
             ),
             (
-                "/v1/review/list",
+                "/v2/review/list",
                 json!({
+                    "filters": {
+                        "order_status": "ALL",
+                        "skus": [],
+                        "status": "NEW",
+                    },
                     "last_id": "review-cursor",
                     "limit": 80,
                     "sort_dir": "DESC",
-                    "status": "UNPROCESSED",
                 }),
             ),
             (
@@ -10441,7 +11950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_tools_send_exact_candidate_contracts_when_explicitly_enabled() {
+    async fn stable_postings_and_accruals_send_exact_contracts() {
         let (server, requests) = mock_server(6);
         let server = server.with_preview_features(true, true);
 
@@ -10477,26 +11986,26 @@ mod tests {
                 )
                 .await,
             server
-                .finance_accrual_postings_preview(
+                .finance_accrual_postings(
                     RequestIdentity::dev(),
-                    Parameters(FinanceAccrualPostingsPreviewInput {
+                    Parameters(FinanceAccrualPostingsInput {
                         store: Some(StoreId::from("store_a")),
                         posting_numbers: vec!["posting-1".to_owned(), "posting-2".to_owned()],
                     }),
                 )
                 .await,
             server
-                .finance_accrual_types_preview(
+                .finance_accrual_types(
                     RequestIdentity::dev(),
-                    Parameters(FinanceAccrualTypesPreviewInput {
+                    Parameters(FinanceAccrualTypesInput {
                         store: Some(StoreId::from("store_a")),
                     }),
                 )
                 .await,
             server
-                .finance_accrual_by_day_preview(
+                .finance_accrual_by_day(
                     RequestIdentity::dev(),
-                    Parameters(FinanceAccrualByDayPreviewInput {
+                    Parameters(FinanceAccrualByDayInput {
                         store: Some(StoreId::from("store_a")),
                         date: "2026-07-05".to_owned(),
                         last_id: "next-page".to_owned(),
@@ -10504,9 +12013,9 @@ mod tests {
                 )
                 .await,
             server
-                .finance_accrual_by_day_preview(
+                .finance_accrual_by_day(
                     RequestIdentity::dev(),
-                    Parameters(FinanceAccrualByDayPreviewInput {
+                    Parameters(FinanceAccrualByDayInput {
                         store: Some(StoreId::from("store_a")),
                         date: "2026-07-06".to_owned(),
                         last_id: String::new(),
@@ -10531,7 +12040,7 @@ mod tests {
                     "with": {
                         "analytics_data": true,
                         "barcodes": true,
-                        "financial_data": true,
+                        "financial_data": false,
                         "legal_info": false,
                     },
                 }),
@@ -10549,7 +12058,7 @@ mod tests {
                     "translit": false,
                     "with": {
                         "analytics_data": true,
-                        "financial_data": true,
+                        "financial_data": false,
                         "legal_info": false,
                     },
                 }),
@@ -10563,7 +12072,10 @@ mod tests {
                 "/v1/finance/accrual/by-day",
                 json!({"date": "2026-07-05", "last_id": "next-page"}),
             ),
-            ("/v1/finance/accrual/by-day", json!({"date": "2026-07-06"})),
+            (
+                "/v1/finance/accrual/by-day",
+                json!({"date": "2026-07-06", "last_id": ""}),
+            ),
         ];
 
         for (result, (expected_path, expected_body)) in results.into_iter().zip(expected) {
@@ -10604,22 +12116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn previews_are_disabled_by_default_and_reject_invalid_inputs_before_network() {
-        let disabled_server = server();
-        assert!(!disabled_server.postings_vnext);
-        assert!(!disabled_server.finance_accruals_preview);
-        let error = disabled_server
-            .finance_accrual_types_preview(
-                RequestIdentity::dev(),
-                Parameters(FinanceAccrualTypesPreviewInput {
-                    store: Some(StoreId::from("store_a")),
-                }),
-            )
-            .await
-            .err()
-            .unwrap();
-        assert!(error.starts_with(PREVIEW_DISABLED));
-
+    async fn stable_postings_and_accruals_reject_invalid_inputs_before_network() {
         let server = server().with_preview_features(true, true);
         let error = server
             .fbs_postings(
@@ -10638,7 +12135,7 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert!(error.starts_with(PREVIEW_CURSOR_REQUIRED));
+        assert!(error.starts_with(CURSOR_REQUIRED));
 
         let error = server
             .fbo_postings(
@@ -10660,9 +12157,9 @@ mod tests {
         assert!(error.contains("от 1 до 100"));
 
         let error = server
-            .finance_accrual_postings_preview(
+            .finance_accrual_postings(
                 RequestIdentity::dev(),
-                Parameters(FinanceAccrualPostingsPreviewInput {
+                Parameters(FinanceAccrualPostingsInput {
                     store: Some(StoreId::from("store_a")),
                     posting_numbers: Vec::new(),
                 }),
@@ -10673,9 +12170,9 @@ mod tests {
         assert!(error.contains("posting_numbers"));
 
         let error = server
-            .finance_accrual_by_day_preview(
+            .finance_accrual_by_day(
                 RequestIdentity::dev(),
-                Parameters(FinanceAccrualByDayPreviewInput {
+                Parameters(FinanceAccrualByDayInput {
                     store: Some(StoreId::from("store_a")),
                     date: "07-05-2026".to_owned(),
                     last_id: String::new(),
@@ -10685,6 +12182,421 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.contains("YYYY-MM-DD"));
+    }
+
+    #[tokio::test]
+    async fn new_seller_analytics_inputs_fail_closed_before_network() {
+        let (server, requests) = mock_server(0);
+
+        for warehouse_ids in [vec![0], vec![7, 7]] {
+            assert_validation_error(
+                server
+                    .warehouses(
+                        RequestIdentity::dev(),
+                        Parameters(WarehouseListInput {
+                            store: Some(StoreId::from("store_a")),
+                            limit: 100,
+                            cursor: None,
+                            warehouse_ids,
+                        }),
+                    )
+                    .await,
+                "warehouse_ids",
+            );
+        }
+
+        assert_validation_error(
+            server
+                .fbs_unfulfilled(
+                    RequestIdentity::dev(),
+                    Parameters(FbsUnfulfilledInput {
+                        store: Some(StoreId::from("store_a")),
+                        date_from: "2026-08-01".to_owned(),
+                        date_to: "2026-08-02".to_owned(),
+                        cursor: String::new(),
+                        limit: 100,
+                        direction: SortDirection::Asc,
+                        statuses: Vec::new(),
+                        warehouse_ids: Vec::new(),
+                        provider_ids: Vec::new(),
+                        delivery_method_ids: Vec::new(),
+                        cutoff_from: Some("2026-08-01".to_owned()),
+                        cutoff_to: Some("2026-08-02".to_owned()),
+                        delivering_date_from: Some("2026-08-01".to_owned()),
+                        delivering_date_to: Some("2026-08-02".to_owned()),
+                    }),
+                )
+                .await,
+            "нельзя передавать одновременно",
+        );
+
+        assert_validation_error(
+            server
+                .finance_cash_flow(
+                    RequestIdentity::dev(),
+                    Parameters(FinanceCashFlowInput {
+                        store: Some(StoreId::from("store_a")),
+                        date_from: "2026-08-01".to_owned(),
+                        date_to: "2026-08-16".to_owned(),
+                        page: 1,
+                        page_size: 100,
+                        with_details: true,
+                    }),
+                )
+                .await,
+            "расчётным интервалом",
+        );
+        assert_validation_error(
+            server
+                .finance_mutual_settlement(
+                    RequestIdentity::dev(),
+                    Parameters(FinanceMutualSettlementInput {
+                        store: Some(StoreId::from("store_a")),
+                        date: "2026-13".to_owned(),
+                        language: FinanceLanguage::Ru,
+                    }),
+                )
+                .await,
+            "YYYY-MM",
+        );
+
+        assert!(
+            requests.try_recv().is_err(),
+            "invalid new read inputs must never reach Ozon"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_read_method_validation_branches_fail_before_network() {
+        fn unfulfilled_input() -> FbsUnfulfilledInput {
+            FbsUnfulfilledInput {
+                store: Some(StoreId::from("store_a")),
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+                cursor: String::new(),
+                limit: 100,
+                direction: SortDirection::Asc,
+                statuses: Vec::new(),
+                warehouse_ids: Vec::new(),
+                provider_ids: Vec::new(),
+                delivery_method_ids: Vec::new(),
+                cutoff_from: None,
+                cutoff_to: None,
+                delivering_date_from: None,
+                delivering_date_to: None,
+            }
+        }
+
+        fn reviews_input() -> ReviewsInput {
+            ReviewsInput {
+                store: Some(StoreId::from("store_a")),
+                limit: 100,
+                last_id: String::new(),
+                status: "ALL".to_owned(),
+                skus: Vec::new(),
+                order_status: "ALL".to_owned(),
+                published_from: None,
+                published_to: None,
+                direction: SortDirection::Asc,
+            }
+        }
+
+        let (server, requests) = mock_server(0);
+
+        assert_validation_error(
+            server
+                .product_stocks(
+                    RequestIdentity::dev(),
+                    Parameters(ProductFilterInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: Vec::new(),
+                        product_ids: vec![" ".to_owned()],
+                        visibility: Visibility::All,
+                        limit: 100,
+                        cursor: None,
+                    }),
+                )
+                .await,
+            "product_ids",
+        );
+
+        assert_validation_error(
+            server
+                .warehouses(
+                    RequestIdentity::dev(),
+                    Parameters(WarehouseListInput {
+                        store: Some(StoreId::from("store_a")),
+                        limit: 100,
+                        cursor: None,
+                        warehouse_ids: vec![1; MAX_PRODUCT_FILTER_ITEMS + 1],
+                    }),
+                )
+                .await,
+            "warehouse_ids",
+        );
+
+        assert_validation_error(
+            server
+                .product_prices(
+                    RequestIdentity::dev(),
+                    Parameters(ProductPriceFilterInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: vec![" ".to_owned()],
+                        product_ids: Vec::new(),
+                        visibility: CatalogVisibility::All,
+                        limit: 100,
+                        cursor: None,
+                    }),
+                )
+                .await,
+            "offer_ids",
+        );
+        assert_validation_error(
+            server
+                .product_prices(
+                    RequestIdentity::dev(),
+                    Parameters(ProductPriceFilterInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: vec!["offer".to_owned(); MAX_PRODUCT_FILTER_ITEMS],
+                        product_ids: vec!["product".to_owned()],
+                        visibility: CatalogVisibility::All,
+                        limit: 100,
+                        cursor: None,
+                    }),
+                )
+                .await,
+            "вместе",
+        );
+
+        assert_validation_error(
+            server
+                .product_info(
+                    RequestIdentity::dev(),
+                    Parameters(ProductInfoListInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: Vec::new(),
+                        product_ids: Vec::new(),
+                        skus: Vec::new(),
+                    }),
+                )
+                .await,
+            "хотя бы один",
+        );
+        assert_validation_error(
+            server
+                .products(
+                    RequestIdentity::dev(),
+                    Parameters(ProductCatalogInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: vec![" ".to_owned()],
+                        product_ids: Vec::new(),
+                        skus: Vec::new(),
+                        visibility: CatalogVisibility::All,
+                        limit: 100,
+                        last_id: String::new(),
+                    }),
+                )
+                .await,
+            "offer_ids",
+        );
+        assert_validation_error(
+            server
+                .product_attributes(
+                    RequestIdentity::dev(),
+                    Parameters(ProductAttributesInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: Vec::new(),
+                        product_ids: vec![" ".to_owned()],
+                        skus: Vec::new(),
+                        visibility: CatalogVisibility::All,
+                        limit: 100,
+                        last_id: String::new(),
+                        sort_direction: ProductSortDirection::Asc,
+                    }),
+                )
+                .await,
+            "product_ids",
+        );
+        assert_validation_error(
+            server
+                .product_info(
+                    RequestIdentity::dev(),
+                    Parameters(ProductInfoListInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: vec!["offer".to_owned(); 500],
+                        product_ids: vec!["product".to_owned(); 501],
+                        skus: Vec::new(),
+                    }),
+                )
+                .await,
+            "вместе",
+        );
+
+        let mut input = unfulfilled_input();
+        input.cutoff_from = Some("2026-08-01".to_owned());
+        assert_validation_error(
+            server
+                .fbs_unfulfilled(RequestIdentity::dev(), Parameters(input))
+                .await,
+            "cutoff",
+        );
+
+        let mut input = unfulfilled_input();
+        input.delivering_date_from = Some("2026-08-02".to_owned());
+        input.delivering_date_to = Some("2026-08-01".to_owned());
+        assert_validation_error(
+            server
+                .fbs_unfulfilled(RequestIdentity::dev(), Parameters(input))
+                .await,
+            "delivering_date_to",
+        );
+
+        let mut input = unfulfilled_input();
+        input.statuses = vec![" ".to_owned()];
+        assert_validation_error(
+            server
+                .fbs_unfulfilled(RequestIdentity::dev(), Parameters(input))
+                .await,
+            "statuses",
+        );
+
+        for fbo in [true, false] {
+            let input = PostingGetInput {
+                store: Some(StoreId::from("store_a")),
+                posting_number: "p".repeat(MAX_IDENTIFIER_CHARS + 1),
+            };
+            let result = if fbo {
+                server
+                    .fbo_posting(RequestIdentity::dev(), Parameters(input))
+                    .await
+            } else {
+                server
+                    .fbs_posting(RequestIdentity::dev(), Parameters(input))
+                    .await
+            };
+            assert_validation_error(result, "posting_number");
+        }
+
+        assert_validation_error(
+            server
+                .finance_cash_flow(
+                    RequestIdentity::dev(),
+                    Parameters(FinanceCashFlowInput {
+                        store: Some(StoreId::from("store_a")),
+                        date_from: "2026-08-01".to_owned(),
+                        date_to: "2026-08-15".to_owned(),
+                        page: 0,
+                        page_size: 100,
+                        with_details: true,
+                    }),
+                )
+                .await,
+            "page",
+        );
+
+        let mut input = reviews_input();
+        input.status = "INVALID".to_owned();
+        assert_validation_error(
+            server
+                .reviews(RequestIdentity::dev(), Parameters(input))
+                .await,
+            "status",
+        );
+
+        let mut input = reviews_input();
+        input.order_status = "INVALID".to_owned();
+        assert_validation_error(
+            server
+                .reviews(RequestIdentity::dev(), Parameters(input))
+                .await,
+            "order_status",
+        );
+
+        let mut input = reviews_input();
+        input.published_from = Some("2026-08-01".to_owned());
+        assert_validation_error(
+            server
+                .reviews(RequestIdentity::dev(), Parameters(input))
+                .await,
+            "published",
+        );
+
+        assert!(
+            requests.try_recv().is_err(),
+            "invalid read inputs must never reach Ozon"
+        );
+    }
+
+    #[tokio::test]
+    async fn optional_date_filters_are_forwarded_exactly() {
+        let (server, requests) = mock_server(2);
+
+        server
+            .fbs_unfulfilled(
+                RequestIdentity::dev(),
+                Parameters(FbsUnfulfilledInput {
+                    store: Some(StoreId::from("store_a")),
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-02".to_owned(),
+                    cursor: String::new(),
+                    limit: 100,
+                    direction: SortDirection::Asc,
+                    statuses: Vec::new(),
+                    warehouse_ids: Vec::new(),
+                    provider_ids: Vec::new(),
+                    delivery_method_ids: Vec::new(),
+                    cutoff_from: None,
+                    cutoff_to: None,
+                    delivering_date_from: Some("2026-08-03".to_owned()),
+                    delivering_date_to: Some("2026-08-04".to_owned()),
+                }),
+            )
+            .await
+            .unwrap();
+
+        server
+            .reviews(
+                RequestIdentity::dev(),
+                Parameters(ReviewsInput {
+                    store: Some(StoreId::from("store_a")),
+                    limit: 100,
+                    last_id: String::new(),
+                    status: "ALL".to_owned(),
+                    skus: Vec::new(),
+                    order_status: "ALL".to_owned(),
+                    published_from: Some("2026-08-05".to_owned()),
+                    published_to: Some("2026-08-06".to_owned()),
+                    direction: SortDirection::Asc,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (path, body) = request_path_and_body(&request);
+        assert_eq!(path, "/v4/posting/fbs/unfulfilled/list");
+        assert_eq!(
+            body["filter"]["delivering_date_from"],
+            json!("2026-08-03T00:00:00.000Z")
+        );
+        assert_eq!(
+            body["filter"]["delivering_date_to"],
+            json!("2026-08-04T23:59:59.999Z")
+        );
+        assert!(body["filter"].get("cutoff_from").is_none());
+
+        let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (path, body) = request_path_and_body(&request);
+        assert_eq!(path, "/v2/review/list");
+        assert_eq!(
+            body["filters"]["published_from"],
+            json!("2026-08-05T00:00:00.000Z")
+        );
+        assert_eq!(
+            body["filters"]["published_to"],
+            json!("2026-08-06T23:59:59.999Z")
+        );
+        assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -10765,11 +12677,11 @@ mod tests {
             server
                 .product_prices(
                     RequestIdentity::dev(),
-                    Parameters(ProductFilterInput {
+                    Parameters(ProductPriceFilterInput {
                         store: Some(StoreId::from("store_a")),
                         offer_ids: Vec::new(),
                         product_ids: vec![oversized_identifier.clone()],
-                        visibility: Visibility::All,
+                        visibility: CatalogVisibility::All,
                         limit: 100,
                         cursor: None,
                     }),
@@ -10781,11 +12693,11 @@ mod tests {
             server
                 .product_prices(
                     RequestIdentity::dev(),
-                    Parameters(ProductFilterInput {
+                    Parameters(ProductPriceFilterInput {
                         store: Some(StoreId::from("store_a")),
                         offer_ids: Vec::new(),
                         product_ids: Vec::new(),
-                        visibility: Visibility::All,
+                        visibility: CatalogVisibility::All,
                         limit: 100,
                         cursor: Some(oversized_token.clone()),
                     }),
@@ -11019,9 +12931,9 @@ mod tests {
         );
         assert_validation_error(
             server
-                .finance_accrual_postings_preview(
+                .finance_accrual_postings(
                     RequestIdentity::dev(),
-                    Parameters(FinanceAccrualPostingsPreviewInput {
+                    Parameters(FinanceAccrualPostingsInput {
                         store: Some(StoreId::from("store_a")),
                         posting_numbers: vec![oversized_identifier.clone()],
                     }),
@@ -11031,9 +12943,9 @@ mod tests {
         );
         assert_validation_error(
             server
-                .finance_accrual_by_day_preview(
+                .finance_accrual_by_day(
                     RequestIdentity::dev(),
-                    Parameters(FinanceAccrualByDayPreviewInput {
+                    Parameters(FinanceAccrualByDayInput {
                         store: Some(StoreId::from("store_a")),
                         date: "2026-01-01".to_owned(),
                         last_id: oversized_token.clone(),
@@ -11066,6 +12978,10 @@ mod tests {
                         limit: 100,
                         last_id: oversized_token.clone(),
                         status: "ALL".to_owned(),
+                        skus: Vec::new(),
+                        order_status: "ALL".to_owned(),
+                        published_from: None,
+                        published_to: None,
                         direction: SortDirection::Asc,
                     }),
                 )
@@ -11081,6 +12997,10 @@ mod tests {
                         limit: 100,
                         last_id: String::new(),
                         status: oversized_enum.clone(),
+                        skus: Vec::new(),
+                        order_status: "ALL".to_owned(),
+                        published_from: None,
+                        published_to: None,
                         direction: SortDirection::Asc,
                     }),
                 )
@@ -11284,9 +13204,9 @@ mod tests {
         );
         assert_validation_error(
             server
-                .finance_accrual_postings_preview(
+                .finance_accrual_postings(
                     RequestIdentity::dev(),
-                    Parameters(FinanceAccrualPostingsPreviewInput {
+                    Parameters(FinanceAccrualPostingsInput {
                         store: Some(StoreId::from("store_a")),
                         posting_numbers: vec!["posting".to_owned(); MAX_POSTING_NUMBERS + 1],
                     }),
@@ -11333,6 +13253,10 @@ mod tests {
                         limit: MIN_REVIEWS_LIMIT - 1,
                         last_id: String::new(),
                         status: "ALL".to_owned(),
+                        skus: Vec::new(),
+                        order_status: "ALL".to_owned(),
+                        published_from: None,
+                        published_to: None,
                         direction: SortDirection::Asc,
                     }),
                 )
@@ -11348,6 +13272,10 @@ mod tests {
                         limit: MIN_REVIEWS_LIMIT,
                         last_id: String::new(),
                         status: " ".to_owned(),
+                        skus: Vec::new(),
+                        order_status: "ALL".to_owned(),
+                        published_from: None,
+                        published_to: None,
                         direction: SortDirection::Asc,
                     }),
                 )
@@ -11496,6 +13424,10 @@ mod tests {
                     })
                     .to_string(),
                 ),
+                (200, json!({"limits": []}).to_string()),
+                (200, json!({"list": [101]}).to_string()),
+                (200, json!({"products": []}).to_string()),
+                (200, json!({"rows": []}).to_string()),
                 (200, json!({"daily": []}).to_string()),
                 (200, json!({"expenses": []}).to_string()),
             ],
@@ -11523,6 +13455,61 @@ mod tests {
             campaigns.data["rows"][0]["customerEmail"],
             json!(REDACTED_VALUE)
         );
+
+        let limits = server
+            .performance_limits(
+                RequestIdentity::dev(),
+                Parameters(StoreOnlyInput {
+                    store: Some(StoreId::from("store_a")),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(limits.endpoint, LIMITS_PATH);
+
+        let objects = server
+            .performance_campaign_objects(
+                RequestIdentity::dev(),
+                Parameters(PerformanceCampaignResourceInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_id: 11,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(objects.endpoint, CAMPAIGN_OBJECTS_PATH_TEMPLATE);
+
+        let products = server
+            .performance_campaign_products(
+                RequestIdentity::dev(),
+                Parameters(PerformanceCampaignProductsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_id: 11,
+                    page: 3,
+                    page_size: 25,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(products.endpoint, CAMPAIGN_PRODUCTS_PATH_TEMPLATE);
+
+        let sku = server
+            .performance_sku_statistics(
+                RequestIdentity::dev(),
+                Parameters(PerformanceSkuStatisticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: vec![11, 22],
+                    date_from: "2026-08-01".to_owned(),
+                    date_to: "2026-08-09".to_owned(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(sku.endpoint, PRODUCT_SKU_STATS_PATH);
 
         let daily = server
             .performance_daily(
@@ -11556,7 +13543,7 @@ mod tests {
         assert_eq!(expenses.endpoint, EXPENSES_PATH);
         assert_eq!(expenses.data_classification, UNTRUSTED_DATA_CLASSIFICATION);
 
-        let captured = (0..4)
+        let captured = (0..8)
             .map(|_| requests.recv_timeout(Duration::from_secs(3)).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(
@@ -11569,11 +13556,35 @@ mod tests {
         );
         assert_eq!(
             captured[2].lines().next().unwrap(),
-            "GET /api/client/statistics/daily/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
+            "GET /api/client/limits/list HTTP/1.1"
         );
         assert_eq!(
             captured[3].lines().next().unwrap(),
-            "GET /api/client/statistics/expense/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
+            "GET /api/client/campaign/11/objects HTTP/1.1"
+        );
+        assert_eq!(
+            captured[4].lines().next().unwrap(),
+            "GET /api/client/campaign/11/v2/products?page=3&pageSize=25 HTTP/1.1"
+        );
+        assert_eq!(
+            captured[5].lines().next().unwrap(),
+            "POST /api/client/statistics/products/sku HTTP/1.1"
+        );
+        assert_eq!(
+            request_path_and_body(&captured[5]).1,
+            json!({
+                "campaignIds": [11, 22],
+                "dateFrom": "2026-08-01",
+                "dateTo": "2026-08-09",
+            })
+        );
+        assert_eq!(
+            captured[6].lines().next().unwrap(),
+            "GET /api/client/statistics/daily?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
+        );
+        assert_eq!(
+            captured[7].lines().next().unwrap(),
+            "GET /api/client/statistics/expense?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
         );
         assert!(requests.try_recv().is_err());
     }
@@ -11767,6 +13778,62 @@ mod tests {
                 .await,
             "date_from",
         );
+        assert_validation_error(
+            server
+                .performance_sku_statistics(
+                    RequestIdentity::dev(),
+                    Parameters(PerformanceSkuStatisticsInput {
+                        store: Some(StoreId::from("store_a")),
+                        campaign_ids: vec![0],
+                        date_from: "2026-08-18".to_owned(),
+                        date_to: "2026-08-19".to_owned(),
+                    }),
+                )
+                .await,
+            "campaign_ids",
+        );
+        assert_validation_error(
+            server
+                .performance_sku_statistics(
+                    RequestIdentity::dev(),
+                    Parameters(PerformanceSkuStatisticsInput {
+                        store: Some(StoreId::from("store_a")),
+                        campaign_ids: Vec::new(),
+                        date_from: "2026-08-19".to_owned(),
+                        date_to: "2026-08-18".to_owned(),
+                    }),
+                )
+                .await,
+            "date_to",
+        );
+        assert_validation_error(
+            server
+                .performance_campaign_objects(
+                    RequestIdentity::dev(),
+                    Parameters(PerformanceCampaignResourceInput {
+                        store: Some(StoreId::from("store_a")),
+                        campaign_id: 0,
+                    }),
+                )
+                .await,
+            "campaign_id",
+        );
+        for (page, page_size, field) in [(0, 100, "page"), (1, 101, "limit")] {
+            assert_validation_error(
+                server
+                    .performance_campaign_products(
+                        RequestIdentity::dev(),
+                        Parameters(PerformanceCampaignProductsInput {
+                            store: Some(StoreId::from("store_a")),
+                            campaign_id: 1,
+                            page,
+                            page_size,
+                        }),
+                    )
+                    .await,
+                field,
+            );
+        }
         assert_validation_error(
             server
                 .performance_campaigns(
@@ -12096,7 +14163,11 @@ mod tests {
         assert_eq!(campaigns["properties"]["page_size"]["minimum"], json!(1));
         assert_eq!(campaigns["properties"]["page_size"]["maximum"], json!(100));
 
-        for tool in ["ozon_performance_daily", "ozon_performance_expenses"] {
+        for tool in [
+            "ozon_performance_daily",
+            "ozon_performance_expenses",
+            "ozon_performance_sku_statistics",
+        ] {
             let schema = schema(tool);
             assert_eq!(schema["additionalProperties"], json!(false), "{tool}");
             assert_eq!(
@@ -12117,6 +14188,22 @@ mod tests {
                 );
             }
         }
+
+        let objects = schema("ozon_performance_campaign_objects");
+        assert_eq!(objects["additionalProperties"], json!(false));
+        assert_eq!(objects["properties"]["campaign_id"]["minimum"], json!(1));
+        let products = schema("ozon_performance_campaign_products");
+        assert_eq!(products["additionalProperties"], json!(false));
+        assert_eq!(products["properties"]["campaign_id"]["minimum"], json!(1));
+        assert_eq!(products["properties"]["page"]["minimum"], json!(1));
+        assert_eq!(products["properties"]["page_size"]["maximum"], json!(100));
+        let sku_statistics = schema("ozon_performance_sku_statistics");
+        assert!(
+            sku_statistics["properties"]["campaign_ids"]
+                .get("minItems")
+                .is_none(),
+            "empty campaign_ids must request all campaigns"
+        );
 
         let (server, requests) = performance_mock_server("admin", Vec::new());
         let body = call_tool_over_http(
@@ -12156,7 +14243,11 @@ mod tests {
         assert!(body.contains("DELETE"), "{body}");
         assert!(requests.try_recv().is_err());
 
-        for tool in ["ozon_performance_daily", "ozon_performance_expenses"] {
+        for tool in [
+            "ozon_performance_daily",
+            "ozon_performance_expenses",
+            "ozon_performance_sku_statistics",
+        ] {
             let (server, requests) = performance_mock_server(
                 "admin",
                 vec![
@@ -12164,12 +14255,17 @@ mod tests {
                     (200, json!({"rows": []}).to_string()),
                 ],
             );
+            let campaign_ids = if tool == "ozon_performance_sku_statistics" {
+                json!([])
+            } else {
+                json!([11])
+            };
             let body = call_tool_over_http(
                 server,
                 tool,
                 json!({
                     "store":"store_a",
-                    "campaign_ids":[11],
+                    "campaign_ids":campaign_ids,
                     "date_from":"2026-08-01",
                     "date_to":"2026-08-02"
                 }),
@@ -12184,6 +14280,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_product_and_campaign_product_inputs_cross_the_mcp_json_boundary() {
+        let (seller, seller_requests) = mock_server(1);
+        let body = call_tool_over_http(
+            seller,
+            "ozon_product_attributes",
+            json!({
+                "store": "store_a",
+                "product_ids": ["product-1"],
+                "skus": [42],
+                "visibility": "VISIBLE",
+                "limit": 25,
+                "last_id": "page-1",
+                "sort_direction": "desc"
+            }),
+        )
+        .await;
+        assert!(body.contains(UNTRUSTED_DATA_CLASSIFICATION), "{body}");
+        let request = seller_requests
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let (path, payload) = request_path_and_body(&request);
+        assert_eq!(path, "/v4/product/info/attributes");
+        assert_eq!(payload["filter"]["product_id"], json!(["product-1"]));
+        assert_eq!(payload["filter"]["sku"], json!([42]));
+
+        let (seller, seller_requests) = mock_server(0);
+        let body = call_tool_over_http(
+            seller,
+            "ozon_product_attributes",
+            json!({"product_ids":["product-1"], "raw_path":"/v1/product/update"}),
+        )
+        .await;
+        assert!(body.contains("unknown field"), "{body}");
+        assert!(body.contains("raw_path"), "{body}");
+        assert!(seller_requests.try_recv().is_err());
+
+        let (performance, performance_requests) = performance_mock_server(
+            "admin",
+            vec![
+                (200, performance_token_response()),
+                (200, json!({"products": []}).to_string()),
+            ],
+        );
+        let body = call_tool_over_http(
+            performance,
+            "ozon_performance_campaign_products",
+            json!({"store":"store_a", "campaign_id":11, "page":2, "page_size":25}),
+        )
+        .await;
+        assert!(body.contains(UNTRUSTED_DATA_CLASSIFICATION), "{body}");
+        let token_request = performance_requests
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert!(token_request.starts_with("POST /api/client/token "));
+        let products_request = performance_requests
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        assert!(
+            products_request
+                .starts_with("GET /api/client/campaign/11/v2/products?page=2&pageSize=25 "),
+            "{products_request}"
+        );
+
+        let (performance, performance_requests) = performance_mock_server("admin", Vec::new());
+        let body = call_tool_over_http(
+            performance,
+            "ozon_performance_campaign_products",
+            json!({"campaign_id":11, "page":1, "page_size":25, "write":true}),
+        )
+        .await;
+        assert!(body.contains("unknown field"), "{body}");
+        assert!(body.contains("write"), "{body}");
+        assert!(performance_requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn performance_errors_are_structured_and_status_never_exposes_credentials() {
         let (server, requests) = performance_mock_server(
             "admin",
@@ -12195,6 +14367,10 @@ mod tests {
                 ),
                 (429, json!({"message":"rate limited"}).to_string()),
                 (500, json!({"message":"server error"}).to_string()),
+                (500, json!({"message":"objects error"}).to_string()),
+                (500, json!({"message":"products error"}).to_string()),
+                (500, json!({"message":"limits error"}).to_string()),
+                (500, json!({"message":"sku statistics error"}).to_string()),
             ],
         );
         let error = server
@@ -12235,7 +14411,7 @@ mod tests {
             .unwrap();
         assert!(daily_error.contains("kind=rate_limited"), "{daily_error}");
         assert!(
-            daily_error.contains("endpoint=/api/client/statistics/daily/json"),
+            daily_error.contains("endpoint=/api/client/statistics/daily"),
             "{daily_error}"
         );
 
@@ -12257,11 +14433,94 @@ mod tests {
             "{expenses_error}"
         );
         assert!(
-            expenses_error.contains("endpoint=/api/client/statistics/expense/json"),
+            expenses_error.contains("endpoint=/api/client/statistics/expense"),
             "{expenses_error}"
         );
 
-        for _ in 0..4 {
+        let objects_error = server
+            .performance_campaign_objects(
+                RequestIdentity::dev(),
+                Parameters(PerformanceCampaignResourceInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_id: 11,
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            objects_error.contains("kind=upstream_http_error"),
+            "{objects_error}"
+        );
+        assert!(
+            objects_error.contains("endpoint=/api/client/campaign/{campaignId}/objects"),
+            "{objects_error}"
+        );
+
+        let products_error = server
+            .performance_campaign_products(
+                RequestIdentity::dev(),
+                Parameters(PerformanceCampaignProductsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_id: 11,
+                    page: 1,
+                    page_size: 25,
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            products_error.contains("kind=upstream_http_error"),
+            "{products_error}"
+        );
+        assert!(
+            products_error.contains("endpoint=/api/client/campaign/{campaignId}/v2/products"),
+            "{products_error}"
+        );
+
+        let limits_error = server
+            .performance_limits(
+                RequestIdentity::dev(),
+                Parameters(StoreOnlyInput {
+                    store: Some(StoreId::from("store_a")),
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            limits_error.contains("kind=upstream_http_error"),
+            "{limits_error}"
+        );
+        assert!(
+            limits_error.contains("endpoint=/api/client/limits/list"),
+            "{limits_error}"
+        );
+
+        let sku_error = server
+            .performance_sku_statistics(
+                RequestIdentity::dev(),
+                Parameters(PerformanceSkuStatisticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    campaign_ids: vec![11],
+                    date_from: "2026-08-18".to_owned(),
+                    date_to: "2026-08-19".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            sku_error.contains("kind=upstream_http_error"),
+            "{sku_error}"
+        );
+        assert!(
+            sku_error.contains("endpoint=/api/client/statistics/products/sku"),
+            "{sku_error}"
+        );
+
+        for _ in 0..8 {
             requests.recv_timeout(Duration::from_secs(3)).unwrap();
         }
         assert!(requests.try_recv().is_err());

@@ -2,10 +2,10 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
-use mcp_ozon::ozon_performance::StatisticsQuery;
+use mcp_ozon::ozon_performance::SkuStatisticsQuery;
 use mcp_ozon::reporting::{
     collector_service::{ReportCollectorConfig, ReportCollectorMode},
-    ozon_adapter::parse_performance_daily_advertising,
+    ozon_adapter::parse_performance_sku_advertising,
     ozon_source::{OzonClientReportTransport, collect_complete_snapshots},
     postgres_collector::PostgresSnapshotWriter,
     wb_source::{WbClientReportTransport, WbReportSource},
@@ -18,7 +18,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// This bounds the entire manual account run, including pagination and the
 /// transactional snapshot publication, so a slow upstream cannot hold an
 /// operator invocation forever.
-const REPORT_DRY_RUN_TOTAL_DEADLINE: Duration = Duration::from_secs(10 * 60);
+const REPORT_DRY_RUN_TOTAL_DEADLINE: Duration = Duration::from_secs(12 * 60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -188,9 +188,9 @@ async fn run_ozon_dry_run(
     let date_string = date.format("%Y-%m-%d").to_string();
     let snapshot_ids = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
         let advertising = performance
-            .daily_statistics(
+            .sku_statistics(
                 &performance_store,
-                StatisticsQuery {
+                SkuStatisticsQuery {
                     campaign_ids: Vec::new(),
                     date_from: date_string.clone(),
                     date_to: date_string,
@@ -198,8 +198,8 @@ async fn run_ozon_dry_run(
             )
             .await
             .map_err(|error| anyhow::anyhow!("performance_{}", error.kind().code()))?;
-        let advertising = parse_performance_daily_advertising(&advertising)
-            .map_err(|_| anyhow::anyhow!("invalid_performance_daily_response"))?;
+        let advertising = parse_performance_sku_advertising(&advertising)
+            .map_err(|_| anyhow::anyhow!("invalid_performance_sku_response"))?;
         let snapshots = collect_complete_snapshots(
             &transport,
             advertising,

@@ -13,8 +13,8 @@ services:
       MCP_BIND: 0.0.0.0:8787
       MCP_DEV_ALLOW_NON_LOOPBACK: "true"
       MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
-      OZON_POSTINGS_VNEXT: "true"
-      OZON_FINANCE_ACCRUALS_PREVIEW: "true"
+      OZON_POSTINGS_VNEXT: "false"
+      OZON_FINANCE_ACCRUALS_PREVIEW: "false"
     ports:
       - "127.0.0.1:8789:8787"
     networks:
