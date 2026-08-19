@@ -240,6 +240,25 @@ database claim succeeds, so a busy/completed or unrelated account reads no
 secret. The shipped Compose mode and policy both remain disabled and do not
 mount this directory, so scheduled collection cannot be enabled accidentally.
 
+The repository ships a separate `compose.reporting-live.yaml` overlay, but it
+has no defaults for live metadata or credentials and its collector is guarded
+by the `reporting-live` profile. After the access registry, enabled policy and
+credential directory have been reviewed, render the merged contract first:
+
+```text
+MCP_ACCESS_CONFIG_HOST=/absolute/path/access.json \
+DAILY_REPORT_POLICY_HOST=/absolute/path/daily-report-policy.json \
+REPORT_COLLECTOR_CREDENTIAL_DIR_HOST=/absolute/path/report-credentials \
+docker compose --env-file .position.env \
+  -f compose.position.yaml -f compose.reporting-live.yaml \
+  --profile reporting-live config --quiet
+```
+
+Only then may an operator start `report-collector` with the same explicit
+files/profile. The overlay supplies `run-scheduler`; it does not enable the
+report worker or email delivery. Omitting any path, the profile, an enabled
+policy or a valid read-only credential directory fails closed.
+
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every
 tick is bounded to 16 generation candidates; missed timer ticks are skipped,

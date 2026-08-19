@@ -70,6 +70,11 @@ Each access-registry credential name maps to one bounded regular file directly
 inside it; symlinks and unexpected names fail closed. Values are read only after
 the exact account/cutoff claim succeeds and are never placed in Compose
 environment variables, command arguments, images or logs.
+The opt-in `compose.reporting-live.yaml` overlay requires explicit absolute
+host paths for the access registry, enabled policy and credential directory,
+and is guarded by the `reporting-live` Compose profile. It starts only the
+collector scheduler; report generation and email remain disabled. Always render
+the merged Compose model with `config --quiet` before starting that profile.
 There is still no `Поисковая видимость за сутки` Dashboard, task registry or
 email job. A manual deterministic
 HTML/XLSX preview and a policy-scoped `report-worker generate <batch-id>` path

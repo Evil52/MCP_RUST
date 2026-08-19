@@ -10,6 +10,8 @@ sonar.env
 /config/access.json
 /config/access.canary.json
 /config/control-policy.json
+/config/daily-report-policy.json
+/report-credentials/
 .DS_Store
 /nvim.log
 /README.md

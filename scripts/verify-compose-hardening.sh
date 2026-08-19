@@ -120,6 +120,23 @@ render_position_compose() {
       config --no-env-resolution --format json
 }
 
+render_reporting_live_compose() {
+  local live_policy="$scratch/daily-report-policy.json"
+  local credential_directory="$scratch/report-credentials"
+  printf '{}\n' >"$live_policy"
+  mkdir "$credential_directory"
+  chmod 500 "$credential_directory"
+  MCP_ACCESS_CONFIG_HOST="$main_access" \
+    DAILY_REPORT_POLICY_HOST="$live_policy" \
+    REPORT_COLLECTOR_CREDENTIAL_DIR_HOST="$credential_directory" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.position.yaml" \
+      -f "$project_dir/compose.reporting-live.yaml" \
+      --profile reporting-live \
+      config --no-env-resolution --format json
+}
+
 # The dollar-prefixed names below are jq variables supplied with `--arg`; the
 # single quotes deliberately prevent the shell from expanding them.
 # shellcheck disable=SC2016
@@ -455,6 +472,89 @@ verify_reporting_service() {
      }'
 }
 
+verify_reporting_live() {
+  local rendered="$1" service expected_database_url live_policy credential_directory
+  service="$(jq -c '.services["report-collector"]' <<<"$rendered")"
+  expected_database_url='postgresql://report_collector:verify-only-report-collector-not-a-secret@position-db:5432/ozon_positions'
+  live_policy="$scratch/daily-report-policy.json"
+  credential_directory="$scratch/report-credentials"
+
+  check "live reporting: collector is guarded by the explicit profile and command" "$service" \
+    '.profiles == ["reporting-live"]
+     and .command == ["run-scheduler"]
+     and .image == "mcp-ozon-report-collector:local"'
+  check "live reporting: no ingress, env file, Compose secret, or config exists" "$service" \
+    '((.ports // []) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)'
+  # jq variables below are supplied with --arg and remain literal in this file.
+  # shellcheck disable=SC2016
+  check "live reporting: environment contains paths but no marketplace values" "$service" \
+    --arg database_url "$expected_database_url" \
+    '.environment == {
+       "REPORT_COLLECTOR_MODE": "scheduled",
+       "REPORT_COLLECTOR_DATABASE_URL": $database_url,
+       "REPORT_COLLECTOR_CREDENTIAL_DIR": "/run/mcp-ozon/report-credentials",
+       "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
+       "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
+       "RUST_LOG": "mcp_ozon::reporting=info"
+     }'
+  # shellcheck disable=SC2016
+  check "live reporting: metadata and credential directory are exactly read-only" "$service" \
+    --arg access "$main_access" \
+    --arg policy "$live_policy" \
+    --arg credentials "$credential_directory" \
+    '((.volumes // []) | map(del(.bind)) | sort_by(.target)) == [
+       {
+         "type": "bind", "source": $access,
+         "target": "/etc/mcp-ozon/access.json", "read_only": true
+       },
+       {
+         "type": "bind", "source": $policy,
+         "target": "/etc/mcp-ozon/daily-report-policy.json", "read_only": true
+       },
+       {
+         "type": "bind", "source": $credentials,
+         "target": "/run/mcp-ozon/report-credentials", "read_only": true
+       }
+     ]
+     and all((.volumes // [])[];
+       .bind == null or .bind == {} or .bind == {"create_host_path": false})'
+  check "live reporting: network, privilege, resource, restart and health bounds remain exact" "$service" \
+    '(.networks | keys | sort) == ["ozon-egress-internal", "position-internal"]
+     and .depends_on == {
+       "ozon-egress": {"condition": "service_healthy", "required": true},
+       "position-db": {"condition": "service_healthy", "required": true}
+     }
+     and .read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false
+     and .mem_limit == "134217728"
+     and .cpus == 0.25
+     and .pids_limit == 64
+     and .stop_grace_period == "10s"
+     and .restart == "unless-stopped"
+     and .logging == {
+       "driver": "json-file",
+       "options": {"max-file": "2", "max-size": "5m"}
+     }
+     and .healthcheck == {
+       "test": ["CMD", "/usr/local/bin/report-collector", "healthcheck"],
+       "timeout": "8s", "interval": "30s", "retries": 3,
+       "start_period": "10s"
+     }'
+  check "live reporting: internal and outbound network definitions remain exact" "$rendered" \
+    '(.networks | keys | sort) == ["outbound", "ozon-egress-internal", "position-internal"]
+     and .networks["position-internal"].name == "mcp-ozon-position-internal"
+     and .networks["position-internal"].internal == true
+     and .networks["ozon-egress-internal"].name == "mcp-ozon-egress-internal"
+     and .networks["ozon-egress-internal"].internal == true
+     and .networks.outbound.name == "mcp-ozon-outbound"
+     and .networks.outbound.external == true'
+}
+
 verify_ozon_egress() {
   local rendered="$1" service
   service="$(jq -c '.services["ozon-egress"]' <<<"$rendered")"
@@ -602,6 +702,7 @@ verify_control() {
 main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_position_compose)"
+reporting_live_rendered="$(render_reporting_live_compose)"
 control_rendered="$(render_control_compose)"
 
 # Rendering uses isolated, existing placeholder files so the result is the
@@ -651,6 +752,18 @@ check_contains \
   "$project_dir/compose.position.yaml" \
   "\${DAILY_REPORT_POLICY_HOST:-./config/daily-report-pilot.example.json}"
 check_contains \
+  "live reporting: access registry has no fallback path" \
+  "$project_dir/compose.reporting-live.yaml" \
+  "\${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for live reporting}"
+check_contains \
+  "live reporting: enabled policy has no fallback path" \
+  "$project_dir/compose.reporting-live.yaml" \
+  "\${DAILY_REPORT_POLICY_HOST:?DAILY_REPORT_POLICY_HOST is required for live reporting}"
+check_contains \
+  "live reporting: credential directory has no fallback path" \
+  "$project_dir/compose.reporting-live.yaml" \
+  "\${REPORT_COLLECTOR_CREDENTIAL_DIR_HOST:?REPORT_COLLECTOR_CREDENTIAL_DIR_HOST is required for live reporting}"
+check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
   "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"
@@ -696,6 +809,7 @@ verify_reporting_service \
   "verify-only-report-worker-not-a-secret" \
   "201326592" \
   "0.5"
+verify_reporting_live "$reporting_live_rendered"
 verify_control "$control_rendered"
 
 if (( failures > 0 )); then
@@ -703,4 +817,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, Control, position database, Ozon read-API egress proxy, and disabled collector/reporting runtimes: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."
+echo "Compose hardening verified for main, canary, Control, position database, Ozon read-API egress proxy, disabled collector/reporting runtimes, and the explicit live-reporting overlay: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."
