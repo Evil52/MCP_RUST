@@ -37,9 +37,11 @@ The first disabled-only phase provides:
 - an explicit operator-only `ozon-dry-run` command which loads only the
   policy-scoped Ozon Seller and Performance read credentials, reaches the two
   fixed API hosts through the deployment-owned CONNECT proxy, normalizes one
-  completed EKB business day and publishes all four sources atomically; and
-- Ozon sales normalization that requests revenue, ordered units, returns and
-  cancellations together, preserving the latter two as explicit unit facts;
+  completed EKB business day against the following day's immutable 08:00 EKB
+  morning cutoff and publishes all four sources atomically; and
+- Ozon sales normalization that requests the two supported metrics, revenue
+  and ordered units; unavailable cancellation/return metrics remain explicit
+  `N/D` values rather than fabricated zeroes;
   Analytics pagination is paced at one request per minute per Client-Id and is
   capped at ten pages (9,999 complete rows) inside the 12-minute dry-run deadline; and
 - warehouse-specific Ozon FBO and FBS stock collection that retains each real
@@ -49,7 +51,9 @@ The first disabled-only phase provides:
   policy-scoped Personal WB token, collects the documented daily sales-funnel,
   current warehouse-stock, current price and eligible-campaign statistics
   endpoints through the exact-host CONNECT proxy, and publishes all four
-  normalized sources atomically; and
+  normalized sources atomically; the tightly limited campaign statistics are
+  attempted first, so a busy advertising quota stops before the other three
+  APIs are called; and
 - Ozon Performance product statistics normalized by the real
   `campaignId + sku + date`, so advertising facts no longer use an
   unavailable-SKU sentinel or fabricated product attribution; and
@@ -174,8 +178,13 @@ mode resolves only that account's Seller and Performance bindings; WB mode
 resolves only that account's Personal token. Secret values must be injected by
 the runtime under the environment-variable names from the access registry,
 never placed in a command line or committed file. Each invocation is bounded
-to ten minutes and publishes the exact four-source snapshot set in one database
-transaction. A timeout or malformed/incomplete source publishes nothing. The
+to twelve minutes and publishes the exact four-source snapshot set in one
+database transaction. The date argument is the completed business day; its
+snapshot identity is the following day's fixed 08:00 EKB morning cutoff, so a
+successful canary can be consumed by the same report-worker manifest contract.
+To preserve the database freshness boundary, the command must start between
+08:00 and 08:30 EKB; an early or late invocation fails before marketplace I/O.
+A timeout, rate limit or malformed/incomplete source publishes nothing. The
 shipped Compose mode remains `disabled`, so neither command runs on a schedule.
 
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an

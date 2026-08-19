@@ -216,13 +216,30 @@ pub fn reporting_interval(
     Ok((start.with_timezone(&Utc), end.with_timezone(&Utc)))
 }
 
+/// Returns the immutable source cutoff expected by snapshot publication.
+///
+/// The morning report is generated at 08:00 EKB for the complete preceding
+/// day. Its data interval ends at local midnight, so the source cutoff is
+/// eight hours later. The evening interval already ends at its 17:00 EKB
+/// cutoff. Collectors and report workers must use this shared calculation;
+/// otherwise a valid snapshot can never join the report manifest.
+pub fn report_cutoff(key: &ReportKey) -> Result<DateTime<Utc>, ReportScheduleError> {
+    let (_, interval_end) = reporting_interval(key)?;
+    match key.kind {
+        ReportKind::Morning => interval_end
+            .checked_add_signed(Duration::hours(MORNING_HOUR.into()))
+            .ok_or(ReportScheduleError::OutOfRange),
+        ReportKind::Evening => Ok(interval_end),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{NaiveDate, TimeZone, Utc};
 
     use super::{
         ReportKey, ReportKind, ReportScheduleError, delivery_deadline, due_deliveries,
-        reporting_interval,
+        report_cutoff, reporting_interval,
     };
 
     fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> chrono::DateTime<Utc> {
@@ -271,6 +288,18 @@ mod tests {
         )
         .unwrap();
         assert!(late[0].delayed);
+    }
+
+    #[test]
+    fn source_cutoffs_match_the_two_fixed_report_times() {
+        assert_eq!(
+            report_cutoff(&key(ReportKind::Morning)).unwrap(),
+            utc(2026, 8, 16, 3, 0)
+        );
+        assert_eq!(
+            report_cutoff(&key(ReportKind::Evening)).unwrap(),
+            utc(2026, 8, 16, 12, 0)
+        );
     }
 
     #[test]

@@ -7,14 +7,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind,
     artifact_store::persist_and_mark_ready,
     postgres_outbox::{GenerationErrorClass, GenerationStatus, PostgresOutboxRepository},
     postgres_snapshot::PostgresSnapshotRepository,
     preview::render_published_preview,
-    reporting_interval,
+    report_cutoff,
     service::{ReportPreviewScope, ReportWorkerConfig, ReportWorkerMode},
 };
 use tokio::{
@@ -296,16 +296,6 @@ fn usage() -> Result<()> {
     bail!(
         "usage: report-worker [healthcheck | generate <batch-id> | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
     )
-}
-
-fn report_cutoff(key: &ReportKey) -> Result<DateTime<Utc>> {
-    let (_, interval_end) = reporting_interval(key)?;
-    match key.kind {
-        ReportKind::Morning => interval_end
-            .checked_add_signed(Duration::hours(8))
-            .context("morning report cutoff is outside the supported range"),
-        ReportKind::Evening => Ok(interval_end),
-    }
 }
 
 fn parse_kind(value: &str) -> Result<ReportKind> {

@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use mcp_ozon::reporting::{
+    ReportKey, ReportKind,
     collector_service::{ReportCollectorConfig, ReportCollectorMode},
     ozon_performance_source::{OzonPerformanceReportSource, PerformanceClientReportTransport},
     ozon_source::{OzonClientReportTransport, collect_complete_snapshots},
     postgres_collector::PostgresSnapshotWriter,
+    report_cutoff, reporting_interval,
     wb_source::{WbClientReportTransport, WbReportSource},
 };
 use tokio::signal;
@@ -121,11 +123,10 @@ async fn run_wb_dry_run(
         !config.policy().enabled,
         "wb-dry-run refuses an enabled daily report policy"
     );
-    let (period_start, period_end) = complete_yekaterinburg_day(date, Utc::now())?;
+    let (period_start, period_end, cutoff_at) = morning_report_window(date, Utc::now())?;
     let account = config.wb_dry_run_account(account_id)?;
     let client = config.wb_dry_run_client()?;
     let source = WbReportSource::new(WbClientReportTransport::new(client, account));
-    let cutoff_at = Utc::now();
     let snapshot_ids = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
         let facts = source
             .collect(date)
@@ -177,7 +178,7 @@ async fn run_ozon_dry_run(
         !config.policy().enabled,
         "ozon-dry-run refuses an enabled daily report policy"
     );
-    let (period_start, period_end) = complete_yekaterinburg_day(date, Utc::now())?;
+    let (period_start, period_end, cutoff_at) = morning_report_window(date, Utc::now())?;
     let store = config.ozon_dry_run_store(account_id)?;
     let client = config.ozon_dry_run_client()?;
     let performance = config.ozon_dry_run_performance_client()?;
@@ -186,7 +187,6 @@ async fn run_ozon_dry_run(
     let performance_source = OzonPerformanceReportSource::new(
         PerformanceClientReportTransport::new(performance, performance_store),
     );
-    let cutoff_at = Utc::now();
     let snapshot_ids = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
         let advertising = performance_source
             .collect(date)
@@ -228,32 +228,28 @@ async fn run_ozon_dry_run(
     Ok(())
 }
 
-fn complete_yekaterinburg_day(
+fn morning_report_window(
     date: NaiveDate,
     now: DateTime<Utc>,
-) -> Result<(DateTime<Utc>, DateTime<Utc>)> {
-    let offset = FixedOffset::east_opt(5 * 60 * 60).expect("valid UTC+05:00 offset");
-    let start = offset
-        .from_local_datetime(
-            &date
-                .and_hms_opt(0, 0, 0)
-                .context("dry-run date is out of range")?,
-        )
-        .single()
-        .context("dry-run start is out of range")?
-        .with_timezone(&Utc);
-    let end_date = date.succ_opt().context("dry-run end is out of range")?;
-    let end = offset
-        .from_local_datetime(
-            &end_date
-                .and_hms_opt(0, 0, 0)
-                .context("dry-run end is out of range")?,
-        )
-        .single()
-        .context("dry-run end is out of range")?
-        .with_timezone(&Utc);
-    ensure!(end <= now, "dry-run requires a completed Yekaterinburg day");
-    Ok((start, end))
+) -> Result<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> {
+    let report_date = date.succ_opt().context("dry-run date is out of range")?;
+    let key = ReportKey {
+        local_date: report_date,
+        kind: ReportKind::Morning,
+        recipient_id: "collector".to_owned(),
+        report_version: 1,
+    };
+    let (start, end) = reporting_interval(&key)?;
+    let cutoff = report_cutoff(&key)?;
+    ensure!(
+        cutoff <= now,
+        "dry-run requires the 08:00 EKB morning cutoff to have passed"
+    );
+    ensure!(
+        now <= cutoff + chrono::Duration::minutes(30),
+        "dry-run must start no later than 08:30 EKB for the requested business day"
+    );
+    Ok((start, end, cutoff))
 }
 
 async fn shutdown_signal() {

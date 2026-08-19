@@ -1,16 +1,16 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 
 use super::{
-    ReportKey, ReportKind,
+    ReportKey,
     bundle::{
         BundleError, DryRunReceipt, ReportBundle, ReportBundleRequest, inspect_dry_run,
         render_bundle,
     },
     dataset::{DatasetError, ReportDataset},
     postgres_snapshot::PublishedReportFacts,
-    reporting_interval,
+    report_cutoff, reporting_interval,
     rules::{PriorityProblem, RuleError, RuleInput, priority_problems},
     snapshot::{FrozenSnapshotManifest, SnapshotSource},
 };
@@ -75,13 +75,7 @@ fn validate_manifest_period(
     manifest: &FrozenSnapshotManifest,
 ) -> Result<(), PreviewError> {
     let expected = reporting_interval(key).map_err(|_| PreviewError::InvalidManifest)?;
-    let expected_cutoff = match key.kind {
-        ReportKind::Morning => expected
-            .1
-            .checked_add_signed(Duration::hours(8))
-            .ok_or(PreviewError::InvalidManifest)?,
-        ReportKind::Evening => expected.1,
-    };
+    let expected_cutoff = report_cutoff(key).map_err(|_| PreviewError::InvalidManifest)?;
     if manifest.cutoff_at() != expected_cutoff
         || generated_at < manifest.cutoff_at()
         || manifest.snapshots().iter().any(|snapshot| {
@@ -191,10 +185,11 @@ fn map_bundle(error: BundleError) -> PreviewError {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{NaiveDate, TimeZone};
+    use chrono::{Duration, NaiveDate, TimeZone};
 
     use super::*;
     use crate::reporting::{
+        ReportKind,
         postgres_snapshot::{
             PublishedAdvertisingFact, PublishedPriceFact, PublishedSalesFact, PublishedStockFact,
         },
@@ -217,10 +212,7 @@ mod tests {
     fn manifest(kind: ReportKind, status: SnapshotStatus) -> FrozenSnapshotManifest {
         let key = key(kind);
         let period = reporting_interval(&key).unwrap();
-        let cutoff = match kind {
-            ReportKind::Morning => period.1 + Duration::hours(8),
-            ReportKind::Evening => period.1,
-        };
+        let cutoff = report_cutoff(&key).unwrap();
         let sources = [
             (SnapshotSource::Sales, 1),
             (SnapshotSource::Advertising, 1),
