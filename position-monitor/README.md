@@ -63,8 +63,13 @@ targets, claim each remaining account before resolving only that account's read
 credentials, and publish the four mandatory sources atomically. Missed timer
 ticks are skipped; bounded sustained failures exit for supervisor restart, and
 shutdown attempts to release the active claim. The shipped Compose mode and
-policy are still disabled and carry no marketplace credential values, so
-neither path is active in the default deployment.
+policy are still disabled and mount no credential directory, so neither path is
+active in the default deployment. Opt-in scheduled mode accepts only an
+operator-owned read-only directory named by `REPORT_COLLECTOR_CREDENTIAL_DIR`.
+Each access-registry credential name maps to one bounded regular file directly
+inside it; symlinks and unexpected names fail closed. Values are read only after
+the exact account/cutoff claim succeeds and are never placed in Compose
+environment variables, command arguments, images or logs.
 There is still no `Поисковая видимость за сутки` Dashboard, task registry or
 email job. A manual deterministic
 HTML/XLSX preview and a policy-scoped `report-worker generate <batch-id>` path

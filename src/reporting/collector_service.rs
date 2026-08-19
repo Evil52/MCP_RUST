@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, fs, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
@@ -24,7 +31,9 @@ const DATABASE_URL_ENV: &str = "REPORT_COLLECTOR_DATABASE_URL";
 const POLICY_PATH_ENV: &str = "DAILY_REPORT_POLICY";
 const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
 const MODE_ENV: &str = "REPORT_COLLECTOR_MODE";
+const CREDENTIAL_DIRECTORY_ENV: &str = "REPORT_COLLECTOR_CREDENTIAL_DIR";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
+const MAX_CREDENTIAL_FILE_BYTES: u64 = 16_386;
 // A completed daily snapshot needs bounded read-only Seller and Performance
 // requests. Ozon can legitimately take longer than an interactive MCP request,
 // so both canary and opt-in scheduled collection allow one minute per request.
@@ -47,19 +56,70 @@ pub enum ReportCollectorMode {
     Scheduled,
 }
 
+struct CredentialDirectory {
+    root: PathBuf,
+}
+
+impl CredentialDirectory {
+    fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        let metadata = fs::symlink_metadata(root)
+            .context("report collector credential directory is unavailable")?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "report collector credential directory is invalid"
+        );
+        let root = root
+            .canonicalize()
+            .context("report collector credential directory is invalid")?;
+        Ok(Self { root })
+    }
+
+    fn read(&self, name: &str) -> Option<String> {
+        if !is_valid_credential_name(name) {
+            return None;
+        }
+        let path = self.root.join(name);
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_CREDENTIAL_FILE_BYTES
+        {
+            return None;
+        }
+        let canonical = path.canonicalize().ok()?;
+        (canonical.parent() == Some(self.root.as_path())).then_some(())?;
+        let bytes = fs::read(canonical).ok()?;
+        (bytes.len() as u64 <= MAX_CREDENTIAL_FILE_BYTES).then_some(())?;
+        let value = String::from_utf8(bytes).ok()?;
+        let value = value.trim_end_matches(['\r', '\n']);
+        (!value.is_empty()).then(|| value.to_owned())
+    }
+}
+
+fn is_valid_credential_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.as_bytes()[0].is_ascii_digit()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 /// Configuration for the disabled runtime, explicit marketplace canaries and
 /// the opt-in one-shot scheduled collector.
 ///
-/// Startup loads only registry metadata. A collection resolves the exact
-/// claimed account's credentials through an explicit method after its database
-/// lease is acquired; credentials for other accounts and marketplaces are not
-/// read.
+/// Startup loads only registry metadata and validates the optional credential
+/// directory itself. A scheduled collection reads individual credential files
+/// only after the exact account's database lease is acquired; credentials for
+/// other accounts and marketplaces are not read.
 pub struct ReportCollectorConfig {
     database: Config,
     mode: ReportCollectorMode,
     policy: DailyReportPolicy,
     registry: Arc<AccessRegistry>,
     collection_plan: Vec<CollectionTarget>,
+    credential_directory: Option<CredentialDirectory>,
 }
 
 impl ReportCollectorConfig {
@@ -91,12 +151,26 @@ impl ReportCollectorConfig {
             .context("DAILY_REPORT_POLICY is invalid")?;
         let collection_plan = build_collection_plan(&policy, &registry)
             .context("daily report collection plan is invalid")?;
+        let credential_directory = lookup(CREDENTIAL_DIRECTORY_ENV)
+            .map(CredentialDirectory::open)
+            .transpose()?;
+        ensure!(
+            matches!(
+                (mode, policy.enabled, credential_directory.is_some()),
+                (ReportCollectorMode::Disabled, false, false)
+                    | (ReportCollectorMode::OzonDryRun, false, false)
+                    | (ReportCollectorMode::WbDryRun, false, false)
+                    | (ReportCollectorMode::Scheduled, true, true)
+            ),
+            "report collector mode, policy and credential directory are inconsistent"
+        );
         Ok(Self {
             database,
             mode,
             policy,
             registry,
             collection_plan,
+            credential_directory,
         })
     }
 
@@ -135,18 +209,22 @@ impl ReportCollectorConfig {
         self.resolve_ozon_claim(claim, lookup)
     }
 
-    /// Resolves the exact Ozon account for an enabled one-shot scheduled run.
-    /// The database lease must already belong to the caller.
+    /// Resolves the exact Ozon account for an enabled scheduled run. The
+    /// database lease must already belong to the caller; values come from the
+    /// validated read-only credential directory rather than process variables.
     pub fn resolve_ozon_scheduled(
         &self,
         claim: &CollectionClaim,
-        lookup: &mut dyn FnMut(&str) -> Option<String>,
     ) -> Result<(OzonClient, PerformanceClient, StoreId)> {
         ensure!(
             self.mode == ReportCollectorMode::Scheduled && self.policy.enabled,
             "scheduled Ozon credentials require scheduled mode and an enabled policy"
         );
-        self.resolve_ozon_claim(claim, lookup)
+        let directory = self
+            .credential_directory
+            .as_ref()
+            .context("scheduled credential directory is unavailable")?;
+        self.resolve_ozon_claim(claim, &mut |name| directory.read(name))
     }
 
     fn resolve_ozon_claim(
@@ -239,18 +317,19 @@ impl ReportCollectorConfig {
         self.resolve_wb_claim(claim, lookup)
     }
 
-    /// Resolves the exact WB account for an enabled one-shot scheduled run.
-    /// The database lease must already belong to the caller.
-    pub fn resolve_wb_scheduled(
-        &self,
-        claim: &CollectionClaim,
-        lookup: &mut dyn FnMut(&str) -> Option<String>,
-    ) -> Result<(WbClient, String)> {
+    /// Resolves the exact WB account for an enabled scheduled run. The database
+    /// lease must already belong to the caller; the token comes from the
+    /// validated read-only credential directory rather than process variables.
+    pub fn resolve_wb_scheduled(&self, claim: &CollectionClaim) -> Result<(WbClient, String)> {
         ensure!(
             self.mode == ReportCollectorMode::Scheduled && self.policy.enabled,
             "scheduled WB credentials require scheduled mode and an enabled policy"
         );
-        self.resolve_wb_claim(claim, lookup)
+        let directory = self
+            .credential_directory
+            .as_ref()
+            .context("scheduled credential directory is unavailable")?;
+        self.resolve_wb_claim(claim, &mut |name| directory.read(name))
     }
 
     fn resolve_wb_claim(
@@ -346,10 +425,21 @@ mod tests {
 
     fn file(label: &str, body: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "mcp-ozon-report-collector-{label}-{}",
+            "mcp-ozon-report-collector-{label}-{}-{}",
+            std::process::id(),
             NEXT_FILE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn directory(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "mcp-ozon-report-collector-{label}-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
         path
     }
 
@@ -612,6 +702,19 @@ mod tests {
         let mut values = entries();
         values[2] = (POLICY_PATH_ENV, enabled_policy.display().to_string());
         values.push((MODE_ENV, "scheduled".to_owned()));
+        let credential_directory = directory("scheduled-credentials");
+        for (name, value) in [
+            ("ID", "client-id"),
+            ("KEY", "api-key"),
+            ("PERF_ID", "performance-client-id"),
+            ("PERF_SECRET", "performance-client-secret"),
+        ] {
+            fs::write(credential_directory.join(name), format!("{value}\n")).unwrap();
+        }
+        values.push((
+            CREDENTIAL_DIRECTORY_ENV,
+            credential_directory.display().to_string(),
+        ));
         let mut startup_keys = Vec::new();
         let scheduled = ReportCollectorConfig::from_lookup(&mut |key| {
             startup_keys.push(key.to_owned());
@@ -628,63 +731,84 @@ mod tests {
                 .all(|key| !startup_keys.iter().any(|requested| requested == key))
         );
 
-        let secrets = [
-            ("ID", "client-id".to_owned()),
-            ("KEY", "api-key".to_owned()),
-            ("PERF_ID", "performance-client-id".to_owned()),
-            ("PERF_SECRET", "performance-client-secret".to_owned()),
-            ("WB_TOKEN", personal_wb_token()),
-        ];
-        let mut ozon_keys = Vec::new();
         assert!(
             scheduled
-                .resolve_ozon_scheduled(
-                    &claim("ozon", super::super::snapshot::Marketplace::Ozon),
-                    &mut |key| {
-                        ozon_keys.push(key.to_owned());
-                        secrets
-                            .iter()
-                            .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
-                    },
-                )
+                .resolve_ozon_scheduled(&claim("ozon", super::super::snapshot::Marketplace::Ozon))
                 .is_ok()
         );
-        assert_eq!(ozon_keys, ["ID", "KEY", "PERF_ID", "PERF_SECRET"]);
 
-        let mut wb_keys = Vec::new();
+        fs::write(credential_directory.join("WB_TOKEN"), personal_wb_token()).unwrap();
         assert!(
             scheduled
-                .resolve_wb_scheduled(
-                    &claim("wb", super::super::snapshot::Marketplace::Wildberries),
-                    &mut |key| {
-                        wb_keys.push(key.to_owned());
-                        secrets
-                            .iter()
-                            .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
-                    },
-                )
+                .resolve_wb_scheduled(&claim(
+                    "wb",
+                    super::super::snapshot::Marketplace::Wildberries
+                ))
                 .is_ok()
         );
-        assert_eq!(wb_keys, ["WB_TOKEN"]);
         assert!(
             scheduled
-                .resolve_wb_scheduled(
-                    &claim("ozon", super::super::snapshot::Marketplace::Ozon),
-                    &mut unexpected_secret_lookup,
-                )
+                .resolve_wb_scheduled(&claim("ozon", super::super::snapshot::Marketplace::Ozon))
                 .is_err()
         );
 
         let mut disabled_policy_values = entries();
         disabled_policy_values.push((MODE_ENV, "scheduled".to_owned()));
-        let scheduled_with_disabled_policy = config(&disabled_policy_values).unwrap();
-        assert!(
-            scheduled_with_disabled_policy
-                .resolve_ozon_scheduled(
-                    &claim("ozon", super::super::snapshot::Marketplace::Ozon),
-                    &mut unexpected_secret_lookup,
-                )
-                .is_err()
-        );
+        assert!(config(&disabled_policy_values).is_err());
+
+        let mut missing_directory = values.clone();
+        missing_directory.retain(|(key, _)| *key != CREDENTIAL_DIRECTORY_ENV);
+        assert!(config(&missing_directory).is_err());
+
+        let mut unexpected_directory = entries();
+        unexpected_directory.push((
+            CREDENTIAL_DIRECTORY_ENV,
+            credential_directory.display().to_string(),
+        ));
+        assert!(config(&unexpected_directory).is_err());
+    }
+
+    #[test]
+    fn credential_directory_is_bounded_exact_and_never_follows_symlinks() {
+        let root = directory("credential-boundaries");
+        let directory = CredentialDirectory::open(&root).unwrap();
+        fs::write(root.join("TOKEN"), "secret\r\n").unwrap();
+        assert_eq!(directory.read("TOKEN").as_deref(), Some("secret"));
+        for invalid in [
+            "",
+            "1TOKEN",
+            "../TOKEN",
+            "lowercase",
+            "HAS-DASH",
+            &"A".repeat(129),
+        ] {
+            assert!(directory.read(invalid).is_none(), "{invalid}");
+        }
+        assert!(directory.read("MISSING").is_none());
+        fs::write(root.join("EMPTY"), "\r\n").unwrap();
+        assert!(directory.read("EMPTY").is_none());
+        fs::write(root.join("BINARY"), [0xff]).unwrap();
+        assert!(directory.read("BINARY").is_none());
+        fs::write(
+            root.join("OVERSIZED"),
+            vec![b'x'; MAX_CREDENTIAL_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(directory.read("OVERSIZED").is_none());
+        fs::create_dir(root.join("DIRECTORY")).unwrap();
+        assert!(directory.read("DIRECTORY").is_none());
+
+        let missing_root = root.with_extension("missing");
+        assert!(CredentialDirectory::open(missing_root).is_err());
+        assert!(CredentialDirectory::open(root.join("TOKEN")).is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("TOKEN"), root.join("LINK")).unwrap();
+            assert!(directory.read("LINK").is_none());
+            let root_link = root.with_extension("link");
+            std::os::unix::fs::symlink(&root, &root_link).unwrap();
+            assert!(CredentialDirectory::open(root_link).is_err());
+        }
     }
 }

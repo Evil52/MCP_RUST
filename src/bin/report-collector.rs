@@ -317,8 +317,7 @@ async fn collect_scheduled_target(
     let date = business_date(occurrence.period_start);
     match target.marketplace {
         Marketplace::Ozon => {
-            let (client, performance, store) =
-                config.resolve_ozon_scheduled(claim, &mut |key| std::env::var(key).ok())?;
+            let (client, performance, store) = config.resolve_ozon_scheduled(claim)?;
             let performance_store = store.clone();
             let transport = OzonClientReportTransport::new(client, store);
             let performance_source = OzonPerformanceReportSource::new(
@@ -346,8 +345,7 @@ async fn collect_scheduled_target(
                 .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
         }
         Marketplace::Wildberries => {
-            let (client, account) =
-                config.resolve_wb_scheduled(claim, &mut |key| std::env::var(key).ok())?;
+            let (client, account) = config.resolve_wb_scheduled(claim)?;
             let source = WbReportSource::new(WbClientReportTransport::new(client, account));
             let facts = source
                 .collect(date)

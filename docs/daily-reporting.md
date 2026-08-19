@@ -227,9 +227,18 @@ source snapshots and claim completion commit together, so an expired owner
 cannot publish after a replacement starts. Each target is bounded by twelve
 minutes and by the remaining completion window. Startup or idle operation never
 performs collection: `collect-due` or `run-scheduler` must be supplied
-explicitly. The shipped Compose mode and policy both remain disabled, and
-marketplace credential values are intentionally absent from that Compose
-contract.
+explicitly. Scheduled mode additionally requires
+`REPORT_COLLECTOR_CREDENTIAL_DIR` to name an existing operator-owned directory.
+Each access-registry credential name resolves to one regular file directly in
+that directory. Names are restricted to uppercase ASCII letters, digits and
+underscores, files are bounded, symbolic links are rejected and trailing line
+endings are ignored. The directory must be mounted read-only; its path may be
+present in process configuration, but marketplace values must never appear in
+Compose environment variables, command arguments, images or logs. Opening the
+runtime validates only the directory. A value is read after the corresponding
+database claim succeeds, so a busy/completed or unrelated account reads no
+secret. The shipped Compose mode and policy both remain disabled and do not
+mount this directory, so scheduled collection cannot be enabled accidentally.
 
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every
