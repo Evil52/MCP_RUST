@@ -131,14 +131,20 @@ the bounded HTML/XLSX artifact without reading environment variables. A
 bounded Gmail API transport also exists, but is not connected to the worker:
 its production constructor has one fixed Gmail send endpoint, one fixed
 dedicated mail-egress proxy, disabled redirects and ambient proxies, a bounded
-response, payload-free errors, and no automatic retry after an ambiguous
-outcome. A separate OAuth refresh transport also exists, but is not connected
-to the worker. It accepts exactly the private files `client_id`,
+  response and payload-free errors. A single-attempt delivery service now joins
+  the strict routing document, validated artifact, OAuth refresh and Gmail send
+  transports, but it is not connected to the outbox worker. It resolves and
+  validates the address and report scope before OAuth, refreshes once, sends
+  once and never retries internally. An explicit provider rate limit and an
+  OAuth failure before send may be scheduled later by a future bounded worker;
+  any timeout, transport failure, 5xx response, redirect, or malformed receipt
+  after the Gmail request starts remains an ambiguous `sending` outcome for
+  operator reconciliation. The OAuth transport accepts exactly the private files `client_id`,
 `client_secret` and `refresh_token`, requires a private credential directory,
 uses only Google's fixed token endpoint through the same dedicated mail-egress
 proxy, and accepts only a bounded Bearer token for the minimal
 `https://www.googleapis.com/auth/gmail.send` scope. The production credential
-mount, mail-egress deployment and outbox-to-provider worker remain future
+  mount, mail-egress deployment and outbox state-transition worker remain future
 release gates. A strict private routing-file loader now resolves the policy's
 symbolic sender and audience names to addresses. It requires one exact route
 per configured symbol, refuses extra/missing/duplicate routes and never lets a

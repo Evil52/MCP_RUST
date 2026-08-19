@@ -178,6 +178,15 @@ impl GmailAccessToken {
     pub fn expires_in_seconds(&self) -> u64 {
         self.expires_in_seconds
     }
+
+    #[cfg(test)]
+    pub(super) fn for_test(value: &str) -> Self {
+        assert!(access_token_is_valid(value));
+        Self {
+            value: value.to_owned(),
+            expires_in_seconds: MIN_ACCESS_TOKEN_SECONDS,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -214,7 +223,7 @@ impl GmailOAuthClient {
     }
 
     #[cfg(test)]
-    fn for_test(token_url: String) -> Self {
+    pub(super) fn for_test(token_url: String) -> Self {
         Self::build(&token_url, None).expect("local test OAuth transport is valid")
     }
 

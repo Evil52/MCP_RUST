@@ -91,7 +91,7 @@ impl GmailClient {
     }
 
     #[cfg(test)]
-    fn for_test(send_url: String) -> Self {
+    pub(super) fn for_test(send_url: String) -> Self {
         Self::build(&send_url, None).expect("local test Gmail transport is valid")
     }
 

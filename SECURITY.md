@@ -233,6 +233,11 @@ has broader vendor permissions.
   match the enabled policy exactly; missing, extra, duplicate, malformed, or prompt-supplied routes
   fail closed. Do not combine email addresses with OAuth credentials or marketplace secrets, and do
   not expose the routing file through Compose environment, report artifacts, logs, or screenshots.
+- Validate routing, report scope and the immutable artifact before OAuth. Perform at most one token
+  refresh and one Gmail send per claimed attempt. Only failures that occur before send, plus an
+  explicit Gmail rate limit, may be scheduled for a later bounded attempt. A timeout, transport
+  failure, 5xx response, redirect or malformed receipt after send begins has an ambiguous outcome:
+  keep the outbox row `sending`, never resend it automatically, and require operator reconciliation.
 - Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
   through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
   `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,
