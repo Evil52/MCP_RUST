@@ -8,7 +8,8 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use thiserror::Error;
 
 use super::{
-    ReportKey, ReportKind, ReportScheduleError, business_date, report_cutoff, reporting_interval,
+    ReportKey, ReportKind, ReportScheduleError, business_date, collector_plan::CollectionTarget,
+    report_cutoff, reporting_interval,
 };
 
 /// A source observation may finish at most this long after its logical
@@ -25,6 +26,13 @@ pub struct DueCollection {
     pub period_end: DateTime<Utc>,
     pub complete_by: DateTime<Utc>,
     pub delayed: bool,
+}
+
+/// Missing account targets for one open immutable occurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledCollection {
+    pub occurrence: DueCollection,
+    pub targets: Vec<CollectionTarget>,
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +73,31 @@ pub fn due_collection(
     Ok(None)
 }
 
+/// Plans only account/cutoff pairs that have not already been published.
+///
+/// The callback is the future repository boundary. It must return `true` only
+/// when all four mandatory sources for the exact account, marketplace and
+/// cutoff are terminal and published. No collection is planned outside the
+/// bounded completion window.
+pub fn due_for_plan(
+    now: DateTime<Utc>,
+    targets: &[CollectionTarget],
+    published: &mut dyn FnMut(&CollectionTarget, DateTime<Utc>) -> bool,
+) -> Result<Option<ScheduledCollection>, CollectionScheduleError> {
+    let Some(occurrence) = due_collection(now)? else {
+        return Ok(None);
+    };
+    let targets = targets
+        .iter()
+        .filter(|target| !published(target, occurrence.cutoff_at))
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok((!targets.is_empty()).then_some(ScheduledCollection {
+        occurrence,
+        targets,
+    }))
+}
+
 fn internal_key(local_date: NaiveDate, kind: ReportKind) -> ReportKey {
     ReportKey {
         local_date,
@@ -78,12 +111,29 @@ fn internal_key(local_date: NaiveDate, kind: ReportKind) -> ReportKey {
 mod tests {
     use chrono::{TimeZone, Utc};
 
-    use super::{COLLECTION_COMPLETION_WINDOW, due_collection};
-    use crate::reporting::ReportKind;
+    use super::{COLLECTION_COMPLETION_WINDOW, due_collection, due_for_plan};
+    use crate::reporting::{
+        ReportKind,
+        collector_plan::CollectionTarget,
+        snapshot::{Marketplace, SnapshotSource},
+    };
 
     fn utc(day: u32, hour: u32, minute: u32, second: u32) -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, day, hour, minute, second)
             .unwrap()
+    }
+
+    fn target(account_id: &str, marketplace: Marketplace) -> CollectionTarget {
+        CollectionTarget {
+            account_id: account_id.to_owned(),
+            marketplace,
+            sources: [
+                SnapshotSource::Sales,
+                SnapshotSource::Advertising,
+                SnapshotSource::Stocks,
+                SnapshotSource::Prices,
+            ],
+        }
     }
 
     #[test]
@@ -121,5 +171,41 @@ mod tests {
         assert_eq!(due.complete_by, utc(16, 12, 30, 0));
         assert!(due.delayed);
         assert!(due_collection(utc(16, 12, 30, 1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn planner_retries_only_missing_accounts_for_the_exact_cutoff() {
+        let targets = [
+            target("diana", Marketplace::Ozon),
+            target("vahrusheva", Marketplace::Wildberries),
+        ];
+        let expected_cutoff = utc(16, 3, 0, 0);
+        let mut inspected = Vec::new();
+        let plan = due_for_plan(utc(16, 3, 12, 0), &targets, &mut |target, cutoff| {
+            inspected.push((target.account_id.clone(), cutoff));
+            target.account_id == "diana"
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            inspected,
+            vec![
+                ("diana".to_owned(), expected_cutoff),
+                ("vahrusheva".to_owned(), expected_cutoff),
+            ]
+        );
+        assert_eq!(plan.targets, vec![targets[1].clone()]);
+        assert!(plan.occurrence.delayed);
+
+        assert!(
+            due_for_plan(utc(16, 3, 13, 0), &targets, &mut |_, _| true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            due_for_plan(utc(16, 4, 0, 0), &targets, &mut |_, _| false)
+                .unwrap()
+                .is_none()
+        );
     }
 }
