@@ -222,6 +222,13 @@ has broader vendor permissions.
   `report-collector bootstrap-credentials` command. Confirm the directory is mode `700`, each file
   is mode `600`, file names exactly match the enabled policy's marketplace bindings, and neither the
   source `.env` nor credential values appear in Compose environment, command output or artifacts.
+- Provision Gmail OAuth separately from marketplace credentials. The private directory must contain
+  exactly `client_id`, `client_secret`, and `refresh_token`, be mode `700`, and contain only regular
+  mode-`600` files. Initial consent must request only
+  `https://www.googleapis.com/auth/gmail.send`; do not use a Gmail password, a broader mail scope, a
+  testing refresh token with an unsuitable lifetime, a symlink, or an address/token in Git, Compose
+  environment, logs, screenshots, or report artifacts. OAuth refresh and Gmail delivery must use
+  their fixed Google endpoints through the dedicated allowlisted mail-egress proxy.
 - Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
   through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
   `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,

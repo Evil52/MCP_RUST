@@ -19,6 +19,7 @@ pub mod collector_service;
 pub mod credential_bootstrap;
 pub mod dataset;
 pub mod gmail;
+pub mod gmail_oauth;
 pub mod html;
 pub mod kpi;
 pub mod mail;

@@ -124,18 +124,21 @@ impl GmailClient {
 }
 
 fn bearer_authorization(access_token: &str) -> Result<HeaderValue, GmailSendError> {
-    if access_token.is_empty()
-        || access_token.len() > MAX_ACCESS_TOKEN_BYTES
-        || access_token
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
+    if !access_token_is_valid(access_token) {
         return Err(GmailSendError::InvalidCredential);
     }
     let mut value = HeaderValue::from_str(&format!("Bearer {access_token}"))
         .map_err(|_| GmailSendError::InvalidCredential)?;
     value.set_sensitive(true);
     Ok(value)
+}
+
+pub(super) fn access_token_is_valid(access_token: &str) -> bool {
+    !access_token.is_empty()
+        && access_token.len() <= MAX_ACCESS_TOKEN_BYTES
+        && !access_token
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
 }
 
 async fn parse_success_response(

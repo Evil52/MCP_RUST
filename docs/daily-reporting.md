@@ -132,8 +132,15 @@ bounded Gmail API transport also exists, but is not connected to the worker:
 its production constructor has one fixed Gmail send endpoint, one fixed
 dedicated mail-egress proxy, disabled redirects and ambient proxies, a bounded
 response, payload-free errors, and no automatic retry after an ambiguous
-outcome. OAuth refresh, credential mounts, mail-egress deployment and the
-outbox-to-provider worker remain future release gates. An opt-in
+outcome. A separate OAuth refresh transport also exists, but is not connected
+to the worker. It accepts exactly the private files `client_id`,
+`client_secret` and `refresh_token`, requires a private credential directory,
+uses only Google's fixed token endpoint through the same dedicated mail-egress
+proxy, and accepts only a bounded Bearer token for the minimal
+`https://www.googleapis.com/auth/gmail.send` scope. The production credential
+mount, mail-egress deployment and outbox-to-provider worker remain future
+release gates. No Gmail password or address belongs in this directory, the
+repository, Compose environment or logs. An opt-in
 `REPORT_WORKER_MODE=dry_run` runtime ticks
 once per minute, plans due 08:00/17:00 EKB occurrences and retries only
 single-section `planned`/`generating` artifact work inside its delivery window.
