@@ -3,8 +3,10 @@
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, NaiveDate, Utc};
 use mcp_ozon::reporting::{
-    ReportKey, ReportKind,
+    ReportKey, ReportKind, business_date,
+    collector_orchestrator::plan_due_collection,
     collector_plan::CollectionTarget,
+    collector_schedule::DueCollection,
     collector_service::{ReportCollectorConfig, ReportCollectorMode},
     ozon_performance_source::{OzonPerformanceReportSource, PerformanceClientReportTransport},
     ozon_source::{OzonClientReportTransport, collect_complete_snapshots},
@@ -21,7 +23,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// This bounds the entire manual account run, including pagination and the
 /// transactional snapshot publication, so a slow upstream cannot hold an
 /// operator invocation forever.
-const REPORT_DRY_RUN_TOTAL_DEADLINE: Duration = Duration::from_secs(12 * 60);
+const REPORT_TARGET_TOTAL_DEADLINE: Duration = Duration::from_secs(12 * 60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,6 +55,10 @@ async fn main() -> Result<()> {
             run_wb_dry_run(&config, &writer, &account_id, date).await?;
             return Ok(());
         }
+        Command::CollectDue => {
+            run_due_collection(&config, &writer, Utc::now()).await?;
+            return Ok(());
+        }
         Command::ServeDisabled => {}
     }
     if config.mode() != ReportCollectorMode::Disabled || config.policy().enabled {
@@ -72,12 +78,14 @@ enum Command {
     Healthcheck,
     OzonDryRun { account_id: String, date: NaiveDate },
     WbDryRun { account_id: String, date: NaiveDate },
+    CollectDue,
 }
 
 fn parse_command(arguments: &[String]) -> Result<Command> {
     match arguments {
         [] => Ok(Command::ServeDisabled),
         [argument] if argument == "healthcheck" => Ok(Command::Healthcheck),
+        [argument] if argument == "collect-due" => Ok(Command::CollectDue),
         [command, account_id, date]
             if matches!(command.as_str(), "ozon-dry-run" | "wb-dry-run") =>
         {
@@ -105,8 +113,162 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         }
         _ => {
             bail!(
-                "usage: report-collector [healthcheck | ozon-dry-run <account-id> <YYYY-MM-DD> | wb-dry-run <account-id> <YYYY-MM-DD>]"
+                "usage: report-collector [healthcheck | collect-due | ozon-dry-run <account-id> <YYYY-MM-DD> | wb-dry-run <account-id> <YYYY-MM-DD>]"
             )
+        }
+    }
+}
+
+async fn run_due_collection(
+    config: &ReportCollectorConfig,
+    writer: &PostgresSnapshotWriter,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    ensure!(
+        config.mode() == ReportCollectorMode::Scheduled,
+        "collect-due requires REPORT_COLLECTOR_MODE=scheduled"
+    );
+    ensure!(
+        config.policy().enabled,
+        "collect-due requires an enabled daily report policy"
+    );
+    let Some(plan) = plan_due_collection(writer, now, config.collection_plan()).await? else {
+        tracing::info!("no daily report collection occurrence is due");
+        return Ok(());
+    };
+    let owner_id = claim_owner("scheduled");
+    let mut completed = 0_usize;
+    let mut busy = 0_usize;
+    let mut failed = 0_usize;
+    let total = plan.targets.len();
+    for target in plan.targets {
+        let remaining = (plan.occurrence.complete_by - Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            let remaining_targets = total.saturating_sub(completed + busy + failed);
+            failed += remaining_targets;
+            tracing::warn!(
+                remaining_targets,
+                "daily report collection window closed before all targets were attempted"
+            );
+            break;
+        }
+        let Some(claim) = writer
+            .claim_target(&target, plan.occurrence.cutoff_at, &owner_id)
+            .await?
+        else {
+            busy += 1;
+            continue;
+        };
+        let deadline = remaining.min(REPORT_TARGET_TOTAL_DEADLINE);
+        let outcome = timeout(
+            deadline,
+            collect_scheduled_target(config, writer, &claim, &target, &plan.occurrence),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(snapshot_ids)) => {
+                completed += 1;
+                tracing::info!(
+                    account_id = target.account_id,
+                    marketplace = ?target.marketplace,
+                    snapshots = snapshot_ids.len(),
+                    cutoff_at = %plan.occurrence.cutoff_at,
+                    "scheduled report snapshots were atomically published"
+                );
+            }
+            Ok(Err(error)) => {
+                failed += 1;
+                let released = writer.release_claim(&claim).await.unwrap_or(false);
+                tracing::warn!(
+                    account_id = target.account_id,
+                    marketplace = ?target.marketplace,
+                    released,
+                    error = %error,
+                    "scheduled report target failed without publishing partial snapshots"
+                );
+            }
+            Err(_) => {
+                failed += 1;
+                let released = writer.release_claim(&claim).await.unwrap_or(false);
+                tracing::warn!(
+                    account_id = target.account_id,
+                    marketplace = ?target.marketplace,
+                    released,
+                    "scheduled report target exceeded its bounded collection deadline"
+                );
+            }
+        }
+    }
+    tracing::info!(total, completed, busy, failed, "collect-due finished");
+    ensure!(
+        failed == 0,
+        "scheduled collection finished with {failed} failed target(s)"
+    );
+    Ok(())
+}
+
+async fn collect_scheduled_target(
+    config: &ReportCollectorConfig,
+    writer: &PostgresSnapshotWriter,
+    claim: &mcp_ozon::reporting::postgres_collector::CollectionClaim,
+    target: &CollectionTarget,
+    occurrence: &DueCollection,
+) -> Result<Vec<i64>> {
+    let date = business_date(occurrence.period_start);
+    match target.marketplace {
+        Marketplace::Ozon => {
+            let (client, performance, store) =
+                config.resolve_ozon_scheduled(claim, &mut |key| std::env::var(key).ok())?;
+            let performance_store = store.clone();
+            let transport = OzonClientReportTransport::new(client, store);
+            let performance_source = OzonPerformanceReportSource::new(
+                PerformanceClientReportTransport::new(performance, performance_store),
+            );
+            let advertising = performance_source
+                .collect(date)
+                .await
+                .map_err(|error| anyhow::anyhow!("performance_{}", error.code()))?;
+            let snapshots = collect_complete_snapshots(
+                &transport,
+                advertising,
+                target.account_id.clone(),
+                occurrence.cutoff_at,
+                Utc::now,
+                occurrence.period_start,
+                occurrence.period_end,
+                env!("CARGO_PKG_VERSION").to_owned(),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+            writer
+                .persist_claimed_batch(claim, &snapshots)
+                .await
+                .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
+        }
+        Marketplace::Wildberries => {
+            let (client, account) =
+                config.resolve_wb_scheduled(claim, &mut |key| std::env::var(key).ok())?;
+            let source = WbReportSource::new(WbClientReportTransport::new(client, account));
+            let facts = source
+                .collect(date)
+                .await
+                .map_err(|error| anyhow::anyhow!("wb_{}", error.code()))?;
+            let snapshots = facts
+                .into_snapshots(
+                    target.account_id.clone(),
+                    occurrence.cutoff_at,
+                    Utc::now(),
+                    occurrence.period_start,
+                    occurrence.period_end,
+                    env!("CARGO_PKG_VERSION").to_owned(),
+                )
+                .map_err(|_| anyhow::anyhow!("invalid_wb_snapshot_input"))?;
+            writer
+                .persist_claimed_batch(claim, &snapshots)
+                .await
+                .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
         }
     }
 }
@@ -132,7 +294,7 @@ async fn run_wb_dry_run(
         .claim_target(&target, cutoff_at, &owner_id)
         .await?
         .context("WB dry-run target is already claimed or complete")?;
-    let outcome = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
+    let outcome = timeout(REPORT_TARGET_TOTAL_DEADLINE, async {
         let (client, account) =
             config.resolve_wb_dry_run(&claim, &mut |key| std::env::var(key).ok())?;
         let source = WbReportSource::new(WbClientReportTransport::new(client, account));
@@ -187,7 +349,7 @@ async fn run_ozon_dry_run(
         .claim_target(&target, cutoff_at, &owner_id)
         .await?
         .context("Ozon dry-run target is already claimed or complete")?;
-    let outcome = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
+    let outcome = timeout(REPORT_TARGET_TOTAL_DEADLINE, async {
         let (client, performance, store) =
             config.resolve_ozon_dry_run(&claim, &mut |key| std::env::var(key).ok())?;
         let performance_store = store.clone();

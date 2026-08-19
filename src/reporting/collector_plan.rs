@@ -14,6 +14,8 @@ use super::{
     snapshot::{Marketplace, SnapshotSource},
 };
 
+const MAX_COLLECTION_TARGETS: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionTarget {
     pub account_id: String,
@@ -23,6 +25,8 @@ pub struct CollectionTarget {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CollectionPlanError {
+    #[error("daily report collection target count exceeds the supported limit")]
+    TooManyTargets,
     #[error("report policy references an unknown account")]
     UnknownAccount,
     #[error("report account has no read-only marketplace binding")]
@@ -43,6 +47,9 @@ pub fn build_collection_plan(
         for manager in &audience.managers {
             account_ids.extend(manager.account_ids.iter().cloned());
         }
+    }
+    if account_ids.len() > MAX_COLLECTION_TARGETS {
+        return Err(CollectionPlanError::TooManyTargets);
     }
     account_ids
         .into_iter()
@@ -167,6 +174,28 @@ mod tests {
         assert_eq!(
             build_collection_plan(&policy, &registry()),
             Err(CollectionPlanError::UnknownAccount)
+        );
+    }
+
+    #[test]
+    fn collection_plan_is_bounded_before_account_resolution() {
+        let policy = DailyReportPolicy {
+            version: 1,
+            enabled: true,
+            timezone: "Asia/Yekaterinburg".to_owned(),
+            sender_email_env: "SENDER".to_owned(),
+            audiences: vec![AudiencePolicy {
+                id: "owner".to_owned(),
+                email_env: "OWNER".to_owned(),
+                managers: vec![ManagerScope {
+                    actor_id: "diana".to_owned(),
+                    account_ids: (0..65).map(|index| format!("account_{index}")).collect(),
+                }],
+            }],
+        };
+        assert_eq!(
+            build_collection_plan(&policy, &registry()),
+            Err(CollectionPlanError::TooManyTargets)
         );
     }
 }

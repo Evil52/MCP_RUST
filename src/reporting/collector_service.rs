@@ -25,11 +25,11 @@ const POLICY_PATH_ENV: &str = "DAILY_REPORT_POLICY";
 const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
 const MODE_ENV: &str = "REPORT_COLLECTOR_MODE";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
-// A completed daily snapshot needs bounded read-only Seller and Performance requests.
-// Ozon can legitimately take longer than an interactive MCP request, so the
-// explicit manual dry-run allows one minute per request. Automatic collection
-// is still disabled and the source set is published atomically.
-const OZON_DRY_RUN_TIMEOUT: Duration = Duration::from_secs(60);
+// A completed daily snapshot needs bounded read-only Seller and Performance
+// requests. Ozon can legitimately take longer than an interactive MCP request,
+// so both canary and opt-in scheduled collection allow one minute per request.
+// Every complete source set is still published atomically.
+const REPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const OZON_SELLER_API_BASE_URL: &str = "https://api-seller.ozon.ru";
 const REPORT_EGRESS_PROXY: &str = "http://ozon-egress:3128";
 
@@ -42,13 +42,18 @@ pub enum ReportCollectorMode {
     /// Explicit operator-only mode for one atomic Wildberries report canary.
     /// It loads only policy-scoped WB read credentials and never schedules.
     WbDryRun,
+    /// Explicit one-shot scheduled collection mode. The caller must invoke
+    /// `collect-due`; startup alone never performs marketplace I/O.
+    Scheduled,
 }
 
-/// Configuration for the disabled runtime and explicit marketplace canaries.
+/// Configuration for the disabled runtime, explicit marketplace canaries and
+/// the opt-in one-shot scheduled collector.
 ///
-/// Startup loads only registry metadata. A canary resolves the exact claimed
-/// account's credentials through an explicit method after its database lease
-/// is acquired; credentials for other accounts and marketplaces are not read.
+/// Startup loads only registry metadata. A collection resolves the exact
+/// claimed account's credentials through an explicit method after its database
+/// lease is acquired; credentials for other accounts and marketplaces are not
+/// read.
 pub struct ReportCollectorConfig {
     database: Config,
     mode: ReportCollectorMode,
@@ -63,6 +68,7 @@ impl ReportCollectorConfig {
             "disabled" => ReportCollectorMode::Disabled,
             "ozon_dry_run" => ReportCollectorMode::OzonDryRun,
             "wb_dry_run" => ReportCollectorMode::WbDryRun,
+            "scheduled" => ReportCollectorMode::Scheduled,
             _ => bail!("report-collector mode is unsupported"),
         };
         let raw_database =
@@ -123,6 +129,32 @@ impl ReportCollectorConfig {
             "Ozon dry-run credentials are unavailable outside Ozon dry-run mode"
         );
         ensure!(
+            !self.policy.enabled,
+            "Ozon dry-run credentials require a disabled daily report policy"
+        );
+        self.resolve_ozon_claim(claim, lookup)
+    }
+
+    /// Resolves the exact Ozon account for an enabled one-shot scheduled run.
+    /// The database lease must already belong to the caller.
+    pub fn resolve_ozon_scheduled(
+        &self,
+        claim: &CollectionClaim,
+        lookup: &mut dyn FnMut(&str) -> Option<String>,
+    ) -> Result<(OzonClient, PerformanceClient, StoreId)> {
+        ensure!(
+            self.mode == ReportCollectorMode::Scheduled && self.policy.enabled,
+            "scheduled Ozon credentials require scheduled mode and an enabled policy"
+        );
+        self.resolve_ozon_claim(claim, lookup)
+    }
+
+    fn resolve_ozon_claim(
+        &self,
+        claim: &CollectionClaim,
+        lookup: &mut dyn FnMut(&str) -> Option<String>,
+    ) -> Result<(OzonClient, PerformanceClient, StoreId)> {
+        ensure!(
             claim.lease_until() > Utc::now(),
             "collection claim has expired"
         );
@@ -147,8 +179,8 @@ impl ReportCollectorConfig {
             .ozon
             .as_ref()
             .context("Ozon report binding is unavailable")?;
-        let client_id = required_secret(lookup, &binding.client_id_env, "Ozon dry-run")?;
-        let api_key = required_secret(lookup, &binding.api_key_env, "Ozon dry-run")?;
+        let client_id = required_secret(lookup, &binding.client_id_env, "Ozon report collection")?;
+        let api_key = required_secret(lookup, &binding.api_key_env, "Ozon report collection")?;
         let performance = binding
             .performance
             .as_ref()
@@ -156,12 +188,12 @@ impl ReportCollectorConfig {
         let performance_client_id = required_secret(
             lookup,
             &performance.client_id_env,
-            "Ozon Performance dry-run",
+            "Ozon Performance report collection",
         )?;
         let performance_client_secret = required_secret(
             lookup,
             &performance.client_secret_env,
-            "Ozon Performance dry-run",
+            "Ozon Performance report collection",
         )?;
         let store_id = binding.store_id.clone();
         let seller_stores =
@@ -175,17 +207,17 @@ impl ReportCollectorConfig {
         )]);
         let seller = OzonClient::new_with_https_proxy(
             OZON_SELLER_API_BASE_URL.to_owned(),
-            OZON_DRY_RUN_TIMEOUT,
+            REPORT_REQUEST_TIMEOUT,
             seller_stores,
             REPORT_EGRESS_PROXY,
         )
-        .context("fixed Ozon dry-run client configuration is invalid")?;
+        .context("fixed Ozon report client configuration is invalid")?;
         let performance = PerformanceClient::new_with_https_proxy(
-            OZON_DRY_RUN_TIMEOUT,
+            REPORT_REQUEST_TIMEOUT,
             performance_stores,
             REPORT_EGRESS_PROXY,
         )
-        .context("fixed Ozon Performance dry-run client configuration is invalid")?;
+        .context("fixed Ozon Performance report client configuration is invalid")?;
         Ok((seller, performance, store_id))
     }
 
@@ -200,6 +232,32 @@ impl ReportCollectorConfig {
             self.mode == ReportCollectorMode::WbDryRun,
             "WB dry-run credentials are unavailable outside WB dry-run mode"
         );
+        ensure!(
+            !self.policy.enabled,
+            "WB dry-run credentials require a disabled daily report policy"
+        );
+        self.resolve_wb_claim(claim, lookup)
+    }
+
+    /// Resolves the exact WB account for an enabled one-shot scheduled run.
+    /// The database lease must already belong to the caller.
+    pub fn resolve_wb_scheduled(
+        &self,
+        claim: &CollectionClaim,
+        lookup: &mut dyn FnMut(&str) -> Option<String>,
+    ) -> Result<(WbClient, String)> {
+        ensure!(
+            self.mode == ReportCollectorMode::Scheduled && self.policy.enabled,
+            "scheduled WB credentials require scheduled mode and an enabled policy"
+        );
+        self.resolve_wb_claim(claim, lookup)
+    }
+
+    fn resolve_wb_claim(
+        &self,
+        claim: &CollectionClaim,
+        lookup: &mut dyn FnMut(&str) -> Option<String>,
+    ) -> Result<(WbClient, String)> {
         ensure!(
             claim.lease_until() > Utc::now(),
             "collection claim has expired"
@@ -225,12 +283,12 @@ impl ReportCollectorConfig {
             .wildberries
             .as_ref()
             .context("WB report binding is unavailable")?;
-        let token = required_secret(lookup, &binding.api_token_env, "WB dry-run")?;
+        let token = required_secret(lookup, &binding.api_token_env, "WB report collection")?;
         validate_wb_token_type(&token, &binding.api_token_env)?;
         let accounts = BTreeMap::from([(account.id.clone(), WbCredentials { token })]);
         let client =
-            WbClient::new_with_https_proxy(OZON_DRY_RUN_TIMEOUT, accounts, REPORT_EGRESS_PROXY)
-                .context("fixed WB dry-run client configuration is invalid")?;
+            WbClient::new_with_https_proxy(REPORT_REQUEST_TIMEOUT, accounts, REPORT_EGRESS_PROXY)
+                .context("fixed WB report client configuration is invalid")?;
         Ok((client, account.id.clone()))
     }
 }
@@ -541,6 +599,91 @@ mod tests {
         assert!(
             disabled
                 .resolve_wb_dry_run(&wb_claim, &mut no_secrets)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scheduled_mode_requires_enabled_policy_and_resolves_only_claimed_account() {
+        let enabled_policy = file(
+            "scheduled-policy",
+            r#"{"version":1,"enabled":true,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]},{"actor_id":"wb","account_ids":["wb"]}]}]}"#,
+        );
+        let mut values = entries();
+        values[2] = (POLICY_PATH_ENV, enabled_policy.display().to_string());
+        values.push((MODE_ENV, "scheduled".to_owned()));
+        let mut startup_keys = Vec::new();
+        let scheduled = ReportCollectorConfig::from_lookup(&mut |key| {
+            startup_keys.push(key.to_owned());
+            values
+                .iter()
+                .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
+        })
+        .unwrap();
+        assert_eq!(scheduled.mode(), ReportCollectorMode::Scheduled);
+        assert!(scheduled.policy().enabled);
+        assert!(
+            ["ID", "KEY", "PERF_ID", "PERF_SECRET", "WB_TOKEN"]
+                .into_iter()
+                .all(|key| !startup_keys.iter().any(|requested| requested == key))
+        );
+
+        let secrets = [
+            ("ID", "client-id".to_owned()),
+            ("KEY", "api-key".to_owned()),
+            ("PERF_ID", "performance-client-id".to_owned()),
+            ("PERF_SECRET", "performance-client-secret".to_owned()),
+            ("WB_TOKEN", personal_wb_token()),
+        ];
+        let mut ozon_keys = Vec::new();
+        assert!(
+            scheduled
+                .resolve_ozon_scheduled(
+                    &claim("ozon", super::super::snapshot::Marketplace::Ozon),
+                    &mut |key| {
+                        ozon_keys.push(key.to_owned());
+                        secrets
+                            .iter()
+                            .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
+                    },
+                )
+                .is_ok()
+        );
+        assert_eq!(ozon_keys, ["ID", "KEY", "PERF_ID", "PERF_SECRET"]);
+
+        let mut wb_keys = Vec::new();
+        assert!(
+            scheduled
+                .resolve_wb_scheduled(
+                    &claim("wb", super::super::snapshot::Marketplace::Wildberries),
+                    &mut |key| {
+                        wb_keys.push(key.to_owned());
+                        secrets
+                            .iter()
+                            .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
+                    },
+                )
+                .is_ok()
+        );
+        assert_eq!(wb_keys, ["WB_TOKEN"]);
+        assert!(
+            scheduled
+                .resolve_wb_scheduled(
+                    &claim("ozon", super::super::snapshot::Marketplace::Ozon),
+                    &mut unexpected_secret_lookup,
+                )
+                .is_err()
+        );
+
+        let mut disabled_policy_values = entries();
+        disabled_policy_values.push((MODE_ENV, "scheduled".to_owned()));
+        let scheduled_with_disabled_policy = config(&disabled_policy_values).unwrap();
+        assert!(
+            scheduled_with_disabled_policy
+                .resolve_ozon_scheduled(
+                    &claim("ozon", super::super::snapshot::Marketplace::Ozon),
+                    &mut unexpected_secret_lookup,
+                )
                 .is_err()
         );
     }

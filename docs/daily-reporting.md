@@ -195,19 +195,35 @@ collection that completes too late publishes nothing.
 A timeout, rate limit or malformed/incomplete source publishes nothing. The
 shipped Compose mode remains `disabled`, so neither command runs on a schedule.
 
-The shared collection scheduler contract is already deterministic: it opens
+The shared collection scheduler contract is deterministic: it opens
 only the `08:00–08:30` and `17:00–17:30` Asia/Yekaterinburg completion windows,
 returns the same immutable cutoff after a restart inside that window, and
-refuses to backdate current state after the window closes. It performs no I/O
-and is not wired to the disabled collector runtime yet. A PostgreSQL-backed
+refuses to backdate current state after the window closes. An external timer
+may invoke the one-shot command below while the explicitly enabled policy and
+mode are active:
+
+```text
+REPORT_COLLECTOR_MODE=scheduled report-collector collect-due
+```
+
+The command exits successfully without marketplace I/O outside a completion
+window. Inside a window, a PostgreSQL-backed
 preflight now removes exact account/marketplace/cutoff targets that already
-have all four terminal published sources. Both implemented canary commands
-claim each remaining account/cutoff idempotently in PostgreSQL before resolving
-credentials or performing marketplace I/O. The database claim is
+have all four terminal published sources. It then processes missing policy
+targets sequentially so shared provider quotas are not multiplied. Every
+target is claimed idempotently in PostgreSQL before resolving only that
+account's credentials or performing marketplace I/O. A failed target releases
+its lease and does not prevent later targets from being attempted; the command
+returns a failure after the bounded pass so an external timer can retry only
+remaining work inside the same window. The database claim is
 exclusive for fifteen minutes, can be explicitly released after a bounded
 failure, and uses a monotonically increasing fencing generation. All four
 source snapshots and claim completion commit together, so an expired owner
-cannot publish after a replacement starts.
+cannot publish after a replacement starts. Each target is bounded by twelve
+minutes and by the remaining completion window. Startup or idle operation never
+performs collection: `collect-due` must be supplied explicitly. The shipped
+Compose mode and policy both remain disabled, and marketplace credential values
+are intentionally absent from that Compose contract.
 
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every
