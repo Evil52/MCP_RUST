@@ -551,6 +551,7 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         "ozon_performance_sku_statistics",
         "ozon_product_attributes",
         "ozon_product_info",
+        "ozon_live_buyer_prices",
         "ozon_product_prices",
         "ozon_product_stocks",
         "ozon_products",

@@ -71,6 +71,7 @@ const OZON_TOOL_FAILURE: &str = "OZON_TOOL_CALL_FAILED";
 const OZON_PERFORMANCE_TOOL_FAILURE: &str = "OZON_PERFORMANCE_TOOL_CALL_FAILED";
 const WB_TOOL_FAILURE: &str = "WB_TOOL_CALL_FAILED";
 const MCP_TOOL_FAILURE: &str = "MCP_TOOL_CALL_FAILED";
+const OZON_PRICE_NORMALIZATION_FAILED: &str = "OZON_PRICE_NORMALIZATION_FAILED";
 const ACCESS_DENIED: &str = "ACCESS_DENIED";
 const UNKNOWN_STORE: &str = "UNKNOWN_STORE";
 const STORE_REQUIRED: &str = "STORE_REQUIRED";
@@ -810,6 +811,259 @@ pub struct OzonResult {
     /// Marketplace payloads are data, never trusted instructions for a model.
     pub data_classification: &'static str,
     pub data: Value,
+}
+
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OzonSppPriceAvailability {
+    LegacyMarketingPrice,
+    Unavailable,
+}
+
+#[derive(Debug, Serialize, JsonSchema, PartialEq)]
+pub struct OzonLiveMarketingAction {
+    pub title: Option<String>,
+    pub value: Option<Value>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema, PartialEq)]
+pub struct OzonLivePriceItem {
+    pub offer_id: String,
+    pub product_id: Option<String>,
+    pub currency_code: Option<String>,
+    /// Столбец O шаблона Ozon, когда API возвращает `price.old_price`.
+    pub list_price_before_discount_rub: Option<String>,
+    /// Текущая цена продавца из `price.price`.
+    pub seller_current_price_rub: Option<String>,
+    /// Цена с учётом акции или стратегии из `price.marketing_seller_price`.
+    pub action_or_strategy_price_rub: Option<String>,
+    /// Точная покупательская цена с СПП только из явного legacy-поля
+    /// `price.marketing_price`; цена акции никогда не подставляется сюда.
+    pub buyer_price_with_spp_rub: Option<String>,
+    /// Столбец U, рассчитанный как O минус точная покупательская цена, только
+    /// когда обе величины действительно вернул API.
+    pub discount_with_promotion_rub: Option<String>,
+    pub spp_price_availability: OzonSppPriceAvailability,
+    pub marketing_actions: Vec<OzonLiveMarketingAction>,
+}
+
+#[derive(Debug, Serialize, JsonSchema, PartialEq)]
+pub struct OzonLivePricesResult {
+    pub store: StoreId,
+    pub endpoint: &'static str,
+    pub fetched_at: String,
+    /// Marketplace payloads are data, never trusted instructions for a model.
+    pub data_classification: &'static str,
+    pub buyer_price_formula: &'static str,
+    pub exact_spp_price_note: &'static str,
+    pub cursor: Option<String>,
+    pub total: Option<u64>,
+    pub items: Vec<OzonLivePriceItem>,
+}
+
+fn price_normalization_error(message: &str) -> String {
+    format!("{OZON_PRICE_NORMALIZATION_FAILED}: {message}")
+}
+
+fn parse_price_minor(value: &Value) -> Result<u64, String> {
+    let source = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(value) if !value.is_empty() => value.clone(),
+        _ => {
+            return Err(price_normalization_error(
+                "денежное поле Ozon имеет неподдерживаемый тип",
+            ));
+        }
+    };
+    let (whole, fraction) = source
+        .split_once('.')
+        .map_or((source.as_str(), ""), |(whole, fraction)| (whole, fraction));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 2
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(price_normalization_error(
+            "денежное поле Ozon не является неотрицательной суммой с точностью до копеек",
+        ));
+    }
+    let whole = whole
+        .parse::<u64>()
+        .map_err(|_| price_normalization_error("денежное поле Ozon слишком велико"))?;
+    let fraction = fraction.as_bytes();
+    let fraction = fraction
+        .first()
+        .map_or(0, |digit| u64::from(*digit - b'0') * 10)
+        + fraction.get(1).map_or(0, |digit| u64::from(*digit - b'0'));
+    whole
+        .checked_mul(100)
+        .and_then(|minor| minor.checked_add(fraction))
+        .ok_or_else(|| price_normalization_error("денежное поле Ozon слишком велико"))
+}
+
+fn format_price_minor(minor: u64) -> String {
+    format!("{}.{:02}", minor / 100, minor % 100)
+}
+
+fn optional_price_minor(
+    price: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    match price.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.is_empty() => Ok(None),
+        Some(value) => parse_price_minor(value).map(Some),
+    }
+}
+
+fn optional_string_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(price_normalization_error(
+            "текстовое поле Ozon имеет неподдерживаемый тип",
+        )),
+    }
+}
+
+fn optional_identifier(value: Option<&Value>) -> Result<Option<String>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+        Some(Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err(price_normalization_error(
+            "идентификатор товара Ozon имеет неподдерживаемый тип",
+        )),
+    }
+}
+
+fn normalize_marketing_actions(
+    item: &serde_json::Map<String, Value>,
+) -> Result<Vec<OzonLiveMarketingAction>, String> {
+    let Some(marketing_actions) = item.get("marketing_actions") else {
+        return Ok(Vec::new());
+    };
+    if marketing_actions.is_null() {
+        return Ok(Vec::new());
+    }
+    let marketing_actions = marketing_actions.as_object().ok_or_else(|| {
+        price_normalization_error("marketing_actions Ozon имеет неподдерживаемую форму")
+    })?;
+    let Some(actions) = marketing_actions.get("actions") else {
+        return Ok(Vec::new());
+    };
+    if actions.is_null() {
+        return Ok(Vec::new());
+    }
+    let actions = actions.as_array().ok_or_else(|| {
+        price_normalization_error("marketing_actions.actions Ozon не является массивом")
+    })?;
+    actions
+        .iter()
+        .map(|action| {
+            let action = action.as_object().ok_or_else(|| {
+                price_normalization_error("элемент marketing_actions.actions не является объектом")
+            })?;
+            Ok(OzonLiveMarketingAction {
+                title: optional_string_field(action, "title")?,
+                value: action
+                    .get("value")
+                    .cloned()
+                    .filter(|value| !value.is_null()),
+                date_from: optional_string_field(action, "date_from")?,
+                date_to: optional_string_field(action, "date_to")?,
+            })
+        })
+        .collect()
+}
+
+fn normalize_live_prices(result: OzonResult) -> Result<OzonLivePricesResult, String> {
+    let OzonResult {
+        store,
+        endpoint,
+        fetched_at,
+        data_classification,
+        data,
+    } = result;
+    let data = data.as_object().ok_or_else(|| {
+        price_normalization_error("ответ /v5/product/info/prices не является объектом")
+    })?;
+    let items = data
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| price_normalization_error("ответ Ozon не содержит массив items"))?;
+    if items.len() > MAX_PRODUCT_FILTER_ITEMS {
+        return Err(price_normalization_error(
+            "ответ Ozon содержит больше 1000 товаров",
+        ));
+    }
+
+    let items = items
+        .iter()
+        .map(|item| {
+            let item = item.as_object().ok_or_else(|| {
+                price_normalization_error("элемент items Ozon не является объектом")
+            })?;
+            let offer_id = optional_string_field(item, "offer_id")?
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| price_normalization_error("товар Ozon не содержит offer_id"))?;
+            let price = item
+                .get("price")
+                .and_then(Value::as_object)
+                .ok_or_else(|| price_normalization_error("товар Ozon не содержит объект price"))?;
+            let list_price = optional_price_minor(price, "old_price")?;
+            let seller_price = optional_price_minor(price, "price")?;
+            let action_price = optional_price_minor(price, "marketing_seller_price")?;
+            let buyer_price = optional_price_minor(price, "marketing_price")?
+                .filter(|buyer_price| *buyer_price > 0);
+            let discount = list_price
+                .zip(buyer_price)
+                .and_then(|(list_price, buyer_price)| list_price.checked_sub(buyer_price));
+            let spp_price_availability = if buyer_price.is_some() {
+                OzonSppPriceAvailability::LegacyMarketingPrice
+            } else {
+                OzonSppPriceAvailability::Unavailable
+            };
+
+            Ok(OzonLivePriceItem {
+                offer_id,
+                product_id: optional_identifier(item.get("product_id"))?,
+                currency_code: optional_string_field(price, "currency_code")?,
+                list_price_before_discount_rub: list_price.map(format_price_minor),
+                seller_current_price_rub: seller_price.map(format_price_minor),
+                action_or_strategy_price_rub: action_price.map(format_price_minor),
+                buyer_price_with_spp_rub: buyer_price.map(format_price_minor),
+                discount_with_promotion_rub: discount.map(format_price_minor),
+                spp_price_availability,
+                marketing_actions: normalize_marketing_actions(item)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let cursor = optional_string_field(data, "cursor")?;
+    let total = match data.get("total") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().ok_or_else(|| {
+            price_normalization_error("поле total Ozon не является неотрицательным целым")
+        })?),
+    };
+
+    Ok(OzonLivePricesResult {
+        store,
+        endpoint,
+        fetched_at,
+        data_classification,
+        buyer_price_formula: "buyer_price_with_spp_rub = list_price_before_discount_rub - discount_with_promotion_rub",
+        exact_spp_price_note: "Точная цена с СПП доступна только если Ozon явно вернул legacy-поле price.marketing_price; price.marketing_seller_price является ценой акции или стратегии и не подставляется вместо неё.",
+        cursor,
+        total,
+        items,
+    })
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -3690,6 +3944,26 @@ impl OzonMcp {
         .await
     }
 
+    /// Возвращает нормализованный снимок текущих цен Ozon для расчёта по
+    /// шаблону O − U. Точная цена с СПП остаётся `null`, если официальный API
+    /// не вернул явное поле `price.marketing_price`; цена акции не используется
+    /// как подмена.
+    #[tool(
+        name = "ozon_live_buyer_prices",
+        annotations(
+            title = "Живые цены Ozon и доступность цены с СПП",
+            read_only_hint = true
+        )
+    )]
+    async fn live_buyer_prices(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ProductPriceFilterInput>,
+    ) -> Result<Json<OzonLivePricesResult>, String> {
+        let Json(result) = self.product_prices(identity, Parameters(input)).await?;
+        normalize_live_prices(result).map(Json)
+    }
+
     /// Возвращает постраничный каталог товаров Ozon с их видимостью.
     #[tool(
         name = "ozon_products",
@@ -5782,6 +6056,248 @@ mod tests {
         assert!(
             error.contains(field),
             "expected error for {field}, got: {error}"
+        );
+    }
+
+    fn normalize_test_price_result(data: Value) -> Result<OzonLivePricesResult, String> {
+        normalize_live_prices(OzonResult {
+            store: StoreId::from("store_a"),
+            endpoint: "/v5/product/info/prices",
+            fetched_at: "2026-08-19T08:00:00Z".to_owned(),
+            data_classification: UNTRUSTED_DATA_CLASSIFICATION,
+            data,
+        })
+    }
+
+    fn normalize_test_prices(data: Value) -> OzonLivePricesResult {
+        normalize_test_price_result(data).unwrap()
+    }
+
+    #[test]
+    fn live_prices_compute_o_minus_u_only_from_explicit_buyer_price() {
+        let result = normalize_test_prices(json!({
+            "cursor": "next-page",
+            "total": 1,
+            "items": [{
+                "offer_id": "OЛ661308916",
+                "product_id": 181028826,
+                "price": {
+                    "currency_code": "RUB",
+                    "old_price": 1457,
+                    "price": 1214,
+                    "marketing_seller_price": 910,
+                    "marketing_price": 504
+                },
+                "marketing_actions": {
+                    "actions": [{
+                        "title": "Акция Ozon",
+                        "value": 910,
+                        "date_from": "2026-08-19T00:00:00Z",
+                        "date_to": "2026-08-20T00:00:00Z"
+                    }]
+                }
+            }]
+        }));
+
+        assert_eq!(result.cursor.as_deref(), Some("next-page"));
+        assert_eq!(result.total, Some(1));
+        let item = &result.items[0];
+        assert_eq!(
+            item.list_price_before_discount_rub.as_deref(),
+            Some("1457.00")
+        );
+        assert_eq!(item.seller_current_price_rub.as_deref(), Some("1214.00"));
+        assert_eq!(item.action_or_strategy_price_rub.as_deref(), Some("910.00"));
+        assert_eq!(item.buyer_price_with_spp_rub.as_deref(), Some("504.00"));
+        assert_eq!(item.discount_with_promotion_rub.as_deref(), Some("953.00"));
+        assert_eq!(
+            item.spp_price_availability,
+            OzonSppPriceAvailability::LegacyMarketingPrice
+        );
+        assert_eq!(item.marketing_actions[0].value, Some(json!(910)));
+    }
+
+    #[test]
+    fn live_prices_never_substitute_action_price_for_missing_spp_price() {
+        let result = normalize_test_prices(json!({
+            "items": [{
+                "offer_id": "OЛ084609799",
+                "product_id": "180967228",
+                "price": {
+                    "currency_code": "RUB",
+                    "old_price": "2813",
+                    "price": "2344.00",
+                    "marketing_seller_price": "1808"
+                },
+                "marketing_actions": {"actions": []}
+            }]
+        }));
+
+        let item = &result.items[0];
+        assert_eq!(
+            item.list_price_before_discount_rub.as_deref(),
+            Some("2813.00")
+        );
+        assert_eq!(
+            item.action_or_strategy_price_rub.as_deref(),
+            Some("1808.00")
+        );
+        assert_eq!(item.buyer_price_with_spp_rub, None);
+        assert_eq!(item.discount_with_promotion_rub, None);
+        assert_eq!(
+            item.spp_price_availability,
+            OzonSppPriceAvailability::Unavailable
+        );
+    }
+
+    #[test]
+    fn live_price_normalization_rejects_every_ambiguous_wire_shape() {
+        for value in [json!(true), json!(""), json!("-1"), json!("1.234")] {
+            assert!(parse_price_minor(&value).is_err());
+        }
+        assert!(parse_price_minor(&json!("18446744073709551615")).is_err());
+        assert!(parse_price_minor(&json!("18446744073709551616")).is_err());
+
+        let empty = json!({}).as_object().unwrap().clone();
+        assert_eq!(optional_price_minor(&empty, "missing").unwrap(), None);
+        assert_eq!(
+            optional_price_minor(json!({"price": null}).as_object().unwrap(), "price").unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_price_minor(json!({"price": ""}).as_object().unwrap(), "price").unwrap(),
+            None
+        );
+        assert_eq!(optional_string_field(&empty, "missing").unwrap(), None);
+        assert!(optional_string_field(json!({"text": 1}).as_object().unwrap(), "text").is_err());
+        assert_eq!(optional_identifier(None).unwrap(), None);
+        assert_eq!(optional_identifier(Some(&Value::Null)).unwrap(), None);
+        assert!(optional_identifier(Some(&json!(true))).is_err());
+
+        assert!(normalize_marketing_actions(&empty).unwrap().is_empty());
+        for item in [
+            json!({"marketing_actions": null}),
+            json!({"marketing_actions": {}}),
+            json!({"marketing_actions": {"actions": null}}),
+        ] {
+            assert!(
+                normalize_marketing_actions(item.as_object().unwrap())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for item in [
+            json!({"marketing_actions": true}),
+            json!({"marketing_actions": {"actions": true}}),
+            json!({"marketing_actions": {"actions": [true]}}),
+            json!({"marketing_actions": {"actions": [{"title": 1}]}}),
+        ] {
+            assert!(normalize_marketing_actions(item.as_object().unwrap()).is_err());
+        }
+
+        let too_many_items = vec![json!({}); MAX_PRODUCT_FILTER_ITEMS + 1];
+        for data in [
+            Value::Null,
+            json!({}),
+            json!({"items": too_many_items}),
+            json!({"items": [true]}),
+            json!({"items": [{"offer_id": 1, "price": {}}]}),
+            json!({"items": [{"offer_id": "", "price": {}}]}),
+            json!({"items": [{"offer_id": "offer", "price": true}]}),
+            json!({"items": [{"offer_id": "offer", "product_id": true, "price": {}}]}),
+            json!({"items": [{"offer_id": "offer", "price": {"currency_code": 1}}]}),
+            json!({"items": [], "cursor": 1}),
+            json!({"items": [], "total": -1}),
+        ] {
+            let error = normalize_test_price_result(data).unwrap_err();
+            assert!(
+                error.starts_with(OZON_PRICE_NORMALIZATION_FAILED),
+                "{error}"
+            );
+        }
+
+        let result = normalize_test_prices(json!({
+            "cursor": null,
+            "total": null,
+            "items": [{
+                "offer_id": "offer",
+                "price": {
+                    "old_price": null,
+                    "price": "",
+                    "marketing_seller_price": null,
+                    "marketing_price": 0
+                }
+            }]
+        }));
+        assert_eq!(result.cursor, None);
+        assert_eq!(result.total, None);
+        assert_eq!(result.items[0].product_id, None);
+        assert!(result.items[0].marketing_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_buyer_prices_uses_the_existing_read_only_price_endpoint() {
+        let response = json!({
+            "cursor": "",
+            "total": 1,
+            "items": [{
+                "offer_id": "offer-1",
+                "product_id": 123,
+                "price": {
+                    "currency_code": "RUB",
+                    "old_price": 1000,
+                    "price": 900,
+                    "marketing_seller_price": 800
+                }
+            }]
+        });
+        let (base_url, requests) = mock_http(vec![(200, response.to_string())]);
+        let stores = BTreeMap::from([(
+            StoreId::from("store_a"),
+            crate::config::StoreCredentials {
+                client_id: "test-client".to_owned(),
+                api_key: "test-key".to_owned(),
+            },
+        )]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), stores).unwrap();
+        let server = OzonMcp::new(client, "admin".to_owned(), registry_source());
+
+        let result = server
+            .live_buyer_prices(
+                RequestIdentity::dev(),
+                Parameters(ProductPriceFilterInput {
+                    store: Some(StoreId::from("store_a")),
+                    offer_ids: vec!["offer-1".to_owned()],
+                    product_ids: Vec::new(),
+                    visibility: CatalogVisibility::All,
+                    limit: 100,
+                    cursor: None,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(result.endpoint, "/v5/product/info/prices");
+        assert_eq!(result.items[0].offer_id, "offer-1");
+        assert_eq!(
+            result.items[0].spp_price_availability,
+            OzonSppPriceAvailability::Unavailable
+        );
+        let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (path, body) = request_path_and_body(&request);
+        assert_eq!(path, "/v5/product/info/prices");
+        assert_eq!(
+            body,
+            json!({
+                "cursor": "",
+                "filter": {
+                    "offer_id": ["offer-1"],
+                    "product_id": [],
+                    "visibility": "ALL"
+                },
+                "limit": 100
+            })
         );
     }
 
@@ -9533,7 +10049,7 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
-        assert_eq!(dev_tools.len(), 67);
+        assert_eq!(dev_tools.len(), 68);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -9544,7 +10060,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 67);
+        assert_eq!(jwt_tools.len(), 68);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -9557,7 +10073,7 @@ mod tests {
                 .with_preview_features(false, true)
                 .tool_router
                 .list_all();
-        assert_eq!(legacy_flag_tools.len(), 67);
+        assert_eq!(legacy_flag_tools.len(), 68);
         assert_policy(
             legacy_flag_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -9600,6 +10116,7 @@ mod tests {
             "ozon_fbs_stocks_by_warehouse",
             "ozon_warehouses",
             "ozon_product_prices",
+            "ozon_live_buyer_prices",
             "ozon_products",
             "ozon_product_info",
             "ozon_product_attributes",
@@ -9723,6 +10240,7 @@ mod tests {
             ("ozon_product_stocks", 1_000),
             ("ozon_warehouse_stocks", 1_000),
             ("ozon_product_prices", 1_000),
+            ("ozon_live_buyer_prices", 1_000),
             ("ozon_stock_turnover", 1_000),
             ("ozon_supply_order_list", 100),
             ("ozon_fbs_postings", 100),
@@ -9903,6 +10421,7 @@ mod tests {
             "ozon_product_stocks",
             "ozon_warehouse_stocks",
             "ozon_product_prices",
+            "ozon_live_buyer_prices",
             "ozon_stock_turnover",
             "ozon_supply_order_list",
             "ozon_supply_order_get",
@@ -9983,7 +10502,11 @@ mod tests {
             }
         }
 
-        for tool in ["ozon_product_stocks", "ozon_product_prices"] {
+        for tool in [
+            "ozon_product_stocks",
+            "ozon_product_prices",
+            "ozon_live_buyer_prices",
+        ] {
             let schema = schema(tool);
             for field in ["offer_ids", "product_ids"] {
                 assert_eq!(
@@ -10139,6 +10662,8 @@ mod tests {
             ("ozon_product_stocks", "product_ids"),
             ("ozon_product_prices", "offer_ids"),
             ("ozon_product_prices", "product_ids"),
+            ("ozon_live_buyer_prices", "offer_ids"),
+            ("ozon_live_buyer_prices", "product_ids"),
             ("ozon_stock_turnover", "skus"),
             ("ozon_returns", "posting_numbers"),
             ("ozon_rfbs_returns", "group_state"),
