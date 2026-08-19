@@ -190,6 +190,13 @@ collection that completes too late publishes nothing.
 A timeout, rate limit or malformed/incomplete source publishes nothing. The
 shipped Compose mode remains `disabled`, so neither command runs on a schedule.
 
+The shared collection scheduler contract is already deterministic: it opens
+only the `08:00–08:30` and `17:00–17:30` Asia/Yekaterinburg completion windows,
+returns the same immutable cutoff after a restart inside that window, and
+refuses to backdate current state after the window closes. It performs no I/O
+and is not wired to the disabled collector runtime yet. The later runtime must
+claim each account/cutoff idempotently in PostgreSQL before using this plan.
+
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every
 tick is bounded to 16 generation candidates; missed timer ticks are skipped,

@@ -12,6 +12,7 @@ use thiserror::Error;
 pub mod artifact_store;
 pub mod bundle;
 pub mod collector_plan;
+pub mod collector_schedule;
 pub mod collector_service;
 pub mod dataset;
 pub mod html;
