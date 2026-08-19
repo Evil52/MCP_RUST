@@ -292,16 +292,18 @@ account's exact files after acquiring its PostgreSQL lease:
 ```text
 MCP_ACCESS_CONFIG_HOST=/absolute/path/access.json \
 REPORT_COLLECTOR_CREDENTIAL_DIR_HOST=/absolute/path/report-credentials \
-./scripts/run-report-canary.sh ozon furnitura_dlya_doma 2026-08-18
+./scripts/run-report-canary.sh ozon furnitura_dlya_doma 2026-08-18 morning
 
 MCP_ACCESS_CONFIG_HOST=/absolute/path/access.json \
 REPORT_COLLECTOR_CREDENTIAL_DIR_HOST=/absolute/path/report-credentials \
-./scripts/run-report-canary.sh wb ip_domnyshev_wb 2026-08-18
+./scripts/run-report-canary.sh wb ip_domnyshev_wb 2026-08-19 evening
 ```
 
-The requested date is the business day being collected. A canary intentionally
-uses the morning report occurrence and must start after its 08:00 EKB cutoff and
-no later than 08:30 EKB; outside that window it fails before marketplace I/O.
+The requested date is the business day being collected. `morning` covers that
+complete day and runs the next day from 08:00 through 08:30 EKB. `evening`
+covers the requested date from midnight through its 17:00 cutoff and runs from
+17:00 through 17:30 EKB. Outside the selected window the command fails before
+marketplace I/O.
 Run Ozon and WB sequentially. A failed, timed-out or partial source set releases
 the lease and publishes no snapshot IDs. The canary policy must stay disabled;
 the enabled policy is reserved for the separately reviewed live overlay. The

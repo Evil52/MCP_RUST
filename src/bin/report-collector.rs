@@ -67,12 +67,20 @@ async fn main() -> Result<()> {
             tracing::info!(targets = targets.len(), "report collector preflight passed");
             return Ok(());
         }
-        Command::OzonDryRun { account_id, date } => {
-            run_ozon_dry_run(&config, &writer, &account_id, date).await?;
+        Command::OzonDryRun {
+            account_id,
+            date,
+            kind,
+        } => {
+            run_ozon_dry_run(&config, &writer, &account_id, date, kind).await?;
             return Ok(());
         }
-        Command::WbDryRun { account_id, date } => {
-            run_wb_dry_run(&config, &writer, &account_id, date).await?;
+        Command::WbDryRun {
+            account_id,
+            date,
+            kind,
+        } => {
+            run_wb_dry_run(&config, &writer, &account_id, date, kind).await?;
             return Ok(());
         }
         Command::CollectDue => {
@@ -106,10 +114,12 @@ enum Command {
     OzonDryRun {
         account_id: String,
         date: NaiveDate,
+        kind: ReportKind,
     },
     WbDryRun {
         account_id: String,
         date: NaiveDate,
+        kind: ReportKind,
     },
     CollectDue,
     RunScheduler,
@@ -138,34 +148,55 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         [command, account_id, date]
             if matches!(command.as_str(), "ozon-dry-run" | "wb-dry-run") =>
         {
-            ensure!(
-                !account_id.is_empty()
-                    && account_id.len() <= 128
-                    && account_id.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
-                    }),
-                "account id is invalid"
-            );
-            let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                .context("dry-run date must use YYYY-MM-DD")?;
-            Ok(if command == "ozon-dry-run" {
-                Command::OzonDryRun {
-                    account_id: account_id.clone(),
-                    date,
-                }
-            } else {
-                Command::WbDryRun {
-                    account_id: account_id.clone(),
-                    date,
-                }
-            })
+            parse_dry_run_command(command, account_id, date, "morning")
+        }
+        [command, account_id, date, kind]
+            if matches!(command.as_str(), "ozon-dry-run" | "wb-dry-run") =>
+        {
+            parse_dry_run_command(command, account_id, date, kind)
         }
         _ => {
             bail!(
-                "usage: report-collector [healthcheck | collect-due | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> | wb-dry-run <account-id> <YYYY-MM-DD> | bootstrap-credentials <access.json> <policy.json> <source.env> <new-output-directory>]"
+                "usage: report-collector [healthcheck | collect-due | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | wb-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | bootstrap-credentials <access.json> <policy.json> <source.env> <new-output-directory>]"
             )
         }
     }
+}
+
+fn parse_dry_run_command(
+    command: &str,
+    account_id: &str,
+    date: &str,
+    kind: &str,
+) -> Result<Command> {
+    ensure!(
+        !account_id.is_empty()
+            && account_id.len() <= 128
+            && account_id
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') }),
+        "account id is invalid"
+    );
+    let date =
+        NaiveDate::parse_from_str(date, "%Y-%m-%d").context("dry-run date must use YYYY-MM-DD")?;
+    let kind = match kind {
+        "morning" => ReportKind::Morning,
+        "evening" => ReportKind::Evening,
+        _ => bail!("dry-run kind must be morning or evening"),
+    };
+    Ok(if command == "ozon-dry-run" {
+        Command::OzonDryRun {
+            account_id: account_id.to_owned(),
+            date,
+            kind,
+        }
+    } else {
+        Command::WbDryRun {
+            account_id: account_id.to_owned(),
+            date,
+            kind,
+        }
+    })
 }
 
 async fn run_collect_due_command(
@@ -414,6 +445,7 @@ async fn run_wb_dry_run(
     writer: &PostgresSnapshotWriter,
     account_id: &str,
     date: NaiveDate,
+    kind: ReportKind,
 ) -> Result<()> {
     ensure!(
         config.mode() == ReportCollectorMode::WbDryRun,
@@ -423,7 +455,7 @@ async fn run_wb_dry_run(
         !config.policy().enabled,
         "wb-dry-run refuses an enabled daily report policy"
     );
-    let (period_start, period_end, cutoff_at) = morning_report_window(date, Utc::now())?;
+    let (period_start, period_end, cutoff_at) = dry_run_report_window(date, kind, Utc::now())?;
     let target = dry_run_target(config, account_id, Marketplace::Wildberries)?;
     let owner_id = claim_owner("wb");
     let claim = writer
@@ -469,6 +501,7 @@ async fn run_ozon_dry_run(
     writer: &mcp_ozon::reporting::postgres_collector::PostgresSnapshotWriter,
     account_id: &str,
     date: NaiveDate,
+    kind: ReportKind,
 ) -> Result<()> {
     ensure!(
         config.mode() == ReportCollectorMode::OzonDryRun,
@@ -478,7 +511,7 @@ async fn run_ozon_dry_run(
         !config.policy().enabled,
         "ozon-dry-run refuses an enabled daily report policy"
     );
-    let (period_start, period_end, cutoff_at) = morning_report_window(date, Utc::now())?;
+    let (period_start, period_end, cutoff_at) = dry_run_report_window(date, kind, Utc::now())?;
     let target = dry_run_target(config, account_id, Marketplace::Ozon)?;
     let owner_id = claim_owner("ozon");
     let claim = writer
@@ -568,14 +601,18 @@ async fn finish_dry_run<T>(
     }
 }
 
-fn morning_report_window(
+fn dry_run_report_window(
     date: NaiveDate,
+    kind: ReportKind,
     now: DateTime<Utc>,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>, DateTime<Utc>)> {
-    let report_date = date.succ_opt().context("dry-run date is out of range")?;
+    let report_date = match kind {
+        ReportKind::Morning => date.succ_opt().context("dry-run date is out of range")?,
+        ReportKind::Evening => date,
+    };
     let key = ReportKey {
         local_date: report_date,
-        kind: ReportKind::Morning,
+        kind,
         recipient_id: "collector".to_owned(),
         report_version: 1,
     };
@@ -583,11 +620,11 @@ fn morning_report_window(
     let cutoff = report_cutoff(&key)?;
     ensure!(
         cutoff <= now,
-        "dry-run requires the 08:00 EKB morning cutoff to have passed"
+        "dry-run requires its EKB report cutoff to have passed"
     );
     ensure!(
         now <= cutoff + chrono::Duration::minutes(30),
-        "dry-run must start no later than 08:30 EKB for the requested business day"
+        "dry-run must start within thirty minutes after its EKB report cutoff"
     );
     Ok((start, end, cutoff))
 }
@@ -616,5 +653,79 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     if signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Timelike};
+
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn dry_run_cli_defaults_to_morning_and_accepts_only_explicit_report_kinds() {
+        assert!(matches!(
+            parse_command(&arguments(&["ozon-dry-run", "ozon", "2026-08-18"])).unwrap(),
+            Command::OzonDryRun {
+                kind: ReportKind::Morning,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_command(&arguments(&["wb-dry-run", "wb", "2026-08-19", "evening"])).unwrap(),
+            Command::WbDryRun {
+                kind: ReportKind::Evening,
+                ..
+            }
+        ));
+        for invalid in [
+            arguments(&["ozon-dry-run", "bad/account", "2026-08-18"]),
+            arguments(&["ozon-dry-run", "ozon", "18-08-2026"]),
+            arguments(&["ozon-dry-run", "ozon", "2026-08-18", "night"]),
+        ] {
+            assert!(parse_command(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn dry_run_windows_match_the_exact_morning_and_evening_cutoffs() {
+        let requested_date = NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
+        let morning_now = Utc.with_ymd_and_hms(2026, 8, 19, 3, 10, 0).unwrap();
+        let (morning_start, morning_end, morning_cutoff) =
+            dry_run_report_window(requested_date, ReportKind::Morning, morning_now).unwrap();
+        assert_eq!(business_date(morning_start), requested_date);
+        assert_eq!(
+            business_date(morning_end),
+            NaiveDate::from_ymd_opt(2026, 8, 19).unwrap()
+        );
+        assert_eq!(morning_cutoff.hour(), 3);
+
+        let evening_now = Utc.with_ymd_and_hms(2026, 8, 18, 12, 20, 0).unwrap();
+        let (evening_start, evening_end, evening_cutoff) =
+            dry_run_report_window(requested_date, ReportKind::Evening, evening_now).unwrap();
+        assert_eq!(business_date(evening_start), requested_date);
+        assert_eq!(evening_end, evening_cutoff);
+        assert_eq!(evening_cutoff.hour(), 12);
+
+        assert!(
+            dry_run_report_window(
+                requested_date,
+                ReportKind::Evening,
+                Utc.with_ymd_and_hms(2026, 8, 18, 11, 59, 59).unwrap(),
+            )
+            .is_err()
+        );
+        assert!(
+            dry_run_report_window(
+                requested_date,
+                ReportKind::Evening,
+                Utc.with_ymd_and_hms(2026, 8, 18, 12, 30, 1).unwrap(),
+            )
+            .is_err()
+        );
     }
 }

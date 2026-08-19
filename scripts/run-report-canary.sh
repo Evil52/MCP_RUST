@@ -4,14 +4,15 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 
-if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <ozon|wb> <account-id> <YYYY-MM-DD>" >&2
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+  echo "usage: $0 <ozon|wb> <account-id> <YYYY-MM-DD> [morning|evening]" >&2
   exit 64
 fi
 
 marketplace="$1"
 account_id="$2"
 business_date="$3"
+report_kind="${4:-morning}"
 case "$marketplace" in
   ozon) mode=ozon_dry_run ;;
   wb) mode=wb_dry_run ;;
@@ -27,6 +28,10 @@ if [[ ! "$account_id" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
 fi
 if [[ ! "$business_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
   echo "business date must use YYYY-MM-DD" >&2
+  exit 64
+fi
+if [[ "$report_kind" != morning && "$report_kind" != evening ]]; then
+  echo "report kind must be morning or evening" >&2
   exit 64
 fi
 
@@ -57,4 +62,4 @@ exec docker compose --env-file .position.env \
   -f compose.reporting-canary.yaml \
   --profile reporting-canary \
   run --rm --no-deps report-collector \
-  "${marketplace}-dry-run" "$account_id" "$business_date"
+  "${marketplace}-dry-run" "$account_id" "$business_date" "$report_kind"
