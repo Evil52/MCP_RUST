@@ -256,6 +256,10 @@ has broader vendor permissions.
   per pass, the 60-second bound per attempt and process exit after five consecutive failed ticks.
   Restart catch-up may claim only `ready` work still inside its immutable delivery deadline;
   `sending`, `sent`, expired and permanent-failure rows must never be reclaimed automatically.
+  Scheduled delivery must be activated only through the explicit `reporting-mail-live` profile
+  and `scripts/start-report-mail-scheduler.sh --confirm-canary-sent-and-reconciled`. Its worker
+  must retain the canary's exact read-only private mounts and internal-only database/mail-proxy
+  networks; only the credentialless mail proxy may attach to the outbound bridge.
 - Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
   through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
   `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,

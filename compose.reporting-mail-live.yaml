@@ -1,0 +1,90 @@
+name: mcp-ozon-position
+
+# Explicit opt-in overlay for scheduled Gmail delivery. This file is inert
+# unless the reporting-mail-live profile is selected deliberately. Operators
+# must run and reconcile the one-shot mail canary before starting this profile.
+services:
+  mail-egress:
+    profiles:
+      - reporting-mail-live
+    image: mcp-ozon-mail-egress:local
+    build:
+      context: .
+      dockerfile: Dockerfile.mail-egress
+    networks:
+      - mail-egress-internal
+      - outbound
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/squid:size=8m,mode=1777
+      - /var/log/squid:size=4m,mode=1777
+      - /var/run/squid:size=1m,mode=1777
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "printf 'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 3129 | head -1 | grep -q '403 Forbidden'"
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
+
+  report-worker:
+    profiles:
+      - reporting-mail-live
+    command: []
+    environment:
+      REPORT_WORKER_MODE: scheduled_delivery
+      REPORT_MAIL_ROUTING: /run/mcp-ozon/mail-routing.json
+      REPORT_GMAIL_OAUTH_DIR: /run/mcp-ozon/gmail-oauth
+    volumes:
+      - type: bind
+        source: ${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for scheduled mail}
+        target: /etc/mcp-ozon/access.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DAILY_REPORT_MAIL_POLICY_HOST:?DAILY_REPORT_MAIL_POLICY_HOST is required for scheduled mail}
+        target: /etc/mcp-ozon/daily-report-policy.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${REPORT_MAIL_ROUTING_HOST:?REPORT_MAIL_ROUTING_HOST is required for scheduled mail}
+        target: /run/mcp-ozon/mail-routing.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${REPORT_GMAIL_OAUTH_DIR_HOST:?REPORT_GMAIL_OAUTH_DIR_HOST is required for scheduled mail}
+        target: /run/mcp-ozon/gmail-oauth
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      position-db:
+        condition: service_healthy
+      mail-egress:
+        condition: service_healthy
+    networks:
+      - position-internal
+      - mail-egress-internal
+
+networks:
+  mail-egress-internal:
+    name: mcp-ozon-mail-egress-internal
+    internal: true

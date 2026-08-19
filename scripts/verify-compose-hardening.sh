@@ -176,6 +176,29 @@ render_reporting_mail_canary_compose() {
       config --no-env-resolution --format json
 }
 
+render_reporting_mail_live_compose() {
+  local mail_policy="$scratch/daily-report-mail-policy.json"
+  local mail_routing="$scratch/mail-routing.json"
+  local oauth_directory="$scratch/gmail-oauth"
+  # Reuse the canary's exact fixture sources so the comparison below can prove
+  # that only profile, command and mode differ between canary and live.
+  [[ -f "$mail_policy" ]] || printf '{}\n' >"$mail_policy"
+  [[ -f "$mail_routing" ]] || printf '{}\n' >"$mail_routing"
+  [[ -d "$oauth_directory" ]] || mkdir "$oauth_directory"
+  chmod 600 "$mail_policy" "$mail_routing"
+  chmod 500 "$oauth_directory"
+  MCP_ACCESS_CONFIG_HOST="$main_access" \
+    DAILY_REPORT_MAIL_POLICY_HOST="$mail_policy" \
+    REPORT_MAIL_ROUTING_HOST="$mail_routing" \
+    REPORT_GMAIL_OAUTH_DIR_HOST="$oauth_directory" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.position.yaml" \
+      -f "$project_dir/compose.reporting-mail-live.yaml" \
+      --profile reporting-mail-live \
+      config --no-env-resolution --format json
+}
+
 # The dollar-prefixed names below are jq variables supplied with `--arg`; the
 # single quotes deliberately prevent the shell from expanding them.
 # shellcheck disable=SC2016
@@ -794,6 +817,38 @@ verify_reporting_mail_canary() {
      and .networks.outbound.external == true'
 }
 
+verify_reporting_mail_live() {
+  local rendered="$1" canary="$2" worker comparison
+  worker="$(jq -c '.services["report-worker"]' <<<"$rendered")"
+
+  check "scheduled mail: worker is selected only through its explicit profile" "$worker" \
+    '.profiles == ["reporting-mail-live"]
+     and (.command // []) == []
+     and .environment.REPORT_WORKER_MODE == "scheduled_delivery"'
+  check "scheduled mail: worker remains internal and has no ingress or Compose secrets" "$worker" \
+    '(.networks | keys | sort) == ["mail-egress-internal", "position-internal"]
+     and ((.ports // []) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)'
+
+  # Every field except the three explicit activation differences must remain
+  # equivalent to the fully verified one-shot canary topology.
+  comparison="$(jq -cn \
+    --argjson live "$rendered" \
+    --argjson canary "$canary" \
+    '{
+       live: ($live
+         | .services["report-worker"].profiles = ["reporting-mail-canary"]
+         | .services["report-worker"].command = ["healthcheck"]
+         | .services["report-worker"].environment.REPORT_WORKER_MODE = "delivery_canary"
+         | .services["mail-egress"].profiles = ["reporting-mail-canary"]),
+       canary: $canary
+     }')"
+  check "scheduled mail: topology is exactly the verified canary with only activation fields changed" \
+    "$comparison" '.live == .canary'
+}
+
 verify_ozon_egress() {
   local rendered="$1" service
   service="$(jq -c '.services["ozon-egress"]' <<<"$rendered")"
@@ -944,6 +999,7 @@ position_rendered="$(render_position_compose)"
 reporting_live_rendered="$(render_reporting_live_compose)"
 reporting_canary_rendered="$(render_reporting_canary_compose)"
 reporting_mail_canary_rendered="$(render_reporting_mail_canary_compose)"
+reporting_mail_live_rendered="$(render_reporting_mail_live_compose)"
 control_rendered="$(render_control_compose)"
 
 # Rendering uses isolated, existing placeholder files so the result is the
@@ -1037,6 +1093,22 @@ check_contains \
   "$project_dir/compose.reporting-mail-canary.yaml" \
   "\${REPORT_GMAIL_OAUTH_DIR_HOST:?REPORT_GMAIL_OAUTH_DIR_HOST is required for mail canary}"
 check_contains \
+  "scheduled mail: access registry has no fallback path" \
+  "$project_dir/compose.reporting-mail-live.yaml" \
+  "\${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for scheduled mail}"
+check_contains \
+  "scheduled mail: enabled policy has no fallback path" \
+  "$project_dir/compose.reporting-mail-live.yaml" \
+  "\${DAILY_REPORT_MAIL_POLICY_HOST:?DAILY_REPORT_MAIL_POLICY_HOST is required for scheduled mail}"
+check_contains \
+  "scheduled mail: routing file has no fallback path" \
+  "$project_dir/compose.reporting-mail-live.yaml" \
+  "\${REPORT_MAIL_ROUTING_HOST:?REPORT_MAIL_ROUTING_HOST is required for scheduled mail}"
+check_contains \
+  "scheduled mail: OAuth directory has no fallback path" \
+  "$project_dir/compose.reporting-mail-live.yaml" \
+  "\${REPORT_GMAIL_OAUTH_DIR_HOST:?REPORT_GMAIL_OAUTH_DIR_HOST is required for scheduled mail}"
+check_contains \
   "mail canary: runner waits for the isolated proxy only" \
   "$project_dir/scripts/run-report-mail-canary.sh" \
   "up --detach --wait --wait-timeout 30 --no-deps mail-egress"
@@ -1044,6 +1116,14 @@ check_contains \
   "mail canary: runner performs exactly an explicit one-shot delivery" \
   "$project_dir/scripts/run-report-mail-canary.sh" \
   "run --rm --no-deps report-worker deliver-one"
+check_contains \
+  "scheduled mail: runner requires explicit canary reconciliation" \
+  "$project_dir/scripts/start-report-mail-scheduler.sh" \
+  "--confirm-canary-sent-and-reconciled"
+check_contains \
+  "scheduled mail: runner activates only the exact mail services" \
+  "$project_dir/scripts/start-report-mail-scheduler.sh" \
+  'up --detach --wait --wait-timeout 60 mail-egress report-worker'
 check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
@@ -1105,6 +1185,7 @@ verify_reporting_service \
 verify_reporting_live "$reporting_live_rendered"
 verify_reporting_canary "$reporting_canary_rendered"
 verify_reporting_mail_canary "$reporting_mail_canary_rendered"
+verify_reporting_mail_live "$reporting_mail_live_rendered" "$reporting_mail_canary_rendered"
 verify_control "$control_rendered"
 
 if (( failures > 0 )); then

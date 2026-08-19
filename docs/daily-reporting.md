@@ -233,15 +233,25 @@ Do not invoke this command until a ready outbox artifact has been manually
 reviewed. It may send one real message. A successful canary does not enable the
 08:00/17:00 scheduler or any background mail delivery.
 
-After a successful canary, `REPORT_WORKER_MODE=scheduled_delivery` can run the
+After a successful and reconciled canary, `REPORT_WORKER_MODE=scheduled_delivery` can run the
 same deterministic planning/generation pass once per minute and then drain at
 most 16 ready deliveries. Each provider attempt has its own 60-second bound.
 Five consecutive failed ticks terminate the process so its supervisor can
 restart a fresh database session. PostgreSQL occurrence uniqueness and the
 delivery deadlines make restart catch-up safe: ready morning/evening work is
 picked up after an outage while its window is open, already sent work cannot be
-recreated, and ambiguous `sending` work is never automatically reclaimed. No
-shipped Compose file selects this mode yet.
+recreated, and ambiguous `sending` work is never automatically reclaimed. The
+separate `reporting-mail-live` profile supplies the same isolated mail proxy and
+mandatory read-only private inputs. It remains inert until an operator invokes:
+
+```text
+./scripts/start-report-mail-scheduler.sh --confirm-canary-sent-and-reconciled
+```
+
+The confirmation records an operational decision, not a security bypass: an
+enabled strict policy, exact routing file, OAuth directory and healthy database
+are still required before the worker can start. Do not invoke it before the
+canary message, recipient, attachment hash and Gmail audit result are checked.
 
 The separate collector has two explicit one-account canary commands:
 
