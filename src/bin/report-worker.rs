@@ -30,6 +30,9 @@ const MAX_GENERATIONS_PER_TICK: u16 = 16;
 const TICK_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Bounds one report generation, including rendering and artifact commit.
 const GENERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Bounds one complete claim/load/OAuth/Gmail/persist canary attempt. Any
+/// timeout after claiming leaves the row `sending` for reconciliation.
+const DELIVERY_CANARY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Consecutive failing ticks tolerated before the process exits for restart.
 const MAX_CONSECUTIVE_TICK_FAILURES: u32 = 5;
 
@@ -52,6 +55,20 @@ async fn main() -> Result<()> {
     let targets = config.collection_plan()?;
     if healthcheck {
         tracing::info!(targets = targets.len(), "report source preflight passed");
+        return Ok(());
+    }
+    if matches!(arguments.as_slice(), [command] if command == "deliver-one") {
+        ensure!(
+            config.mode() == ReportWorkerMode::DeliveryCanary && config.policy().enabled,
+            "deliver-one requires explicit delivery_canary mode and enabled policy"
+        );
+        let worker = config.delivery_worker(outbox)?;
+        let outcome = timeout(DELIVERY_CANARY_TIMEOUT, worker.deliver_one())
+            .await
+            .context(
+                "Gmail canary exceeded 60 seconds; any claimed row remains sending for reconciliation",
+            )??;
+        tracing::info!(?outcome, "single Gmail canary attempt finished");
         return Ok(());
     }
     if let [
@@ -138,6 +155,9 @@ async fn main() -> Result<()> {
                 result = run_dry_scheduler(&config, &outbox, &snapshots) => result?,
                 _ = shutdown_signal() => {}
             }
+        }
+        (ReportWorkerMode::DeliveryCanary, true) => {
+            bail!("delivery_canary mode requires the explicit deliver-one command")
         }
         _ => bail!("report-worker mode and policy enabled flag are inconsistent"),
     }
@@ -294,7 +314,7 @@ async fn generate_batch(
 
 fn usage() -> Result<()> {
     bail!(
-        "usage: report-worker [healthcheck | generate <batch-id> | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
+        "usage: report-worker [healthcheck | deliver-one | generate <batch-id> | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
     )
 }
 

@@ -9,6 +9,10 @@ use super::{
     ReportKey,
     artifact_store::LocalArtifactStore,
     collector_plan::{CollectionPlanError, CollectionTarget, build_collection_plan},
+    gmail_delivery::GmailDeliveryService,
+    gmail_oauth::GmailOAuthCredentials,
+    gmail_outbox::{GmailOutboxWorker, GmailProvider},
+    mail_routing::MailRouting,
     policy::DailyReportPolicy,
     postgres_outbox::PostgresOutboxRepository,
     postgres_snapshot::PostgresSnapshotRepository,
@@ -20,25 +24,29 @@ const POLICY_PATH_ENV: &str = "DAILY_REPORT_POLICY";
 const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
 const ARTIFACT_ROOT_ENV: &str = "REPORT_ARTIFACT_ROOT";
 const MODE_ENV: &str = "REPORT_WORKER_MODE";
+const MAIL_ROUTING_PATH_ENV: &str = "REPORT_MAIL_ROUTING";
+const GMAIL_CREDENTIAL_DIR_ENV: &str = "REPORT_GMAIL_OAUTH_DIR";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportWorkerMode {
     Disabled,
     DryRun,
+    DeliveryCanary,
 }
 
 /// Credential-isolated configuration for the reporting runtime.
 ///
-/// This process reads registry metadata and routing policy only. It never
-/// resolves marketplace credential environment variables, calls `dotenv`, or
-/// accepts any mail/S3 configuration in this phase.
+/// This process never resolves marketplace credential environment variables or
+/// calls `dotenv`. Mail configuration is loaded only for the explicit
+/// single-attempt canary mode; disabled and dry-run modes do not read it.
 pub struct ReportWorkerConfig {
     database: Config,
     mode: ReportWorkerMode,
     policy: DailyReportPolicy,
     registry: Arc<AccessRegistry>,
     artifact_store: LocalArtifactStore,
+    mail_provider: Option<GmailProvider>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +69,8 @@ impl ReportWorkerConfig {
         let mode = match lookup(MODE_ENV).as_deref().unwrap_or("disabled") {
             "disabled" => ReportWorkerMode::Disabled,
             "dry_run" => ReportWorkerMode::DryRun,
-            _ => bail!("report-worker mode must be disabled or dry_run"),
+            "delivery_canary" => ReportWorkerMode::DeliveryCanary,
+            _ => bail!("report-worker mode must be disabled, dry_run, or delivery_canary"),
         };
         let raw_database =
             lookup(DATABASE_URL_ENV).context("REPORT_WORKER_DATABASE_URL is required")?;
@@ -85,12 +94,32 @@ impl ReportWorkerConfig {
             lookup(ARTIFACT_ROOT_ENV).context("REPORT_ARTIFACT_ROOT is required")?;
         let artifact_store = LocalArtifactStore::open(artifact_root)
             .context("REPORT_ARTIFACT_ROOT must be an existing safe directory")?;
+        let mail_provider = if mode == ReportWorkerMode::DeliveryCanary {
+            ensure!(
+                policy.enabled,
+                "delivery canary requires an enabled daily report policy"
+            );
+            let routing_path =
+                lookup(MAIL_ROUTING_PATH_ENV).context("REPORT_MAIL_ROUTING is required")?;
+            let credential_directory =
+                lookup(GMAIL_CREDENTIAL_DIR_ENV).context("REPORT_GMAIL_OAUTH_DIR is required")?;
+            let routing = MailRouting::load(routing_path, &policy)
+                .context("REPORT_MAIL_ROUTING is invalid")?;
+            let credentials = GmailOAuthCredentials::load(credential_directory)
+                .context("REPORT_GMAIL_OAUTH_DIR is invalid")?;
+            let delivery = GmailDeliveryService::through_mail_egress()
+                .context("fixed Gmail delivery transport is invalid")?;
+            Some(GmailProvider::new(delivery, routing, credentials))
+        } else {
+            None
+        };
         Ok(Self {
             database,
             mode,
             policy,
             registry: snapshot,
             artifact_store,
+            mail_provider,
         })
     }
 
@@ -104,6 +133,25 @@ impl ReportWorkerConfig {
 
     pub fn artifact_store(&self) -> &LocalArtifactStore {
         &self.artifact_store
+    }
+
+    /// Constructs the one-attempt delivery coordinator only in the explicit
+    /// canary mode. The shipped Compose service stays disabled and therefore
+    /// has neither mail configuration nor a path to this constructor.
+    pub fn delivery_worker(&self, outbox: PostgresOutboxRepository) -> Result<GmailOutboxWorker> {
+        ensure!(
+            self.mode == ReportWorkerMode::DeliveryCanary && self.policy.enabled,
+            "Gmail delivery is not enabled"
+        );
+        let provider = self
+            .mail_provider
+            .clone()
+            .context("Gmail delivery configuration is unavailable")?;
+        Ok(GmailOutboxWorker::new(
+            outbox,
+            self.artifact_store.clone(),
+            provider,
+        ))
     }
 
     /// Performs the credential-free source preflight used by health checks.
@@ -241,7 +289,7 @@ fn read_bounded_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -256,6 +304,59 @@ mod tests {
         ));
         fs::write(&path, body).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode(_path: &Path, _mode: u32) {}
+
+    fn private_file(label: &str, body: &str) -> PathBuf {
+        let path = file(label, body);
+        set_mode(&path, 0o600);
+        path
+    }
+
+    fn gmail_credentials() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "mcp-ozon-report-worker-gmail-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        set_mode(&path, 0o700);
+        for (name, value) in [
+            ("client_id", "client-id.apps.googleusercontent.com"),
+            ("client_secret", "client-secret"),
+            ("refresh_token", "refresh-token"),
+        ] {
+            let file = path.join(name);
+            fs::write(&file, value).unwrap();
+            set_mode(&file, 0o600);
+        }
+        path
+    }
+
+    fn canary_entries() -> Vec<(&'static str, String)> {
+        let mut entries = valid_entries(true);
+        let routing = private_file(
+            "routing",
+            r#"{"version":1,"routes":[{"name":"DAILY_REPORT_SENDER_EMAIL","address":"sender@example.test"},{"name":"DAILY_REPORT_PILOT_RECIPIENT_EMAIL","address":"recipient@example.test"}]}"#,
+        );
+        entries.extend([
+            (MODE_ENV, "delivery_canary".to_owned()),
+            (MAIL_ROUTING_PATH_ENV, routing.display().to_string()),
+            (
+                GMAIL_CREDENTIAL_DIR_ENV,
+                gmail_credentials().display().to_string(),
+            ),
+        ]);
+        entries
     }
 
     fn registry() -> &'static str {
@@ -425,6 +526,85 @@ mod tests {
         let config = config(entries).unwrap();
         assert_eq!(config.mode(), ReportWorkerMode::DryRun);
         assert!(config.policy().enabled);
+    }
+
+    #[test]
+    fn disabled_and_dry_run_modes_never_lookup_mail_configuration() {
+        for (mode, enabled) in [("disabled", false), ("dry_run", true)] {
+            let mut entries = valid_entries(enabled);
+            entries.push((MODE_ENV, mode.to_owned()));
+            let loaded = ReportWorkerConfig::from_lookup(|key| {
+                assert!(!matches!(
+                    key,
+                    MAIL_ROUTING_PATH_ENV | GMAIL_CREDENTIAL_DIR_ENV
+                ));
+                entries
+                    .iter()
+                    .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
+            })
+            .unwrap();
+            assert!(loaded.mail_provider.is_none());
+        }
+    }
+
+    #[test]
+    fn delivery_canary_requires_enabled_policy_and_exact_private_mail_files() {
+        let canary = config(canary_entries()).unwrap();
+        assert_eq!(canary.mode(), ReportWorkerMode::DeliveryCanary);
+        assert!(canary.policy().enabled);
+        assert!(canary.mail_provider.is_some());
+
+        for missing in [MAIL_ROUTING_PATH_ENV, GMAIL_CREDENTIAL_DIR_ENV] {
+            let mut entries = canary_entries();
+            entries.retain(|(key, _)| *key != missing);
+            assert!(config(entries).is_err());
+        }
+
+        let disabled_policy = canary_entries();
+        let policy_path = disabled_policy
+            .iter()
+            .find(|(key, _)| *key == POLICY_PATH_ENV)
+            .unwrap()
+            .1
+            .clone();
+        fs::write(policy_path, policy(false)).unwrap();
+        assert!(config(disabled_policy).is_err());
+
+        let mut invalid_routing = canary_entries();
+        invalid_routing
+            .iter_mut()
+            .find(|(key, _)| *key == MAIL_ROUTING_PATH_ENV)
+            .unwrap()
+            .1 = private_file("bad-routing", "{}").display().to_string();
+        assert!(config(invalid_routing).is_err());
+
+        let mut invalid_credentials = canary_entries();
+        invalid_credentials
+            .iter_mut()
+            .find(|(key, _)| *key == GMAIL_CREDENTIAL_DIR_ENV)
+            .unwrap()
+            .1 = std::env::temp_dir().display().to_string();
+        assert!(config(invalid_credentials).is_err());
+    }
+
+    #[cfg_attr(
+        not(coverage),
+        ignore = "requires the isolated report-worker PostgreSQL role"
+    )]
+    #[tokio::test]
+    async fn canary_builds_the_non_looping_delivery_worker() {
+        let database_url = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL")
+            .expect("coverage wrapper must provide the report-worker database URL");
+        let mut entries = canary_entries();
+        entries
+            .iter_mut()
+            .find(|(key, _)| *key == DATABASE_URL_ENV)
+            .unwrap()
+            .1 = database_url;
+        let config = config(entries).unwrap();
+        let (outbox, _) = config.connect().await.unwrap();
+        let worker = config.delivery_worker(outbox).unwrap();
+        assert!(format!("{worker:?}").contains("single-attempt"));
     }
 
     #[test]

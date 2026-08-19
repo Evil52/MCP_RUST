@@ -152,12 +152,14 @@ transient network problem. The OAuth transport accepts exactly the private files
 uses only Google's fixed token endpoint through the same dedicated mail-egress
 proxy, and accepts only a bounded Bearer token for the minimal
 `https://www.googleapis.com/auth/gmail.send` scope. The production credential
-mount, mail-egress deployment and runtime loop remain future
+mount, mail-egress deployment and continuous delivery loop remain future
 release gates. A strict private routing-file loader now resolves the policy's
 symbolic sender and audience names to addresses. It requires one exact route
 per configured symbol, refuses extra/missing/duplicate routes and never lets a
 prompt, report row or account payload select an address. The routing file is
-not mounted or consumed by the runtime yet. No Gmail password or address
+not mounted by the shipped Compose service. It is consumed only in explicit
+`REPORT_WORKER_MODE=delivery_canary`, together with an exact private OAuth
+directory. No Gmail password or address
 belongs in the OAuth directory, repository, Compose environment or logs. An opt-in
 `REPORT_WORKER_MODE=dry_run` runtime ticks
 once per minute, plans due 08:00/17:00 EKB occurrences and retries only
@@ -169,12 +171,15 @@ four-source manifest. The immutable local store and outbox-publication
 primitive can now be invoked explicitly for one already-planned outbox batch
 while delivery remains disabled. Consolidated two-period
 catch-up rendering remains fail-closed until it has an explicit two-section
-template rather than silently presenting one interval as two reports.
-Consequently this phase cannot send email and cannot affect a
-marketplace. Search-position collection remains disabled.
+template rather than silently presenting one interval as two reports. The
+shipped Compose service consequently cannot send email. The binary can perform
+one operator-invoked `deliver-one` canary attempt when all private mounts and
+the dedicated mail-egress proxy are provisioned outside the default stack; it
+has no automatic delivery loop. It cannot affect a marketplace. Search-position
+collection remains disabled.
 
 `report-worker` supports `healthcheck`, disabled idle operation and the
-operator-only command below. The selected actor must belong to the selected
+operator-only commands below. The selected actor must belong to the selected
 audience; its account scope comes from the validated policy and cannot be
 supplied on the command line. Existing output files are never overwritten.
 
@@ -183,10 +188,13 @@ report-worker preview <audience-id> <actor-id> <YYYY-MM-DD> \
   <morning|evening> <cutoff-rfc3339> <existing-output-dir>
 
 report-worker generate <batch-id>
+
+REPORT_WORKER_MODE=delivery_canary report-worker deliver-one
 ```
 
-Both commands deliberately require delivery mode and policy to remain
-disabled. Neither reads recipient email values, sends mail or calls a
+`preview` requires disabled mode and a disabled policy. `generate` accepts
+disabled mode with a disabled policy or dry-run mode with an enabled policy;
+neither command reads recipient email values, sends mail or calls a
 marketplace. `preview` accepts an operator-selected manager and output path but
 never creates or changes an outbox occurrence. `generate` accepts only a
 positive batch ID: recipient, manager/account scope, report date, kind and
@@ -194,7 +202,11 @@ cutoff are loaded from PostgreSQL plus the validated policy. It renders with
 the immutable batch creation timestamp, commits both files to the dedicated
 artifact volume and only then marks that exact batch ready. Repeating it can
 only reproduce or reuse the same bytes. The hardened production container has
-a read-only root filesystem plus one dedicated artifact volume.
+a read-only root filesystem plus one dedicated artifact volume. `deliver-one`
+requires an enabled policy, strict private routing and OAuth files, claims at
+most one ready batch, and is bounded by 60 seconds. It refreshes OAuth once and
+sends once; an ambiguous or unpersisted post-claim outcome remains `sending`
+for operator reconciliation rather than being retried.
 
 The separate collector has two explicit one-account canary commands:
 

@@ -242,6 +242,10 @@ has broader vendor permissions.
   `sending` and never reinterpret it as a retryable pre-send failure.
   Persist local artifact/routing failures and explicit provider rejection under separate permanent
   error classes; never relabel them as a transient transport failure merely to make them retryable.
+  Before any automatic loop exists, exercise only the explicit `delivery_canary` `deliver-one`
+  command. It must claim at most one ready batch, finish within the outer 60-second budget, and
+  leave any timed-out claimed row `sending`. The default Compose service must remain `disabled`
+  and must not mount routing, OAuth credentials, or the mail-egress network.
 - Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
   through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
   `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,
