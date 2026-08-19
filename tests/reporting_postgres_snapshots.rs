@@ -365,7 +365,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
         }],
         account_id.clone(),
         timestamp("2098-08-17T03:00:00Z"),
-        timestamp("2098-08-17T02:30:00Z"),
+        || timestamp("2098-08-17T02:30:00Z"),
         timestamp("2098-08-15T19:00:00Z"),
         timestamp("2098-08-16T19:00:00Z"),
         "integration-test".to_owned(),

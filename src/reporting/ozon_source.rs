@@ -53,22 +53,30 @@ const MAX_PRODUCT_PAGES: usize = 100;
 
 /// Collects the three Seller sources and atomically publishes them together
 /// with a separately verified Performance SKU snapshot.
+///
+/// The observation clock is invoked only after every Seller request has
+/// completed. This prevents callers from accidentally labelling later facts
+/// with a timestamp captured before collection finished.
 #[allow(clippy::too_many_arguments)]
-pub async fn collect_complete_snapshots(
+pub async fn collect_complete_snapshots<F>(
     transport: &dyn OzonReportTransport,
     advertising: Vec<CollectedAdvertisingFact>,
     account_id: String,
     cutoff_at: DateTime<Utc>,
-    source_as_of: DateTime<Utc>,
+    completed_at: F,
     sales_period_start: DateTime<Utc>,
     sales_period_end: DateTime<Utc>,
     collector_version: String,
-) -> Result<Vec<CollectedSnapshot>, OzonReportSourceError> {
+) -> Result<Vec<CollectedSnapshot>, OzonReportSourceError>
+where
+    F: FnOnce() -> DateTime<Utc>,
+{
     let source = OzonReportSource::new(transport);
     let (date_from, date_to) = report_business_dates(sales_period_start, sales_period_end)?;
     let facts = source
         .collect_required_seller_facts(date_from, date_to)
         .await?;
+    let source_as_of = completed_at();
     let snapshots = facts
         .into_complete_snapshots(
             advertising,
@@ -916,7 +924,10 @@ mod tests {
             }],
             "ozon".to_owned(),
             as_of,
-            as_of,
+            || {
+                assert!(transport.0.lock().unwrap().is_empty());
+                as_of
+            },
             period_start,
             as_of,
             "test-1".to_owned(),
@@ -940,7 +951,7 @@ mod tests {
                 Vec::new(),
                 "ozon".to_owned(),
                 as_of,
-                as_of,
+                Utc::now,
                 period_start,
                 as_of,
                 "test-1".to_owned(),
@@ -975,7 +986,7 @@ mod tests {
                 }],
                 "ozon".to_owned(),
                 as_of,
-                as_of,
+                || as_of,
                 period_start,
                 as_of,
                 "test-1".to_owned(),

@@ -193,13 +193,12 @@ async fn run_ozon_dry_run(
             .collect(date)
             .await
             .map_err(|error| anyhow::anyhow!("performance_{}", error.code()))?;
-        let source_as_of = Utc::now();
         let snapshots = collect_complete_snapshots(
             &transport,
             advertising,
             account_id.to_owned(),
             cutoff_at,
-            source_as_of,
+            Utc::now,
             period_start,
             period_end,
             env!("CARGO_PKG_VERSION").to_owned(),
