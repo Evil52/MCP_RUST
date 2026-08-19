@@ -1,8 +1,9 @@
 //! Deterministic scheduling primitives for server-generated daily reports.
 //!
-//! This module does not collect marketplace data and does not send email. It
-//! defines stable report identities and catch-up decisions which a future
-//! PostgreSQL outbox worker can persist and deliver exactly once.
+//! The shipped runtime keeps marketplace collection and email delivery
+//! disabled by default. These modules define the deterministic identities,
+//! persistence, rendering and bounded provider boundaries needed to enable
+//! those operations through separately reviewed deployment overlays.
 
 use std::collections::BTreeSet;
 
@@ -17,6 +18,7 @@ pub mod collector_schedule;
 pub mod collector_service;
 pub mod credential_bootstrap;
 pub mod dataset;
+pub mod gmail;
 pub mod html;
 pub mod kpi;
 pub mod mail;

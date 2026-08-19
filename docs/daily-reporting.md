@@ -125,10 +125,16 @@ writer, bounded fact reader and report dataset are present. Manual bounded Ozon
 and WB adapters are available for policy-scoped canaries, but automatic
 marketplace collection remains disabled.
 No scheduler is enabled in the shipped Compose configuration, and no S3 writer
-or mail provider is wired. A provider-independent email envelope now validates
+or live mail delivery is wired. A provider-independent email envelope validates
 one server-resolved sender and recipient, one exact claimed report scope, and
-the bounded HTML/XLSX artifact without reading environment variables or using
-the network. An opt-in `REPORT_WORKER_MODE=dry_run` runtime ticks
+the bounded HTML/XLSX artifact without reading environment variables. A
+bounded Gmail API transport also exists, but is not connected to the worker:
+its production constructor has one fixed Gmail send endpoint, one fixed
+dedicated mail-egress proxy, disabled redirects and ambient proxies, a bounded
+response, payload-free errors, and no automatic retry after an ambiguous
+outcome. OAuth refresh, credential mounts, mail-egress deployment and the
+outbox-to-provider worker remain future release gates. An opt-in
+`REPORT_WORKER_MODE=dry_run` runtime ticks
 once per minute, plans due 08:00/17:00 EKB occurrences and retries only
 single-section `planned`/`generating` artifact work inside its delivery window.
 It never claims a ready delivery. The isolated
