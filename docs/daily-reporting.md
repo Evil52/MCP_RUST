@@ -200,14 +200,19 @@ only the `08:00–08:30` and `17:00–17:30` Asia/Yekaterinburg completion windo
 returns the same immutable cutoff after a restart inside that window, and
 refuses to backdate current state after the window closes. An external timer
 may invoke the one-shot command below while the explicitly enabled policy and
-mode are active:
+mode are active, or the same process can run the bounded minute scheduler:
 
 ```text
 REPORT_COLLECTOR_MODE=scheduled report-collector collect-due
+REPORT_COLLECTOR_MODE=scheduled report-collector run-scheduler
 ```
 
-The command exits successfully without marketplace I/O outside a completion
-window. Inside a window, a PostgreSQL-backed
+Both paths perform no marketplace I/O outside a completion window. The
+long-running command executes an immediate tick, then once per minute with
+missed ticks skipped and without overlapping passes. Five consecutive tick
+failures terminate the process so its supervisor can restart a fresh database
+session. SIGTERM/Ctrl-C cancels the active target and attempts to release its
+lease before exit. Inside a window, a PostgreSQL-backed
 preflight now removes exact account/marketplace/cutoff targets that already
 have all four terminal published sources. It then processes missing policy
 targets sequentially so shared provider quotas are not multiplied. Every
@@ -221,9 +226,10 @@ failure, and uses a monotonically increasing fencing generation. All four
 source snapshots and claim completion commit together, so an expired owner
 cannot publish after a replacement starts. Each target is bounded by twelve
 minutes and by the remaining completion window. Startup or idle operation never
-performs collection: `collect-due` must be supplied explicitly. The shipped
-Compose mode and policy both remain disabled, and marketplace credential values
-are intentionally absent from that Compose contract.
+performs collection: `collect-due` or `run-scheduler` must be supplied
+explicitly. The shipped Compose mode and policy both remain disabled, and
+marketplace credential values are intentionally absent from that Compose
+contract.
 
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every

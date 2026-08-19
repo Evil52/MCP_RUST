@@ -56,13 +56,15 @@ published projections and operate the outbox. It does not store email bodies,
 credentials or marketplace payloads. Rendered HTML/XLSX bytes live outside
 PostgreSQL in an immutable artifact store; the outbox keeps only the stable
 XLSX object key and SHA-256.
-The collector also exposes an opt-in one-shot `collect-due` command for an
-external timer. It considers only the open 08:00/17:00 EKB thirty-minute
-completion window, skips already published targets, claims each remaining
-account before resolving only that account's read credentials, and publishes
-the four mandatory sources atomically. The shipped Compose mode and policy are
-still disabled and carry no marketplace credential values, so this command is
-not active in the default deployment.
+The collector also exposes an opt-in one-shot `collect-due` command and a
+non-overlapping `run-scheduler` minute loop. They consider only the open
+08:00/17:00 EKB thirty-minute completion window, skip already published
+targets, claim each remaining account before resolving only that account's read
+credentials, and publish the four mandatory sources atomically. Missed timer
+ticks are skipped; bounded sustained failures exit for supervisor restart, and
+shutdown attempts to release the active claim. The shipped Compose mode and
+policy are still disabled and carry no marketplace credential values, so
+neither path is active in the default deployment.
 There is still no `Поисковая видимость за сутки` Dashboard, task registry or
 email job. A manual deterministic
 HTML/XLSX preview and a policy-scoped `report-worker generate <batch-id>` path

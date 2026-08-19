@@ -42,8 +42,8 @@ pub enum ReportCollectorMode {
     /// Explicit operator-only mode for one atomic Wildberries report canary.
     /// It loads only policy-scoped WB read credentials and never schedules.
     WbDryRun,
-    /// Explicit one-shot scheduled collection mode. The caller must invoke
-    /// `collect-due`; startup alone never performs marketplace I/O.
+    /// Explicit scheduled collection mode. The caller must invoke
+    /// `collect-due` or `run-scheduler`; startup alone never performs I/O.
     Scheduled,
 }
 

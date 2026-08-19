@@ -16,7 +16,8 @@ use mcp_ozon::reporting::{
     wb_source::{WbClientReportTransport, WbReportSource},
 };
 use tokio::signal;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, MissedTickBehavior, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// The individual Seller request limit is configured by the report collector.
@@ -24,6 +25,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// transactional snapshot publication, so a slow upstream cannot hold an
 /// operator invocation forever.
 const REPORT_TARGET_TOTAL_DEADLINE: Duration = Duration::from_secs(12 * 60);
+const SCHEDULED_TICK: Duration = Duration::from_secs(60);
+const MAX_CONSECUTIVE_SCHEDULER_FAILURES: u32 = 5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -56,7 +59,11 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Command::CollectDue => {
-            run_due_collection(&config, &writer, Utc::now()).await?;
+            run_collect_due_command(&config, &writer).await?;
+            return Ok(());
+        }
+        Command::RunScheduler => {
+            run_scheduler_command(&config, &writer).await?;
             return Ok(());
         }
         Command::ServeDisabled => {}
@@ -79,6 +86,7 @@ enum Command {
     OzonDryRun { account_id: String, date: NaiveDate },
     WbDryRun { account_id: String, date: NaiveDate },
     CollectDue,
+    RunScheduler,
 }
 
 fn parse_command(arguments: &[String]) -> Result<Command> {
@@ -86,6 +94,7 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         [] => Ok(Command::ServeDisabled),
         [argument] if argument == "healthcheck" => Ok(Command::Healthcheck),
         [argument] if argument == "collect-due" => Ok(Command::CollectDue),
+        [argument] if argument == "run-scheduler" => Ok(Command::RunScheduler),
         [command, account_id, date]
             if matches!(command.as_str(), "ozon-dry-run" | "wb-dry-run") =>
         {
@@ -113,8 +122,80 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         }
         _ => {
             bail!(
-                "usage: report-collector [healthcheck | collect-due | ozon-dry-run <account-id> <YYYY-MM-DD> | wb-dry-run <account-id> <YYYY-MM-DD>]"
+                "usage: report-collector [healthcheck | collect-due | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> | wb-dry-run <account-id> <YYYY-MM-DD>]"
             )
+        }
+    }
+}
+
+async fn run_collect_due_command(
+    config: &ReportCollectorConfig,
+    writer: &PostgresSnapshotWriter,
+) -> Result<()> {
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_cancellation.cancel();
+    });
+    let result = run_due_collection(config, writer, Utc::now(), &cancellation).await;
+    signal_task.abort();
+    result
+}
+
+async fn run_scheduler_command(
+    config: &ReportCollectorConfig,
+    writer: &PostgresSnapshotWriter,
+) -> Result<()> {
+    ensure!(
+        config.mode() == ReportCollectorMode::Scheduled && config.policy().enabled,
+        "run-scheduler requires scheduled mode and an enabled daily report policy"
+    );
+    let cancellation = CancellationToken::new();
+    let signal_cancellation = cancellation.clone();
+    let signal_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        signal_cancellation.cancel();
+    });
+    tracing::info!(
+        targets = config.collection_plan().len(),
+        tick_seconds = SCHEDULED_TICK.as_secs(),
+        "daily report collection scheduler started"
+    );
+    let result = run_collection_scheduler(config, writer, &cancellation).await;
+    signal_task.abort();
+    result
+}
+
+async fn run_collection_scheduler(
+    config: &ReportCollectorConfig,
+    writer: &PostgresSnapshotWriter,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut timer = tokio::time::interval(SCHEDULED_TICK);
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut consecutive_failures = 0_u32;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = timer.tick() => {}
+        }
+        match run_due_collection(config, writer, Utc::now(), cancellation).await {
+            Ok(()) => consecutive_failures = 0,
+            Err(error) => {
+                consecutive_failures += 1;
+                ensure!(
+                    consecutive_failures < MAX_CONSECUTIVE_SCHEDULER_FAILURES,
+                    "daily report collector failed {consecutive_failures} consecutive ticks; \
+                     exiting so the supervisor can restart it"
+                );
+                tracing::warn!(
+                    consecutive_failures,
+                    error = %error,
+                    "daily report collection tick failed; retrying on the next tick"
+                );
+            }
         }
     }
 }
@@ -123,6 +204,7 @@ async fn run_due_collection(
     config: &ReportCollectorConfig,
     writer: &PostgresSnapshotWriter,
     now: DateTime<Utc>,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
     ensure!(
         config.mode() == ReportCollectorMode::Scheduled,
@@ -142,6 +224,10 @@ async fn run_due_collection(
     let mut failed = 0_usize;
     let total = plan.targets.len();
     for target in plan.targets {
+        if cancellation.is_cancelled() {
+            tracing::info!("daily report collection cancelled before the next target");
+            return Ok(());
+        }
         let remaining = (plan.occurrence.complete_by - Utc::now())
             .to_std()
             .unwrap_or(Duration::ZERO);
@@ -162,11 +248,23 @@ async fn run_due_collection(
             continue;
         };
         let deadline = remaining.min(REPORT_TARGET_TOTAL_DEADLINE);
-        let outcome = timeout(
-            deadline,
-            collect_scheduled_target(config, writer, &claim, &target, &plan.occurrence),
-        )
-        .await;
+        let outcome = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                let released = writer.release_claim(&claim).await.unwrap_or(false);
+                tracing::info!(
+                    account_id = target.account_id,
+                    marketplace = ?target.marketplace,
+                    released,
+                    "scheduled report collection cancelled and its live claim was released"
+                );
+                return Ok(());
+            }
+            outcome = timeout(
+                deadline,
+                collect_scheduled_target(config, writer, &claim, &target, &plan.occurrence),
+            ) => outcome
+        };
         match outcome {
             Ok(Ok(snapshot_ids)) => {
                 completed += 1;
