@@ -3,6 +3,7 @@ use std::{collections::VecDeque, fs, future::Future, pin::Pin, str::FromStr, syn
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind,
+    collector_plan::CollectionTarget,
     collector_service::ReportCollectorConfig,
     ozon_adapter::OzonReportRequest,
     ozon_source::{OzonReportSourceError, OzonReportTransport, collect_complete_snapshots},
@@ -12,7 +13,7 @@ use mcp_ozon::reporting::{
     },
     postgres_snapshot::{PostgresSnapshotError, PostgresSnapshotRepository},
     preview::render_published_preview,
-    snapshot::{AccountScope, Marketplace, SnapshotQuality, SnapshotStatus},
+    snapshot::{AccountScope, Marketplace, SnapshotQuality, SnapshotSource, SnapshotStatus},
 };
 use serde_json::{Value, json};
 use tokio_postgres::Config;
@@ -351,6 +352,33 @@ async fn complete_ozon_source_set_is_published_atomically() {
         }}],"cursor":""})),
     ])));
     let account_id = format!("ozon_source_atomic_{}", std::process::id());
+    assert!(
+        writer
+            .published_targets(timestamp("2098-08-17T03:00:00Z"), &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let target = CollectionTarget {
+        account_id: account_id.clone(),
+        marketplace: Marketplace::Ozon,
+        sources: [
+            SnapshotSource::Sales,
+            SnapshotSource::Advertising,
+            SnapshotSource::Stocks,
+            SnapshotSource::Prices,
+        ],
+    };
+    assert!(
+        writer
+            .published_targets(
+                timestamp("2098-08-17T03:00:00Z"),
+                std::slice::from_ref(&target)
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let snapshots = collect_complete_snapshots(
         &transport,
         vec![CollectedAdvertisingFact {
@@ -374,6 +402,30 @@ async fn complete_ozon_source_set_is_published_atomically() {
     .unwrap();
     let ids = writer.persist_batch(&snapshots).await.unwrap();
     assert_eq!(ids.len(), 4);
+    assert_eq!(
+        writer
+            .published_targets(
+                timestamp("2098-08-17T03:00:00Z"),
+                std::slice::from_ref(&target),
+            )
+            .await
+            .unwrap(),
+        [(account_id.clone(), Marketplace::Ozon)]
+            .into_iter()
+            .collect()
+    );
+    let wrong_marketplace = CollectionTarget {
+        account_id: account_id.clone(),
+        marketplace: Marketplace::Wildberries,
+        sources: target.sources,
+    };
+    assert!(
+        writer
+            .published_targets(timestamp("2098-08-17T03:00:00Z"), &[wrong_marketplace],)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let worker_config = Config::from_str(&worker_url).unwrap();
     let repository = PostgresSnapshotRepository::connect(&worker_config)
         .await

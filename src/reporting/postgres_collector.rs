@@ -7,10 +7,15 @@ use tokio_postgres::{Client, Config, Transaction};
 
 use crate::postgres::SupervisedClient;
 
-use super::snapshot::{Marketplace, SnapshotDescriptor, SnapshotSource, SnapshotStatus};
+use super::{
+    collector_plan::CollectionTarget,
+    snapshot::{Marketplace, SnapshotDescriptor, SnapshotSource, SnapshotStatus},
+};
 
 const MAX_FACT_ROWS: usize = 25_000;
 const MAX_COLLECTOR_VERSION_BYTES: usize = 64;
+const MAX_COLLECTION_TARGETS: usize = 64;
+const MAX_ACCOUNT_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CollectedSalesFact {
@@ -215,6 +220,62 @@ impl PostgresSnapshotWriter {
             .ok_or(PostgresCollectorError::Unavailable)
     }
 
+    /// Returns policy targets whose exact cutoff already has all four
+    /// terminal published source snapshots.
+    ///
+    /// The bounded result is used before marketplace I/O. A partial account
+    /// set is not considered published, so the scheduler can fail closed on
+    /// the existing uniqueness conflict instead of silently treating an
+    /// incomplete report as complete.
+    pub async fn published_targets(
+        &self,
+        cutoff_at: DateTime<Utc>,
+        targets: &[CollectionTarget],
+    ) -> Result<BTreeSet<(String, Marketplace)>, PostgresCollectorError> {
+        validate_coverage_targets(targets)?;
+        if targets.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let account_ids = targets
+            .iter()
+            .map(|target| target.account_id.clone())
+            .collect::<Vec<_>>();
+        let marketplaces = targets
+            .iter()
+            .map(|target| marketplace_name(target.marketplace).to_owned())
+            .collect::<Vec<_>>();
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let rows = client
+            .query(
+                "WITH requested(account_id, marketplace) AS ( \
+                     SELECT * FROM unnest($2::text[], $3::text[]) \
+                 ) \
+                 SELECT snapshot.account_id, snapshot.marketplace \
+                 FROM daily_reporting.source_snapshots AS snapshot \
+                 JOIN requested \
+                   ON requested.account_id = snapshot.account_id::text \
+                  AND requested.marketplace = snapshot.marketplace::text \
+                 WHERE snapshot.cutoff_at = $1 \
+                   AND snapshot.status IN ('succeeded', 'partial') \
+                 GROUP BY snapshot.account_id, snapshot.marketplace \
+                 HAVING count(*) = 4 AND count(DISTINCT source) = 4 \
+                 ORDER BY snapshot.account_id, snapshot.marketplace",
+                &[&cutoff_at, &account_ids, &marketplaces],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        rows.into_iter()
+            .map(|row| {
+                let marketplace = parse_marketplace(row.get(1))?;
+                Ok((row.get(0), marketplace))
+            })
+            .collect()
+    }
+
     /// Atomically appends facts and publishes their immutable snapshot.
     ///
     /// Any failure rolls back both the snapshot row and all facts. A duplicate
@@ -267,6 +328,42 @@ fn validate_batch(snapshots: &[CollectedSnapshot]) -> Result<(), PostgresCollect
     }
 }
 
+fn validate_coverage_targets(targets: &[CollectionTarget]) -> Result<(), PostgresCollectorError> {
+    let mut identities = BTreeSet::new();
+    let required_sources = SnapshotSource::ALL.into_iter().collect::<BTreeSet<_>>();
+    if targets.len() > MAX_COLLECTION_TARGETS
+        || targets.iter().any(|target| {
+            !identities.insert((&target.account_id, target.marketplace))
+                || target.account_id.is_empty()
+                || target.account_id.len() > MAX_ACCOUNT_ID_BYTES
+                || !target
+                    .account_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                || target.sources.into_iter().collect::<BTreeSet<_>>() != required_sources
+        })
+    {
+        Err(PostgresCollectorError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn marketplace_name(marketplace: Marketplace) -> &'static str {
+    match marketplace {
+        Marketplace::Ozon => "ozon",
+        Marketplace::Wildberries => "wildberries",
+    }
+}
+
+fn parse_marketplace(value: &str) -> Result<Marketplace, PostgresCollectorError> {
+    match value {
+        "ozon" => Ok(Marketplace::Ozon),
+        "wildberries" => Ok(Marketplace::Wildberries),
+        _ => Err(PostgresCollectorError::Unavailable),
+    }
+}
+
 async fn persist_in_transaction(
     transaction: &Transaction<'_>,
     snapshot: &CollectedSnapshot,
@@ -305,10 +402,7 @@ async fn insert_snapshot(
     transaction: &Transaction<'_>,
     snapshot: &CollectedSnapshot,
 ) -> Result<i64, PostgresCollectorError> {
-    let marketplace = match snapshot.marketplace {
-        Marketplace::Ozon => "ozon",
-        Marketplace::Wildberries => "wildberries",
-    };
+    let marketplace = marketplace_name(snapshot.marketplace);
     let source = match snapshot.facts.source() {
         SnapshotSource::Sales => "sales",
         SnapshotSource::Advertising => "advertising",
@@ -701,6 +795,65 @@ mod tests {
         assert_eq!(
             validate_batch(&[]),
             Err(PostgresCollectorError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn coverage_query_inputs_are_bounded_and_unique() {
+        let target = CollectionTarget {
+            account_id: "pilot".to_owned(),
+            marketplace: Marketplace::Ozon,
+            sources: SnapshotSource::ALL,
+        };
+        assert!(validate_coverage_targets(&[]).is_ok());
+        assert!(validate_coverage_targets(std::slice::from_ref(&target)).is_ok());
+        assert_eq!(
+            validate_coverage_targets(&[target.clone(), target]),
+            Err(PostgresCollectorError::InvalidInput)
+        );
+        let incomplete = CollectionTarget {
+            account_id: "incomplete".to_owned(),
+            marketplace: Marketplace::Ozon,
+            sources: [
+                SnapshotSource::Sales,
+                SnapshotSource::Advertising,
+                SnapshotSource::Stocks,
+                SnapshotSource::Stocks,
+            ],
+        };
+        assert_eq!(
+            validate_coverage_targets(&[incomplete]),
+            Err(PostgresCollectorError::InvalidInput)
+        );
+        for account_id in ["", "unsafe/account", &"a".repeat(MAX_ACCOUNT_ID_BYTES + 1)] {
+            assert_eq!(
+                validate_coverage_targets(&[CollectionTarget {
+                    account_id: account_id.to_owned(),
+                    marketplace: Marketplace::Ozon,
+                    sources: SnapshotSource::ALL,
+                }]),
+                Err(PostgresCollectorError::InvalidInput)
+            );
+        }
+        let too_many = (0..=MAX_COLLECTION_TARGETS)
+            .map(|index| CollectionTarget {
+                account_id: format!("account-{index}"),
+                marketplace: Marketplace::Ozon,
+                sources: SnapshotSource::ALL,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_coverage_targets(&too_many),
+            Err(PostgresCollectorError::InvalidInput)
+        );
+        assert_eq!(parse_marketplace("ozon"), Ok(Marketplace::Ozon));
+        assert_eq!(
+            parse_marketplace("wildberries"),
+            Ok(Marketplace::Wildberries)
+        );
+        assert_eq!(
+            parse_marketplace("unknown"),
+            Err(PostgresCollectorError::Unavailable)
         );
     }
 }

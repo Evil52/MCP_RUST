@@ -24,7 +24,7 @@ pub enum SnapshotSource {
 }
 
 impl SnapshotSource {
-    const ALL: [Self; 4] = [Self::Sales, Self::Advertising, Self::Stocks, Self::Prices];
+    pub(crate) const ALL: [Self; 4] = [Self::Sales, Self::Advertising, Self::Stocks, Self::Prices];
 
     fn freshness_sla(self) -> Duration {
         match self {
