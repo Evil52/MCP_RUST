@@ -278,15 +278,10 @@ fn log_source_completed(source: &'static str, facts: usize) {
 
 impl WbReportSource {
     pub async fn collect(&self, date: NaiveDate) -> Result<WbCollectedFacts, WbReportSourceError> {
-        tracing::info!(source = "sales", "collecting WB daily-report source");
-        let sales = self.collect_sales_pages(date).await?;
-        log_source_completed("sales", sales.len());
-        tracing::info!(source = "stocks", "collecting WB daily-report source");
-        let stocks = self.collect_stock_pages().await?;
-        log_source_completed("stocks", stocks.len());
-        tracing::info!(source = "prices", "collecting WB daily-report source");
-        let prices = self.collect_price_pages().await?;
-        log_source_completed("prices", prices.len());
+        // Advertising statistics have the tightest documented WB quota. Run
+        // that source first so a busy shared account fails before spending
+        // calls on the independently paginated sales, stock and price APIs.
+        // The completed four-source set is still published atomically.
         tracing::info!(source = "campaigns", "collecting WB daily-report source");
         let ids = parse_campaign_ids(&self.transport.campaigns().await?)
             .map_err(|_| WbReportSourceError::InvalidCampaignResponse)?;
@@ -304,6 +299,15 @@ impl WbReportSource {
             );
         }
         log_source_completed("advertising", advertising.len());
+        tracing::info!(source = "sales", "collecting WB daily-report source");
+        let sales = self.collect_sales_pages(date).await?;
+        log_source_completed("sales", sales.len());
+        tracing::info!(source = "stocks", "collecting WB daily-report source");
+        let stocks = self.collect_stock_pages().await?;
+        log_source_completed("stocks", stocks.len());
+        tracing::info!(source = "prices", "collecting WB daily-report source");
+        let prices = self.collect_price_pages().await?;
+        log_source_completed("prices", prices.len());
         Ok(WbCollectedFacts {
             sales,
             advertising,
@@ -419,8 +423,9 @@ mod tests {
         stocks: Arc<Mutex<VecDeque<Value>>>,
         prices: Arc<Mutex<VecDeque<Value>>>,
         campaign_ids: Value,
-        stats: Arc<Mutex<VecDeque<Value>>>,
+        stats: Arc<Mutex<VecDeque<Result<Value, WbReportSourceError>>>>,
         requested_stats: Arc<Mutex<Vec<Vec<u64>>>>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
     struct SalesFixtureTransport {
@@ -487,13 +492,14 @@ mod tests {
                     "sizes":[{"price":100,"discountedPrice":90}]
                 }]}})]))),
                 campaign_ids: json!({"adverts":[{"status":9,"advert_list":[{"advertId":4}]}]}),
-                stats: Arc::new(Mutex::new(VecDeque::from([
+                stats: Arc::new(Mutex::new(VecDeque::from([Ok(
                     json!([{"advertId":4,"stats":[{
                         "date":"2026-08-17","nm_id":1,"views":10,"clicks":1,"sum":2,
                         "orders":1,"sum_price":90
                     }]}]),
-                ]))),
+                )]))),
                 requested_stats: Arc::new(Mutex::new(Vec::new())),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -507,6 +513,7 @@ mod tests {
             _offset: u32,
         ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
             Box::pin(async move {
+                self.calls.lock().unwrap().push("sales");
                 Ok(json!({"data":{"currency":"RUB","products":[{
                     "product":{"nmId":1},"statistic":{"selected":{
                         "period":{
@@ -525,6 +532,7 @@ mod tests {
             _offset: u32,
         ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
             Box::pin(async {
+                self.calls.lock().unwrap().push("stocks");
                 self.stocks
                     .lock()
                     .unwrap()
@@ -539,6 +547,7 @@ mod tests {
             _offset: u32,
         ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
             Box::pin(async {
+                self.calls.lock().unwrap().push("prices");
                 self.prices
                     .lock()
                     .unwrap()
@@ -550,7 +559,10 @@ mod tests {
         fn campaigns<'a>(
             &'a self,
         ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-            Box::pin(async { Ok(self.campaign_ids.clone()) })
+            Box::pin(async {
+                self.calls.lock().unwrap().push("campaigns");
+                Ok(self.campaign_ids.clone())
+            })
         }
 
         fn promotion_stats<'a>(
@@ -560,12 +572,13 @@ mod tests {
             _end: NaiveDate,
         ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
             Box::pin(async {
+                self.calls.lock().unwrap().push("advertising");
                 self.requested_stats.lock().unwrap().push(ids);
                 self.stats
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .ok_or(WbReportSourceError::InvalidResponse)
+                    .ok_or(WbReportSourceError::InvalidResponse)?
             })
         }
     }
@@ -611,6 +624,22 @@ mod tests {
                 .advertising
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn advertising_rate_limit_fails_before_other_wb_sources_are_called() {
+        let mut fixture = FixtureTransport::complete();
+        fixture.stats = Arc::new(Mutex::new(VecDeque::from([Err(
+            WbReportSourceError::Upstream(WbErrorKind::RateLimited),
+        )])));
+        let calls = Arc::clone(&fixture.calls);
+        assert_eq!(
+            WbReportSource::new(fixture)
+                .collect(NaiveDate::from_ymd_opt(2026, 8, 17).unwrap())
+                .await,
+            Err(WbReportSourceError::Upstream(WbErrorKind::RateLimited))
+        );
+        assert_eq!(&*calls.lock().unwrap(), &["campaigns", "advertising"]);
     }
 
     #[tokio::test]
@@ -689,7 +718,7 @@ mod tests {
             "status":9,
             "advert_list": (1_u64..=51).map(|advert_id| json!({"advertId":advert_id})).collect::<Vec<_>>()
         }]});
-        fixture.stats = Arc::new(Mutex::new(VecDeque::from([json!([]), json!([])])));
+        fixture.stats = Arc::new(Mutex::new(VecDeque::from([Ok(json!([])), Ok(json!([]))])));
         let requested_stats = Arc::clone(&fixture.requested_stats);
         let source = WbReportSource::new(fixture);
         let facts = source
@@ -812,7 +841,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_stats_and_full_page_limits_fail_closed() {
         let mut malformed = FixtureTransport::complete();
-        malformed.stats = Arc::new(Mutex::new(VecDeque::from([json!({})])));
+        malformed.stats = Arc::new(Mutex::new(VecDeque::from([Ok(json!({}))])));
         assert_eq!(
             WbReportSource::new(malformed)
                 .collect(NaiveDate::from_ymd_opt(2026, 8, 17).unwrap())
