@@ -33,6 +33,7 @@ pub enum ReportWorkerMode {
     Disabled,
     DryRun,
     DeliveryCanary,
+    ScheduledDelivery,
 }
 
 /// Credential-isolated configuration for the reporting runtime.
@@ -70,7 +71,10 @@ impl ReportWorkerConfig {
             "disabled" => ReportWorkerMode::Disabled,
             "dry_run" => ReportWorkerMode::DryRun,
             "delivery_canary" => ReportWorkerMode::DeliveryCanary,
-            _ => bail!("report-worker mode must be disabled, dry_run, or delivery_canary"),
+            "scheduled_delivery" => ReportWorkerMode::ScheduledDelivery,
+            _ => bail!(
+                "report-worker mode must be disabled, dry_run, delivery_canary, or scheduled_delivery"
+            ),
         };
         let raw_database =
             lookup(DATABASE_URL_ENV).context("REPORT_WORKER_DATABASE_URL is required")?;
@@ -94,10 +98,13 @@ impl ReportWorkerConfig {
             lookup(ARTIFACT_ROOT_ENV).context("REPORT_ARTIFACT_ROOT is required")?;
         let artifact_store = LocalArtifactStore::open(artifact_root)
             .context("REPORT_ARTIFACT_ROOT must be an existing safe directory")?;
-        let mail_provider = if mode == ReportWorkerMode::DeliveryCanary {
+        let mail_provider = if matches!(
+            mode,
+            ReportWorkerMode::DeliveryCanary | ReportWorkerMode::ScheduledDelivery
+        ) {
             ensure!(
                 policy.enabled,
-                "delivery canary requires an enabled daily report policy"
+                "mail delivery requires an enabled daily report policy"
             );
             let routing_path =
                 lookup(MAIL_ROUTING_PATH_ENV).context("REPORT_MAIL_ROUTING is required")?;
@@ -135,12 +142,15 @@ impl ReportWorkerConfig {
         &self.artifact_store
     }
 
-    /// Constructs the one-attempt delivery coordinator only in the explicit
-    /// canary mode. The shipped Compose service stays disabled and therefore
-    /// has neither mail configuration nor a path to this constructor.
+    /// Constructs the single-attempt delivery coordinator only in an explicit
+    /// mail mode. The shipped default Compose service stays disabled and
+    /// therefore has neither mail configuration nor a path to this constructor.
     pub fn delivery_worker(&self, outbox: PostgresOutboxRepository) -> Result<GmailOutboxWorker> {
         ensure!(
-            self.mode == ReportWorkerMode::DeliveryCanary && self.policy.enabled,
+            matches!(
+                self.mode,
+                ReportWorkerMode::DeliveryCanary | ReportWorkerMode::ScheduledDelivery
+            ) && self.policy.enabled,
             "Gmail delivery is not enabled"
         );
         let provider = self
@@ -359,6 +369,16 @@ mod tests {
         entries
     }
 
+    fn scheduled_delivery_entries() -> Vec<(&'static str, String)> {
+        let mut entries = canary_entries();
+        entries
+            .iter_mut()
+            .find(|(key, _)| *key == MODE_ENV)
+            .unwrap()
+            .1 = "scheduled_delivery".to_owned();
+        entries
+    }
+
     fn registry() -> &'static str {
         r#"{"version":1,"actors":[{"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}},{"id":"wb6","name":"Vahrusheva / Torsunova","role":"manager","oidc":{"username":"wb6"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana_serafimovich","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY","performance":{"client_id_env":"OZON_PERFORMANCE_ID","client_secret_env":"OZON_PERFORMANCE_SECRET"}}},{"id":"ip_domnyshev_wb","organization":"WB","marketplace":"wildberries","seller_client_id":"2","manager_id":"wb6","wildberries":{"api_token_env":"WB_TOKEN"}}]}"#
     }
@@ -554,6 +574,11 @@ mod tests {
         assert!(canary.policy().enabled);
         assert!(canary.mail_provider.is_some());
 
+        let scheduled = config(scheduled_delivery_entries()).unwrap();
+        assert_eq!(scheduled.mode(), ReportWorkerMode::ScheduledDelivery);
+        assert!(scheduled.policy().enabled);
+        assert!(scheduled.mail_provider.is_some());
+
         for missing in [MAIL_ROUTING_PATH_ENV, GMAIL_CREDENTIAL_DIR_ENV] {
             let mut entries = canary_entries();
             entries.retain(|(key, _)| *key != missing);
@@ -601,10 +626,12 @@ mod tests {
             .find(|(key, _)| *key == DATABASE_URL_ENV)
             .unwrap()
             .1 = database_url;
-        let config = config(entries).unwrap();
+        let mut config = config(entries).unwrap();
         let (outbox, _) = config.connect().await.unwrap();
-        let worker = config.delivery_worker(outbox).unwrap();
+        let worker = config.delivery_worker(outbox.clone()).unwrap();
         assert!(format!("{worker:?}").contains("single-attempt"));
+        config.mode = ReportWorkerMode::Disabled;
+        assert!(config.delivery_worker(outbox).is_err());
     }
 
     #[test]

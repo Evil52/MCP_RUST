@@ -152,9 +152,10 @@ transient network problem. The OAuth transport accepts exactly the private files
 uses only Google's fixed token endpoint through the same dedicated mail-egress
 proxy, and accepts only a bounded Bearer token for the minimal
 `https://www.googleapis.com/auth/gmail.send` scope. The operator-only credential
-mounts and isolated mail-egress canary overlay are present; a continuous
-delivery loop remains a future release gate. A strict private routing-file
-loader resolves the policy's
+mounts and isolated mail-egress canary overlay are present. The binary contains
+a gated bounded delivery scheduler, but its production Compose overlay and
+activation remain future release gates. A strict private routing-file loader
+resolves the policy's
 symbolic sender and audience names to addresses. It requires one exact route
 per configured symbol, refuses extra/missing/duplicate routes and never lets a
 prompt, report row or account payload select an address. The routing file is
@@ -231,6 +232,16 @@ scripts/run-report-mail-canary.sh
 Do not invoke this command until a ready outbox artifact has been manually
 reviewed. It may send one real message. A successful canary does not enable the
 08:00/17:00 scheduler or any background mail delivery.
+
+After a successful canary, `REPORT_WORKER_MODE=scheduled_delivery` can run the
+same deterministic planning/generation pass once per minute and then drain at
+most 16 ready deliveries. Each provider attempt has its own 60-second bound.
+Five consecutive failed ticks terminate the process so its supervisor can
+restart a fresh database session. PostgreSQL occurrence uniqueness and the
+delivery deadlines make restart catch-up safe: ready morning/evening work is
+picked up after an outage while its window is open, already sent work cannot be
+recreated, and ambiguous `sending` work is never automatically reclaimed. No
+shipped Compose file selects this mode yet.
 
 The separate collector has two explicit one-account canary commands:
 

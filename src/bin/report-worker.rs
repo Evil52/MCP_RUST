@@ -11,6 +11,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind,
     artifact_store::persist_and_mark_ready,
+    gmail_outbox::GmailOutboxWorker,
     postgres_outbox::{GenerationErrorClass, GenerationStatus, PostgresOutboxRepository},
     postgres_snapshot::PostgresSnapshotRepository,
     preview::render_published_preview,
@@ -159,6 +160,18 @@ async fn main() -> Result<()> {
         (ReportWorkerMode::DeliveryCanary, true) => {
             bail!("delivery_canary mode requires the explicit deliver-one command")
         }
+        (ReportWorkerMode::ScheduledDelivery, true) => {
+            let delivery = config.delivery_worker(outbox.clone())?;
+            tracing::info!(
+                targets = targets.len(),
+                tick_seconds = DRY_RUN_TICK.as_secs(),
+                "scheduled report generation and Gmail delivery started"
+            );
+            tokio::select! {
+                result = run_delivery_scheduler(&config, &outbox, &snapshots, &delivery) => result?,
+                _ = shutdown_signal() => {}
+            }
+        }
         _ => bail!("report-worker mode and policy enabled flag are inconsistent"),
     }
     Ok(())
@@ -200,6 +213,57 @@ async fn run_dry_scheduler(
     }
 }
 
+/// Runs generation and a bounded delivery drain on the same minute cadence.
+///
+/// Planning remains authoritative in PostgreSQL, so a restart inside a report
+/// deadline catches up ready work without creating a second occurrence. Each
+/// send is still delegated to the one-attempt coordinator: an ambiguous send
+/// stays `sending` and can never be claimed by a later tick.
+async fn run_delivery_scheduler(
+    config: &ReportWorkerConfig,
+    outbox: &PostgresOutboxRepository,
+    snapshots: &PostgresSnapshotRepository,
+    delivery: &GmailOutboxWorker,
+) -> Result<()> {
+    let mut timer = tokio::time::interval(DRY_RUN_TICK);
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut consecutive_failures = 0_u32;
+    loop {
+        timer.tick().await;
+        let result = async {
+            run_scheduler_tick(config, outbox, snapshots, Utc::now()).await?;
+            run_delivery_tick(delivery).await
+        }
+        .await;
+        match result {
+            Ok(()) => consecutive_failures = 0,
+            Err(error) => {
+                consecutive_failures += 1;
+                ensure!(
+                    consecutive_failures < MAX_CONSECUTIVE_TICK_FAILURES,
+                    "daily report delivery scheduler failed {consecutive_failures} consecutive ticks; \
+                     exiting so the supervisor can restart it"
+                );
+                tracing::warn!(
+                    consecutive_failures,
+                    error = %error,
+                    "daily report delivery tick failed; retrying on the next tick"
+                );
+            }
+        }
+    }
+}
+
+async fn run_delivery_tick(delivery: &GmailOutboxWorker) -> Result<()> {
+    let outcome = delivery.deliver_ready().await?;
+    tracing::info!(
+        attempts = outcome.attempts,
+        queue_drained = outcome.queue_drained,
+        "bounded Gmail delivery pass finished"
+    );
+    Ok(())
+}
+
 /// Executes exactly one planning and generation pass.
 ///
 /// The queue reads are bounded so a stalled tick cannot hold the loop open
@@ -239,7 +303,7 @@ async fn run_scheduler_tick(
                 tracing::warn!(
                     batch_id,
                     error = %error,
-                    "daily report generation deferred; delivery remains disabled"
+                    "daily report generation deferred"
                 );
                 GenerationErrorClass::Failed
             }
@@ -247,7 +311,7 @@ async fn run_scheduler_tick(
                 tracing::warn!(
                     batch_id,
                     timeout_seconds = GENERATION_TIMEOUT.as_secs(),
-                    "daily report generation exceeded its budget; delivery remains disabled"
+                    "daily report generation exceeded its budget"
                 );
                 GenerationErrorClass::Timeout
             }
@@ -307,7 +371,7 @@ async fn generate_batch(
         object_key = receipt.artifact.object_key,
         xlsx_bytes = receipt.xlsx_size_bytes,
         html_bytes = receipt.html_size_bytes,
-        "daily report artifact generated; delivery remains disabled"
+        "daily report artifact generated"
     );
     Ok(())
 }

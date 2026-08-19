@@ -99,8 +99,9 @@ pub enum PostgresOutboxError {
     InvalidDelivery,
 }
 
+#[derive(Clone)]
 pub struct PostgresOutboxRepository {
-    client: SupervisedClient,
+    client: std::sync::Arc<SupervisedClient>,
 }
 
 impl PostgresOutboxRepository {
@@ -108,12 +109,17 @@ impl PostgresOutboxRepository {
         let client = SupervisedClient::connect(config, "mcp-ozon-report-worker")
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
-        Ok(Self { client })
+        Ok(Self {
+            client: std::sync::Arc::new(client),
+        })
     }
 
     pub fn from_client(client: Client) -> Self {
         Self {
-            client: SupervisedClient::preconnected(client, "mcp-ozon-report-worker"),
+            client: std::sync::Arc::new(SupervisedClient::preconnected(
+                client,
+                "mcp-ozon-report-worker",
+            )),
         }
     }
 

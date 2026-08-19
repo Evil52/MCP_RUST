@@ -251,6 +251,11 @@ has broader vendor permissions.
   `deliver-one`, and stop the proxy on exit. The worker may attach only to the internal database
   and mail-proxy networks; only the credentialless proxy may attach to the outbound bridge, and
   its allowlist must remain exactly `oauth2.googleapis.com` plus `gmail.googleapis.com` on TLS 443.
+  Do not deploy `REPORT_WORKER_MODE=scheduled_delivery` until that canary is reconciled. The
+  scheduled process must retain the one-minute missed-tick-skip cadence, a maximum of 16 attempts
+  per pass, the 60-second bound per attempt and process exit after five consecutive failed ticks.
+  Restart catch-up may claim only `ready` work still inside its immutable delivery deadline;
+  `sending`, `sent`, expired and permanent-failure rows must never be reclaimed automatically.
 - Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
   through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
   `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,

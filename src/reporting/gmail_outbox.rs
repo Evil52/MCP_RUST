@@ -1,10 +1,11 @@
 //! Exactly-once-oriented bridge between the report outbox and Gmail.
 //!
-//! This module does not run a loop and is not wired into the shipped runtime.
-//! One call claims at most one ready row, verifies its immutable artifact,
-//! performs one provider attempt, and records only an outcome whose safety is
-//! known. An ambiguous provider outcome or a post-claim persistence failure
-//! leaves the row `sending`, so another worker cannot resend it automatically.
+//! This module does not own a background loop. One call claims at most one
+//! ready row, verifies its immutable artifact, performs one provider attempt,
+//! and records only an outcome whose safety is known. A bounded pass may invoke
+//! that primitive repeatedly, but an ambiguous provider outcome or a post-claim
+//! persistence failure leaves the row `sending`, so another worker cannot
+//! resend it automatically.
 
 use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
@@ -21,6 +22,8 @@ use super::{
 
 const RETRY_BASE_SECONDS: i64 = 60;
 const RETRY_MAX_SECONDS: i64 = 15 * 60;
+const DELIVERY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_DELIVERIES_PER_PASS: u8 = 16;
 
 type ClaimFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ClaimedDelivery>, PostgresOutboxError>> + Send + 'a>>;
@@ -221,12 +224,20 @@ pub enum DeliveryTickOutcome {
     Ambiguous { batch_id: i64, attempt_no: u8 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryPassOutcome {
+    pub attempts: u8,
+    pub queue_drained: bool,
+}
+
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum GmailOutboxError {
     #[error("daily report outbox is unavailable before a delivery claim")]
     ClaimUnavailable,
     #[error("daily report outcome could not be persisted; the claim remains sending")]
     CompletionUncertain,
+    #[error("daily report delivery attempt timed out; any claim remains sending")]
+    AttemptTimedOut,
 }
 
 #[derive(Clone)]
@@ -330,6 +341,32 @@ impl GmailOutboxWorker {
                     .await
             }
         }
+    }
+
+    /// Drains a bounded number of ready rows for one scheduler pass.
+    ///
+    /// Every row still gets one provider attempt. Observing an empty queue ends
+    /// the pass early; otherwise the hard cap leaves remaining work for the
+    /// next minute tick. A timed-out attempt is never converted into a retry:
+    /// if it had already claimed a row, that row stays `sending`.
+    pub async fn deliver_ready(&self) -> Result<DeliveryPassOutcome, GmailOutboxError> {
+        let mut attempts = 0_u8;
+        while attempts < MAX_DELIVERIES_PER_PASS {
+            let outcome = tokio::time::timeout(DELIVERY_ATTEMPT_TIMEOUT, self.deliver_one())
+                .await
+                .map_err(|_| GmailOutboxError::AttemptTimedOut)??;
+            if outcome == DeliveryTickOutcome::Idle {
+                return Ok(DeliveryPassOutcome {
+                    attempts,
+                    queue_drained: true,
+                });
+            }
+            attempts += 1;
+        }
+        Ok(DeliveryPassOutcome {
+            attempts,
+            queue_drained: false,
+        })
     }
 
     async fn record_known_failure(
@@ -465,14 +502,14 @@ mod tests {
     }
 
     struct FakeOutbox {
-        claim: Mutex<Result<Option<ClaimedDelivery>, PostgresOutboxError>>,
+        claims: Mutex<VecDeque<Result<Option<ClaimedDelivery>, PostgresOutboxError>>>,
         completion_error: bool,
         recorded: Mutex<Vec<Recorded>>,
     }
 
     impl DeliveryOutbox for FakeOutbox {
         fn claim<'a>(&'a self, _now: DateTime<Utc>) -> ClaimFuture<'a> {
-            Box::pin(async move { self.claim.lock().unwrap().clone() })
+            Box::pin(async move { self.claims.lock().unwrap().pop_front().unwrap_or(Ok(None)) })
         }
 
         fn sent<'a>(
@@ -566,6 +603,18 @@ mod tests {
         }
     }
 
+    struct PendingDelivery;
+
+    impl MailDelivery for PendingDelivery {
+        fn deliver<'a>(
+            &'a self,
+            _claim: &'a ClaimedDelivery,
+            _bundle: StoredReportBundle,
+        ) -> DeliveryFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+
     struct FakeClock {
         times: Mutex<VecDeque<DateTime<Utc>>>,
     }
@@ -620,7 +669,7 @@ mod tests {
         Arc<FakeDelivery>,
     ) {
         let outbox = Arc::new(FakeOutbox {
-            claim: Mutex::new(claim_result),
+            claims: Mutex::new(VecDeque::from([claim_result])),
             completion_error,
             recorded: Mutex::new(Vec::new()),
         });
@@ -647,6 +696,30 @@ mod tests {
         Ok(GmailSendReceipt {
             provider_message_id: "message-1".to_owned(),
         })
+    }
+
+    fn queued_worker(
+        claims: Vec<Result<Option<ClaimedDelivery>, PostgresOutboxError>>,
+        times: Vec<DateTime<Utc>>,
+        delivery: Arc<dyn MailDelivery>,
+    ) -> (GmailOutboxWorker, Arc<FakeOutbox>, Arc<FakeArtifacts>) {
+        let outbox = Arc::new(FakeOutbox {
+            claims: Mutex::new(claims.into()),
+            completion_error: false,
+            recorded: Mutex::new(Vec::new()),
+        });
+        let artifacts = Arc::new(FakeArtifacts {
+            fail: false,
+            calls: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(FakeClock {
+            times: Mutex::new(times.into()),
+        });
+        (
+            GmailOutboxWorker::for_test(outbox.clone(), artifacts.clone(), delivery, clock),
+            outbox,
+            artifacts,
+        )
     }
 
     fn policy(audience_id: &str) -> super::super::policy::DailyReportPolicy {
@@ -797,6 +870,82 @@ mod tests {
             format!("{success:?}"),
             "GmailOutboxWorker { delivery: \"single-attempt\" }"
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_pass_stops_on_idle_and_hard_caps_a_nonempty_queue() {
+        let delivery = Arc::new(FakeDelivery {
+            result: Mutex::new(receipt()),
+            calls: AtomicUsize::new(0),
+        });
+        let (drained, outbox, artifacts) = queued_worker(
+            vec![
+                Ok(Some(claim(1, ReportKind::Evening))),
+                Ok(Some(claim(1, ReportKind::Evening))),
+                Ok(None),
+            ],
+            (0..5).map(|minute| at(12, minute)).collect(),
+            delivery.clone(),
+        );
+        assert_eq!(
+            drained.deliver_ready().await.unwrap(),
+            DeliveryPassOutcome {
+                attempts: 2,
+                queue_drained: true,
+            }
+        );
+        assert_eq!(delivery.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(artifacts.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(outbox.recorded.lock().unwrap().len(), 2);
+
+        let delivery = Arc::new(FakeDelivery {
+            result: Mutex::new(receipt()),
+            calls: AtomicUsize::new(0),
+        });
+        let (bounded, outbox, artifacts) = queued_worker(
+            (0..=MAX_DELIVERIES_PER_PASS)
+                .map(|_| Ok(Some(claim(1, ReportKind::Evening))))
+                .collect(),
+            (0..(MAX_DELIVERIES_PER_PASS * 2))
+                .map(|second| at(13, 0) + Duration::seconds(i64::from(second)))
+                .collect(),
+            delivery.clone(),
+        );
+        assert_eq!(
+            bounded.deliver_ready().await.unwrap(),
+            DeliveryPassOutcome {
+                attempts: MAX_DELIVERIES_PER_PASS,
+                queue_drained: false,
+            }
+        );
+        assert_eq!(
+            delivery.calls.load(Ordering::Relaxed),
+            usize::from(MAX_DELIVERIES_PER_PASS)
+        );
+        assert_eq!(
+            artifacts.calls.load(Ordering::Relaxed),
+            usize::from(MAX_DELIVERIES_PER_PASS)
+        );
+        assert_eq!(
+            outbox.recorded.lock().unwrap().len(),
+            usize::from(MAX_DELIVERIES_PER_PASS)
+        );
+        assert_eq!(outbox.claims.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_pass_timeout_leaves_a_claim_unclassified() {
+        let (worker, outbox, artifacts) = queued_worker(
+            vec![Ok(Some(claim(1, ReportKind::Evening)))],
+            vec![at(12, 0)],
+            Arc::new(PendingDelivery),
+        );
+        assert_eq!(
+            worker.deliver_ready().await,
+            Err(GmailOutboxError::AttemptTimedOut)
+        );
+        assert_eq!(artifacts.calls.load(Ordering::Relaxed), 1);
+        assert!(outbox.recorded.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
