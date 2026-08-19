@@ -67,9 +67,9 @@ pub struct ReportKey {
 
 /// A report that may be delivered now.
 ///
-/// `covered_keys` normally contains one key. When the server recovers after
-/// 17:00 and neither report was sent, one consolidated delivery covers both
-/// keys so the recipient does not receive two near-identical messages.
+/// Every planned delivery contains one report key. When the server recovers
+/// after 17:00, missed morning and evening reports are queued separately so
+/// each artifact keeps its own explicit period and neither occurrence is lost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDelivery {
     pub covered_keys: Vec<ReportKey>,
@@ -90,8 +90,9 @@ pub enum ReportScheduleError {
 /// Returns due report deliveries for the current Yekaterinburg business day.
 ///
 /// Already sent report keys are never returned. Missed morning and evening
-/// reports are consolidated after 17:00. Reports are not delivered after the
-/// evening 23:00 deadline; the persistence layer records such keys as expired.
+/// reports are queued separately after 17:00. A recovered morning occurrence
+/// receives the evening 23:00 delivery deadline; the persistence layer records
+/// work that remains unfinished after that deadline as expired.
 pub fn due_deliveries(
     now: DateTime<Utc>,
     recipient_id: &str,
@@ -114,21 +115,22 @@ pub fn due_deliveries(
     let evening_missing = !sent.contains(&evening_key);
 
     if local_now >= evening && local_now <= evening_deadline {
-        let mut covered_keys = Vec::with_capacity(2);
+        let mut deliveries = Vec::with_capacity(2);
         if morning_missing {
-            covered_keys.push(morning_key);
+            deliveries.push(PendingDelivery {
+                covered_keys: vec![morning_key],
+                scheduled_for: evening.with_timezone(&Utc),
+                delayed: true,
+            });
         }
         if evening_missing {
-            covered_keys.push(evening_key);
-        }
-        return Ok((!covered_keys.is_empty())
-            .then(|| PendingDelivery {
-                covered_keys,
+            deliveries.push(PendingDelivery {
+                covered_keys: vec![evening_key],
                 scheduled_for: evening.with_timezone(&Utc),
                 delayed: local_now > evening,
-            })
-            .into_iter()
-            .collect());
+            });
+        }
+        return Ok(deliveries);
     }
 
     if local_now >= morning && local_now <= morning_deadline && morning_missing {
@@ -312,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_after_evening_cutoff_consolidates_missing_reports() {
+    fn recovery_after_evening_cutoff_queues_explicit_missing_reports() {
         let deliveries = due_deliveries(
             utc(2026, 8, 16, 13, 30),
             "pilot_owner",
@@ -321,13 +323,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(deliveries.len(), 1);
-        assert!(deliveries[0].delayed);
-        assert_eq!(
-            deliveries[0].covered_keys,
-            vec![key(ReportKind::Morning), key(ReportKind::Evening)]
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries.iter().all(|delivery| delivery.delayed));
+        assert_eq!(deliveries[0].covered_keys, vec![key(ReportKind::Morning)]);
+        assert_eq!(deliveries[1].covered_keys, vec![key(ReportKind::Evening)]);
+        assert!(
+            deliveries
+                .iter()
+                .all(|delivery| delivery.scheduled_for == utc(2026, 8, 16, 12, 0))
         );
-        assert_eq!(deliveries[0].scheduled_for, utc(2026, 8, 16, 12, 0));
     }
 
     #[test]

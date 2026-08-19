@@ -11,8 +11,10 @@ The first disabled-only phase provides:
   `Asia/Yekaterinburg`;
 - deterministic D-1 and preliminary same-day reporting intervals;
 - catch-up after process downtime without duplicate report identities;
-- one consolidated delivery after 17:00 when both daily reports were missed;
-- automatic-delivery deadlines at 14:00 and 23:00 local time;
+- separate delayed morning and evening deliveries after 17:00 when both were
+  missed, preserving each report's explicit period and identity;
+- automatic-delivery deadlines at 14:00 for a normally scheduled morning
+  report and 23:00 for evening or post-outage recovered work;
 - a five-attempt bounded delivery state machine with explicit permanent and
   transient error classes;
 - artifact SHA-256 and provider-message identities without storing message
@@ -174,9 +176,9 @@ production artifact volume is mounted and health-checked. Manual
 HTML/XLSX previews can be generated from an already published complete
 four-source manifest. The immutable local store and outbox-publication
 primitive can now be invoked explicitly for one already-planned outbox batch
-while delivery remains disabled. Consolidated two-period
-catch-up rendering remains fail-closed until it has an explicit two-section
-template rather than silently presenting one interval as two reports. The
+while delivery remains disabled. Recovery queues a missed morning and evening
+as separate single-section artifacts; it never presents one interval as two
+reports. The
 shipped default Compose service consequently cannot send email. The canary
 overlay can perform one operator-invoked `deliver-one` attempt when all private
 host paths are supplied. Merely starting its profile runs `healthcheck`, not
@@ -459,9 +461,10 @@ loader exists.
 
 The persistence layer transactionally stores report occurrences, delivery
 coverage and attempts. Its unique occurrence key is
-`(local_date, kind, recipient_id, report_version)`. Consolidated mail covers two
-such keys in one delivery; either both keys are committed or neither is. A
-crash before a provider call leaves work claimable. A crash after a delivery is
+`(local_date, kind, recipient_id, report_version)`. New catch-up work always
+keeps morning and evening in separate single-period deliveries. Legacy
+multi-period rows remain fail-closed and cannot be rendered or sent. A crash
+before a provider call leaves work claimable. A crash after a delivery is
 claimed deliberately leaves the batch in `sending` for operator reconciliation:
 an ambiguous provider result is never retried automatically.
 

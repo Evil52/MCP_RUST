@@ -48,8 +48,8 @@ request and refuse collection while the circuit is open.
 ## Daily reporting persistence layer
 
 The database includes a separate `daily_reporting` boundary for the planned
-08:00/17:00 EKB reports. It stores immutable report occurrences, consolidated
-coverage, bounded delivery state, append-only provider attempts and normalized
+08:00/17:00 EKB reports. It stores immutable report occurrences, separate
+period-preserving catch-up coverage, bounded delivery state, append-only provider attempts and normalized
 sales, advertising, stock and price snapshots. A dedicated `report_collector`
 can append and finalize snapshots; `report_worker` can read only terminal
 published projections and operate the outbox. It does not store email bodies,
@@ -233,6 +233,9 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
   sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
   < position-monitor/initdb/013_daily_reporting_delivery_reconciliation.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/014_daily_reporting_period_preserving_catchup.sql
 ```
 
 The migrations are transactional. The final claim migration gives each exact

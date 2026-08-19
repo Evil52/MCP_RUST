@@ -459,12 +459,9 @@ impl PostgresOutboxRepository {
     }
 
     /// Loads one due, non-expired single-section batch for deterministic
-    /// rendering or recovery.
-    ///
-    /// Consolidated morning+evening batches are deliberately rejected until
-    /// a renderer with two explicit report sections exists. `ready` batches
-    /// are accepted so an operator can verify an ambiguous post-persistence
-    /// outcome without creating another delivery identity.
+    /// rendering or recovery. `ready` batches are accepted so an operator can
+    /// verify an ambiguous post-persistence outcome without creating another
+    /// delivery identity.
     pub async fn generation_candidate(
         &self,
         batch_id: i64,
@@ -1084,6 +1081,9 @@ async fn create_planned_inner(
 
     let report_version =
         i32::try_from(first.report_version).map_err(|_| PostgresOutboxError::InvalidDelivery)?;
+    let deadline_at = record
+        .deadline_at()
+        .map_err(|_| PostgresOutboxError::InvalidDelivery)?;
     let row = transaction
         .query_one(
             "INSERT INTO daily_reporting.delivery_batches ( \
@@ -1112,20 +1112,14 @@ async fn create_planned_inner(
                     &report_version,
                     &key.local_date,
                     &kind_text(key.kind),
-                    &scheduled_for(key)?,
-                    &delivery_deadline(key).map_err(|_| PostgresOutboxError::InvalidDelivery)?,
+                    &record.scheduled_for(),
+                    &deadline_at,
                 ],
             )
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
     }
     Ok(CreateOutcome::Inserted(batch_id))
-}
-
-fn scheduled_for(key: &ReportKey) -> Result<DateTime<Utc>, PostgresOutboxError> {
-    delivery_deadline(key)
-        .map(|deadline| deadline - chrono::Duration::hours(6))
-        .map_err(|_| PostgresOutboxError::InvalidDelivery)
 }
 
 fn kind_text(kind: ReportKind) -> &'static str {

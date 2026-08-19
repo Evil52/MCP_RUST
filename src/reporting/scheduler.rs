@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_after_downtime_consolidates_only_uncovered_occurrences() {
+    fn recovery_after_downtime_queues_only_uncovered_occurrences() {
         let morning = ReportKey {
             local_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
             kind: ReportKind::Morning,
@@ -128,6 +128,16 @@ mod tests {
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].delivery.covered_keys.len(), 1);
         assert_eq!(plans[0].delivery.covered_keys[0].kind, ReportKind::Evening);
+
+        let all_missing = due_for_audience(utc(13), "new_owner", 1, &BTreeSet::new()).unwrap();
+        assert_eq!(all_missing.len(), 2);
+        assert_eq!(
+            all_missing
+                .iter()
+                .map(|plan| plan.delivery.covered_keys[0].kind)
+                .collect::<Vec<_>>(),
+            vec![ReportKind::Morning, ReportKind::Evening]
+        );
     }
 
     #[test]

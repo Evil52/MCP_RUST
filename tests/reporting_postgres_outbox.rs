@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, fs, str::FromStr};
 
 use chrono::{Duration, TimeZone, Utc};
 use mcp_ozon::reporting::{
+    PendingDelivery,
     artifact_store::{
         ArtifactPublicationError, LocalArtifactStore, PersistDisposition, persist_and_mark_ready,
     },
@@ -214,26 +215,31 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
             .contains(&batch_id)
     );
 
-    let consolidated_recipient = format!("consolidated_{}", std::process::id());
-    let consolidated = due_deliveries(utc(13, 30), &consolidated_recipient, 1, &BTreeSet::new())
+    let recovered_recipient = format!("recovered_{}", std::process::id());
+    let recovered = due_deliveries(utc(13, 30), &recovered_recipient, 1, &BTreeSet::new())
         .unwrap()
         .remove(0);
-    let consolidated_id = match repository.create_planned(consolidated).await.unwrap() {
+    let recovered_id = match repository.create_planned(recovered).await.unwrap() {
         CreateOutcome::Inserted(id) => id,
         CreateOutcome::Existing(_) => unreachable!(),
     };
+    let recovered_candidate = repository
+        .generation_candidate(recovered_id, utc(13, 31))
+        .await
+        .unwrap();
+    assert_eq!(recovered_candidate.batch_id, recovered_id);
+    assert_eq!(recovered_candidate.key.recipient_id, recovered_recipient);
     assert_eq!(
-        repository
-            .generation_candidate(consolidated_id, utc(13, 31))
-            .await,
-        Err(PostgresOutboxError::Conflict)
+        recovered_candidate.key.kind,
+        mcp_ozon::reporting::ReportKind::Morning
     );
+    assert_eq!(recovered_candidate.status, GenerationStatus::Planned);
     assert!(
-        !repository
+        repository
             .pending_generation_ids(utc(13, 31), 16)
             .await
             .unwrap()
-            .contains(&consolidated_id)
+            .contains(&recovered_id)
     );
     assert_eq!(
         repository.generation_candidate(batch_id, utc(9, 1)).await,
@@ -268,7 +274,7 @@ async fn scheduled_mail_activation_requires_a_recent_completed_canary() {
 
     let delivery = due_deliveries(now, &recipient, 1, &BTreeSet::new())
         .unwrap()
-        .remove(0);
+        .remove(1);
     let batch_id = match repository.create_planned(delivery).await.unwrap() {
         CreateOutcome::Inserted(id) => id,
         CreateOutcome::Existing(_) => unreachable!(),
@@ -331,7 +337,7 @@ async fn ambiguous_delivery_reconciliation_is_scoped_idempotent_and_append_only(
     let sent_time = utc(12, 0) + Duration::days(70);
     let sent_delivery = due_deliveries(sent_time, &sent_recipient, 1, &BTreeSet::new())
         .unwrap()
-        .remove(0);
+        .remove(1);
     let sent_batch = match repository.create_planned(sent_delivery).await.unwrap() {
         CreateOutcome::Inserted(id) => id,
         CreateOutcome::Existing(_) => unreachable!(),
@@ -478,7 +484,7 @@ async fn ambiguous_delivery_reconciliation_is_scoped_idempotent_and_append_only(
     let suppressed_delivery =
         due_deliveries(suppressed_time, &suppressed_recipient, 1, &BTreeSet::new())
             .unwrap()
-            .remove(0);
+            .remove(1);
     let suppressed_batch = match repository
         .create_planned(suppressed_delivery)
         .await
@@ -606,8 +612,8 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
 
     let delivery = due_deliveries(utc(13, 30), "integration_owner", 1, &BTreeSet::new())
         .unwrap()
-        .remove(0);
-    assert_eq!(delivery.covered_keys.len(), 2);
+        .remove(1);
+    assert_eq!(delivery.covered_keys.len(), 1);
     let batch_id = match repository.create_planned(delivery.clone()).await.unwrap() {
         CreateOutcome::Inserted(id) => id,
         CreateOutcome::Existing(_) => panic!("fresh database unexpectedly contained the report"),
@@ -616,12 +622,17 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
         repository.create_planned(delivery).await.unwrap(),
         CreateOutcome::Existing(batch_id)
     );
-
-    let morning_only = due_deliveries(utc(3, 0), "integration_owner", 1, &BTreeSet::new())
-        .unwrap()
-        .remove(0);
+    let recovered = due_deliveries(utc(13, 30), "integration_owner", 1, &BTreeSet::new()).unwrap();
+    let legacy_mixed = PendingDelivery {
+        covered_keys: recovered
+            .into_iter()
+            .flat_map(|delivery| delivery.covered_keys)
+            .collect(),
+        scheduled_for: utc(12, 0),
+        delayed: true,
+    };
     assert_eq!(
-        repository.create_planned(morning_only).await,
+        repository.create_planned(legacy_mixed).await,
         Err(PostgresOutboxError::Conflict)
     );
 
@@ -668,7 +679,7 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
     let first = repository.claim_ready(utc(13, 31)).await.unwrap().unwrap();
     assert_eq!(first.batch_id, batch_id);
     assert_eq!(first.attempt_no, 1);
-    assert_eq!(first.covered_keys.len(), 2);
+    assert_eq!(first.covered_keys.len(), 1);
     assert_eq!(first.artifact, artifact());
     assert!(repository.claim_ready(utc(13, 31)).await.unwrap().is_none());
 
@@ -711,7 +722,7 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
     assert_eq!(audit.get::<_, &str>(0), "sent");
     assert!(audit.get::<_, bool>(1));
     assert_eq!(audit.get::<_, i16>(2), 2);
-    assert_eq!(audit.get::<_, i64>(3), 2);
+    assert_eq!(audit.get::<_, i64>(3), 1);
     assert_eq!(audit.get::<_, i64>(4), 2);
     assert_eq!(audit.get::<_, &str>(5), "gmail.message-2099");
 
@@ -745,7 +756,7 @@ async fn repository_rejects_invalid_delivery_inputs_before_writing() {
         &BTreeSet::new(),
     )
     .unwrap()
-    .remove(0);
+    .remove(1);
     let batch_id = match repository.create_planned(delivery).await.unwrap() {
         CreateOutcome::Inserted(id) => id,
         CreateOutcome::Existing(_) => unreachable!(),
@@ -814,7 +825,7 @@ async fn repository_rejects_invalid_delivery_inputs_before_writing() {
         &BTreeSet::new(),
     )
     .unwrap()
-    .remove(0);
+    .remove(1);
     let budget_batch = match repository.create_planned(budget_delivery).await.unwrap() {
         CreateOutcome::Inserted(id) => id,
         CreateOutcome::Existing(_) => unreachable!(),
@@ -897,7 +908,7 @@ async fn permanent_delivery_failures_keep_their_exact_audit_class() {
         let recipient = format!("permanent_{}_{}", std::process::id(), offset);
         let delivery = due_deliveries(now, &recipient, 1, &BTreeSet::new())
             .unwrap()
-            .remove(0);
+            .remove(1);
         let batch_id = match repository.create_planned(delivery).await.unwrap() {
             CreateOutcome::Inserted(id) => id,
             CreateOutcome::Existing(_) => unreachable!(),
@@ -954,7 +965,7 @@ async fn exhausted_retryable_failure_is_terminal_with_its_exact_class() {
     let recipient = format!("exhausted_{}", std::process::id());
     let delivery = due_deliveries(now, &recipient, 1, &BTreeSet::new())
         .unwrap()
-        .remove(0);
+        .remove(1);
     let batch_id = match repository.create_planned(delivery).await.unwrap() {
         CreateOutcome::Inserted(id) => id,
         CreateOutcome::Existing(_) => unreachable!(),

@@ -81,6 +81,13 @@ SELECT
     AND EXISTS (
         SELECT 1
         FROM pg_constraint
+        WHERE conrelid = 'daily_reporting.delivery_coverage'::regclass
+          AND conname = 'delivery_coverage_schedule_check'
+          AND contype = 'c'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM pg_constraint
         WHERE conrelid = 'daily_reporting.source_snapshots'::regclass
           AND conname = 'source_snapshots_period_window_check'
           AND contype = 'c'

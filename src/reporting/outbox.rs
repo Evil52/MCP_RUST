@@ -100,8 +100,22 @@ impl DeliveryRecord {
         if unique_keys.len() != delivery.covered_keys.len() {
             return Err(OutboxError::InvalidSchedule);
         }
-        let deadline = deadline(&delivery.covered_keys)?;
-        if delivery.scheduled_for != deadline - Duration::hours(6) {
+        let standard_schedule = deadline(&delivery.covered_keys)? - Duration::hours(6);
+        let recovered_morning_schedule = if let [key] = delivery.covered_keys.as_slice()
+            && key.kind == super::ReportKind::Morning
+        {
+            let mut evening = key.clone();
+            evening.kind = super::ReportKind::Evening;
+            Some(
+                delivery_deadline(&evening).map_err(|_| OutboxError::InvalidSchedule)?
+                    - Duration::hours(6),
+            )
+        } else {
+            None
+        };
+        if delivery.scheduled_for != standard_schedule
+            && Some(delivery.scheduled_for) != recovered_morning_schedule
+        {
             return Err(OutboxError::InvalidSchedule);
         }
         Ok(Self {
@@ -123,6 +137,12 @@ impl DeliveryRecord {
 
     pub fn scheduled_for(&self) -> DateTime<Utc> {
         self.scheduled_for
+    }
+
+    pub(crate) fn deadline_at(&self) -> Result<DateTime<Utc>, OutboxError> {
+        self.scheduled_for
+            .checked_add_signed(Duration::hours(6))
+            .ok_or(OutboxError::InvalidSchedule)
     }
 
     pub fn status(&self) -> DeliveryStatus {
@@ -216,7 +236,7 @@ impl DeliveryRecord {
             return Ok(());
         }
         let retry_at = retry_at.ok_or(OutboxError::InvalidRetryTime)?;
-        if retry_at <= now || retry_at > deadline(&self.covered_keys)? {
+        if retry_at <= now || retry_at > self.deadline_at()? {
             return Err(OutboxError::InvalidRetryTime);
         }
         self.last_error = Some(class);
@@ -229,7 +249,7 @@ impl DeliveryRecord {
         if self.status.is_terminal() {
             return Err(OutboxError::InvalidTransition);
         }
-        if now <= deadline(&self.covered_keys)? {
+        if now <= self.deadline_at()? {
             return Err(OutboxError::DeadlineExceeded);
         }
         self.status = DeliveryStatus::Expired;
@@ -238,7 +258,7 @@ impl DeliveryRecord {
     }
 
     fn require_before_deadline(&self, now: DateTime<Utc>) -> Result<(), OutboxError> {
-        if now > deadline(&self.covered_keys)? {
+        if now > self.deadline_at()? {
             return Err(OutboxError::DeadlineExceeded);
         }
         Ok(())
@@ -320,7 +340,7 @@ mod tests {
     use super::{
         ArtifactIdentity, DeliveryErrorClass, DeliveryRecord, DeliveryStatus, OutboxError,
     };
-    use crate::reporting::due_deliveries;
+    use crate::reporting::{PendingDelivery, due_deliveries};
 
     fn utc(hour: u32, minute: u32) -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 16, hour, minute, 0).unwrap()
@@ -331,6 +351,18 @@ mod tests {
             .unwrap()
             .remove(0);
         DeliveryRecord::planned(delivery).unwrap()
+    }
+
+    fn legacy_consolidated(now: chrono::DateTime<Utc>) -> PendingDelivery {
+        let deliveries = due_deliveries(now, "pilot_owner", 1, &BTreeSet::new()).unwrap();
+        PendingDelivery {
+            covered_keys: deliveries
+                .into_iter()
+                .flat_map(|delivery| delivery.covered_keys)
+                .collect(),
+            scheduled_for: utc(12, 0),
+            delayed: true,
+        }
     }
 
     fn artifact() -> ArtifactIdentity {
@@ -532,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn deadlines_expire_nonterminal_work_and_consolidated_uses_evening_deadline() {
+    fn deadlines_expire_nonterminal_work_and_recovered_morning_uses_evening_deadline() {
         let mut morning = planned(utc(3, 0));
         assert_eq!(
             morning.expire(utc(9, 0)),
@@ -545,12 +577,12 @@ mod tests {
             Err(OutboxError::InvalidTransition)
         );
 
-        let mut consolidated = planned(utc(13, 30));
-        assert!(consolidated.delayed());
-        assert_eq!(consolidated.covered_keys().len(), 2);
-        consolidated.start_generation(utc(13, 30)).unwrap();
-        consolidated.mark_ready(utc(13, 31), artifact()).unwrap();
-        consolidated.claim_send(utc(17, 59)).unwrap();
+        let mut recovered = planned(utc(13, 30));
+        assert!(recovered.delayed());
+        assert_eq!(recovered.covered_keys().len(), 1);
+        recovered.start_generation(utc(13, 30)).unwrap();
+        recovered.mark_ready(utc(13, 31), artifact()).unwrap();
+        recovered.claim_send(utc(17, 59)).unwrap();
 
         let mut late = planned(utc(3, 0));
         assert_eq!(
@@ -561,9 +593,7 @@ mod tests {
 
     #[test]
     fn malformed_schedule_cannot_enter_outbox() {
-        let valid = due_deliveries(utc(13, 0), "pilot_owner", 1, &BTreeSet::new())
-            .unwrap()
-            .remove(0);
+        let valid = legacy_consolidated(utc(13, 0));
         let mut empty = valid.clone();
         empty.covered_keys.clear();
         assert_eq!(
@@ -578,9 +608,7 @@ mod tests {
             Err(OutboxError::InvalidSchedule)
         );
 
-        let valid = due_deliveries(utc(13, 0), "pilot_owner", 1, &BTreeSet::new())
-            .unwrap()
-            .remove(0);
+        let valid = legacy_consolidated(utc(13, 0));
         for malformed in [
             {
                 let mut value = valid.clone();

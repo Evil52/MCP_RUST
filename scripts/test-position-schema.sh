@@ -210,6 +210,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/012_daily_reporting_delivery_error_classes.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/013_daily_reporting_delivery_reconciliation.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/014_daily_reporting_period_preserving_catchup.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -1845,8 +1847,8 @@ expect_failure_containing \
   "${report_collector_psql[@]}" \
   --command 'SELECT count(*) FROM daily_reporting.collection_claims'
 
-# Reporting outbox: two missed occurrences are atomically covered by one
-# delivery, provider attempts are append-only, and terminal delivery is frozen.
+# Reporting outbox: legacy consolidated coverage remains readable, provider
+# attempts are append-only, and terminal delivery is frozen.
 "${report_worker_psql[@]}" --command "
   INSERT INTO daily_reporting.delivery_batches
       (recipient_id, report_version, scheduled_for, delayed)
@@ -1910,10 +1912,46 @@ report_delivery="$({ "${report_worker_psql[@]}" --tuples-only --no-align \
     GROUP BY batch.id
   "; } | tr -d '\r')"
 if [[ "$report_delivery" != "sent:t:1:2:evening:morning:2" ]]; then
-  echo "consolidated report delivery was not persisted exactly" >&2
+  echo "legacy consolidated report delivery was not persisted exactly" >&2
   printf '%s\n' "$report_delivery" >&2
   exit 1
 fi
+
+# A recovered morning remains its own occurrence and receives only the bounded
+# 17:00--23:00 EKB catch-up window.
+"${report_worker_psql[@]}" --command "
+  INSERT INTO daily_reporting.delivery_batches
+      (recipient_id, report_version, scheduled_for, delayed)
+  VALUES ('recovered_owner', 1, '2099-08-17 12:00:00+00', true);
+  INSERT INTO daily_reporting.delivery_coverage
+      (
+          batch_id, recipient_id, report_version, local_date, report_kind,
+          scheduled_for, deadline_at
+      )
+  SELECT id, recipient_id, report_version, '2099-08-17', 'morning',
+         '2099-08-17 12:00:00+00', '2099-08-17 18:00:00+00'
+  FROM daily_reporting.delivery_batches
+  WHERE recipient_id = 'recovered_owner';
+" >/dev/null
+
+expect_failure_containing \
+  "invalid recovered morning deadline" \
+  "violates check constraint" \
+  "${report_worker_psql[@]}" \
+  --command "
+    INSERT INTO daily_reporting.delivery_batches
+        (recipient_id, report_version, scheduled_for, delayed)
+    VALUES ('invalid_recovery', 1, '2099-08-17 12:00:00+00', true);
+    INSERT INTO daily_reporting.delivery_coverage
+        (
+            batch_id, recipient_id, report_version, local_date, report_kind,
+            scheduled_for, deadline_at
+        )
+    SELECT id, recipient_id, report_version, '2099-08-17', 'morning',
+           '2099-08-17 12:00:00+00', '2099-08-17 17:59:59+00'
+    FROM daily_reporting.delivery_batches
+    WHERE recipient_id = 'invalid_recovery';
+  "
 
 expect_failure_containing \
   "report artifact identity outside delivery coverage" \
