@@ -191,6 +191,7 @@ render_reporting_mail_live_compose() {
     DAILY_REPORT_MAIL_POLICY_HOST="$mail_policy" \
     REPORT_MAIL_ROUTING_HOST="$mail_routing" \
     REPORT_GMAIL_OAUTH_DIR_HOST="$oauth_directory" \
+    REPORT_MAIL_CANARY_AUDIENCE_ID=pilot_owner \
     docker compose \
       --env-file "$interpolation_env" \
       -f "$project_dir/compose.position.yaml" \
@@ -824,7 +825,8 @@ verify_reporting_mail_live() {
   check "scheduled mail: worker is selected only through its explicit profile" "$worker" \
     '.profiles == ["reporting-mail-live"]
      and (.command // []) == []
-     and .environment.REPORT_WORKER_MODE == "scheduled_delivery"'
+     and .environment.REPORT_WORKER_MODE == "scheduled_delivery"
+     and .environment.REPORT_MAIL_CANARY_AUDIENCE_ID == "pilot_owner"'
   check "scheduled mail: worker remains internal and has no ingress or Compose secrets" "$worker" \
     '(.networks | keys | sort) == ["mail-egress-internal", "position-internal"]
      and ((.ports // []) | length == 0)
@@ -842,6 +844,7 @@ verify_reporting_mail_live() {
          | .services["report-worker"].profiles = ["reporting-mail-canary"]
          | .services["report-worker"].command = ["healthcheck"]
          | .services["report-worker"].environment.REPORT_WORKER_MODE = "delivery_canary"
+         | del(.services["report-worker"].environment.REPORT_MAIL_CANARY_AUDIENCE_ID)
          | .services["mail-egress"].profiles = ["reporting-mail-canary"]),
        canary: $canary
      }')"
@@ -1109,6 +1112,10 @@ check_contains \
   "$project_dir/compose.reporting-mail-live.yaml" \
   "\${REPORT_GMAIL_OAUTH_DIR_HOST:?REPORT_GMAIL_OAUTH_DIR_HOST is required for scheduled mail}"
 check_contains \
+  "scheduled mail: activation audience has no fallback value" \
+  "$project_dir/compose.reporting-mail-live.yaml" \
+  "\${REPORT_MAIL_CANARY_AUDIENCE_ID:?REPORT_MAIL_CANARY_AUDIENCE_ID is required for scheduled mail}"
+check_contains \
   "mail canary: runner waits for the isolated proxy only" \
   "$project_dir/scripts/run-report-mail-canary.sh" \
   "up --detach --wait --wait-timeout 30 --no-deps mail-egress"
@@ -1124,6 +1131,11 @@ check_contains \
   "scheduled mail: runner activates only the exact mail services" \
   "$project_dir/scripts/start-report-mail-scheduler.sh" \
   'up --detach --wait --wait-timeout 60 mail-egress report-worker'
+# shellcheck disable=SC2016
+check_contains \
+  "scheduled mail: runner requires a database-backed activation preflight" \
+  "$project_dir/scripts/start-report-mail-scheduler.sh" \
+  'mail-preflight "$REPORT_MAIL_CANARY_AUDIENCE_ID"'
 check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \

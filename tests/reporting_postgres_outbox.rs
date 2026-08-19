@@ -244,6 +244,81 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
 }
 
 #[tokio::test]
+async fn scheduled_mail_activation_requires_a_recent_completed_canary() {
+    let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
+        return;
+    };
+    let _guard = DB_TEST_LOCK.lock().await;
+    let repository = PostgresOutboxRepository::connect(&Config::from_str(&url).unwrap())
+        .await
+        .unwrap();
+    let now = utc(12, 0) + Duration::days(60);
+    let recipient = format!("activation_{}", std::process::id());
+
+    assert_eq!(
+        repository.verify_mail_activation(&recipient, 1, now).await,
+        Err(PostgresOutboxError::CanaryMissing)
+    );
+    assert_eq!(
+        repository
+            .verify_mail_activation("bad recipient", 1, now)
+            .await,
+        Err(PostgresOutboxError::InvalidDelivery)
+    );
+
+    let delivery = due_deliveries(now, &recipient, 1, &BTreeSet::new())
+        .unwrap()
+        .remove(0);
+    let batch_id = match repository.create_planned(delivery).await.unwrap() {
+        CreateOutcome::Inserted(id) => id,
+        CreateOutcome::Existing(_) => unreachable!(),
+    };
+    repository.start_generation(batch_id).await.unwrap();
+    repository
+        .mark_ready(
+            batch_id,
+            &artifact_for(&now.format("%Y/%m/%d").to_string(), &recipient),
+        )
+        .await
+        .unwrap();
+    let claim = repository
+        .claim_ready(now + Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repository
+            .verify_mail_activation(&recipient, 1, now + Duration::minutes(1))
+            .await,
+        Err(PostgresOutboxError::AmbiguousDelivery)
+    );
+    repository
+        .record_sent(
+            &claim,
+            now + Duration::minutes(1),
+            now + Duration::minutes(2),
+            "gmail-canary-proof",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repository
+            .verify_mail_activation(&recipient, 1, now + Duration::minutes(3))
+            .await
+            .unwrap()
+            .canary_sent_at,
+        now + Duration::minutes(2)
+    );
+    assert_eq!(
+        repository
+            .verify_mail_activation(&recipient, 1, now + Duration::hours(25))
+            .await,
+        Err(PostgresOutboxError::CanaryMissing)
+    );
+}
+
+#[tokio::test]
 async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
     let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
         return;

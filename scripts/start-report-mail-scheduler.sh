@@ -14,6 +14,12 @@ fi
 : "${DAILY_REPORT_MAIL_POLICY_HOST:?DAILY_REPORT_MAIL_POLICY_HOST is required}"
 : "${REPORT_MAIL_ROUTING_HOST:?REPORT_MAIL_ROUTING_HOST is required}"
 : "${REPORT_GMAIL_OAUTH_DIR_HOST:?REPORT_GMAIL_OAUTH_DIR_HOST is required}"
+: "${REPORT_MAIL_CANARY_AUDIENCE_ID:?REPORT_MAIL_CANARY_AUDIENCE_ID is required}"
+
+if [[ ! "$REPORT_MAIL_CANARY_AUDIENCE_ID" =~ ^[A-Za-z0-9_-]{1,128}$ ]]; then
+  echo "REPORT_MAIL_CANARY_AUDIENCE_ID must be a bounded audience identifier" >&2
+  exit 65
+fi
 
 for path in \
   "$MCP_ACCESS_CONFIG_HOST" \
@@ -43,4 +49,6 @@ compose=(
 # Compose recreates the disabled base worker with the opt-in scheduled mode.
 # The narrow credentialless proxy is the only component attached to outbound.
 "${compose[@]}" config --quiet
+"${compose[@]}" run --rm --no-deps report-worker \
+  mail-preflight "$REPORT_MAIL_CANARY_AUDIENCE_ID"
 "${compose[@]}" up --detach --wait --wait-timeout 60 mail-egress report-worker

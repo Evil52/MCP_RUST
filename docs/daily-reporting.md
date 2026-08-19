@@ -118,14 +118,15 @@ Ozon account and the Vahrusheva/Torsunova Wildberries account. Sender and recipi
 addresses are referenced only by environment-variable names. Passwords, OAuth
 tokens and actual addresses must not be committed.
 
-## Not implemented yet
+## Remaining rollout gates
 
 The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
 writer, bounded fact reader and report dataset are present. Manual bounded Ozon
 and WB adapters are available for policy-scoped canaries, but automatic
 marketplace collection remains disabled.
-No scheduler is enabled in the shipped Compose configuration, and no S3 writer
-or live mail delivery is enabled. A provider-independent email envelope validates
+The default Compose stack enables no scheduler, S3 writer or live mail
+delivery. Separate opt-in collection and mail profiles are present but require
+their canary gates and private deployment inputs. A provider-independent email envelope validates
 one server-resolved sender and recipient, one exact claimed report scope, and
 the bounded HTML/XLSX artifact without reading environment variables. A
 bounded Gmail API transport also exists:
@@ -133,7 +134,7 @@ its production constructor has one fixed Gmail send endpoint, one fixed
 dedicated mail-egress proxy, disabled redirects and ambient proxies, a bounded
 response and payload-free errors. A single-attempt delivery service joins
 the strict routing document, validated artifact, OAuth refresh and Gmail send
-transports. A non-looping outbox coordinator now claims at most one ready row,
+transports. The primitive outbox coordinator claims at most one ready row,
 loads and verifies its immutable artifact, invokes that service once, and
 persists only a result whose safety is known. It resolves and
 validates the address and report scope before OAuth, refreshes once, sends
@@ -152,9 +153,10 @@ transient network problem. The OAuth transport accepts exactly the private files
 uses only Google's fixed token endpoint through the same dedicated mail-egress
 proxy, and accepts only a bounded Bearer token for the minimal
 `https://www.googleapis.com/auth/gmail.send` scope. The operator-only credential
-mounts and isolated mail-egress canary overlay are present. The binary contains
-a gated bounded delivery scheduler, but its production Compose overlay and
-activation remain future release gates. A strict private routing-file loader
+mounts and isolated mail-egress canary overlay are present. The binary and
+separate `reporting-mail-live` profile contain a gated bounded delivery
+scheduler; activation remains an operator rollout decision after a successful
+database-backed canary preflight. A strict private routing-file loader
 resolves the policy's
 symbolic sender and audience names to addresses. It requires one exact route
 per configured symbol, refuses extra/missing/duplicate routes and never lets a
@@ -180,9 +182,10 @@ overlay can perform one operator-invoked `deliver-one` attempt when all private
 host paths are supplied. Merely starting its profile runs `healthcheck`, not
 delivery. The worker has no general Internet network; its fixed Gmail and OAuth
 clients can reach only `gmail.googleapis.com` and `oauth2.googleapis.com`
-through the credentialless deny-by-default Squid service. It has no automatic
-delivery loop and cannot affect a marketplace. Search-position collection
-remains disabled.
+through the credentialless deny-by-default Squid service. The default and
+canary profiles have no automatic delivery loop; only the explicit live profile
+can start it. Mail delivery cannot affect a marketplace. Search-position
+collection remains disabled.
 
 `report-worker` supports `healthcheck`, disabled idle operation and the
 operator-only commands below. The selected actor must belong to the selected
@@ -196,6 +199,8 @@ report-worker preview <audience-id> <actor-id> <YYYY-MM-DD> \
 report-worker generate <batch-id>
 
 REPORT_WORKER_MODE=delivery_canary report-worker deliver-one
+
+REPORT_WORKER_MODE=scheduled_delivery report-worker mail-preflight <audience-id>
 ```
 
 `preview` requires disabled mode and a disabled policy. `generate` accepts
@@ -248,10 +253,15 @@ mandatory read-only private inputs. It remains inert until an operator invokes:
 ./scripts/start-report-mail-scheduler.sh --confirm-canary-sent-and-reconciled
 ```
 
-The confirmation records an operational decision, not a security bypass: an
-enabled strict policy, exact routing file, OAuth directory and healthy database
-are still required before the worker can start. Do not invoke it before the
-canary message, recipient, attachment hash and Gmail audit result are checked.
+Set `REPORT_MAIL_CANARY_AUDIENCE_ID` to the non-secret audience identifier used
+by the canary. Before starting the services, the wrapper runs a database-backed
+`mail-preflight`: that exact audience and policy version must have a successful
+provider delivery no more than 24 hours old, and it must have no unresolved
+`sending` row. The confirmation records an operational decision, not a security
+bypass: an enabled strict policy, exact routing file, OAuth directory and
+healthy database are still required before the worker can start. Do not invoke
+it before the canary message, recipient, attachment hash and Gmail audit result
+are checked.
 
 The separate collector has two explicit one-account canary commands:
 

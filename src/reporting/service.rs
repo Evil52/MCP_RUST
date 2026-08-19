@@ -26,6 +26,7 @@ const ARTIFACT_ROOT_ENV: &str = "REPORT_ARTIFACT_ROOT";
 const MODE_ENV: &str = "REPORT_WORKER_MODE";
 const MAIL_ROUTING_PATH_ENV: &str = "REPORT_MAIL_ROUTING";
 const GMAIL_CREDENTIAL_DIR_ENV: &str = "REPORT_GMAIL_OAUTH_DIR";
+const MAIL_CANARY_AUDIENCE_ENV: &str = "REPORT_MAIL_CANARY_AUDIENCE_ID";
 const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub struct ReportWorkerConfig {
     registry: Arc<AccessRegistry>,
     artifact_store: LocalArtifactStore,
     mail_provider: Option<GmailProvider>,
+    activation_audience_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +100,20 @@ impl ReportWorkerConfig {
             lookup(ARTIFACT_ROOT_ENV).context("REPORT_ARTIFACT_ROOT is required")?;
         let artifact_store = LocalArtifactStore::open(artifact_root)
             .context("REPORT_ARTIFACT_ROOT must be an existing safe directory")?;
+        let activation_audience_id = if mode == ReportWorkerMode::ScheduledDelivery {
+            let audience_id = lookup(MAIL_CANARY_AUDIENCE_ENV)
+                .context("REPORT_MAIL_CANARY_AUDIENCE_ID is required")?;
+            ensure!(
+                policy
+                    .audiences
+                    .iter()
+                    .any(|audience| audience.id == audience_id),
+                "REPORT_MAIL_CANARY_AUDIENCE_ID is outside the validated policy"
+            );
+            Some(audience_id)
+        } else {
+            None
+        };
         let mail_provider = if matches!(
             mode,
             ReportWorkerMode::DeliveryCanary | ReportWorkerMode::ScheduledDelivery
@@ -127,6 +143,7 @@ impl ReportWorkerConfig {
             registry: snapshot,
             artifact_store,
             mail_provider,
+            activation_audience_id,
         })
     }
 
@@ -140,6 +157,10 @@ impl ReportWorkerConfig {
 
     pub fn artifact_store(&self) -> &LocalArtifactStore {
         &self.artifact_store
+    }
+
+    pub fn activation_audience_id(&self) -> Option<&str> {
+        self.activation_audience_id.as_deref()
     }
 
     /// Constructs the single-attempt delivery coordinator only in an explicit
@@ -376,6 +397,7 @@ mod tests {
             .find(|(key, _)| *key == MODE_ENV)
             .unwrap()
             .1 = "scheduled_delivery".to_owned();
+        entries.push((MAIL_CANARY_AUDIENCE_ENV, "pilot_owner".to_owned()));
         entries
     }
 
@@ -578,6 +600,18 @@ mod tests {
         assert_eq!(scheduled.mode(), ReportWorkerMode::ScheduledDelivery);
         assert!(scheduled.policy().enabled);
         assert!(scheduled.mail_provider.is_some());
+        assert_eq!(scheduled.activation_audience_id(), Some("pilot_owner"));
+
+        let mut entries = scheduled_delivery_entries();
+        entries.retain(|(key, _)| *key != MAIL_CANARY_AUDIENCE_ENV);
+        assert!(config(entries).is_err());
+        let mut entries = scheduled_delivery_entries();
+        entries
+            .iter_mut()
+            .find(|(key, _)| *key == MAIL_CANARY_AUDIENCE_ENV)
+            .unwrap()
+            .1 = "outside_policy".to_owned();
+        assert!(config(entries).is_err());
 
         for missing in [MAIL_ROUTING_PATH_ENV, GMAIL_CREDENTIAL_DIR_ENV] {
             let mut entries = canary_entries();

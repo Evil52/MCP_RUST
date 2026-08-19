@@ -259,7 +259,9 @@ has broader vendor permissions.
   Scheduled delivery must be activated only through the explicit `reporting-mail-live` profile
   and `scripts/start-report-mail-scheduler.sh --confirm-canary-sent-and-reconciled`. Its worker
   must retain the canary's exact read-only private mounts and internal-only database/mail-proxy
-  networks; only the credentialless mail proxy may attach to the outbound bridge.
+  networks; only the credentialless mail proxy may attach to the outbound bridge. Before service
+  startup, `mail-preflight` must prove a successful canary for the selected audience and current
+  policy version within 24 hours and reject any unresolved `sending` row for that audience.
 - Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
   through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
   `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,

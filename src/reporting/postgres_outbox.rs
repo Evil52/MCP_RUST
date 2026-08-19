@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use tokio_postgres::{Client, Config, Transaction};
 
 use crate::postgres::SupervisedClient;
@@ -15,10 +15,12 @@ use super::{
     },
     policy::DailyReportPolicy,
     scheduler::{ScheduledDelivery, due_for_audience},
+    validate_identity,
 };
 
 const MAX_DELIVERY_ATTEMPTS: u8 = 5;
 const MAX_GENERATION_CANDIDATES: u16 = 16;
+const MAIL_CANARY_MAX_AGE: Duration = Duration::hours(24);
 
 /// First generation retry delay. Each further attempt doubles it, so a batch
 /// that keeps failing backs off to roughly a quarter of an hour before its
@@ -89,6 +91,11 @@ pub struct GenerationCandidate {
     pub status: GenerationStatus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailActivationReceipt {
+    pub canary_sent_at: DateTime<Utc>,
+}
+
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum PostgresOutboxError {
     #[error("report outbox is unavailable")]
@@ -97,6 +104,10 @@ pub enum PostgresOutboxError {
     Conflict,
     #[error("report delivery is invalid")]
     InvalidDelivery,
+    #[error("a report delivery has an ambiguous sending state")]
+    AmbiguousDelivery,
+    #[error("a recent successful mail canary is unavailable")]
+    CanaryMissing,
 }
 
 #[derive(Clone)]
@@ -166,6 +177,40 @@ impl PostgresOutboxRepository {
         } else {
             Err(PostgresOutboxError::Unavailable)
         }
+    }
+
+    /// Requires recent provider-backed proof before scheduled mail activation.
+    ///
+    /// The canary must use the same immutable audience and report-policy
+    /// version as the scheduler. A `sending` row is deliberately blocking: its
+    /// provider outcome is unknown and must be reconciled by an operator before
+    /// any further automatic delivery starts.
+    pub async fn verify_mail_activation(
+        &self,
+        recipient_id: &str,
+        report_version: u32,
+        now: DateTime<Utc>,
+    ) -> Result<MailActivationReceipt, PostgresOutboxError> {
+        validate_identity(recipient_id, report_version)
+            .map_err(|_| PostgresOutboxError::InvalidDelivery)?;
+        let version =
+            i32::try_from(report_version).map_err(|_| PostgresOutboxError::InvalidDelivery)?;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
+        let row = client
+            .query_one(
+                "SELECT count(*) FILTER (WHERE status = 'sending'), \
+                        max(sent_at) FILTER (WHERE status = 'sent') \
+                 FROM daily_reporting.delivery_batches \
+                 WHERE recipient_id = $1 AND report_version = $2",
+                &[&recipient_id, &version],
+            )
+            .await
+            .map_err(|_| PostgresOutboxError::Unavailable)?;
+        validate_mail_activation_state(row.get(0), row.get(1), now)
     }
 
     pub async fn create_planned(
@@ -815,6 +860,26 @@ impl PostgresOutboxRepository {
     }
 }
 
+fn validate_mail_activation_state(
+    ambiguous_count: i64,
+    sent_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<MailActivationReceipt, PostgresOutboxError> {
+    if ambiguous_count != 0 {
+        return Err(PostgresOutboxError::AmbiguousDelivery);
+    }
+    let sent_at = sent_at.ok_or(PostgresOutboxError::CanaryMissing)?;
+    let oldest_allowed = now
+        .checked_sub_signed(MAIL_CANARY_MAX_AGE)
+        .ok_or(PostgresOutboxError::InvalidDelivery)?;
+    if sent_at < oldest_allowed || sent_at > now {
+        return Err(PostgresOutboxError::CanaryMissing);
+    }
+    Ok(MailActivationReceipt {
+        canary_sent_at: sent_at,
+    })
+}
+
 async fn create_planned_inner(
     transaction: &Transaction<'_>,
     record: &DeliveryRecord,
@@ -1000,6 +1065,7 @@ mod tests {
     use super::{
         GenerationStatus, PostgresOutboxError, exactly_one, parse_generation_status, parse_kind,
         permanent_error_text, transient_error_text, validate_attempt_times,
+        validate_mail_activation_state,
     };
     use crate::{reporting::ReportKind, reporting::outbox::DeliveryErrorClass};
 
@@ -1069,6 +1135,39 @@ mod tests {
         assert_eq!(
             validate_attempt_times(start, start - chrono::Duration::seconds(1)),
             Err(PostgresOutboxError::InvalidDelivery)
+        );
+    }
+
+    #[test]
+    fn mail_activation_requires_recent_unambiguous_canary_proof() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            validate_mail_activation_state(1, Some(now), now),
+            Err(PostgresOutboxError::AmbiguousDelivery)
+        );
+        assert_eq!(
+            validate_mail_activation_state(0, None, now),
+            Err(PostgresOutboxError::CanaryMissing)
+        );
+        assert_eq!(
+            validate_mail_activation_state(0, Some(now - chrono::Duration::hours(25)), now),
+            Err(PostgresOutboxError::CanaryMissing)
+        );
+        assert_eq!(
+            validate_mail_activation_state(0, Some(now + chrono::Duration::seconds(1)), now),
+            Err(PostgresOutboxError::CanaryMissing)
+        );
+        assert_eq!(
+            validate_mail_activation_state(0, Some(now), chrono::DateTime::<Utc>::MIN_UTC),
+            Err(PostgresOutboxError::InvalidDelivery)
+        );
+        assert_eq!(
+            validate_mail_activation_state(0, Some(now), now)
+                .unwrap()
+                .canary_sent_at,
+            now
         );
     }
 }

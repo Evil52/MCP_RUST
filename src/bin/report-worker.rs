@@ -72,6 +72,31 @@ async fn main() -> Result<()> {
         tracing::info!(?outcome, "single Gmail canary attempt finished");
         return Ok(());
     }
+    if let [command, audience_id] = arguments.as_slice()
+        && command == "mail-preflight"
+    {
+        ensure!(
+            config.mode() == ReportWorkerMode::ScheduledDelivery && config.policy().enabled,
+            "mail-preflight requires explicit scheduled_delivery mode and enabled policy"
+        );
+        ensure!(
+            config
+                .policy()
+                .audiences
+                .iter()
+                .any(|audience| audience.id == *audience_id),
+            "mail-preflight audience is outside the validated policy"
+        );
+        let receipt = outbox
+            .verify_mail_activation(audience_id, config.policy().version, Utc::now())
+            .await?;
+        tracing::info!(
+            audience_id,
+            canary_sent_at = %receipt.canary_sent_at,
+            "scheduled mail activation preflight passed"
+        );
+        return Ok(());
+    }
     if let [
         command,
         audience_id,
@@ -161,10 +186,18 @@ async fn main() -> Result<()> {
             bail!("delivery_canary mode requires the explicit deliver-one command")
         }
         (ReportWorkerMode::ScheduledDelivery, true) => {
+            let activation_audience_id = config
+                .activation_audience_id()
+                .context("scheduled mail activation audience is unavailable")?;
+            let receipt = outbox
+                .verify_mail_activation(activation_audience_id, config.policy().version, Utc::now())
+                .await?;
             let delivery = config.delivery_worker(outbox.clone())?;
             tracing::info!(
                 targets = targets.len(),
                 tick_seconds = DRY_RUN_TICK.as_secs(),
+                activation_audience_id,
+                canary_sent_at = %receipt.canary_sent_at,
                 "scheduled report generation and Gmail delivery started"
             );
             tokio::select! {
@@ -378,7 +411,7 @@ async fn generate_batch(
 
 fn usage() -> Result<()> {
     bail!(
-        "usage: report-worker [healthcheck | deliver-one | generate <batch-id> | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
+        "usage: report-worker [healthcheck | deliver-one | mail-preflight <audience-id> | generate <batch-id> | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
     )
 }
 
