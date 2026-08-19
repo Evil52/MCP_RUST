@@ -151,13 +151,15 @@ transient network problem. The OAuth transport accepts exactly the private files
 `client_secret` and `refresh_token`, requires a private credential directory,
 uses only Google's fixed token endpoint through the same dedicated mail-egress
 proxy, and accepts only a bounded Bearer token for the minimal
-`https://www.googleapis.com/auth/gmail.send` scope. The production credential
-mount, mail-egress deployment and continuous delivery loop remain future
-release gates. A strict private routing-file loader now resolves the policy's
+`https://www.googleapis.com/auth/gmail.send` scope. The operator-only credential
+mounts and isolated mail-egress canary overlay are present; a continuous
+delivery loop remains a future release gate. A strict private routing-file
+loader resolves the policy's
 symbolic sender and audience names to addresses. It requires one exact route
 per configured symbol, refuses extra/missing/duplicate routes and never lets a
 prompt, report row or account payload select an address. The routing file is
-not mounted by the shipped Compose service. It is consumed only in explicit
+not mounted by the default Compose service. The separate
+`reporting-mail-canary` profile mounts it only for explicit
 `REPORT_WORKER_MODE=delivery_canary`, together with an exact private OAuth
 directory. No Gmail password or address
 belongs in the OAuth directory, repository, Compose environment or logs. An opt-in
@@ -172,11 +174,14 @@ primitive can now be invoked explicitly for one already-planned outbox batch
 while delivery remains disabled. Consolidated two-period
 catch-up rendering remains fail-closed until it has an explicit two-section
 template rather than silently presenting one interval as two reports. The
-shipped Compose service consequently cannot send email. The binary can perform
-one operator-invoked `deliver-one` canary attempt when all private mounts and
-the dedicated mail-egress proxy are provisioned outside the default stack; it
-has no automatic delivery loop. It cannot affect a marketplace. Search-position
-collection remains disabled.
+shipped default Compose service consequently cannot send email. The canary
+overlay can perform one operator-invoked `deliver-one` attempt when all private
+host paths are supplied. Merely starting its profile runs `healthcheck`, not
+delivery. The worker has no general Internet network; its fixed Gmail and OAuth
+clients can reach only `gmail.googleapis.com` and `oauth2.googleapis.com`
+through the credentialless deny-by-default Squid service. It has no automatic
+delivery loop and cannot affect a marketplace. Search-position collection
+remains disabled.
 
 `report-worker` supports `healthcheck`, disabled idle operation and the
 operator-only commands below. The selected actor must belong to the selected
@@ -207,6 +212,25 @@ requires an enabled policy, strict private routing and OAuth files, claims at
 most one ready batch, and is bounded by 60 seconds. It refreshes OAuth once and
 sends once; an ambiguous or unpersisted post-claim outcome remains `sending`
 for operator reconciliation rather than being retried.
+
+The one-shot Compose canary is launched only by the guarded wrapper below. It
+requires an already healthy `position-db`, builds/starts the dedicated proxy,
+waits for its deny-by-default healthcheck, performs exactly one worker command,
+and stops the proxy on exit. The four variables are host paths, never secret
+values; the routing file and OAuth directory must satisfy the private-mode and
+exact-inventory checks described above.
+
+```text
+MCP_ACCESS_CONFIG_HOST=/private/path/access.json \
+DAILY_REPORT_MAIL_POLICY_HOST=/private/path/daily-report-policy.json \
+REPORT_MAIL_ROUTING_HOST=/private/path/mail-routing.json \
+REPORT_GMAIL_OAUTH_DIR_HOST=/private/path/gmail-oauth \
+scripts/run-report-mail-canary.sh
+```
+
+Do not invoke this command until a ready outbox artifact has been manually
+reviewed. It may send one real message. A successful canary does not enable the
+08:00/17:00 scheduler or any background mail delivery.
 
 The separate collector has two explicit one-account canary commands:
 

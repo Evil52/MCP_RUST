@@ -155,6 +155,27 @@ render_reporting_canary_compose() {
       config --no-env-resolution --format json
 }
 
+render_reporting_mail_canary_compose() {
+  local mail_policy="$scratch/daily-report-mail-policy.json"
+  local mail_routing="$scratch/mail-routing.json"
+  local oauth_directory="$scratch/gmail-oauth"
+  printf '{}\n' >"$mail_policy"
+  printf '{}\n' >"$mail_routing"
+  mkdir "$oauth_directory"
+  chmod 600 "$mail_policy" "$mail_routing"
+  chmod 500 "$oauth_directory"
+  MCP_ACCESS_CONFIG_HOST="$main_access" \
+    DAILY_REPORT_MAIL_POLICY_HOST="$mail_policy" \
+    REPORT_MAIL_ROUTING_HOST="$mail_routing" \
+    REPORT_GMAIL_OAUTH_DIR_HOST="$oauth_directory" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.position.yaml" \
+      -f "$project_dir/compose.reporting-mail-canary.yaml" \
+      --profile reporting-mail-canary \
+      config --no-env-resolution --format json
+}
+
 # The dollar-prefixed names below are jq variables supplied with `--arg`; the
 # single quotes deliberately prevent the shell from expanding them.
 # shellcheck disable=SC2016
@@ -647,6 +668,132 @@ verify_reporting_canary() {
      }'
 }
 
+verify_reporting_mail_canary() {
+  local rendered="$1" worker proxy expected_database_url mail_policy mail_routing oauth_directory
+  worker="$(jq -c '.services["report-worker"]' <<<"$rendered")"
+  proxy="$(jq -c '.services["mail-egress"]' <<<"$rendered")"
+  expected_database_url='postgresql://report_worker:verify-only-report-worker-not-a-secret@position-db:5432/ozon_positions'
+  mail_policy="$scratch/daily-report-mail-policy.json"
+  mail_routing="$scratch/mail-routing.json"
+  oauth_directory="$scratch/gmail-oauth"
+
+  check "mail canary: worker is inert unless an operator overrides the command" "$worker" \
+    '.profiles == ["reporting-mail-canary"]
+     and .command == ["healthcheck"]
+     and .image == "mcp-ozon-report-worker:local"'
+  check "mail canary: worker has no ingress, env file, Compose secret, or config" "$worker" \
+    '((.ports // []) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)'
+  # shellcheck disable=SC2016
+  check "mail canary: environment contains only fixed paths and no secret values" "$worker" \
+    --arg database_url "$expected_database_url" \
+    '.environment == {
+       "REPORT_WORKER_MODE": "delivery_canary",
+       "REPORT_WORKER_DATABASE_URL": $database_url,
+       "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
+       "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
+       "REPORT_ARTIFACT_ROOT": "/var/lib/mcp-ozon/report-artifacts",
+       "REPORT_MAIL_ROUTING": "/run/mcp-ozon/mail-routing.json",
+       "REPORT_GMAIL_OAUTH_DIR": "/run/mcp-ozon/gmail-oauth",
+       "RUST_LOG": "mcp_ozon::reporting=info"
+     }
+     and ([.environment | to_entries[]
+       | select(.key | test("(?i)(gmail.*(client|refresh|secret|token)|oauth.*(client|refresh|secret|token))"))]
+       | length == 0)'
+  # shellcheck disable=SC2016
+  check "mail canary: metadata, routing and OAuth inputs are exactly read-only" "$worker" \
+    --arg access "$main_access" \
+    --arg policy "$mail_policy" \
+    --arg routing "$mail_routing" \
+    --arg oauth "$oauth_directory" \
+    '((.volumes // []) | map(.read_only //= false | del(.bind)) | sort_by(.target)) == [
+       {
+         "type": "bind", "source": $access,
+         "target": "/etc/mcp-ozon/access.json", "read_only": true
+       },
+       {
+         "type": "bind", "source": $policy,
+         "target": "/etc/mcp-ozon/daily-report-policy.json", "read_only": true
+       },
+       {
+         "type": "bind", "source": $oauth,
+         "target": "/run/mcp-ozon/gmail-oauth", "read_only": true
+       },
+       {
+         "type": "bind", "source": $routing,
+         "target": "/run/mcp-ozon/mail-routing.json", "read_only": true
+       },
+       {
+         "type": "volume", "source": "report-artifacts",
+         "target": "/var/lib/mcp-ozon/report-artifacts", "read_only": false
+       }
+     ]
+     and all((.volumes // [])[];
+       .bind == null or .bind == {} or .bind == {"create_host_path": false})'
+  check "mail canary: worker keeps exact isolation and resource bounds" "$worker" \
+    '(.networks | keys | sort) == ["mail-egress-internal", "position-internal"]
+     and .depends_on == {
+       "mail-egress": {"condition": "service_healthy", "required": true},
+       "position-db": {"condition": "service_healthy", "required": true}
+     }
+     and .read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false
+     and .mem_limit == "201326592"
+     and .cpus == 0.5
+     and .pids_limit == 64
+     and .stop_grace_period == "10s"
+     and .restart == "unless-stopped"
+     and .logging == {
+       "driver": "json-file",
+       "options": {"max-file": "2", "max-size": "5m"}
+     }
+     and .healthcheck == {
+       "test": ["CMD", "/usr/local/bin/report-worker", "healthcheck"],
+       "timeout": "8s", "interval": "30s", "retries": 3,
+       "start_period": "10s"
+     }'
+
+  check "mail egress: proxy is isolated, credentialless and has no ingress" "$proxy" \
+    '.profiles == ["reporting-mail-canary"]
+     and .image == "mcp-ozon-mail-egress:local"
+     and ((.ports // []) | length == 0)
+     and ((.volumes // []) | length == 0)
+     and ((.environment // {}) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)
+     and (.networks | keys | sort) == ["mail-egress-internal", "outbound"]'
+  check "mail egress: filesystem, privileges, resources and denial probe are exact" "$proxy" \
+    '.read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false
+     and (.tmpfs // [] | sort) == [
+       "/var/cache/squid:size=8m,mode=1777",
+       "/var/log/squid:size=4m,mode=1777",
+       "/var/run/squid:size=1m,mode=1777"
+     ]
+     and .mem_limit == "134217728"
+     and .cpus == 0.25
+     and .pids_limit == 64
+     and .stop_grace_period == "10s"
+     and .restart == "unless-stopped"
+     and .logging == {"driver": "json-file", "options": {"max-file": "2", "max-size": "1m"}}
+     and .healthcheck == {
+       "test": ["CMD-SHELL", "printf '"'"'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n'"'"' | nc -w 3 127.0.0.1 3129 | head -1 | grep -q '"'"'403 Forbidden'"'"'"],
+       "timeout": "8s", "interval": "30s", "retries": 3, "start_period": "10s"
+     }'
+  check "mail canary: network definitions keep worker internal and proxy-only outbound" "$rendered" \
+    '.networks["mail-egress-internal"].name == "mcp-ozon-mail-egress-internal"
+     and .networks["mail-egress-internal"].internal == true
+     and .networks.outbound.name == "mcp-ozon-outbound"
+     and .networks.outbound.external == true'
+}
+
 verify_ozon_egress() {
   local rendered="$1" service
   service="$(jq -c '.services["ozon-egress"]' <<<"$rendered")"
@@ -796,6 +943,7 @@ canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_position_compose)"
 reporting_live_rendered="$(render_reporting_live_compose)"
 reporting_canary_rendered="$(render_reporting_canary_compose)"
+reporting_mail_canary_rendered="$(render_reporting_mail_canary_compose)"
 control_rendered="$(render_control_compose)"
 
 # Rendering uses isolated, existing placeholder files so the result is the
@@ -873,6 +1021,30 @@ check_contains \
   "$project_dir/scripts/run-report-canary.sh" \
   "run --rm --no-deps report-collector"
 check_contains \
+  "mail canary: access registry has no fallback path" \
+  "$project_dir/compose.reporting-mail-canary.yaml" \
+  "\${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for mail canary}"
+check_contains \
+  "mail canary: enabled policy has no fallback path" \
+  "$project_dir/compose.reporting-mail-canary.yaml" \
+  "\${DAILY_REPORT_MAIL_POLICY_HOST:?DAILY_REPORT_MAIL_POLICY_HOST is required for mail canary}"
+check_contains \
+  "mail canary: routing file has no fallback path" \
+  "$project_dir/compose.reporting-mail-canary.yaml" \
+  "\${REPORT_MAIL_ROUTING_HOST:?REPORT_MAIL_ROUTING_HOST is required for mail canary}"
+check_contains \
+  "mail canary: OAuth directory has no fallback path" \
+  "$project_dir/compose.reporting-mail-canary.yaml" \
+  "\${REPORT_GMAIL_OAUTH_DIR_HOST:?REPORT_GMAIL_OAUTH_DIR_HOST is required for mail canary}"
+check_contains \
+  "mail canary: runner waits for the isolated proxy only" \
+  "$project_dir/scripts/run-report-mail-canary.sh" \
+  "up --detach --wait --wait-timeout 30 --no-deps mail-egress"
+check_contains \
+  "mail canary: runner performs exactly an explicit one-shot delivery" \
+  "$project_dir/scripts/run-report-mail-canary.sh" \
+  "run --rm --no-deps report-worker deliver-one"
+check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
   "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"
@@ -883,6 +1055,18 @@ check_contains \
 check_contains \
   "ozon egress: proxy denies every other destination" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
+  "http_access deny all"
+check_contains \
+  "mail egress: proxy permits only the fixed OAuth and Gmail API hosts" \
+  "$project_dir/position-monitor/mail-egress/squid.conf" \
+  "acl google_mail_api dstdomain oauth2.googleapis.com gmail.googleapis.com"
+check_contains \
+  "mail egress: proxy applies the exact Google host allowlist" \
+  "$project_dir/position-monitor/mail-egress/squid.conf" \
+  "http_access allow connect google_mail_api tls_port"
+check_contains \
+  "mail egress: proxy denies every other destination" \
+  "$project_dir/position-monitor/mail-egress/squid.conf" \
   "http_access deny all"
 
 verify_server \
@@ -920,6 +1104,7 @@ verify_reporting_service \
   "0.5"
 verify_reporting_live "$reporting_live_rendered"
 verify_reporting_canary "$reporting_canary_rendered"
+verify_reporting_mail_canary "$reporting_mail_canary_rendered"
 verify_control "$control_rendered"
 
 if (( failures > 0 )); then
@@ -927,4 +1112,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, Control, position database, Ozon read-API egress proxy, disabled collector/reporting runtimes, and the explicit reporting canary/live overlays: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."
+echo "Compose hardening verified for main, canary, Control, position database, Ozon read-API and Gmail egress proxies, disabled collector/reporting runtimes, and the explicit reporting collection/mail canary and live overlays: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."

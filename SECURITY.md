@@ -245,7 +245,12 @@ has broader vendor permissions.
   Before any automatic loop exists, exercise only the explicit `delivery_canary` `deliver-one`
   command. It must claim at most one ready batch, finish within the outer 60-second budget, and
   leave any timed-out claimed row `sending`. The default Compose service must remain `disabled`
-  and must not mount routing, OAuth credentials, or the mail-egress network.
+  and must not mount routing, OAuth credentials, or the mail-egress network. Use only the
+  `reporting-mail-canary` profile and `scripts/run-report-mail-canary.sh`: profile startup alone
+  must run `healthcheck`, the wrapper must wait for the deny-by-default proxy, invoke exactly one
+  `deliver-one`, and stop the proxy on exit. The worker may attach only to the internal database
+  and mail-proxy networks; only the credentialless proxy may attach to the outbound bridge, and
+  its allowlist must remain exactly `oauth2.googleapis.com` plus `gmail.googleapis.com` on TLS 443.
 - Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
   through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
   `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,
