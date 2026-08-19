@@ -133,8 +133,8 @@ async fn run_wb_dry_run(
         .await?
         .context("WB dry-run target is already claimed or complete")?;
     let outcome = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
-        let account = config.wb_dry_run_account(account_id)?;
-        let client = config.wb_dry_run_client()?;
+        let (client, account) =
+            config.resolve_wb_dry_run(&claim, &mut |key| std::env::var(key).ok())?;
         let source = WbReportSource::new(WbClientReportTransport::new(client, account));
         let facts = source
             .collect(date)
@@ -188,9 +188,8 @@ async fn run_ozon_dry_run(
         .await?
         .context("Ozon dry-run target is already claimed or complete")?;
     let outcome = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
-        let store = config.ozon_dry_run_store(account_id)?;
-        let client = config.ozon_dry_run_client()?;
-        let performance = config.ozon_dry_run_performance_client()?;
+        let (client, performance, store) =
+            config.resolve_ozon_dry_run(&claim, &mut |key| std::env::var(key).ok())?;
         let performance_store = store.clone();
         let transport = OzonClientReportTransport::new(client, store);
         let performance_source = OzonPerformanceReportSource::new(

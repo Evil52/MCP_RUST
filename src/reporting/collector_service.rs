@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, fs, path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
+use chrono::Utc;
 use tokio_postgres::{Config, config::Host};
 
 use crate::{
@@ -16,6 +17,7 @@ use crate::{
 use super::{
     collector_plan::{CollectionTarget, build_collection_plan},
     policy::DailyReportPolicy,
+    postgres_collector::CollectionClaim,
 };
 
 const DATABASE_URL_ENV: &str = "REPORT_COLLECTOR_DATABASE_URL";
@@ -42,20 +44,17 @@ pub enum ReportCollectorMode {
     WbDryRun,
 }
 
-/// Configuration for the disabled runtime and explicit Ozon canary command.
+/// Configuration for the disabled runtime and explicit marketplace canaries.
 ///
-/// Disabled mode never resolves marketplace credentials. Ozon dry-run resolves
-/// only the exact marketplace bindings selected by the validated policy and
-/// the explicit mode. Credentials for the other marketplace are never loaded.
+/// Startup loads only registry metadata. A canary resolves the exact claimed
+/// account's credentials through an explicit method after its database lease
+/// is acquired; credentials for other accounts and marketplaces are not read.
 pub struct ReportCollectorConfig {
     database: Config,
     mode: ReportCollectorMode,
     policy: DailyReportPolicy,
     registry: Arc<AccessRegistry>,
     collection_plan: Vec<CollectionTarget>,
-    ozon_dry_run_stores: BTreeMap<StoreId, StoreCredentials>,
-    ozon_dry_run_performance: BTreeMap<StoreId, PerformanceCredentials>,
-    wb_dry_run_accounts: BTreeMap<String, WbCredentials>,
 }
 
 impl ReportCollectorConfig {
@@ -86,28 +85,12 @@ impl ReportCollectorConfig {
             .context("DAILY_REPORT_POLICY is invalid")?;
         let collection_plan = build_collection_plan(&policy, &registry)
             .context("daily report collection plan is invalid")?;
-        let (ozon_dry_run_stores, ozon_dry_run_performance, wb_dry_run_accounts) = match mode {
-            ReportCollectorMode::Disabled => (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
-            ReportCollectorMode::OzonDryRun => {
-                let (seller, performance) =
-                    resolve_ozon_dry_run_stores(&registry, &collection_plan, lookup)?;
-                (seller, performance, BTreeMap::new())
-            }
-            ReportCollectorMode::WbDryRun => (
-                BTreeMap::new(),
-                BTreeMap::new(),
-                resolve_wb_dry_run_accounts(&registry, &collection_plan, lookup)?,
-            ),
-        };
         Ok(Self {
             database,
             mode,
             policy,
             registry,
             collection_plan,
-            ozon_dry_run_stores,
-            ozon_dry_run_performance,
-            wb_dry_run_accounts,
         })
     }
 
@@ -127,57 +110,28 @@ impl ReportCollectorConfig {
         &self.database
     }
 
-    /// Builds a read-only Ozon client containing only accounts selected by
-    /// the report policy. It is unavailable in normal disabled mode.
-    pub fn ozon_dry_run_client(&self) -> Result<OzonClient> {
-        ensure!(
-            self.mode == ReportCollectorMode::OzonDryRun && !self.ozon_dry_run_stores.is_empty(),
-            "Ozon dry-run credentials are unavailable in disabled mode"
-        );
-        // These are fixed, previously validated client-builder inputs. A
-        // failure here can only be an unrecoverable local reqwest/TLS runtime
-        // construction failure; no marketplace request or snapshot write has
-        // begun at this point.
-        Ok(OzonClient::new_with_https_proxy(
-            OZON_SELLER_API_BASE_URL.to_owned(),
-            OZON_DRY_RUN_TIMEOUT,
-            self.ozon_dry_run_stores.clone(),
-            REPORT_EGRESS_PROXY,
-        )
-        .expect("fixed Ozon dry-run client configuration is valid"))
-    }
-
-    /// Builds the read-only Ozon Performance client for the exact same
-    /// policy-selected stores as the Seller client.
-    pub fn ozon_dry_run_performance_client(&self) -> Result<PerformanceClient> {
-        ensure!(
-            self.mode == ReportCollectorMode::OzonDryRun
-                && !self.ozon_dry_run_performance.is_empty(),
-            "Ozon Performance dry-run credentials are unavailable in disabled mode"
-        );
-        PerformanceClient::new_with_https_proxy(
-            OZON_DRY_RUN_TIMEOUT,
-            self.ozon_dry_run_performance.clone(),
-            REPORT_EGRESS_PROXY,
-        )
-        .context("fixed Ozon Performance dry-run client configuration is invalid")
-    }
-
-    /// Resolves one policy-selected Ozon account to its opaque store identity.
-    ///
-    /// This is intentionally available only for the explicit manual dry-run
-    /// mode. Callers cannot select an arbitrary registry account or borrow a
-    /// store binding from a different marketplace.
-    pub fn ozon_dry_run_store(&self, account_id: &str) -> Result<StoreId> {
+    /// Resolves the exact claimed Ozon account after the caller has acquired
+    /// its database lease. Startup and busy/completed claims therefore never
+    /// read Seller or Performance secret values.
+    pub fn resolve_ozon_dry_run(
+        &self,
+        claim: &CollectionClaim,
+        lookup: &mut dyn FnMut(&str) -> Option<String>,
+    ) -> Result<(OzonClient, PerformanceClient, StoreId)> {
         ensure!(
             self.mode == ReportCollectorMode::OzonDryRun,
-            "Ozon dry-run store is unavailable in disabled mode"
+            "Ozon dry-run credentials are unavailable outside Ozon dry-run mode"
+        );
+        ensure!(
+            claim.lease_until() > Utc::now(),
+            "collection claim has expired"
         );
         let target = self
             .collection_plan
             .iter()
             .find(|target| {
-                target.account_id == account_id
+                target.account_id == claim.account_id()
+                    && target.marketplace == claim.marketplace()
                     && target.marketplace == super::snapshot::Marketplace::Ozon
             })
             .context("Ozon report account is not selected by the policy")?;
@@ -189,139 +143,78 @@ impl ReportCollectorConfig {
                 account.id == target.account_id && account.marketplace == Marketplace::Ozon
             })
             .context("Ozon report account is unavailable")?;
-        let store_id = account
-            .ozon
-            .as_ref()
-            .context("Ozon report binding is unavailable")?
-            .store_id
-            .clone();
-        ensure!(
-            self.ozon_dry_run_stores.contains_key(&store_id),
-            "Ozon report credentials are unavailable"
-        );
-        Ok(store_id)
-    }
-
-    /// Builds a WB client containing only policy-selected accounts. It uses
-    /// the deployment-owned egress proxy and is unavailable in every other
-    /// collector mode.
-    pub fn wb_dry_run_client(&self) -> Result<WbClient> {
-        ensure!(
-            self.mode == ReportCollectorMode::WbDryRun && !self.wb_dry_run_accounts.is_empty(),
-            "WB dry-run credentials are unavailable outside WB dry-run mode"
-        );
-        WbClient::new_with_https_proxy(
-            OZON_DRY_RUN_TIMEOUT,
-            self.wb_dry_run_accounts.clone(),
-            REPORT_EGRESS_PROXY,
-        )
-        .context("fixed WB dry-run client configuration is invalid")
-    }
-
-    /// Resolves a caller-supplied account only after matching the validated
-    /// policy plan and the exact WB credential map.
-    pub fn wb_dry_run_account(&self, account_id: &str) -> Result<String> {
-        ensure!(
-            self.mode == ReportCollectorMode::WbDryRun,
-            "WB dry-run account is unavailable outside WB dry-run mode"
-        );
-        ensure!(
-            self.collection_plan.iter().any(|target| {
-                target.account_id == account_id
-                    && target.marketplace == super::snapshot::Marketplace::Wildberries
-            }) && self.wb_dry_run_accounts.contains_key(account_id),
-            "WB report account is not selected by the policy"
-        );
-        Ok(account_id.to_owned())
-    }
-}
-
-fn resolve_ozon_dry_run_stores(
-    registry: &AccessRegistry,
-    plan: &[CollectionTarget],
-    lookup: &mut dyn FnMut(&str) -> Option<String>,
-) -> Result<(
-    BTreeMap<StoreId, StoreCredentials>,
-    BTreeMap<StoreId, PerformanceCredentials>,
-)> {
-    let mut seller_stores = BTreeMap::new();
-    let mut performance_stores = BTreeMap::new();
-    for target in plan
-        .iter()
-        .filter(|target| target.marketplace == super::snapshot::Marketplace::Ozon)
-    {
-        let account = registry
-            .accounts
-            .iter()
-            .find(|account| {
-                account.id == target.account_id && account.marketplace == Marketplace::Ozon
-            })
-            .context("Ozon report account is unavailable")?;
         let binding = account
             .ozon
             .as_ref()
             .context("Ozon report binding is unavailable")?;
-        let client_id = lookup(&binding.client_id_env)
-            .with_context(|| format!("{} is required for Ozon dry-run", binding.client_id_env))?;
-        let api_key = lookup(&binding.api_key_env)
-            .with_context(|| format!("{} is required for Ozon dry-run", binding.api_key_env))?;
-        ensure!(
-            !client_id.is_empty() && !api_key.is_empty(),
-            "Ozon dry-run credentials must not be empty"
-        );
+        let client_id = required_secret(lookup, &binding.client_id_env, "Ozon dry-run")?;
+        let api_key = required_secret(lookup, &binding.api_key_env, "Ozon dry-run")?;
         let performance = binding
             .performance
             .as_ref()
             .context("Ozon report Performance binding is unavailable")?;
-        let performance_client_id = lookup(&performance.client_id_env).with_context(|| {
-            format!(
-                "{} is required for Ozon Performance dry-run",
-                performance.client_id_env
-            )
-        })?;
-        let performance_client_secret =
-            lookup(&performance.client_secret_env).with_context(|| {
-                format!(
-                    "{} is required for Ozon Performance dry-run",
-                    performance.client_secret_env
-                )
-            })?;
-        ensure!(
-            !performance_client_id.is_empty() && !performance_client_secret.is_empty(),
-            "Ozon Performance dry-run credentials must not be empty"
-        );
-        // AccessRegistry validates store_id uniqueness before this point, so
-        // insertion cannot silently replace credentials for another account.
-        seller_stores.insert(
-            binding.store_id.clone(),
-            StoreCredentials { client_id, api_key },
-        );
-        performance_stores.insert(
-            binding.store_id.clone(),
+        let performance_client_id = required_secret(
+            lookup,
+            &performance.client_id_env,
+            "Ozon Performance dry-run",
+        )?;
+        let performance_client_secret = required_secret(
+            lookup,
+            &performance.client_secret_env,
+            "Ozon Performance dry-run",
+        )?;
+        let store_id = binding.store_id.clone();
+        let seller_stores =
+            BTreeMap::from([(store_id.clone(), StoreCredentials { client_id, api_key })]);
+        let performance_stores = BTreeMap::from([(
+            store_id.clone(),
             PerformanceCredentials {
                 client_id: performance_client_id,
                 client_secret: performance_client_secret,
             },
-        );
+        )]);
+        let seller = OzonClient::new_with_https_proxy(
+            OZON_SELLER_API_BASE_URL.to_owned(),
+            OZON_DRY_RUN_TIMEOUT,
+            seller_stores,
+            REPORT_EGRESS_PROXY,
+        )
+        .context("fixed Ozon dry-run client configuration is invalid")?;
+        let performance = PerformanceClient::new_with_https_proxy(
+            OZON_DRY_RUN_TIMEOUT,
+            performance_stores,
+            REPORT_EGRESS_PROXY,
+        )
+        .context("fixed Ozon Performance dry-run client configuration is invalid")?;
+        Ok((seller, performance, store_id))
     }
-    ensure!(
-        !seller_stores.is_empty(),
-        "the report policy contains no Ozon account for Ozon dry-run"
-    );
-    Ok((seller_stores, performance_stores))
-}
 
-fn resolve_wb_dry_run_accounts(
-    registry: &AccessRegistry,
-    plan: &[CollectionTarget],
-    lookup: &mut dyn FnMut(&str) -> Option<String>,
-) -> Result<BTreeMap<String, WbCredentials>> {
-    let mut accounts = BTreeMap::new();
-    for target in plan
-        .iter()
-        .filter(|target| target.marketplace == super::snapshot::Marketplace::Wildberries)
-    {
-        let account = registry
+    /// Resolves only the exact claimed WB account. No other manager's token is
+    /// read, and no token is read during startup, healthcheck or a lost claim.
+    pub fn resolve_wb_dry_run(
+        &self,
+        claim: &CollectionClaim,
+        lookup: &mut dyn FnMut(&str) -> Option<String>,
+    ) -> Result<(WbClient, String)> {
+        ensure!(
+            self.mode == ReportCollectorMode::WbDryRun,
+            "WB dry-run credentials are unavailable outside WB dry-run mode"
+        );
+        ensure!(
+            claim.lease_until() > Utc::now(),
+            "collection claim has expired"
+        );
+        let target = self
+            .collection_plan
+            .iter()
+            .find(|target| {
+                target.account_id == claim.account_id()
+                    && target.marketplace == claim.marketplace()
+                    && target.marketplace == super::snapshot::Marketplace::Wildberries
+            })
+            .context("WB report account is not selected by the policy")?;
+        let account = self
+            .registry
             .accounts
             .iter()
             .find(|account| {
@@ -332,16 +225,25 @@ fn resolve_wb_dry_run_accounts(
             .wildberries
             .as_ref()
             .context("WB report binding is unavailable")?;
-        let token = lookup(&binding.api_token_env)
-            .with_context(|| format!("{} is required for WB dry-run", binding.api_token_env))?;
+        let token = required_secret(lookup, &binding.api_token_env, "WB dry-run")?;
         validate_wb_token_type(&token, &binding.api_token_env)?;
-        accounts.insert(account.id.clone(), WbCredentials { token });
+        let accounts = BTreeMap::from([(account.id.clone(), WbCredentials { token })]);
+        let client =
+            WbClient::new_with_https_proxy(OZON_DRY_RUN_TIMEOUT, accounts, REPORT_EGRESS_PROXY)
+                .context("fixed WB dry-run client configuration is invalid")?;
+        Ok((client, account.id.clone()))
     }
-    ensure!(
-        !accounts.is_empty(),
-        "the report policy contains no WB account for WB dry-run"
-    );
-    Ok(accounts)
+}
+
+fn required_secret(
+    lookup: &mut dyn FnMut(&str) -> Option<String>,
+    env_name: &str,
+    purpose: &str,
+) -> Result<String> {
+    let value =
+        lookup(env_name).with_context(|| format!("{env_name} is required for {purpose}"))?;
+    ensure!(!value.is_empty(), "{purpose} credential must not be empty");
+    Ok(value)
 }
 
 fn validate_database(config: &Config) -> Result<()> {
@@ -427,6 +329,27 @@ mod tests {
         format!("{header}.{claims}.{signature}")
     }
 
+    fn claim(
+        account_id: &str,
+        marketplace: super::super::snapshot::Marketplace,
+    ) -> CollectionClaim {
+        CollectionClaim::for_test(
+            account_id,
+            marketplace,
+            Utc::now() + Duration::from_secs(60),
+        )
+    }
+
+    fn unexpected_secret_lookup(_: &str) -> Option<String> {
+        panic!("secret lookup must not occur before account admission")
+    }
+
+    #[test]
+    #[should_panic(expected = "secret lookup must not occur before account admission")]
+    fn unexpected_secret_lookup_is_a_failing_test_sentinel() {
+        let _ = unexpected_secret_lookup("UNEXPECTED_SECRET");
+    }
+
     #[test]
     fn disabled_config_has_exact_pilot_plan_and_restricted_database() {
         let config = config(&entries()).unwrap();
@@ -464,57 +387,106 @@ mod tests {
     #[test]
     fn explicit_ozon_dry_run_resolves_only_the_policy_scoped_read_bindings() {
         let disabled = config(&entries()).unwrap();
-        assert!(disabled.ozon_dry_run_client().is_err());
-        assert!(disabled.ozon_dry_run_performance_client().is_err());
+        let mut no_secrets = unexpected_secret_lookup;
+        let ozon_claim = claim("ozon", super::super::snapshot::Marketplace::Ozon);
+        assert!(
+            disabled
+                .resolve_ozon_dry_run(&ozon_claim, &mut no_secrets)
+                .is_err()
+        );
 
         let mut values = entries();
-        values.extend([
-            (MODE_ENV, "ozon_dry_run".to_owned()),
+        values.push((MODE_ENV, "ozon_dry_run".to_owned()));
+        let mut startup_keys = Vec::new();
+        let dry_run = ReportCollectorConfig::from_lookup(&mut |key| {
+            startup_keys.push(key.to_owned());
+            values
+                .iter()
+                .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
+        })
+        .unwrap();
+        assert_eq!(dry_run.mode(), ReportCollectorMode::OzonDryRun);
+        assert!(
+            ["ID", "KEY", "PERF_ID", "PERF_SECRET", "WB_TOKEN"]
+                .into_iter()
+                .all(|key| !startup_keys.iter().any(|requested| requested == key))
+        );
+
+        let secrets = [
             ("ID", "client-id".to_owned()),
             ("KEY", "api-key".to_owned()),
             ("PERF_ID", "performance-client-id".to_owned()),
             ("PERF_SECRET", "performance-client-secret".to_owned()),
-            // This unrelated credential is deliberately not resolved: the
-            // selected policy contains no WB dry-run source in this phase.
             ("WB_TOKEN", "unrelated-wb-token".to_owned()),
-        ]);
-        let dry_run = config(&values).unwrap();
-        assert_eq!(dry_run.mode(), ReportCollectorMode::OzonDryRun);
+        ];
+        let mut resolved_keys = Vec::new();
+        let (seller, performance, store_id) = dry_run
+            .resolve_ozon_dry_run(&ozon_claim, &mut |key| {
+                resolved_keys.push(key.to_owned());
+                secrets
+                    .iter()
+                    .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
+            })
+            .unwrap();
+        assert!(
+            seller.is_configured(&StoreId::from("1"))
+                && performance.is_configured(&StoreId::from("1"))
+        );
+        assert_eq!(store_id, StoreId::from("1"));
+        assert_eq!(resolved_keys, ["ID", "KEY", "PERF_ID", "PERF_SECRET"]);
         assert!(
             dry_run
-                .ozon_dry_run_client()
-                .unwrap()
-                .is_configured(&StoreId::from("1"))
+                .resolve_ozon_dry_run(
+                    &claim("wb", super::super::snapshot::Marketplace::Wildberries),
+                    &mut unexpected_secret_lookup,
+                )
+                .is_err()
         );
-        assert!(
-            dry_run
-                .ozon_dry_run_performance_client()
-                .unwrap()
-                .is_configured(&StoreId::from("1"))
-        );
-        assert_eq!(
-            dry_run.ozon_dry_run_store("ozon").unwrap(),
-            StoreId::from("1")
-        );
-        assert!(dry_run.ozon_dry_run_store("wb").is_err());
 
         let mixed_policy = file(
             "mixed-policy",
             r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]},{"actor_id":"wb","account_ids":["wb"]}]}]}"#,
         );
         values[2] = (POLICY_PATH_ENV, mixed_policy.display().to_string());
-        // The WB plan target is intentionally skipped rather than causing its
-        // token to be read by the Ozon-only dry-run client.
-        assert!(config(&values).unwrap().ozon_dry_run_client().is_ok());
+        let mixed = config(&values).unwrap();
+        let mut requested = Vec::new();
+        assert!(
+            mixed
+                .resolve_ozon_dry_run(&ozon_claim, &mut |key| {
+                    requested.push(key.to_owned());
+                    secrets
+                        .iter()
+                        .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
+                })
+                .is_ok()
+        );
+        assert!(!requested.iter().any(|key| key == "WB_TOKEN"));
 
-        let mut missing_id = values.clone();
-        missing_id.retain(|(key, _)| *key != "ID");
-        assert!(config(&missing_id).is_err());
-        for key in ["KEY", "PERF_ID", "PERF_SECRET"] {
-            let mut missing = values.clone();
-            missing.retain(|(entry, _)| *entry != key);
-            assert!(config(&missing).is_err(), "missing {key}");
+        for missing_key in ["ID", "KEY", "PERF_ID", "PERF_SECRET"] {
+            assert!(
+                mixed
+                    .resolve_ozon_dry_run(&ozon_claim, &mut |key| {
+                        (key != missing_key).then(|| "present".to_owned())
+                    })
+                    .is_err(),
+                "missing {missing_key}"
+            );
         }
+        assert!(
+            mixed
+                .resolve_ozon_dry_run(&ozon_claim, &mut |_| Some(String::new()))
+                .is_err()
+        );
+        let expired_claim = CollectionClaim::for_test(
+            "ozon",
+            super::super::snapshot::Marketplace::Ozon,
+            Utc::now() - Duration::from_secs(1),
+        );
+        assert!(
+            mixed
+                .resolve_ozon_dry_run(&expired_claim, &mut unexpected_secret_lookup)
+                .is_err()
+        );
     }
 
     #[test]
@@ -525,37 +497,51 @@ mod tests {
         );
         let mut values = entries();
         values[2] = (POLICY_PATH_ENV, mixed_policy.display().to_string());
-        values.extend([
-            (MODE_ENV, "wb_dry_run".to_owned()),
-            ("WB_TOKEN", personal_wb_token()),
-            // Ozon credentials are deliberately absent: WB mode must not
-            // resolve or require bindings for the other marketplace.
-        ]);
+        values.push((MODE_ENV, "wb_dry_run".to_owned()));
         let dry_run = config(&values).unwrap();
         assert_eq!(dry_run.mode(), ReportCollectorMode::WbDryRun);
-        assert!(dry_run.wb_dry_run_client().unwrap().is_configured("wb"));
-        assert_eq!(dry_run.wb_dry_run_account("wb").unwrap(), "wb");
-        assert!(dry_run.wb_dry_run_account("ozon").is_err());
-        assert!(dry_run.ozon_dry_run_client().is_err());
+        let token = personal_wb_token();
+        let mut resolved_keys = Vec::new();
+        let wb_claim = claim("wb", super::super::snapshot::Marketplace::Wildberries);
+        let (client, account_id) = dry_run
+            .resolve_wb_dry_run(&wb_claim, &mut |key| {
+                resolved_keys.push(key.to_owned());
+                (key == "WB_TOKEN").then(|| token.clone())
+            })
+            .unwrap();
+        assert!(client.is_configured("wb"));
+        assert_eq!(account_id, "wb");
+        assert_eq!(resolved_keys, ["WB_TOKEN"]);
 
-        let mut missing = values.clone();
-        missing.retain(|(key, _)| *key != "WB_TOKEN");
-        assert!(config(&missing).is_err());
-        let mut wrong_type = values;
-        wrong_type
-            .iter_mut()
-            .find(|(key, _)| *key == "WB_TOKEN")
-            .unwrap()
-            .1 = {
+        let ozon_claim = claim("ozon", super::super::snapshot::Marketplace::Ozon);
+        assert!(
+            dry_run
+                .resolve_wb_dry_run(&ozon_claim, &mut unexpected_secret_lookup)
+                .is_err()
+        );
+        assert!(
+            dry_run
+                .resolve_wb_dry_run(&wb_claim, &mut |_| None)
+                .is_err()
+        );
+        let wrong_type = {
             let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
             let claims = URL_SAFE_NO_PAD.encode(br#"{"acc":1}"#);
             let signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
             format!("{header}.{claims}.{signature}")
         };
-        assert!(config(&wrong_type).is_err());
+        assert!(
+            dry_run
+                .resolve_wb_dry_run(&wb_claim, &mut |_| Some(wrong_type.clone()))
+                .is_err()
+        );
 
         let disabled = config(&entries()).unwrap();
-        assert!(disabled.wb_dry_run_client().is_err());
-        assert!(disabled.wb_dry_run_account("wb").is_err());
+        let mut no_secrets = unexpected_secret_lookup;
+        assert!(
+            disabled
+                .resolve_wb_dry_run(&wb_claim, &mut no_secrets)
+                .is_err()
+        );
     }
 }

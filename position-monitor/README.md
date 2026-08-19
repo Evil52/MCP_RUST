@@ -211,8 +211,10 @@ The migrations are transactional. The final claim migration gives each exact
 account/marketplace/cutoff a fifteen-minute lease with a monotonically
 increasing fencing generation. New source snapshots must carry the live claim,
 and completion of all four sources is atomic. Existing published snapshots
-remain readable without rewriting their provenance. The migrations create no
-scheduler and send no email.
+remain readable without rewriting their provenance. The explicit canary
+collectors resolve only the claimed account's marketplace credentials after
+claim acquisition; a busy or completed claim reads no marketplace secret. The
+migrations create no scheduler and send no email.
 Rebuild/recreate only `position-db` afterward to install the matching
 healthcheck, while retaining the named volume.
 

@@ -34,8 +34,9 @@ The first disabled-only phase provides:
 - a separate disabled `report-collector` runtime that validates the exact pilot
   account/source plan and the `report_collector` database role without loading
   marketplace credentials or making network requests; and
-- an explicit operator-only `ozon-dry-run` command which loads only the
-  policy-scoped Ozon Seller and Performance read credentials, reaches the two
+- an explicit operator-only `ozon-dry-run` command which first claims the exact
+  account/cutoff lease and only then loads that account's policy-scoped Ozon
+  Seller and Performance read credentials, reaches the two
   fixed API hosts through the deployment-owned CONNECT proxy, normalizes one
   completed EKB business day against the following day's immutable 08:00 EKB
   morning cutoff and publishes all four sources atomically; and
@@ -47,8 +48,9 @@ The first disabled-only phase provides:
 - warehouse-specific Ozon FBO and FBS stock collection that retains each real
   warehouse ID with an `fbo:` or `fbs:` namespace instead of substituting a
   synthetic channel-wide warehouse; and
-- an explicit operator-only `wb-dry-run` command which loads only one
-  policy-scoped Personal WB token, collects the documented daily sales-funnel,
+- an explicit operator-only `wb-dry-run` command which first claims the exact
+  account/cutoff lease and only then loads that account's policy-scoped Personal
+  WB token, collects the documented daily sales-funnel,
   current warehouse-stock, current price and eligible-campaign statistics
   endpoints through the exact-host CONNECT proxy, and publishes all four
   normalized sources atomically; the tightly limited campaign statistics are
@@ -173,11 +175,14 @@ REPORT_COLLECTOR_MODE=wb_dry_run report-collector \
   wb-dry-run <account-id> <completed-YYYY-MM-DD>
 ```
 
-The account must already belong to the validated disabled report policy. Ozon
-mode resolves only that account's Seller and Performance bindings; WB mode
-resolves only that account's Personal token. Secret values must be injected by
-the runtime under the environment-variable names from the access registry,
-never placed in a command line or committed file. Each invocation is bounded
+The account must already belong to the validated disabled report policy. Startup
+loads registry metadata but no marketplace secret values. Each command first
+claims the exact account/marketplace/cutoff lease; a busy or completed target
+returns before reading any marketplace secret. Only the successful claimant
+resolves the selected Ozon account's Seller and Performance bindings or the
+selected WB account's Personal token. Secret values must be injected by the
+runtime under the environment-variable names from the access registry, never
+placed in a command line or committed file. Each invocation is bounded
 to twelve minutes and publishes the exact four-source snapshot set in one
 database transaction. The date argument is the completed business day; its
 snapshot identity is the following day's fixed 08:00 EKB morning cutoff, so a
@@ -196,9 +201,9 @@ returns the same immutable cutoff after a restart inside that window, and
 refuses to backdate current state after the window closes. It performs no I/O
 and is not wired to the disabled collector runtime yet. A PostgreSQL-backed
 preflight now removes exact account/marketplace/cutoff targets that already
-have all four terminal published sources before credentials can be resolved.
-The later runtime must still claim each remaining account/cutoff idempotently
-in PostgreSQL before marketplace I/O. The database claim now exists: it is
+have all four terminal published sources. Both implemented canary commands
+claim each remaining account/cutoff idempotently in PostgreSQL before resolving
+credentials or performing marketplace I/O. The database claim is
 exclusive for fifteen minutes, can be explicitly released after a bounded
 failure, and uses a monotonically increasing fencing generation. All four
 source snapshots and claim completion commit together, so an expired owner

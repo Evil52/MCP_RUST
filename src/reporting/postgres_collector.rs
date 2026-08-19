@@ -178,8 +178,33 @@ pub struct CollectionClaim {
 }
 
 impl CollectionClaim {
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    pub fn marketplace(&self) -> Marketplace {
+        self.marketplace
+    }
+
     pub fn lease_until(&self) -> DateTime<Utc> {
         self.lease_until
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        account_id: &str,
+        marketplace: Marketplace,
+        lease_until: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id: 1,
+            generation: 1,
+            account_id: account_id.to_owned(),
+            marketplace,
+            cutoff_at: lease_until - chrono::Duration::minutes(15),
+            owner_id: "unit-test-owner".to_owned(),
+            lease_until,
+        }
     }
 }
 
