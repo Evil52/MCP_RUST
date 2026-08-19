@@ -34,6 +34,7 @@ SELECT
     AND to_regclass('daily_reporting.delivery_batches') IS NOT NULL
     AND to_regclass('daily_reporting.delivery_coverage') IS NOT NULL
     AND to_regclass('daily_reporting.delivery_attempts') IS NOT NULL
+    AND to_regclass('daily_reporting.delivery_reconciliations') IS NOT NULL
     AND to_regclass('daily_reporting.claimable_deliveries') IS NOT NULL
     AND to_regclass('daily_reporting.generation_attempts') IS NOT NULL
     AND to_regclass('daily_reporting.generatable_batches') IS NOT NULL
@@ -94,6 +95,12 @@ SELECT
         'daily_reporting.require_active_delivery_attempt()'
     ) IS NOT NULL
     AND to_regprocedure(
+        'daily_reporting.require_ambiguous_delivery_reconciliation()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.reject_reconciliation_mutation()'
+    ) IS NOT NULL
+    AND to_regprocedure(
         'daily_reporting.enforce_delivery_artifact_identity()'
     ) IS NOT NULL
     AND to_regprocedure(
@@ -136,6 +143,15 @@ SELECT
             'delivery_coverage_is_append_only',
             'delivery_attempts_require_active_send',
             'delivery_attempts_are_append_only'
+        )
+          AND NOT tgisinternal
+    )
+    AND (
+        SELECT count(*) = 2
+        FROM pg_trigger
+        WHERE tgname IN (
+            'delivery_reconciliations_require_active_send',
+            'delivery_reconciliations_are_append_only'
         )
           AND NOT tgisinternal
     )

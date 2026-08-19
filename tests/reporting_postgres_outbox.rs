@@ -11,7 +11,7 @@ use mcp_ozon::reporting::{
     policy::{AudiencePolicy, DailyReportPolicy, ManagerScope},
     postgres_outbox::{
         CreateOutcome, GenerationErrorClass, GenerationStatus, PostgresOutboxError,
-        PostgresOutboxRepository,
+        PostgresOutboxRepository, ReconciliationDecision, ReconciliationOutcome,
     },
     service::ReportWorkerConfig,
 };
@@ -319,6 +319,250 @@ async fn scheduled_mail_activation_requires_a_recent_completed_canary() {
 }
 
 #[tokio::test]
+async fn ambiguous_delivery_reconciliation_is_scoped_idempotent_and_append_only() {
+    let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
+        return;
+    };
+    let _guard = DB_TEST_LOCK.lock().await;
+    let config = Config::from_str(&url).unwrap();
+    let repository = PostgresOutboxRepository::connect(&config).await.unwrap();
+
+    let sent_recipient = format!("reconcile_sent_{}", std::process::id());
+    let sent_time = utc(12, 0) + Duration::days(70);
+    let sent_delivery = due_deliveries(sent_time, &sent_recipient, 1, &BTreeSet::new())
+        .unwrap()
+        .remove(0);
+    let sent_batch = match repository.create_planned(sent_delivery).await.unwrap() {
+        CreateOutcome::Inserted(id) => id,
+        CreateOutcome::Existing(_) => unreachable!(),
+    };
+    repository.start_generation(sent_batch).await.unwrap();
+    repository
+        .mark_ready(
+            sent_batch,
+            &artifact_for(&sent_time.format("%Y/%m/%d").to_string(), &sent_recipient),
+        )
+        .await
+        .unwrap();
+    let sent_claim = repository
+        .claim_ready(sent_time + Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let confirmed = ReconciliationDecision::ConfirmedSent {
+        provider_message_id: "gmail-reconciled-message".to_owned(),
+    };
+    for (batch_id, attempt_no, recipient_id, version, decision) in [
+        (
+            0,
+            sent_claim.attempt_no,
+            sent_recipient.as_str(),
+            1,
+            &confirmed,
+        ),
+        (sent_batch, 0, sent_recipient.as_str(), 1, &confirmed),
+        (
+            sent_batch,
+            sent_claim.attempt_no,
+            "wrong recipient",
+            1,
+            &confirmed,
+        ),
+        (
+            sent_batch,
+            sent_claim.attempt_no,
+            sent_recipient.as_str(),
+            0,
+            &confirmed,
+        ),
+    ] {
+        assert_eq!(
+            repository
+                .reconcile_sending(
+                    batch_id,
+                    attempt_no,
+                    recipient_id,
+                    version,
+                    Utc::now(),
+                    decision,
+                )
+                .await,
+            Err(PostgresOutboxError::InvalidDelivery)
+        );
+    }
+    assert_eq!(
+        repository
+            .reconcile_sending(
+                sent_batch,
+                sent_claim.attempt_no,
+                &sent_recipient,
+                1,
+                Utc::now(),
+                &ReconciliationDecision::ConfirmedSent {
+                    provider_message_id: String::new(),
+                },
+            )
+            .await,
+        Err(PostgresOutboxError::InvalidDelivery)
+    );
+    assert_eq!(
+        repository
+            .reconcile_sending(
+                sent_batch,
+                sent_claim.attempt_no,
+                "foreign_recipient",
+                1,
+                Utc::now(),
+                &confirmed,
+            )
+            .await,
+        Err(PostgresOutboxError::Conflict)
+    );
+    assert_eq!(
+        repository
+            .reconcile_sending(
+                sent_batch,
+                sent_claim.attempt_no + 1,
+                &sent_recipient,
+                1,
+                Utc::now(),
+                &confirmed,
+            )
+            .await,
+        Err(PostgresOutboxError::Conflict)
+    );
+    assert_eq!(
+        repository
+            .reconcile_sending(
+                sent_batch,
+                sent_claim.attempt_no,
+                &sent_recipient,
+                1,
+                Utc::now(),
+                &confirmed,
+            )
+            .await
+            .unwrap(),
+        ReconciliationOutcome::Applied
+    );
+    assert_eq!(
+        repository
+            .reconcile_sending(
+                sent_batch,
+                sent_claim.attempt_no,
+                &sent_recipient,
+                1,
+                Utc::now(),
+                &confirmed,
+            )
+            .await
+            .unwrap(),
+        ReconciliationOutcome::Existing
+    );
+    assert_eq!(
+        repository
+            .reconcile_sending(
+                sent_batch,
+                sent_claim.attempt_no,
+                &sent_recipient,
+                1,
+                Utc::now(),
+                &ReconciliationDecision::SuppressedUnknown,
+            )
+            .await,
+        Err(PostgresOutboxError::Conflict)
+    );
+
+    let suppressed_recipient = format!("reconcile_unknown_{}", std::process::id());
+    let suppressed_time = sent_time + Duration::days(1);
+    let suppressed_delivery =
+        due_deliveries(suppressed_time, &suppressed_recipient, 1, &BTreeSet::new())
+            .unwrap()
+            .remove(0);
+    let suppressed_batch = match repository
+        .create_planned(suppressed_delivery)
+        .await
+        .unwrap()
+    {
+        CreateOutcome::Inserted(id) => id,
+        CreateOutcome::Existing(_) => unreachable!(),
+    };
+    repository.start_generation(suppressed_batch).await.unwrap();
+    repository
+        .mark_ready(
+            suppressed_batch,
+            &artifact_for(
+                &suppressed_time.format("%Y/%m/%d").to_string(),
+                &suppressed_recipient,
+            ),
+        )
+        .await
+        .unwrap();
+    let suppressed_claim = repository
+        .claim_ready(suppressed_time + Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repository
+            .reconcile_sending(
+                suppressed_batch,
+                suppressed_claim.attempt_no,
+                &suppressed_recipient,
+                1,
+                Utc::now(),
+                &ReconciliationDecision::SuppressedUnknown,
+            )
+            .await
+            .unwrap(),
+        ReconciliationOutcome::Applied
+    );
+    assert_eq!(
+        repository
+            .reconcile_sending(
+                suppressed_batch,
+                suppressed_claim.attempt_no,
+                &suppressed_recipient,
+                1,
+                Utc::now(),
+                &ReconciliationDecision::SuppressedUnknown,
+            )
+            .await
+            .unwrap(),
+        ReconciliationOutcome::Existing
+    );
+
+    let client = repository_test_client(&config).await;
+    let rows = client
+        .query(
+            "SELECT batch.status, batch.last_error_class, reconciliation.decision, \
+                    reconciliation.provider_message_id \
+             FROM daily_reporting.delivery_batches AS batch \
+             JOIN daily_reporting.delivery_reconciliations AS reconciliation \
+               ON reconciliation.batch_id = batch.id \
+             WHERE batch.id = ANY($1) ORDER BY batch.id",
+            &[&&[sent_batch, suppressed_batch][..]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, &str>(0), "sent");
+    assert_eq!(rows[0].get::<_, Option<&str>>(1), None);
+    assert_eq!(rows[0].get::<_, &str>(2), "confirmed_sent");
+    assert_eq!(
+        rows[0].get::<_, Option<&str>>(3),
+        Some("gmail-reconciled-message")
+    );
+    assert_eq!(rows[1].get::<_, &str>(0), "permanent_failure");
+    assert_eq!(
+        rows[1].get::<_, Option<&str>>(1),
+        Some("operator_reconciled_unknown")
+    );
+    assert_eq!(rows[1].get::<_, &str>(2), "suppressed_unknown");
+    assert_eq!(rows[1].get::<_, Option<&str>>(3), None);
+}
+
+#[tokio::test]
 async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
     let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
         return;
@@ -345,12 +589,13 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
                     has_column_privilege(current_user, 'daily_reporting.delivery_batches', 'artifact_html_sha256', 'UPDATE'), \
                     has_table_privilege(current_user, 'daily_reporting.delivery_coverage', 'SELECT,INSERT'), \
                     has_table_privilege(current_user, 'daily_reporting.delivery_attempts', 'SELECT,INSERT'), \
+                    has_table_privilege(current_user, 'daily_reporting.delivery_reconciliations', 'SELECT,INSERT'), \
                     NOT has_schema_privilege(current_user, 'search_position', 'USAGE')",
             &[],
         )
         .await
         .unwrap();
-    let privilege_values = (0..8)
+    let privilege_values = (0..9)
         .map(|index| privileges.get::<_, bool>(index))
         .collect::<Vec<_>>();
     assert!(

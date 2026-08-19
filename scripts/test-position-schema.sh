@@ -208,6 +208,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/011_daily_reporting_collection_claims.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/012_daily_reporting_delivery_error_classes.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/013_daily_reporting_delivery_reconciliation.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -1988,6 +1990,14 @@ expect_failure_containing \
   "${report_worker_psql[@]}" \
   --command "
     DELETE FROM daily_reporting.delivery_attempts WHERE batch_id = 1
+  "
+
+expect_failure_containing \
+  "report reconciliation mutation" \
+  "permission denied for table delivery_reconciliations" \
+  "${report_worker_psql[@]}" \
+  --command "
+    DELETE FROM daily_reporting.delivery_reconciliations WHERE batch_id = 1
   "
 
 expect_failure_containing \

@@ -201,6 +201,14 @@ report-worker generate <batch-id>
 REPORT_WORKER_MODE=delivery_canary report-worker deliver-one
 
 REPORT_WORKER_MODE=scheduled_delivery report-worker mail-preflight <audience-id>
+
+REPORT_WORKER_MODE=dry_run report-worker reconcile-sent \
+  <audience-id> <batch-id> <attempt-no> <provider-message-id> \
+  --confirm-gmail-sent
+
+REPORT_WORKER_MODE=dry_run report-worker reconcile-suppress \
+  <audience-id> <batch-id> <attempt-no> \
+  --confirm-provider-outcome-unknown
 ```
 
 `preview` requires disabled mode and a disabled policy. `generate` accepts
@@ -218,6 +226,19 @@ requires an enabled policy, strict private routing and OAuth files, claims at
 most one ready batch, and is bounded by 60 seconds. It refreshes OAuth once and
 sends once; an ambiguous or unpersisted post-claim outcome remains `sending`
 for operator reconciliation rather than being retried.
+
+The reconciliation commands require an enabled policy in `dry_run` mode and
+never load Gmail OAuth, routing or marketplace credentials. The audience must
+exist in that exact policy version, while the batch and active attempt must
+match an unresolved `sending` row for the same audience. Use `reconcile-sent`
+only after Gmail independently proves delivery and supplies the exact provider
+message ID. If delivery cannot be proven, `reconcile-suppress` permanently
+closes the attempt as `operator_reconciled_unknown`; it deliberately prefers a
+possible missed report to a duplicate email. Both decisions atomically append
+an immutable database audit row and move the batch to a terminal state.
+Repeating the identical command is idempotent, while a different decision is a
+conflict. Never repair an ambiguous send with direct SQL or by returning it to
+`ready`.
 
 The one-shot Compose canary is launched only by the guarded wrapper below. It
 requires an already healthy `position-db`, builds/starts the dedicated proxy,

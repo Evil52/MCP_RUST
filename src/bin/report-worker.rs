@@ -12,7 +12,9 @@ use mcp_ozon::reporting::{
     ReportKey, ReportKind,
     artifact_store::persist_and_mark_ready,
     gmail_outbox::GmailOutboxWorker,
-    postgres_outbox::{GenerationErrorClass, GenerationStatus, PostgresOutboxRepository},
+    postgres_outbox::{
+        GenerationErrorClass, GenerationStatus, PostgresOutboxRepository, ReconciliationDecision,
+    },
     postgres_snapshot::PostgresSnapshotRepository,
     preview::render_published_preview,
     report_cutoff,
@@ -94,6 +96,65 @@ async fn main() -> Result<()> {
             audience_id,
             canary_sent_at = %receipt.canary_sent_at,
             "scheduled mail activation preflight passed"
+        );
+        return Ok(());
+    }
+    if let [
+        command,
+        audience_id,
+        batch_id,
+        attempt_no,
+        provider_message_id,
+        confirmation,
+    ] = arguments.as_slice()
+        && command == "reconcile-sent"
+    {
+        ensure!(
+            confirmation == "--confirm-gmail-sent",
+            "reconcile-sent requires --confirm-gmail-sent"
+        );
+        ensure_reconciliation_mode(&config, audience_id)?;
+        let outcome = outbox
+            .reconcile_sending(
+                parse_positive_i64(batch_id, "batch id")?,
+                parse_attempt_no(attempt_no)?,
+                audience_id,
+                config.policy().version,
+                Utc::now(),
+                &ReconciliationDecision::ConfirmedSent {
+                    provider_message_id: provider_message_id.clone(),
+                },
+            )
+            .await?;
+        tracing::info!(
+            audience_id,
+            ?outcome,
+            "ambiguous Gmail send reconciled as sent"
+        );
+        return Ok(());
+    }
+    if let [command, audience_id, batch_id, attempt_no, confirmation] = arguments.as_slice()
+        && command == "reconcile-suppress"
+    {
+        ensure!(
+            confirmation == "--confirm-provider-outcome-unknown",
+            "reconcile-suppress requires --confirm-provider-outcome-unknown"
+        );
+        ensure_reconciliation_mode(&config, audience_id)?;
+        let outcome = outbox
+            .reconcile_sending(
+                parse_positive_i64(batch_id, "batch id")?,
+                parse_attempt_no(attempt_no)?,
+                audience_id,
+                config.policy().version,
+                Utc::now(),
+                &ReconciliationDecision::SuppressedUnknown,
+            )
+            .await?;
+        tracing::info!(
+            audience_id,
+            ?outcome,
+            "ambiguous Gmail send suppressed without retry"
         );
         return Ok(());
     }
@@ -411,8 +472,43 @@ async fn generate_batch(
 
 fn usage() -> Result<()> {
     bail!(
-        "usage: report-worker [healthcheck | deliver-one | mail-preflight <audience-id> | generate <batch-id> | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
+        "usage: report-worker [healthcheck | deliver-one | mail-preflight <audience-id> | reconcile-sent <audience-id> <batch-id> <attempt-no> <provider-message-id> --confirm-gmail-sent | reconcile-suppress <audience-id> <batch-id> <attempt-no> --confirm-provider-outcome-unknown | generate <batch-id> | preview <audience-id> <actor-id> <YYYY-MM-DD> <morning|evening> <cutoff-rfc3339> <existing-output-dir>]"
     )
+}
+
+fn ensure_reconciliation_mode(config: &ReportWorkerConfig, audience_id: &str) -> Result<()> {
+    ensure!(
+        config.mode() == ReportWorkerMode::DryRun && config.policy().enabled,
+        "mail reconciliation requires dry_run mode and an enabled policy"
+    );
+    ensure!(
+        config
+            .policy()
+            .audiences
+            .iter()
+            .any(|audience| audience.id == audience_id),
+        "mail reconciliation audience is outside the validated policy"
+    );
+    Ok(())
+}
+
+fn parse_positive_i64(value: &str, name: &str) -> Result<i64> {
+    let value = value
+        .parse::<i64>()
+        .with_context(|| format!("{name} must be a positive integer"))?;
+    ensure!(value > 0, "{name} must be a positive integer");
+    Ok(value)
+}
+
+fn parse_attempt_no(value: &str) -> Result<u8> {
+    let value = value
+        .parse::<u8>()
+        .context("attempt number must be between 1 and 5")?;
+    ensure!(
+        (1..=5).contains(&value),
+        "attempt number must be between 1 and 5"
+    );
+    Ok(value)
 }
 
 fn parse_kind(value: &str) -> Result<ReportKind> {

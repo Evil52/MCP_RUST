@@ -240,6 +240,13 @@ has broader vendor permissions.
   keep the outbox row `sending`, never resend it automatically, and require operator reconciliation.
   A database failure while recording any post-claim outcome follows the same rule: leave the claim
   `sending` and never reinterpret it as a retryable pre-send failure.
+  Reconcile an ambiguous attempt only through the operator commands `reconcile-sent` or
+  `reconcile-suppress` in `dry_run` mode with the current enabled policy. Confirm `sent` only after
+  Gmail independently provides the exact provider message ID. If the outcome cannot be proven,
+  suppress it permanently as `operator_reconciled_unknown`; never return it to `ready`, retry it,
+  or edit the batch directly. The reconciliation record must remain append-only, scoped to the
+  exact audience, policy version, batch and active attempt, and an identical replay must be the
+  only idempotent outcome.
   Persist local artifact/routing failures and explicit provider rejection under separate permanent
   error classes; never relabel them as a transient transport failure merely to make them retryable.
   Before any automatic loop exists, exercise only the explicit `delivery_canary` `deliver-one`

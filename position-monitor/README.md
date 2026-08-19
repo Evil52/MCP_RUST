@@ -186,9 +186,12 @@ The init scripts run only when the named volume is empty. A fresh database
 applies the base schema, the additive Ozon collector contract, the additive WB
 migration, restricted role grants, the Ozon adapter digest migration, then the
 daily reporting outbox, normalized snapshot, optional-metric and strict
-artifact-identity migrations.
-The final migration also adds append-only generation-attempt history, bounded
-retry backoff and an operator-only stalled-work view.
+artifact-identity migrations, bounded generation backoff, observation-window
+and collection-claim contracts, explicit delivery error classes, and the
+append-only delivery-reconciliation contract.
+The final migrations also add append-only generation-attempt history, bounded
+retry backoff, an operator-only stalled-work view, and terminal operator
+resolution for an ambiguous Gmail send without permitting an automatic resend.
 Password rotation and schema migration after initial deployment must use an
 explicit migration, never volume deletion.
 
@@ -224,6 +227,12 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
   sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
   < position-monitor/initdb/011_daily_reporting_collection_claims.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/012_daily_reporting_delivery_error_classes.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/013_daily_reporting_delivery_reconciliation.sql
 ```
 
 The migrations are transactional. The final claim migration gives each exact
@@ -233,7 +242,9 @@ and completion of all four sources is atomic. Existing published snapshots
 remain readable without rewriting their provenance. The explicit canary
 collectors resolve only the claimed account's marketplace credentials after
 claim acquisition; a busy or completed claim reads no marketplace secret. The
-migrations create no scheduler and send no email.
+migrations create no scheduler and send no email. The reconciliation migration
+does not infer a provider outcome: it only gives the restricted report worker
+an append-only, exact-attempt path after an operator has checked Gmail.
 Rebuild/recreate only `position-db` afterward to install the matching
 healthcheck, while retaining the named volume.
 
