@@ -59,6 +59,27 @@ SELECT
     AND EXISTS (
         SELECT 1
         FROM pg_constraint
+        WHERE conrelid = 'daily_reporting.delivery_batches'::regclass
+          AND conname = 'delivery_batches_error_class_check'
+          AND contype = 'c'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'daily_reporting.delivery_attempts'::regclass
+          AND conname = 'delivery_attempts_shape_check'
+          AND contype = 'c'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'daily_reporting.delivery_attempts'::regclass
+          AND conname = 'delivery_attempts_transient_error_class_check'
+          AND contype = 'c'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM pg_constraint
         WHERE conrelid = 'daily_reporting.source_snapshots'::regclass
           AND conname = 'source_snapshots_period_window_check'
           AND contype = 'c'

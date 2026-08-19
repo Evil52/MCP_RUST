@@ -139,7 +139,10 @@ dedicated mail-egress proxy, disabled redirects and ambient proxies, a bounded
   OAuth failure before send may be scheduled later by a future bounded worker;
   any timeout, transport failure, 5xx response, redirect, or malformed receipt
   after the Gmail request starts remains an ambiguous `sending` outcome for
-  operator reconciliation. The OAuth transport accepts exactly the private files `client_id`,
+  operator reconciliation. The outbox vocabulary reserves distinct permanent
+  audit classes for invalid artifact scope, invalid private routing and an
+  explicit provider rejection; these failures are never mislabeled as a
+  transient network problem. The OAuth transport accepts exactly the private files `client_id`,
 `client_secret` and `refresh_token`, requires a private credential directory,
 uses only Google's fixed token endpoint through the same dedicated mail-egress
 proxy, and accepts only a bounded Bearer token for the minimal

@@ -922,9 +922,11 @@ fn transient_error_text(class: DeliveryErrorClass) -> Result<&'static str, Postg
         DeliveryErrorClass::RateLimited => Ok("rate_limited"),
         DeliveryErrorClass::ProviderUnavailable => Ok("provider_unavailable"),
         DeliveryErrorClass::Transport => Ok("transport"),
-        DeliveryErrorClass::Authentication | DeliveryErrorClass::InvalidRecipient => {
-            Err(PostgresOutboxError::InvalidDelivery)
-        }
+        DeliveryErrorClass::Authentication
+        | DeliveryErrorClass::InvalidRecipient
+        | DeliveryErrorClass::InvalidArtifact
+        | DeliveryErrorClass::InvalidRouting
+        | DeliveryErrorClass::ProviderRejected => Err(PostgresOutboxError::InvalidDelivery),
     }
 }
 
@@ -932,6 +934,9 @@ fn permanent_error_text(class: DeliveryErrorClass) -> Result<&'static str, Postg
     match class {
         DeliveryErrorClass::Authentication => Ok("authentication"),
         DeliveryErrorClass::InvalidRecipient => Ok("invalid_recipient"),
+        DeliveryErrorClass::InvalidArtifact => Ok("invalid_artifact"),
+        DeliveryErrorClass::InvalidRouting => Ok("invalid_routing"),
+        DeliveryErrorClass::ProviderRejected => Ok("provider_rejected"),
         DeliveryErrorClass::RateLimited
         | DeliveryErrorClass::ProviderUnavailable
         | DeliveryErrorClass::Transport => Err(PostgresOutboxError::InvalidDelivery),
@@ -1000,20 +1005,24 @@ mod tests {
         for class in [
             DeliveryErrorClass::Authentication,
             DeliveryErrorClass::InvalidRecipient,
+            DeliveryErrorClass::InvalidArtifact,
+            DeliveryErrorClass::InvalidRouting,
+            DeliveryErrorClass::ProviderRejected,
         ] {
             assert_eq!(
                 transient_error_text(class),
                 Err(PostgresOutboxError::InvalidDelivery)
             );
         }
-        assert_eq!(
-            permanent_error_text(DeliveryErrorClass::Authentication).unwrap(),
-            "authentication"
-        );
-        assert_eq!(
-            permanent_error_text(DeliveryErrorClass::InvalidRecipient).unwrap(),
-            "invalid_recipient"
-        );
+        for (class, expected) in [
+            (DeliveryErrorClass::Authentication, "authentication"),
+            (DeliveryErrorClass::InvalidRecipient, "invalid_recipient"),
+            (DeliveryErrorClass::InvalidArtifact, "invalid_artifact"),
+            (DeliveryErrorClass::InvalidRouting, "invalid_routing"),
+            (DeliveryErrorClass::ProviderRejected, "provider_rejected"),
+        ] {
+            assert_eq!(permanent_error_text(class).unwrap(), expected);
+        }
         for class in [
             DeliveryErrorClass::RateLimited,
             DeliveryErrorClass::ProviderUnavailable,

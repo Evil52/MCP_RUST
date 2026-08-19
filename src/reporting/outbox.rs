@@ -28,6 +28,9 @@ impl DeliveryStatus {
 pub enum DeliveryErrorClass {
     Authentication,
     InvalidRecipient,
+    InvalidArtifact,
+    InvalidRouting,
+    ProviderRejected,
     RateLimited,
     ProviderUnavailable,
     Transport,
@@ -404,6 +407,9 @@ mod tests {
         for class in [
             DeliveryErrorClass::Authentication,
             DeliveryErrorClass::InvalidRecipient,
+            DeliveryErrorClass::InvalidArtifact,
+            DeliveryErrorClass::InvalidRouting,
+            DeliveryErrorClass::ProviderRejected,
         ] {
             let mut record = ready();
             record.claim_send(utc(3, 3)).unwrap();
