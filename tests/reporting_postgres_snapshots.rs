@@ -333,7 +333,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
     let transport = FixtureTransport(Mutex::new(VecDeque::from([
         Ok(json!({"result":{"data":[{
             "dimensions":[{"id":"3411079879"},{"id":"2098-08-15"}],
-            "metrics":["675.00", 2, 1, 0]
+            "metrics":["675.00", 2]
         }]}})),
         Ok(json!({
             "products":[{
@@ -401,7 +401,8 @@ async fn complete_ozon_source_set_is_published_atomically() {
     )
     .unwrap();
     assert!(preview.bundle.html.contains("Диана"));
-    assert!(!preview.bundle.html.contains("N/D"));
+    assert!(preview.bundle.html.contains("Отменено / возвращено единиц"));
+    assert!(preview.bundle.html.contains("N/D / N/D"));
     assert!(preview.bundle.xlsx.starts_with(b"PK"));
     assert_eq!(preview.receipt.size_bytes, preview.bundle.xlsx.len());
     assert!(!preview.receipt.persisted);

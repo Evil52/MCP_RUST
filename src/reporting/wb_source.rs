@@ -16,7 +16,7 @@ use super::{
     snapshot::{Marketplace, SnapshotStatus},
     wb_adapter::{
         WbReportParseError, parse_campaign_ids, parse_price_page, parse_promotion_stats,
-        parse_sales_history, parse_stock_page,
+        parse_sales_page, parse_stock_page,
     },
 };
 
@@ -25,10 +25,12 @@ const MAX_PAGES: usize = 25;
 const CAMPAIGNS_PER_REQUEST: usize = 50;
 
 pub trait WbReportTransport: Send + Sync {
-    fn sales_history<'a>(
+    fn sales_page<'a>(
         &'a self,
         start: NaiveDate,
         end: NaiveDate,
+        limit: u32,
+        offset: u32,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>>;
 
     fn stock_page<'a>(
@@ -68,14 +70,16 @@ impl WbClientReportTransport {
 }
 
 impl WbReportTransport for WbClientReportTransport {
-    fn sales_history<'a>(
+    fn sales_page<'a>(
         &'a self,
         start: NaiveDate,
         end: NaiveDate,
+        limit: u32,
+        offset: u32,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
         Box::pin(async move {
             self.client
-                .sales_funnel_history(
+                .sales_funnel(
                     &self.account_id,
                     json!({
                         "selectedPeriod": {
@@ -83,8 +87,12 @@ impl WbReportTransport for WbClientReportTransport {
                             "end": end.format("%Y-%m-%d").to_string(),
                         },
                         "nmIds": [],
+                        "brandNames": [],
+                        "subjectIds": [],
+                        "tagIds": [],
                         "skipDeletedNm": false,
-                        "aggregationLevel": "day",
+                        "limit": limit,
+                        "offset": offset,
                     }),
                 )
                 .await
@@ -226,6 +234,16 @@ pub enum WbReportSourceError {
     Upstream(WbErrorKind),
     #[error("Wildberries daily-report source response is invalid")]
     InvalidResponse,
+    #[error("Wildberries sales response is invalid")]
+    InvalidSalesResponse,
+    #[error("Wildberries stock response is invalid")]
+    InvalidStockResponse,
+    #[error("Wildberries price response is invalid")]
+    InvalidPriceResponse,
+    #[error("Wildberries campaign response is invalid")]
+    InvalidCampaignResponse,
+    #[error("Wildberries promotion statistics response is invalid")]
+    InvalidPromotionResponse,
     #[error("Wildberries daily-report source pagination exceeded its fixed bound")]
     PaginationLimit,
     #[error("Wildberries daily-report snapshot input is invalid")]
@@ -237,6 +255,11 @@ impl WbReportSourceError {
         match self {
             Self::Upstream(kind) => kind.code(),
             Self::InvalidResponse => "invalid_response",
+            Self::InvalidSalesResponse => "invalid_sales_response",
+            Self::InvalidStockResponse => "invalid_stock_response",
+            Self::InvalidPriceResponse => "invalid_price_response",
+            Self::InvalidCampaignResponse => "invalid_campaign_response",
+            Self::InvalidPromotionResponse => "invalid_promotion_response",
             Self::PaginationLimit => "pagination_limit",
             Self::InvalidSnapshotInput => "invalid_snapshot_input",
         }
@@ -249,27 +272,77 @@ impl From<WbReportParseError> for WbReportSourceError {
     }
 }
 
+fn log_source_completed(source: &'static str, facts: usize) {
+    tracing::info!(source, facts, "WB source completed");
+}
+
 impl WbReportSource {
     pub async fn collect(&self, date: NaiveDate) -> Result<WbCollectedFacts, WbReportSourceError> {
-        let sales = parse_sales_history(&self.transport.sales_history(date, date).await?)?;
+        tracing::info!(source = "sales", "collecting WB daily-report source");
+        let sales = self.collect_sales_pages(date).await?;
+        log_source_completed("sales", sales.len());
+        tracing::info!(source = "stocks", "collecting WB daily-report source");
         let stocks = self.collect_stock_pages().await?;
+        log_source_completed("stocks", stocks.len());
+        tracing::info!(source = "prices", "collecting WB daily-report source");
         let prices = self.collect_price_pages().await?;
-        let ids = parse_campaign_ids(&self.transport.campaigns().await?)?;
+        log_source_completed("prices", prices.len());
+        tracing::info!(source = "campaigns", "collecting WB daily-report source");
+        let ids = parse_campaign_ids(&self.transport.campaigns().await?)
+            .map_err(|_| WbReportSourceError::InvalidCampaignResponse)?;
+        log_source_completed("campaigns", ids.len());
         let mut advertising = Vec::new();
         for chunk in ids.chunks(CAMPAIGNS_PER_REQUEST) {
-            advertising.extend(parse_promotion_stats(
-                &self
-                    .transport
-                    .promotion_stats(chunk.to_vec(), date, date)
-                    .await?,
-            )?);
+            advertising.extend(
+                parse_promotion_stats(
+                    &self
+                        .transport
+                        .promotion_stats(chunk.to_vec(), date, date)
+                        .await?,
+                )
+                .map_err(|_| WbReportSourceError::InvalidPromotionResponse)?,
+            );
         }
+        log_source_completed("advertising", advertising.len());
         Ok(WbCollectedFacts {
             sales,
             advertising,
             stocks,
             prices,
         })
+    }
+
+    async fn collect_sales_pages(
+        &self,
+        date: NaiveDate,
+    ) -> Result<Vec<CollectedSalesFact>, WbReportSourceError> {
+        self.collect_sales_pages_with_limit(date, MAX_PAGES).await
+    }
+
+    async fn collect_sales_pages_with_limit(
+        &self,
+        date: NaiveDate,
+        max_pages: usize,
+    ) -> Result<Vec<CollectedSalesFact>, WbReportSourceError> {
+        let mut facts = Vec::new();
+        for page in 0..max_pages {
+            let offset = page_offset(page)?;
+            let (rows, source_rows) = parse_sales_page(
+                &self
+                    .transport
+                    .sales_page(date, date, PAGE_SIZE as u32, offset)
+                    .await?,
+            )
+            .map_err(|_| WbReportSourceError::InvalidSalesResponse)?;
+            if rows.iter().any(|row| row.business_date != date) {
+                return Err(WbReportSourceError::InvalidSalesResponse);
+            }
+            facts.extend(rows);
+            if source_rows < PAGE_SIZE {
+                return Ok(facts);
+            }
+        }
+        Err(WbReportSourceError::PaginationLimit)
     }
 
     async fn collect_stock_pages(&self) -> Result<Vec<CollectedStockFact>, WbReportSourceError> {
@@ -284,7 +357,8 @@ impl WbReportSource {
         for page in 0..max_pages {
             let offset = page_offset(page)?;
             let (rows, source_rows) =
-                parse_stock_page(&self.transport.stock_page(PAGE_SIZE as u32, offset).await?)?;
+                parse_stock_page(&self.transport.stock_page(PAGE_SIZE as u32, offset).await?)
+                    .map_err(|_| WbReportSourceError::InvalidStockResponse)?;
             // Multiple chrt rows can normalize into one SKU/warehouse fact.
             // Only the raw response count proves that the page was short.
             let complete = source_rows < PAGE_SIZE;
@@ -308,7 +382,8 @@ impl WbReportSource {
         for page in 0..max_pages {
             let offset = page_offset(page)?;
             let (rows, source_rows) =
-                parse_price_page(&self.transport.price_page(PAGE_SIZE as u32, offset).await?)?;
+                parse_price_page(&self.transport.price_page(PAGE_SIZE as u32, offset).await?)
+                    .map_err(|_| WbReportSourceError::InvalidPriceResponse)?;
             let complete = source_rows < PAGE_SIZE;
             facts.extend(rows);
             if complete {
@@ -348,6 +423,59 @@ mod tests {
         requested_stats: Arc<Mutex<Vec<Vec<u64>>>>,
     }
 
+    struct SalesFixtureTransport {
+        pages: Mutex<VecDeque<Value>>,
+    }
+
+    impl WbReportTransport for SalesFixtureTransport {
+        fn sales_page<'a>(
+            &'a self,
+            _start: NaiveDate,
+            _end: NaiveDate,
+            _limit: u32,
+            _offset: u32,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+            Box::pin(async {
+                self.pages
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or(WbReportSourceError::InvalidResponse)
+            })
+        }
+
+        fn stock_page<'a>(
+            &'a self,
+            _limit: u32,
+            _offset: u32,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+            Box::pin(async { Err(WbReportSourceError::InvalidResponse) })
+        }
+
+        fn price_page<'a>(
+            &'a self,
+            _limit: u32,
+            _offset: u32,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+            Box::pin(async { Err(WbReportSourceError::InvalidResponse) })
+        }
+
+        fn campaigns<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+            Box::pin(async { Err(WbReportSourceError::InvalidResponse) })
+        }
+
+        fn promotion_stats<'a>(
+            &'a self,
+            _ids: Vec<u64>,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+            Box::pin(async { Err(WbReportSourceError::InvalidResponse) })
+        }
+    }
+
     impl FixtureTransport {
         fn complete() -> Self {
             Self {
@@ -371,15 +499,23 @@ mod tests {
     }
 
     impl WbReportTransport for FixtureTransport {
-        fn sales_history<'a>(
+        fn sales_page<'a>(
             &'a self,
-            _start: NaiveDate,
-            _end: NaiveDate,
+            start: NaiveDate,
+            end: NaiveDate,
+            _limit: u32,
+            _offset: u32,
         ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-            Box::pin(async {
-                Ok(json!([{"product":{"nmId":1},"currency":"RUB","history":[{
-                    "date":"2026-08-17","orderCount":2,"orderSum":180
-                }]}]))
+            Box::pin(async move {
+                Ok(json!({"data":{"currency":"RUB","products":[{
+                    "product":{"nmId":1},"statistic":{"selected":{
+                        "period":{
+                            "start":start.format("%Y-%m-%d").to_string(),
+                            "end":end.format("%Y-%m-%d").to_string()
+                        },
+                        "orderCount":2,"orderSum":180,"cancelCount":0
+                    }}
+                }]}}))
             })
         }
 
@@ -495,6 +631,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sales_pagination_rejects_foreign_dates_and_requires_a_terminal_page() {
+        fn sales_page(date: &str, count: usize) -> Value {
+            json!({"data":{"currency":"RUB","products": (1..=count).map(|sku| json!({
+                "product":{"nmId":sku},
+                "statistic":{"selected":{
+                    "period":{"start":date,"end":date},
+                    "orderCount":1,"orderSum":90,"cancelCount":0
+                }}
+            })).collect::<Vec<_>>()}})
+        }
+
+        let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let wrong_date = WbReportSource::new(SalesFixtureTransport {
+            pages: Mutex::new(VecDeque::from([sales_page("2026-08-16", 1)])),
+        });
+        assert_eq!(
+            wrong_date.collect_sales_pages(date).await,
+            Err(WbReportSourceError::InvalidSalesResponse)
+        );
+
+        let unterminated = WbReportSource::new(SalesFixtureTransport {
+            pages: Mutex::new(VecDeque::from([sales_page("2026-08-17", PAGE_SIZE)])),
+        });
+        assert_eq!(
+            unterminated.collect_sales_pages_with_limit(date, 1).await,
+            Err(WbReportSourceError::PaginationLimit)
+        );
+
+        // The sales-only fixture deliberately refuses every unrelated route;
+        // exercising those refusals also keeps the all-target line gate exact.
+        let unrelated = SalesFixtureTransport {
+            pages: Mutex::new(VecDeque::new()),
+        };
+        assert_eq!(
+            unrelated.stock_page(1, 0).await,
+            Err(WbReportSourceError::InvalidResponse)
+        );
+        assert_eq!(
+            unrelated.price_page(1, 0).await,
+            Err(WbReportSourceError::InvalidResponse)
+        );
+        assert_eq!(
+            unrelated.campaigns().await,
+            Err(WbReportSourceError::InvalidResponse)
+        );
+        assert_eq!(
+            unrelated.promotion_stats(vec![1], date, date).await,
+            Err(WbReportSourceError::InvalidResponse)
+        );
+    }
+
+    #[tokio::test]
     async fn campaigns_are_split_into_documented_fifty_id_requests() {
         let mut fixture = FixtureTransport::complete();
         fixture.campaign_ids = json!({"adverts":[{
@@ -541,7 +729,7 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
 
         assert_eq!(
-            transport.sales_history(date, date).await.unwrap(),
+            transport.sales_page(date, date, 1000, 0).await.unwrap(),
             json!([])
         );
         assert_eq!(
@@ -562,8 +750,9 @@ mod tests {
         );
 
         let sales = analytics_requests.recv().unwrap();
-        assert!(sales.starts_with("POST /api/analytics/v3/sales-funnel/products/history HTTP/1.1"));
-        assert!(sales.contains(r#""aggregationLevel":"day""#));
+        assert!(sales.starts_with("POST /api/analytics/v3/sales-funnel/products HTTP/1.1"));
+        assert!(sales.contains(r#""limit":1000"#));
+        assert!(sales.contains(r#""offset":0"#));
         let stock = analytics_requests.recv().unwrap();
         assert!(stock.starts_with("POST /api/analytics/v1/stocks-report/wb-warehouses HTTP/1.1"));
         assert!(stock.contains(r#""limit":1000"#));
@@ -610,7 +799,7 @@ mod tests {
         let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
         let expected = Err(WbReportSourceError::Upstream(WbErrorKind::Unauthorized));
 
-        assert_eq!(transport.sales_history(date, date).await, expected);
+        assert_eq!(transport.sales_page(date, date, 1000, 0).await, expected);
         assert_eq!(transport.stock_page(1_000, 0).await, expected);
         assert_eq!(transport.price_page(1_000, 0).await, expected);
         assert_eq!(transport.campaigns().await, expected);
@@ -628,7 +817,7 @@ mod tests {
             WbReportSource::new(malformed)
                 .collect(NaiveDate::from_ymd_opt(2026, 8, 17).unwrap())
                 .await,
-            Err(WbReportSourceError::InvalidResponse)
+            Err(WbReportSourceError::InvalidPromotionResponse)
         );
 
         let mut full_stock = FixtureTransport::complete();
@@ -671,6 +860,26 @@ mod tests {
         assert_eq!(
             WbReportSourceError::InvalidResponse.code(),
             "invalid_response"
+        );
+        assert_eq!(
+            WbReportSourceError::InvalidSalesResponse.code(),
+            "invalid_sales_response"
+        );
+        assert_eq!(
+            WbReportSourceError::InvalidStockResponse.code(),
+            "invalid_stock_response"
+        );
+        assert_eq!(
+            WbReportSourceError::InvalidPriceResponse.code(),
+            "invalid_price_response"
+        );
+        assert_eq!(
+            WbReportSourceError::InvalidCampaignResponse.code(),
+            "invalid_campaign_response"
+        );
+        assert_eq!(
+            WbReportSourceError::InvalidPromotionResponse.code(),
+            "invalid_promotion_response"
         );
         assert_eq!(
             WbReportSourceError::PaginationLimit.code(),

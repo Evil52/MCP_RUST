@@ -361,8 +361,10 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         let request = sales_request(date_from, date_to, offset)
             .map_err(|_| OzonReportSourceError::InvalidResponse)?;
         let response = self.transport.post(request).await?;
-        parse_sales_page(&response).map_err(|_| OzonReportSourceError::InvalidSalesResponse {
-            shape: sales_response_shape(&response),
+        parse_sales_page(&response).map_err(|_| {
+            let shape = sales_response_shape(&response);
+            tracing::warn!(shape, "Ozon Seller analytics response shape was rejected");
+            OzonReportSourceError::InvalidSalesResponse { shape }
         })
     }
 
@@ -692,7 +694,7 @@ mod tests {
         let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
             Ok(json!({"result":{"data":[{
                 "dimensions":[{"id":"1"},{"id":"2026-08-16"}],
-                "metrics":["1.00", 2, 1, 1]
+                "metrics":["1.00", 2]
             }]}})),
             Ok(json!({
                 "products":[{"sku":1,"warehouse_id":11,"present":4,"reserved":1}],
@@ -713,8 +715,8 @@ mod tests {
         let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
         let sales = source.sales_page(day, day, 0).await.unwrap();
         assert_eq!(sales[0].ordered_units, 2);
-        assert_eq!(sales[0].returned_units, Some(1));
-        assert_eq!(sales[0].cancelled_units, Some(1));
+        assert_eq!(sales[0].returned_units, None);
+        assert_eq!(sales[0].cancelled_units, None);
         let stocks = source.collect_stock_pages().await.unwrap();
         assert_eq!(stocks.len(), 2);
         assert_eq!(stocks[0].warehouse_id, "fbo:11");
@@ -1175,7 +1177,7 @@ mod tests {
         let full_sales_page = || {
             json!({"result":{"data":(0..1_000).map(|index| json!({
                 "dimensions":[{"id":index.to_string()},{"id":"2026-08-16"}],
-                "metrics":["1", 1, 0, 0]
+                "metrics":["1", 1]
             })).collect::<Vec<_>>()}})
         };
         let sales = OzonReportSource::new(FixtureTransport(Mutex::new(

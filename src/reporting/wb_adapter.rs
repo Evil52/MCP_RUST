@@ -4,10 +4,14 @@
 //! ruble amounts into integer kopecks. It performs no I/O and never retains
 //! product titles, buyer data, credentials, or upstream error bodies.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write,
+};
 
 use chrono::NaiveDate;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::postgres_collector::{
@@ -16,6 +20,8 @@ use super::postgres_collector::{
 
 const MAX_ROWS: usize = 25_000;
 const MAX_CAMPAIGNS: usize = 500;
+const MAX_WAREHOUSE_LABEL_BYTES: usize = 512;
+const WB_UNSPECIFIED_WAREHOUSE_ID: i64 = -999_999;
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum WbReportParseError {
@@ -59,6 +65,50 @@ pub fn parse_sales_history(
     Ok(facts)
 }
 
+/// Normalizes one page of the current product funnel for a one-day period.
+///
+/// Unlike the history endpoint, this endpoint supports bounded pagination over
+/// the complete current product catalogue without requiring hundreds of
+/// separately paced 20-SKU requests.
+pub fn parse_sales_page(
+    response: &Value,
+) -> Result<(Vec<CollectedSalesFact>, usize), WbReportParseError> {
+    let data = object(field(object(response)?, "data")?)?;
+    if field(data, "currency")?.as_str() != Some("RUB") {
+        return Err(WbReportParseError::Value);
+    }
+    let products = array(field(data, "products")?)?;
+    if products.len() > MAX_ROWS {
+        return Err(WbReportParseError::TooManyRows);
+    }
+    let mut facts = Vec::with_capacity(products.len());
+    for product in products {
+        let product = object(product)?;
+        let identity = object(field(product, "product")?)?;
+        let sku = unsigned(field(identity, "nmId")?)?;
+        ensure_positive(sku)?;
+        let selected = object(field(object(field(product, "statistic")?)?, "selected")?)?;
+        let period = object(field(selected, "period")?)?;
+        let start = date(field(period, "start")?)?;
+        let end = date(field(period, "end")?)?;
+        if start != end {
+            return Err(WbReportParseError::Value);
+        }
+        facts.push(CollectedSalesFact {
+            business_date: start,
+            sku,
+            ordered_units: unsigned(field(selected, "orderCount")?)?,
+            operational_gmv_minor: minor(field(selected, "orderSum")?)?,
+            cancelled_units: Some(unsigned(field(selected, "cancelCount")?)?),
+            // The funnel exposes buyouts, not cohort-correct returns. Never
+            // manufacture a return count from unrelated counters.
+            returned_units: None,
+        });
+    }
+    ensure_unique(&facts, |fact| (fact.business_date, fact.sku))?;
+    Ok((facts, products.len()))
+}
+
 pub fn parse_stock_page(
     response: &Value,
 ) -> Result<(Vec<CollectedStockFact>, usize), WbReportParseError> {
@@ -67,13 +117,12 @@ pub fn parse_stock_page(
     if rows.len() > MAX_ROWS {
         return Err(WbReportParseError::TooManyRows);
     }
-    let mut totals = BTreeMap::<(u64, u64), u64>::new();
+    let mut totals = BTreeMap::<(u64, String), u64>::new();
     for row in rows {
         let row = object(row)?;
         let sku = unsigned(field(row, "nmId")?)?;
-        let warehouse = unsigned(field(row, "warehouseId")?)?;
         ensure_positive(sku)?;
-        ensure_positive(warehouse)?;
+        let warehouse = warehouse_identity(row)?;
         let quantity = unsigned(field(row, "quantity")?)?;
         let total = totals.entry((sku, warehouse)).or_default();
         *total = total
@@ -83,14 +132,48 @@ pub fn parse_stock_page(
     Ok((
         totals
             .into_iter()
-            .map(|((sku, warehouse), sellable_units)| CollectedStockFact {
+            .map(|((sku, warehouse_id), sellable_units)| CollectedStockFact {
                 sku,
-                warehouse_id: format!("wb:{warehouse}"),
+                warehouse_id,
                 sellable_units,
             })
             .collect(),
         rows.len(),
     ))
+}
+
+fn warehouse_identity(row: &Map<String, Value>) -> Result<String, WbReportParseError> {
+    let warehouse_id = signed(field(row, "warehouseId")?)?;
+    if warehouse_id > 0 {
+        return Ok(format!("wb:{warehouse_id}"));
+    }
+    if warehouse_id != WB_UNSPECIFIED_WAREHOUSE_ID {
+        return Err(WbReportParseError::Value);
+    }
+    let region = bounded_warehouse_label(field(row, "regionName")?)?;
+    let warehouse = bounded_warehouse_label(field(row, "warehouseName")?)?;
+    let mut digest = Sha256::new();
+    digest.update(b"mcp-ozon-wb-warehouse-v1\0");
+    digest.update(region.as_bytes());
+    digest.update([0]);
+    digest.update(warehouse.as_bytes());
+    let mut identity = String::with_capacity(74);
+    identity.push_str("wb:sha256:");
+    for byte in digest.finalize() {
+        write!(&mut identity, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(identity)
+}
+
+fn bounded_warehouse_label(value: &Value) -> Result<&str, WbReportParseError> {
+    let value = value.as_str().ok_or(WbReportParseError::Shape)?;
+    if value.is_empty()
+        || value.len() > MAX_WAREHOUSE_LABEL_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(WbReportParseError::Value);
+    }
+    Ok(value)
 }
 
 pub fn parse_price_page(
@@ -158,6 +241,11 @@ pub fn parse_campaign_ids(response: &Value) -> Result<Vec<u64>, WbReportParseErr
 pub fn parse_promotion_stats(
     response: &Value,
 ) -> Result<Vec<CollectedAdvertisingFact>, WbReportParseError> {
+    // WB returns a JSON `null` body for a successful fullstats request when
+    // none of the requested campaigns has statistics in the selected period.
+    if response.is_null() {
+        return Ok(Vec::new());
+    }
     let campaigns = array(response)?;
     let mut totals = BTreeMap::<(NaiveDate, u64, u64), AdvertisingTotals>::new();
     for campaign in campaigns {
@@ -400,6 +488,55 @@ mod tests {
             (7, "wb:507", 45)
         );
 
+        let (funnel, funnel_rows) = parse_sales_page(&json!({"data":{
+            "currency":"RUB","products":[{
+                "product":{"nmId":7},
+                "statistic":{"selected":{
+                    "period":{"start":"2026-08-17","end":"2026-08-17"},
+                    "orderCount":4,"orderSum":123.45,"cancelCount":1
+                }}
+            }]
+        }}))
+        .unwrap();
+        assert_eq!(funnel_rows, 1);
+        assert_eq!(
+            (
+                funnel[0].business_date,
+                funnel[0].sku,
+                funnel[0].ordered_units,
+                funnel[0].operational_gmv_minor,
+                funnel[0].cancelled_units,
+                funnel[0].returned_units,
+            ),
+            (
+                NaiveDate::from_ymd_opt(2026, 8, 17).unwrap(),
+                7,
+                4,
+                12_345,
+                Some(1),
+                None,
+            )
+        );
+
+        let (anonymous_warehouse, _) = parse_stock_page(&json!({"data":{"items":[
+            {"nmId":7,"warehouseId":-999999,"warehouseName":"Central","regionName":"Ural","quantity":3}
+        ]}}))
+        .unwrap();
+        assert!(
+            anonymous_warehouse[0]
+                .warehouse_id
+                .starts_with("wb:sha256:")
+        );
+        assert_eq!(anonymous_warehouse[0].warehouse_id.len(), 74);
+        assert_eq!(
+            anonymous_warehouse,
+            parse_stock_page(&json!({"data":{"items":[
+                {"nmId":7,"warehouseId":-999999,"warehouseName":"Central","regionName":"Ural","quantity":3}
+            ]}}))
+            .unwrap()
+            .0
+        );
+
         let (prices, price_rows) = parse_price_page(&json!({"data":{"listGoods":[{
             "nmID":98486,"currencyIsoCode4217":"RUB","sizes":[
                 {"price":500,"discountedPrice":350},
@@ -420,6 +557,7 @@ mod tests {
 
     #[test]
     fn campaigns_and_both_stats_shapes_are_normalized_without_double_counting() {
+        assert!(parse_promotion_stats(&Value::Null).unwrap().is_empty());
         let ids = parse_campaign_ids(&json!({"adverts":[
             {"status":9,"advert_list":[{"advertId":2},{"advertId":1}]},
             {"status":8,"advert_list":[{"advertId":3}]}
@@ -489,6 +627,24 @@ mod tests {
             .is_err()
         );
         assert!(parse_stock_page(&json!({"data":{"items":[{"nmId":1,"warehouseId":1,"quantity":u64::MAX},{"nmId":1,"warehouseId":1,"quantity":1}]}})).is_err());
+        for label in ["", "bad\nlabel"] {
+            assert!(
+                parse_stock_page(&json!({"data":{"items":[{
+                "nmId":1,"warehouseId":-999999,"quantity":1,
+                    "warehouseName":label,"regionName":"region"
+                }]}}))
+                .is_err()
+            );
+        }
+        for warehouse_id in [0, -1, -999_998] {
+            assert!(
+                parse_stock_page(&json!({"data":{"items":[{
+                    "nmId":1,"warehouseId":warehouse_id,"quantity":1,
+                    "warehouseName":"warehouse","regionName":"region"
+                }]}}))
+                .is_err()
+            );
+        }
         assert!(
             parse_price_page(
                 &json!({"data":{"listGoods":[{"nmID":1,"currencyIsoCode4217":"USD","sizes":[]}]}})
@@ -503,6 +659,16 @@ mod tests {
         );
         assert!(parse_price_page(&json!({"data":{"listGoods":[{"nmID":1,"currencyIsoCode4217":"RUB","sizes":[{"price":1,"discountedPrice":2}]}]}})).is_err());
         assert!(parse_sales_history(&json!([{"product":{"nmId":1},"currency":"RUB","history":[{"date":"2026-08-17","orderCount":1,"orderSum":1},{"date":"2026-08-17","orderCount":1,"orderSum":1}]}])).is_err());
+        assert!(parse_sales_page(&json!({"data":{"currency":"USD","products":[]}})).is_err());
+        assert!(
+            parse_sales_page(&json!({"data":{"currency":"RUB","products":[{
+                "product":{"nmId":1},"statistic":{"selected":{
+                    "period":{"start":"2026-08-16","end":"2026-08-17"},
+                    "orderCount":1,"orderSum":1,"cancelCount":0
+                }}
+            }]}}))
+            .is_err()
+        );
         assert!(parse_promotion_stats(&json!([{"advertId":1}])).is_err());
         assert!(parse_promotion_stats(&json!([{"stats":[]}])).is_err());
         assert!(parse_promotion_stats(&json!([{"advertId":true,"stats":[]}])).is_err());
@@ -537,6 +703,12 @@ mod tests {
             parse_sales_history(&json!([{
                 "product":{"nmId":1},"currency":"RUB","history":history
             }])),
+            Err(WbReportParseError::TooManyRows)
+        );
+        assert_eq!(
+            parse_sales_page(&json!({"data":{"currency":"RUB","products":
+                vec![Value::Null; MAX_ROWS + 1]
+            }})),
             Err(WbReportParseError::TooManyRows)
         );
         assert_eq!(

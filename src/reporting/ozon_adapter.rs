@@ -85,7 +85,7 @@ pub fn sales_request(
         payload: serde_json::json!({
             "date_from": date_from.format("%Y-%m-%d").to_string(),
             "date_to": date_to.format("%Y-%m-%d").to_string(),
-            "metrics": ["revenue", "ordered_units", "returns", "cancellations"],
+            "metrics": ["revenue", "ordered_units"],
             "dimension": ["sku", "day"],
             "filters": [],
             "sort": [],
@@ -148,7 +148,7 @@ pub fn product_page_request(
 }
 
 /// Normalizes `/v1/analytics/data` for dimensions `["sku", "day"]` and
-/// metrics `["revenue", "ordered_units", "returns", "cancellations"]`.
+/// metrics `["revenue", "ordered_units"]`.
 ///
 /// The metric order is part of this local contract. A different query must
 /// not be parsed by this function because positional metric arrays otherwise
@@ -169,7 +169,7 @@ pub fn parse_sales_page(response: &Value) -> Result<Vec<CollectedSalesFact>, Ozo
         let sku = parse_u64(field(dimensions[0].as_object(), "id")?)?;
         let business_date = parse_date(field(dimensions[1].as_object(), "id")?)?;
         let metrics = array_field_value(row.get("metrics"))?;
-        if metrics.len() != 4 {
+        if metrics.len() != 2 {
             return Err(OzonReportParseError::Shape);
         }
         facts.push(CollectedSalesFact {
@@ -177,8 +177,10 @@ pub fn parse_sales_page(response: &Value) -> Result<Vec<CollectedSalesFact>, Ozo
             sku,
             operational_gmv_minor: parse_minor(&metrics[0])?,
             ordered_units: parse_count(&metrics[1])?,
-            cancelled_units: Some(parse_count(&metrics[3])?),
-            returned_units: Some(parse_count(&metrics[2])?),
+            // Ozon returns and cancellations require separate, differently
+            // attributed sources. Never turn unavailable events into zeros.
+            cancelled_units: None,
+            returned_units: None,
         });
     }
     Ok(facts)
@@ -564,14 +566,14 @@ mod tests {
         let sales = parse_sales_page(&json!({
             "result": {"data": [{
                 "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
-                "metrics": ["12.34", 5, 2, 1]
+                "metrics": ["12.34", 5]
             }]}
         }))
         .unwrap();
         assert_eq!(sales[0].operational_gmv_minor, 1_234);
         assert_eq!(sales[0].ordered_units, 5);
-        assert_eq!(sales[0].returned_units, Some(2));
-        assert_eq!(sales[0].cancelled_units, Some(1));
+        assert_eq!(sales[0].returned_units, None);
+        assert_eq!(sales[0].cancelled_units, None);
 
         let stocks = parse_stock_page(&json!({"items": [{
             "product_id": 123,
@@ -669,17 +671,17 @@ mod tests {
         let accepted = parse_sales_page(&json!({
             "result": {"data": [{
                 "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
-                "metrics": ["1.00", 2.0, 1, 0]
+                "metrics": ["1.00", 2.0]
             }]}
         }))
         .unwrap();
         assert_eq!(accepted[0].ordered_units, 2);
-        assert_eq!(accepted[0].returned_units, Some(1));
+        assert_eq!(accepted[0].returned_units, None);
 
         let fractional = parse_sales_page(&json!({
             "result": {"data": [{
                 "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
-                "metrics": ["1.00", 1.5, 0, 0]
+                "metrics": ["1.00", 1.5]
             }]}
         }));
         assert_eq!(fractional, Err(OzonReportParseError::Value));
@@ -687,7 +689,7 @@ mod tests {
         let invalid_kind = parse_sales_page(&json!({
             "result": {"data": [{
                 "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
-                "metrics": ["1.00", true, 0, 0]
+                "metrics": ["1.00", true]
             }]}
         }));
         assert_eq!(invalid_kind, Err(OzonReportParseError::Value));
@@ -695,7 +697,7 @@ mod tests {
         let string_count = parse_sales_page(&json!({
             "result": {"data": [{
                 "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
-                "metrics": ["1.00", "2", "0", "0"]
+                "metrics": ["1.00", "2"]
             }]}
         }))
         .unwrap();
@@ -712,7 +714,7 @@ mod tests {
                 path: "/v1/analytics/data",
                 payload: json!({
                     "date_from": "2026-08-15", "date_to": "2026-08-16",
-                    "metrics": ["revenue", "ordered_units", "returns", "cancellations"],
+                    "metrics": ["revenue", "ordered_units"],
                     "dimension": ["sku", "day"], "filters": [], "sort": [],
                     "limit": 1_000, "offset": 7,
                 }),
@@ -947,7 +949,7 @@ mod tests {
             parse_sales_page(&json!({
                 "result": {"data": [{
                     "dimensions": [{"id": "1"}, {"id": "not-a-date"}],
-                    "metrics": ["0", 0, 0, 0]
+                    "metrics": ["0", 0]
                 }]}
             })),
             Err(OzonReportParseError::Value)
