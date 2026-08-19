@@ -229,6 +229,10 @@ has broader vendor permissions.
   testing refresh token with an unsuitable lifetime, a symlink, or an address/token in Git, Compose
   environment, logs, screenshots, or report artifacts. OAuth refresh and Gmail delivery must use
   their fixed Google endpoints through the dedicated allowlisted mail-egress proxy.
+- Keep the address routing document in a separate private regular file. Its symbolic names must
+  match the enabled policy exactly; missing, extra, duplicate, malformed, or prompt-supplied routes
+  fail closed. Do not combine email addresses with OAuth credentials or marketplace secrets, and do
+  not expose the routing file through Compose environment, report artifacts, logs, or screenshots.
 - Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
   through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
   `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,

@@ -23,6 +23,7 @@ pub mod gmail_oauth;
 pub mod html;
 pub mod kpi;
 pub mod mail;
+pub mod mail_routing;
 pub mod outbox;
 pub mod ozon_adapter;
 pub mod ozon_performance_source;

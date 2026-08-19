@@ -139,8 +139,12 @@ uses only Google's fixed token endpoint through the same dedicated mail-egress
 proxy, and accepts only a bounded Bearer token for the minimal
 `https://www.googleapis.com/auth/gmail.send` scope. The production credential
 mount, mail-egress deployment and outbox-to-provider worker remain future
-release gates. No Gmail password or address belongs in this directory, the
-repository, Compose environment or logs. An opt-in
+release gates. A strict private routing-file loader now resolves the policy's
+symbolic sender and audience names to addresses. It requires one exact route
+per configured symbol, refuses extra/missing/duplicate routes and never lets a
+prompt, report row or account payload select an address. The routing file is
+not mounted or consumed by the runtime yet. No Gmail password or address
+belongs in the OAuth directory, repository, Compose environment or logs. An opt-in
 `REPORT_WORKER_MODE=dry_run` runtime ticks
 once per minute, plans due 08:00/17:00 EKB occurrences and retries only
 single-section `planned`/`generating` artifact work inside its delivery window.

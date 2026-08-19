@@ -176,7 +176,7 @@ pub fn build_report_email(
     })
 }
 
-fn validate_address(value: &str) -> Result<(), MailBuildError> {
+pub(super) fn validate_address(value: &str) -> Result<(), MailBuildError> {
     if value.is_empty()
         || value.len() > MAX_ADDRESS_BYTES
         || !value.is_ascii()
