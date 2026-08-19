@@ -132,11 +132,12 @@ async fn run_wb_dry_run(
             .collect(date)
             .await
             .map_err(|error| anyhow::anyhow!("wb_{}", error.code()))?;
+        let source_as_of = Utc::now();
         let snapshots = facts
             .into_snapshots(
                 account_id.to_owned(),
                 cutoff_at,
-                cutoff_at,
+                source_as_of,
                 period_start,
                 period_end,
                 env!("CARGO_PKG_VERSION").to_owned(),
@@ -192,12 +193,13 @@ async fn run_ozon_dry_run(
             .collect(date)
             .await
             .map_err(|error| anyhow::anyhow!("performance_{}", error.code()))?;
+        let source_as_of = Utc::now();
         let snapshots = collect_complete_snapshots(
             &transport,
             advertising,
             account_id.to_owned(),
             cutoff_at,
-            cutoff_at,
+            source_as_of,
             period_start,
             period_end,
             env!("CARGO_PKG_VERSION").to_owned(),

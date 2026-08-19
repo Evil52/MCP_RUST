@@ -48,6 +48,20 @@ SELECT
     AND to_regclass('daily_reporting.published_advertising_facts') IS NOT NULL
     AND to_regclass('daily_reporting.published_stock_facts') IS NOT NULL
     AND to_regclass('daily_reporting.published_price_facts') IS NOT NULL
+    AND EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'daily_reporting.source_snapshots'::regclass
+          AND conname = 'source_snapshots_observation_window_check'
+          AND contype = 'c'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'daily_reporting.source_snapshots'::regclass
+          AND conname = 'source_snapshots_period_window_check'
+          AND contype = 'c'
+    )
     AND to_regprocedure(
         'daily_reporting.enforce_delivery_batch_state()'
     ) IS NOT NULL

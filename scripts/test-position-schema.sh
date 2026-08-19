@@ -202,6 +202,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/008_daily_reporting_artifact_identity.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/009_daily_reporting_generation_backoff.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/010_daily_reporting_observation_window.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -1658,8 +1660,8 @@ expect_failure_containing \
   VALUES
       (
           'diana-ozon', 'ozon', 'stocks', '2099-08-16 03:00:00+00',
-          '2099-08-16 02:35:00+00', '2099-08-16 02:35:00+00',
-          '2099-08-16 02:35:00+00', 'schema-test'
+          '2099-08-16 03:20:00+00', '2099-08-16 03:20:00+00',
+          '2099-08-16 03:20:00+00', 'schema-test'
       );
   UPDATE daily_reporting.source_snapshots
   SET status = 'failed', finished_at = '2099-08-16 02:41:00+00',
@@ -1712,6 +1714,24 @@ expect_failure_containing \
         payload_sha256 = repeat('b', 64),
         finished_at = '2099-08-16 02:40:00+00'
     WHERE id = 3
+  "
+
+expect_failure_containing \
+  "daily-report observation after the bounded cutoff window" \
+  "source_snapshots_observation_window_check" \
+  "${report_collector_psql[@]}" \
+  --command "
+    INSERT INTO daily_reporting.source_snapshots
+        (
+            account_id, marketplace, source, cutoff_at, source_as_of,
+            period_start, period_end, collector_version
+        )
+    VALUES
+        (
+            'anna-wb', 'wildberries', 'stocks', '2099-08-16 03:00:00+00',
+            '2099-08-16 03:30:01+00', '2099-08-16 03:30:01+00',
+            '2099-08-16 03:30:01+00', 'schema-test'
+        )
   "
 
 expect_failure_containing \

@@ -6,6 +6,7 @@ use thiserror::Error;
 
 const MAX_ACCOUNTS: usize = 64;
 const MAX_IDENTIFIER_BYTES: usize = 128;
+const MAX_POST_CUTOFF_OBSERVATION_DELAY: Duration = Duration::minutes(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,11 +112,12 @@ impl SnapshotDescriptor {
             return Err(SnapshotError::InvalidSnapshot);
         }
         validate_identifier(&account_id)?;
-        if source_as_of > cutoff_at || period_start > period_end || period_end > cutoff_at {
+        if source_as_of > cutoff_at + MAX_POST_CUTOFF_OBSERVATION_DELAY || period_start > period_end
+        {
             return Err(SnapshotError::InvalidTimeRange);
         }
         if source.is_period_source() {
-            if period_start == period_end {
+            if period_start == period_end || period_end > cutoff_at {
                 return Err(SnapshotError::InvalidTimeRange);
             }
         } else if period_start != source_as_of || period_end != source_as_of {
@@ -460,9 +462,9 @@ mod tests {
         for (source, source_as_of, start, end) in [
             (
                 SnapshotSource::Stocks,
-                cutoff() + Duration::seconds(1),
-                point,
-                point,
+                cutoff() + Duration::minutes(30) + Duration::seconds(1),
+                cutoff() + Duration::minutes(30) + Duration::seconds(1),
+                cutoff() + Duration::minutes(30) + Duration::seconds(1),
             ),
             (SnapshotSource::Sales, point, cutoff(), point),
             (
@@ -496,6 +498,40 @@ mod tests {
                 Err(SnapshotError::InvalidTimeRange)
             );
         }
+
+        let delayed_point = cutoff() + Duration::minutes(20);
+        assert!(
+            SnapshotDescriptor::new(
+                1,
+                "store".to_owned(),
+                Marketplace::Ozon,
+                SnapshotSource::Stocks,
+                cutoff(),
+                delayed_point,
+                delayed_point,
+                delayed_point,
+                0,
+                true,
+                SnapshotStatus::Succeeded,
+            )
+            .is_ok()
+        );
+        assert!(
+            SnapshotDescriptor::new(
+                1,
+                "store".to_owned(),
+                Marketplace::Ozon,
+                SnapshotSource::Sales,
+                cutoff(),
+                delayed_point,
+                cutoff() - Duration::days(1),
+                cutoff(),
+                0,
+                true,
+                SnapshotStatus::Succeeded,
+            )
+            .is_ok()
+        );
 
         for id in ["", "bad id", &"x".repeat(129)] {
             assert_eq!(

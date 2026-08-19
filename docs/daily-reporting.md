@@ -182,8 +182,11 @@ to twelve minutes and publishes the exact four-source snapshot set in one
 database transaction. The date argument is the completed business day; its
 snapshot identity is the following day's fixed 08:00 EKB morning cutoff, so a
 successful canary can be consumed by the same report-worker manifest contract.
-To preserve the database freshness boundary, the command must start between
-08:00 and 08:30 EKB; an early or late invocation fails before marketplace I/O.
+The actual completion time is retained as `source_as_of`; it is never backdated
+to the logical cutoff. To preserve the database freshness boundary, the command
+must start after 08:00 EKB and the complete atomic source set must be ready no
+later than 08:30 EKB. An early invocation fails before marketplace I/O, while a
+collection that completes too late publishes nothing.
 A timeout, rate limit or malformed/incomplete source publishes nothing. The
 shipped Compose mode remains `disabled`, so neither command runs on a schedule.
 
