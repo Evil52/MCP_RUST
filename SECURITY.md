@@ -266,5 +266,10 @@ has broader vendor permissions.
   through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
   `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,
   an atomic complete snapshot set and zero credential values in environment, arguments or logs.
+  Then start automatic collection only through
+  `scripts/start-report-collector-scheduler.sh --confirm-canaries-published-and-reconciled`.
+  Its database-backed `collection-preflight` must prove that every enabled-policy target shares
+  one successful, fully paginated four-source cutoff from the previous 24 hours; it performs no
+  marketplace request.
 - Run OAuth provider integration tests only against disposable test identities. Run marketplace canaries
   sequentially, read-only, on isolated configuration, and never as part of routine CI.

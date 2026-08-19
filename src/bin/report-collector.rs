@@ -67,6 +67,21 @@ async fn main() -> Result<()> {
             tracing::info!(targets = targets.len(), "report collector preflight passed");
             return Ok(());
         }
+        Command::CollectionPreflight => {
+            ensure!(
+                config.mode() == ReportCollectorMode::Scheduled && config.policy().enabled,
+                "collection-preflight requires scheduled mode and an enabled daily report policy"
+            );
+            let receipt = writer
+                .verify_collection_activation(targets, Utc::now())
+                .await?;
+            tracing::info!(
+                cutoff_at = %receipt.cutoff_at,
+                targets = receipt.target_count,
+                "scheduled collection activation preflight passed"
+            );
+            return Ok(());
+        }
         Command::OzonDryRun {
             account_id,
             date,
@@ -111,6 +126,7 @@ async fn main() -> Result<()> {
 enum Command {
     ServeDisabled,
     Healthcheck,
+    CollectionPreflight,
     OzonDryRun {
         account_id: String,
         date: NaiveDate,
@@ -135,6 +151,7 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
     match arguments {
         [] => Ok(Command::ServeDisabled),
         [argument] if argument == "healthcheck" => Ok(Command::Healthcheck),
+        [argument] if argument == "collection-preflight" => Ok(Command::CollectionPreflight),
         [argument] if argument == "collect-due" => Ok(Command::CollectDue),
         [argument] if argument == "run-scheduler" => Ok(Command::RunScheduler),
         [command, registry, policy, dotenv, output] if command == "bootstrap-credentials" => {
@@ -157,7 +174,7 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         }
         _ => {
             bail!(
-                "usage: report-collector [healthcheck | collect-due | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | wb-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | bootstrap-credentials <access.json> <policy.json> <source.env> <new-output-directory>]"
+                "usage: report-collector [healthcheck | collection-preflight | collect-due | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | wb-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | bootstrap-credentials <access.json> <policy.json> <source.env> <new-output-directory>]"
             )
         }
     }
@@ -222,6 +239,9 @@ async fn run_scheduler_command(
         config.mode() == ReportCollectorMode::Scheduled && config.policy().enabled,
         "run-scheduler requires scheduled mode and an enabled daily report policy"
     );
+    let receipt = writer
+        .verify_collection_activation(config.collection_plan(), Utc::now())
+        .await?;
     let cancellation = CancellationToken::new();
     let signal_cancellation = cancellation.clone();
     let signal_task = tokio::spawn(async move {
@@ -230,6 +250,7 @@ async fn run_scheduler_command(
     });
     tracing::info!(
         targets = config.collection_plan().len(),
+        activation_cutoff_at = %receipt.cutoff_at,
         tick_seconds = SCHEDULED_TICK.as_secs(),
         "daily report collection scheduler started"
     );
@@ -668,6 +689,10 @@ mod tests {
 
     #[test]
     fn dry_run_cli_defaults_to_morning_and_accepts_only_explicit_report_kinds() {
+        assert_eq!(
+            parse_command(&arguments(&["collection-preflight"])).unwrap(),
+            Command::CollectionPreflight
+        );
         assert!(matches!(
             parse_command(&arguments(&["ozon-dry-run", "ozon", "2026-08-18"])).unwrap(),
             Command::OzonDryRun {

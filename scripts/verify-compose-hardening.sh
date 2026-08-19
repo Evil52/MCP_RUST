@@ -1124,6 +1124,18 @@ check_contains \
   "$project_dir/scripts/run-report-mail-canary.sh" \
   "run --rm --no-deps report-worker deliver-one"
 check_contains \
+  "scheduled collection: runner requires explicit canary reconciliation" \
+  "$project_dir/scripts/start-report-collector-scheduler.sh" \
+  "--confirm-canaries-published-and-reconciled"
+check_contains \
+  "scheduled collection: runner requires a database-backed activation preflight" \
+  "$project_dir/scripts/start-report-collector-scheduler.sh" \
+  "run --rm --no-deps report-collector collection-preflight"
+check_contains \
+  "scheduled collection: runner activates only collector and marketplace egress" \
+  "$project_dir/scripts/start-report-collector-scheduler.sh" \
+  "up --detach --wait --wait-timeout 60 ozon-egress report-collector"
+check_contains \
   "scheduled mail: runner requires explicit canary reconciliation" \
   "$project_dir/scripts/start-report-mail-scheduler.sh" \
   "--confirm-canary-sent-and-reconciled"

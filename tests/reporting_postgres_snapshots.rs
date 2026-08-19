@@ -127,6 +127,27 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         .unwrap();
     let account_id = format!("snapshot_integration_{}", std::process::id());
     let target = collection_target(&account_id, Marketplace::Ozon);
+    assert_eq!(
+        writer
+            .verify_collection_activation(&[], timestamp("2098-08-17T03:20:00Z"))
+            .await,
+        Err(PostgresCollectorError::InvalidInput)
+    );
+    assert_eq!(
+        writer
+            .verify_collection_activation(std::slice::from_ref(&target), DateTime::<Utc>::MIN_UTC,)
+            .await,
+        Err(PostgresCollectorError::InvalidInput)
+    );
+    assert_eq!(
+        writer
+            .verify_collection_activation(
+                std::slice::from_ref(&target),
+                timestamp("2098-08-17T03:20:00Z"),
+            )
+            .await,
+        Err(PostgresCollectorError::CanaryMissing)
+    );
     let claim = writer
         .claim_target(&target, cutoff(), "manifest-owner")
         .await
@@ -201,6 +222,15 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         .await
         .unwrap();
     assert_eq!(snapshot_ids.len(), 4);
+    assert_eq!(
+        writer
+            .verify_collection_activation(
+                std::slice::from_ref(&target),
+                timestamp("2098-08-16T03:20:00Z"),
+            )
+            .await,
+        Err(PostgresCollectorError::CanaryMissing)
+    );
     assert!(
         writer
             .claim_target(&target, cutoff(), "after-completion")
@@ -447,6 +477,24 @@ async fn complete_ozon_source_set_is_published_atomically() {
         .await
         .unwrap();
     assert_eq!(ids.len(), 4);
+    let activation = writer
+        .verify_collection_activation(
+            std::slice::from_ref(&target),
+            timestamp("2098-08-17T03:20:00Z"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(activation.cutoff_at, timestamp("2098-08-17T03:00:00Z"));
+    assert_eq!(activation.target_count, 1);
+    assert_eq!(
+        writer
+            .verify_collection_activation(
+                std::slice::from_ref(&target),
+                timestamp("2098-08-18T03:20:01Z"),
+            )
+            .await,
+        Err(PostgresCollectorError::CanaryMissing)
+    );
     assert_eq!(
         writer
             .published_targets(
@@ -464,6 +512,15 @@ async fn complete_ozon_source_set_is_published_atomically() {
         marketplace: Marketplace::Wildberries,
         sources: target.sources,
     };
+    assert_eq!(
+        writer
+            .verify_collection_activation(
+                &[target.clone(), wrong_marketplace.clone()],
+                timestamp("2098-08-17T03:20:00Z"),
+            )
+            .await,
+        Err(PostgresCollectorError::CanaryMissing)
+    );
     assert!(
         writer
             .published_targets(timestamp("2098-08-17T03:00:00Z"), &[wrong_marketplace],)

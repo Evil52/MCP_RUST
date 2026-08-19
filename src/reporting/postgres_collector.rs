@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio_postgres::{Client, Config, Transaction, error::SqlState};
@@ -16,6 +16,7 @@ const MAX_FACT_ROWS: usize = 25_000;
 const MAX_COLLECTOR_VERSION_BYTES: usize = 64;
 const MAX_COLLECTION_TARGETS: usize = 64;
 const MAX_ACCOUNT_ID_BYTES: usize = 128;
+const COLLECTION_CANARY_MAX_AGE: Duration = Duration::hours(24);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CollectedSalesFact {
@@ -164,6 +165,14 @@ pub enum PostgresCollectorError {
     Conflict,
     #[error("the report collection claim is absent, busy, expired, or superseded")]
     ClaimLost,
+    #[error("a recent complete collection canary is unavailable")]
+    CanaryMissing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionActivationReceipt {
+    pub cutoff_at: DateTime<Utc>,
+    pub target_count: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,7 +381,8 @@ impl PostgresSnapshotWriter {
                    ON requested.account_id = snapshot.account_id::text \
                   AND requested.marketplace = snapshot.marketplace::text \
                  WHERE snapshot.cutoff_at = $1 \
-                   AND snapshot.status IN ('succeeded', 'partial') \
+                   AND snapshot.status = 'succeeded' \
+                   AND snapshot.pagination_complete \
                  GROUP BY snapshot.account_id, snapshot.marketplace \
                  HAVING count(*) = 4 AND count(DISTINCT source) = 4 \
                  ORDER BY snapshot.account_id, snapshot.marketplace",
@@ -386,6 +396,77 @@ impl PostgresSnapshotWriter {
                 Ok((row.get(0), marketplace))
             })
             .collect()
+    }
+
+    /// Requires one recent common four-source cutoff for every policy target.
+    ///
+    /// A live policy is expanded only after each account has completed the
+    /// same operator-reviewed occurrence. The proof contains no credentials
+    /// and performs no marketplace I/O. Normal scheduled publications can
+    /// subsequently serve as the same bounded restart proof.
+    pub async fn verify_collection_activation(
+        &self,
+        targets: &[CollectionTarget],
+        now: DateTime<Utc>,
+    ) -> Result<CollectionActivationReceipt, PostgresCollectorError> {
+        validate_coverage_targets(targets)?;
+        if targets.is_empty() {
+            return Err(PostgresCollectorError::InvalidInput);
+        }
+        let oldest_allowed = now
+            .checked_sub_signed(COLLECTION_CANARY_MAX_AGE)
+            .ok_or(PostgresCollectorError::InvalidInput)?;
+        let account_ids = targets
+            .iter()
+            .map(|target| target.account_id.clone())
+            .collect::<Vec<_>>();
+        let marketplaces = targets
+            .iter()
+            .map(|target| marketplace_name(target.marketplace).to_owned())
+            .collect::<Vec<_>>();
+        let required_rows = i64::try_from(targets.len() * SnapshotSource::ALL.len())
+            .map_err(|_| PostgresCollectorError::InvalidInput)?;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let row = client
+            .query_opt(
+                "WITH requested(account_id, marketplace) AS ( \
+                     SELECT * FROM unnest($3::text[], $4::text[]) \
+                 ) \
+                 SELECT snapshot.cutoff_at \
+                 FROM daily_reporting.source_snapshots AS snapshot \
+                 JOIN requested \
+                   ON requested.account_id = snapshot.account_id::text \
+                  AND requested.marketplace = snapshot.marketplace::text \
+                 WHERE snapshot.cutoff_at BETWEEN $1 AND $2 \
+                   AND snapshot.status = 'succeeded' \
+                   AND snapshot.pagination_complete \
+                 GROUP BY snapshot.cutoff_at \
+                 HAVING count(*) = $5 \
+                    AND count(DISTINCT (snapshot.account_id, snapshot.marketplace, snapshot.source)) = $5 \
+                 ORDER BY snapshot.cutoff_at DESC \
+                 LIMIT 1",
+                &[
+                    &oldest_allowed,
+                    &now,
+                    &account_ids,
+                    &marketplaces,
+                    &required_rows,
+                ],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let cutoff_at = row
+            .map(|row| row.get(0))
+            .ok_or(PostgresCollectorError::CanaryMissing)?;
+        Ok(CollectionActivationReceipt {
+            cutoff_at,
+            target_count: u16::try_from(targets.len())
+                .map_err(|_| PostgresCollectorError::InvalidInput)?,
+        })
     }
 
     /// Atomically appends facts and publishes their immutable snapshot.

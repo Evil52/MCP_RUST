@@ -303,6 +303,7 @@ mode are active, or the same process can run the bounded minute scheduler:
 ```text
 REPORT_COLLECTOR_MODE=scheduled report-collector collect-due
 REPORT_COLLECTOR_MODE=scheduled report-collector run-scheduler
+REPORT_COLLECTOR_MODE=scheduled report-collector collection-preflight
 ```
 
 Both paths perform no marketplace I/O outside a completion window. The
@@ -338,6 +339,14 @@ database claim succeeds, so a busy/completed or unrelated account reads no
 secret. The shipped Compose mode and policy both remain disabled and do not
 mount this directory, so scheduled collection cannot be enabled accidentally.
 
+`collection-preflight` performs no marketplace request. It requires every
+target in the enabled policy to share one successful, fully paginated
+four-source cutoff no more
+than 24 hours old. A target added to the policy therefore cannot enter the
+automatic scheduler until its manual canary has published the same reviewed
+occurrence as the other targets. The long-running scheduler repeats this proof
+at process startup; later publications provide bounded restart proof.
+
 The repository ships a separate `compose.reporting-live.yaml` overlay, but it
 has no defaults for live metadata or credentials and its collector is guarded
 by the `reporting-live` profile. After the access registry, enabled policy and
@@ -352,10 +361,19 @@ docker compose --env-file .position.env \
   --profile reporting-live config --quiet
 ```
 
-Only then may an operator start `report-collector` with the same explicit
-files/profile. The overlay supplies `run-scheduler`; it does not enable the
-report worker or email delivery. Omitting any path, the profile, an enabled
-policy or a valid read-only credential directory fails closed.
+Only then may an operator start `report-collector` through the guarded wrapper
+with the same explicit files/profile:
+
+```text
+./scripts/start-report-collector-scheduler.sh \
+  --confirm-canaries-published-and-reconciled
+```
+
+The wrapper renders the Compose contract and runs the database-backed
+`collection-preflight` before it starts the egress proxy and collector. The
+overlay supplies `run-scheduler`; it does not enable the report worker or email
+delivery. Omitting any path, the profile, an enabled policy, a recent complete
+successful canary occurrence or a valid read-only credential directory fails closed.
 
 Create that directory with the bundled operator command rather than copying the
 whole runtime `.env`:
