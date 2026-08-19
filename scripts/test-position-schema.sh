@@ -204,6 +204,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/009_daily_reporting_generation_backoff.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/010_daily_reporting_observation_window.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/011_daily_reporting_collection_claims.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -322,9 +324,20 @@ migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
           'position_reader',
           'daily_reporting.generation_attempts',
           'SELECT'
+      ),
+      to_regclass('daily_reporting.collection_claims') IS NOT NULL,
+      has_function_privilege(
+          'report_collector',
+          'daily_reporting.claim_report_collection(text,text,timestamp with time zone,text)',
+          'EXECUTE'
+      ),
+      NOT has_table_privilege(
+          'report_collector',
+          'daily_reporting.collection_claims',
+          'SELECT,INSERT,UPDATE,DELETE'
       )
   "; } | tr -d '\r')"
-if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
+if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
   echo "existing-volume migrations did not install the expected schema/ACL" >&2
   printf '%s\n' "$migration_acl" >&2
   exit 1
@@ -1628,45 +1641,107 @@ expect_failure_containing \
 # Daily-report source facts are published atomically. A report worker can read
 # only terminal succeeded/partial projections; raw/running/failed data stays
 # private to the collector boundary.
+claim_identity="$({ "${report_collector_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT claim_id, claim_generation
+    FROM daily_reporting.claim_report_collection(
+        'diana-ozon', 'ozon', '2099-08-16 03:00:00+00', 'schema-test-diana'
+    )
+  "; } | tr -d '\r')"
+same_claim_identity="$({ "${report_collector_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT claim_id, claim_generation
+    FROM daily_reporting.claim_report_collection(
+        'diana-ozon', 'ozon', '2099-08-16 03:00:00+00', 'schema-test-diana'
+    )
+  "; } | tr -d '\r')"
+busy_claim_count="$({ "${report_collector_psql[@]}" --tuples-only --no-align \
+  --command "
+    SELECT count(*)
+    FROM daily_reporting.claim_report_collection(
+        'diana-ozon', 'ozon', '2099-08-16 03:00:00+00', 'competing-owner'
+    )
+  "; } | tr -d '[:space:]')"
+if [[ -z "$claim_identity" || "$same_claim_identity" != "$claim_identity" \
+    || "$busy_claim_count" != 0 ]]; then
+  echo "daily-report collection claim is not idempotent and exclusive" >&2
+  exit 1
+fi
+
+expect_failure_containing \
+  "daily-report snapshot without collection claim" \
+  "new source snapshot requires an active collection claim" \
+  "${report_collector_psql[@]}" \
+  --command "
+    INSERT INTO daily_reporting.source_snapshots
+        (
+            account_id, marketplace, source, cutoff_at, source_as_of,
+            period_start, period_end, collector_version
+        )
+    VALUES
+        (
+            'unclaimed', 'ozon', 'stocks', '2099-08-16 03:00:00+00',
+            '2099-08-16 02:30:00+00', '2099-08-16 02:30:00+00',
+            '2099-08-16 02:30:00+00', 'schema-test'
+        )
+  "
+
 "${report_collector_psql[@]}" --command "
   INSERT INTO daily_reporting.source_snapshots
       (
           account_id, marketplace, source, cutoff_at, source_as_of,
-          period_start, period_end, collector_version
+          period_start, period_end, collector_version,
+          claim_id, claim_generation
       )
-  VALUES
-      (
+  SELECT
           'diana-ozon', 'ozon', 'sales', '2099-08-16 03:00:00+00',
           '2099-08-16 02:30:00+00', '2099-08-15 00:00:00+00',
-          '2099-08-16 00:00:00+00', 'schema-test'
-      );
+          '2099-08-16 00:00:00+00', 'schema-test',
+          claim_id, claim_generation
+  FROM daily_reporting.claim_report_collection(
+      'diana-ozon', 'ozon', '2099-08-16 03:00:00+00', 'schema-test-diana'
+  );
   INSERT INTO daily_reporting.sales_facts
       (
           snapshot_id, business_date, sku, ordered_units,
           operational_gmv_minor, cancelled_units, returned_units
       )
-  VALUES (1, '2099-08-15', 3411079879, 4, 270000, 0, 1);
+  SELECT id, '2099-08-15', 3411079879, 4, 270000, 0, 1
+  FROM daily_reporting.source_snapshots
+  WHERE account_id = 'diana-ozon'
+    AND marketplace = 'ozon'
+    AND source = 'sales'
+    AND cutoff_at = '2099-08-16 03:00:00+00';
   UPDATE daily_reporting.source_snapshots
   SET status = 'succeeded', pagination_complete = true, row_count = 1,
       payload_sha256 = repeat('a', 64),
       finished_at = '2099-08-16 02:40:00+00'
-  WHERE id = 1;
+  WHERE account_id = 'diana-ozon'
+    AND marketplace = 'ozon'
+    AND source = 'sales'
+    AND cutoff_at = '2099-08-16 03:00:00+00';
 
   INSERT INTO daily_reporting.source_snapshots
       (
           account_id, marketplace, source, cutoff_at, source_as_of,
-          period_start, period_end, collector_version
+          period_start, period_end, collector_version,
+          claim_id, claim_generation
       )
-  VALUES
-      (
+  SELECT
           'diana-ozon', 'ozon', 'stocks', '2099-08-16 03:00:00+00',
           '2099-08-16 03:20:00+00', '2099-08-16 03:20:00+00',
-          '2099-08-16 03:20:00+00', 'schema-test'
-      );
+          '2099-08-16 03:20:00+00', 'schema-test',
+          claim_id, claim_generation
+  FROM daily_reporting.claim_report_collection(
+      'diana-ozon', 'ozon', '2099-08-16 03:00:00+00', 'schema-test-diana'
+  );
   UPDATE daily_reporting.source_snapshots
   SET status = 'failed', finished_at = '2099-08-16 02:41:00+00',
       error_class = 'transport', http_status = 502
-  WHERE id = 2;
+  WHERE account_id = 'diana-ozon'
+    AND marketplace = 'ozon'
+    AND source = 'stocks'
+    AND cutoff_at = '2099-08-16 03:00:00+00';
 " >/dev/null
 
 published_report_facts="$({ "${report_worker_psql[@]}" --tuples-only --no-align \
@@ -1690,7 +1765,12 @@ expect_failure_containing \
   --command "
     INSERT INTO daily_reporting.sales_facts
         (snapshot_id, business_date, sku, ordered_units, operational_gmv_minor)
-    VALUES (1, '2099-08-15', 3388722638, 1, 10000)
+    SELECT id, '2099-08-15', 3388722638, 1, 10000
+    FROM daily_reporting.source_snapshots
+    WHERE account_id = 'diana-ozon'
+      AND marketplace = 'ozon'
+      AND source = 'sales'
+      AND cutoff_at = '2099-08-16 03:00:00+00'
   "
 
 expect_failure_containing \
@@ -1701,19 +1781,25 @@ expect_failure_containing \
     INSERT INTO daily_reporting.source_snapshots
         (
             account_id, marketplace, source, cutoff_at, source_as_of,
-            period_start, period_end, collector_version
+            period_start, period_end, collector_version,
+            claim_id, claim_generation
         )
-    VALUES
-        (
+    SELECT
             'anna-wb', 'wildberries', 'prices', '2099-08-16 03:00:00+00',
             '2099-08-16 02:30:00+00', '2099-08-16 02:30:00+00',
-            '2099-08-16 02:30:00+00', 'schema-test'
-        );
+            '2099-08-16 02:30:00+00', 'schema-test',
+            claim_id, claim_generation
+    FROM daily_reporting.claim_report_collection(
+        'anna-wb', 'wildberries', '2099-08-16 03:00:00+00', 'schema-test-anna'
+    );
     UPDATE daily_reporting.source_snapshots
     SET status = 'succeeded', pagination_complete = true, row_count = 1,
         payload_sha256 = repeat('b', 64),
         finished_at = '2099-08-16 02:40:00+00'
-    WHERE id = 3
+    WHERE account_id = 'anna-wb'
+      AND marketplace = 'wildberries'
+      AND source = 'prices'
+      AND cutoff_at = '2099-08-16 03:00:00+00'
   "
 
 expect_failure_containing \
@@ -1724,14 +1810,17 @@ expect_failure_containing \
     INSERT INTO daily_reporting.source_snapshots
         (
             account_id, marketplace, source, cutoff_at, source_as_of,
-            period_start, period_end, collector_version
+            period_start, period_end, collector_version,
+            claim_id, claim_generation
         )
-    VALUES
-        (
+    SELECT
             'anna-wb', 'wildberries', 'stocks', '2099-08-16 03:00:00+00',
             '2099-08-16 03:30:01+00', '2099-08-16 03:30:01+00',
-            '2099-08-16 03:30:01+00', 'schema-test'
-        )
+            '2099-08-16 03:30:01+00', 'schema-test',
+            claim_id, claim_generation
+    FROM daily_reporting.claim_report_collection(
+        'anna-wb', 'wildberries', '2099-08-16 03:00:00+00', 'schema-test-anna'
+    )
   "
 
 expect_failure_containing \
@@ -1745,6 +1834,12 @@ expect_failure_containing \
   "permission denied for table delivery_batches" \
   "${report_collector_psql[@]}" \
   --command 'SELECT count(*) FROM daily_reporting.delivery_batches'
+
+expect_failure_containing \
+  "report collector raw collection-claim access" \
+  "permission denied for table collection_claims" \
+  "${report_collector_psql[@]}" \
+  --command 'SELECT count(*) FROM daily_reporting.collection_claims'
 
 # Reporting outbox: two missed occurrences are atomically covered by one
 # delivery, provider attempts are append-only, and terminal delivery is frozen.

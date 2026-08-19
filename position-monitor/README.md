@@ -199,9 +199,20 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
   sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
   < position-monitor/initdb/009_daily_reporting_generation_backoff.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/010_daily_reporting_observation_window.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/011_daily_reporting_collection_claims.sql
 ```
 
-The migration is transactional. It creates no scheduler and sends no email.
+The migrations are transactional. The final claim migration gives each exact
+account/marketplace/cutoff a fifteen-minute lease with a monotonically
+increasing fencing generation. New source snapshots must carry the live claim,
+and completion of all four sources is atomic. Existing published snapshots
+remain readable without rewriting their provenance. The migrations create no
+scheduler and send no email.
 Rebuild/recreate only `position-db` afterward to install the matching
 healthcheck, while retaining the named volume.
 

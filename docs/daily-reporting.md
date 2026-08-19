@@ -198,7 +198,11 @@ and is not wired to the disabled collector runtime yet. A PostgreSQL-backed
 preflight now removes exact account/marketplace/cutoff targets that already
 have all four terminal published sources before credentials can be resolved.
 The later runtime must still claim each remaining account/cutoff idempotently
-in PostgreSQL before marketplace I/O.
+in PostgreSQL before marketplace I/O. The database claim now exists: it is
+exclusive for fifteen minutes, can be explicitly released after a bounded
+failure, and uses a monotonically increasing fencing generation. All four
+source snapshots and claim completion commit together, so an expired owner
+cannot publish after a replacement starts.
 
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every

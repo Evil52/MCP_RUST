@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio_postgres::{Client, Config, Transaction};
+use tokio_postgres::{Client, Config, Transaction, error::SqlState};
 
 use crate::postgres::SupervisedClient;
 
@@ -162,6 +162,25 @@ pub enum PostgresCollectorError {
     Unavailable,
     #[error("a report snapshot already exists for this account/source/cutoff")]
     Conflict,
+    #[error("the report collection claim is absent, busy, expired, or superseded")]
+    ClaimLost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionClaim {
+    id: i64,
+    generation: i64,
+    account_id: String,
+    marketplace: Marketplace,
+    cutoff_at: DateTime<Utc>,
+    owner_id: String,
+    lease_until: DateTime<Utc>,
+}
+
+impl CollectionClaim {
+    pub fn lease_until(&self) -> DateTime<Utc> {
+        self.lease_until
+    }
 }
 
 pub struct PostgresSnapshotWriter {
@@ -209,6 +228,17 @@ impl PostgresSnapshotWriter {
                         'daily_reporting.stock_facts', 'INSERT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.price_facts', 'INSERT') \
+                    AND has_function_privilege(current_user, \
+                        'daily_reporting.claim_report_collection(text,text,timestamptz,text)', \
+                        'EXECUTE') \
+                    AND has_function_privilege(current_user, \
+                        'daily_reporting.release_report_collection_claim(bigint,bigint,text)', \
+                        'EXECUTE') \
+                    AND has_function_privilege(current_user, \
+                        'daily_reporting.complete_report_collection_claim(bigint,bigint,text)', \
+                        'EXECUTE') \
+                    AND NOT has_table_privilege(current_user, \
+                        'daily_reporting.collection_claims', 'SELECT,INSERT,UPDATE,DELETE') \
                     AND NOT has_table_privilege(current_user, \
                         'daily_reporting.delivery_batches', 'SELECT')",
                 &[],
@@ -218,6 +248,63 @@ impl PostgresSnapshotWriter {
         row.get::<_, bool>(0)
             .then_some(())
             .ok_or(PostgresCollectorError::Unavailable)
+    }
+
+    /// Claims one exact account/marketplace/cutoff before credential lookup or
+    /// marketplace I/O. `None` means another live owner already holds the
+    /// fifteen-minute lease or the occurrence was completed earlier.
+    pub async fn claim_target(
+        &self,
+        target: &CollectionTarget,
+        cutoff_at: DateTime<Utc>,
+        owner_id: &str,
+    ) -> Result<Option<CollectionClaim>, PostgresCollectorError> {
+        validate_coverage_targets(std::slice::from_ref(target))?;
+        validate_owner_id(owner_id)?;
+        let marketplace = marketplace_name(target.marketplace);
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let row = client
+            .query_opt(
+                "SELECT claim_id, claim_generation, lease_until \
+                 FROM daily_reporting.claim_report_collection($1, $2, $3, $4)",
+                &[&target.account_id, &marketplace, &cutoff_at, &owner_id],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        Ok(row.map(|row| CollectionClaim {
+            id: row.get(0),
+            generation: row.get(1),
+            account_id: target.account_id.clone(),
+            marketplace: target.marketplace,
+            cutoff_at,
+            owner_id: owner_id.to_owned(),
+            lease_until: row.get(2),
+        }))
+    }
+
+    /// Relinquishes a live claim after a failed collection so another bounded
+    /// attempt may start without waiting for lease expiry.
+    pub async fn release_claim(
+        &self,
+        claim: &CollectionClaim,
+    ) -> Result<bool, PostgresCollectorError> {
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        client
+            .query_one(
+                "SELECT daily_reporting.release_report_collection_claim($1, $2, $3)",
+                &[&claim.id, &claim.generation, &claim.owner_id],
+            )
+            .await
+            .map(|row| row.get(0))
+            .map_err(|_| PostgresCollectorError::Unavailable)
     }
 
     /// Returns policy targets whose exact cutoff already has all four
@@ -281,24 +368,16 @@ impl PostgresSnapshotWriter {
     /// Any failure rolls back both the snapshot row and all facts. A duplicate
     /// account/source/cutoff identity fails closed instead of overwriting or
     /// silently reusing data from a previous collection attempt.
-    pub async fn persist(
-        &self,
-        snapshot: &CollectedSnapshot,
-    ) -> Result<i64, PostgresCollectorError> {
-        Ok(self
-            .persist_batch(std::slice::from_ref(snapshot))
-            .await?
-            .remove(0))
-    }
-
     /// Persists a related group of report snapshots as one database unit.
     /// A failed source can therefore never publish only sales, stocks, or
-    /// prices for one logical report cutoff.
-    pub async fn persist_batch(
+    /// prices for one logical report cutoff. Completion of the fencing claim
+    /// is part of the same transaction, so a stale owner cannot publish.
+    pub async fn persist_claimed_batch(
         &self,
+        claim: &CollectionClaim,
         snapshots: &[CollectedSnapshot],
     ) -> Result<Vec<i64>, PostgresCollectorError> {
-        validate_batch(snapshots)?;
+        validate_claimed_batch(claim, snapshots)?;
         let mut client = self
             .client
             .acquire()
@@ -310,8 +389,17 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         let mut snapshot_ids = Vec::with_capacity(snapshots.len());
         for snapshot in snapshots {
-            snapshot_ids.push(persist_in_transaction(&transaction, snapshot).await?);
+            snapshot_ids.push(persist_in_transaction(&transaction, claim, snapshot).await?);
         }
+        let completed = transaction
+            .query_one(
+                "SELECT daily_reporting.complete_report_collection_claim($1, $2, $3)",
+                &[&claim.id, &claim.generation, &claim.owner_id],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?
+            .get::<_, bool>(0);
+        require_claim_completed(completed)?;
         transaction
             .commit()
             .await
@@ -320,8 +408,41 @@ impl PostgresSnapshotWriter {
     }
 }
 
-fn validate_batch(snapshots: &[CollectedSnapshot]) -> Result<(), PostgresCollectorError> {
-    if snapshots.is_empty() {
+fn require_claim_completed(completed: bool) -> Result<(), PostgresCollectorError> {
+    completed
+        .then_some(())
+        .ok_or(PostgresCollectorError::ClaimLost)
+}
+
+fn validate_claimed_batch(
+    claim: &CollectionClaim,
+    snapshots: &[CollectedSnapshot],
+) -> Result<(), PostgresCollectorError> {
+    let sources = snapshots
+        .iter()
+        .map(|snapshot| snapshot.facts.source())
+        .collect::<BTreeSet<_>>();
+    if snapshots.len() != SnapshotSource::ALL.len()
+        || sources != SnapshotSource::ALL.into_iter().collect()
+        || snapshots.iter().any(|snapshot| {
+            snapshot.account_id != claim.account_id
+                || snapshot.marketplace != claim.marketplace
+                || snapshot.cutoff_at != claim.cutoff_at
+        })
+    {
+        Err(PostgresCollectorError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_owner_id(owner_id: &str) -> Result<(), PostgresCollectorError> {
+    if owner_id.is_empty()
+        || owner_id.len() > 64
+        || !owner_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
         Err(PostgresCollectorError::InvalidInput)
     } else {
         Ok(())
@@ -366,13 +487,14 @@ fn parse_marketplace(value: &str) -> Result<Marketplace, PostgresCollectorError>
 
 async fn persist_in_transaction(
     transaction: &Transaction<'_>,
+    claim: &CollectionClaim,
     snapshot: &CollectedSnapshot,
 ) -> Result<i64, PostgresCollectorError> {
     let payload = serde_json::to_vec(snapshot).map_err(|_| PostgresCollectorError::InvalidInput)?;
     let payload_sha256 = sha256(&payload);
     let row_count =
         i32::try_from(snapshot.facts.len()).map_err(|_| PostgresCollectorError::InvalidInput)?;
-    let snapshot_id = insert_snapshot(transaction, snapshot).await?;
+    let snapshot_id = insert_snapshot(transaction, claim, snapshot).await?;
     insert_facts(transaction, snapshot_id, &snapshot.facts).await?;
     let status = match snapshot.status {
         SnapshotStatus::Succeeded => "succeeded",
@@ -398,8 +520,21 @@ async fn persist_in_transaction(
     Ok(snapshot_id)
 }
 
+fn map_snapshot_insert_error(error: tokio_postgres::Error) -> PostgresCollectorError {
+    classify_snapshot_insert_code(error.code())
+}
+
+fn classify_snapshot_insert_code(code: Option<&SqlState>) -> PostgresCollectorError {
+    if code == Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE) {
+        PostgresCollectorError::ClaimLost
+    } else {
+        PostgresCollectorError::Unavailable
+    }
+}
+
 async fn insert_snapshot(
     transaction: &Transaction<'_>,
+    claim: &CollectionClaim,
     snapshot: &CollectedSnapshot,
 ) -> Result<i64, PostgresCollectorError> {
     let marketplace = marketplace_name(snapshot.marketplace);
@@ -413,8 +548,8 @@ async fn insert_snapshot(
         .query_opt(
             "INSERT INTO daily_reporting.source_snapshots \
                 (account_id, marketplace, source, cutoff_at, source_as_of, \
-                 period_start, period_end, collector_version) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 period_start, period_end, collector_version, claim_id, claim_generation) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
              ON CONFLICT (account_id, marketplace, source, cutoff_at) DO NOTHING \
              RETURNING id",
             &[
@@ -426,10 +561,12 @@ async fn insert_snapshot(
                 &snapshot.period_start,
                 &snapshot.period_end,
                 &snapshot.collector_version,
+                &claim.id,
+                &claim.generation,
             ],
         )
         .await
-        .map_err(|_| PostgresCollectorError::Unavailable)?;
+        .map_err(map_snapshot_insert_error)?;
     row.map(|row| row.get(0))
         .ok_or(PostgresCollectorError::Conflict)
 }
@@ -791,10 +928,41 @@ mod tests {
     }
 
     #[test]
-    fn empty_batch_fails_before_database_access() {
+    fn claimed_batch_requires_the_complete_exact_identity() {
+        let claim = CollectionClaim {
+            id: 1,
+            generation: 1,
+            account_id: "pilot".to_owned(),
+            marketplace: Marketplace::Ozon,
+            cutoff_at: cutoff(),
+            owner_id: "test-owner".to_owned(),
+            lease_until: cutoff() + Duration::minutes(15),
+        };
         assert_eq!(
-            validate_batch(&[]),
+            validate_claimed_batch(&claim, &[]),
             Err(PostgresCollectorError::InvalidInput)
+        );
+        assert_eq!(
+            validate_owner_id("bad owner"),
+            Err(PostgresCollectorError::InvalidInput)
+        );
+        assert_eq!(
+            validate_owner_id(&"a".repeat(65)),
+            Err(PostgresCollectorError::InvalidInput)
+        );
+        assert!(validate_owner_id("collector:1-2").is_ok());
+        assert_eq!(
+            classify_snapshot_insert_code(Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)),
+            PostgresCollectorError::ClaimLost
+        );
+        assert_eq!(
+            classify_snapshot_insert_code(None),
+            PostgresCollectorError::Unavailable
+        );
+        assert_eq!(require_claim_completed(true), Ok(()));
+        assert_eq!(
+            require_claim_completed(false),
+            Err(PostgresCollectorError::ClaimLost)
         );
     }
 

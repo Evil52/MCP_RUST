@@ -4,11 +4,13 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, NaiveDate, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind,
+    collector_plan::CollectionTarget,
     collector_service::{ReportCollectorConfig, ReportCollectorMode},
     ozon_performance_source::{OzonPerformanceReportSource, PerformanceClientReportTransport},
     ozon_source::{OzonClientReportTransport, collect_complete_snapshots},
     postgres_collector::PostgresSnapshotWriter,
     report_cutoff, reporting_interval,
+    snapshot::Marketplace,
     wb_source::{WbClientReportTransport, WbReportSource},
 };
 use tokio::signal;
@@ -124,10 +126,16 @@ async fn run_wb_dry_run(
         "wb-dry-run refuses an enabled daily report policy"
     );
     let (period_start, period_end, cutoff_at) = morning_report_window(date, Utc::now())?;
-    let account = config.wb_dry_run_account(account_id)?;
-    let client = config.wb_dry_run_client()?;
-    let source = WbReportSource::new(WbClientReportTransport::new(client, account));
-    let snapshot_ids = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
+    let target = dry_run_target(config, account_id, Marketplace::Wildberries)?;
+    let owner_id = claim_owner("wb");
+    let claim = writer
+        .claim_target(&target, cutoff_at, &owner_id)
+        .await?
+        .context("WB dry-run target is already claimed or complete")?;
+    let outcome = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
+        let account = config.wb_dry_run_account(account_id)?;
+        let client = config.wb_dry_run_client()?;
+        let source = WbReportSource::new(WbClientReportTransport::new(client, account));
         let facts = source
             .collect(date)
             .await
@@ -144,19 +152,12 @@ async fn run_wb_dry_run(
             )
             .map_err(|_| anyhow::anyhow!("invalid_wb_snapshot_input"))?;
         writer
-            .persist_batch(&snapshots)
+            .persist_claimed_batch(&claim, &snapshots)
             .await
             .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
     })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "WB dry-run failed (collection_deadline); no partial report snapshots were published"
-        )
-    })?
-    .map_err(|error| {
-        anyhow::anyhow!("WB dry-run failed ({error:#}); no partial report snapshots were published")
-    })?;
+    .await;
+    let snapshot_ids = finish_dry_run(writer, &claim, "WB", outcome).await?;
     tracing::info!(
         account_id,
         snapshots = snapshot_ids.len(),
@@ -180,15 +181,21 @@ async fn run_ozon_dry_run(
         "ozon-dry-run refuses an enabled daily report policy"
     );
     let (period_start, period_end, cutoff_at) = morning_report_window(date, Utc::now())?;
-    let store = config.ozon_dry_run_store(account_id)?;
-    let client = config.ozon_dry_run_client()?;
-    let performance = config.ozon_dry_run_performance_client()?;
-    let performance_store = store.clone();
-    let transport = OzonClientReportTransport::new(client, store);
-    let performance_source = OzonPerformanceReportSource::new(
-        PerformanceClientReportTransport::new(performance, performance_store),
-    );
-    let snapshot_ids = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
+    let target = dry_run_target(config, account_id, Marketplace::Ozon)?;
+    let owner_id = claim_owner("ozon");
+    let claim = writer
+        .claim_target(&target, cutoff_at, &owner_id)
+        .await?
+        .context("Ozon dry-run target is already claimed or complete")?;
+    let outcome = timeout(REPORT_DRY_RUN_TOTAL_DEADLINE, async {
+        let store = config.ozon_dry_run_store(account_id)?;
+        let client = config.ozon_dry_run_client()?;
+        let performance = config.ozon_dry_run_performance_client()?;
+        let performance_store = store.clone();
+        let transport = OzonClientReportTransport::new(client, store);
+        let performance_source = OzonPerformanceReportSource::new(
+            PerformanceClientReportTransport::new(performance, performance_store),
+        );
         let advertising = performance_source
             .collect(date)
             .await
@@ -206,27 +213,62 @@ async fn run_ozon_dry_run(
         .await
         .map_err(anyhow::Error::from)?;
         writer
-            .persist_batch(&snapshots)
+            .persist_claimed_batch(&claim, &snapshots)
             .await
             .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
     })
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "Ozon dry-run failed (collection_deadline); no partial report snapshots were published"
-        )
-    })?
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "Ozon dry-run failed ({error:#}); no partial report snapshots were published"
-        )
-    })?;
+    .await;
+    let snapshot_ids = finish_dry_run(writer, &claim, "Ozon", outcome).await?;
     tracing::info!(
         account_id,
         snapshots = snapshot_ids.len(),
         "Ozon dry-run completed and atomically published its complete seller snapshot set"
     );
     Ok(())
+}
+
+fn dry_run_target(
+    config: &ReportCollectorConfig,
+    account_id: &str,
+    marketplace: Marketplace,
+) -> Result<CollectionTarget> {
+    config
+        .collection_plan()
+        .iter()
+        .find(|target| target.account_id == account_id && target.marketplace == marketplace)
+        .cloned()
+        .context("dry-run account is outside the validated collection plan")
+}
+
+fn claim_owner(marketplace: &str) -> String {
+    format!(
+        "dry-run-{marketplace}-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_micros()
+    )
+}
+
+async fn finish_dry_run<T>(
+    writer: &PostgresSnapshotWriter,
+    claim: &mcp_ozon::reporting::postgres_collector::CollectionClaim,
+    marketplace: &str,
+    outcome: Result<Result<T>, tokio::time::error::Elapsed>,
+) -> Result<T> {
+    match outcome {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            let _ = writer.release_claim(claim).await;
+            Err(anyhow::anyhow!(
+                "{marketplace} dry-run failed ({error:#}); no partial report snapshots were published"
+            ))
+        }
+        Err(_) => {
+            let _ = writer.release_claim(claim).await;
+            Err(anyhow::anyhow!(
+                "{marketplace} dry-run failed (collection_deadline); no partial report snapshots were published"
+            ))
+        }
+    }
 }
 
 fn morning_report_window(

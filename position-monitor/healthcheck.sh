@@ -43,6 +43,7 @@ SELECT
     AND to_regclass('daily_reporting.advertising_facts') IS NOT NULL
     AND to_regclass('daily_reporting.stock_facts') IS NOT NULL
     AND to_regclass('daily_reporting.price_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.collection_claims') IS NOT NULL
     AND to_regclass('daily_reporting.published_source_snapshots') IS NOT NULL
     AND to_regclass('daily_reporting.published_sales_facts') IS NOT NULL
     AND to_regclass('daily_reporting.published_advertising_facts') IS NOT NULL
@@ -86,6 +87,24 @@ SELECT
     AND to_regprocedure(
         'daily_reporting.reject_generation_attempt_mutation()'
     ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.claim_report_collection(text,text,timestamp with time zone,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.release_report_collection_claim(bigint,bigint,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.complete_report_collection_claim(bigint,bigint,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.require_active_collection_claim()'
+    ) IS NOT NULL
+    AND EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'source_snapshots_require_active_collection_claim'
+          AND NOT tgisinternal
+    )
     AND (
         SELECT count(*) = 6
         FROM pg_trigger
@@ -507,6 +526,30 @@ SELECT
     )
     AND has_table_privilege(
         'report_collector', 'daily_reporting.sales_facts', 'INSERT'
+    )
+    AND NOT has_table_privilege(
+        'report_collector', 'daily_reporting.collection_claims',
+        'SELECT,INSERT,UPDATE,DELETE'
+    )
+    AND has_function_privilege(
+        'report_collector',
+        'daily_reporting.claim_report_collection(text,text,timestamp with time zone,text)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_collector',
+        'daily_reporting.release_report_collection_claim(bigint,bigint,text)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_collector',
+        'daily_reporting.complete_report_collection_claim(bigint,bigint,text)',
+        'EXECUTE'
+    )
+    AND NOT has_function_privilege(
+        'report_worker',
+        'daily_reporting.claim_report_collection(text,text,timestamp with time zone,text)',
+        'EXECUTE'
     )
     AND NOT has_table_privilege(
         'report_collector', 'daily_reporting.delivery_batches', 'SELECT'

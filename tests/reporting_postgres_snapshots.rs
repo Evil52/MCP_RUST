@@ -40,6 +40,19 @@ fn timestamp(value: &str) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
+fn collection_target(account_id: &str, marketplace: Marketplace) -> CollectionTarget {
+    CollectionTarget {
+        account_id: account_id.to_owned(),
+        marketplace,
+        sources: [
+            SnapshotSource::Sales,
+            SnapshotSource::Advertising,
+            SnapshotSource::Stocks,
+            SnapshotSource::Prices,
+        ],
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collected(
     account_id: &str,
@@ -113,6 +126,20 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         .await
         .unwrap();
     let account_id = format!("snapshot_integration_{}", std::process::id());
+    let target = collection_target(&account_id, Marketplace::Ozon);
+    let claim = writer
+        .claim_target(&target, cutoff(), "manifest-owner")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(claim.lease_until() > Utc::now());
+    assert!(
+        writer
+            .claim_target(&target, cutoff(), "competing-owner")
+            .await
+            .unwrap()
+            .is_none()
+    );
     let sales = collected(
         &account_id,
         timestamp("2098-08-16T02:30:00Z"),
@@ -128,112 +155,116 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
             returned_units: Some(0),
         }]),
     );
-    writer.persist(&sales).await.unwrap();
-    assert_eq!(
-        writer.persist(&sales).await,
-        Err(PostgresCollectorError::Conflict)
+    let advertising = collected(
+        &account_id,
+        timestamp("2098-08-16T02:00:00Z"),
+        timestamp("2098-08-15T00:00:00Z"),
+        timestamp("2098-08-16T00:00:00Z"),
+        true,
+        CollectedFacts::Advertising(vec![CollectedAdvertisingFact {
+            business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+            campaign_id: 35751912,
+            sku: 3411079879,
+            impressions: 1000,
+            clicks: 20,
+            spend_minor: 12000,
+            attributed_orders: 2,
+            attributed_revenue_minor: 135000,
+        }]),
     );
-
-    let rollback_account = format!("snapshot_batch_{}", std::process::id());
-    let batch_stock = collected(
-        &rollback_account,
+    let stocks = collected(
+        &account_id,
         timestamp("2098-08-16T02:45:00Z"),
         timestamp("2098-08-16T02:45:00Z"),
         timestamp("2098-08-16T02:45:00Z"),
         false,
-        CollectedFacts::Stocks(Vec::new()),
+        CollectedFacts::Stocks(vec![CollectedStockFact {
+            sku: 3411079879,
+            warehouse_id: "fbo-msk".to_owned(),
+            sellable_units: 19,
+        }]),
     );
-    assert_eq!(
-        writer
-            .persist_batch(&[batch_stock.clone(), batch_stock])
-            .await,
-        Err(PostgresCollectorError::Conflict)
+    let prices = collected(
+        &account_id,
+        timestamp("2098-08-16T02:40:00Z"),
+        timestamp("2098-08-16T02:40:00Z"),
+        timestamp("2098-08-16T02:40:00Z"),
+        false,
+        CollectedFacts::Prices(vec![CollectedPriceFact {
+            sku: 3411079879,
+            price_minor: 67500,
+            old_price_minor: Some(70200),
+        }]),
     );
-    let (rollback_client, rollback_connection) = collector_config
-        .connect(tokio_postgres::NoTls)
+    let snapshot_ids = writer
+        .persist_claimed_batch(&claim, &[sales, advertising, stocks, prices])
         .await
         .unwrap();
-    tokio::spawn(rollback_connection);
-    assert_eq!(
-        rollback_client
-            .query_one(
-                "SELECT count(*) FROM daily_reporting.source_snapshots WHERE account_id = $1",
-                &[&rollback_account],
-            )
+    assert_eq!(snapshot_ids.len(), 4);
+    assert!(
+        writer
+            .claim_target(&target, cutoff(), "after-completion")
             .await
             .unwrap()
-            .get::<_, i64>(0),
-        0
+            .is_none()
     );
-    writer
-        .persist(&collected(
-            &account_id,
-            timestamp("2098-08-16T02:00:00Z"),
+
+    let rollback_account = format!("snapshot_batch_{}", std::process::id());
+    let rollback_target = collection_target(&rollback_account, Marketplace::Ozon);
+    let released_claim = writer
+        .claim_target(&rollback_target, cutoff(), "release-owner")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(writer.release_claim(&released_claim).await.unwrap());
+    assert!(!writer.release_claim(&released_claim).await.unwrap());
+    let replacement_claim = writer
+        .claim_target(&rollback_target, cutoff(), "replacement-owner")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(replacement_claim.lease_until() > Utc::now());
+    let stale_batch = [
+        collected(
+            &rollback_account,
+            timestamp("2098-08-16T02:30:00Z"),
             timestamp("2098-08-15T00:00:00Z"),
             timestamp("2098-08-16T00:00:00Z"),
-            true,
-            CollectedFacts::Advertising(vec![CollectedAdvertisingFact {
-                business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
-                campaign_id: 35751912,
-                sku: 3411079879,
-                impressions: 1000,
-                clicks: 20,
-                spend_minor: 12000,
-                attributed_orders: 2,
-                attributed_revenue_minor: 135000,
-            }]),
-        ))
-        .await
-        .unwrap();
-    let wb_as_of = timestamp("2098-08-16T02:35:00Z");
-    writer
-        .persist(
-            &CollectedSnapshot::new(
-                format!("writer_wb_{}", std::process::id()),
-                Marketplace::Wildberries,
-                cutoff(),
-                wb_as_of,
-                wb_as_of,
-                wb_as_of,
-                SnapshotStatus::Succeeded,
-                true,
-                "integration-test".to_owned(),
-                CollectedFacts::Prices(Vec::new()),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    writer
-        .persist(&collected(
-            &account_id,
+            false,
+            CollectedFacts::Sales(Vec::new()),
+        ),
+        collected(
+            &rollback_account,
+            timestamp("2098-08-16T02:30:00Z"),
+            timestamp("2098-08-15T00:00:00Z"),
+            timestamp("2098-08-16T00:00:00Z"),
+            false,
+            CollectedFacts::Advertising(Vec::new()),
+        ),
+        collected(
+            &rollback_account,
             timestamp("2098-08-16T02:45:00Z"),
             timestamp("2098-08-16T02:45:00Z"),
             timestamp("2098-08-16T02:45:00Z"),
             false,
-            CollectedFacts::Stocks(vec![CollectedStockFact {
-                sku: 3411079879,
-                warehouse_id: "fbo-msk".to_owned(),
-                sellable_units: 19,
-            }]),
-        ))
-        .await
-        .unwrap();
-    writer
-        .persist(&collected(
-            &account_id,
+            CollectedFacts::Stocks(Vec::new()),
+        ),
+        collected(
+            &rollback_account,
             timestamp("2098-08-16T02:40:00Z"),
             timestamp("2098-08-16T02:40:00Z"),
             timestamp("2098-08-16T02:40:00Z"),
             false,
-            CollectedFacts::Prices(vec![CollectedPriceFact {
-                sku: 3411079879,
-                price_minor: 67500,
-                old_price_minor: Some(70200),
-            }]),
-        ))
-        .await
-        .unwrap();
+            CollectedFacts::Prices(Vec::new()),
+        ),
+    ];
+    assert_eq!(
+        writer
+            .persist_claimed_batch(&released_claim, &stale_batch)
+            .await,
+        Err(PostgresCollectorError::ClaimLost)
+    );
+    assert!(writer.release_claim(&replacement_claim).await.unwrap());
 
     let repository = PostgresSnapshotRepository::connect(&worker_config)
         .await
@@ -360,16 +391,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
             .unwrap()
             .is_empty()
     );
-    let target = CollectionTarget {
-        account_id: account_id.clone(),
-        marketplace: Marketplace::Ozon,
-        sources: [
-            SnapshotSource::Sales,
-            SnapshotSource::Advertising,
-            SnapshotSource::Stocks,
-            SnapshotSource::Prices,
-        ],
-    };
+    let target = collection_target(&account_id, Marketplace::Ozon);
     assert!(
         writer
             .published_targets(
@@ -390,6 +412,15 @@ async fn complete_ozon_source_set_is_published_atomically() {
     .unwrap();
     assert_eq!(scheduled.targets, vec![target.clone()]);
     assert!(scheduled.occurrence.delayed);
+    let claim = writer
+        .claim_target(
+            &target,
+            timestamp("2098-08-17T03:00:00Z"),
+            "orchestrator-owner",
+        )
+        .await
+        .unwrap()
+        .unwrap();
     let snapshots = collect_complete_snapshots(
         &transport,
         vec![CollectedAdvertisingFact {
@@ -411,7 +442,10 @@ async fn complete_ozon_source_set_is_published_atomically() {
     )
     .await
     .unwrap();
-    let ids = writer.persist_batch(&snapshots).await.unwrap();
+    let ids = writer
+        .persist_claimed_batch(&claim, &snapshots)
+        .await
+        .unwrap();
     assert_eq!(ids.len(), 4);
     assert_eq!(
         writer
@@ -490,7 +524,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
     assert_eq!(preview.receipt.size_bytes, preview.bundle.xlsx.len());
     assert!(!preview.receipt.persisted);
     assert_eq!(
-        writer.persist_batch(&[]).await,
+        writer.persist_claimed_batch(&claim, &[]).await,
         Err(PostgresCollectorError::InvalidInput)
     );
 }
