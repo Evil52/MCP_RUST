@@ -622,6 +622,63 @@ async fn permanent_delivery_failures_keep_their_exact_audit_class() {
     }
 }
 
+#[tokio::test]
+async fn exhausted_retryable_failure_is_terminal_with_its_exact_class() {
+    let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
+        return;
+    };
+    let _guard = DB_TEST_LOCK.lock().await;
+    let config = Config::from_str(&url).unwrap();
+    let repository = PostgresOutboxRepository::connect(&config).await.unwrap();
+    let now = utc(12, 0) + Duration::days(30);
+    let recipient = format!("exhausted_{}", std::process::id());
+    let delivery = due_deliveries(now, &recipient, 1, &BTreeSet::new())
+        .unwrap()
+        .remove(0);
+    let batch_id = match repository.create_planned(delivery).await.unwrap() {
+        CreateOutcome::Inserted(id) => id,
+        CreateOutcome::Existing(_) => unreachable!(),
+    };
+    repository.start_generation(batch_id).await.unwrap();
+    repository
+        .mark_ready(
+            batch_id,
+            &artifact_for(&now.format("%Y/%m/%d").to_string(), &recipient),
+        )
+        .await
+        .unwrap();
+    let claim = repository
+        .claim_ready(now + Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    repository
+        .record_exhausted_failure(
+            &claim,
+            now + Duration::minutes(1),
+            now + Duration::minutes(2),
+            DeliveryErrorClass::RateLimited,
+        )
+        .await
+        .unwrap();
+
+    let client = repository_test_client(&config).await;
+    let row = client
+        .query_one(
+            "SELECT batch.status, batch.last_error_class, attempt.outcome, attempt.error_class \
+             FROM daily_reporting.delivery_batches AS batch \
+             JOIN daily_reporting.delivery_attempts AS attempt ON attempt.batch_id = batch.id \
+             WHERE batch.id = $1",
+            &[&batch_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, &str>(0), "permanent_failure");
+    assert_eq!(row.get::<_, &str>(1), "rate_limited");
+    assert_eq!(row.get::<_, &str>(2), "permanent");
+    assert_eq!(row.get::<_, &str>(3), "rate_limited");
+}
+
 const MAX_TEST_ATTEMPTS: u8 = 5;
 
 /// A batch whose generation keeps failing must stop occupying a candidate

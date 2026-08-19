@@ -701,6 +701,31 @@ impl PostgresOutboxRepository {
         .await
     }
 
+    /// Finishes a known pre-send transient failure when no bounded retry can
+    /// fit inside the delivery window. This is distinct from an ambiguous send:
+    /// the provider was not asked to accept a message, so the exact safe error
+    /// class can be committed as an exhausted permanent attempt.
+    pub async fn record_exhausted_failure(
+        &self,
+        claim: &ClaimedDelivery,
+        started_at: DateTime<Utc>,
+        finished_at: DateTime<Utc>,
+        class: DeliveryErrorClass,
+    ) -> Result<(), PostgresOutboxError> {
+        validate_attempt_times(started_at, finished_at)?;
+        let class = transient_error_text(class)?;
+        self.finish_attempt(
+            claim,
+            started_at,
+            finished_at,
+            AttemptOutcome::Permanent,
+            Some(class),
+            None,
+            None,
+        )
+        .await
+    }
+
     async fn transition(&self, batch_id: i64, sql: &str) -> Result<(), PostgresOutboxError> {
         let client = self
             .client

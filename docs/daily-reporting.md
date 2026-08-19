@@ -125,29 +125,34 @@ writer, bounded fact reader and report dataset are present. Manual bounded Ozon
 and WB adapters are available for policy-scoped canaries, but automatic
 marketplace collection remains disabled.
 No scheduler is enabled in the shipped Compose configuration, and no S3 writer
-or live mail delivery is wired. A provider-independent email envelope validates
+or live mail delivery is enabled. A provider-independent email envelope validates
 one server-resolved sender and recipient, one exact claimed report scope, and
 the bounded HTML/XLSX artifact without reading environment variables. A
-bounded Gmail API transport also exists, but is not connected to the worker:
+bounded Gmail API transport also exists:
 its production constructor has one fixed Gmail send endpoint, one fixed
 dedicated mail-egress proxy, disabled redirects and ambient proxies, a bounded
-  response and payload-free errors. A single-attempt delivery service now joins
-  the strict routing document, validated artifact, OAuth refresh and Gmail send
-  transports, but it is not connected to the outbox worker. It resolves and
-  validates the address and report scope before OAuth, refreshes once, sends
-  once and never retries internally. An explicit provider rate limit and an
-  OAuth failure before send may be scheduled later by a future bounded worker;
-  any timeout, transport failure, 5xx response, redirect, or malformed receipt
-  after the Gmail request starts remains an ambiguous `sending` outcome for
-  operator reconciliation. The outbox vocabulary reserves distinct permanent
-  audit classes for invalid artifact scope, invalid private routing and an
-  explicit provider rejection; these failures are never mislabeled as a
-  transient network problem. The OAuth transport accepts exactly the private files `client_id`,
+response and payload-free errors. A single-attempt delivery service joins
+the strict routing document, validated artifact, OAuth refresh and Gmail send
+transports. A non-looping outbox coordinator now claims at most one ready row,
+loads and verifies its immutable artifact, invokes that service once, and
+persists only a result whose safety is known. It resolves and
+validates the address and report scope before OAuth, refreshes once, sends
+once and never retries internally. An explicit provider rate limit and an
+OAuth failure before send may be scheduled by the coordinator within the
+report deadline; an exhausted safe retry becomes a terminal audited failure.
+Any timeout, transport failure, 5xx response, redirect, or malformed receipt
+after the Gmail request starts remains an ambiguous `sending` outcome for
+operator reconciliation. A failure to persist a post-claim outcome also leaves
+the row `sending`; it is never converted into an automatic resend. The outbox
+vocabulary reserves distinct permanent
+audit classes for invalid artifact scope, invalid private routing and an
+explicit provider rejection; these failures are never mislabeled as a
+transient network problem. The OAuth transport accepts exactly the private files `client_id`,
 `client_secret` and `refresh_token`, requires a private credential directory,
 uses only Google's fixed token endpoint through the same dedicated mail-egress
 proxy, and accepts only a bounded Bearer token for the minimal
 `https://www.googleapis.com/auth/gmail.send` scope. The production credential
-  mount, mail-egress deployment and outbox state-transition worker remain future
+mount, mail-egress deployment and runtime loop remain future
 release gates. A strict private routing-file loader now resolves the policy's
 symbolic sender and audience names to addresses. It requires one exact route
 per configured symbol, refuses extra/missing/duplicate routes and never lets a

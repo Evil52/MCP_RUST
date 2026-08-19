@@ -21,6 +21,7 @@ pub mod dataset;
 pub mod gmail;
 pub mod gmail_delivery;
 pub mod gmail_oauth;
+pub mod gmail_outbox;
 pub mod html;
 pub mod kpi;
 pub mod mail;

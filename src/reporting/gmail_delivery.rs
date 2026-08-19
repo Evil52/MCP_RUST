@@ -128,6 +128,14 @@ impl GmailDeliveryService {
         Self { oauth, messages }
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test_endpoints(token_url: String, send_url: String) -> Self {
+        Self {
+            oauth: Arc::new(GmailOAuthClient::for_test(token_url)),
+            messages: Arc::new(GmailClient::for_test(send_url)),
+        }
+    }
+
     /// Resolves, validates and sends one claimed report exactly once.
     pub async fn deliver(
         &self,

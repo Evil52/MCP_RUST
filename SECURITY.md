@@ -238,6 +238,8 @@ has broader vendor permissions.
   explicit Gmail rate limit, may be scheduled for a later bounded attempt. A timeout, transport
   failure, 5xx response, redirect or malformed receipt after send begins has an ambiguous outcome:
   keep the outbox row `sending`, never resend it automatically, and require operator reconciliation.
+  A database failure while recording any post-claim outcome follows the same rule: leave the claim
+  `sending` and never reinterpret it as a retryable pre-send failure.
   Persist local artifact/routing failures and explicit provider rejection under separate permanent
   error classes; never relabel them as a transient transport failure merely to make them retryable.
 - Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
