@@ -15,6 +15,7 @@ pub mod collector_orchestrator;
 pub mod collector_plan;
 pub mod collector_schedule;
 pub mod collector_service;
+pub mod credential_bootstrap;
 pub mod dataset;
 pub mod html;
 pub mod kpi;

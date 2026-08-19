@@ -218,5 +218,9 @@ has broader vendor permissions.
   access, including the mutating operations that use HTTP `GET`.
 - Confirm the runtime registry and `.env` are ignored regular files with mode `600`; never copy their
   contents into logs, screenshots, CI artifacts, or Git.
+- Generate a scheduled-report credential directory only with the policy-scoped
+  `report-collector bootstrap-credentials` command. Confirm the directory is mode `700`, each file
+  is mode `600`, file names exactly match the enabled policy's marketplace bindings, and neither the
+  source `.env` nor credential values appear in Compose environment, command output or artifacts.
 - Run OAuth provider integration tests only against disposable test identities. Run marketplace canaries
   sequentially, read-only, on isolated configuration, and never as part of routine CI.

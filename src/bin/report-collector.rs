@@ -8,6 +8,7 @@ use mcp_ozon::reporting::{
     collector_plan::CollectionTarget,
     collector_schedule::DueCollection,
     collector_service::{ReportCollectorConfig, ReportCollectorMode},
+    credential_bootstrap::bootstrap_report_credentials,
     ozon_performance_source::{OzonPerformanceReportSource, PerformanceClientReportTransport},
     ozon_source::{OzonClientReportTransport, collect_complete_snapshots},
     postgres_collector::PostgresSnapshotWriter,
@@ -15,6 +16,7 @@ use mcp_ozon::reporting::{
     snapshot::Marketplace,
     wb_source::{WbClientReportTransport, WbReportSource},
 };
+use std::path::PathBuf;
 use tokio::signal;
 use tokio::time::{Duration, MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
@@ -39,6 +41,21 @@ async fn main() -> Result<()> {
         .init();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let command = parse_command(&arguments)?;
+    if let Command::BootstrapCredentials {
+        registry,
+        policy,
+        dotenv,
+        output,
+    } = &command
+    {
+        let summary = bootstrap_report_credentials(registry, policy, dotenv, output)?;
+        tracing::info!(
+            accounts = summary.account_count,
+            credentials = summary.credential_count,
+            "created the policy-scoped report credential directory"
+        );
+        return Ok(());
+    }
     let config = ReportCollectorConfig::from_lookup(&mut |key| std::env::var(key).ok())?;
     let writer = PostgresSnapshotWriter::connect(config.database_config())
         .await
@@ -66,6 +83,9 @@ async fn main() -> Result<()> {
             run_scheduler_command(&config, &writer).await?;
             return Ok(());
         }
+        Command::BootstrapCredentials { .. } => {
+            unreachable!("bootstrap exits before runtime configuration")
+        }
         Command::ServeDisabled => {}
     }
     if config.mode() != ReportCollectorMode::Disabled || config.policy().enabled {
@@ -83,10 +103,22 @@ async fn main() -> Result<()> {
 enum Command {
     ServeDisabled,
     Healthcheck,
-    OzonDryRun { account_id: String, date: NaiveDate },
-    WbDryRun { account_id: String, date: NaiveDate },
+    OzonDryRun {
+        account_id: String,
+        date: NaiveDate,
+    },
+    WbDryRun {
+        account_id: String,
+        date: NaiveDate,
+    },
     CollectDue,
     RunScheduler,
+    BootstrapCredentials {
+        registry: PathBuf,
+        policy: PathBuf,
+        dotenv: PathBuf,
+        output: PathBuf,
+    },
 }
 
 fn parse_command(arguments: &[String]) -> Result<Command> {
@@ -95,6 +127,14 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         [argument] if argument == "healthcheck" => Ok(Command::Healthcheck),
         [argument] if argument == "collect-due" => Ok(Command::CollectDue),
         [argument] if argument == "run-scheduler" => Ok(Command::RunScheduler),
+        [command, registry, policy, dotenv, output] if command == "bootstrap-credentials" => {
+            Ok(Command::BootstrapCredentials {
+                registry: registry.into(),
+                policy: policy.into(),
+                dotenv: dotenv.into(),
+                output: output.into(),
+            })
+        }
         [command, account_id, date]
             if matches!(command.as_str(), "ozon-dry-run" | "wb-dry-run") =>
         {
@@ -122,7 +162,7 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         }
         _ => {
             bail!(
-                "usage: report-collector [healthcheck | collect-due | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> | wb-dry-run <account-id> <YYYY-MM-DD>]"
+                "usage: report-collector [healthcheck | collect-due | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> | wb-dry-run <account-id> <YYYY-MM-DD> | bootstrap-credentials <access.json> <policy.json> <source.env> <new-output-directory>]"
             )
         }
     }

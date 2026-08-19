@@ -259,6 +259,28 @@ files/profile. The overlay supplies `run-scheduler`; it does not enable the
 report worker or email delivery. Omitting any path, the profile, an enabled
 policy or a valid read-only credential directory fails closed.
 
+Create that directory with the bundled operator command rather than copying the
+whole runtime `.env`:
+
+```text
+cargo run --locked --bin report-collector -- \
+  bootstrap-credentials \
+  config/access.json \
+  config/daily-report-policy.json \
+  .env \
+  report-credentials
+```
+
+The destination must not already exist. The command accepts only strict
+`NAME=value` source lines, validates the enabled policy against the access
+registry and copies only marketplace credential names used by policy-selected
+accounts. It never loads values into the process environment, expands `$`
+references, follows symbolic links, copies unrelated variables, overwrites a
+directory or prints secret values. The new directory is mode `0700` and every
+credential file is mode `0600`. Re-running after a policy or key change means
+creating a different new directory, reviewing it by file names and count, then
+atomically switching the host bind; do not edit the mounted directory in place.
+
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every
 tick is bounded to 16 generation candidates; missed timer ticks are skipped,
