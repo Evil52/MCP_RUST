@@ -194,8 +194,11 @@ The shared collection scheduler contract is already deterministic: it opens
 only the `08:00–08:30` and `17:00–17:30` Asia/Yekaterinburg completion windows,
 returns the same immutable cutoff after a restart inside that window, and
 refuses to backdate current state after the window closes. It performs no I/O
-and is not wired to the disabled collector runtime yet. The later runtime must
-claim each account/cutoff idempotently in PostgreSQL before using this plan.
+and is not wired to the disabled collector runtime yet. A PostgreSQL-backed
+preflight now removes exact account/marketplace/cutoff targets that already
+have all four terminal published sources before credentials can be resolved.
+The later runtime must still claim each remaining account/cutoff idempotently
+in PostgreSQL before marketplace I/O.
 
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every

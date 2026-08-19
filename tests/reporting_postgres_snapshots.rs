@@ -3,6 +3,7 @@ use std::{collections::VecDeque, fs, future::Future, pin::Pin, str::FromStr, syn
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind,
+    collector_orchestrator::plan_due_collection,
     collector_plan::CollectionTarget,
     collector_service::ReportCollectorConfig,
     ozon_adapter::OzonReportRequest,
@@ -379,6 +380,16 @@ async fn complete_ozon_source_set_is_published_atomically() {
             .unwrap()
             .is_empty()
     );
+    let scheduled = plan_due_collection(
+        &writer,
+        timestamp("2098-08-17T03:05:00Z"),
+        std::slice::from_ref(&target),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(scheduled.targets, vec![target.clone()]);
+    assert!(scheduled.occurrence.delayed);
     let snapshots = collect_complete_snapshots(
         &transport,
         vec![CollectedAdvertisingFact {
@@ -425,6 +436,26 @@ async fn complete_ozon_source_set_is_published_atomically() {
             .await
             .unwrap()
             .is_empty()
+    );
+    assert!(
+        plan_due_collection(
+            &writer,
+            timestamp("2098-08-17T03:06:00Z"),
+            std::slice::from_ref(&target),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(
+        plan_due_collection(
+            &writer,
+            timestamp("2098-08-17T04:00:00Z"),
+            std::slice::from_ref(&target),
+        )
+        .await
+        .unwrap()
+        .is_none()
     );
     let worker_config = Config::from_str(&worker_url).unwrap();
     let repository = PostgresSnapshotRepository::connect(&worker_config)
