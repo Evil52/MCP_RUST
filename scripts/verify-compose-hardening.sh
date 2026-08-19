@@ -869,6 +869,10 @@ check_contains \
   "$project_dir/compose.reporting-canary.yaml" \
   "\${REPORT_COLLECTOR_CREDENTIAL_DIR_HOST:?REPORT_COLLECTOR_CREDENTIAL_DIR_HOST is required for reporting canary}"
 check_contains \
+  "reporting canary: runner never creates or recreates dependencies" \
+  "$project_dir/scripts/run-report-canary.sh" \
+  "run --rm --no-deps report-collector"
+check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
   "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"

@@ -304,7 +304,10 @@ uses the morning report occurrence and must start after its 08:00 EKB cutoff and
 no later than 08:30 EKB; outside that window it fails before marketplace I/O.
 Run Ozon and WB sequentially. A failed, timed-out or partial source set releases
 the lease and publishes no snapshot IDs. The canary policy must stay disabled;
-the enabled policy is reserved for the separately reviewed live overlay.
+the enabled policy is reserved for the separately reviewed live overlay. The
+base `position-db` and `ozon-egress` services must already be healthy. The runner
+uses `--no-deps`, so a canary never creates or recreates either dependency; an
+unavailable dependency makes the canary fail closed.
 
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every

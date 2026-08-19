@@ -56,5 +56,5 @@ exec docker compose --env-file .position.env \
   -f compose.position.yaml \
   -f compose.reporting-canary.yaml \
   --profile reporting-canary \
-  run --rm report-collector \
+  run --rm --no-deps report-collector \
   "${marketplace}-dry-run" "$account_id" "$business_date"
