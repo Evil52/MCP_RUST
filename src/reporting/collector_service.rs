@@ -159,7 +159,9 @@ impl ReportCollectorConfig {
                 (mode, policy.enabled, credential_directory.is_some()),
                 (ReportCollectorMode::Disabled, false, false)
                     | (ReportCollectorMode::OzonDryRun, false, false)
+                    | (ReportCollectorMode::OzonDryRun, false, true)
                     | (ReportCollectorMode::WbDryRun, false, false)
+                    | (ReportCollectorMode::WbDryRun, false, true)
                     | (ReportCollectorMode::Scheduled, true, true)
             ),
             "report collector mode, policy and credential directory are inconsistent"
@@ -206,7 +208,11 @@ impl ReportCollectorConfig {
             !self.policy.enabled,
             "Ozon dry-run credentials require a disabled daily report policy"
         );
-        self.resolve_ozon_claim(claim, lookup)
+        if let Some(directory) = &self.credential_directory {
+            self.resolve_ozon_claim(claim, &mut |name| directory.read(name))
+        } else {
+            self.resolve_ozon_claim(claim, lookup)
+        }
     }
 
     /// Resolves the exact Ozon account for an enabled scheduled run. The
@@ -314,7 +320,11 @@ impl ReportCollectorConfig {
             !self.policy.enabled,
             "WB dry-run credentials require a disabled daily report policy"
         );
-        self.resolve_wb_claim(claim, lookup)
+        if let Some(directory) = &self.credential_directory {
+            self.resolve_wb_claim(claim, &mut |name| directory.read(name))
+        } else {
+            self.resolve_wb_claim(claim, lookup)
+        }
     }
 
     /// Resolves the exact WB account for an enabled scheduled run. The database
@@ -690,6 +700,63 @@ mod tests {
             disabled
                 .resolve_wb_dry_run(&wb_claim, &mut no_secrets)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn dry_runs_can_resolve_only_the_claimed_account_from_a_credential_directory() {
+        let mixed_policy = file(
+            "directory-canary-policy",
+            r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]},{"actor_id":"wb","account_ids":["wb"]}]}]}"#,
+        );
+        let credential_directory = directory("canary-credentials");
+        for (name, value) in [
+            ("ID", "client-id".to_owned()),
+            ("KEY", "api-key".to_owned()),
+            ("PERF_ID", "performance-client-id".to_owned()),
+            ("PERF_SECRET", "performance-client-secret".to_owned()),
+            ("WB_TOKEN", personal_wb_token()),
+        ] {
+            fs::write(credential_directory.join(name), value).unwrap();
+        }
+
+        let mut values = entries();
+        values[2] = (POLICY_PATH_ENV, mixed_policy.display().to_string());
+        values.extend([
+            (MODE_ENV, "ozon_dry_run".to_owned()),
+            (
+                CREDENTIAL_DIRECTORY_ENV,
+                credential_directory.display().to_string(),
+            ),
+        ]);
+        let ozon = config(&values).unwrap();
+        let (seller, performance, store) = ozon
+            .resolve_ozon_dry_run(
+                &claim("ozon", super::super::snapshot::Marketplace::Ozon),
+                &mut unexpected_secret_lookup,
+            )
+            .unwrap();
+        assert!(seller.is_configured(&store) && performance.is_configured(&store));
+
+        values.retain(|(key, _)| *key != MODE_ENV);
+        values.push((MODE_ENV, "wb_dry_run".to_owned()));
+        let wb = config(&values).unwrap();
+        let (client, account) = wb
+            .resolve_wb_dry_run(
+                &claim("wb", super::super::snapshot::Marketplace::Wildberries),
+                &mut unexpected_secret_lookup,
+            )
+            .unwrap();
+        assert_eq!(account, "wb");
+        assert!(client.is_configured("wb"));
+
+        fs::remove_file(credential_directory.join("WB_TOKEN")).unwrap();
+        assert!(
+            wb.resolve_wb_dry_run(
+                &claim("wb", super::super::snapshot::Marketplace::Wildberries),
+                &mut unexpected_secret_lookup,
+            )
+            .is_err()
         );
     }
 

@@ -281,6 +281,31 @@ credential file is mode `0600`. Re-running after a policy or key change means
 creating a different new directory, reviewing it by file names and count, then
 atomically switching the host bind; do not edit the mounted directory in place.
 
+Before enabling the scheduler, run each pilot marketplace once through the
+operator-only canary overlay. It mounts the same credential directory read-only,
+but requires the disabled pilot policy and defaults to the local `healthcheck`
+command. Merely starting the profile therefore cannot contact a marketplace.
+Only `scripts/run-report-canary.sh` supplies an explicit single-account command;
+the script accepts no credential values and the collector reads only the claimed
+account's exact files after acquiring its PostgreSQL lease:
+
+```text
+MCP_ACCESS_CONFIG_HOST=/absolute/path/access.json \
+REPORT_COLLECTOR_CREDENTIAL_DIR_HOST=/absolute/path/report-credentials \
+./scripts/run-report-canary.sh ozon furnitura_dlya_doma 2026-08-18
+
+MCP_ACCESS_CONFIG_HOST=/absolute/path/access.json \
+REPORT_COLLECTOR_CREDENTIAL_DIR_HOST=/absolute/path/report-credentials \
+./scripts/run-report-canary.sh wb ip_domnyshev_wb 2026-08-18
+```
+
+The requested date is the business day being collected. A canary intentionally
+uses the morning report occurrence and must start after its 08:00 EKB cutoff and
+no later than 08:30 EKB; outside that window it fails before marketplace I/O.
+Run Ozon and WB sequentially. A failed, timed-out or partial source set releases
+the lease and publishes no snapshot IDs. The canary policy must stay disabled;
+the enabled policy is reserved for the separately reviewed live overlay.
+
 Dry-run scheduling additionally requires `REPORT_WORKER_MODE=dry_run` and an
 enabled validated policy. The shipped Compose value remains `disabled`. Every
 tick is bounded to 16 generation candidates; missed timer ticks are skipped,

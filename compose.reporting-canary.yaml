@@ -1,0 +1,34 @@
+name: mcp-ozon-position
+
+# Operator-only overlay for one manual read-only marketplace canary. Merely
+# starting the profile runs the local healthcheck command and performs no
+# marketplace request. The actual `ozon-dry-run` or `wb-dry-run` command must
+# be supplied explicitly with `docker compose run`.
+services:
+  report-collector:
+    profiles:
+      - reporting-canary
+    command:
+      - healthcheck
+    environment:
+      REPORT_COLLECTOR_MODE: ${REPORT_COLLECTOR_CANARY_MODE:?REPORT_COLLECTOR_CANARY_MODE must be ozon_dry_run or wb_dry_run}
+      REPORT_COLLECTOR_CREDENTIAL_DIR: /run/mcp-ozon/report-credentials
+    volumes:
+      - type: bind
+        source: ${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for reporting canary}
+        target: /etc/mcp-ozon/access.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DAILY_REPORT_CANARY_POLICY_HOST:?DAILY_REPORT_CANARY_POLICY_HOST is required for reporting canary}
+        target: /etc/mcp-ozon/daily-report-policy.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${REPORT_COLLECTOR_CREDENTIAL_DIR_HOST:?REPORT_COLLECTOR_CREDENTIAL_DIR_HOST is required for reporting canary}
+        target: /run/mcp-ozon/report-credentials
+        read_only: true
+        bind:
+          create_host_path: false

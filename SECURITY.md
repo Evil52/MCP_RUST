@@ -222,5 +222,9 @@ has broader vendor permissions.
   `report-collector bootstrap-credentials` command. Confirm the directory is mode `700`, each file
   is mode `600`, file names exactly match the enabled policy's marketplace bindings, and neither the
   source `.env` nor credential values appear in Compose environment, command output or artifacts.
+- Before enabling `compose.reporting-live.yaml`, run the Ozon and WB pilot accounts sequentially
+  through `scripts/run-report-canary.sh`. Require the disabled pilot policy, the explicit
+  `reporting-canary` profile, the read-only credential-directory mount, an acquired account lease,
+  an atomic complete snapshot set and zero credential values in environment, arguments or logs.
 - Run OAuth provider integration tests only against disposable test identities. Run marketplace canaries
   sequentially, read-only, on isolated configuration, and never as part of routine CI.

@@ -137,6 +137,24 @@ render_reporting_live_compose() {
       config --no-env-resolution --format json
 }
 
+render_reporting_canary_compose() {
+  local canary_policy="$scratch/daily-report-canary-policy.json"
+  local credential_directory="$scratch/report-canary-credentials"
+  printf '{}\n' >"$canary_policy"
+  mkdir "$credential_directory"
+  chmod 500 "$credential_directory"
+  MCP_ACCESS_CONFIG_HOST="$main_access" \
+    DAILY_REPORT_CANARY_POLICY_HOST="$canary_policy" \
+    REPORT_COLLECTOR_CREDENTIAL_DIR_HOST="$credential_directory" \
+    REPORT_COLLECTOR_CANARY_MODE=ozon_dry_run \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.position.yaml" \
+      -f "$project_dir/compose.reporting-canary.yaml" \
+      --profile reporting-canary \
+      config --no-env-resolution --format json
+}
+
 # The dollar-prefixed names below are jq variables supplied with `--arg`; the
 # single quotes deliberately prevent the shell from expanding them.
 # shellcheck disable=SC2016
@@ -555,6 +573,80 @@ verify_reporting_live() {
      and .networks.outbound.external == true'
 }
 
+verify_reporting_canary() {
+  local rendered="$1" service expected_database_url canary_policy credential_directory
+  service="$(jq -c '.services["report-collector"]' <<<"$rendered")"
+  expected_database_url='postgresql://report_collector:verify-only-report-collector-not-a-secret@position-db:5432/ozon_positions'
+  canary_policy="$scratch/daily-report-canary-policy.json"
+  credential_directory="$scratch/report-canary-credentials"
+
+  check "reporting canary: collector is inert unless an operator overrides the command" "$service" \
+    '.profiles == ["reporting-canary"]
+     and .command == ["healthcheck"]
+     and .image == "mcp-ozon-report-collector:local"'
+  check "reporting canary: no ingress, env file, Compose secret, or config exists" "$service" \
+    '((.ports // []) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)'
+  # shellcheck disable=SC2016
+  check "reporting canary: environment contains paths but no marketplace values" "$service" \
+    --arg database_url "$expected_database_url" \
+    '.environment == {
+       "REPORT_COLLECTOR_MODE": "ozon_dry_run",
+       "REPORT_COLLECTOR_DATABASE_URL": $database_url,
+       "REPORT_COLLECTOR_CREDENTIAL_DIR": "/run/mcp-ozon/report-credentials",
+       "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
+       "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
+       "RUST_LOG": "mcp_ozon::reporting=info"
+     }'
+  # shellcheck disable=SC2016
+  check "reporting canary: metadata and credential directory are exactly read-only" "$service" \
+    --arg access "$main_access" \
+    --arg policy "$canary_policy" \
+    --arg credentials "$credential_directory" \
+    '((.volumes // []) | map(del(.bind)) | sort_by(.target)) == [
+       {
+         "type": "bind", "source": $access,
+         "target": "/etc/mcp-ozon/access.json", "read_only": true
+       },
+       {
+         "type": "bind", "source": $policy,
+         "target": "/etc/mcp-ozon/daily-report-policy.json", "read_only": true
+       },
+       {
+         "type": "bind", "source": $credentials,
+         "target": "/run/mcp-ozon/report-credentials", "read_only": true
+       }
+     ]
+     and all((.volumes // [])[];
+       .bind == null or .bind == {} or .bind == {"create_host_path": false})'
+  check "reporting canary: network, privilege and resource bounds remain exact" "$service" \
+    '(.networks | keys | sort) == ["ozon-egress-internal", "position-internal"]
+     and .depends_on == {
+       "ozon-egress": {"condition": "service_healthy", "required": true},
+       "position-db": {"condition": "service_healthy", "required": true}
+     }
+     and .read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false
+     and .mem_limit == "134217728"
+     and .cpus == 0.25
+     and .pids_limit == 64
+     and .stop_grace_period == "10s"
+     and .restart == "unless-stopped"
+     and .logging == {
+       "driver": "json-file",
+       "options": {"max-file": "2", "max-size": "5m"}
+     }
+     and .healthcheck == {
+       "test": ["CMD", "/usr/local/bin/report-collector", "healthcheck"],
+       "timeout": "8s", "interval": "30s", "retries": 3,
+       "start_period": "10s"
+     }'
+}
+
 verify_ozon_egress() {
   local rendered="$1" service
   service="$(jq -c '.services["ozon-egress"]' <<<"$rendered")"
@@ -703,6 +795,7 @@ main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_position_compose)"
 reporting_live_rendered="$(render_reporting_live_compose)"
+reporting_canary_rendered="$(render_reporting_canary_compose)"
 control_rendered="$(render_control_compose)"
 
 # Rendering uses isolated, existing placeholder files so the result is the
@@ -764,6 +857,18 @@ check_contains \
   "$project_dir/compose.reporting-live.yaml" \
   "\${REPORT_COLLECTOR_CREDENTIAL_DIR_HOST:?REPORT_COLLECTOR_CREDENTIAL_DIR_HOST is required for live reporting}"
 check_contains \
+  "reporting canary: access registry has no fallback path" \
+  "$project_dir/compose.reporting-canary.yaml" \
+  "\${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for reporting canary}"
+check_contains \
+  "reporting canary: disabled policy has no fallback path" \
+  "$project_dir/compose.reporting-canary.yaml" \
+  "\${DAILY_REPORT_CANARY_POLICY_HOST:?DAILY_REPORT_CANARY_POLICY_HOST is required for reporting canary}"
+check_contains \
+  "reporting canary: credential directory has no fallback path" \
+  "$project_dir/compose.reporting-canary.yaml" \
+  "\${REPORT_COLLECTOR_CREDENTIAL_DIR_HOST:?REPORT_COLLECTOR_CREDENTIAL_DIR_HOST is required for reporting canary}"
+check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
   "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"
@@ -810,6 +915,7 @@ verify_reporting_service \
   "201326592" \
   "0.5"
 verify_reporting_live "$reporting_live_rendered"
+verify_reporting_canary "$reporting_canary_rendered"
 verify_control "$control_rendered"
 
 if (( failures > 0 )); then
@@ -817,4 +923,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, Control, position database, Ozon read-API egress proxy, disabled collector/reporting runtimes, and the explicit live-reporting overlay: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."
+echo "Compose hardening verified for main, canary, Control, position database, Ozon read-API egress proxy, disabled collector/reporting runtimes, and the explicit reporting canary/live overlays: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."
