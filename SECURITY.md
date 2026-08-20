@@ -24,12 +24,14 @@ The following properties are treated as release gates:
    `WbClient::request` enforce exact allowlists before credentials are selected and before any
    socket is opened. Chat input cannot supply a host, HTTP method, or path. Redirects and ambient
    HTTP proxies are disabled.
-2. Production Ozon Seller egress uses 34 stable reporting/list/info paths, including the three
+2. Production Ozon Seller egress uses 35 stable reporting/list/info paths, including the three
    finance-accrual reads promoted after canary validation. Posting lists use only
    `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list`; the superseded
    `/v2/posting/fbo/list` and `/v3/posting/fbs/list` are denied. Reviews use only
    `POST /v2/review/list`; the superseded `/v1/review/list` is denied. Warehouse discovery uses
    `POST /v2/warehouse/list` with a bounded limit and optional cursor/warehouse-ID filters.
+   Product picture diagnostics use canary-validated `POST /v2/product/pictures/info`; the
+   normalized composite tool bounds the page to 100 products and redacts image URLs.
    Ozon Performance business
    egress is fixed to exactly `GET /api/client/campaign`,
    `GET /api/client/statistics/daily/json`, `GET /api/client/statistics/expense/json`,
@@ -195,9 +197,9 @@ has broader vendor permissions.
 
 - Run `./scripts/local-ci.sh`, require 100% line coverage, Clippy/rustdoc warnings as errors,
   RustSec/cargo-deny, CodeQL, dependency review, secret scanning, and the hardened-container job.
-- Verify the production tool list contains exactly 68 stable tools, no preview tools, and every
+- Verify the production tool list contains exactly 70 stable tools, no preview tools, and every
   tool advertises `readOnlyHint=true`, `destructiveHint=false`, and the expected OAuth/noauth policy.
-- Verify the Ozon Seller allowlist contains exactly 34 stable paths. Assert that
+- Verify the Ozon Seller allowlist contains exactly 35 stable paths. Assert that
   `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list` are admitted while their superseded
   list versions fail locally without credentials or network access.
 - Verify the Ozon Performance namespace contains exactly `ozon_performance_campaigns`,

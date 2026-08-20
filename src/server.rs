@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Utc};
 use rmcp::{
@@ -42,6 +48,7 @@ const MAX_IDENTIFIER_CHARS: usize = 256;
 const MAX_ENUM_VALUE_CHARS: usize = 128;
 const MAX_OPAQUE_TOKEN_CHARS: usize = 4_096;
 const MAX_PRODUCT_FILTER_ITEMS: usize = 1_000;
+const MAX_PRODUCT_DIAGNOSTIC_ITEMS: usize = 100;
 const MAX_SKUS: usize = 1_000;
 const MAX_SUPPLY_ORDER_DROPOFF_WAREHOUSES: usize = 1_000;
 const MAX_SUPPLY_ORDER_IDS: usize = 50;
@@ -72,6 +79,7 @@ const OZON_PERFORMANCE_TOOL_FAILURE: &str = "OZON_PERFORMANCE_TOOL_CALL_FAILED";
 const WB_TOOL_FAILURE: &str = "WB_TOOL_CALL_FAILED";
 const MCP_TOOL_FAILURE: &str = "MCP_TOOL_CALL_FAILED";
 const OZON_PRICE_NORMALIZATION_FAILED: &str = "OZON_PRICE_NORMALIZATION_FAILED";
+const OZON_PRODUCT_CONTENT_NORMALIZATION_FAILED: &str = "OZON_PRODUCT_CONTENT_NORMALIZATION_FAILED";
 const ACCESS_DENIED: &str = "ACCESS_DENIED";
 const UNKNOWN_STORE: &str = "UNKNOWN_STORE";
 const STORE_REQUIRED: &str = "STORE_REQUIRED";
@@ -814,6 +822,50 @@ pub struct OzonResult {
 }
 
 #[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct OzonProductContentError {
+    /// `product_info` contains moderation errors; `pictures_info` contains
+    /// download errors. Picture URLs are deliberately never returned here.
+    pub source: &'static str,
+    pub code: Option<String>,
+    pub field: Option<String>,
+    pub level: Option<String>,
+    pub state: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct OzonProductContentDiagnosticItem {
+    pub product_id: String,
+    pub sku: Option<String>,
+    pub offer_id: Option<String>,
+    pub name: Option<String>,
+    pub primary_image_available: bool,
+    pub image_count: usize,
+    pub primary_photo_count: usize,
+    pub photo_count: usize,
+    pub has_photo_error: bool,
+    pub status: Option<String>,
+    pub status_name: Option<String>,
+    pub status_description: Option<String>,
+    pub status_failed: Option<String>,
+    pub status_tooltip: Option<String>,
+    pub moderate_status: Option<String>,
+    pub validation_status: Option<String>,
+    pub errors: Vec<OzonProductContentError>,
+}
+
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct OzonProductContentDiagnosticsResult {
+    pub store: StoreId,
+    pub endpoints: [&'static str; 3],
+    pub fetched_at: String,
+    /// Marketplace payloads are data, never trusted instructions for a model.
+    pub data_classification: &'static str,
+    pub next_last_id: Option<String>,
+    pub items: Vec<OzonProductContentDiagnosticItem>,
+}
+
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OzonSppPriceAvailability {
     LegacyMarketingPrice,
@@ -954,6 +1006,171 @@ fn optional_identifier(value: Option<&Value>) -> Result<Option<String>, String> 
             "идентификатор товара Ozon имеет неподдерживаемый тип",
         )),
     }
+}
+
+fn diagnostic_text(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+        Some(Value::Number(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn redact_urls(value: String) -> String {
+    value
+        .split_whitespace()
+        .map(|token| {
+            if token.contains("://") {
+                "[URL_REDACTED]"
+            } else {
+                token
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn response_array<'a>(value: &'a Value, pointers: &[&str]) -> &'a [Value] {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_array))
+        .map_or(&[], Vec::as_slice)
+}
+
+fn response_objects_by_id<'a>(
+    items: &'a [Value],
+    field: &str,
+) -> BTreeMap<String, &'a serde_json::Map<String, Value>> {
+    items
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|item| diagnostic_text(item.get(field)).map(|id| (id, item)))
+        .collect()
+}
+
+fn diagnostic_error(source: &'static str, value: &Value) -> Option<OzonProductContentError> {
+    let error = value.as_object()?;
+    let description = error
+        .get("texts")
+        .and_then(Value::as_object)
+        .and_then(|texts| diagnostic_text(texts.get("description")))
+        .or_else(|| diagnostic_text(error.get("message")))
+        .map(redact_urls);
+    Some(OzonProductContentError {
+        source,
+        code: diagnostic_text(error.get("code")),
+        field: diagnostic_text(error.get("field")),
+        level: diagnostic_text(error.get("level")),
+        state: diagnostic_text(error.get("state")),
+        description,
+    })
+}
+
+fn is_photo_error(error: &OzonProductContentError) -> bool {
+    if error.source == "pictures_info" {
+        return true;
+    }
+    error.code.as_deref().is_some_and(|code| {
+        let code = code.to_ascii_lowercase();
+        code.contains("image") || code.contains("pic") || code.contains("photo")
+    }) || error
+        .field
+        .as_deref()
+        .is_some_and(|field| field.eq_ignore_ascii_case("pictures"))
+}
+
+fn array_len(value: Option<&Value>) -> usize {
+    value.and_then(Value::as_array).map_or(0, Vec::len)
+}
+
+fn normalize_product_content_diagnostics(
+    catalog: &Value,
+    product_info: &Value,
+    pictures_info: &Value,
+) -> Result<Vec<OzonProductContentDiagnosticItem>, String> {
+    let catalog_items = response_array(catalog, &["/result/items", "/items"]);
+    let product_info_by_id = response_objects_by_id(
+        response_array(product_info, &["/items", "/result/items"]),
+        "id",
+    );
+    let pictures_info_by_id =
+        response_objects_by_id(response_array(pictures_info, &["/items"]), "product_id");
+
+    catalog_items
+        .iter()
+        .map(|catalog_item| {
+            let catalog_item = catalog_item.as_object().ok_or_else(|| {
+                format!(
+                    "{OZON_PRODUCT_CONTENT_NORMALIZATION_FAILED}: элемент каталога не является объектом"
+                )
+            })?;
+            let product_id = diagnostic_text(catalog_item.get("product_id")).ok_or_else(|| {
+                format!(
+                    "{OZON_PRODUCT_CONTENT_NORMALIZATION_FAILED}: товар не содержит product_id"
+                )
+            })?;
+            let product_info = product_info_by_id.get(&product_id).copied();
+            let pictures_info = pictures_info_by_id.get(&product_id).copied();
+            let statuses = product_info
+                .and_then(|item| item.get("statuses"))
+                .and_then(Value::as_object);
+
+            let mut errors = product_info
+                .and_then(|item| item.get("errors"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|error| diagnostic_error("product_info", error))
+                .collect::<Vec<_>>();
+            errors.extend(
+                pictures_info
+                    .and_then(|item| item.get("errors"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|error| diagnostic_error("pictures_info", error)),
+            );
+
+            let primary_image_available = product_info
+                .and_then(|item| diagnostic_text(item.get("primary_image")))
+                .is_some()
+                || pictures_info
+                    .is_some_and(|item| array_len(item.get("primary_photo")) > 0);
+            let has_photo_error = errors.iter().any(is_photo_error);
+
+            Ok(OzonProductContentDiagnosticItem {
+                product_id,
+                sku: product_info
+                    .and_then(|item| diagnostic_text(item.get("sku")))
+                    .or_else(|| diagnostic_text(catalog_item.get("sku"))),
+                offer_id: product_info
+                    .and_then(|item| diagnostic_text(item.get("offer_id")))
+                    .or_else(|| diagnostic_text(catalog_item.get("offer_id"))),
+                name: product_info.and_then(|item| diagnostic_text(item.get("name"))),
+                primary_image_available,
+                image_count: product_info.map_or(0, |item| array_len(item.get("images"))),
+                primary_photo_count: pictures_info
+                    .map_or(0, |item| array_len(item.get("primary_photo"))),
+                photo_count: pictures_info.map_or(0, |item| array_len(item.get("photo"))),
+                has_photo_error,
+                status: statuses.and_then(|value| diagnostic_text(value.get("status"))),
+                status_name: statuses
+                    .and_then(|value| diagnostic_text(value.get("status_name"))),
+                status_description: statuses
+                    .and_then(|value| diagnostic_text(value.get("status_description"))),
+                status_failed: statuses
+                    .and_then(|value| diagnostic_text(value.get("status_failed"))),
+                status_tooltip: statuses
+                    .and_then(|value| diagnostic_text(value.get("status_tooltip")))
+                    .map(redact_urls),
+                moderate_status: statuses
+                    .and_then(|value| diagnostic_text(value.get("moderate_status"))),
+                validation_status: statuses
+                    .and_then(|value| diagnostic_text(value.get("validation_status"))),
+                errors,
+            })
+        })
+        .collect()
 }
 
 fn normalize_marketing_actions(
@@ -2087,6 +2304,59 @@ pub struct ProductInfoListInput {
         extend("uniqueItems" = true)
     )]
     pub skus: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductPicturesInfoInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[schemars(
+        length(min = 1, max = 1_000),
+        inner(length(min = 1, max = 256)),
+        extend("uniqueItems" = true)
+    )]
+    pub product_ids: Vec<String>,
+}
+
+fn default_content_diagnostic_visibility() -> CatalogVisibility {
+    CatalogVisibility::StateFailed
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProductContentDiagnosticsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический store_id или account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub store: Option<StoreId>,
+    #[serde(default)]
+    #[schemars(length(max = 100), inner(length(min = 1, max = 256)))]
+    pub offer_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(length(max = 100), inner(length(min = 1, max = 256)))]
+    pub product_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        length(max = 100),
+        inner(range(min = 1, max = 9_223_372_036_854_775_807_u64)),
+        extend("uniqueItems" = true)
+    )]
+    pub skus: Vec<u64>,
+    #[serde(default = "default_content_diagnostic_visibility")]
+    pub visibility: CatalogVisibility,
+    #[serde(default = "default_product_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: u32,
+    #[serde(default)]
+    #[schemars(length(max = 4_096))]
+    pub last_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -4008,10 +4278,13 @@ impl OzonMcp {
         .await
     }
 
-    /// Возвращает карточки товаров по offer_id, product_id или SKU.
+    /// Вызывает read-only Ozon `POST /v3/product/info/list` и возвращает
+    /// карточки с `images`, `primary_image`, `errors`, `statuses` и
+    /// `visibility_details`. Для компактной проверки проблем контента и фото
+    /// используйте `ozon_product_content_diagnostics`.
     #[tool(
         name = "ozon_product_info",
-        annotations(title = "Карточки товаров Ozon", read_only_hint = true)
+        annotations(title = "Карточки, фото и ошибки товаров Ozon", read_only_hint = true)
     )]
     async fn product_info(
         &self,
@@ -4036,6 +4309,148 @@ impl OzonMcp {
             }),
         )
         .await
+    }
+
+    /// Проверяет статус загрузки изображений через read-only Ozon
+    /// `POST /v2/product/pictures/info`. Возвращает upstream поля
+    /// `primary_photo`, `photo`, `photo_360`, `color_photo` и `errors`.
+    #[tool(
+        name = "ozon_product_pictures_info",
+        annotations(title = "Статусы загрузки изображений Ozon", read_only_hint = true)
+    )]
+    async fn product_pictures_info(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ProductPicturesInfoInput>,
+    ) -> Result<Json<OzonResult>, String> {
+        validate_string_list(
+            "product_ids",
+            &input.product_ids,
+            MAX_PRODUCT_FILTER_ITEMS,
+            MAX_IDENTIFIER_CHARS,
+        )?;
+        if input.product_ids.is_empty() {
+            return Err("product_ids должен содержать хотя бы один идентификатор".to_owned());
+        }
+        let unique = input.product_ids.iter().collect::<BTreeSet<_>>();
+        if unique.len() != input.product_ids.len() {
+            return Err("product_ids не должен содержать повторяющиеся ID".to_owned());
+        }
+        self.request(
+            &identity,
+            input.store,
+            "/v2/product/pictures/info",
+            json!({"product_id": input.product_ids}),
+        )
+        .await
+    }
+
+    /// Диагностирует карточки Ozon одной bounded read-only цепочкой:
+    /// `product/list` → `product/info/list` → `product/pictures/info`.
+    /// По умолчанию выбирает `STATE_FAILED`; возвращает только идентификаторы,
+    /// статусы, счётчики фото и безопасные тексты ошибок без URL изображений.
+    #[tool(
+        name = "ozon_product_content_diagnostics",
+        annotations(title = "Диагностика контента и фото Ozon", read_only_hint = true)
+    )]
+    async fn product_content_diagnostics(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ProductContentDiagnosticsInput>,
+    ) -> Result<Json<OzonProductContentDiagnosticsResult>, String> {
+        validate_product_identifiers(&input.offer_ids, &input.product_ids, &input.skus)?;
+        let selected = input.offer_ids.len() + input.product_ids.len() + input.skus.len();
+        if selected > MAX_PRODUCT_DIAGNOSTIC_ITEMS {
+            return Err(format!(
+                "offer_ids, product_ids и skus вместе должны содержать не более {MAX_PRODUCT_DIAGNOSTIC_ITEMS} значений"
+            ));
+        }
+        validate_limit(input.limit, MAX_PRODUCT_DIAGNOSTIC_ITEMS as u32)?;
+        validate_max_chars("last_id", &input.last_id, MAX_OPAQUE_TOKEN_CHARS)?;
+
+        let catalog = self
+            .request(
+                &identity,
+                input.store,
+                "/v3/product/list",
+                json!({
+                    "filter": {
+                        "offer_id": input.offer_ids,
+                        "product_id": input.product_ids,
+                        "skus": input.skus,
+                        "visibility": input.visibility,
+                    },
+                    "last_id": input.last_id,
+                    "limit": input.limit,
+                }),
+            )
+            .await?
+            .0;
+        let next_last_id = catalog
+            .data
+            .pointer("/result/last_id")
+            .and_then(|value| diagnostic_text(Some(value)))
+            .filter(|value| !value.is_empty());
+        let product_ids = response_array(&catalog.data, &["/result/items", "/items"])
+            .iter()
+            .filter_map(Value::as_object)
+            .filter_map(|item| diagnostic_text(item.get("product_id")))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let store = catalog.store.clone();
+
+        if product_ids.is_empty() {
+            return Ok(Json(OzonProductContentDiagnosticsResult {
+                store,
+                endpoints: [
+                    "/v3/product/list",
+                    "/v3/product/info/list",
+                    "/v2/product/pictures/info",
+                ],
+                fetched_at: Utc::now().to_rfc3339(),
+                data_classification: UNTRUSTED_DATA_CLASSIFICATION,
+                next_last_id,
+                items: Vec::new(),
+            }));
+        }
+
+        let product_info = self
+            .request(
+                &identity,
+                Some(store.clone()),
+                "/v3/product/info/list",
+                json!({"offer_id": [], "product_id": product_ids.clone(), "sku": []}),
+            )
+            .await?
+            .0;
+        let pictures_info = self
+            .request(
+                &identity,
+                Some(store.clone()),
+                "/v2/product/pictures/info",
+                json!({"product_id": product_ids}),
+            )
+            .await?
+            .0;
+        let items = normalize_product_content_diagnostics(
+            &catalog.data,
+            &product_info.data,
+            &pictures_info.data,
+        )?;
+
+        Ok(Json(OzonProductContentDiagnosticsResult {
+            store,
+            endpoints: [
+                "/v3/product/list",
+                "/v3/product/info/list",
+                "/v2/product/pictures/info",
+            ],
+            fetched_at: Utc::now().to_rfc3339(),
+            data_classification: UNTRUSTED_DATA_CLASSIFICATION,
+            next_last_id,
+            items,
+        }))
     }
 
     /// Возвращает описания и характеристики товаров Ozon.
@@ -5840,6 +6255,12 @@ mod tests {
 
     fn mock_server(expected_requests: usize) -> (OzonMcp, mpsc::Receiver<String>) {
         let responses = vec![(200, r#"{"ok":true}"#.to_owned()); expected_requests];
+        mock_server_with_responses(responses)
+    }
+
+    fn mock_server_with_responses(
+        responses: Vec<(u16, String)>,
+    ) -> (OzonMcp, mpsc::Receiver<String>) {
         let (base_url, receiver) = mock_http(responses);
         let stores = BTreeMap::from([(
             StoreId::from("store_a"),
@@ -10112,7 +10533,7 @@ mod tests {
         // The release checklist in `SECURITY.md` states this count verbatim.
         // Changing it here without updating that gate leaves the gate
         // describing a router that no longer exists.
-        assert_eq!(dev_tools.len(), 68);
+        assert_eq!(dev_tools.len(), 70);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -10123,7 +10544,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 68);
+        assert_eq!(jwt_tools.len(), 70);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -10136,7 +10557,7 @@ mod tests {
                 .with_preview_features(false, true)
                 .tool_router
                 .list_all();
-        assert_eq!(legacy_flag_tools.len(), 68);
+        assert_eq!(legacy_flag_tools.len(), 70);
         assert_policy(
             legacy_flag_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -10182,6 +10603,8 @@ mod tests {
             "ozon_live_buyer_prices",
             "ozon_products",
             "ozon_product_info",
+            "ozon_product_pictures_info",
+            "ozon_product_content_diagnostics",
             "ozon_product_attributes",
             "ozon_stock_turnover",
             "ozon_supply_order_list",
@@ -10240,6 +10663,35 @@ mod tests {
             .with_preview_features(false, true)
             .with_preview_features(false, false);
         assert_eq!(names(&legacy_flags), default_names);
+    }
+
+    #[test]
+    fn product_content_tools_are_discoverable_by_fields_and_workflow() {
+        let tools = server().tool_router.list_all();
+        let description = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .and_then(|tool| tool.description.as_deref())
+                .unwrap_or_default()
+                .to_owned()
+        };
+
+        let product_info = description("ozon_product_info");
+        for field in ["images", "primary_image", "errors", "statuses"] {
+            assert!(
+                product_info.contains(field),
+                "missing {field}: {product_info}"
+            );
+        }
+        let pictures = description("ozon_product_pictures_info");
+        for field in ["primary_photo", "photo_360", "errors"] {
+            assert!(pictures.contains(field), "missing {field}: {pictures}");
+        }
+        let diagnostics = description("ozon_product_content_diagnostics");
+        for hint in ["STATE_FAILED", "без URL"] {
+            assert!(diagnostics.contains(hint), "missing {hint}: {diagnostics}");
+        }
     }
 
     #[tokio::test]
@@ -10433,6 +10885,31 @@ mod tests {
             warehouses["properties"]["warehouse_ids"]["uniqueItems"],
             json!(true)
         );
+
+        let pictures = schema("ozon_product_pictures_info");
+        assert_eq!(pictures["properties"]["product_ids"]["minItems"], json!(1));
+        assert_eq!(
+            pictures["properties"]["product_ids"]["maxItems"],
+            json!(MAX_PRODUCT_FILTER_ITEMS)
+        );
+        assert_eq!(
+            pictures["properties"]["product_ids"]["uniqueItems"],
+            json!(true)
+        );
+
+        let diagnostics = schema("ozon_product_content_diagnostics");
+        assert_eq!(diagnostics["properties"]["limit"]["minimum"], json!(1));
+        assert_eq!(
+            diagnostics["properties"]["limit"]["maximum"],
+            json!(MAX_PRODUCT_DIAGNOSTIC_ITEMS)
+        );
+        for field in ["offer_ids", "product_ids", "skus"] {
+            assert_eq!(
+                diagnostics["properties"][field]["maxItems"],
+                json!(MAX_PRODUCT_DIAGNOSTIC_ITEMS),
+                "{field}"
+            );
+        }
 
         let supply_list = schema("ozon_supply_order_list");
         assert_eq!(
@@ -10821,6 +11298,7 @@ mod tests {
             "/v2/posting/fbo/get",
             "/v2/posting/fbs/cancel-reason/list",
             "/v2/product/info/stocks-by-warehouse/fbs",
+            "/v2/product/pictures/info",
             "/v2/returns/rfbs/list",
             "/v2/review/list",
             "/v2/warehouse/list",
@@ -11411,7 +11889,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_read_only_tool_sends_the_exact_ozon_contract() {
-        let (server, requests) = mock_server(31);
+        let (server, requests) = mock_server(32);
         let mut results = Vec::new();
 
         results.push(
@@ -11553,6 +12031,19 @@ mod tests {
                         offer_ids: vec!["offer-info".to_owned()],
                         product_ids: Vec::new(),
                         skus: vec![502],
+                    }),
+                )
+                .await
+                .unwrap()
+                .0,
+        );
+        results.push(
+            server
+                .product_pictures_info(
+                    RequestIdentity::dev(),
+                    Parameters(ProductPicturesInfoInput {
+                        store: Some(StoreId::from("store_a")),
+                        product_ids: vec!["product-picture-1".to_owned()],
                     }),
                 )
                 .await
@@ -11999,6 +12490,10 @@ mod tests {
                 }),
             ),
             (
+                "/v2/product/pictures/info",
+                json!({"product_id": ["product-picture-1"]}),
+            ),
+            (
                 "/v4/product/info/attributes",
                 json!({
                     "filter": {
@@ -12257,6 +12752,318 @@ mod tests {
             assert_eq!(actual_path, expected_path);
             assert_eq!(actual_body, expected_body, "{expected_path}");
         }
+    }
+
+    #[tokio::test]
+    async fn product_content_diagnostics_composes_three_read_only_contracts_without_photo_urls() {
+        let (server, requests) = mock_server_with_responses(vec![
+            (
+                200,
+                json!({
+                    "result": {
+                        "items": [{"product_id": 11, "offer_id": "offer-11", "sku": 0}],
+                        "last_id": "next-page"
+                    }
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "items": [{
+                        "id": 11,
+                        "sku": 0,
+                        "offer_id": "offer-11",
+                        "name": "Product 11",
+                        "primary_image": "https://private.example/primary.jpg",
+                        "images": ["https://private.example/additional.jpg"],
+                        "statuses": {
+                            "status": "new",
+                            "status_name": "Not selling",
+                            "status_description": "Not created",
+                            "status_failed": "pics_delivered",
+                            "status_tooltip": "Open https://seller.example/history",
+                            "moderate_status": "declined",
+                            "validation_status": "success"
+                        },
+                        "errors": [{
+                            "code": "all_image_failed",
+                            "field": "pictures",
+                            "level": "ERROR_LEVEL_ERROR",
+                            "state": "pics_delivered",
+                            "texts": {"description": "Failed https://private.example/image.jpg"}
+                        }]
+                    }]
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "items": [{
+                        "product_id": 11,
+                        "primary_photo": [],
+                        "photo": [],
+                        "photo_360": [],
+                        "color_photo": [],
+                        "errors": [{
+                            "message": "Cannot download https://private.example/image.jpg",
+                            "url": "https://private.example/image.jpg"
+                        }]
+                    }]
+                })
+                .to_string(),
+            ),
+        ]);
+
+        let result = server
+            .product_content_diagnostics(
+                RequestIdentity::dev(),
+                Parameters(ProductContentDiagnosticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    offer_ids: Vec::new(),
+                    product_ids: Vec::new(),
+                    skus: Vec::new(),
+                    visibility: CatalogVisibility::StateFailed,
+                    limit: 10,
+                    last_id: String::new(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(result.store, StoreId::from("store_a"));
+        assert_eq!(result.next_last_id.as_deref(), Some("next-page"));
+        assert_eq!(result.items.len(), 1);
+        let item = &result.items[0];
+        assert_eq!(item.product_id, "11");
+        assert_eq!(item.offer_id.as_deref(), Some("offer-11"));
+        assert_eq!(item.name.as_deref(), Some("Product 11"));
+        assert!(item.primary_image_available);
+        assert_eq!(item.image_count, 1);
+        assert_eq!(item.primary_photo_count, 0);
+        assert_eq!(item.photo_count, 0);
+        assert!(item.has_photo_error);
+        assert_eq!(item.status_failed.as_deref(), Some("pics_delivered"));
+        assert_eq!(item.status_tooltip.as_deref(), Some("Open [URL_REDACTED]"));
+        assert_eq!(item.errors.len(), 2);
+        assert_eq!(item.errors[0].code.as_deref(), Some("all_image_failed"));
+        assert_eq!(
+            item.errors[0].description.as_deref(),
+            Some("Failed [URL_REDACTED]")
+        );
+        assert_eq!(item.errors[1].source, "pictures_info");
+        assert_eq!(
+            item.errors[1].description.as_deref(),
+            Some("Cannot download [URL_REDACTED]")
+        );
+        assert!(
+            !serde_json::to_string(&result)
+                .unwrap()
+                .contains("private.example")
+        );
+
+        let expected = [
+            (
+                "/v3/product/list",
+                json!({
+                    "filter": {
+                        "offer_id": [],
+                        "product_id": [],
+                        "skus": [],
+                        "visibility": "STATE_FAILED"
+                    },
+                    "last_id": "",
+                    "limit": 10
+                }),
+            ),
+            (
+                "/v3/product/info/list",
+                json!({"offer_id": [], "product_id": ["11"], "sku": []}),
+            ),
+            ("/v2/product/pictures/info", json!({"product_id": ["11"]})),
+        ];
+        for (path, body) in expected {
+            let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+            let (actual_path, actual_body) = request_path_and_body(&request);
+            assert_eq!(actual_path, path);
+            assert_eq!(actual_body, body, "{path}");
+        }
+    }
+
+    #[test]
+    fn product_content_normalization_covers_picture_fallbacks_and_rejects_bad_catalog_items() {
+        let catalog = json!({
+            "items": [{
+                "product_id": "11",
+                "sku": "catalog-sku",
+                "offer_id": "catalog-offer"
+            }]
+        });
+        let product_info = json!({
+            "result": {
+                "items": [{
+                    "id": "11",
+                    "errors": [{"code": "other", "field": "PiCtUrEs"}]
+                }]
+            }
+        });
+        let pictures_info = json!({"items": [{"product_id": "11", "primary_photo": []}]});
+        let item = normalize_product_content_diagnostics(&catalog, &product_info, &pictures_info)
+            .unwrap()
+            .remove(0);
+        assert_eq!(item.sku.as_deref(), Some("catalog-sku"));
+        assert_eq!(item.offer_id.as_deref(), Some("catalog-offer"));
+        assert!(item.has_photo_error);
+        assert!(!item.primary_image_available);
+
+        let picture_only = normalize_product_content_diagnostics(
+            &catalog,
+            &json!({"items": [{"id": "11", "errors": []}]}),
+            &json!({
+                "items": [{
+                    "product_id": "11",
+                    "primary_photo": ["https://private.example/primary.jpg"],
+                    "errors": [{"message": "download failed"}]
+                }]
+            }),
+        )
+        .unwrap()
+        .remove(0);
+        assert!(picture_only.primary_image_available);
+        assert!(picture_only.has_photo_error);
+
+        for invalid_catalog in [json!({"items": [42]}), json!({"items": [{}]})] {
+            let error =
+                normalize_product_content_diagnostics(&invalid_catalog, &json!({}), &json!({}))
+                    .unwrap_err();
+            assert!(error.contains(OZON_PRODUCT_CONTENT_NORMALIZATION_FAILED));
+        }
+    }
+
+    #[tokio::test]
+    async fn product_content_diagnostics_stops_after_an_empty_catalog_page() {
+        let (server, requests) = mock_server_with_responses(vec![(
+            200,
+            json!({"result": {"items": [], "last_id": ""}}).to_string(),
+        )]);
+
+        let result = server
+            .product_content_diagnostics(
+                RequestIdentity::dev(),
+                Parameters(ProductContentDiagnosticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    offer_ids: Vec::new(),
+                    product_ids: Vec::new(),
+                    skus: Vec::new(),
+                    visibility: CatalogVisibility::StateFailed,
+                    limit: 100,
+                    last_id: String::new(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+
+        assert!(result.items.is_empty());
+        assert!(result.next_last_id.is_none());
+        assert_eq!(result.store, StoreId::from("store_a"));
+        assert_eq!(
+            request_path_and_body(&requests.recv_timeout(Duration::from_secs(3)).unwrap()).0,
+            "/v3/product/list"
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[tokio::test]
+    async fn product_content_diagnostics_propagates_invalid_catalog_shape() {
+        let (server, _requests) = mock_server_with_responses(vec![
+            (
+                200,
+                json!({"result": {"items": [42, {"product_id": 11}]}}).to_string(),
+            ),
+            (200, json!({"items": [{"id": 11}]}).to_string()),
+            (200, json!({"items": [{"product_id": 11}]}).to_string()),
+        ]);
+
+        let error = server
+            .product_content_diagnostics(
+                RequestIdentity::dev(),
+                Parameters(ProductContentDiagnosticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    offer_ids: Vec::new(),
+                    product_ids: Vec::new(),
+                    skus: Vec::new(),
+                    visibility: CatalogVisibility::StateFailed,
+                    limit: 100,
+                    last_id: String::new(),
+                }),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains(OZON_PRODUCT_CONTENT_NORMALIZATION_FAILED));
+    }
+
+    #[tokio::test]
+    async fn product_picture_tools_reject_unbounded_or_ambiguous_inputs_before_network() {
+        let (server, requests) = mock_server(0);
+
+        for product_ids in [
+            Vec::new(),
+            vec!["11".to_owned(), "11".to_owned()],
+            vec!["x".repeat(MAX_IDENTIFIER_CHARS + 1)],
+        ] {
+            assert_validation_error(
+                server
+                    .product_pictures_info(
+                        RequestIdentity::dev(),
+                        Parameters(ProductPicturesInfoInput {
+                            store: Some(StoreId::from("store_a")),
+                            product_ids,
+                        }),
+                    )
+                    .await,
+                "product_ids",
+            );
+        }
+
+        assert_validation_error(
+            server
+                .product_content_diagnostics(
+                    RequestIdentity::dev(),
+                    Parameters(ProductContentDiagnosticsInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: vec!["offer".to_owned(); MAX_PRODUCT_DIAGNOSTIC_ITEMS + 1],
+                        product_ids: Vec::new(),
+                        skus: Vec::new(),
+                        visibility: CatalogVisibility::StateFailed,
+                        limit: 100,
+                        last_id: String::new(),
+                    }),
+                )
+                .await,
+            "не более 100",
+        );
+        assert_validation_error(
+            server
+                .product_content_diagnostics(
+                    RequestIdentity::dev(),
+                    Parameters(ProductContentDiagnosticsInput {
+                        store: Some(StoreId::from("store_a")),
+                        offer_ids: Vec::new(),
+                        product_ids: Vec::new(),
+                        skus: Vec::new(),
+                        visibility: CatalogVisibility::StateFailed,
+                        limit: 101,
+                        last_id: String::new(),
+                    }),
+                )
+                .await,
+            "limit",
+        );
+        assert!(requests.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
     #[tokio::test]
