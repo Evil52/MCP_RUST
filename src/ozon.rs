@@ -63,6 +63,7 @@ pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
     "/v2/posting/fbo/get",
     "/v2/posting/fbs/cancel-reason/list",
     "/v2/product/info/stocks-by-warehouse/fbs",
+    "/v2/product/pictures/info",
     "/v2/returns/rfbs/list",
     "/v2/review/list",
     "/v2/warehouse/list",
@@ -1282,7 +1283,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, READ_ONLY_ENDPOINT_ALLOWLIST);
-        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 34);
+        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 35);
 
         for endpoint in READ_ONLY_ENDPOINT_ALLOWLIST {
             assert!(endpoint.starts_with('/'), "{endpoint}");
@@ -1326,6 +1327,7 @@ mod tests {
             "/v2/posting/fbo/get",
             "/v2/posting/fbs/cancel-reason/list",
             "/v2/product/info/stocks-by-warehouse/fbs",
+            "/v2/product/pictures/info",
             "/v2/review/list",
             "/v2/warehouse/list",
             "/v3/posting/fbs/get",
