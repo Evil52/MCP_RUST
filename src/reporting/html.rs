@@ -238,6 +238,7 @@ mod tests {
     fn kpis() -> KpiSummary {
         KpiSummary {
             ordered_units: 12,
+            realized_units: Some(9),
             operational_gmv_minor: 123_456,
             cancelled_units: Some(1),
             returned_units: Some(2),
@@ -251,6 +252,7 @@ mod tests {
             ad_conversion: Some(BasisPoints(2_000)),
             cpo_minor: Some(6_173),
             drr: Some(BasisPoints(2_469)),
+            buyout_rate: Some(BasisPoints(7_500)),
         }
     }
 

@@ -195,7 +195,7 @@ mod tests {
     };
 
     use axum::{Router, http::StatusCode, routing::post};
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, TimeZone, Utc};
     use serde_json::json;
     use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -327,6 +327,7 @@ mod tests {
                 recipient_id: recipient_id.to_owned(),
                 report_version: 1,
             }],
+            deadline_at: Utc.with_ymd_and_hms(2026, 8, 19, 9, 0, 0).unwrap(),
         }
     }
 

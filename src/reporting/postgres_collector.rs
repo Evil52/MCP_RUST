@@ -40,6 +40,66 @@ pub struct CollectedAdvertisingFact {
     pub spend_minor: u64,
     pub attributed_orders: u64,
     pub attributed_revenue_minor: u64,
+    pub basket_additions: u64,
+    pub model_attributed_orders: u64,
+    pub model_attributed_revenue_minor: u64,
+    pub product_price_minor: u64,
+    pub average_cpc_minor: Option<u64>,
+    pub cpm_minor: Option<u64>,
+    pub cpl_minor: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CollectedAdvertisingExpenseFact {
+    pub business_date: NaiveDate,
+    pub campaign_id: u64,
+    pub money_spent_minor: u64,
+    pub bonus_spent_minor: u64,
+    pub prepayment_spent_minor: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinanceCategory {
+    Sale,
+    Commission,
+    Acquiring,
+    Logistics,
+    Storage,
+    PaidAcceptance,
+    Compensation,
+    MarketplaceDiscount,
+    Advertising,
+    Other,
+}
+
+impl FinanceCategory {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sale => "sale",
+            Self::Commission => "commission",
+            Self::Acquiring => "acquiring",
+            Self::Logistics => "logistics",
+            Self::Storage => "storage",
+            Self::PaidAcceptance => "paid_acceptance",
+            Self::Compensation => "compensation",
+            Self::MarketplaceDiscount => "marketplace_discount",
+            Self::Advertising => "advertising",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CollectedFinanceFact {
+    pub business_date: NaiveDate,
+    /// `None` is an account-wide accrual which Ozon did not attribute to SKU.
+    pub sku: Option<u64>,
+    pub category: FinanceCategory,
+    /// Signed marketplace amount: credits are positive, deductions negative.
+    pub amount_minor: i64,
+    pub line_count: u32,
+    pub unknown_type_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -61,6 +121,7 @@ pub struct CollectedPriceFact {
 pub enum CollectedFacts {
     Sales(Vec<CollectedSalesFact>),
     Advertising(Vec<CollectedAdvertisingFact>),
+    Finance(Vec<CollectedFinanceFact>),
     Stocks(Vec<CollectedStockFact>),
     Prices(Vec<CollectedPriceFact>),
 }
@@ -70,6 +131,7 @@ impl CollectedFacts {
         match self {
             Self::Sales(_) => SnapshotSource::Sales,
             Self::Advertising(_) => SnapshotSource::Advertising,
+            Self::Finance(_) => SnapshotSource::Finance,
             Self::Stocks(_) => SnapshotSource::Stocks,
             Self::Prices(_) => SnapshotSource::Prices,
         }
@@ -79,6 +141,7 @@ impl CollectedFacts {
         match self {
             Self::Sales(facts) => facts.len(),
             Self::Advertising(facts) => facts.len(),
+            Self::Finance(facts) => facts.len(),
             Self::Stocks(facts) => facts.len(),
             Self::Prices(facts) => facts.len(),
         }
@@ -97,6 +160,7 @@ pub struct CollectedSnapshot {
     pagination_complete: bool,
     collector_version: String,
     facts: CollectedFacts,
+    advertising_expenses: Vec<CollectedAdvertisingExpenseFact>,
 }
 
 impl CollectedSnapshot {
@@ -151,7 +215,23 @@ impl CollectedSnapshot {
             pagination_complete,
             collector_version,
             facts,
+            advertising_expenses: Vec::new(),
         })
+    }
+
+    pub fn with_advertising_expenses(
+        mut self,
+        expenses: Vec<CollectedAdvertisingExpenseFact>,
+    ) -> Result<Self, PostgresCollectorError> {
+        if self.marketplace != Marketplace::Ozon
+            || self.facts.source() != SnapshotSource::Advertising
+            || expenses.len() > MAX_FACT_ROWS
+        {
+            return Err(PostgresCollectorError::InvalidInput);
+        }
+        validate_advertising_expenses(&expenses)?;
+        self.advertising_expenses = expenses;
+        Ok(self)
     }
 }
 
@@ -259,6 +339,10 @@ impl PostgresSnapshotWriter {
                     AND has_table_privilege(current_user, \
                         'daily_reporting.advertising_facts', 'INSERT') \
                     AND has_table_privilege(current_user, \
+                        'daily_reporting.advertising_expense_facts', 'INSERT') \
+                    AND has_table_privilege(current_user, \
+                        'daily_reporting.finance_facts', 'INSERT') \
+                    AND has_table_privilege(current_user, \
                         'daily_reporting.stock_facts', 'INSERT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.price_facts', 'INSERT') \
@@ -341,8 +425,8 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)
     }
 
-    /// Returns policy targets whose exact cutoff already has all four
-    /// terminal published source snapshots.
+    /// Returns policy targets whose exact cutoff already has every required
+    /// terminal published source snapshot for its marketplace.
     ///
     /// The bounded result is used before marketplace I/O. A partial account
     /// set is not considered published, so the scheduler can fail closed on
@@ -365,6 +449,11 @@ impl PostgresSnapshotWriter {
             .iter()
             .map(|target| marketplace_name(target.marketplace).to_owned())
             .collect::<Vec<_>>();
+        let required_counts = targets
+            .iter()
+            .map(|target| i64::try_from(target.sources.len()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PostgresCollectorError::InvalidInput)?;
         let client = self
             .client
             .acquire()
@@ -372,8 +461,8 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         let rows = client
             .query(
-                "WITH requested(account_id, marketplace) AS ( \
-                     SELECT * FROM unnest($2::text[], $3::text[]) \
+                "WITH requested(account_id, marketplace, required_count) AS ( \
+                     SELECT * FROM unnest($2::text[], $3::text[], $4::bigint[]) \
                  ) \
                  SELECT snapshot.account_id, snapshot.marketplace \
                  FROM daily_reporting.source_snapshots AS snapshot \
@@ -384,9 +473,10 @@ impl PostgresSnapshotWriter {
                    AND snapshot.status = 'succeeded' \
                    AND snapshot.pagination_complete \
                  GROUP BY snapshot.account_id, snapshot.marketplace \
-                 HAVING count(*) = 4 AND count(DISTINCT source) = 4 \
+                 HAVING count(*) = max(requested.required_count) \
+                    AND count(DISTINCT source) = max(requested.required_count) \
                  ORDER BY snapshot.account_id, snapshot.marketplace",
-                &[&cutoff_at, &account_ids, &marketplaces],
+                &[&cutoff_at, &account_ids, &marketplaces, &required_counts],
             )
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
@@ -398,7 +488,7 @@ impl PostgresSnapshotWriter {
             .collect()
     }
 
-    /// Requires one recent common four-source cutoff for every policy target.
+    /// Requires one recent common complete-source cutoff for every policy target.
     ///
     /// A live policy is expanded only after each account has completed the
     /// same operator-reviewed occurrence. The proof contains no credentials
@@ -424,8 +514,13 @@ impl PostgresSnapshotWriter {
             .iter()
             .map(|target| marketplace_name(target.marketplace).to_owned())
             .collect::<Vec<_>>();
-        let required_rows = i64::try_from(targets.len() * SnapshotSource::ALL.len())
-            .map_err(|_| PostgresCollectorError::InvalidInput)?;
+        let required_rows = i64::try_from(
+            targets
+                .iter()
+                .map(|target| target.sources.len())
+                .sum::<usize>(),
+        )
+        .map_err(|_| PostgresCollectorError::InvalidInput)?;
         let client = self
             .client
             .acquire()
@@ -528,8 +623,12 @@ fn validate_claimed_batch(
         .iter()
         .map(|snapshot| snapshot.facts.source())
         .collect::<BTreeSet<_>>();
-    if snapshots.len() != SnapshotSource::ALL.len()
-        || sources != SnapshotSource::ALL.into_iter().collect()
+    let required_sources = SnapshotSource::required_for(claim.marketplace)
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if snapshots.len() != required_sources.len()
+        || sources != required_sources
         || snapshots.iter().any(|snapshot| {
             snapshot.account_id != claim.account_id
                 || snapshot.marketplace != claim.marketplace
@@ -557,9 +656,12 @@ fn validate_owner_id(owner_id: &str) -> Result<(), PostgresCollectorError> {
 
 fn validate_coverage_targets(targets: &[CollectionTarget]) -> Result<(), PostgresCollectorError> {
     let mut identities = BTreeSet::new();
-    let required_sources = SnapshotSource::ALL.into_iter().collect::<BTreeSet<_>>();
     if targets.len() > MAX_COLLECTION_TARGETS
         || targets.iter().any(|target| {
+            let required_sources = SnapshotSource::required_for(target.marketplace)
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
             !identities.insert((&target.account_id, target.marketplace))
                 || target.account_id.is_empty()
                 || target.account_id.len() > MAX_ACCOUNT_ID_BYTES
@@ -567,7 +669,8 @@ fn validate_coverage_targets(targets: &[CollectionTarget]) -> Result<(), Postgre
                     .account_id
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-                || target.sources.into_iter().collect::<BTreeSet<_>>() != required_sources
+                || target.sources.iter().copied().collect::<BTreeSet<_>>() != required_sources
+                || target.sources.len() != required_sources.len()
         })
     {
         Err(PostgresCollectorError::InvalidInput)
@@ -602,6 +705,7 @@ async fn persist_in_transaction(
         i32::try_from(snapshot.facts.len()).map_err(|_| PostgresCollectorError::InvalidInput)?;
     let snapshot_id = insert_snapshot(transaction, claim, snapshot).await?;
     insert_facts(transaction, snapshot_id, &snapshot.facts).await?;
+    insert_advertising_expenses(transaction, snapshot_id, &snapshot.advertising_expenses).await?;
     let status = match snapshot.status {
         SnapshotStatus::Succeeded => "succeeded",
         SnapshotStatus::Partial => "partial",
@@ -626,6 +730,33 @@ async fn persist_in_transaction(
     Ok(snapshot_id)
 }
 
+async fn insert_advertising_expenses(
+    transaction: &Transaction<'_>,
+    snapshot_id: i64,
+    facts: &[CollectedAdvertisingExpenseFact],
+) -> Result<(), PostgresCollectorError> {
+    for fact in facts {
+        transaction
+            .execute(
+                "INSERT INTO daily_reporting.advertising_expense_facts \
+                 (snapshot_id, business_date, campaign_id, money_spent_minor, \
+                  bonus_spent_minor, prepayment_spent_minor) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &snapshot_id,
+                    &fact.business_date,
+                    &as_i64(fact.campaign_id)?,
+                    &as_i64(fact.money_spent_minor)?,
+                    &as_i64(fact.bonus_spent_minor)?,
+                    &as_i64(fact.prepayment_spent_minor)?,
+                ],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+    }
+    Ok(())
+}
+
 fn map_snapshot_insert_error(error: tokio_postgres::Error) -> PostgresCollectorError {
     classify_snapshot_insert_code(error.code())
 }
@@ -647,6 +778,7 @@ async fn insert_snapshot(
     let source = match snapshot.facts.source() {
         SnapshotSource::Sales => "sales",
         SnapshotSource::Advertising => "advertising",
+        SnapshotSource::Finance => "finance",
         SnapshotSource::Stocks => "stocks",
         SnapshotSource::Prices => "prices",
     };
@@ -713,8 +845,12 @@ async fn insert_facts(
                     .execute(
                         "INSERT INTO daily_reporting.advertising_facts \
                          (snapshot_id, business_date, campaign_id, sku, impressions, clicks, \
-                          spend_minor, attributed_orders, attributed_revenue_minor) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                          spend_minor, attributed_orders, attributed_revenue_minor, \
+                          basket_additions, model_attributed_orders, \
+                          model_attributed_revenue_minor, product_price_minor, \
+                          average_cpc_minor, cpm_minor, cpl_minor) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                                 $13, $14, $15, $16)",
                         &[
                             &snapshot_id,
                             &fact.business_date,
@@ -725,6 +861,38 @@ async fn insert_facts(
                             &as_i64(fact.spend_minor)?,
                             &as_i32(fact.attributed_orders)?,
                             &as_i64(fact.attributed_revenue_minor)?,
+                            &as_i32(fact.basket_additions)?,
+                            &as_i32(fact.model_attributed_orders)?,
+                            &as_i64(fact.model_attributed_revenue_minor)?,
+                            &as_i64(fact.product_price_minor)?,
+                            &fact.average_cpc_minor.map(as_i64).transpose()?,
+                            &fact.cpm_minor.map(as_i64).transpose()?,
+                            &fact.cpl_minor.map(as_i64).transpose()?,
+                        ],
+                    )
+                    .await
+                    .map_err(|_| PostgresCollectorError::Unavailable)?;
+            }
+        }
+        CollectedFacts::Finance(facts) => {
+            for fact in facts {
+                let sku = fact.sku.map(as_i64).transpose()?;
+                transaction
+                    .execute(
+                        "INSERT INTO daily_reporting.finance_facts \
+                         (snapshot_id, business_date, sku, category, amount_minor, \
+                          line_count, unknown_type_count) \
+                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                        &[
+                            &snapshot_id,
+                            &fact.business_date,
+                            &sku,
+                            &fact.category.as_str(),
+                            &fact.amount_minor,
+                            &i32::try_from(fact.line_count)
+                                .map_err(|_| PostgresCollectorError::InvalidInput)?,
+                            &i32::try_from(fact.unknown_type_count)
+                                .map_err(|_| PostgresCollectorError::InvalidInput)?,
                         ],
                     )
                     .await
@@ -798,6 +966,22 @@ fn validate_facts(facts: &CollectedFacts) -> Result<(), PostgresCollectorError> 
                     && fits_i64(fact.spend_minor)
                     && fits_i32(fact.attributed_orders)
                     && fits_i64(fact.attributed_revenue_minor)
+                    && fits_i64(fact.basket_additions)
+                    && fits_i32(fact.model_attributed_orders)
+                    && fits_i64(fact.model_attributed_revenue_minor)
+                    && fits_i64(fact.product_price_minor)
+                    && fact.average_cpc_minor.is_none_or(fits_i64)
+                    && fact.cpm_minor.is_none_or(fits_i64)
+                    && fact.cpl_minor.is_none_or(fits_i64)
+            },
+        ),
+        CollectedFacts::Finance(facts) => ensure_unique(
+            facts,
+            |fact| (fact.business_date, fact.sku, fact.category),
+            |fact| {
+                fact.sku.is_none_or(|sku| sku > 0)
+                    && fact.line_count > 0
+                    && fact.unknown_type_count <= fact.line_count
             },
         ),
         CollectedFacts::Stocks(facts) => ensure_unique(
@@ -827,6 +1011,22 @@ fn validate_facts(facts: &CollectedFacts) -> Result<(), PostgresCollectorError> 
             },
         ),
     }
+}
+
+fn validate_advertising_expenses(
+    facts: &[CollectedAdvertisingExpenseFact],
+) -> Result<(), PostgresCollectorError> {
+    ensure_unique(
+        facts,
+        |fact| (fact.business_date, fact.campaign_id),
+        |fact| {
+            fact.campaign_id > 0
+                && fits_i64(fact.campaign_id)
+                && fits_i64(fact.money_spent_minor)
+                && fits_i64(fact.bonus_spent_minor)
+                && fits_i64(fact.prepayment_spent_minor)
+        },
+    )
 }
 
 fn ensure_unique<T, K: Ord>(
@@ -881,7 +1081,7 @@ mod tests {
     fn snapshot(facts: CollectedFacts) -> Result<CollectedSnapshot, PostgresCollectorError> {
         let source_as_of = cutoff() - Duration::minutes(10);
         let (period_start, period_end) = match facts.source() {
-            SnapshotSource::Sales | SnapshotSource::Advertising => {
+            SnapshotSource::Sales | SnapshotSource::Advertising | SnapshotSource::Finance => {
                 (cutoff() - Duration::days(1), cutoff())
             }
             SnapshotSource::Stocks | SnapshotSource::Prices => (source_as_of, source_as_of),
@@ -921,6 +1121,13 @@ mod tests {
             spend_minor: 20,
             attributed_orders: 1,
             attributed_revenue_minor: 80,
+            basket_additions: 2,
+            model_attributed_orders: 1,
+            model_attributed_revenue_minor: 80,
+            product_price_minor: 100,
+            average_cpc_minor: Some(4),
+            cpm_minor: Some(200),
+            cpl_minor: Some(10),
         }
     }
 
@@ -928,6 +1135,17 @@ mod tests {
     fn every_fact_shape_and_partial_snapshot_validate() {
         assert!(snapshot(CollectedFacts::Sales(vec![sales()])).is_ok());
         assert!(snapshot(CollectedFacts::Advertising(vec![advertising()])).is_ok());
+        assert!(
+            snapshot(CollectedFacts::Finance(vec![CollectedFinanceFact {
+                business_date: cutoff().date_naive(),
+                sku: Some(1),
+                category: FinanceCategory::Sale,
+                amount_minor: 100,
+                line_count: 1,
+                unknown_type_count: 0,
+            }]))
+            .is_ok()
+        );
         assert!(
             snapshot(CollectedFacts::Stocks(vec![CollectedStockFact {
                 sku: 1,
@@ -960,6 +1178,38 @@ mod tests {
             )
             .is_ok()
         );
+
+        let advertising_snapshot = snapshot(CollectedFacts::Advertising(vec![advertising()]))
+            .unwrap()
+            .with_advertising_expenses(vec![CollectedAdvertisingExpenseFact {
+                business_date: cutoff().date_naive(),
+                campaign_id: 2,
+                money_spent_minor: 20,
+                bonus_spent_minor: 5,
+                prepayment_spent_minor: 15,
+            }]);
+        assert!(advertising_snapshot.is_ok());
+        assert_eq!(
+            snapshot(CollectedFacts::Sales(vec![sales()]))
+                .unwrap()
+                .with_advertising_expenses(Vec::new()),
+            Err(PostgresCollectorError::InvalidInput)
+        );
+
+        for category in [
+            FinanceCategory::Sale,
+            FinanceCategory::Commission,
+            FinanceCategory::Acquiring,
+            FinanceCategory::Logistics,
+            FinanceCategory::Storage,
+            FinanceCategory::PaidAcceptance,
+            FinanceCategory::Compensation,
+            FinanceCategory::MarketplaceDiscount,
+            FinanceCategory::Advertising,
+            FinanceCategory::Other,
+        ] {
+            assert!(!category.as_str().is_empty());
+        }
     }
 
     #[test]
@@ -1077,7 +1327,7 @@ mod tests {
         let target = CollectionTarget {
             account_id: "pilot".to_owned(),
             marketplace: Marketplace::Ozon,
-            sources: SnapshotSource::ALL,
+            sources: SnapshotSource::required_for(Marketplace::Ozon).to_vec(),
         };
         assert!(validate_coverage_targets(&[]).is_ok());
         assert!(validate_coverage_targets(std::slice::from_ref(&target)).is_ok());
@@ -1088,7 +1338,7 @@ mod tests {
         let incomplete = CollectionTarget {
             account_id: "incomplete".to_owned(),
             marketplace: Marketplace::Ozon,
-            sources: [
+            sources: vec![
                 SnapshotSource::Sales,
                 SnapshotSource::Advertising,
                 SnapshotSource::Stocks,
@@ -1104,7 +1354,7 @@ mod tests {
                 validate_coverage_targets(&[CollectionTarget {
                     account_id: account_id.to_owned(),
                     marketplace: Marketplace::Ozon,
-                    sources: SnapshotSource::ALL,
+                    sources: SnapshotSource::required_for(Marketplace::Ozon).to_vec(),
                 }]),
                 Err(PostgresCollectorError::InvalidInput)
             );
@@ -1113,7 +1363,7 @@ mod tests {
             .map(|index| CollectionTarget {
                 account_id: format!("account-{index}"),
                 marketplace: Marketplace::Ozon,
-                sources: SnapshotSource::ALL,
+                sources: SnapshotSource::required_for(Marketplace::Ozon).to_vec(),
             })
             .collect::<Vec<_>>();
         assert_eq!(

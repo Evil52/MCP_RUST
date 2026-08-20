@@ -41,7 +41,7 @@ The first disabled-only phase provides:
   Seller and Performance read credentials, reaches the two
   fixed API hosts through the deployment-owned CONNECT proxy, normalizes one
   completed EKB business day against the following day's immutable 08:00 EKB
-  morning cutoff and publishes all four sources atomically; and
+  morning cutoff and publishes all five Ozon sources atomically; and
 - Ozon sales normalization that requests the two supported metrics, revenue
   and ordered units; unavailable cancellation/return metrics remain explicit
   `N/D` values rather than fabricated zeroes;
@@ -61,8 +61,14 @@ The first disabled-only phase provides:
 - Ozon Performance product statistics normalized by the real
   `campaignId + sku + date`, so advertising facts no longer use an
   unavailable-SKU sentinel or fabricated product attribution; and
+- Ozon Performance expense JSON that preserves `moneySpent`, `bonusSpent`
+  and `prepaymentSpent` independently, plus SKU baskets, model-attributed
+  orders/revenue, product price, average CPC and derived CPM/CPL; and
+- an Ozon finance source based on the bounded accrual type and by-day ledger
+  APIs; unknown accrual types remain visible through an explicit counter and
+  are never silently reclassified; and
 - a bounded PostgreSQL reader that loads only published source descriptors and
-  revalidates the exact four-source manifest before report generation;
+  revalidates the exact marketplace-specific manifest before report generation;
 - a bounded published-fact reader that selects rows only by the frozen
   snapshot identities, rechecks every persisted row count and rejects foreign
   account data; and
@@ -174,7 +180,7 @@ single-section `planned`/`generating` artifact work inside its delivery window.
 It never claims a ready delivery. The isolated
 production artifact volume is mounted and health-checked. Manual
 HTML/XLSX previews can be generated from an already published complete
-four-source manifest. The immutable local store and outbox-publication
+marketplace-specific manifest. The immutable local store and outbox-publication
 primitive can now be invoked explicitly for one already-planned outbox batch
 while delivery remains disabled. Recovery queues a missed morning and evening
 as separate single-section artifacts; it never presents one interval as two
@@ -286,6 +292,17 @@ healthy database are still required before the worker can start. Do not invoke
 it before the canary message, recipient, attachment hash and Gmail audit result
 are checked.
 
+The scheduled worker re-checks that same activation receipt every time it
+starts, so the gate also trips when a whole day of scheduled deliveries has
+failed. Because the service runs with `restart: unless-stopped`, the container
+then restarts straight back into the refusal: a restart never clears it. The
+startup error names the required operator action. Reconcile any ambiguous
+`sending` attempt with `report-worker reconcile-sent` or
+`report-worker reconcile-suppress`, re-run the `delivery_canary` `deliver-one`
+command, and only then start the scheduler again. This is deliberate — an
+automatic mail loop must not resume while its last provider-backed proof is
+unknown or stale.
+
 The separate collector has two explicit one-account canary commands:
 
 ```text
@@ -304,7 +321,7 @@ resolves the selected Ozon account's Seller and Performance bindings or the
 selected WB account's Personal token. Secret values must be injected by the
 runtime under the environment-variable names from the access registry, never
 placed in a command line or committed file. Each invocation is bounded
-to twelve minutes and publishes the exact four-source snapshot set in one
+to twelve minutes and publishes the exact marketplace-specific snapshot set in one
 database transaction. The date argument is the completed business day; its
 snapshot identity is the following day's fixed 08:00 EKB morning cutoff, so a
 successful canary can be consumed by the same report-worker manifest contract.
@@ -336,7 +353,7 @@ failures terminate the process so its supervisor can restart a fresh database
 session. SIGTERM/Ctrl-C cancels the active target and attempts to release its
 lease before exit. Inside a window, a PostgreSQL-backed
 preflight now removes exact account/marketplace/cutoff targets that already
-have all four terminal published sources. It then processes missing policy
+have all required terminal published sources. It then processes missing policy
 targets sequentially so shared provider quotas are not multiplied. Every
 target is claimed idempotently in PostgreSQL before resolving only that
 account's credentials or performing marketplace I/O. A failed target releases
@@ -344,7 +361,7 @@ its lease and does not prevent later targets from being attempted; the command
 returns a failure after the bounded pass so an external timer can retry only
 remaining work inside the same window. The database claim is
 exclusive for fifteen minutes, can be explicitly released after a bounded
-failure, and uses a monotonically increasing fencing generation. All four
+failure, and uses a monotonically increasing fencing generation. All required
 source snapshots and claim completion commit together, so an expired owner
 cannot publish after a replacement starts. Each target is bounded by twelve
 minutes and by the remaining completion window. Startup or idle operation never
@@ -364,7 +381,7 @@ mount this directory, so scheduled collection cannot be enabled accidentally.
 
 `collection-preflight` performs no marketplace request. It requires every
 target in the enabled policy to share one successful, fully paginated
-four-source cutoff no more
+marketplace-specific cutoff no more
 than 24 hours old. A target added to the policy therefore cannot enter the
 automatic scheduler until its manual canary has published the same reviewed
 occurrence as the other targets. The long-running scheduler repeats this proof
@@ -470,7 +487,7 @@ an ambiguous provider result is never retried automatically.
 
 ## Planned pilot
 
-1. Validate a manual Ozon four-source preview for Diana and add the
+1. Validate a manual Ozon five-source preview for Diana and add the
    corresponding manual WB four-source preview for Vahrusheva/Torsunova.
 2. Run the opt-in scheduler dry mode for Diana and Vahrusheva/Torsunova after
    both marketplace collectors publish complete manifests.

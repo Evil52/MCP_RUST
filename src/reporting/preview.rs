@@ -216,6 +216,7 @@ mod tests {
         let sources = [
             (SnapshotSource::Sales, 1),
             (SnapshotSource::Advertising, 1),
+            (SnapshotSource::Finance, 0),
             (SnapshotSource::Stocks, 1),
             (SnapshotSource::Prices, 1),
         ];
@@ -224,12 +225,14 @@ mod tests {
             .enumerate()
             .map(|(index, (source, rows))| {
                 let observed = cutoff - Duration::minutes(30);
-                let (start, end) =
-                    if matches!(source, SnapshotSource::Sales | SnapshotSource::Advertising) {
-                        period
-                    } else {
-                        (observed, observed)
-                    };
+                let (start, end) = if matches!(
+                    source,
+                    SnapshotSource::Sales | SnapshotSource::Advertising | SnapshotSource::Finance
+                ) {
+                    period
+                } else {
+                    (observed, observed)
+                };
                 SnapshotDescriptor::new(
                     index as i64 + 1,
                     "store".to_owned(),
@@ -275,7 +278,16 @@ mod tests {
                 spend_minor: 1_000,
                 attributed_orders: 0,
                 attributed_revenue_minor: 0,
+                basket_additions: 0,
+                model_attributed_orders: 0,
+                model_attributed_revenue_minor: 0,
+                product_price_minor: 0,
+                average_cpc_minor: None,
+                cpm_minor: None,
+                cpl_minor: None,
             }],
+            advertising_expenses: vec![],
+            finance: vec![],
             stocks: vec![PublishedStockFact {
                 account_id: "store".to_owned(),
                 sku: 10,

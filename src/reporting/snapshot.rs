@@ -19,23 +19,38 @@ pub enum Marketplace {
 pub enum SnapshotSource {
     Sales,
     Advertising,
+    Finance,
     Stocks,
     Prices,
 }
 
 impl SnapshotSource {
-    pub(crate) const ALL: [Self; 4] = [Self::Sales, Self::Advertising, Self::Stocks, Self::Prices];
+    pub(crate) const BASE: [Self; 4] = [Self::Sales, Self::Advertising, Self::Stocks, Self::Prices];
+    pub(crate) const OZON: [Self; 5] = [
+        Self::Sales,
+        Self::Advertising,
+        Self::Finance,
+        Self::Stocks,
+        Self::Prices,
+    ];
+
+    pub(crate) fn required_for(marketplace: Marketplace) -> &'static [Self] {
+        match marketplace {
+            Marketplace::Ozon => &Self::OZON,
+            Marketplace::Wildberries => &Self::BASE,
+        }
+    }
 
     fn freshness_sla(self) -> Duration {
         match self {
-            Self::Sales => Duration::hours(6),
+            Self::Sales | Self::Finance => Duration::hours(6),
             Self::Advertising => Duration::hours(2),
             Self::Stocks | Self::Prices => Duration::hours(1),
         }
     }
 
     fn is_period_source(self) -> bool {
-        matches!(self, Self::Sales | Self::Advertising)
+        matches!(self, Self::Sales | Self::Advertising | Self::Finance)
     }
 }
 
@@ -222,7 +237,15 @@ impl FrozenSnapshotManifest {
                 return Err(SnapshotError::DuplicateAccount);
             }
         }
-        if snapshots.len() != expected.len() * SnapshotSource::ALL.len() {
+        let expected_sources = expected
+            .iter()
+            .flat_map(|(account_id, marketplace)| {
+                SnapshotSource::required_for(*marketplace)
+                    .iter()
+                    .map(move |source| (account_id.as_str(), *source))
+            })
+            .collect::<BTreeSet<_>>();
+        if snapshots.len() != expected_sources.len() {
             return Err(SnapshotError::IncompleteManifest);
         }
 
@@ -244,6 +267,9 @@ impl FrozenSnapshotManifest {
                 return Err(SnapshotError::DuplicateSnapshot);
             }
             quality = quality.max(snapshot.quality());
+        }
+        if seen != expected_sources {
+            return Err(SnapshotError::IncompleteManifest);
         }
         Ok(Self {
             cutoff_at,
@@ -356,7 +382,7 @@ mod tests {
             ("ozon_store", Marketplace::Ozon),
             ("wb_store", Marketplace::Wildberries),
         ] {
-            for source in SnapshotSource::ALL {
+            for &source in SnapshotSource::required_for(marketplace) {
                 snapshots.push(snapshot(id, account_id, marketplace, source));
                 id += 1;
             }
@@ -375,7 +401,7 @@ mod tests {
     fn complete_manifest_covers_every_account_and_source_exactly_once() {
         let manifest = FrozenSnapshotManifest::new(cutoff(), accounts(), all_snapshots()).unwrap();
         assert_eq!(manifest.cutoff_at(), cutoff());
-        assert_eq!(manifest.snapshots().len(), 8);
+        assert_eq!(manifest.snapshots().len(), 9);
         assert_eq!(manifest.quality(), SnapshotQuality::Complete);
         assert!(manifest.recommendations_allowed());
 
@@ -598,6 +624,20 @@ mod tests {
         assert_eq!(
             FrozenSnapshotManifest::new(cutoff(), accounts(), duplicate_id),
             Err(SnapshotError::DuplicateSnapshot)
+        );
+
+        let mut wrong_complete_set = all_snapshots();
+        let wb_sales = wrong_complete_set
+            .iter_mut()
+            .find(|snapshot| {
+                snapshot.marketplace == Marketplace::Wildberries
+                    && snapshot.source == SnapshotSource::Sales
+            })
+            .unwrap();
+        wb_sales.source = SnapshotSource::Finance;
+        assert_eq!(
+            FrozenSnapshotManifest::new(cutoff(), accounts(), wrong_complete_set),
+            Err(SnapshotError::IncompleteManifest)
         );
 
         let too_many = (0..65)

@@ -154,7 +154,8 @@ fn stock_problem(input: &RuleInput) -> Option<PriorityProblem> {
         sku: input.sku,
         kind: ProblemKind::LowStockCover,
         severity,
-        observed: ((cover_left * 10) / u128::from(input.sold_units)) as u64,
+        observed: ((cover_left * 10) / u128::from(input.sold_units)).min(u128::from(u64::MAX))
+            as u64,
         threshold: u64::from(input.lead_time_days.unwrap_or(3)) * 10,
         impact_minor: input.sales_gmv_minor,
     })
@@ -164,11 +165,13 @@ fn spend_without_orders(input: &RuleInput, minimum: u64) -> Option<PriorityProbl
     if input.attributed_orders != 0 {
         return None;
     }
+    // Without an approved target CPO there is no "twice the target" level, so
+    // the store minimum is the only defensible red threshold; the click count
+    // still separates red from yellow. Overflow saturates upward so a huge
+    // target can never lower the bar.
     let red_spend = input
         .target_cpo_minor
-        .and_then(|target| target.checked_mul(2))
-        .unwrap_or(u64::MAX)
-        .max(minimum);
+        .map_or(minimum, |target| target.saturating_mul(2).max(minimum));
     let severity = if input.ad_clicks >= 20 && input.ad_spend_minor >= red_spend {
         Severity::Red
     } else if input.ad_clicks >= 10 && input.ad_spend_minor >= minimum {
@@ -196,9 +199,11 @@ fn high_drr(input: &RuleInput) -> Option<PriorityProblem> {
     if input.attributed_revenue_minor == 0 {
         return None;
     }
-    let current = (u128::from(input.ad_spend_minor) * 10_000
-        / u128::from(input.attributed_revenue_minor))
-    .min(u128::from(u64::MAX)) as u64;
+    // Rounded exactly like `kpi::percentage`, so the DRR printed in the report
+    // and the DRR this rule compares against a threshold can never differ.
+    let revenue = u128::from(input.attributed_revenue_minor);
+    let current = ((u128::from(input.ad_spend_minor) * 10_000 + revenue / 2) / revenue)
+        .min(u128::from(u64::MAX)) as u64;
     let severity = if u128::from(current) * 2 > u128::from(target) * 3
         && current >= target.saturating_add(500)
     {
@@ -377,6 +382,53 @@ mod tests {
             priority_problems(&vec![input(1); MAX_RULE_INPUTS + 1], true, 1),
             Err(RuleError::InvalidInput)
         );
+    }
+
+    /// Without an approved target CPO the store minimum is the red threshold.
+    /// Falling back to `u64::MAX` instead made red unreachable, so a product
+    /// burning ad spend with no attributed order could only ever be yellow.
+    #[test]
+    fn spend_without_orders_stays_gradable_without_a_target_cpo() {
+        let mut without_target = input(1);
+        without_target.target_cpo_minor = None;
+        without_target.ad_clicks = 20;
+        without_target.ad_spend_minor = 500;
+        let problems = priority_problems(&[without_target.clone()], true, 500).unwrap();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind, ProblemKind::SpendWithoutOrders);
+        assert_eq!(problems[0].severity, Severity::Red);
+        assert_eq!(problems[0].threshold, 500);
+
+        let mut yellow = without_target.clone();
+        yellow.ad_clicks = 10;
+        let problems = priority_problems(&[yellow], true, 500).unwrap();
+        assert_eq!(problems[0].severity, Severity::Yellow);
+
+        // A target CPO whose doubling overflows must never lower the bar.
+        let mut overflowing = without_target;
+        overflowing.target_cpo_minor = Some(u64::MAX);
+        assert!(
+            priority_problems(&[overflowing], true, 500)
+                .unwrap()
+                .iter()
+                .all(|problem| problem.severity != Severity::Red)
+        );
+    }
+
+    /// The rule must compare the same rounded DRR the report prints, otherwise
+    /// a report can show the threshold while the rule silently stayed below it.
+    #[test]
+    fn high_drr_rounds_exactly_like_the_report_kpi() {
+        let mut input = input(1);
+        input.target_drr_bps = Some(1_000);
+        input.ad_clicks = 1;
+        input.attributed_orders = 1;
+        // 1499 / 10000 = 14.99% floored to 1499 bps, rounded to 1500 bps.
+        input.ad_spend_minor = 1_499;
+        input.attributed_revenue_minor = 10_000;
+        let problems = priority_problems(&[input], true, u64::MAX).unwrap();
+        assert_eq!(problems[0].kind, ProblemKind::HighDrr);
+        assert_eq!(problems[0].observed, 1_499);
     }
 
     #[test]

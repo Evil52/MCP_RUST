@@ -8,7 +8,7 @@ use crate::postgres::SupervisedClient;
 use super::{
     PendingDelivery, ReportKey, ReportKind,
     bundle::artifact_object_key,
-    business_date, delivery_deadline,
+    business_date,
     outbox::{
         ArtifactIdentity, DeliveryErrorClass, DeliveryRecord, validate_artifact,
         validate_provider_message_id,
@@ -70,6 +70,13 @@ pub struct ClaimedDelivery {
     pub attempt_no: u8,
     pub artifact: ArtifactIdentity,
     pub covered_keys: Vec<ReportKey>,
+    /// Terminal deadline persisted with the batch coverage.
+    ///
+    /// A recovered morning occurrence is scheduled at the 17:00 EKB boundary
+    /// and keeps the evening 23:00 EKB deadline, so it must never be recomputed
+    /// from the report kind: that would collapse its window back to 14:00 and
+    /// turn the first transient failure into a permanent one.
+    pub deadline_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,7 +735,7 @@ impl PostgresOutboxRepository {
                         batch.artifact_html_sha256 \
                  FROM daily_reporting.delivery_batches AS batch \
                  WHERE batch.status = 'ready' \
-                   AND batch.attempts < 5 \
+                   AND batch.attempts < $2 \
                    AND (batch.next_attempt_at IS NULL OR batch.next_attempt_at <= $1) \
                    AND EXISTS ( \
                        SELECT 1 FROM daily_reporting.delivery_coverage AS coverage \
@@ -736,7 +743,7 @@ impl PostgresOutboxRepository {
                    ) \
                  ORDER BY batch.scheduled_for, batch.id \
                  FOR UPDATE SKIP LOCKED LIMIT 1",
-                &[&now],
+                &[&now, &i16::from(MAX_DELIVERY_ATTEMPTS)],
             )
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
@@ -758,13 +765,21 @@ impl PostgresOutboxRepository {
         let html_sha256: String = row.get(6);
         let coverage = transaction
             .query(
-                "SELECT local_date, report_kind \
+                "SELECT local_date, report_kind, deadline_at \
                  FROM daily_reporting.delivery_coverage \
                  WHERE batch_id = $1 ORDER BY report_kind",
                 &[&batch_id],
             )
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
+        // The persisted deadline is authoritative. `delivery_deadline` derives
+        // the standard window from the report kind alone and cannot describe a
+        // morning occurrence recovered into the evening window.
+        let deadline_at = coverage
+            .iter()
+            .map(|row| row.get::<_, DateTime<Utc>>(2))
+            .max()
+            .ok_or(PostgresOutboxError::Conflict)?;
         let covered_keys = coverage
             .into_iter()
             .map(|row| {
@@ -803,6 +818,7 @@ impl PostgresOutboxRepository {
                 html_sha256,
             },
             covered_keys,
+            deadline_at,
         }))
     }
 
@@ -851,16 +867,7 @@ impl PostgresOutboxRepository {
                 )
                 .await;
         }
-        let deadline = claim
-            .covered_keys
-            .iter()
-            .map(delivery_deadline)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| PostgresOutboxError::InvalidDelivery)?
-            .into_iter()
-            .max()
-            .ok_or(PostgresOutboxError::InvalidDelivery)?;
-        if retry_at <= finished_at || retry_at > deadline {
+        if retry_at <= finished_at || retry_at > claim.deadline_at {
             return Err(PostgresOutboxError::InvalidDelivery);
         }
         self.finish_attempt(

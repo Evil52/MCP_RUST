@@ -10,7 +10,7 @@ use mcp_ozon::reporting::{
     collector_service::{ReportCollectorConfig, ReportCollectorMode},
     credential_bootstrap::bootstrap_report_credentials,
     ozon_performance_source::{OzonPerformanceReportSource, PerformanceClientReportTransport},
-    ozon_source::{OzonClientReportTransport, collect_complete_snapshots},
+    ozon_source::{OzonClientReportTransport, collect_complete_snapshots_extended},
     postgres_collector::PostgresSnapshotWriter,
     report_cutoff, reporting_interval,
     snapshot::Marketplace,
@@ -415,13 +415,14 @@ async fn collect_scheduled_target(
             let performance_source = OzonPerformanceReportSource::new(
                 PerformanceClientReportTransport::new(performance, performance_store),
             );
-            let advertising = performance_source
-                .collect(date)
+            let performance_facts = performance_source
+                .collect_extended(date)
                 .await
                 .map_err(|error| anyhow::anyhow!("performance_{}", error.code()))?;
-            let snapshots = collect_complete_snapshots(
+            let snapshots = collect_complete_snapshots_extended(
                 &transport,
-                advertising,
+                performance_facts.advertising,
+                performance_facts.expenses,
                 target.account_id.clone(),
                 occurrence.cutoff_at,
                 Utc::now,
@@ -547,13 +548,14 @@ async fn run_ozon_dry_run(
         let performance_source = OzonPerformanceReportSource::new(
             PerformanceClientReportTransport::new(performance, performance_store),
         );
-        let advertising = performance_source
-            .collect(date)
+        let performance_facts = performance_source
+            .collect_extended(date)
             .await
             .map_err(|error| anyhow::anyhow!("performance_{}", error.code()))?;
-        let snapshots = collect_complete_snapshots(
+        let snapshots = collect_complete_snapshots_extended(
             &transport,
-            advertising,
+            performance_facts.advertising,
+            performance_facts.expenses,
             account_id.to_owned(),
             cutoff_at,
             Utc::now,

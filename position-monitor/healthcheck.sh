@@ -42,12 +42,17 @@ SELECT
     AND to_regclass('daily_reporting.source_snapshots') IS NOT NULL
     AND to_regclass('daily_reporting.sales_facts') IS NOT NULL
     AND to_regclass('daily_reporting.advertising_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.advertising_expense_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.finance_facts') IS NOT NULL
     AND to_regclass('daily_reporting.stock_facts') IS NOT NULL
     AND to_regclass('daily_reporting.price_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.unit_economics_inputs') IS NOT NULL
     AND to_regclass('daily_reporting.collection_claims') IS NOT NULL
     AND to_regclass('daily_reporting.published_source_snapshots') IS NOT NULL
     AND to_regclass('daily_reporting.published_sales_facts') IS NOT NULL
     AND to_regclass('daily_reporting.published_advertising_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.published_advertising_expense_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.published_finance_facts') IS NOT NULL
     AND to_regclass('daily_reporting.published_stock_facts') IS NOT NULL
     AND to_regclass('daily_reporting.published_price_facts') IS NOT NULL
     AND EXISTS (

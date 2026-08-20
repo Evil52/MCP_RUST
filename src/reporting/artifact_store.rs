@@ -435,6 +435,8 @@ mod tests {
             kpis: calculate_kpis(&[], &[]).unwrap(),
             sales: vec![],
             advertising: vec![],
+            advertising_expenses: vec![],
+            finance: vec![],
             inventory: vec![InventoryReportRow {
                 account_id: "store".to_owned(),
                 sku: "10".to_owned(),

@@ -247,6 +247,8 @@ mod tests {
                 attributed_orders: 1,
                 attributed_revenue_minor: 10_000,
             }],
+            advertising_expenses: vec![],
+            finance: vec![],
             inventory: vec![InventoryReportRow {
                 account_id: "store".to_owned(),
                 sku: "10".to_owned(),

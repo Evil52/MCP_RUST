@@ -14,7 +14,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use super::postgres_collector::{
-    CollectedAdvertisingFact, CollectedPriceFact, CollectedSalesFact, CollectedStockFact,
+    CollectedAdvertisingExpenseFact, CollectedAdvertisingFact, CollectedPriceFact,
+    CollectedSalesFact, CollectedStockFact,
 };
 
 const MAX_PAGE_ROWS: usize = 1_000;
@@ -368,6 +369,13 @@ pub fn parse_performance_daily_advertising(
                 spend_minor: row.spend_minor,
                 attributed_orders: row.attributed_orders,
                 attributed_revenue_minor: row.attributed_revenue_minor,
+                basket_additions: 0,
+                model_attributed_orders: 0,
+                model_attributed_revenue_minor: 0,
+                product_price_minor: 0,
+                average_cpc_minor: None,
+                cpm_minor: None,
+                cpl_minor: None,
             })
             .collect()
     })
@@ -392,6 +400,8 @@ pub fn parse_performance_sku_advertising(
             let sku = parse_u64(field(Some(row), "sku")?)?;
             let impressions = parse_u64(field(Some(row), "views")?)?;
             let clicks = parse_u64(field(Some(row), "clicks")?)?;
+            let spend_minor = parse_performance_minor(field(Some(row), "expense")?)?;
+            let basket_additions = parse_u64(field(Some(row), "toCart")?)?;
             if campaign_id == 0 || sku == 0 || clicks > impressions {
                 return Err(OzonReportParseError::Value);
             }
@@ -401,12 +411,74 @@ pub fn parse_performance_sku_advertising(
                 sku,
                 impressions,
                 clicks,
-                spend_minor: parse_performance_minor(field(Some(row), "expense")?)?,
+                spend_minor,
                 attributed_orders: parse_u64(field(Some(row), "orders")?)?,
                 attributed_revenue_minor: parse_performance_minor(field(Some(row), "sales")?)?,
+                basket_additions,
+                model_attributed_orders: parse_u64(field(Some(row), "modelOrders")?)?,
+                model_attributed_revenue_minor: parse_performance_minor(field(
+                    Some(row),
+                    "modelSales",
+                )?)?,
+                product_price_minor: parse_performance_minor(field(Some(row), "price")?)?,
+                average_cpc_minor: Some(parse_performance_minor(field(Some(row), "avgCpc")?)?),
+                cpm_minor: per_thousand(spend_minor, impressions)?,
+                cpl_minor: per_event(spend_minor, basket_additions)?,
             })
         })
         .collect()
+}
+
+pub fn parse_performance_expenses(
+    response: &Value,
+) -> Result<Vec<CollectedAdvertisingExpenseFact>, OzonReportParseError> {
+    let rows = array_field(response, "rows")?;
+    if rows.len() > MAX_PERFORMANCE_SKU_ROWS {
+        return Err(OzonReportParseError::TooManyRows);
+    }
+    rows.iter()
+        .map(|row| {
+            let row = row.as_object().ok_or(OzonReportParseError::Shape)?;
+            let campaign_id = parse_u64(field(Some(row), "id")?)?;
+            if campaign_id == 0 {
+                return Err(OzonReportParseError::Value);
+            }
+            Ok(CollectedAdvertisingExpenseFact {
+                business_date: parse_date(field(Some(row), "date")?)?,
+                campaign_id,
+                money_spent_minor: parse_performance_minor(field(Some(row), "moneySpent")?)?,
+                bonus_spent_minor: parse_performance_minor(field(Some(row), "bonusSpent")?)?,
+                prepayment_spent_minor: parse_performance_minor(field(
+                    Some(row),
+                    "prepaymentSpent",
+                )?)?,
+            })
+        })
+        .collect()
+}
+
+fn per_thousand(amount_minor: u64, events: u64) -> Result<Option<u64>, OzonReportParseError> {
+    if events == 0 {
+        return Ok(None);
+    }
+    let value = u128::from(amount_minor)
+        .checked_mul(1_000)
+        .and_then(|value| value.checked_add(u128::from(events / 2)))
+        .ok_or(OzonReportParseError::Value)?
+        / u128::from(events);
+    u64::try_from(value)
+        .map(Some)
+        .map_err(|_| OzonReportParseError::Value)
+}
+
+fn per_event(amount_minor: u64, events: u64) -> Result<Option<u64>, OzonReportParseError> {
+    if events == 0 {
+        return Ok(None);
+    }
+    let value = (u128::from(amount_minor) + u128::from(events / 2)) / u128::from(events);
+    u64::try_from(value)
+        .map(Some)
+        .map_err(|_| OzonReportParseError::Value)
 }
 
 fn invalid_cursor(cursor: &str) -> bool {
@@ -628,12 +700,31 @@ mod tests {
         let sku_performance = parse_performance_sku_advertising(&json!({"rows": [{
             "campaignId": "35751912", "sku": "123", "date": "2026-08-16",
             "views": "3764", "clicks": "126", "expense": "701,78",
-            "orders": "4", "sales": "4321.09"
+            "orders": "4", "sales": "4321.09", "toCart": "21",
+            "modelOrders": "6", "modelSales": "5000,00",
+            "price": "1234,56", "avgCpc": "5,57"
         }]}))
         .unwrap();
         assert_eq!(sku_performance[0].sku, 123);
         assert_eq!(sku_performance[0].spend_minor, 70_178);
         assert_eq!(sku_performance[0].attributed_revenue_minor, 432_109);
+        assert_eq!(sku_performance[0].basket_additions, 21);
+        assert_eq!(sku_performance[0].model_attributed_orders, 6);
+        assert_eq!(sku_performance[0].model_attributed_revenue_minor, 500_000);
+        assert_eq!(sku_performance[0].product_price_minor, 123_456);
+        assert_eq!(sku_performance[0].average_cpc_minor, Some(557));
+        assert_eq!(sku_performance[0].cpm_minor, Some(18_645));
+        assert_eq!(sku_performance[0].cpl_minor, Some(3_342));
+
+        let expenses = parse_performance_expenses(&json!({"rows": [{
+            "id": "35751912", "date": "2026-08-16",
+            "moneySpent": "701,78", "bonusSpent": "20,10",
+            "prepaymentSpent": "650,00", "title": "Реклама с Тёмой"
+        }]}))
+        .unwrap();
+        assert_eq!(expenses[0].money_spent_minor, 70_178);
+        assert_eq!(expenses[0].bonus_spent_minor, 2_010);
+        assert_eq!(expenses[0].prepayment_spent_minor, 65_000);
 
         let fbo = parse_warehouse_stock_page(
             &json!({"products": [{
@@ -908,7 +999,9 @@ mod tests {
 
         let valid_sku_row = json!({
             "campaignId":"1", "sku":"2", "date":"2026-08-16",
-            "views":"1", "clicks":"1", "expense":"0", "orders":"0", "sales":"0"
+            "views":"1", "clicks":"1", "expense":"0", "orders":"0", "sales":"0",
+            "toCart":"0", "modelOrders":"0", "modelSales":"0",
+            "price":"0", "avgCpc":"0"
         });
         let large_valid_response = json!({"rows": vec![valid_sku_row; MAX_PAGE_ROWS + 1]});
         assert_eq!(
@@ -923,6 +1016,48 @@ mod tests {
             ),
             Err(OzonReportParseError::TooManyRows)
         );
+
+        let sku_row = |campaign_id: Value, sku: Value, views: Value, clicks: Value| {
+            json!({
+                "campaignId":campaign_id, "sku":sku, "date":"2026-08-16",
+                "views":views, "clicks":clicks, "expense":"0", "orders":"0",
+                "sales":"0", "toCart":"0", "modelOrders":"0", "modelSales":"0",
+                "price":"0", "avgCpc":"0"
+            })
+        };
+        for row in [
+            sku_row(json!(0), json!(2), json!(1), json!(1)),
+            sku_row(json!(1), json!(0), json!(1), json!(1)),
+            sku_row(json!(1), json!(2), json!(1), json!(2)),
+        ] {
+            assert_eq!(
+                parse_performance_sku_advertising(&json!({"rows":[row]})),
+                Err(OzonReportParseError::Value)
+            );
+        }
+        let zero_events = parse_performance_sku_advertising(&json!({
+            "rows":[sku_row(json!(1), json!(2), json!(0), json!(0))]
+        }))
+        .unwrap();
+        assert_eq!(zero_events[0].cpm_minor, None);
+        assert_eq!(zero_events[0].cpl_minor, None);
+
+        let mut invalid_model_sales = sku_row(json!(1), json!(2), json!(1), json!(1));
+        invalid_model_sales["modelSales"] = json!("invalid");
+        assert!(parse_performance_sku_advertising(&json!({"rows":[invalid_model_sales]})).is_err());
+
+        assert_eq!(
+            parse_performance_expenses(
+                &json!({"rows": vec![Value::Null; MAX_PERFORMANCE_SKU_ROWS + 1]})
+            ),
+            Err(OzonReportParseError::TooManyRows)
+        );
+        for row in [
+            json!({"id":0, "date":"2026-08-16", "moneySpent":"0", "bonusSpent":"0", "prepaymentSpent":"0"}),
+            json!({"id":1, "date":"2026-08-16", "moneySpent":"0", "bonusSpent":"0", "prepaymentSpent":"invalid"}),
+        ] {
+            assert!(parse_performance_expenses(&json!({"rows":[row]})).is_err());
+        }
     }
 
     #[test]

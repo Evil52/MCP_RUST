@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 
 use super::{
     kpi::{AdvertisingMetricInput, KpiError, KpiSummary, SalesMetricInput, calculate_kpis},
-    postgres_snapshot::{PublishedReportFacts, PublishedSalesFact},
+    postgres_snapshot::{
+        PublishedAdvertisingExpenseFact, PublishedFinanceFact, PublishedReportFacts,
+        PublishedSalesFact,
+    },
     snapshot::{FrozenSnapshotManifest, SnapshotQuality, SnapshotSource},
     xlsx::{AdvertisingDetail, InventoryDetail, SalesDetail, SourceQualityDetail},
 };
@@ -57,6 +60,8 @@ pub struct ReportDataset {
     pub kpis: KpiSummary,
     pub sales: Vec<SalesReportRow>,
     pub advertising: Vec<AdvertisingReportRow>,
+    pub advertising_expenses: Vec<PublishedAdvertisingExpenseFact>,
+    pub finance: Vec<PublishedFinanceFact>,
     pub inventory: Vec<InventoryReportRow>,
     pub source_quality: Vec<SourceQualityRow>,
 }
@@ -90,6 +95,13 @@ impl ReportDataset {
                     .iter()
                     .map(|fact| fact.account_id.as_str()),
             )
+            .chain(
+                facts
+                    .advertising_expenses
+                    .iter()
+                    .map(|fact| fact.account_id.as_str()),
+            )
+            .chain(facts.finance.iter().map(|fact| fact.account_id.as_str()))
             .chain(facts.stocks.iter().map(|fact| fact.account_id.as_str()))
             .chain(facts.prices.iter().map(|fact| fact.account_id.as_str()))
             .any(|account| !expected_accounts.contains(account))
@@ -113,6 +125,8 @@ impl ReportDataset {
         )
         .map_err(map_kpi)?;
 
+        let advertising_expenses = facts.advertising_expenses;
+        let finance = facts.finance;
         let mut sales = BTreeMap::new();
         for fact in facts.sales {
             let row = sales.entry((fact.account_id, fact.sku)).or_insert((
@@ -231,6 +245,8 @@ impl ReportDataset {
             kpis,
             sales,
             advertising,
+            advertising_expenses,
+            finance,
             inventory,
             source_quality,
         })
@@ -310,6 +326,7 @@ fn validate_row_counts(
         .sales
         .len()
         .checked_add(facts.advertising.len())
+        .and_then(|value| value.checked_add(facts.finance.len()))
         .and_then(|value| value.checked_add(facts.stocks.len()))
         .and_then(|value| value.checked_add(facts.prices.len()))
         .ok_or(DatasetError::Overflow)?;
@@ -325,6 +342,7 @@ fn validate_row_counts(
     if total_rows > MAX_DATASET_ROWS
         || expected_rows(SnapshotSource::Sales) != Some(facts.sales.len())
         || expected_rows(SnapshotSource::Advertising) != Some(facts.advertising.len())
+        || expected_rows(SnapshotSource::Finance) != Some(facts.finance.len())
         || expected_rows(SnapshotSource::Stocks) != Some(facts.stocks.len())
         || expected_rows(SnapshotSource::Prices) != Some(facts.prices.len())
     {
@@ -366,13 +384,14 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap()
     }
 
-    fn manifest_with_counts(accounts: &[&str], counts: [u32; 4]) -> FrozenSnapshotManifest {
+    fn manifest_with_counts(accounts: &[&str], counts: [u32; 5]) -> FrozenSnapshotManifest {
         let mut id = 1;
         let mut snapshots = Vec::new();
         for account in accounts {
             for (source_index, source) in [
                 SnapshotSource::Sales,
                 SnapshotSource::Advertising,
+                SnapshotSource::Finance,
                 SnapshotSource::Stocks,
                 SnapshotSource::Prices,
             ]
@@ -380,12 +399,14 @@ mod tests {
             .enumerate()
             {
                 let source_as_of = cutoff() - Duration::minutes(30);
-                let (start, end) =
-                    if matches!(source, SnapshotSource::Sales | SnapshotSource::Advertising) {
-                        (cutoff() - Duration::days(1), cutoff())
-                    } else {
-                        (source_as_of, source_as_of)
-                    };
+                let (start, end) = if matches!(
+                    source,
+                    SnapshotSource::Sales | SnapshotSource::Advertising | SnapshotSource::Finance
+                ) {
+                    (cutoff() - Duration::days(1), cutoff())
+                } else {
+                    (source_as_of, source_as_of)
+                };
                 snapshots.push(
                     SnapshotDescriptor::new(
                         id,
@@ -417,7 +438,7 @@ mod tests {
     }
 
     fn manifest(accounts: &[&str]) -> FrozenSnapshotManifest {
-        manifest_with_counts(accounts, [1, 1, 1, 1])
+        manifest_with_counts(accounts, [1, 1, 0, 1, 1])
     }
 
     fn facts(account: &str) -> PublishedReportFacts {
@@ -441,7 +462,16 @@ mod tests {
                 spend_minor: 1_000,
                 attributed_orders: 1,
                 attributed_revenue_minor: 10_000,
+                basket_additions: 2,
+                model_attributed_orders: 1,
+                model_attributed_revenue_minor: 10_000,
+                product_price_minor: 10_000,
+                average_cpc_minor: Some(100),
+                cpm_minor: Some(10_000),
+                cpl_minor: Some(500),
             }],
+            advertising_expenses: vec![],
+            finance: vec![],
             stocks: vec![PublishedStockFact {
                 account_id: account.to_owned(),
                 sku: 10,
@@ -462,6 +492,25 @@ mod tests {
     #[test]
     fn dataset_aggregates_rows_and_produces_renderer_views() {
         let mut input = facts("store");
+        input
+            .advertising_expenses
+            .push(PublishedAdvertisingExpenseFact {
+                account_id: "store".to_owned(),
+                business_date: cutoff().date_naive(),
+                campaign_id: 20,
+                money_spent_minor: 1_000,
+                bonus_spent_minor: 100,
+                prepayment_spent_minor: 900,
+            });
+        input.finance.push(PublishedFinanceFact {
+            account_id: "store".to_owned(),
+            business_date: cutoff().date_naive(),
+            sku: Some(10),
+            category: crate::reporting::postgres_collector::FinanceCategory::Sale,
+            amount_minor: 20_000,
+            line_count: 1,
+            unknown_type_count: 0,
+        });
         input.sales.push(PublishedSalesFact {
             ordered_units: 3,
             operational_gmv_minor: 30_000,
@@ -475,9 +524,11 @@ mod tests {
             observed_at: cutoff() - Duration::minutes(5),
             ..input.stocks[0].clone()
         });
-        let dataset =
-            ReportDataset::from_published(&manifest_with_counts(&["store"], [2, 1, 2, 1]), input)
-                .unwrap();
+        let dataset = ReportDataset::from_published(
+            &manifest_with_counts(&["store"], [2, 1, 1, 2, 1]),
+            input,
+        )
+        .unwrap();
         assert_eq!(dataset.kpis.ordered_units, 5);
         assert_eq!(dataset.sales[0].operational_gmv_minor, 50_000);
         assert_eq!(dataset.inventory[0].sellable_stock, 7);
@@ -490,7 +541,9 @@ mod tests {
         assert_eq!(dataset.sales_details()[0].sku, "10");
         assert_eq!(dataset.advertising_details()[0].campaign_id, "20");
         assert_eq!(dataset.inventory_details()[0].sellable_stock, 7);
-        assert_eq!(dataset.quality_details().len(), 4);
+        assert_eq!(dataset.quality_details().len(), 5);
+        assert_eq!(dataset.advertising_expenses.len(), 1);
+        assert_eq!(dataset.finance.len(), 1);
     }
 
     #[test]
@@ -507,9 +560,11 @@ mod tests {
     fn price_only_inventory_does_not_claim_a_stock_observation() {
         let mut input = facts("store");
         input.stocks.clear();
-        let dataset =
-            ReportDataset::from_published(&manifest_with_counts(&["store"], [1, 1, 0, 1]), input)
-                .unwrap();
+        let dataset = ReportDataset::from_published(
+            &manifest_with_counts(&["store"], [1, 1, 0, 0, 1]),
+            input,
+        )
+        .unwrap();
         assert_eq!(dataset.inventory.len(), 1);
         assert!(!dataset.inventory[0].stock_observed);
         assert_eq!(dataset.inventory[0].sellable_stock, 0);
@@ -541,7 +596,7 @@ mod tests {
             .push(duplicate_price.prices[0].clone());
         assert_eq!(
             ReportDataset::from_published(
-                &manifest_with_counts(&["store"], [1, 1, 1, 2]),
+                &manifest_with_counts(&["store"], [1, 1, 0, 1, 2]),
                 duplicate_price
             ),
             Err(DatasetError::InvalidFacts)
@@ -562,7 +617,7 @@ mod tests {
         excessive.sales = vec![excessive.sales[0].clone(); MAX_DATASET_ROWS + 1];
         assert_eq!(
             validate_row_counts(
-                &manifest_with_counts(&["store"], [MAX_DATASET_ROWS as u32 + 1, 1, 1, 1]),
+                &manifest_with_counts(&["store"], [MAX_DATASET_ROWS as u32 + 1, 1, 0, 1, 1],),
                 &excessive
             ),
             Err(DatasetError::InvalidFacts)

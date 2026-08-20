@@ -647,6 +647,7 @@ fn source_text(source: SnapshotSource) -> &'static str {
     match source {
         SnapshotSource::Sales => "Продажи",
         SnapshotSource::Advertising => "Реклама",
+        SnapshotSource::Finance => "Финансы",
         SnapshotSource::Stocks => "Остатки",
         SnapshotSource::Prices => "Цены",
     }
@@ -708,6 +709,7 @@ mod tests {
     fn kpis() -> KpiSummary {
         KpiSummary {
             ordered_units: 10,
+            realized_units: Some(7),
             operational_gmv_minor: 100_000,
             cancelled_units: Some(1),
             returned_units: Some(2),
@@ -721,6 +723,7 @@ mod tests {
             ad_conversion: Some(BasisPoints(1_000)),
             cpo_minor: Some(5_000),
             drr: Some(BasisPoints(2_000)),
+            buyout_rate: Some(BasisPoints(7_000)),
         }
     }
 

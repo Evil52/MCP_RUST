@@ -27,6 +27,8 @@ pub struct BasisPoints(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KpiSummary {
     pub ordered_units: u64,
+    /// Orders left after known cancellations and returns.
+    pub realized_units: Option<u64>,
     pub operational_gmv_minor: u64,
     pub cancelled_units: Option<u64>,
     pub returned_units: Option<u64>,
@@ -40,6 +42,7 @@ pub struct KpiSummary {
     pub ad_conversion: Option<BasisPoints>,
     pub cpo_minor: Option<u64>,
     pub drr: Option<BasisPoints>,
+    pub buyout_rate: Option<BasisPoints>,
 }
 
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +59,7 @@ pub fn calculate_kpis(
 ) -> Result<KpiSummary, KpiError> {
     let mut summary = KpiSummary {
         ordered_units: 0,
+        realized_units: None,
         operational_gmv_minor: 0,
         cancelled_units: Some(0),
         returned_units: Some(0),
@@ -69,6 +73,7 @@ pub fn calculate_kpis(
         ad_conversion: None,
         cpo_minor: None,
         drr: None,
+        buyout_rate: None,
     };
 
     for input in sales {
@@ -100,6 +105,16 @@ pub fn calculate_kpis(
     summary.ad_conversion = percentage(summary.attributed_orders, summary.ad_clicks)?;
     summary.cpo_minor = per_event(summary.ad_spend_minor, summary.attributed_orders);
     summary.drr = percentage(summary.ad_spend_minor, summary.attributed_revenue_minor)?;
+    summary.realized_units = match (summary.cancelled_units, summary.returned_units) {
+        (Some(cancelled), Some(returned)) => cancelled
+            .checked_add(returned)
+            .and_then(|rejected| summary.ordered_units.checked_sub(rejected)),
+        _ => None,
+    };
+    summary.buyout_rate = match summary.realized_units {
+        Some(realized) => percentage(realized, summary.ordered_units)?,
+        None => None,
+    };
     Ok(summary)
 }
 

@@ -918,6 +918,20 @@ fn optional_price_minor(
     }
 }
 
+/// Reads one money field under the Ozon convention that a zero amount means
+/// "not set" rather than a real price of nothing.
+///
+/// `old_price`, `marketing_seller_price` and `marketing_price` are all returned
+/// as `0` when the corresponding price does not exist, and a listed product
+/// never has a genuine seller price of zero. Reporting `"0.00"` would put a
+/// fabricated list price into column O and break the documented O − U formula.
+fn optional_positive_price_minor(
+    price: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    Ok(optional_price_minor(price, field)?.filter(|amount| *amount > 0))
+}
+
 fn optional_string_field(
     object: &serde_json::Map<String, Value>,
     field: &str,
@@ -1016,11 +1030,10 @@ fn normalize_live_prices(result: OzonResult) -> Result<OzonLivePricesResult, Str
                 .get("price")
                 .and_then(Value::as_object)
                 .ok_or_else(|| price_normalization_error("товар Ozon не содержит объект price"))?;
-            let list_price = optional_price_minor(price, "old_price")?;
-            let seller_price = optional_price_minor(price, "price")?;
-            let action_price = optional_price_minor(price, "marketing_seller_price")?;
-            let buyer_price = optional_price_minor(price, "marketing_price")?
-                .filter(|buyer_price| *buyer_price > 0);
+            let list_price = optional_positive_price_minor(price, "old_price")?;
+            let seller_price = optional_positive_price_minor(price, "price")?;
+            let action_price = optional_positive_price_minor(price, "marketing_seller_price")?;
+            let buyer_price = optional_positive_price_minor(price, "marketing_price")?;
             let discount = list_price
                 .zip(buyer_price)
                 .and_then(|(list_price, buyer_price)| list_price.checked_sub(buyer_price));
@@ -6150,6 +6163,53 @@ mod tests {
         );
     }
 
+    /// Ozon returns `0` for a price that does not exist. Reporting it as
+    /// `"0.00"` fabricates a list price and makes the published
+    /// `buyer_price = list − discount` formula untrue for that row.
+    #[test]
+    fn live_prices_treat_a_zero_amount_as_an_absent_price() {
+        let result = normalize_test_prices(json!({
+            "items": [{
+                "offer_id": "offer-zero",
+                "price": {
+                    "currency_code": "RUB",
+                    "old_price": 0,
+                    "price": "0.00",
+                    "marketing_seller_price": "0",
+                    "marketing_price": 0
+                }
+            }]
+        }));
+
+        let item = &result.items[0];
+        assert_eq!(item.list_price_before_discount_rub, None);
+        assert_eq!(item.seller_current_price_rub, None);
+        assert_eq!(item.action_or_strategy_price_rub, None);
+        assert_eq!(item.buyer_price_with_spp_rub, None);
+        assert_eq!(item.discount_with_promotion_rub, None);
+        assert_eq!(
+            item.spp_price_availability,
+            OzonSppPriceAvailability::Unavailable
+        );
+
+        // A zero old price must not silently suppress a real buyer price.
+        let partial = normalize_test_prices(json!({
+            "items": [{
+                "offer_id": "offer-mixed",
+                "price": {"old_price": 0, "price": 1214, "marketing_price": 504}
+            }]
+        }));
+        let item = &partial.items[0];
+        assert_eq!(item.list_price_before_discount_rub, None);
+        assert_eq!(item.seller_current_price_rub.as_deref(), Some("1214.00"));
+        assert_eq!(item.buyer_price_with_spp_rub.as_deref(), Some("504.00"));
+        assert_eq!(item.discount_with_promotion_rub, None);
+        assert_eq!(
+            item.spp_price_availability,
+            OzonSppPriceAvailability::LegacyMarketingPrice
+        );
+    }
+
     #[test]
     fn live_price_normalization_rejects_every_ambiguous_wire_shape() {
         for value in [json!(true), json!(""), json!("-1"), json!("1.234")] {
@@ -10049,6 +10109,9 @@ mod tests {
         }
 
         let dev_tools = server().tool_router.list_all();
+        // The release checklist in `SECURITY.md` states this count verbatim.
+        // Changing it here without updating that gate leaves the gate
+        // describing a router that no longer exists.
         assert_eq!(dev_tools.len(), 68);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
@@ -14105,11 +14168,11 @@ mod tests {
         );
         assert_eq!(
             captured[6].lines().next().unwrap(),
-            "GET /api/client/statistics/daily?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
+            "GET /api/client/statistics/daily/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
         );
         assert_eq!(
             captured[7].lines().next().unwrap(),
-            "GET /api/client/statistics/expense?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
+            "GET /api/client/statistics/expense/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1"
         );
         assert!(requests.try_recv().is_err());
     }
@@ -14936,7 +14999,7 @@ mod tests {
             .unwrap();
         assert!(daily_error.contains("kind=rate_limited"), "{daily_error}");
         assert!(
-            daily_error.contains("endpoint=/api/client/statistics/daily"),
+            daily_error.contains("endpoint=/api/client/statistics/daily/json"),
             "{daily_error}"
         );
 
@@ -14958,7 +15021,7 @@ mod tests {
             "{expenses_error}"
         );
         assert!(
-            expenses_error.contains("endpoint=/api/client/statistics/expense"),
+            expenses_error.contains("endpoint=/api/client/statistics/expense/json"),
             "{expenses_error}"
         );
 

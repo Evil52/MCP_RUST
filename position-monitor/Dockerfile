@@ -15,6 +15,9 @@ COPY --chmod=0644 initdb/011_daily_reporting_collection_claims.sql /docker-entry
 COPY --chmod=0644 initdb/012_daily_reporting_delivery_error_classes.sql /docker-entrypoint-initdb.d/012_daily_reporting_delivery_error_classes.sql
 COPY --chmod=0644 initdb/013_daily_reporting_delivery_reconciliation.sql /docker-entrypoint-initdb.d/013_daily_reporting_delivery_reconciliation.sql
 COPY --chmod=0644 initdb/014_daily_reporting_period_preserving_catchup.sql /docker-entrypoint-initdb.d/014_daily_reporting_period_preserving_catchup.sql
+COPY --chmod=0644 initdb/015_daily_reporting_ozon_finance.sql /docker-entrypoint-initdb.d/015_daily_reporting_ozon_finance.sql
+COPY --chmod=0644 initdb/016_daily_reporting_unit_economics.sql /docker-entrypoint-initdb.d/016_daily_reporting_unit_economics.sql
+COPY --chmod=0644 initdb/017_daily_reporting_advertising_extensions.sql /docker-entrypoint-initdb.d/017_daily_reporting_advertising_extensions.sql
 COPY --chmod=0755 healthcheck.sh /usr/local/bin/position-db-healthcheck
 
 # This image always runs as postgres, so the root-only privilege-drop helper is

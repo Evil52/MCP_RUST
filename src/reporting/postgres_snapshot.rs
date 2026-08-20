@@ -5,6 +5,7 @@ use tokio_postgres::{Client, Config};
 
 use crate::postgres::SupervisedClient;
 
+use super::postgres_collector::FinanceCategory;
 use super::snapshot::{
     AccountScope, FrozenSnapshotManifest, Marketplace, SnapshotDescriptor, SnapshotSource,
     SnapshotStatus,
@@ -35,6 +36,34 @@ pub struct PublishedAdvertisingFact {
     pub spend_minor: u64,
     pub attributed_orders: u64,
     pub attributed_revenue_minor: u64,
+    pub basket_additions: u64,
+    pub model_attributed_orders: u64,
+    pub model_attributed_revenue_minor: u64,
+    pub product_price_minor: u64,
+    pub average_cpc_minor: Option<u64>,
+    pub cpm_minor: Option<u64>,
+    pub cpl_minor: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedAdvertisingExpenseFact {
+    pub account_id: String,
+    pub business_date: NaiveDate,
+    pub campaign_id: u64,
+    pub money_spent_minor: u64,
+    pub bonus_spent_minor: u64,
+    pub prepayment_spent_minor: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedFinanceFact {
+    pub account_id: String,
+    pub business_date: NaiveDate,
+    pub sku: Option<u64>,
+    pub category: FinanceCategory,
+    pub amount_minor: i64,
+    pub line_count: u64,
+    pub unknown_type_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +88,8 @@ pub struct PublishedPriceFact {
 pub struct PublishedReportFacts {
     pub sales: Vec<PublishedSalesFact>,
     pub advertising: Vec<PublishedAdvertisingFact>,
+    pub advertising_expenses: Vec<PublishedAdvertisingExpenseFact>,
+    pub finance: Vec<PublishedFinanceFact>,
     pub stocks: Vec<PublishedStockFact>,
     pub prices: Vec<PublishedPriceFact>,
 }
@@ -110,6 +141,10 @@ impl PostgresSnapshotRepository {
                         'daily_reporting.published_sales_facts', 'SELECT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.published_advertising_facts', 'SELECT') \
+                    AND has_table_privilege(current_user, \
+                        'daily_reporting.published_advertising_expense_facts', 'SELECT') \
+                    AND has_table_privilege(current_user, \
+                        'daily_reporting.published_finance_facts', 'SELECT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.published_stock_facts', 'SELECT') \
                     AND has_table_privilege(current_user, \
@@ -217,10 +252,36 @@ impl PostgresSnapshotRepository {
         let advertising_rows = client
             .query(
                 "SELECT account_id, business_date, campaign_id, sku, impressions, clicks, \
-                        spend_minor, attributed_orders, attributed_revenue_minor \
+                        spend_minor, attributed_orders, attributed_revenue_minor, \
+                        basket_additions, model_attributed_orders, \
+                        model_attributed_revenue_minor, product_price_minor, \
+                        average_cpc_minor, cpm_minor, cpl_minor \
                  FROM daily_reporting.published_advertising_facts \
                  WHERE snapshot_id = ANY($1::bigint[]) \
                  ORDER BY account_id, business_date, campaign_id, sku",
+                &[&snapshot_ids],
+            )
+            .await
+            .map_err(|_| PostgresSnapshotError::Unavailable)?;
+        let advertising_expense_rows = client
+            .query(
+                "SELECT account_id, business_date, campaign_id, money_spent_minor, \
+                        bonus_spent_minor, prepayment_spent_minor \
+                 FROM daily_reporting.published_advertising_expense_facts \
+                 WHERE snapshot_id = ANY($1::bigint[]) \
+                 ORDER BY account_id, business_date, campaign_id",
+                &[&snapshot_ids],
+            )
+            .await
+            .map_err(|_| PostgresSnapshotError::Unavailable)?;
+        validate_fact_row_limit(advertising_expense_rows.len())?;
+        let finance_rows = client
+            .query(
+                "SELECT account_id, business_date, sku, category, amount_minor, \
+                        line_count, unknown_type_count \
+                 FROM daily_reporting.published_finance_facts \
+                 WHERE snapshot_id = ANY($1::bigint[]) \
+                 ORDER BY account_id, business_date, sku NULLS FIRST, category",
                 &[&snapshot_ids],
             )
             .await
@@ -249,6 +310,7 @@ impl PostgresSnapshotRepository {
         let actual_total = sales_rows
             .len()
             .checked_add(advertising_rows.len())
+            .and_then(|value| value.checked_add(finance_rows.len()))
             .and_then(|value| value.checked_add(stock_rows.len()))
             .and_then(|value| value.checked_add(price_rows.len()))
             .ok_or(PostgresSnapshotError::InvalidManifest)?;
@@ -280,6 +342,52 @@ impl PostgresSnapshotRepository {
                     spend_minor: nonnegative_i64(row.get(6))?,
                     attributed_orders: nonnegative_i32(row.get(7))?,
                     attributed_revenue_minor: nonnegative_i64(row.get(8))?,
+                    basket_additions: nonnegative_i32(row.get(9))?,
+                    model_attributed_orders: nonnegative_i32(row.get(10))?,
+                    model_attributed_revenue_minor: nonnegative_i64(row.get(11))?,
+                    product_price_minor: nonnegative_i64(row.get(12))?,
+                    average_cpc_minor: row
+                        .get::<_, Option<i64>>(13)
+                        .map(nonnegative_i64)
+                        .transpose()?,
+                    cpm_minor: row
+                        .get::<_, Option<i64>>(14)
+                        .map(nonnegative_i64)
+                        .transpose()?,
+                    cpl_minor: row
+                        .get::<_, Option<i64>>(15)
+                        .map(nonnegative_i64)
+                        .transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, PostgresSnapshotError>>()?;
+        let advertising_expenses = advertising_expense_rows
+            .into_iter()
+            .map(|row| {
+                Ok(PublishedAdvertisingExpenseFact {
+                    account_id: checked_account(row.get(0), &expected_accounts)?,
+                    business_date: row.get(1),
+                    campaign_id: nonnegative_i64(row.get(2))?,
+                    money_spent_minor: nonnegative_i64(row.get(3))?,
+                    bonus_spent_minor: nonnegative_i64(row.get(4))?,
+                    prepayment_spent_minor: nonnegative_i64(row.get(5))?,
+                })
+            })
+            .collect::<Result<Vec<_>, PostgresSnapshotError>>()?;
+        let finance = finance_rows
+            .into_iter()
+            .map(|row| {
+                Ok(PublishedFinanceFact {
+                    account_id: checked_account(row.get(0), &expected_accounts)?,
+                    business_date: row.get(1),
+                    sku: row
+                        .get::<_, Option<i64>>(2)
+                        .map(nonnegative_i64)
+                        .transpose()?,
+                    category: parse_finance_category(row.get(3))?,
+                    amount_minor: row.get(4),
+                    line_count: nonnegative_i32(row.get(5))?,
+                    unknown_type_count: nonnegative_i32(row.get(6))?,
                 })
             })
             .collect::<Result<Vec<_>, PostgresSnapshotError>>()?;
@@ -313,6 +421,8 @@ impl PostgresSnapshotRepository {
         Ok(PublishedReportFacts {
             sales,
             advertising,
+            advertising_expenses,
+            finance,
             stocks,
             prices,
         })
@@ -374,8 +484,25 @@ fn parse_source(value: &str) -> Result<SnapshotSource, PostgresSnapshotError> {
     match value {
         "sales" => Ok(SnapshotSource::Sales),
         "advertising" => Ok(SnapshotSource::Advertising),
+        "finance" => Ok(SnapshotSource::Finance),
         "stocks" => Ok(SnapshotSource::Stocks),
         "prices" => Ok(SnapshotSource::Prices),
+        _ => Err(PostgresSnapshotError::InvalidManifest),
+    }
+}
+
+fn parse_finance_category(value: &str) -> Result<FinanceCategory, PostgresSnapshotError> {
+    match value {
+        "sale" => Ok(FinanceCategory::Sale),
+        "commission" => Ok(FinanceCategory::Commission),
+        "acquiring" => Ok(FinanceCategory::Acquiring),
+        "logistics" => Ok(FinanceCategory::Logistics),
+        "storage" => Ok(FinanceCategory::Storage),
+        "paid_acceptance" => Ok(FinanceCategory::PaidAcceptance),
+        "compensation" => Ok(FinanceCategory::Compensation),
+        "marketplace_discount" => Ok(FinanceCategory::MarketplaceDiscount),
+        "advertising" => Ok(FinanceCategory::Advertising),
+        "other" => Ok(FinanceCategory::Other),
         _ => Err(PostgresSnapshotError::InvalidManifest),
     }
 }
@@ -391,9 +518,10 @@ fn parse_status(value: &str) -> Result<SnapshotStatus, PostgresSnapshotError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_REPORT_FACT_ROWS, Marketplace, PostgresSnapshotError, SnapshotSource, SnapshotStatus,
-        checked_account, nonnegative_i32, nonnegative_i64, parse_marketplace, parse_source,
-        parse_status, validate_actual_total, validate_fact_row_limit,
+        FinanceCategory, MAX_REPORT_FACT_ROWS, Marketplace, PostgresSnapshotError, SnapshotSource,
+        SnapshotStatus, checked_account, nonnegative_i32, nonnegative_i64, parse_finance_category,
+        parse_marketplace, parse_source, parse_status, validate_actual_total,
+        validate_fact_row_limit,
     };
 
     #[test]
@@ -405,6 +533,7 @@ mod tests {
         );
         assert_eq!(parse_source("sales"), Ok(SnapshotSource::Sales));
         assert_eq!(parse_source("advertising"), Ok(SnapshotSource::Advertising));
+        assert_eq!(parse_source("finance"), Ok(SnapshotSource::Finance));
         assert_eq!(parse_source("stocks"), Ok(SnapshotSource::Stocks));
         assert_eq!(parse_source("prices"), Ok(SnapshotSource::Prices));
         assert_eq!(parse_status("succeeded"), Ok(SnapshotStatus::Succeeded));
@@ -417,6 +546,24 @@ mod tests {
             };
             assert_eq!(error, Err(PostgresSnapshotError::InvalidManifest));
         }
+        for (raw, expected) in [
+            ("sale", FinanceCategory::Sale),
+            ("commission", FinanceCategory::Commission),
+            ("acquiring", FinanceCategory::Acquiring),
+            ("logistics", FinanceCategory::Logistics),
+            ("storage", FinanceCategory::Storage),
+            ("paid_acceptance", FinanceCategory::PaidAcceptance),
+            ("compensation", FinanceCategory::Compensation),
+            ("marketplace_discount", FinanceCategory::MarketplaceDiscount),
+            ("advertising", FinanceCategory::Advertising),
+            ("other", FinanceCategory::Other),
+        ] {
+            assert_eq!(parse_finance_category(raw), Ok(expected));
+        }
+        assert_eq!(
+            parse_finance_category("unknown"),
+            Err(PostgresSnapshotError::InvalidManifest)
+        );
     }
 
     #[test]

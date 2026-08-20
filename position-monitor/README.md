@@ -236,12 +236,22 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
   sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
   < position-monitor/initdb/014_daily_reporting_period_preserving_catchup.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/015_daily_reporting_ozon_finance.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/016_daily_reporting_unit_economics.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/017_daily_reporting_advertising_extensions.sql
 ```
 
 The migrations are transactional. The final claim migration gives each exact
 account/marketplace/cutoff a fifteen-minute lease with a monotonically
 increasing fencing generation. New source snapshots must carry the live claim,
-and completion of all four sources is atomic. Existing published snapshots
+and completion of all required sources is atomic (five for Ozon, four for
+Wildberries). Existing published snapshots
 remain readable without rewriting their provenance. The explicit canary
 collectors resolve only the claimed account's marketplace credentials after
 claim acquisition; a busy or completed claim reads no marketplace secret. The

@@ -22,9 +22,11 @@ use super::{
         parse_sales_page, parse_warehouse_stock_page, product_page_request, sales_request,
         warehouse_stock_page_request,
     },
+    ozon_finance_source::collect_finance_facts,
     postgres_collector::{
-        CollectedAdvertisingFact, CollectedFacts, CollectedPriceFact, CollectedSalesFact,
-        CollectedSnapshot, CollectedStockFact, PostgresCollectorError,
+        CollectedAdvertisingExpenseFact, CollectedAdvertisingFact, CollectedFacts,
+        CollectedFinanceFact, CollectedPriceFact, CollectedSalesFact, CollectedSnapshot,
+        CollectedStockFact, PostgresCollectorError,
     },
     snapshot::{Marketplace, SnapshotStatus},
 };
@@ -71,6 +73,35 @@ pub async fn collect_complete_snapshots<F>(
 where
     F: FnOnce() -> DateTime<Utc>,
 {
+    collect_complete_snapshots_extended(
+        transport,
+        advertising,
+        Vec::new(),
+        account_id,
+        cutoff_at,
+        completed_at,
+        sales_period_start,
+        sales_period_end,
+        collector_version,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn collect_complete_snapshots_extended<F>(
+    transport: &dyn OzonReportTransport,
+    advertising: Vec<CollectedAdvertisingFact>,
+    advertising_expenses: Vec<CollectedAdvertisingExpenseFact>,
+    account_id: String,
+    cutoff_at: DateTime<Utc>,
+    completed_at: F,
+    sales_period_start: DateTime<Utc>,
+    sales_period_end: DateTime<Utc>,
+    collector_version: String,
+) -> Result<Vec<CollectedSnapshot>, OzonReportSourceError>
+where
+    F: FnOnce() -> DateTime<Utc>,
+{
     let source = OzonReportSource::new(transport);
     let (date_from, date_to) = report_business_dates(sales_period_start, sales_period_end)?;
     let facts = source
@@ -78,8 +109,9 @@ where
         .await?;
     let source_as_of = completed_at();
     let snapshots = facts
-        .into_complete_snapshots(
+        .into_complete_snapshots_extended(
             advertising,
+            advertising_expenses,
             account_id,
             cutoff_at,
             source_as_of,
@@ -202,6 +234,7 @@ pub struct OzonReportSource<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OzonCollectedFacts {
     pub sales: Vec<CollectedSalesFact>,
+    pub finance: Vec<CollectedFinanceFact>,
     pub stocks: Vec<CollectedStockFact>,
     pub prices: Vec<CollectedPriceFact>,
 }
@@ -241,6 +274,18 @@ impl OzonCollectedFacts {
             collector_version.clone(),
             CollectedFacts::Stocks(self.stocks),
         )?;
+        let finance = CollectedSnapshot::new(
+            account_id.clone(),
+            Marketplace::Ozon,
+            cutoff_at,
+            source_as_of,
+            sales_period_start,
+            sales_period_end,
+            SnapshotStatus::Succeeded,
+            true,
+            collector_version.clone(),
+            CollectedFacts::Finance(self.finance),
+        )?;
         let prices = CollectedSnapshot::new(
             account_id,
             Marketplace::Ozon,
@@ -253,13 +298,37 @@ impl OzonCollectedFacts {
             collector_version,
             CollectedFacts::Prices(self.prices),
         )?;
-        Ok(vec![sales, stocks, prices])
+        Ok(vec![sales, finance, stocks, prices])
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn into_complete_snapshots(
         self,
         advertising: Vec<CollectedAdvertisingFact>,
+        account_id: String,
+        cutoff_at: DateTime<Utc>,
+        source_as_of: DateTime<Utc>,
+        sales_period_start: DateTime<Utc>,
+        sales_period_end: DateTime<Utc>,
+        collector_version: String,
+    ) -> Result<Vec<CollectedSnapshot>, PostgresCollectorError> {
+        self.into_complete_snapshots_extended(
+            advertising,
+            Vec::new(),
+            account_id,
+            cutoff_at,
+            source_as_of,
+            sales_period_start,
+            sales_period_end,
+            collector_version,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn into_complete_snapshots_extended(
+        self,
+        advertising: Vec<CollectedAdvertisingFact>,
+        advertising_expenses: Vec<CollectedAdvertisingExpenseFact>,
         account_id: String,
         cutoff_at: DateTime<Utc>,
         source_as_of: DateTime<Utc>,
@@ -278,7 +347,8 @@ impl OzonCollectedFacts {
             true,
             collector_version.clone(),
             CollectedFacts::Advertising(advertising),
-        )?;
+        )?
+        .with_advertising_expenses(advertising_expenses)?;
         let mut snapshots = self.into_snapshots(
             account_id,
             cutoff_at,
@@ -312,6 +382,8 @@ pub enum OzonReportSourceError {
     InvalidStocksResponse,
     #[error("Ozon daily-report prices response is invalid")]
     InvalidPricesResponse,
+    #[error("Ozon daily-report finance response is invalid")]
+    InvalidFinanceResponse,
     #[error("Ozon daily-report snapshot input is invalid")]
     InvalidSnapshotInput,
     #[error("Ozon daily-report source pagination exceeded its fixed bound")]
@@ -328,6 +400,7 @@ impl OzonReportSourceError {
             Self::InvalidSalesResponse { .. } => "invalid_sales_response",
             Self::InvalidStocksResponse => "invalid_stocks_response",
             Self::InvalidPricesResponse => "invalid_prices_response",
+            Self::InvalidFinanceResponse => "invalid_finance_response",
             Self::InvalidSnapshotInput => "invalid_snapshot_input",
             Self::PaginationLimit => "pagination_limit",
         }
@@ -351,10 +424,12 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         date_to: NaiveDate,
     ) -> Result<OzonCollectedFacts, OzonReportSourceError> {
         let sales = self.collect_sales_pages(date_from, date_to).await?;
+        let finance = collect_finance_facts(&self.transport, date_from, date_to).await?;
         let stocks = self.collect_stock_pages().await?;
         let prices = self.collect_price_pages().await?;
         Ok(OzonCollectedFacts {
             sales,
+            finance,
             stocks,
             prices,
         })
@@ -577,6 +652,7 @@ mod tests {
 
     use super::*;
     use crate::config::StoreCredentials;
+    use crate::reporting::postgres_collector::FinanceCategory;
 
     /// A local admission refusal never reached Ozon, so re-offering the page
     /// cannot duplicate a marketplace request. Before this, one transient
@@ -882,6 +958,8 @@ mod tests {
     async fn required_facts_are_returned_only_after_all_sources_succeed() {
         let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
             Ok(json!({"result":{"data":[]}})),
+            Ok(json!({"accrual_types":[]})),
+            Ok(json!({"accruals":[],"last_id":""})),
             Ok(json!({"products":[],"cursor":"","has_next":false})),
             Ok(json!({"products":[],"cursor":"","has_next":false})),
             Ok(json!({"items":[],"cursor":""})),
@@ -894,6 +972,7 @@ mod tests {
                 .unwrap(),
             OzonCollectedFacts {
                 sales: vec![],
+                finance: vec![],
                 stocks: vec![],
                 prices: vec![]
             }
@@ -901,9 +980,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn complete_collection_builds_four_validated_snapshots_without_database_io() {
+    async fn complete_collection_builds_five_validated_snapshots_without_database_io() {
         let transport = FixtureTransport(Mutex::new(VecDeque::from([
             Ok(json!({"result":{"data":[]}})),
+            Ok(json!({"accrual_types":[]})),
+            Ok(json!({"accruals":[],"last_id":""})),
             Ok(json!({"products":[],"cursor":"","has_next":false})),
             Ok(json!({"products":[],"cursor":"","has_next":false})),
             Ok(json!({"items":[],"cursor":""})),
@@ -921,6 +1002,13 @@ mod tests {
                 spend_minor: 100,
                 attributed_orders: 0,
                 attributed_revenue_minor: 0,
+                basket_additions: 0,
+                model_attributed_orders: 0,
+                model_attributed_revenue_minor: 0,
+                product_price_minor: 0,
+                average_cpc_minor: None,
+                cpm_minor: None,
+                cpl_minor: None,
             }],
             "ozon".to_owned(),
             as_of,
@@ -934,7 +1022,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(snapshots.len(), 4);
+        assert_eq!(snapshots.len(), 5);
     }
 
     #[tokio::test]
@@ -965,6 +1053,8 @@ mod tests {
     async fn complete_collection_refuses_an_invalid_performance_fact_atomically() {
         let transport = FixtureTransport(Mutex::new(VecDeque::from([
             Ok(json!({"result":{"data":[]}})),
+            Ok(json!({"accrual_types":[]})),
+            Ok(json!({"accruals":[],"last_id":""})),
             Ok(json!({"products":[],"cursor":"","has_next":false})),
             Ok(json!({"products":[],"cursor":"","has_next":false})),
             Ok(json!({"items":[],"cursor":""})),
@@ -983,6 +1073,13 @@ mod tests {
                     spend_minor: 0,
                     attributed_orders: 0,
                     attributed_revenue_minor: 0,
+                    basket_additions: 0,
+                    model_attributed_orders: 0,
+                    model_attributed_revenue_minor: 0,
+                    product_price_minor: 0,
+                    average_cpc_minor: None,
+                    cpm_minor: None,
+                    cpl_minor: None,
                 }],
                 "ozon".to_owned(),
                 as_of,
@@ -1009,6 +1106,7 @@ mod tests {
                 cancelled_units: Some(0),
                 returned_units: Some(0),
             }],
+            finance: vec![],
             stocks: vec![CollectedStockFact {
                 sku: 1,
                 warehouse_id: "fbo".to_owned(),
@@ -1031,7 +1129,7 @@ mod tests {
                 "test-1".to_owned(),
             )
             .unwrap();
-        assert_eq!(seller_only.len(), 3);
+        assert_eq!(seller_only.len(), 4);
         let complete = facts
             .into_complete_snapshots(
                 vec![CollectedAdvertisingFact {
@@ -1043,6 +1141,13 @@ mod tests {
                     spend_minor: 100,
                     attributed_orders: 0,
                     attributed_revenue_minor: 0,
+                    basket_additions: 0,
+                    model_attributed_orders: 0,
+                    model_attributed_revenue_minor: 0,
+                    product_price_minor: 0,
+                    average_cpc_minor: None,
+                    cpm_minor: None,
+                    cpl_minor: None,
                 }],
                 "ozon".to_owned(),
                 as_of,
@@ -1052,7 +1157,7 @@ mod tests {
                 "test-1".to_owned(),
             )
             .unwrap();
-        assert_eq!(complete.len(), 4);
+        assert_eq!(complete.len(), 5);
     }
 
     #[test]
@@ -1095,11 +1200,26 @@ mod tests {
                     sku: 0,
                     ..valid_sales()
                 }],
+                finance: vec![],
                 stocks: vec![valid_stock()],
                 prices: Vec::new(),
             },
             OzonCollectedFacts {
                 sales: vec![valid_sales()],
+                finance: vec![CollectedFinanceFact {
+                    business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
+                    sku: Some(1),
+                    category: FinanceCategory::Other,
+                    amount_minor: 1,
+                    line_count: 0,
+                    unknown_type_count: 0,
+                }],
+                stocks: vec![valid_stock()],
+                prices: Vec::new(),
+            },
+            OzonCollectedFacts {
+                sales: vec![valid_sales()],
+                finance: vec![],
                 stocks: vec![CollectedStockFact {
                     warehouse_id: String::new(),
                     ..valid_stock()
@@ -1108,6 +1228,7 @@ mod tests {
             },
             OzonCollectedFacts {
                 sales: vec![valid_sales()],
+                finance: vec![],
                 stocks: vec![valid_stock()],
                 prices: vec![CollectedPriceFact {
                     sku: 0,
@@ -1130,6 +1251,10 @@ mod tests {
                     .is_err()
             );
         }
+        assert_eq!(
+            OzonReportSourceError::InvalidFinanceResponse.code(),
+            "invalid_finance_response"
+        );
 
         let valid_advertising = || CollectedAdvertisingFact {
             business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
@@ -1140,10 +1265,18 @@ mod tests {
             spend_minor: 100,
             attributed_orders: 0,
             attributed_revenue_minor: 0,
+            basket_additions: 0,
+            model_attributed_orders: 0,
+            model_attributed_revenue_minor: 0,
+            product_price_minor: 0,
+            average_cpc_minor: None,
+            cpm_minor: None,
+            cpl_minor: None,
         };
         assert!(
             OzonCollectedFacts {
                 sales: vec![valid_sales()],
+                finance: vec![],
                 stocks: vec![valid_stock()],
                 prices: Vec::new(),
             }
@@ -1167,6 +1300,7 @@ mod tests {
                     sku: 0,
                     ..valid_sales()
                 }],
+                finance: vec![],
                 stocks: vec![valid_stock()],
                 prices: Vec::new(),
             }

@@ -76,8 +76,8 @@ pub fn due_collection(
 /// Plans only account/cutoff pairs that have not already been published.
 ///
 /// The callback is the future repository boundary. It must return `true` only
-/// when all four mandatory sources for the exact account, marketplace and
-/// cutoff are terminal and published. No collection is planned outside the
+/// when the marketplace-specific mandatory source set for the exact account
+/// and cutoff is terminal and published. No collection is planned outside the
 /// bounded completion window.
 pub fn due_for_plan(
     now: DateTime<Utc>,
@@ -127,7 +127,7 @@ mod tests {
         CollectionTarget {
             account_id: account_id.to_owned(),
             marketplace,
-            sources: [
+            sources: vec![
                 SnapshotSource::Sales,
                 SnapshotSource::Advertising,
                 SnapshotSource::Stocks,

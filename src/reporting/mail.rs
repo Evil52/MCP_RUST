@@ -240,7 +240,7 @@ pub(super) fn validate_address(value: &str) -> Result<(), MailBuildError> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, TimeZone, Utc};
 
     use super::*;
     use crate::reporting::{ReportKey, outbox::ArtifactIdentity};
@@ -262,6 +262,7 @@ mod tests {
                 recipient_id: "pilot_owner".to_owned(),
                 report_version: 1,
             }],
+            deadline_at: Utc.with_ymd_and_hms(2026, 8, 18, 9, 0, 0).unwrap(),
         }
     }
 

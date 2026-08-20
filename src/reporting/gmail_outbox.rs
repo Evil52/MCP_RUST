@@ -386,16 +386,11 @@ impl GmailOutboxWorker {
 
         let class = transient_class(error).ok_or(GmailOutboxError::CompletionUncertain)?;
         let retry_at = finished_at + retry_delay(claim.attempt_no);
-        let deadline = claim
-            .covered_keys
-            .iter()
-            .map(super::delivery_deadline)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| GmailOutboxError::CompletionUncertain)?
-            .into_iter()
-            .max()
-            .ok_or(GmailOutboxError::CompletionUncertain)?;
-        if retry_at <= deadline {
+        // The claim carries the deadline persisted with its coverage. Deriving
+        // it from the report kind would give a recovered morning occurrence the
+        // 14:00 window it was explicitly moved out of, so its first transient
+        // failure would exhaust a budget that still had hours left.
+        if retry_at <= claim.deadline_at {
             self.outbox
                 .transient(claim, started_at, finished_at, class, retry_at)
                 .await
@@ -626,26 +621,43 @@ mod tests {
     }
 
     fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 19, hour, minute, 0).unwrap()
+        Utc.with_ymd_and_hms(2098, 8, 19, hour, minute, 0).unwrap()
     }
 
+    /// Claim carrying the standard window for its kind: 14:00 EKB (09:00 UTC)
+    /// for morning, 23:00 EKB (18:00 UTC) for evening.
     fn claim(attempt_no: u8, kind: ReportKind) -> ClaimedDelivery {
+        let deadline_at = match kind {
+            ReportKind::Morning => at(9, 0),
+            ReportKind::Evening => at(18, 0),
+        };
+        claim_with_deadline(attempt_no, kind, deadline_at)
+    }
+
+    /// Claim carrying an explicit persisted deadline, as `claim_ready` builds
+    /// it from `delivery_coverage`.
+    fn claim_with_deadline(
+        attempt_no: u8,
+        kind: ReportKind,
+        deadline_at: DateTime<Utc>,
+    ) -> ClaimedDelivery {
         ClaimedDelivery {
             batch_id: 7,
             recipient_id: "owner".to_owned(),
             report_version: 1,
             attempt_no,
             artifact: ArtifactIdentity {
-                object_key: "daily-reports/2026/08/19/owner/v1/evening.xlsx".to_owned(),
+                object_key: "daily-reports/2098/08/19/owner/v1/evening.xlsx".to_owned(),
                 sha256: "a".repeat(64),
                 html_sha256: "b".repeat(64),
             },
             covered_keys: vec![ReportKey {
-                local_date: NaiveDate::from_ymd_opt(2026, 8, 19).unwrap(),
+                local_date: NaiveDate::from_ymd_opt(2098, 8, 19).unwrap(),
                 kind,
                 recipient_id: "owner".to_owned(),
                 report_version: 1,
             }],
+            deadline_at,
         }
     }
 
@@ -812,11 +824,11 @@ mod tests {
             .collect();
         ReportBundle {
             artifact: ArtifactIdentity {
-                object_key: format!("daily-reports/2026/08/19/{recipient}/v1/evening.xlsx"),
+                object_key: format!("daily-reports/2098/08/19/{recipient}/v1/evening.xlsx"),
                 sha256,
                 html_sha256,
             },
-            attachment_name: "daily-report-2026-08-19-evening.xlsx".to_owned(),
+            attachment_name: "daily-report-2098-08-19-evening.xlsx".to_owned(),
             html,
             xlsx,
         }
@@ -1062,6 +1074,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovered_morning_keeps_the_evening_retry_window_it_was_scheduled_into() {
+        // A morning occurrence recovered after 17:00 EKB is scheduled at the
+        // evening boundary and persists the 23:00 EKB (18:00 UTC) deadline.
+        // Deriving the window from the report kind would collapse it back to
+        // 14:00 EKB and make the first transient failure terminal.
+        let (worker, outbox, _, _) = worker(
+            Ok(Some(claim_with_deadline(1, ReportKind::Morning, at(18, 0)))),
+            false,
+            Err(GmailDeliveryError::ProviderRateLimited),
+            false,
+            vec![at(12, 5), at(12, 6)],
+        );
+        assert!(matches!(
+            worker.deliver_one().await.unwrap(),
+            DeliveryTickOutcome::RetryScheduled { .. }
+        ));
+        assert_eq!(
+            outbox.recorded.lock().unwrap().as_slice(),
+            &[Recorded::Transient(DeliveryErrorClass::RateLimited)]
+        );
+    }
+
+    #[tokio::test]
     async fn ambiguous_send_and_completion_failure_never_become_a_retry() {
         let (ambiguous, outbox, _, delivery) = worker(
             Ok(Some(claim(1, ReportKind::Evening))),
@@ -1092,21 +1127,6 @@ mod tests {
             outbox.recorded.lock().unwrap().as_slice(),
             &[Recorded::Sent]
         );
-
-        let mut invalid_claim = claim(1, ReportKind::Evening);
-        invalid_claim.covered_keys[0].recipient_id.clear();
-        let (invalid_deadline, outbox, _, _) = worker(
-            Ok(Some(invalid_claim)),
-            false,
-            Err(GmailDeliveryError::OAuthUnavailable),
-            false,
-            vec![at(12, 0), at(12, 1)],
-        );
-        assert_eq!(
-            invalid_deadline.deliver_one().await,
-            Err(GmailOutboxError::CompletionUncertain)
-        );
-        assert!(outbox.recorded.lock().unwrap().is_empty());
 
         for error in [
             GmailDeliveryError::Routing,
@@ -1152,7 +1172,7 @@ mod tests {
         let config = Config::from_str(database_url).unwrap();
         let setup = PostgresOutboxRepository::connect(&config).await.unwrap();
         let covered_morning = [ReportKey {
-            local_date: NaiveDate::from_ymd_opt(2026, 8, 19).unwrap(),
+            local_date: NaiveDate::from_ymd_opt(2098, 8, 19).unwrap(),
             kind: ReportKind::Morning,
             recipient_id: recipient.clone(),
             report_version: 1,

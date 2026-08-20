@@ -195,7 +195,7 @@ mod tests {
         response::IntoResponse,
         routing::post,
     };
-    use chrono::NaiveDate;
+    use chrono::{NaiveDate, TimeZone, Utc};
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
@@ -262,6 +262,7 @@ mod tests {
                 recipient_id: "pilot_owner".to_owned(),
                 report_version: 1,
             }],
+            deadline_at: Utc.with_ymd_and_hms(2026, 8, 18, 9, 0, 0).unwrap(),
         };
         build_report_email(
             "reports@example.test",

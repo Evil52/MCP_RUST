@@ -9,8 +9,9 @@ use mcp_ozon::reporting::{
     ozon_adapter::OzonReportRequest,
     ozon_source::{OzonReportSourceError, OzonReportTransport, collect_complete_snapshots},
     postgres_collector::{
-        CollectedAdvertisingFact, CollectedFacts, CollectedPriceFact, CollectedSalesFact,
-        CollectedSnapshot, CollectedStockFact, PostgresCollectorError, PostgresSnapshotWriter,
+        CollectedAdvertisingExpenseFact, CollectedAdvertisingFact, CollectedFacts,
+        CollectedFinanceFact, CollectedPriceFact, CollectedSalesFact, CollectedSnapshot,
+        CollectedStockFact, FinanceCategory, PostgresCollectorError, PostgresSnapshotWriter,
     },
     postgres_snapshot::{PostgresSnapshotError, PostgresSnapshotRepository},
     preview::render_published_preview,
@@ -41,15 +42,25 @@ fn timestamp(value: &str) -> DateTime<Utc> {
 }
 
 fn collection_target(account_id: &str, marketplace: Marketplace) -> CollectionTarget {
-    CollectionTarget {
-        account_id: account_id.to_owned(),
-        marketplace,
-        sources: [
+    let sources = match marketplace {
+        Marketplace::Ozon => vec![
+            SnapshotSource::Sales,
+            SnapshotSource::Advertising,
+            SnapshotSource::Finance,
+            SnapshotSource::Stocks,
+            SnapshotSource::Prices,
+        ],
+        Marketplace::Wildberries => vec![
             SnapshotSource::Sales,
             SnapshotSource::Advertising,
             SnapshotSource::Stocks,
             SnapshotSource::Prices,
         ],
+    };
+    CollectionTarget {
+        account_id: account_id.to_owned(),
+        marketplace,
+        sources,
     }
 }
 
@@ -191,6 +202,36 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
             spend_minor: 12000,
             attributed_orders: 2,
             attributed_revenue_minor: 135000,
+            basket_additions: 0,
+            model_attributed_orders: 0,
+            model_attributed_revenue_minor: 0,
+            product_price_minor: 0,
+            average_cpc_minor: None,
+            cpm_minor: None,
+            cpl_minor: None,
+        }]),
+    )
+    .with_advertising_expenses(vec![CollectedAdvertisingExpenseFact {
+        business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+        campaign_id: 35751912,
+        money_spent_minor: 12_000,
+        bonus_spent_minor: 2_500,
+        prepayment_spent_minor: 9_000,
+    }])
+    .unwrap();
+    let finance = collected(
+        &account_id,
+        timestamp("2098-08-16T02:20:00Z"),
+        timestamp("2098-08-15T00:00:00Z"),
+        timestamp("2098-08-16T00:00:00Z"),
+        false,
+        CollectedFacts::Finance(vec![CollectedFinanceFact {
+            business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+            sku: Some(3411079879),
+            category: FinanceCategory::Sale,
+            amount_minor: 180_000,
+            line_count: 2,
+            unknown_type_count: 0,
         }]),
     );
     let stocks = collected(
@@ -218,10 +259,10 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         }]),
     );
     let snapshot_ids = writer
-        .persist_claimed_batch(&claim, &[sales, advertising, stocks, prices])
+        .persist_claimed_batch(&claim, &[sales, advertising, finance, stocks, prices])
         .await
         .unwrap();
-    assert_eq!(snapshot_ids.len(), 4);
+    assert_eq!(snapshot_ids.len(), 5);
     assert_eq!(
         writer
             .verify_collection_activation(
@@ -273,6 +314,14 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         ),
         collected(
             &rollback_account,
+            timestamp("2098-08-16T02:20:00Z"),
+            timestamp("2098-08-15T00:00:00Z"),
+            timestamp("2098-08-16T00:00:00Z"),
+            false,
+            CollectedFacts::Finance(Vec::new()),
+        ),
+        collected(
+            &rollback_account,
             timestamp("2098-08-16T02:45:00Z"),
             timestamp("2098-08-16T02:45:00Z"),
             timestamp("2098-08-16T02:45:00Z"),
@@ -307,7 +356,7 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         )
         .await
         .unwrap();
-    assert_eq!(manifest.snapshots().len(), 4);
+    assert_eq!(manifest.snapshots().len(), 5);
     assert_eq!(manifest.quality(), SnapshotQuality::Partial);
     assert!(!manifest.recommendations_allowed());
     let facts = repository.load_report_facts(&manifest).await.unwrap();
@@ -329,6 +378,13 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(facts.advertising[0].spend_minor, 12000);
     assert_eq!(facts.advertising[0].attributed_orders, 2);
     assert_eq!(facts.advertising[0].attributed_revenue_minor, 135000);
+    assert_eq!(facts.advertising_expenses.len(), 1);
+    assert_eq!(facts.advertising_expenses[0].money_spent_minor, 12_000);
+    assert_eq!(facts.advertising_expenses[0].bonus_spent_minor, 2_500);
+    assert_eq!(facts.advertising_expenses[0].prepayment_spent_minor, 9_000);
+    assert_eq!(facts.finance.len(), 1);
+    assert_eq!(facts.finance[0].category, FinanceCategory::Sale);
+    assert_eq!(facts.finance[0].amount_minor, 180_000);
     assert_eq!(facts.stocks.len(), 1);
     assert_eq!(facts.stocks[0].warehouse_id, "fbo-msk");
     assert_eq!(facts.stocks[0].sellable_units, 19);
@@ -398,6 +454,8 @@ async fn complete_ozon_source_set_is_published_atomically() {
             "dimensions":[{"id":"3411079879"},{"id":"2098-08-15"}],
             "metrics":["675.00", 2]
         }]}})),
+        Ok(json!({"accrual_types":[]})),
+        Ok(json!({"accruals":[],"last_id":""})),
         Ok(json!({
             "products":[{
                 "sku":3411079879_u64,
@@ -462,6 +520,13 @@ async fn complete_ozon_source_set_is_published_atomically() {
             spend_minor: 1_000,
             attributed_orders: 1,
             attributed_revenue_minor: 10_000,
+            basket_additions: 0,
+            model_attributed_orders: 0,
+            model_attributed_revenue_minor: 0,
+            product_price_minor: 0,
+            average_cpc_minor: None,
+            cpm_minor: None,
+            cpl_minor: None,
         }],
         account_id.clone(),
         timestamp("2098-08-17T03:00:00Z"),
@@ -476,7 +541,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
         .persist_claimed_batch(&claim, &snapshots)
         .await
         .unwrap();
-    assert_eq!(ids.len(), 4);
+    assert_eq!(ids.len(), 5);
     let activation = writer
         .verify_collection_activation(
             std::slice::from_ref(&target),
@@ -507,11 +572,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
             .into_iter()
             .collect()
     );
-    let wrong_marketplace = CollectionTarget {
-        account_id: account_id.clone(),
-        marketplace: Marketplace::Wildberries,
-        sources: target.sources,
-    };
+    let wrong_marketplace = collection_target(&account_id, Marketplace::Wildberries);
     assert_eq!(
         writer
             .verify_collection_activation(

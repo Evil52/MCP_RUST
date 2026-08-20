@@ -289,6 +289,13 @@ pub fn parse_promotion_stats(
                 spend_minor: value.spend_minor,
                 attributed_orders: value.orders,
                 attributed_revenue_minor: value.revenue_minor,
+                basket_additions: 0,
+                model_attributed_orders: 0,
+                model_attributed_revenue_minor: 0,
+                product_price_minor: 0,
+                average_cpc_minor: None,
+                cpm_minor: None,
+                cpl_minor: None,
             })
         })
         .collect()

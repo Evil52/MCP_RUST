@@ -389,14 +389,16 @@ fn batch_budget(plan: &BatchPlan, started_at: DateTime<Utc>) -> Result<Duration,
         return Err(CollectError::OutsideStartWindow);
     }
 
-    let _slot_end = plan
-        .slot()
+    // Reject a slot whose own interval is not representable: the fixed budget
+    // below is only meaningful inside a slot that has an end.
+    plan.slot()
         .checked_add_signed(ChronoDuration::minutes(i64::from(
             COLLECTION_INTERVAL_MINUTES,
         )))
         .ok_or(CollectError::OutsideStartWindow)?;
     // The latest accepted start is slot + 7 minutes, so the fixed 20-minute
-    // budget always ends no later than slot + 27 minutes.
+    // budget always ends no later than slot + 27 minutes, comfortably inside
+    // the next COLLECTION_INTERVAL_MINUTES boundary.
     Ok(Duration::from_secs(BATCH_TIMEOUT_SECONDS))
 }
 

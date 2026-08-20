@@ -215,9 +215,7 @@ async fn main() -> Result<()> {
             ),
             "artifact generation requires a consistent non-delivery mode"
         );
-        let batch_id = batch_id
-            .parse::<i64>()
-            .context("generation batch id must be a positive integer")?;
+        let batch_id = parse_positive_i64(batch_id, "generation batch id")?;
         generate_batch(&config, &outbox, &snapshots, batch_id, Utc::now()).await?;
         return Ok(());
     }
@@ -250,9 +248,23 @@ async fn main() -> Result<()> {
             let activation_audience_id = config
                 .activation_audience_id()
                 .context("scheduled mail activation audience is unavailable")?;
+            // The gate is deliberately hard: scheduled Gmail delivery never
+            // starts without recent provider-backed proof. It also trips when
+            // every delivery has failed for a day, and `restart: unless-stopped`
+            // then restarts the container into the same refusal, so the message
+            // has to name the operator action instead of only the condition.
             let receipt = outbox
                 .verify_mail_activation(activation_audience_id, config.policy().version, Utc::now())
-                .await?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "scheduled mail activation refused for audience {activation_audience_id}: \
+                         no successful Gmail send in the last 24 hours, or an unreconciled \
+                         sending row remains. Restarting will not clear this. Reconcile any \
+                         ambiguous attempt with `report-worker reconcile-sent`/`reconcile-suppress`, \
+                         then re-run the `delivery_canary` `deliver-one` command before scheduling"
+                    )
+                })?;
             let delivery = config.delivery_worker(outbox.clone())?;
             tracing::info!(
                 targets = targets.len(),

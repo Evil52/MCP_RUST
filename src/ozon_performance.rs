@@ -20,8 +20,8 @@ use crate::config::{PerformanceCredentials, StoreId};
 const PERFORMANCE_API_BASE_URL: &str = "https://api-performance.ozon.ru";
 const TOKEN_PATH: &str = "/api/client/token";
 pub const CAMPAIGNS_PATH: &str = "/api/client/campaign";
-pub const DAILY_STATS_PATH: &str = "/api/client/statistics/daily";
-pub const EXPENSES_PATH: &str = "/api/client/statistics/expense";
+pub const DAILY_STATS_PATH: &str = "/api/client/statistics/daily/json";
+pub const EXPENSES_PATH: &str = "/api/client/statistics/expense/json";
 pub const LIMITS_PATH: &str = "/api/client/limits/list";
 pub const PRODUCT_SKU_STATS_PATH: &str = "/api/client/statistics/products/sku";
 pub const CAMPAIGN_OBJECTS_PATH_TEMPLATE: &str = "/api/client/campaign/{campaignId}/objects";
@@ -1075,11 +1075,11 @@ mod tests {
 
         let daily = requests.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(daily.starts_with(
-            "GET /api/client/statistics/daily?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1\r\n"
+            "GET /api/client/statistics/daily/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1\r\n"
         ));
         let expenses = requests.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(expenses.starts_with(
-            "GET /api/client/statistics/expense?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1\r\n"
+            "GET /api/client/statistics/expense/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-01&dateTo=2026-08-09 HTTP/1.1\r\n"
         ));
         let sku = requests.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(sku.starts_with("POST /api/client/statistics/products/sku HTTP/1.1\r\n"));
@@ -1812,7 +1812,8 @@ mod tests {
         let server = thread::spawn(move || {
             let (mut first_request, _) = listener.accept().unwrap();
             assert!(
-                read_request(&mut first_request).starts_with("GET /api/client/statistics/daily?")
+                read_request(&mut first_request)
+                    .starts_with("GET /api/client/statistics/daily/json?")
             );
             write_json(&mut first_request, 401, "{}");
 
@@ -1832,7 +1833,8 @@ mod tests {
 
             let (mut replay_request, _) = listener.accept().unwrap();
             assert!(
-                read_request(&mut replay_request).starts_with("GET /api/client/statistics/daily?")
+                read_request(&mut replay_request)
+                    .starts_with("GET /api/client/statistics/daily/json?")
             );
             write_json(&mut replay_request, 200, r#"{"rows":[]}"#);
             refresh_response.join().unwrap();

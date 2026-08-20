@@ -11,6 +11,7 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 suffix="${GITHUB_RUN_ID:-local}-${RANDOM}-$$"
 image="mcp-ozon-position-repository-test:${suffix}"
 container="mcp-ozon-position-repository-test-${suffix}"
+data_volume="${container}-data"
 admin_password="position-admin-repository-test"
 collector_password="position-collector-repository-test"
 reader_password="position-reader-repository-test"
@@ -20,13 +21,16 @@ report_collector_password="report-collector-repository-test"
 cleanup() {
   docker rm --force "$container" >/dev/null 2>&1 || true
   docker image rm "$image" >/dev/null 2>&1 || true
+  docker volume rm "$data_volume" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 docker build --pull --tag "$image" \
   --file "$project_root/position-monitor/Dockerfile" \
   "$project_root/position-monitor" >/dev/null
+docker volume create "$data_volume" >/dev/null
 docker run --detach --rm --name "$container" \
+  --volume "$data_volume:/var/lib/postgresql/data" \
   --publish 127.0.0.1::5432 \
   --env POSTGRES_DB=ozon_positions \
   --env POSTGRES_USER=position_admin \

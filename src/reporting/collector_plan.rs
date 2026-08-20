@@ -20,7 +20,7 @@ const MAX_COLLECTION_TARGETS: usize = 64;
 pub struct CollectionTarget {
     pub account_id: String,
     pub marketplace: Marketplace,
-    pub sources: [SnapshotSource; 4],
+    pub sources: Vec<SnapshotSource>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -36,8 +36,9 @@ pub enum CollectionPlanError {
 }
 
 /// Builds the exact account/source inventory that a future collector must
-/// complete before a report can be generated. All four sources are mandatory:
-/// missing data is a preflight error, not a silently zero-valued KPI.
+/// complete before a report can be generated. Every marketplace-specific
+/// source is mandatory: missing data is a preflight error, not a silently
+/// zero-valued KPI.
 pub fn build_collection_plan(
     policy: &DailyReportPolicy,
     registry: &AccessRegistry,
@@ -80,12 +81,7 @@ pub fn build_collection_plan(
             Ok(CollectionTarget {
                 account_id,
                 marketplace,
-                sources: [
-                    SnapshotSource::Sales,
-                    SnapshotSource::Advertising,
-                    SnapshotSource::Stocks,
-                    SnapshotSource::Prices,
-                ],
+                sources: SnapshotSource::required_for(marketplace).to_vec(),
             })
         })
         .collect()
@@ -124,6 +120,7 @@ mod tests {
         let plan = build_collection_plan(&policy, &registry()).unwrap();
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].account_id, "ozon");
+        assert_eq!(plan[0].sources.len(), 5);
         assert_eq!(plan[1].sources.len(), 4);
     }
 

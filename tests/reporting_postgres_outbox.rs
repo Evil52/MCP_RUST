@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fs, str::FromStr};
 
 use chrono::{Duration, TimeZone, Utc};
 use mcp_ozon::reporting::{
-    PendingDelivery,
+    PendingDelivery, ReportKind,
     artifact_store::{
         ArtifactPublicationError, LocalArtifactStore, PersistDisposition, persist_and_mark_ready,
     },
@@ -1008,6 +1008,106 @@ async fn exhausted_retryable_failure_is_terminal_with_its_exact_class() {
     assert_eq!(row.get::<_, &str>(1), "rate_limited");
     assert_eq!(row.get::<_, &str>(2), "permanent");
     assert_eq!(row.get::<_, &str>(3), "rate_limited");
+}
+
+/// A morning occurrence recovered after the 17:00 EKB boundary is scheduled
+/// into the evening window and persists its 23:00 EKB deadline. Recomputing
+/// that deadline from the report kind gives back the 14:00 EKB window it was
+/// deliberately moved out of, which turns the first transient failure into a
+/// permanent one while hours of the delivery window remain.
+#[tokio::test]
+async fn recovered_morning_retries_inside_its_persisted_evening_window() {
+    let Ok(url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
+        return;
+    };
+    let _guard = DB_TEST_LOCK.lock().await;
+    let config = Config::from_str(&url).unwrap();
+    let repository = PostgresOutboxRepository::connect(&config).await.unwrap();
+    // 13:30 UTC is 18:30 EKB: past the morning deadline, inside the evening
+    // window, so the morning occurrence is recovered rather than dropped.
+    let now = utc(13, 30) + Duration::days(90);
+    let recipient = format!("recovered_retry_{}", std::process::id());
+    let recovered = due_deliveries(now, &recipient, 1, &BTreeSet::new())
+        .unwrap()
+        .remove(0);
+    assert_eq!(recovered.covered_keys.len(), 1);
+    assert_eq!(recovered.covered_keys[0].kind, ReportKind::Morning);
+    let batch_id = match repository.create_planned(recovered).await.unwrap() {
+        CreateOutcome::Inserted(id) => id,
+        CreateOutcome::Existing(_) => unreachable!(),
+    };
+    repository.start_generation(batch_id).await.unwrap();
+    let date = now.format("%Y/%m/%d").to_string();
+    repository
+        .mark_ready(batch_id, &artifact_for_kind(&date, &recipient, "morning"))
+        .await
+        .unwrap();
+
+    let claim = repository
+        .claim_ready(now + Duration::minutes(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.batch_id, batch_id);
+    // 23:00 EKB on the report's local date, not the morning 14:00 EKB.
+    assert_eq!(claim.deadline_at, utc(18, 0) + Duration::days(90));
+
+    repository
+        .record_transient_failure(
+            &claim,
+            now + Duration::minutes(1),
+            now + Duration::minutes(2),
+            DeliveryErrorClass::RateLimited,
+            now + Duration::minutes(3),
+        )
+        .await
+        .unwrap();
+    // Still refused past the persisted deadline.
+    let second = repository
+        .claim_ready(now + Duration::minutes(3))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.attempt_no, 2);
+    assert_eq!(
+        repository
+            .record_transient_failure(
+                &second,
+                now + Duration::minutes(3),
+                now + Duration::minutes(4),
+                DeliveryErrorClass::RateLimited,
+                utc(18, 1) + Duration::days(90),
+            )
+            .await,
+        Err(PostgresOutboxError::InvalidDelivery)
+    );
+    repository
+        .record_sent(
+            &second,
+            now + Duration::minutes(3),
+            now + Duration::minutes(4),
+            "gmail.recovered-morning",
+        )
+        .await
+        .unwrap();
+
+    let client = repository_test_client(&config).await;
+    let row = client
+        .query_one(
+            "SELECT batch.status, batch.attempts, coverage.deadline_at \
+             FROM daily_reporting.delivery_batches AS batch \
+             JOIN daily_reporting.delivery_coverage AS coverage ON coverage.batch_id = batch.id \
+             WHERE batch.id = $1",
+            &[&batch_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, &str>(0), "sent");
+    assert_eq!(row.get::<_, i16>(1), 2);
+    assert_eq!(
+        row.get::<_, chrono::DateTime<Utc>>(2),
+        utc(18, 0) + Duration::days(90)
+    );
 }
 
 const MAX_TEST_ATTEMPTS: u8 = 5;

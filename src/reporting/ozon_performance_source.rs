@@ -16,12 +16,15 @@ use crate::{
     config::StoreId,
     ozon_performance::{
         CampaignsQuery, PerformanceClient, PerformanceErrorKind, SkuStatisticsQuery,
+        StatisticsQuery,
     },
 };
 
 use super::{
-    ozon_adapter::{OzonReportParseError, parse_performance_sku_advertising},
-    postgres_collector::CollectedAdvertisingFact,
+    ozon_adapter::{
+        OzonReportParseError, parse_performance_expenses, parse_performance_sku_advertising,
+    },
+    postgres_collector::{CollectedAdvertisingExpenseFact, CollectedAdvertisingFact},
 };
 
 const CAMPAIGN_PAGE_SIZE: u32 = 100;
@@ -41,6 +44,15 @@ pub trait OzonPerformanceReportTransport: Send + Sync {
         campaign_ids: Vec<u64>,
         date: NaiveDate,
     ) -> Pin<Box<dyn Future<Output = Result<Value, OzonPerformanceReportSourceError>> + Send + '_>>;
+
+    fn expenses(
+        &self,
+        _campaign_ids: Vec<u64>,
+        _date: NaiveDate,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, OzonPerformanceReportSourceError>> + Send + '_>>
+    {
+        Box::pin(async { Err(OzonPerformanceReportSourceError::InvalidResponse) })
+    }
 }
 
 #[derive(Clone)]
@@ -104,6 +116,34 @@ impl OzonPerformanceReportTransport for PerformanceClientReportTransport {
                 .map_err(|error| OzonPerformanceReportSourceError::Upstream(error.kind()))
         })
     }
+
+    fn expenses(
+        &self,
+        campaign_ids: Vec<u64>,
+        date: NaiveDate,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, OzonPerformanceReportSourceError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let date = date.format("%Y-%m-%d").to_string();
+            self.client
+                .expenses(
+                    &self.store,
+                    StatisticsQuery {
+                        campaign_ids,
+                        date_from: date.clone(),
+                        date_to: date,
+                    },
+                )
+                .await
+                .map_err(|error| OzonPerformanceReportSourceError::Upstream(error.kind()))
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OzonPerformanceCollectedFacts {
+    pub advertising: Vec<CollectedAdvertisingFact>,
+    pub expenses: Vec<CollectedAdvertisingExpenseFact>,
 }
 
 pub struct OzonPerformanceReportSource {
@@ -144,6 +184,46 @@ impl OzonPerformanceReportSource {
         Ok(facts)
     }
 
+    pub async fn collect_extended(
+        &self,
+        date: NaiveDate,
+    ) -> Result<OzonPerformanceCollectedFacts, OzonPerformanceReportSourceError> {
+        let campaign_ids = self.collect_campaign_ids(date).await?;
+        let mut advertising = Vec::new();
+        let mut expenses = Vec::new();
+        let mut advertising_keys = BTreeSet::new();
+        let mut expense_keys = BTreeSet::new();
+        for chunk in campaign_ids.chunks(CAMPAIGNS_PER_STATISTICS_REQUEST) {
+            let response = self.transport.sku_statistics(chunk.to_vec(), date).await?;
+            for row in parse_performance_sku_advertising(&response)? {
+                if row.business_date != date
+                    || !chunk.contains(&row.campaign_id)
+                    || !advertising_keys.insert((row.business_date, row.campaign_id, row.sku))
+                {
+                    return Err(OzonPerformanceReportSourceError::InvalidResponse);
+                }
+                advertising.push(row);
+            }
+            let response = self.transport.expenses(chunk.to_vec(), date).await?;
+            for row in parse_performance_expenses(&response)? {
+                if row.business_date != date
+                    || !chunk.contains(&row.campaign_id)
+                    || !expense_keys.insert((row.business_date, row.campaign_id))
+                {
+                    return Err(OzonPerformanceReportSourceError::InvalidResponse);
+                }
+                expenses.push(row);
+            }
+            if advertising.len() > MAX_ADVERTISING_FACTS || expenses.len() > MAX_ADVERTISING_FACTS {
+                return Err(OzonPerformanceReportSourceError::TooManyFacts);
+            }
+        }
+        Ok(OzonPerformanceCollectedFacts {
+            advertising,
+            expenses,
+        })
+    }
+
     async fn collect_campaign_ids(
         &self,
         date: NaiveDate,
@@ -160,23 +240,15 @@ impl OzonPerformanceReportSource {
         loop {
             let response = self.transport.campaigns(page, CAMPAIGN_PAGE_SIZE).await?;
             let (campaigns, total) = parse_campaign_page(&response)?;
-            match expected_total {
-                None => expected_total = Some(total),
-                Some(expected) if expected != total => {
-                    return Err(OzonPerformanceReportSourceError::InconsistentPagination);
-                }
-                Some(_) => {}
+            if *expected_total.get_or_insert(total) != total {
+                return Err(OzonPerformanceReportSourceError::InconsistentPagination);
             }
-            for campaign in &campaigns {
-                if !seen_campaign_ids.insert(campaign.id) {
-                    return Err(OzonPerformanceReportSourceError::InconsistentPagination);
-                }
-                if campaign.from_date.is_none_or(|from| from <= date)
-                    && campaign.to_date.is_none_or(|to| date <= to)
-                {
-                    eligible_campaign_ids.insert(campaign.id);
-                }
-            }
+            absorb_campaign_page(
+                &campaigns,
+                date,
+                &mut seen_campaign_ids,
+                &mut eligible_campaign_ids,
+            )?;
             if seen_campaign_ids.len() == total {
                 let report_date_campaigns = eligible_campaign_ids.len();
                 tracing::info!(
@@ -224,6 +296,29 @@ impl From<OzonReportParseError> for OzonPerformanceReportSourceError {
     fn from(_: OzonReportParseError) -> Self {
         Self::InvalidResponse
     }
+}
+
+/// Folds one campaign page into the running inventory.
+///
+/// Extracted from `collect_campaign_ids` so neither the pagination loop nor
+/// the per-campaign filtering has to be read through the other.
+fn absorb_campaign_page(
+    campaigns: &[CampaignWindow],
+    date: NaiveDate,
+    seen_campaign_ids: &mut BTreeSet<u64>,
+    eligible_campaign_ids: &mut BTreeSet<u64>,
+) -> Result<(), OzonPerformanceReportSourceError> {
+    for campaign in campaigns {
+        if !seen_campaign_ids.insert(campaign.id) {
+            return Err(OzonPerformanceReportSourceError::InconsistentPagination);
+        }
+        if campaign.from_date.is_none_or(|from| from <= date)
+            && campaign.to_date.is_none_or(|to| date <= to)
+        {
+            eligible_campaign_ids.insert(campaign.id);
+        }
+    }
+    Ok(())
 }
 
 fn parse_campaign_page(
@@ -331,6 +426,7 @@ mod tests {
     struct FixtureTransport {
         campaign_pages: Mutex<VecDeque<Result<Value, OzonPerformanceReportSourceError>>>,
         statistics: Mutex<VecDeque<Result<Value, OzonPerformanceReportSourceError>>>,
+        expenses: Mutex<VecDeque<Result<Value, OzonPerformanceReportSourceError>>>,
         calls: Mutex<Vec<Vec<u64>>>,
     }
 
@@ -341,8 +437,14 @@ mod tests {
                     campaign_pages.into_iter().map(Ok).collect::<VecDeque<_>>(),
                 ),
                 statistics: Mutex::new(statistics.into_iter().map(Ok).collect::<VecDeque<_>>()),
+                expenses: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_expenses(self, expenses: Vec<Value>) -> Self {
+            *self.expenses.lock().unwrap() = expenses.into_iter().map(Ok).collect();
+            self
         }
     }
 
@@ -379,6 +481,23 @@ mod tests {
                     .unwrap_or(Err(OzonPerformanceReportSourceError::InvalidResponse))
             })
         }
+
+        fn expenses(
+            &self,
+            campaign_ids: Vec<u64>,
+            _date: NaiveDate,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Value, OzonPerformanceReportSourceError>> + Send + '_>,
+        > {
+            self.calls.lock().unwrap().push(campaign_ids);
+            Box::pin(async {
+                self.expenses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Err(OzonPerformanceReportSourceError::InvalidResponse))
+            })
+        }
     }
 
     fn campaign_page(ids: &[u64], total: usize) -> Value {
@@ -396,7 +515,8 @@ mod tests {
         json!({"rows": [{
             "campaignId": campaign_id.to_string(), "sku": sku.to_string(), "date": date,
             "views": "10", "clicks": "2", "expense": "3.00", "orders": "1",
-            "sales": "9.00"
+            "sales": "9.00", "toCart": "3", "modelOrders": "1",
+            "modelSales": "9.00", "price": "9.00", "avgCpc": "1.50"
         }]})
     }
 
@@ -425,6 +545,7 @@ mod tests {
             (200, token()),
             (200, json!({"list": [], "total": "0"}).to_string()),
             (200, json!({"rows": []}).to_string()),
+            (200, json!({"rows": []}).to_string()),
         ]);
         let client =
             PerformanceClient::new_for_test(base_url, Duration::from_secs(3), credentials());
@@ -439,6 +560,10 @@ mod tests {
             transport.sku_statistics(vec![11, 22], date).await.unwrap(),
             json!({"rows": []})
         );
+        assert_eq!(
+            transport.expenses(vec![11, 22], date).await.unwrap(),
+            json!({"rows": []})
+        );
 
         let auth = requests.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(auth.starts_with("POST /api/client/token HTTP/1.1"));
@@ -451,6 +576,10 @@ mod tests {
         assert!(statistics.contains(r#""campaignIds":[11,22]"#));
         assert!(statistics.contains(r#""dateFrom":"2026-08-18""#));
         assert!(statistics.contains(r#""dateTo":"2026-08-18""#));
+        let expenses = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(expenses.starts_with(
+            "GET /api/client/statistics/expense/json?campaignIds=11&campaignIds=22&dateFrom=2026-08-18&dateTo=2026-08-18 HTTP/1.1"
+        ));
     }
 
     #[tokio::test]
@@ -514,6 +643,145 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn default_expense_contract_fails_closed() {
+        struct WithoutExpenses;
+
+        impl OzonPerformanceReportTransport for WithoutExpenses {
+            fn campaigns(
+                &self,
+                _page: u32,
+                _page_size: u32,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Value, OzonPerformanceReportSourceError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(campaign_page(&[], 0)) })
+            }
+
+            fn sku_statistics(
+                &self,
+                _campaign_ids: Vec<u64>,
+                _date: NaiveDate,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Value, OzonPerformanceReportSourceError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(json!({"rows":[]})) })
+            }
+        }
+
+        assert_eq!(
+            WithoutExpenses.campaigns(1, 100).await,
+            Ok(campaign_page(&[], 0))
+        );
+        assert_eq!(
+            WithoutExpenses
+                .sku_statistics(vec![1], NaiveDate::from_ymd_opt(2026, 8, 18).unwrap())
+                .await,
+            Ok(json!({"rows":[]}))
+        );
+        assert_eq!(
+            WithoutExpenses
+                .expenses(vec![1], NaiveDate::from_ymd_opt(2026, 8, 18).unwrap())
+                .await,
+            Err(OzonPerformanceReportSourceError::InvalidResponse)
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_collection_preserves_rubles_bonuses_and_prepayment() {
+        let source = OzonPerformanceReportSource::new(
+            FixtureTransport::new(
+                vec![campaign_page(&[7], 1)],
+                vec![statistics(7, 123, "2026-08-18")],
+            )
+            .with_expenses(vec![json!({"rows": [{
+                "id": "7", "date": "2026-08-18", "title": "campaign",
+                "moneySpent": "12,34", "bonusSpent": "2,00",
+                "prepaymentSpent": "9,50"
+            }]})]),
+        );
+        let facts = source
+            .collect_extended(NaiveDate::from_ymd_opt(2026, 8, 18).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(facts.advertising.len(), 1);
+        assert_eq!(facts.expenses.len(), 1);
+        assert_eq!(facts.expenses[0].money_spent_minor, 1_234);
+        assert_eq!(facts.expenses[0].bonus_spent_minor, 200);
+        assert_eq!(facts.expenses[0].prepayment_spent_minor, 950);
+    }
+
+    #[tokio::test]
+    async fn extended_collection_rejects_foreign_duplicates_and_oversized_sets() {
+        let report_date = NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
+        for statistics_response in [
+            statistics(8, 123, "2026-08-18"),
+            json!({"rows":[
+                statistics(7, 123, "2026-08-18")["rows"][0].clone(),
+                statistics(7, 123, "2026-08-18")["rows"][0].clone()
+            ]}),
+        ] {
+            let source = OzonPerformanceReportSource::new(FixtureTransport::new(
+                vec![campaign_page(&[7], 1)],
+                vec![statistics_response],
+            ));
+            assert_eq!(
+                source.collect_extended(report_date).await,
+                Err(OzonPerformanceReportSourceError::InvalidResponse)
+            );
+        }
+
+        for expense_rows in [
+            vec![json!({
+                "id":"8", "date":"2026-08-18", "moneySpent":"1",
+                "bonusSpent":"0", "prepaymentSpent":"0"
+            })],
+            vec![
+                json!({"id":"7", "date":"2026-08-18", "moneySpent":"1", "bonusSpent":"0", "prepaymentSpent":"0"}),
+                json!({"id":"7", "date":"2026-08-18", "moneySpent":"2", "bonusSpent":"0", "prepaymentSpent":"0"}),
+            ],
+        ] {
+            let source = OzonPerformanceReportSource::new(
+                FixtureTransport::new(
+                    vec![campaign_page(&[7], 1)],
+                    vec![statistics(7, 123, "2026-08-18")],
+                )
+                .with_expenses(vec![json!({"rows":expense_rows})]),
+            );
+            assert_eq!(
+                source.collect_extended(report_date).await,
+                Err(OzonPerformanceReportSourceError::InvalidResponse)
+            );
+        }
+
+        let rows = |campaign_id: u64, count: usize| {
+            json!({"rows":(1..=count).map(|sku| json!({
+                "campaignId":campaign_id.to_string(), "sku":sku.to_string(), "date":"2026-08-18",
+                "views":"1", "clicks":"0", "expense":"0", "orders":"0", "sales":"0",
+                "toCart":"0", "modelOrders":"0", "modelSales":"0", "price":"0", "avgCpc":"0"
+            })).collect::<Vec<_>>()})
+        };
+        let source = OzonPerformanceReportSource::new(
+            FixtureTransport::new(
+                vec![campaign_page(&(1..=11).collect::<Vec<_>>(), 11)],
+                vec![rows(1, 20_000), rows(11, 5_001)],
+            )
+            .with_expenses(vec![json!({"rows":[]}), json!({"rows":[]})]),
+        );
+        assert_eq!(
+            source.collect_extended(report_date).await,
+            Err(OzonPerformanceReportSourceError::TooManyFacts)
         );
     }
 
@@ -614,7 +882,12 @@ mod tests {
                 "clicks": "2",
                 "expense": "3.00",
                 "orders": "1",
-                "sales": "9.00"
+                "sales": "9.00",
+                "toCart": "3",
+                "modelOrders": "1",
+                "modelSales": "9.00",
+                "price": "9.00",
+                "avgCpc": "1.50"
             })).collect::<Vec<_>>()})
         }
 

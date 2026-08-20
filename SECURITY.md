@@ -32,7 +32,7 @@ The following properties are treated as release gates:
    `POST /v2/warehouse/list` with a bounded limit and optional cursor/warehouse-ID filters.
    Ozon Performance business
    egress is fixed to exactly `GET /api/client/campaign`,
-   `GET /api/client/statistics/daily`, `GET /api/client/statistics/expense`,
+   `GET /api/client/statistics/daily/json`, `GET /api/client/statistics/expense/json`,
    `GET /api/client/limits/list`, `GET /api/client/campaign/{campaignId}/objects`,
    `GET /api/client/campaign/{campaignId}/v2/products`, and
    `POST /api/client/statistics/products/sku`. Dynamic routes require one canonical positive
@@ -195,7 +195,7 @@ has broader vendor permissions.
 
 - Run `./scripts/local-ci.sh`, require 100% line coverage, Clippy/rustdoc warnings as errors,
   RustSec/cargo-deny, CodeQL, dependency review, secret scanning, and the hardened-container job.
-- Verify the production tool list contains exactly 67 stable tools, no preview tools, and every
+- Verify the production tool list contains exactly 68 stable tools, no preview tools, and every
   tool advertises `readOnlyHint=true`, `destructiveHint=false`, and the expected OAuth/noauth policy.
 - Verify the Ozon Seller allowlist contains exactly 34 stable paths. Assert that
   `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list` are admitted while their superseded
