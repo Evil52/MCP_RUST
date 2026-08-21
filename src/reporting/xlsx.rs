@@ -156,7 +156,9 @@ fn validate(report: &XlsxReport<'_>) -> Result<(), XlsxReportError> {
         validate_id(row.account_id)?;
         validate_text(row.campaign_id)?;
         validate_text(row.sku)?;
-        if row.clicks > row.impressions || row.attributed_orders > row.clicks {
+        // Attributed orders are ordered units; one click may produce more than
+        // one unit. Only clicks above impressions is an impossible relation.
+        if row.clicks > row.impressions {
             return Err(XlsxReportError::InvalidInput);
         }
         validate_numbers(&[
@@ -938,16 +940,6 @@ mod tests {
                 attributed_orders: 0,
                 attributed_revenue_minor: 0,
             },
-            AdvertisingDetail {
-                account_id: "ozon_store",
-                campaign_id: "campaign",
-                sku: "sku",
-                impressions: 1,
-                clicks: 1,
-                spend_minor: 0,
-                attributed_orders: 2,
-                attributed_revenue_minor: 0,
-            },
         ] {
             assert_eq!(
                 render_xlsx(XlsxReport {
@@ -960,6 +952,27 @@ mod tests {
                 Err(XlsxReportError::InvalidInput)
             );
         }
+
+        let multiple_units = [AdvertisingDetail {
+            account_id: "ozon_store",
+            campaign_id: "campaign",
+            sku: "sku",
+            impressions: 1,
+            clicks: 1,
+            spend_minor: 100,
+            attributed_orders: 2,
+            attributed_revenue_minor: 1_000,
+        }];
+        assert!(
+            render_xlsx(XlsxReport {
+                summary: summary(&kpis, &[]),
+                sales: &[],
+                advertising: &multiple_units,
+                inventory: &[],
+                source_quality: &[],
+            })
+            .is_ok()
+        );
 
         let future_inventory = InventoryDetail {
             account_id: "ozon_store",

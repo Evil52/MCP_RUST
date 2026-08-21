@@ -26,6 +26,7 @@ pub mod html;
 pub mod kpi;
 pub mod mail;
 pub mod mail_routing;
+pub mod mcp_read;
 pub mod outbox;
 pub mod ozon_adapter;
 pub mod ozon_finance_source;

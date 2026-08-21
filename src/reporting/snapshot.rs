@@ -6,7 +6,13 @@ use thiserror::Error;
 
 const MAX_ACCOUNTS: usize = 64;
 const MAX_IDENTIFIER_BYTES: usize = 128;
-const MAX_POST_CUTOFF_OBSERVATION_DELAY: Duration = Duration::minutes(30);
+/// A manually recovered collection may finish after its logical cutoff.
+///
+/// The scheduler still claims ordinary work only during its shorter
+/// thirty-minute window.  This wider bound exists so an operator can recover
+/// a missed 08:00/17:00 delivery without falsifying the actual observation
+/// time of current-state sources.
+const MAX_POST_CUTOFF_OBSERVATION_DELAY: Duration = Duration::hours(24);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -488,9 +494,9 @@ mod tests {
         for (source, source_as_of, start, end) in [
             (
                 SnapshotSource::Stocks,
-                cutoff() + Duration::minutes(30) + Duration::seconds(1),
-                cutoff() + Duration::minutes(30) + Duration::seconds(1),
-                cutoff() + Duration::minutes(30) + Duration::seconds(1),
+                cutoff() + Duration::hours(24) + Duration::seconds(1),
+                cutoff() + Duration::hours(24) + Duration::seconds(1),
+                cutoff() + Duration::hours(24) + Duration::seconds(1),
             ),
             (SnapshotSource::Sales, point, cutoff(), point),
             (
@@ -536,6 +542,24 @@ mod tests {
                 delayed_point,
                 delayed_point,
                 delayed_point,
+                0,
+                true,
+                SnapshotStatus::Succeeded,
+            )
+            .is_ok()
+        );
+
+        let recovered_point = cutoff() + Duration::hours(24);
+        assert!(
+            SnapshotDescriptor::new(
+                1,
+                "store".to_owned(),
+                Marketplace::Ozon,
+                SnapshotSource::Stocks,
+                cutoff(),
+                recovered_point,
+                recovered_point,
+                recovered_point,
                 0,
                 true,
                 SnapshotStatus::Succeeded,

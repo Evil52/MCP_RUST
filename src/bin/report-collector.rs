@@ -564,7 +564,7 @@ async fn run_ozon_dry_run(
             env!("CARGO_PKG_VERSION").to_owned(),
         )
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(|error| anyhow::anyhow!("seller_{}", error.code()))?;
         writer
             .persist_claimed_batch(&claim, &snapshots)
             .await
@@ -646,8 +646,8 @@ fn dry_run_report_window(
         "dry-run requires its EKB report cutoff to have passed"
     );
     ensure!(
-        now <= cutoff + chrono::Duration::minutes(30),
-        "dry-run must start within thirty minutes after its EKB report cutoff"
+        now <= cutoff + chrono::Duration::hours(24),
+        "dry-run must start within 24 hours after its EKB report cutoff"
     );
     Ok((start, end, cutoff))
 }
@@ -750,7 +750,15 @@ mod tests {
             dry_run_report_window(
                 requested_date,
                 ReportKind::Evening,
-                Utc.with_ymd_and_hms(2026, 8, 18, 12, 30, 1).unwrap(),
+                Utc.with_ymd_and_hms(2026, 8, 19, 11, 59, 59).unwrap(),
+            )
+            .is_ok()
+        );
+        assert!(
+            dry_run_report_window(
+                requested_date,
+                ReportKind::Evening,
+                Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 1).unwrap(),
             )
             .is_err()
         );

@@ -86,7 +86,10 @@ pub fn calculate_kpis(
             checked_optional_sum(summary.returned_units, input.returned_units)?;
     }
     for input in advertising {
-        if input.clicks > input.impressions || input.attributed_orders > input.clicks {
+        // Ozon reports attributed ordered units, not a count of unique converting
+        // clicks. One click may therefore produce several ordered units. Clicks
+        // exceeding impressions is still an impossible counter relationship.
+        if input.clicks > input.impressions {
             return Err(KpiError::InvalidAdvertisingCounters);
         }
         summary.ad_impressions = checked_sum(summary.ad_impressions, input.impressions)?;
@@ -240,27 +243,31 @@ mod tests {
 
     #[test]
     fn impossible_counters_and_every_aggregate_overflow_fail_closed() {
-        for input in [
-            AdvertisingMetricInput {
-                impressions: 1,
-                clicks: 2,
-                spend_minor: 0,
-                attributed_orders: 0,
-                attributed_revenue_minor: 0,
-            },
-            AdvertisingMetricInput {
+        let input = AdvertisingMetricInput {
+            impressions: 1,
+            clicks: 2,
+            spend_minor: 0,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        };
+        assert_eq!(
+            calculate_kpis(&[], &[input]),
+            Err(KpiError::InvalidAdvertisingCounters)
+        );
+
+        let multi_unit_order = calculate_kpis(
+            &[],
+            &[AdvertisingMetricInput {
                 impressions: 1,
                 clicks: 1,
-                spend_minor: 0,
+                spend_minor: 100,
                 attributed_orders: 2,
-                attributed_revenue_minor: 0,
-            },
-        ] {
-            assert_eq!(
-                calculate_kpis(&[], &[input]),
-                Err(KpiError::InvalidAdvertisingCounters)
-            );
-        }
+                attributed_revenue_minor: 1_000,
+            }],
+        )
+        .unwrap();
+        assert_eq!(multi_unit_order.attributed_orders, 2);
+        assert_eq!(multi_unit_order.ad_conversion, Some(BasisPoints(20_000)));
 
         let maximal_sale = SalesMetricInput {
             ordered_units: u64::MAX,

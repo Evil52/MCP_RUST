@@ -197,8 +197,14 @@ has broader vendor permissions.
 
 - Run `./scripts/local-ci.sh`, require 100% line coverage, Clippy/rustdoc warnings as errors,
   RustSec/cargo-deny, CodeQL, dependency review, secret scanning, and the hardened-container job.
-- Verify the production tool list contains exactly 70 stable tools, no preview tools, and every
+- Verify the production tool list contains exactly 75 stable tools, no preview tools, and every
   tool advertises `readOnlyHint=true`, `destructiveHint=false`, and the expected OAuth/noauth policy.
+- Verify `ofk_collection_status`, `ofk_data_completeness`, `ofk_metrics_history`,
+  `ofk_manager_actions`, and `ofk_reports` are internal read-only reporting tools with
+  `openWorldHint=false`. They must read only curated PostgreSQL views through the restricted
+  reporting reader, enforce actor/account RBAC before database access, and return a stable
+  unavailable result when the reporting database is not configured; they must never start a sync,
+  mutate marketplace or internal data, generate a report, or send mail.
 - Verify the Ozon Seller allowlist contains exactly 35 stable paths. Assert that
   `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list` are admitted while their superseded
   list versions fail locally without credentials or network access.

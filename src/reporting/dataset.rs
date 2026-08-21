@@ -79,7 +79,10 @@ impl ReportDataset {
         manifest: &FrozenSnapshotManifest,
         facts: PublishedReportFacts,
     ) -> Result<Self, DatasetError> {
-        validate_row_counts(manifest, &facts)?;
+        if let Err(error) = validate_row_counts(manifest, &facts) {
+            tracing::warn!(stage = "row_counts", "published report dataset rejected");
+            return Err(error);
+        }
         let expected_accounts = manifest
             .snapshots()
             .iter()
@@ -106,6 +109,7 @@ impl ReportDataset {
             .chain(facts.prices.iter().map(|fact| fact.account_id.as_str()))
             .any(|account| !expected_accounts.contains(account))
         {
+            tracing::warn!(stage = "account_scope", "published report dataset rejected");
             return Err(DatasetError::InvalidFacts);
         }
 
@@ -123,7 +127,10 @@ impl ReportDataset {
                 })
                 .collect::<Vec<_>>(),
         )
-        .map_err(map_kpi)?;
+        .map_err(|error| {
+            tracing::warn!(stage = "kpi", "published report dataset rejected");
+            map_kpi(error)
+        })?;
 
         let advertising_expenses = facts.advertising_expenses;
         let finance = facts.finance;
@@ -211,6 +218,10 @@ impl ReportDataset {
                 false,
             ));
             if row.1.replace(fact.price_minor).is_some() {
+                tracing::warn!(
+                    stage = "duplicate_price",
+                    "published report dataset rejected"
+                );
                 return Err(DatasetError::InvalidFacts);
             }
             row.2 = row.2.max(fact.observed_at);
@@ -611,6 +622,10 @@ mod tests {
         missing_stock.stocks.clear();
         assert_eq!(
             validate_row_counts(&manifest(&["store"]), &missing_stock),
+            Err(DatasetError::InvalidFacts)
+        );
+        assert_eq!(
+            ReportDataset::from_published(&manifest(&["store"]), missing_stock),
             Err(DatasetError::InvalidFacts)
         );
         let mut excessive = facts("store");

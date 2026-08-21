@@ -142,7 +142,7 @@ report_collector_psql=(
   --no-psqlrc --set ON_ERROR_STOP=1
 )
 
-# Prove that both additive migrations can be applied safely to an existing
+# Prove that every additive migration can be applied safely to an existing
 # database initialized with the original Ozon-only schema and existing roles.
 "${admin_psql[@]}" --command 'CREATE DATABASE migration_probe' >/dev/null
 migration_admin_psql=(
@@ -212,6 +212,26 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/013_daily_reporting_delivery_reconciliation.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/014_daily_reporting_period_preserving_catchup.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/015_daily_reporting_ozon_finance.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/016_daily_reporting_unit_economics.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/017_daily_reporting_advertising_extensions.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/018_daily_reporting_recovery_observation_window.sql >/dev/null
+"${migration_admin_psql[@]}" --command '
+  GRANT USAGE ON SCHEMA daily_reporting TO position_reader;
+  GRANT SELECT ON ALL TABLES IN SCHEMA daily_reporting TO position_reader;
+  ALTER DEFAULT PRIVILEGES IN SCHEMA daily_reporting
+      GRANT SELECT ON TABLES TO position_reader;
+' >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql >/dev/null
+# Reapplying an additive migration is required to converge an existing volume
+# without changing the exposed contract or broadening the reader role.
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -225,9 +245,15 @@ if [[ "$optional_sales_metrics" != "cancelled_units:YES,returned_units:YES" ]]; 
   printf '%s\n' "$optional_sales_metrics" >&2
   exit 1
 fi
-"${migration_admin_psql[@]}" --command '
-  CREATE TABLE search_position.reader_default_acl_probe (id integer)
-' >/dev/null
+"${migration_admin_psql[@]}" --command "
+  CREATE TABLE search_position.reader_default_acl_probe (id integer);
+  CREATE TABLE daily_reporting.reader_default_acl_probe (id integer);
+  CREATE FUNCTION daily_reporting.reader_default_acl_probe()
+  RETURNS integer
+  LANGUAGE sql
+  IMMUTABLE
+  AS \$function\$SELECT 1\$function\$;
+" >/dev/null
 migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT
@@ -346,6 +372,113 @@ migration_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
 if [[ "$migration_acl" != "t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t:t" ]]; then
   echo "existing-volume migrations did not install the expected schema/ACL" >&2
   printf '%s\n' "$migration_acl" >&2
+  exit 1
+fi
+migration_mcp_acl="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
+  --command "
+    SELECT
+      has_schema_privilege('position_reader', 'daily_reporting', 'USAGE')
+      AND NOT has_schema_privilege('position_reader', 'daily_reporting', 'CREATE')
+      AND (
+          SELECT count(*) = 9
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = 'daily_reporting'
+            AND relation.relkind = 'v'
+            AND relation.relname IN (
+                'mcp_collection_status',
+                'mcp_published_source_snapshots',
+                'mcp_sales_facts',
+                'mcp_advertising_facts',
+                'mcp_advertising_expense_facts',
+                'mcp_finance_facts',
+                'mcp_stock_facts',
+                'mcp_price_facts',
+                'mcp_ready_reports'
+            )
+            AND coalesce(relation.reloptions, ARRAY[]::text[])
+                @> ARRAY['security_barrier=true']
+      )
+      AND (
+          SELECT bool_and(
+              has_table_privilege(
+                  'position_reader', readable.object_name, 'SELECT'
+              )
+              AND NOT has_table_privilege(
+                  'position_reader', readable.object_name,
+                  'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+              )
+          )
+          FROM unnest(ARRAY[
+              'daily_reporting.mcp_collection_status',
+              'daily_reporting.mcp_published_source_snapshots',
+              'daily_reporting.mcp_sales_facts',
+              'daily_reporting.mcp_advertising_facts',
+              'daily_reporting.mcp_advertising_expense_facts',
+              'daily_reporting.mcp_finance_facts',
+              'daily_reporting.mcp_stock_facts',
+              'daily_reporting.mcp_price_facts',
+              'daily_reporting.mcp_ready_reports'
+          ]::text[]) AS readable(object_name)
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM unnest(ARRAY[
+              'daily_reporting.source_snapshots',
+              'daily_reporting.sales_facts',
+              'daily_reporting.advertising_facts',
+              'daily_reporting.advertising_expense_facts',
+              'daily_reporting.finance_facts',
+              'daily_reporting.stock_facts',
+              'daily_reporting.price_facts',
+              'daily_reporting.unit_economics_inputs',
+              'daily_reporting.collection_claims',
+              'daily_reporting.delivery_batches',
+              'daily_reporting.delivery_coverage',
+              'daily_reporting.delivery_attempts',
+              'daily_reporting.delivery_reconciliations',
+              'daily_reporting.generation_attempts',
+              'daily_reporting.claimable_deliveries',
+              'daily_reporting.generatable_batches',
+              'daily_reporting.stalled_report_work',
+              'daily_reporting.published_source_snapshots',
+              'daily_reporting.published_sales_facts',
+              'daily_reporting.published_advertising_facts',
+              'daily_reporting.published_advertising_expense_facts',
+              'daily_reporting.published_finance_facts',
+              'daily_reporting.published_stock_facts',
+              'daily_reporting.published_price_facts',
+              'daily_reporting.reader_default_acl_probe'
+          ]::text[]) AS protected(object_name)
+          WHERE has_table_privilege(
+              'position_reader', protected.object_name, 'SELECT'
+          )
+      )
+      AND NOT has_function_privilege(
+          'position_reader',
+          'daily_reporting.reader_default_acl_probe()',
+          'EXECUTE'
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_default_acl AS defaults
+          CROSS JOIN LATERAL aclexplode(defaults.defaclacl) AS expanded_acl
+          WHERE defaults.defaclnamespace = 'daily_reporting'::regnamespace
+            AND expanded_acl.grantee = 'position_reader'::regrole
+      )
+      AND (
+          SELECT string_agg(column_name, ',' ORDER BY ordinal_position) =
+                 'batch_id,recipient_id,report_version,local_date,report_kind,' ||
+                 'scheduled_for,deadline_at,status,delayed,created_at,updated_at,sent_at'
+          FROM information_schema.columns
+          WHERE table_schema = 'daily_reporting'
+            AND table_name = 'mcp_ready_reports'
+      )
+  "; } | tr -d '[:space:]')"
+if [[ "$migration_mcp_acl" != t ]]; then
+  echo "MCP read views did not converge the existing-volume least-privilege ACL" >&2
+  printf '%s\n' "$migration_mcp_acl" >&2
   exit 1
 fi
 "${admin_psql[@]}" --command 'DROP DATABASE migration_probe' >/dev/null
@@ -1741,8 +1874,17 @@ expect_failure_containing \
   FROM daily_reporting.claim_report_collection(
       'diana-ozon', 'ozon', '2099-08-16 03:00:00+00', 'schema-test-diana'
   );
+  INSERT INTO daily_reporting.stock_facts
+      (snapshot_id, sku, warehouse_id, sellable_units)
+  SELECT id, 3411079879, 'failed-source-probe', 2
+  FROM daily_reporting.source_snapshots
+  WHERE account_id = 'diana-ozon'
+    AND marketplace = 'ozon'
+    AND source = 'stocks'
+    AND cutoff_at = '2099-08-16 03:00:00+00';
   UPDATE daily_reporting.source_snapshots
-  SET status = 'failed', finished_at = '2099-08-16 02:41:00+00',
+  SET status = 'failed', row_count = 1,
+      finished_at = '2099-08-16 02:41:00+00',
       error_class = 'transport', http_status = 502
   WHERE account_id = 'diana-ozon'
     AND marketplace = 'ozon'
@@ -1761,6 +1903,51 @@ published_report_facts="$({ "${report_worker_psql[@]}" --tuples-only --no-align 
 if [[ "$published_report_facts" != "succeeded:1:3411079879:4:1" ]]; then
   echo "published daily-report facts differ from the frozen snapshot" >&2
   printf '%s\n' "$published_report_facts" >&2
+  exit 1
+fi
+
+mcp_collection_status="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT source, status, pagination_complete, row_count,
+           coalesce(last_published_status, 'none')
+    FROM daily_reporting.mcp_collection_status
+    WHERE account_id = 'diana-ozon'
+      AND marketplace = 'ozon'
+    ORDER BY source
+  "; } | tr -d '\r')"
+expected_mcp_collection_status=$'sales:succeeded:t:1:succeeded\nstocks:failed:f:1:none'
+if [[ "$mcp_collection_status" != "$expected_mcp_collection_status" ]]; then
+  echo "MCP collection status did not preserve failed versus published state" >&2
+  printf '%s\n' "$mcp_collection_status" >&2
+  exit 1
+fi
+
+mcp_published_dataset="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT manifest.source, manifest.status, manifest.pagination_complete,
+           manifest.row_count, fact.sku, fact.ordered_units,
+           fact.returned_units
+    FROM daily_reporting.mcp_published_source_snapshots AS manifest
+    JOIN daily_reporting.mcp_sales_facts AS fact
+      ON fact.snapshot_id = manifest.snapshot_id
+    WHERE manifest.account_id = 'diana-ozon'
+      AND manifest.marketplace = 'ozon'
+  "; } | tr -d '\r')"
+if [[ "$mcp_published_dataset" != "sales:succeeded:t:1:3411079879:4:1" ]]; then
+  echo "MCP published dataset differs from its frozen snapshot manifest" >&2
+  printf '%s\n' "$mcp_published_dataset" >&2
+  exit 1
+fi
+
+mcp_failed_stock_count="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --command "
+    SELECT count(*)
+    FROM daily_reporting.mcp_stock_facts
+    WHERE account_id = 'diana-ozon'
+      AND marketplace = 'ozon'
+  "; } | tr -d '[:space:]')"
+if [[ "$mcp_failed_stock_count" != 0 ]]; then
+  echo "MCP stock projection published facts from a failed source" >&2
   exit 1
 fi
 
@@ -1821,8 +2008,8 @@ expect_failure_containing \
         )
     SELECT
             'anna-wb', 'wildberries', 'stocks', '2099-08-16 03:00:00+00',
-            '2099-08-16 03:30:01+00', '2099-08-16 03:30:01+00',
-            '2099-08-16 03:30:01+00', 'schema-test',
+            '2099-08-17 03:00:01+00', '2099-08-17 03:00:01+00',
+            '2099-08-17 03:00:01+00', 'schema-test',
             claim_id, claim_generation
     FROM daily_reporting.claim_report_collection(
         'anna-wb', 'wildberries', '2099-08-16 03:00:00+00', 'schema-test-anna'
@@ -1834,6 +2021,18 @@ expect_failure_containing \
   "permission denied for table source_snapshots" \
   "${report_worker_psql[@]}" \
   --command 'SELECT count(*) FROM daily_reporting.source_snapshots'
+
+expect_failure_containing \
+  "position reader raw daily-report snapshot access" \
+  "permission denied for table source_snapshots" \
+  "${reader_psql[@]}" \
+  --command 'SELECT count(*) FROM daily_reporting.source_snapshots'
+
+expect_failure_containing \
+  "position reader underlying published snapshot access" \
+  "permission denied for view published_source_snapshots" \
+  "${reader_psql[@]}" \
+  --command 'SELECT count(*) FROM daily_reporting.published_source_snapshots'
 
 expect_failure_containing \
   "report collector outbox access" \
@@ -1896,6 +2095,30 @@ expect_failure_containing \
       sent_at = '2099-08-16 12:01:01+00',
       updated_at = updated_at + interval '1 second'
   WHERE id = 1;
+
+  INSERT INTO daily_reporting.delivery_batches
+      (recipient_id, report_version, scheduled_for)
+  VALUES ('ready_owner', 1, '2099-08-18 03:00:00+00');
+  INSERT INTO daily_reporting.delivery_coverage
+      (
+          batch_id, recipient_id, report_version, local_date, report_kind,
+          scheduled_for, deadline_at
+      )
+  SELECT id, recipient_id, report_version, '2099-08-18', 'morning',
+         '2099-08-18 03:00:00+00', '2099-08-18 09:00:00+00'
+  FROM daily_reporting.delivery_batches
+  WHERE recipient_id = 'ready_owner';
+  UPDATE daily_reporting.delivery_batches
+  SET status = 'generating', updated_at = updated_at + interval '1 second'
+  WHERE recipient_id = 'ready_owner';
+  UPDATE daily_reporting.delivery_batches
+  SET status = 'ready',
+      artifact_object_key =
+          'daily-reports/2099/08/18/ready_owner/v1/morning.xlsx',
+      artifact_sha256 = repeat('c', 64),
+      artifact_html_sha256 = repeat('d', 64),
+      updated_at = updated_at + interval '1 second'
+  WHERE recipient_id = 'ready_owner';
 " >/dev/null
 
 report_delivery="$({ "${report_worker_psql[@]}" --tuples-only --no-align \
@@ -1916,6 +2139,34 @@ if [[ "$report_delivery" != "sent:t:1:2:evening:morning:2" ]]; then
   printf '%s\n' "$report_delivery" >&2
   exit 1
 fi
+
+mcp_ready_report="$({ "${reader_psql[@]}" --tuples-only --no-align \
+  --field-separator=: --command "
+    SELECT recipient_id, report_version, local_date, report_kind, status,
+           delayed,
+           scheduled_for = CASE recipient_id
+               WHEN 'pilot_owner' THEN TIMESTAMPTZ '2099-08-16 12:00:00+00'
+               ELSE TIMESTAMPTZ '2099-08-18 03:00:00+00'
+           END,
+           deadline_at = CASE recipient_id
+               WHEN 'pilot_owner' THEN TIMESTAMPTZ '2099-08-16 18:00:00+00'
+               ELSE TIMESTAMPTZ '2099-08-18 09:00:00+00'
+           END
+    FROM daily_reporting.mcp_ready_reports
+    ORDER BY recipient_id
+  "; } | tr -d '\r')"
+expected_mcp_ready_report=$'pilot_owner:1:2099-08-16:evening:sent:t:t:t\nready_owner:1:2099-08-18:morning:ready:f:t:t'
+if [[ "$mcp_ready_report" != "$expected_mcp_ready_report" ]]; then
+  echo "MCP ready-report catalog did not expose the safe batch metadata" >&2
+  printf '%s\n' "$mcp_ready_report" >&2
+  exit 1
+fi
+
+expect_failure_containing \
+  "MCP ready-report provider identifier exposure" \
+  "column \"provider_message_id\" does not exist" \
+  "${reader_psql[@]}" \
+  --command 'SELECT provider_message_id FROM daily_reporting.mcp_ready_reports'
 
 # A recovered morning remains its own occurrence and receives only the bounded
 # 17:00--23:00 EKB catch-up window.
@@ -2046,9 +2297,15 @@ expect_failure_containing \
 
 expect_failure_containing \
   "position reader report-outbox access" \
-  "permission denied for schema daily_reporting" \
+  "permission denied for table delivery_batches" \
   "${reader_psql[@]}" \
   --command 'SELECT count(*) FROM daily_reporting.delivery_batches'
+
+expect_failure_containing \
+  "position reader report-attempt access" \
+  "permission denied for table delivery_attempts" \
+  "${reader_psql[@]}" \
+  --command 'SELECT count(*) FROM daily_reporting.delivery_attempts'
 
 expect_failure_containing \
   "position_reader TEMPORARY privilege" \
@@ -2108,6 +2365,12 @@ done
   LANGUAGE sql
   IMMUTABLE
   AS 'SELECT 1';
+  CREATE TABLE daily_reporting.future_table_default_acl_probe (id integer);
+  CREATE FUNCTION daily_reporting.default_acl_probe()
+  RETURNS integer
+  LANGUAGE sql
+  IMMUTABLE
+  AS 'SELECT 1';
 " >/dev/null
 
 expect_failure_containing \
@@ -2127,6 +2390,18 @@ expect_failure_containing \
   "permission denied for function default_acl_probe" \
   "${collector_psql[@]}" \
   --command 'SELECT search_position.default_acl_probe()'
+
+expect_failure_containing \
+  "position_reader future daily-report table SELECT privilege" \
+  "permission denied for table future_table_default_acl_probe" \
+  "${reader_psql[@]}" \
+  --command 'SELECT count(*) FROM daily_reporting.future_table_default_acl_probe'
+
+expect_failure_containing \
+  "position_reader future daily-report function EXECUTE privilege" \
+  "permission denied for function default_acl_probe" \
+  "${reader_psql[@]}" \
+  --command 'SELECT daily_reporting.default_acl_probe()'
 
 role_attributes="$("${admin_psql[@]}" --tuples-only --no-align --field-separator=: \
   --command "

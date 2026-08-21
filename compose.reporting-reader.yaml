@@ -1,0 +1,14 @@
+# Explicit opt-in for the read-only reporting projections. The position
+# database stack is started, migrated, and verified separately.
+services:
+  server:
+    environment:
+      MCP_REPORTING_DATABASE_URL: postgresql://position_reader:${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+    networks:
+      - outbound
+      - position-internal
+
+networks:
+  position-internal:
+    name: mcp-ozon-position-internal
+    external: true

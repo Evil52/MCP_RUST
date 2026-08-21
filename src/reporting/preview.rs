@@ -102,7 +102,7 @@ struct RuleAccumulator {
     attributed_revenue: u64,
 }
 
-fn rule_inputs(dataset: &ReportDataset) -> Result<Vec<RuleInput>, PreviewError> {
+pub(crate) fn rule_inputs(dataset: &ReportDataset) -> Result<Vec<RuleInput>, PreviewError> {
     let mut rows = BTreeMap::<(String, u64), RuleAccumulator>::new();
     for inventory in &dataset.inventory {
         if !inventory.stock_observed {

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
 use rmcp::{
     Json, RoleServer, ServerHandler,
     handler::server::{
@@ -37,6 +37,13 @@ use crate::{
         CAMPAIGN_OBJECTS_PATH_TEMPLATE, CAMPAIGN_PRODUCTS_PATH_TEMPLATE, CAMPAIGNS_PATH,
         CampaignProductsQuery, CampaignsQuery, DAILY_STATS_PATH, EXPENSES_PATH, LIMITS_PATH,
         PRODUCT_SKU_STATS_PATH, PerformanceClient, SkuStatisticsQuery, StatisticsQuery,
+    },
+    reporting::{
+        mcp_read::{
+            CollectionStatusResult, DataCompletenessResult, ManagerActionsResult,
+            MetricsHistoryResult, ReadyReportsResult, ReportingReadError, ReportingReader,
+        },
+        snapshot::{AccountScope, Marketplace as ReportingMarketplace},
     },
     wb::WbClient,
 };
@@ -87,6 +94,14 @@ const NO_ACCESSIBLE_STORE: &str = "NO_ACCESSIBLE_STORE";
 const CURSOR_REQUIRED: &str = "CURSOR_REQUIRED";
 const READ_ONLY_ENDPOINT_DENIED: &str = "READ_ONLY_ENDPOINT_DENIED";
 const ROLE_ACCESS_DENIED: &str = "ROLE_ACCESS_DENIED";
+const REPORTING_UNAVAILABLE: &str = "REPORTING_UNAVAILABLE";
+const REPORTING_INVALID_REQUEST: &str = "REPORTING_INVALID_REQUEST";
+const REPORTING_TEMPORARILY_UNAVAILABLE: &str = "REPORTING_TEMPORARILY_UNAVAILABLE";
+const REPORTING_INVALID_PUBLISHED_DATA: &str = "REPORTING_INVALID_PUBLISHED_DATA";
+const MAX_REPORTING_STATUS_ROWS: u16 = 50;
+const MAX_REPORTING_HISTORY_POINTS: u16 = 100;
+const MAX_REPORTING_REPORTS: u16 = 100;
+const MAX_REPORTING_HISTORY_DAYS: i64 = 366;
 const FINANCE_ENDPOINTS: &[&str] = &[
     "/v1/finance/accrual/by-day",
     "/v1/finance/accrual/postings",
@@ -196,6 +211,7 @@ pub struct OzonMcp {
     default_actor_id: Option<String>,
     authenticator: Option<JwtAuthenticator>,
     registry: RegistrySource,
+    reporting_reader: ReportingReader,
     tool_router: ToolRouter<Self>,
     tool_call_slots: Arc<Semaphore>,
 }
@@ -240,7 +256,7 @@ impl OzonMcp {
             annotations.read_only_hint = Some(true);
             annotations.destructive_hint = Some(false);
             annotations.idempotent_hint = Some(true);
-            annotations.open_world_hint = Some(true);
+            annotations.open_world_hint.get_or_insert(true);
             route.attr.security_schemes = Some(security_schemes.clone());
             route
                 .attr
@@ -260,6 +276,7 @@ impl OzonMcp {
             default_actor_id: Some(actor_id),
             authenticator: None,
             registry,
+            reporting_reader: ReportingReader::disabled(),
             tool_router: Self::default_tool_router(None),
             tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
         }
@@ -278,6 +295,7 @@ impl OzonMcp {
             default_actor_id: None,
             authenticator: Some(authenticator),
             registry,
+            reporting_reader: ReportingReader::disabled(),
             tool_router,
             tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
         }
@@ -317,6 +335,11 @@ impl OzonMcp {
 
     pub fn with_performance_client(mut self, performance_client: PerformanceClient) -> Self {
         self.performance_client = performance_client;
+        self
+    }
+
+    pub fn with_reporting_reader(mut self, reporting_reader: ReportingReader) -> Self {
+        self.reporting_reader = reporting_reader;
         self
     }
 
@@ -431,6 +454,99 @@ impl OzonMcp {
             Err(format!(
                 "{ROLE_ACCESS_DENIED}: рекламные бюджеты и расходы Ozon Performance доступны только ролям finance и admin"
             ))
+        }
+    }
+
+    fn authorize_reporting_details_for_role(role: Role) -> Result<(), String> {
+        if matches!(role, Role::Finance | Role::Admin) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{ROLE_ACCESS_DENIED}: история KPI и рекомендации доступны только ролям finance и admin"
+            ))
+        }
+    }
+
+    fn authorize_report_catalog_for_role(role: Role) -> Result<(), String> {
+        if role == Role::Admin {
+            Ok(())
+        } else {
+            Err(format!(
+                "{ROLE_ACCESS_DENIED}: каталог готовых отчётов доступен только роли admin"
+            ))
+        }
+    }
+
+    fn resolve_reporting_account(
+        &self,
+        identity: &RequestIdentity,
+        selector: Option<&str>,
+    ) -> Result<(AccountScope, Role), String> {
+        let (registry, actor) = self.access_context(identity)?;
+        let account = if let Some(selector) = selector {
+            validate_non_blank("account", selector)?;
+            validate_max_chars("account", selector, MAX_STORE_SELECTOR_CHARS)?;
+            let account = registry
+                .accounts
+                .iter()
+                .find(|account| account.id == selector)
+                .ok_or_else(|| {
+                    "UNKNOWN_REPORTING_ACCOUNT: выбранный кабинет не зарегистрирован. Получите допустимый account_id через marketplace_accounts."
+                        .to_owned()
+                })?;
+            if !actor.can_access_account(account) {
+                return Err(format!(
+                    "{ACCESS_DENIED}: текущий пользователь не имеет доступа к выбранному кабинету."
+                ));
+            }
+            account
+        } else {
+            let mut accessible = registry
+                .accounts
+                .iter()
+                .filter(|account| actor.can_access_account(account));
+            match (accessible.next(), accessible.next()) {
+                (None, _) => {
+                    return Err(
+                        "NO_ACCESSIBLE_REPORTING_ACCOUNT: у текущего пользователя нет доступных кабинетов."
+                            .to_owned(),
+                    );
+                }
+                (Some(account), None) => account,
+                (Some(_), Some(_)) => {
+                    return Err(
+                        "REPORTING_ACCOUNT_REQUIRED: доступно несколько кабинетов; явно передайте account из marketplace_accounts."
+                            .to_owned(),
+                    );
+                }
+            }
+        };
+        let marketplace = match account.marketplace {
+            Marketplace::Ozon => ReportingMarketplace::Ozon,
+            Marketplace::Wildberries => ReportingMarketplace::Wildberries,
+        };
+        let scope = AccountScope::new(account.id.clone(), marketplace).map_err(|_| {
+            format!(
+                "{REPORTING_INVALID_REQUEST}: выбранный кабинет имеет недопустимый идентификатор"
+            )
+        })?;
+        Ok((scope, actor.role))
+    }
+
+    fn reporting_error(error: ReportingReadError) -> String {
+        match error {
+            ReportingReadError::Disabled => {
+                format!("{REPORTING_UNAVAILABLE}: серверная история отчётов не подключена")
+            }
+            ReportingReadError::InvalidRequest => {
+                format!("{REPORTING_INVALID_REQUEST}: параметры запроса истории недопустимы")
+            }
+            ReportingReadError::Unavailable => format!(
+                "{REPORTING_TEMPORARILY_UNAVAILABLE}: хранилище отчётов временно недоступно"
+            ),
+            ReportingReadError::InvalidPublishedData => format!(
+                "{REPORTING_INVALID_PUBLISHED_DATA}: опубликованный набор данных не прошёл проверку"
+            ),
         }
     }
 
@@ -3163,8 +3279,233 @@ pub struct QuestionsInput {
     pub last_id: String,
 }
 
+fn default_reporting_status_limit() -> u16 {
+    20
+}
+
+fn default_reporting_history_limit() -> u16 {
+    14
+}
+
+fn default_reporting_reports_limit() -> u16 {
+    20
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportingCollectionStatusInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[serde(default = "default_reporting_status_limit")]
+    #[schemars(range(min = 1, max = 50))]
+    pub limit: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportingCompletenessInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Точный cutoff опубликованного набора в RFC 3339; без значения выбирается последний наблюдаемый cutoff",
+        length(min = 1, max = 64)
+    )]
+    pub cutoff_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportingMetricsHistoryInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Начало периода YYYY-MM-DD", length(equal = 10))]
+    pub date_from: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Конец периода YYYY-MM-DD", length(equal = 10))]
+    pub date_to: Option<String>,
+    #[serde(default = "default_reporting_history_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportingManagerActionsInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Канонический account_id из marketplace_accounts",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Точный cutoff опубликованного набора в RFC 3339; без значения выбирается последний наблюдаемый cutoff",
+        length(min = 1, max = 64)
+    )]
+    pub cutoff_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportingReadyReportsInput {
+    #[serde(default = "default_reporting_reports_limit")]
+    #[schemars(range(min = 1, max = 100))]
+    pub limit: u16,
+}
+
 #[tool_router]
 impl OzonMcp {
+    /// Показывает последние попытки фонового сбора для одного разрешённого кабинета.
+    /// Метод читает только серверную PostgreSQL-проекцию и не обращается к маркетплейсам.
+    #[tool(
+        name = "ofk_collection_status",
+        annotations(
+            title = "Статус фонового сбора OFK",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reporting_collection_status(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ReportingCollectionStatusInput>,
+    ) -> Result<Json<CollectionStatusResult>, String> {
+        validate_reporting_limit(input.limit, MAX_REPORTING_STATUS_ROWS)?;
+        let (account, _) = self.resolve_reporting_account(&identity, input.account.as_deref())?;
+        self.reporting_reader
+            .collection_status(&account, input.limit)
+            .await
+            .map(Json)
+            .map_err(Self::reporting_error)
+    }
+
+    /// Проверяет полноту и качество опубликованного набора источников для одного кабинета.
+    /// Значение N/D никогда не подменяется нулём; внешние API этим методом не вызываются.
+    #[tool(
+        name = "ofk_data_completeness",
+        annotations(
+            title = "Полнота данных OFK",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reporting_data_completeness(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ReportingCompletenessInput>,
+    ) -> Result<Json<DataCompletenessResult>, String> {
+        let cutoff = parse_reporting_cutoff(input.cutoff_at.as_deref())?;
+        let (account, _) = self.resolve_reporting_account(&identity, input.account.as_deref())?;
+        self.reporting_reader
+            .data_completeness(&account, cutoff)
+            .await
+            .map(Json)
+            .map_err(Self::reporting_error)
+    }
+
+    /// Возвращает ограниченную историю канонических KPI по опубликованным снимкам.
+    /// Финансово-рекламные показатели доступны только ролям finance/admin.
+    #[tool(
+        name = "ofk_metrics_history",
+        annotations(
+            title = "История KPI OFK",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reporting_metrics_history(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ReportingMetricsHistoryInput>,
+    ) -> Result<Json<MetricsHistoryResult>, String> {
+        validate_reporting_limit(input.limit, MAX_REPORTING_HISTORY_POINTS)?;
+        let (date_from, date_to) =
+            parse_reporting_date_range(input.date_from.as_deref(), input.date_to.as_deref())?;
+        let (account, role) =
+            self.resolve_reporting_account(&identity, input.account.as_deref())?;
+        Self::authorize_reporting_details_for_role(role)?;
+        self.reporting_reader
+            .metrics_history(&account, date_from, date_to, input.limit)
+            .await
+            .map(Json)
+            .map_err(Self::reporting_error)
+    }
+
+    /// Возвращает до пяти детерминированных рекомендаций по опубликованному снимку.
+    /// Пороговые значения задаются серверной политикой и не принимаются от модели.
+    #[tool(
+        name = "ofk_manager_actions",
+        annotations(
+            title = "Приоритетные действия менеджера OFK",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reporting_manager_actions(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ReportingManagerActionsInput>,
+    ) -> Result<Json<ManagerActionsResult>, String> {
+        let cutoff = parse_reporting_cutoff(input.cutoff_at.as_deref())?;
+        let (account, role) =
+            self.resolve_reporting_account(&identity, input.account.as_deref())?;
+        Self::authorize_reporting_details_for_role(role)?;
+        self.reporting_reader
+            .manager_actions(&account, cutoff)
+            .await
+            .map(Json)
+            .map_err(Self::reporting_error)
+    }
+
+    /// Показывает администратору каталог уже сформированных неизменяемых отчётов.
+    /// Метод не раскрывает адреса, provider ID, пути, хэши, ошибки доставки или содержимое писем.
+    #[tool(
+        name = "ofk_reports",
+        annotations(
+            title = "Готовые отчёты OFK",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reporting_ready_reports(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ReportingReadyReportsInput>,
+    ) -> Result<Json<ReadyReportsResult>, String> {
+        validate_reporting_limit(input.limit, MAX_REPORTING_REPORTS)?;
+        let (_, actor) = self.access_context(&identity)?;
+        Self::authorize_report_catalog_for_role(actor.role)?;
+        self.reporting_reader
+            .ready_reports(input.limit)
+            .await
+            .map(Json)
+            .map_err(Self::reporting_error)
+    }
+
     /// Показывает локально настроенные магазины и наличие ключей, не раскрывая секреты. Не проверяет сеть или авторизацию Ozon API.
     #[tool(
         name = "ozon_stores_status",
@@ -5529,6 +5870,53 @@ fn parse_date(value: &str, field: &str) -> Result<NaiveDate, String> {
         .map_err(|_| format!("{field} должен иметь формат YYYY-MM-DD"))
 }
 
+fn parse_reporting_cutoff(value: Option<&str>) -> Result<Option<DateTime<Utc>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    validate_non_blank("cutoff_at", value)?;
+    validate_max_chars("cutoff_at", value, 64)?;
+    DateTime::parse_from_rfc3339(value)
+        .map(|cutoff| Some(cutoff.with_timezone(&Utc)))
+        .map_err(|_| format!("{REPORTING_INVALID_REQUEST}: cutoff_at должен иметь формат RFC 3339"))
+}
+
+fn parse_reporting_date_range(
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+) -> Result<(Option<NaiveDate>, Option<NaiveDate>), String> {
+    match (date_from, date_to) {
+        (None, None) => Ok((None, None)),
+        (Some(date_from), Some(date_to)) => {
+            let from = parse_date(date_from, "date_from")?;
+            let to = parse_date(date_to, "date_to")?;
+            if to < from {
+                return Err(format!(
+                    "{REPORTING_INVALID_REQUEST}: date_to не может быть раньше date_from"
+                ));
+            }
+            if (to - from).num_days() + 1 > MAX_REPORTING_HISTORY_DAYS {
+                return Err(format!(
+                    "{REPORTING_INVALID_REQUEST}: период истории не может превышать {MAX_REPORTING_HISTORY_DAYS} дней"
+                ));
+            }
+            Ok((Some(from), Some(to)))
+        }
+        _ => Err(format!(
+            "{REPORTING_INVALID_REQUEST}: date_from и date_to нужно передавать вместе"
+        )),
+    }
+}
+
+fn validate_reporting_limit(limit: u16, maximum: u16) -> Result<(), String> {
+    if !(1..=maximum).contains(&limit) {
+        return Err(format!(
+            "{REPORTING_INVALID_REQUEST}: limit должен быть от 1 до {maximum}"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_date_range(date_from: &str, date_to: &str, max_days: i64) -> Result<(), String> {
     let from = parse_date(date_from, "date_from")?;
     let to = parse_date(date_to, "date_to")?;
@@ -6121,6 +6509,12 @@ mod tests {
         PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST, READ_ONLY_ENDPOINT_ALLOWLIST,
         is_read_only_endpoint_allowed,
     };
+    use crate::reporting::mcp_read::{
+        CollectionState, CollectionStatusItem, DataQuality, DataState, KpiValues, ManagerAction,
+        ManagerActionKind, MetricsHistoryPoint, PublishedCheckpoint, ReadyReportItem,
+        ReadyReportKind, ReadyReportState, ReportingMarketplace as ReadMarketplace,
+        ReportingReadFuture, ReportingReadRepository, ReportingSource, SourceCompleteness,
+    };
     use crate::test_support::mock_http;
     use axum::Extension;
     use rmcp::transport::{
@@ -6251,6 +6645,240 @@ mod tests {
             actor.to_owned(),
             registry_source(),
         )
+    }
+
+    struct FakeReportingRepository {
+        calls: AtomicU64,
+        error: Option<ReportingReadError>,
+    }
+
+    impl FakeReportingRepository {
+        fn succeeding() -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+                error: None,
+            }
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn complete<'a, T: Send + 'a>(&'a self, value: T) -> ReportingReadFuture<'a, T> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let error = self.error;
+            Box::pin(async move { error.map_or(Ok(value), Err) })
+        }
+
+        fn marketplace(account: &AccountScope) -> ReadMarketplace {
+            match account.marketplace() {
+                ReportingMarketplace::Ozon => ReadMarketplace::Ozon,
+                ReportingMarketplace::Wildberries => ReadMarketplace::Wildberries,
+            }
+        }
+    }
+
+    impl ReportingReadRepository for FakeReportingRepository {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn collection_status<'a>(
+            &'a self,
+            account: &'a AccountScope,
+            _limit: u16,
+        ) -> ReportingReadFuture<'a, CollectionStatusResult> {
+            self.complete(CollectionStatusResult {
+                account_id: account.account_id().to_owned(),
+                marketplace: Self::marketplace(account),
+                items: vec![CollectionStatusItem {
+                    snapshot_id: "snapshot-1".to_owned(),
+                    source: ReportingSource::Sales,
+                    cutoff_at: "2026-08-20T03:00:00Z".to_owned(),
+                    source_as_of: "2026-08-20T02:55:00Z".to_owned(),
+                    status: CollectionState::Succeeded,
+                    pagination_complete: true,
+                    row_count: 7,
+                    collector_version: "test".to_owned(),
+                    started_at: "2026-08-20T02:59:00Z".to_owned(),
+                    finished_at: Some("2026-08-20T03:00:00Z".to_owned()),
+                    error_class: None,
+                    http_status: Some(200),
+                    last_published: Some(PublishedCheckpoint {
+                        cutoff_at: "2026-08-20T03:00:00Z".to_owned(),
+                        source_as_of: "2026-08-20T02:55:00Z".to_owned(),
+                        status: CollectionState::Succeeded,
+                        row_count: 7,
+                    }),
+                }],
+            })
+        }
+
+        fn data_completeness<'a>(
+            &'a self,
+            account: &'a AccountScope,
+            _cutoff: Option<DateTime<Utc>>,
+        ) -> ReportingReadFuture<'a, DataCompletenessResult> {
+            self.complete(DataCompletenessResult {
+                account_id: account.account_id().to_owned(),
+                marketplace: Self::marketplace(account),
+                cutoff_at: Some("2026-08-20T03:00:00Z".to_owned()),
+                state: DataState::Complete,
+                recommendations_allowed: true,
+                sources: vec![SourceCompleteness {
+                    source: ReportingSource::Sales,
+                    available: true,
+                    status: Some(CollectionState::Succeeded),
+                    quality: Some(DataQuality::Complete),
+                    pagination_complete: Some(true),
+                    row_count: Some(7),
+                    source_as_of: Some("2026-08-20T02:55:00Z".to_owned()),
+                }],
+            })
+        }
+
+        fn metrics_history<'a>(
+            &'a self,
+            account: &'a AccountScope,
+            _from: Option<NaiveDate>,
+            _to: Option<NaiveDate>,
+            _limit: u16,
+        ) -> ReportingReadFuture<'a, MetricsHistoryResult> {
+            self.complete(MetricsHistoryResult {
+                account_id: account.account_id().to_owned(),
+                marketplace: Self::marketplace(account),
+                date_from: "2026-08-19".to_owned(),
+                date_to: "2026-08-20".to_owned(),
+                points: vec![MetricsHistoryPoint {
+                    cutoff_at: "2026-08-20T03:00:00Z".to_owned(),
+                    state: DataState::Complete,
+                    kpis: Some(KpiValues {
+                        ordered_units: 2,
+                        realized_units: Some(1),
+                        operational_gmv_minor: 1_000,
+                        cancelled_units: Some(0),
+                        returned_units: Some(0),
+                        ad_impressions: 10,
+                        ad_clicks: 2,
+                        ad_spend_minor: 100,
+                        attributed_orders: 1,
+                        attributed_revenue_minor: 800,
+                        ctr_bps: Some(2_000),
+                        cpc_minor: Some(50),
+                        ad_conversion_bps: Some(5_000),
+                        cpo_minor: Some(100),
+                        drr_bps: Some(1_250),
+                        buyout_rate_bps: Some(5_000),
+                    }),
+                }],
+            })
+        }
+
+        fn manager_actions<'a>(
+            &'a self,
+            account: &'a AccountScope,
+            _cutoff: Option<DateTime<Utc>>,
+        ) -> ReportingReadFuture<'a, ManagerActionsResult> {
+            self.complete(ManagerActionsResult {
+                account_id: account.account_id().to_owned(),
+                marketplace: Self::marketplace(account),
+                cutoff_at: Some("2026-08-20T03:00:00Z".to_owned()),
+                state: DataState::Complete,
+                recommendations_allowed: true,
+                actions: vec![ManagerAction {
+                    sku: "sku-1".to_owned(),
+                    kind: ManagerActionKind::LowStockCover,
+                    severity: crate::reporting::mcp_read::ActionSeverity::Yellow,
+                    observed: 2,
+                    threshold: 3,
+                    impact_minor: 500,
+                }],
+            })
+        }
+
+        fn ready_reports(&self, _limit: u16) -> ReportingReadFuture<'_, ReadyReportsResult> {
+            self.complete(ReadyReportsResult {
+                reports: vec![ReadyReportItem {
+                    batch_id: "batch-1".to_owned(),
+                    report_version: 1,
+                    local_date: "2026-08-20".to_owned(),
+                    kind: ReadyReportKind::Morning,
+                    state: ReadyReportState::Ready,
+                    artifact_ready: true,
+                    sent: false,
+                    delayed: false,
+                    scheduled_for: "2026-08-20T03:00:00Z".to_owned(),
+                    deadline_at: "2026-08-20T03:30:00Z".to_owned(),
+                    state_changed_at: "2026-08-20T03:01:00Z".to_owned(),
+                    sent_at: None,
+                }],
+            })
+        }
+    }
+
+    fn reporting_test_server(actor: &str, repository: Arc<dyn ReportingReadRepository>) -> OzonMcp {
+        OzonMcp::new(
+            OzonClient::new(
+                "http://127.0.0.1:1".to_owned(),
+                Duration::from_secs(1),
+                BTreeMap::new(),
+            )
+            .unwrap(),
+            actor.to_owned(),
+            performance_registry_source(),
+        )
+        .with_reporting_reader(ReportingReader::from_repository(repository))
+    }
+
+    fn reporting_edge_registry_source() -> RegistrySource {
+        let sequence = REGISTRY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mcp-ozon-reporting-edge-access-{}-{sequence}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "actors": [
+                {"id":"admin","name":"Administrator","role":"admin"},
+                {"id":"owner_a","name":"Owner A","role":"manager"},
+                {"id":"owner_b","name":"Owner B","role":"manager"},
+                {"id":"wb_manager","name":"WB Manager","role":"manager"},
+                {"id":"invalid_manager","name":"Invalid ID Manager","role":"manager"},
+                {"id":"orphan","name":"No Accounts","role":"manager"}
+              ],
+              "accounts": [
+                {"id":"account_a","organization":"Example organization A","marketplace":"ozon","seller_client_id":"seller-a","manager_id":"owner_a","ozon":{"store_id":"store_a","client_id_env":"OZON_CLIENT_ID","api_key_env":"OZON_API_KEY"}},
+                {"id":"account_b","organization":"Example organization B","marketplace":"ozon","seller_client_id":"seller-b","manager_id":"owner_b","ozon":{"store_id":"store_b","client_id_env":"OZON_B_CLIENT_ID","api_key_env":"OZON_B_API_KEY"}},
+                {"id":"account_wb","organization":"WB account","marketplace":"wildberries","seller_client_id":"42","manager_id":"wb_manager","wildberries":{"api_token_env":"WB_TOKEN"}},
+                {"id":"bad.id","organization":"Invalid reporting ID","marketplace":"wildberries","seller_client_id":"43","manager_id":"invalid_manager","wildberries":{"api_token_env":"WB_BAD_TOKEN"}}
+              ]
+            }"#,
+        )
+        .unwrap();
+        RegistrySource::new(path).unwrap()
+    }
+
+    fn reporting_edge_test_server(
+        actor: &str,
+        repository: Arc<dyn ReportingReadRepository>,
+    ) -> OzonMcp {
+        OzonMcp::new(
+            OzonClient::new(
+                "http://127.0.0.1:1".to_owned(),
+                Duration::from_secs(1),
+                BTreeMap::new(),
+            )
+            .unwrap(),
+            actor.to_owned(),
+            reporting_edge_registry_source(),
+        )
+        .with_reporting_reader(ReportingReader::from_repository(repository))
+    }
+
+    fn reporting_tool_error<T>(result: Result<Json<T>, String>) -> String {
+        result.err().expect("expected reporting tool to fail")
     }
 
     fn mock_server(expected_requests: usize) -> (OzonMcp, mpsc::Receiver<String>) {
@@ -6929,6 +7557,13 @@ mod tests {
 
     #[test]
     fn all_tools_are_read_only_and_described() {
+        const INTERNAL_REPORTING_TOOLS: &[&str] = &[
+            "ofk_collection_status",
+            "ofk_data_completeness",
+            "ofk_manager_actions",
+            "ofk_metrics_history",
+            "ofk_reports",
+        ];
         let tools = server()
             .with_preview_features(false, true)
             .tool_router
@@ -6947,7 +7582,12 @@ mod tests {
             let annotations = tool.annotations.as_ref().unwrap();
             assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
             assert_eq!(annotations.idempotent_hint, Some(true), "{}", tool.name);
-            assert_eq!(annotations.open_world_hint, Some(true), "{}", tool.name);
+            assert_eq!(
+                annotations.open_world_hint,
+                Some(!INTERNAL_REPORTING_TOOLS.contains(&tool.name.as_ref())),
+                "{}",
+                tool.name
+            );
             assert_eq!(
                 tool.input_schema.get("additionalProperties"),
                 Some(&Value::Bool(false)),
@@ -6955,6 +7595,470 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reporting_tools_fail_closed_when_the_reader_is_disabled() {
+        let manager = manager_server("manager");
+        let admin = server();
+
+        let status = reporting_tool_error(
+            manager
+                .reporting_collection_status(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCollectionStatusInput {
+                        account: None,
+                        limit: 20,
+                    }),
+                )
+                .await,
+        );
+        let completeness = reporting_tool_error(
+            manager
+                .reporting_data_completeness(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCompletenessInput {
+                        account: None,
+                        cutoff_at: None,
+                    }),
+                )
+                .await,
+        );
+        let history = reporting_tool_error(
+            admin
+                .reporting_metrics_history(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingMetricsHistoryInput {
+                        account: Some("store_a".to_owned()),
+                        date_from: None,
+                        date_to: None,
+                        limit: 14,
+                    }),
+                )
+                .await,
+        );
+        let actions = reporting_tool_error(
+            admin
+                .reporting_manager_actions(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingManagerActionsInput {
+                        account: Some("store_a".to_owned()),
+                        cutoff_at: None,
+                    }),
+                )
+                .await,
+        );
+        let reports = reporting_tool_error(
+            admin
+                .reporting_ready_reports(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingReadyReportsInput { limit: 20 }),
+                )
+                .await,
+        );
+
+        for error in [status, completeness, history, actions, reports] {
+            assert!(error.starts_with(REPORTING_UNAVAILABLE), "{error}");
+            assert!(!error.contains("postgres"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reporting_validation_and_rbac_precede_repository_access() {
+        let repository = Arc::new(FakeReportingRepository::succeeding());
+        let manager = reporting_test_server("manager", repository.clone());
+
+        assert_validation_error(
+            manager
+                .reporting_collection_status(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCollectionStatusInput {
+                        account: None,
+                        limit: 0,
+                    }),
+                )
+                .await,
+            "limit",
+        );
+        assert_validation_error(
+            manager
+                .reporting_collection_status(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCollectionStatusInput {
+                        account: None,
+                        limit: 51,
+                    }),
+                )
+                .await,
+            "limit",
+        );
+        assert_validation_error(
+            manager
+                .reporting_data_completeness(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCompletenessInput {
+                        account: None,
+                        cutoff_at: Some("not-a-time".to_owned()),
+                    }),
+                )
+                .await,
+            "cutoff_at",
+        );
+        assert_validation_error(
+            manager
+                .reporting_metrics_history(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingMetricsHistoryInput {
+                        account: None,
+                        date_from: Some("2026-08-20".to_owned()),
+                        date_to: None,
+                        limit: 14,
+                    }),
+                )
+                .await,
+            "date_from",
+        );
+        assert_validation_error(
+            manager
+                .reporting_metrics_history(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingMetricsHistoryInput {
+                        account: None,
+                        date_from: None,
+                        date_to: None,
+                        limit: 101,
+                    }),
+                )
+                .await,
+            "limit",
+        );
+        assert_validation_error(
+            manager
+                .reporting_metrics_history(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingMetricsHistoryInput {
+                        account: None,
+                        date_from: Some("2025-08-19".to_owned()),
+                        date_to: Some("2026-08-20".to_owned()),
+                        limit: 14,
+                    }),
+                )
+                .await,
+            "период",
+        );
+        assert_validation_error(
+            manager
+                .reporting_metrics_history(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingMetricsHistoryInput {
+                        account: None,
+                        date_from: Some("2026-08-20".to_owned()),
+                        date_to: Some("2026-08-19".to_owned()),
+                        limit: 14,
+                    }),
+                )
+                .await,
+            "date_to",
+        );
+        assert_validation_error(
+            manager
+                .reporting_ready_reports(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingReadyReportsInput { limit: 101 }),
+                )
+                .await,
+            "limit",
+        );
+
+        let unknown_account = reporting_tool_error(
+            manager
+                .reporting_collection_status(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCollectionStatusInput {
+                        account: Some("missing_account".to_owned()),
+                        limit: 20,
+                    }),
+                )
+                .await,
+        );
+        assert!(
+            unknown_account.starts_with("UNKNOWN_REPORTING_ACCOUNT"),
+            "{unknown_account}"
+        );
+
+        let denied_account = reporting_tool_error(
+            manager
+                .reporting_collection_status(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCollectionStatusInput {
+                        account: Some("account_b".to_owned()),
+                        limit: 20,
+                    }),
+                )
+                .await,
+        );
+        assert!(
+            denied_account.starts_with(ACCESS_DENIED),
+            "{denied_account}"
+        );
+
+        let denied_history = reporting_tool_error(
+            manager
+                .reporting_metrics_history(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingMetricsHistoryInput {
+                        account: Some("account_a".to_owned()),
+                        date_from: None,
+                        date_to: None,
+                        limit: 14,
+                    }),
+                )
+                .await,
+        );
+        assert!(
+            denied_history.starts_with(ROLE_ACCESS_DENIED),
+            "{denied_history}"
+        );
+        let denied_actions = reporting_tool_error(
+            manager
+                .reporting_manager_actions(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingManagerActionsInput {
+                        account: Some("account_a".to_owned()),
+                        cutoff_at: None,
+                    }),
+                )
+                .await,
+        );
+        assert!(
+            denied_actions.starts_with(ROLE_ACCESS_DENIED),
+            "{denied_actions}"
+        );
+        let denied_reports = reporting_tool_error(
+            manager
+                .reporting_ready_reports(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingReadyReportsInput { limit: 20 }),
+                )
+                .await,
+        );
+        assert!(
+            denied_reports.starts_with(ROLE_ACCESS_DENIED),
+            "{denied_reports}"
+        );
+        assert_eq!(repository.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn reporting_account_resolution_is_explicit_fail_closed_and_maps_wb() {
+        let repository = Arc::new(FakeReportingRepository::succeeding());
+        assert!(repository.enabled());
+
+        let orphan = reporting_edge_test_server("orphan", repository.clone());
+        let no_account = reporting_tool_error(
+            orphan
+                .reporting_collection_status(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCollectionStatusInput {
+                        account: None,
+                        limit: 20,
+                    }),
+                )
+                .await,
+        );
+        assert!(
+            no_account.starts_with("NO_ACCESSIBLE_REPORTING_ACCOUNT"),
+            "{no_account}"
+        );
+
+        let admin = reporting_edge_test_server("admin", repository.clone());
+        let ambiguous = reporting_tool_error(
+            admin
+                .reporting_collection_status(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCollectionStatusInput {
+                        account: None,
+                        limit: 20,
+                    }),
+                )
+                .await,
+        );
+        assert!(
+            ambiguous.starts_with("REPORTING_ACCOUNT_REQUIRED"),
+            "{ambiguous}"
+        );
+
+        let wb_manager = reporting_edge_test_server("wb_manager", repository.clone());
+        let wb_status = wb_manager
+            .reporting_collection_status(
+                RequestIdentity::dev(),
+                Parameters(ReportingCollectionStatusInput {
+                    account: None,
+                    limit: 20,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(wb_status.account_id, "account_wb");
+        assert_eq!(wb_status.marketplace, ReadMarketplace::Wildberries);
+
+        let invalid_manager = reporting_edge_test_server("invalid_manager", repository.clone());
+        let invalid_account = reporting_tool_error(
+            invalid_manager
+                .reporting_collection_status(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingCollectionStatusInput {
+                        account: None,
+                        limit: 20,
+                    }),
+                )
+                .await,
+        );
+        assert!(
+            invalid_account.starts_with(REPORTING_INVALID_REQUEST),
+            "{invalid_account}"
+        );
+        assert_eq!(repository.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn reporting_tools_return_only_repository_projections_for_allowed_roles() {
+        let repository = Arc::new(FakeReportingRepository::succeeding());
+        let manager = reporting_test_server("manager", repository.clone());
+        let finance = reporting_test_server("finance", repository.clone());
+        let admin = reporting_test_server("admin", repository.clone());
+
+        let status = manager
+            .reporting_collection_status(
+                RequestIdentity::dev(),
+                Parameters(ReportingCollectionStatusInput {
+                    account: None,
+                    limit: 1,
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(status.account_id, "account_a");
+        assert_eq!(status.items.len(), 1);
+
+        let completeness = manager
+            .reporting_data_completeness(
+                RequestIdentity::dev(),
+                Parameters(ReportingCompletenessInput {
+                    account: None,
+                    cutoff_at: Some("2026-08-20T08:00:00+05:00".to_owned()),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(completeness.account_id, "account_a");
+        assert_eq!(completeness.state, DataState::Complete);
+
+        for actor in [&finance, &admin] {
+            let history = actor
+                .reporting_metrics_history(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingMetricsHistoryInput {
+                        account: Some("account_a".to_owned()),
+                        date_from: Some("2026-08-19".to_owned()),
+                        date_to: Some("2026-08-20".to_owned()),
+                        limit: 2,
+                    }),
+                )
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(history.account_id, "account_a");
+            assert_eq!(history.points.len(), 1);
+
+            let actions = actor
+                .reporting_manager_actions(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingManagerActionsInput {
+                        account: Some("account_a".to_owned()),
+                        cutoff_at: None,
+                    }),
+                )
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(actions.account_id, "account_a");
+            assert_eq!(actions.actions.len(), 1);
+        }
+
+        let reports = admin
+            .reporting_ready_reports(
+                RequestIdentity::dev(),
+                Parameters(ReportingReadyReportsInput { limit: 1 }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(reports.reports.len(), 1);
+        assert_eq!(reports.reports[0].batch_id, "batch-1");
+        assert_eq!(repository.calls(), 7);
+    }
+
+    #[tokio::test]
+    async fn reporting_tool_json_boundaries_reject_unknown_fields_before_repository_access() {
+        let repository = Arc::new(FakeReportingRepository::succeeding());
+        let manager = reporting_test_server("manager", repository.clone());
+        let admin = reporting_test_server("admin", repository.clone());
+        let cases = [
+            (
+                manager.clone(),
+                "ofk_collection_status",
+                json!({"unexpected": true}),
+            ),
+            (
+                manager,
+                "ofk_data_completeness",
+                json!({"unexpected": true}),
+            ),
+            (
+                admin.clone(),
+                "ofk_metrics_history",
+                json!({"account": "account_a", "unexpected": true}),
+            ),
+            (
+                admin.clone(),
+                "ofk_manager_actions",
+                json!({"account": "account_a", "unexpected": true}),
+            ),
+            (admin, "ofk_reports", json!({"unexpected": true})),
+        ];
+
+        for (server, tool, arguments) in cases {
+            let body = call_tool_over_http(server, tool, arguments).await;
+            assert!(body.contains("unknown field"), "{tool}: {body}");
+            assert!(body.contains("unexpected"), "{tool}: {body}");
+        }
+        assert_eq!(repository.calls(), 0);
+    }
+
+    #[test]
+    fn reporting_errors_have_stable_sanitized_mcp_codes() {
+        assert_eq!(
+            OzonMcp::reporting_error(ReportingReadError::Disabled),
+            format!("{REPORTING_UNAVAILABLE}: серверная история отчётов не подключена")
+        );
+        assert_eq!(
+            OzonMcp::reporting_error(ReportingReadError::InvalidRequest),
+            format!("{REPORTING_INVALID_REQUEST}: параметры запроса истории недопустимы")
+        );
+        assert_eq!(
+            OzonMcp::reporting_error(ReportingReadError::Unavailable),
+            format!("{REPORTING_TEMPORARILY_UNAVAILABLE}: хранилище отчётов временно недоступно")
+        );
+        assert_eq!(
+            OzonMcp::reporting_error(ReportingReadError::InvalidPublishedData),
+            format!(
+                "{REPORTING_INVALID_PUBLISHED_DATA}: опубликованный набор данных не прошёл проверку"
+            )
+        );
     }
 
     #[test]
@@ -10533,7 +11637,7 @@ mod tests {
         // The release checklist in `SECURITY.md` states this count verbatim.
         // Changing it here without updating that gate leaves the gate
         // describing a router that no longer exists.
-        assert_eq!(dev_tools.len(), 70);
+        assert_eq!(dev_tools.len(), 75);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -10544,7 +11648,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 70);
+        assert_eq!(jwt_tools.len(), 75);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -10557,7 +11661,7 @@ mod tests {
                 .with_preview_features(false, true)
                 .tool_router
                 .list_all();
-        assert_eq!(legacy_flag_tools.len(), 70);
+        assert_eq!(legacy_flag_tools.len(), 75);
         assert_policy(
             legacy_flag_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -10570,6 +11674,11 @@ mod tests {
             "ozon_stores_status",
             "marketplace_accounts",
             "list_members",
+            "ofk_collection_status",
+            "ofk_data_completeness",
+            "ofk_metrics_history",
+            "ofk_manager_actions",
+            "ofk_reports",
             "wb_stores_status",
             "wb_ping",
             "wb_sales_funnel",

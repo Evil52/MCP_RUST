@@ -64,6 +64,30 @@ fn collection_target(account_id: &str, marketplace: Marketplace) -> CollectionTa
     }
 }
 
+#[tokio::test]
+async fn ozon_source_rejects_an_empty_period_before_transport_io() {
+    let transport = FixtureTransport(Mutex::new(VecDeque::new()));
+    let period_boundary = timestamp("2098-08-16T19:00:00Z");
+
+    let result = collect_complete_snapshots(
+        &transport,
+        Vec::new(),
+        "ozon-invalid-period".to_owned(),
+        cutoff(),
+        || timestamp("2098-08-17T02:30:00Z"),
+        period_boundary,
+        period_boundary,
+        "integration-test".to_owned(),
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(OzonReportSourceError::InvalidSnapshotInput)
+    ));
+    assert!(transport.0.lock().unwrap().is_empty());
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collected(
     account_id: &str,

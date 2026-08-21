@@ -420,7 +420,11 @@ pub fn parse_performance_sku_advertising(
                     Some(row),
                     "modelSales",
                 )?)?,
-                product_price_minor: parse_performance_minor(field(Some(row), "price")?)?,
+                // Ozon emits an empty string when the campaign row has no
+                // observable product price. The persistence contract already
+                // uses zero as the explicit "unavailable" sentinel for this
+                // field; keep every other malformed monetary value fail-closed.
+                product_price_minor: parse_optional_performance_price(field(Some(row), "price")?)?,
                 average_cpc_minor: Some(parse_performance_minor(field(Some(row), "avgCpc")?)?),
                 cpm_minor: per_thousand(spend_minor, impressions)?,
                 cpl_minor: per_event(spend_minor, basket_additions)?,
@@ -593,6 +597,14 @@ fn parse_performance_minor(value: &Value) -> Result<u64, OzonReportParseError> {
         return Err(OzonReportParseError::Value);
     }
     parse_minor(&Value::String(value.replace(',', ".")))
+}
+
+fn parse_optional_performance_price(value: &Value) -> Result<u64, OzonReportParseError> {
+    if value.as_str() == Some("") {
+        Ok(0)
+    } else {
+        parse_performance_minor(value)
+    }
 }
 
 fn parse_minor(value: &Value) -> Result<u64, OzonReportParseError> {
@@ -1041,6 +1053,19 @@ mod tests {
         .unwrap();
         assert_eq!(zero_events[0].cpm_minor, None);
         assert_eq!(zero_events[0].cpl_minor, None);
+
+        let mut unavailable_price = sku_row(json!(1), json!(2), json!(1), json!(1));
+        unavailable_price["price"] = json!("");
+        let unavailable_price =
+            parse_performance_sku_advertising(&json!({"rows":[unavailable_price]})).unwrap();
+        assert_eq!(unavailable_price[0].product_price_minor, 0);
+
+        let mut unavailable_spend = sku_row(json!(1), json!(2), json!(1), json!(1));
+        unavailable_spend["expense"] = json!("");
+        assert_eq!(
+            parse_performance_sku_advertising(&json!({"rows":[unavailable_spend]})),
+            Err(OzonReportParseError::Value)
+        );
 
         let mut invalid_model_sales = sku_row(json!(1), json!(2), json!(1), json!(1));
         invalid_model_sales["modelSales"] = json!("invalid");

@@ -120,6 +120,15 @@ render_position_compose() {
       config --no-env-resolution --format json
 }
 
+render_reporting_reader_compose() {
+  MCP_ACCESS_CONFIG_HOST="$main_access" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.yaml" \
+      -f "$project_dir/compose.reporting-reader.yaml" \
+      config --no-env-resolution --format json
+}
+
 render_reporting_live_compose() {
   local live_policy="$scratch/daily-report-policy.json"
   local credential_directory="$scratch/report-credentials"
@@ -292,6 +301,51 @@ verify_server() {
      and .environment.OZON_FINANCE_ACCRUALS_PREVIEW == "false"'
   check "$label: restart policy matches the deployment contract" "$server" \
     --arg restart "$expected_restart" '.restart == $restart'
+}
+
+# The reporting-reader overlay may change exactly two things on the verified
+# main MCP service: add its restricted database URL and attach the existing
+# internal database network. Everything else, including the outbound bridge,
+# mounts, published port, filesystem and resource hardening, must remain byte-
+# for-byte equivalent after Compose has merged the files.
+# shellcheck disable=SC2016
+verify_reporting_reader() {
+  local rendered="$1" base_rendered="$2" service base_service
+  local expected_database_url
+  service="$(jq -c '.services.server' <<<"$rendered")"
+  base_service="$(jq -c '.services.server' <<<"$base_rendered")"
+  expected_database_url='postgresql://position_reader:verify-only-reader-not-a-secret@position-db:5432/ozon_positions'
+
+  check "reporting reader: server service exists" "$service" 'type == "object"'
+  check "reporting reader: only the URL and network attachment differ from main" "$service" \
+    --argjson base "$base_service" \
+    'del(.environment.MCP_REPORTING_DATABASE_URL, .networks)
+     == ($base | del(.environment.MCP_REPORTING_DATABASE_URL, .networks))'
+  check "reporting reader: only the restricted reader URL is added" "$service" \
+    --arg database_url "$expected_database_url" \
+    '.environment.MCP_REPORTING_DATABASE_URL == $database_url
+     and (.environment | has("POSITION_DB_ADMIN_PASSWORD") | not)
+     and (.environment | has("POSITION_COLLECTOR_DB_PASSWORD") | not)
+     and (.environment | has("POSITION_READER_DB_PASSWORD") | not)
+     and (.environment | has("REPORT_WORKER_DB_PASSWORD") | not)
+     and (.environment | has("REPORT_COLLECTOR_DB_PASSWORD") | not)'
+  check "reporting reader: exact outbound and fixed database networks are attached" "$rendered" \
+    '(.services.server.networks | keys | sort) == ["outbound", "position-internal"]
+     and (.networks | keys | sort) == ["outbound", "position-internal"]
+     and .networks["position-internal"].name == "mcp-ozon-position-internal"
+     and .networks["position-internal"].external == true
+     and (.networks["position-internal"].internal // false) == false
+     and .networks.outbound.name == "mcp-ozon-outbound"
+     and .networks.outbound.driver == "bridge"
+     and (.networks.outbound.internal // false) == false
+     and .networks.outbound.driver_opts == {
+       "com.docker.network.bridge.enable_icc": "false",
+       "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1"
+     }'
+  check "reporting reader: overlay does not add lifecycle coupling or secret mounts" "$service" \
+    '(has("depends_on") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)'
 }
 
 verify_position() {
@@ -999,6 +1053,7 @@ verify_control() {
 main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_position_compose)"
+reporting_reader_rendered="$(render_reporting_reader_compose)"
 reporting_live_rendered="$(render_reporting_live_compose)"
 reporting_canary_rendered="$(render_reporting_canary_compose)"
 reporting_mail_canary_rendered="$(render_reporting_mail_canary_compose)"
@@ -1051,6 +1106,14 @@ check_contains \
   "reporting: default policy path is the disabled pilot" \
   "$project_dir/compose.position.yaml" \
   "\${DAILY_REPORT_POLICY_HOST:-./config/daily-report-pilot.example.json}"
+check_contains \
+  "reporting reader: reader password has no fallback value" \
+  "$project_dir/compose.reporting-reader.yaml" \
+  "\${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}"
+check_contains \
+  "reporting reader: fixed database network is external" \
+  "$project_dir/compose.reporting-reader.yaml" \
+  "name: mcp-ozon-position-internal"
 check_contains \
   "live reporting: access registry has no fallback path" \
   "$project_dir/compose.reporting-live.yaml" \
@@ -1187,6 +1250,7 @@ verify_server \
   "8789" \
   "no" \
   "mcp-ozon-canary-outbound"
+verify_reporting_reader "$reporting_reader_rendered" "$main_rendered"
 verify_position "$position_rendered"
 verify_position_collector "$position_rendered"
 verify_ozon_egress "$position_rendered"
@@ -1217,4 +1281,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, Control, position database, Ozon read-API and Gmail egress proxies, disabled collector/reporting runtimes, and the explicit reporting collection/mail canary and live overlays: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."
+echo "Compose hardening verified for main, canary, Control, position database, the opt-in MCP reporting reader, Ozon read-API and Gmail egress proxies, disabled collector/reporting runtimes, and the explicit reporting collection/mail canary and live overlays: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."

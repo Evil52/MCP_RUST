@@ -19,8 +19,8 @@ use crate::{
 use super::{
     ozon_adapter::{
         OzonReportParseError, OzonReportRequest, next_warehouse_stock_cursor, parse_price_page,
-        parse_sales_page, parse_warehouse_stock_page, product_page_request, sales_request,
-        warehouse_stock_page_request,
+        parse_sales_page, parse_stock_page, parse_warehouse_stock_page, product_page_request,
+        sales_request, warehouse_stock_page_request,
     },
     ozon_finance_source::collect_finance_facts,
     postgres_collector::{
@@ -108,7 +108,7 @@ where
         .collect_required_seller_facts(date_from, date_to)
         .await?;
     let source_as_of = completed_at();
-    let snapshots = facts
+    facts
         .into_complete_snapshots_extended(
             advertising,
             advertising_expenses,
@@ -119,8 +119,7 @@ where
             sales_period_end,
             collector_version,
         )
-        .map_err(|_| OzonReportSourceError::InvalidSnapshotInput)?;
-    Ok(snapshots)
+        .map_err(|_| OzonReportSourceError::InvalidSnapshotInput)
 }
 
 fn report_business_dates(
@@ -132,9 +131,9 @@ fn report_business_dates(
     }
     let offset =
         FixedOffset::east_opt(5 * 60 * 60).expect("the fixed Yekaterinburg UTC offset is valid");
-    let inclusive_end = period_end
-        .checked_sub_signed(Duration::nanoseconds(1))
-        .ok_or(OzonReportSourceError::InvalidSnapshotInput)?;
+    // `period_end > period_start` proves that `period_end` is not the minimum
+    // representable instant, so moving the exclusive bound back by 1 ns is safe.
+    let inclusive_end = period_end - Duration::nanoseconds(1);
     Ok((
         period_start.with_timezone(&offset).date_naive(),
         inclusive_end.with_timezone(&offset).date_naive(),
@@ -219,9 +218,19 @@ where
                 attempt += 1;
                 tokio::time::sleep(OVERLOAD_RETRY_DELAY).await;
             }
-            Err(kind) => return Err(OzonReportSourceError::Upstream(kind)),
+            Err(kind) => return Err(report_upstream_failure(path, kind)),
         }
     }
+}
+
+fn report_upstream_failure(path: &'static str, kind: OzonErrorKind) -> OzonReportSourceError {
+    let error_code = kind.code();
+    tracing::warn!(
+        endpoint = path,
+        error_code,
+        "Ozon daily-report request failed"
+    );
+    OzonReportSourceError::Upstream(kind)
 }
 
 pub struct OzonReportSource<T> {
@@ -261,7 +270,8 @@ impl OzonCollectedFacts {
             true,
             collector_version.clone(),
             CollectedFacts::Sales(self.sales),
-        )?;
+        )
+        .map_err(|error| snapshot_validation_error("sales", error))?;
         let stocks = CollectedSnapshot::new(
             account_id.clone(),
             Marketplace::Ozon,
@@ -273,7 +283,8 @@ impl OzonCollectedFacts {
             true,
             collector_version.clone(),
             CollectedFacts::Stocks(self.stocks),
-        )?;
+        )
+        .map_err(|error| snapshot_validation_error("stocks", error))?;
         let finance = CollectedSnapshot::new(
             account_id.clone(),
             Marketplace::Ozon,
@@ -285,7 +296,8 @@ impl OzonCollectedFacts {
             true,
             collector_version.clone(),
             CollectedFacts::Finance(self.finance),
-        )?;
+        )
+        .map_err(|error| snapshot_validation_error("finance", error))?;
         let prices = CollectedSnapshot::new(
             account_id,
             Marketplace::Ozon,
@@ -297,7 +309,8 @@ impl OzonCollectedFacts {
             true,
             collector_version,
             CollectedFacts::Prices(self.prices),
-        )?;
+        )
+        .map_err(|error| snapshot_validation_error("prices", error))?;
         Ok(vec![sales, finance, stocks, prices])
     }
 
@@ -362,6 +375,14 @@ impl OzonCollectedFacts {
     }
 }
 
+fn snapshot_validation_error(
+    source: &'static str,
+    error: PostgresCollectorError,
+) -> PostgresCollectorError {
+    tracing::warn!(source, "Ozon daily-report snapshot facts failed validation");
+    error
+}
+
 impl<T> OzonReportSource<T> {
     pub fn new(transport: T) -> Self {
         Self { transport }
@@ -423,9 +444,13 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         date_from: NaiveDate,
         date_to: NaiveDate,
     ) -> Result<OzonCollectedFacts, OzonReportSourceError> {
+        tracing::info!(source = "sales", "collecting Ozon daily-report source");
         let sales = self.collect_sales_pages(date_from, date_to).await?;
+        tracing::info!(source = "finance", "collecting Ozon daily-report source");
         let finance = collect_finance_facts(&self.transport, date_from, date_to).await?;
+        tracing::info!(source = "stocks", "collecting Ozon daily-report source");
         let stocks = self.collect_stock_pages().await?;
+        tracing::info!(source = "prices", "collecting Ozon daily-report source");
         let prices = self.collect_price_pages().await?;
         Ok(OzonCollectedFacts {
             sales,
@@ -476,17 +501,40 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         Err(OzonReportSourceError::PaginationLimit)
     }
 
-    /// Collects real warehouse-granular FBO and FBS stock pages.
+    /// Collects real warehouse-granular FBO and FBS stock pages when the
+    /// legacy warehouse endpoints remain available.
     ///
-    /// Both sources must complete. Falling back to `/v4/product/info/stocks`
-    /// would silently collapse all physical warehouses into two fulfillment
-    /// labels and make OOS/DaysCover analytics misleading.
+    /// Ozon has retired the legacy FBO route for some accounts. Only an HTTP
+    /// rejection or an explicit not-found response from that first route may
+    /// fall back to the already allowlisted `/v4/product/info/stocks` source.
+    /// The normalized fallback exposes fulfillment-level, not physical-
+    /// warehouse-level, inventory; its stable `fbo`/`fbs` identifiers retain
+    /// that provenance. Authentication, quota, server, and transport failures
+    /// remain fail-closed and are never hidden by the fallback.
     pub async fn collect_stock_pages(
         &self,
     ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
-        let mut facts = self
+        let fbo = self
             .collect_warehouse_stock_pages("/v1/product/info/stocks-by-warehouse/fbo", "fbo")
-            .await?;
+            .await;
+        let mut facts = match fbo {
+            Ok(facts) => facts,
+            Err(OzonReportSourceError::Upstream(OzonErrorKind::Http | OzonErrorKind::NotFound)) => {
+                tracing::warn!(
+                    endpoint = "/v1/product/info/stocks-by-warehouse/fbo",
+                    fallback = "/v4/product/info/stocks",
+                    "legacy Ozon stock endpoint was rejected; using fulfillment-level fallback"
+                );
+                return self
+                    .collect_product_pages(
+                        "/v4/product/info/stocks",
+                        parse_stock_page,
+                        OzonReportSourceError::InvalidStocksResponse,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
         facts.extend(
             self.collect_warehouse_stock_pages("/v2/product/info/stocks-by-warehouse/fbs", "fbs")
                 .await?,
@@ -660,53 +708,51 @@ mod tests {
     /// page already collected, because snapshots publish atomically.
     #[tokio::test(start_paused = true)]
     async fn a_transient_local_overload_does_not_discard_the_run() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::io::sink)
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
         let calls = std::cell::Cell::new(0_usize);
-        let value = retry_local_overload("/v3/posting/fbo/list", || async {
+        let forced_failure = std::cell::Cell::new(None);
+        let mut attempt_once = || async {
             calls.set(calls.get() + 1);
-            if calls.get() < 3 {
+            if let Some(kind) = forced_failure.get() {
+                Err(kind)
+            } else if calls.get() < 3 {
                 Err(OzonErrorKind::Overloaded)
             } else {
                 Ok(serde_json::json!({"result": "ok"}))
             }
-        })
-        .await
-        .expect("a transient local refusal must not fail the page");
+        };
+        let value = retry_local_overload("/v3/posting/fbo/list", &mut attempt_once)
+            .await
+            .expect("a transient local refusal must not fail the page");
         assert_eq!(value["result"], "ok");
         assert_eq!(calls.get(), 3);
-    }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_sustained_local_overload_still_fails_the_page() {
-        let calls = std::cell::Cell::new(0_usize);
-        let error = retry_local_overload("/v3/posting/fbo/list", || async {
-            calls.set(calls.get() + 1);
-            Err(OzonErrorKind::Overloaded)
-        })
-        .await
-        .expect_err("the retry budget is bounded");
-        assert!(matches!(
+        forced_failure.set(Some(OzonErrorKind::Overloaded));
+        let error = retry_local_overload("/v3/posting/fbo/list", &mut attempt_once)
+            .await
+            .expect_err("the same request closure must honor the bounded retry budget");
+        assert_eq!(
             error,
             OzonReportSourceError::Upstream(OzonErrorKind::Overloaded)
-        ));
-        assert_eq!(calls.get(), OVERLOAD_RETRY_ATTEMPTS);
-    }
+        );
+        assert_eq!(calls.get(), 3 + OVERLOAD_RETRY_ATTEMPTS);
 
-    /// Only the local refusal is retried. An upstream failure has already
-    /// reached Ozon, so repeating it would be a second marketplace request.
-    #[tokio::test(start_paused = true)]
-    async fn an_upstream_failure_is_never_retried() {
-        let calls = std::cell::Cell::new(0_usize);
-        let error = retry_local_overload("/v3/posting/fbo/list", || async {
-            calls.set(calls.get() + 1);
-            Err(OzonErrorKind::RateLimited)
-        })
-        .await
-        .expect_err("an upstream failure is surfaced");
-        assert!(matches!(
+        // Only the local refusal is retried. An upstream failure has already
+        // reached Ozon, so repeating it would be a second marketplace request.
+        let calls_before_upstream_failure = calls.get();
+        forced_failure.set(Some(OzonErrorKind::RateLimited));
+        let error = retry_local_overload("/v3/posting/fbo/list", &mut attempt_once)
+            .await
+            .expect_err("an upstream failure is surfaced");
+        assert_eq!(
             error,
             OzonReportSourceError::Upstream(OzonErrorKind::RateLimited)
-        ));
-        assert_eq!(calls.get(), 1);
+        );
+        assert_eq!(calls.get(), calls_before_upstream_failure + 1);
     }
 
     struct FixtureTransport(Mutex<VecDeque<Result<Value, OzonReportSourceError>>>);
@@ -756,6 +802,84 @@ mod tests {
             [
                 "/v1/product/info/stocks-by-warehouse/fbo",
                 "/v2/product/info/stocks-by-warehouse/fbs",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stock_collection_propagates_a_non_fallback_fbo_failure() {
+        let transport = RecordingTransport {
+            responses: Mutex::new(VecDeque::from([Err(OzonReportSourceError::Upstream(
+                OzonErrorKind::RateLimited,
+            ))])),
+            paths: Mutex::new(Vec::new()),
+        };
+        let source = OzonReportSource::new(&transport);
+
+        assert_eq!(
+            source.collect_stock_pages().await,
+            Err(OzonReportSourceError::Upstream(OzonErrorKind::RateLimited))
+        );
+        assert_eq!(
+            transport.paths.lock().unwrap().as_slice(),
+            ["/v1/product/info/stocks-by-warehouse/fbo"]
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_fbo_route_uses_the_bounded_fulfillment_fallback() {
+        let transport = RecordingTransport {
+            responses: Mutex::new(VecDeque::from([
+                Err(OzonReportSourceError::Upstream(OzonErrorKind::Http)),
+                Ok(json!({
+                    "items":[{
+                        "product_id":1,
+                        "stocks":[
+                            {"type":"fbo","present":4,"reserved":0},
+                            {"type":"fbs","present":2,"reserved":0}
+                        ]
+                    }],
+                    "cursor":""
+                })),
+            ])),
+            paths: Mutex::new(Vec::new()),
+        };
+        let source = OzonReportSource::new(&transport);
+
+        let facts = source.collect_stock_pages().await.unwrap();
+
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].warehouse_id, "FBO");
+        assert_eq!(facts[1].warehouse_id, "FBS");
+        assert_eq!(
+            transport.paths.lock().unwrap().as_slice(),
+            [
+                "/v1/product/info/stocks-by-warehouse/fbo",
+                "/v4/product/info/stocks",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_fbo_route_rejects_an_invalid_fulfillment_fallback_page() {
+        let transport = RecordingTransport {
+            responses: Mutex::new(VecDeque::from([
+                Err(OzonReportSourceError::Upstream(OzonErrorKind::Http)),
+                Ok(json!({"items": "invalid", "cursor": ""})),
+            ])),
+            paths: Mutex::new(Vec::new()),
+        };
+        let source = OzonReportSource::new(&transport);
+
+        assert_eq!(
+            source.collect_stock_pages().await,
+            Err(OzonReportSourceError::InvalidStocksResponse)
+        );
+        assert_eq!(
+            transport.paths.lock().unwrap().as_slice(),
+            [
+                "/v1/product/info/stocks-by-warehouse/fbo",
+                "/v4/product/info/stocks",
             ]
         );
     }
@@ -829,10 +953,10 @@ mod tests {
             source.collect_stock_pages().await,
             Err(OzonReportSourceError::InvalidStocksResponse)
         );
-        assert!(matches!(
-            source.sales_page(day, day, 0).await,
-            Err(OzonReportSourceError::InvalidSalesResponse { .. })
-        ));
+        assert_eq!(
+            source.sales_page(day, day, 0).await.unwrap_err().code(),
+            "invalid_sales_response"
+        );
     }
 
     #[tokio::test]
@@ -866,10 +990,10 @@ mod tests {
         let transport: &dyn OzonReportTransport = &invalid_sales;
         let source = OzonReportSource::new(transport);
         let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
-        assert!(matches!(
-            source.sales_page(day, day, 0).await,
-            Err(OzonReportSourceError::InvalidSalesResponse { .. })
-        ));
+        assert_eq!(
+            source.sales_page(day, day, 0).await.unwrap_err().code(),
+            "invalid_sales_response"
+        );
     }
 
     #[test]
@@ -941,6 +1065,19 @@ mod tests {
                 OzonReportSourceError::InvalidPricesResponse
             ),
             Err(OzonReportSourceError::InvalidResponse)
+        );
+        assert_eq!(
+            next_cursor(&json!({}), OzonReportSourceError::InvalidPricesResponse),
+            Err(OzonReportSourceError::InvalidPricesResponse)
+        );
+
+        let missing_cursor =
+            OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([Ok(
+                json!({"items": []}),
+            )]))));
+        assert_eq!(
+            missing_cursor.collect_price_pages().await,
+            Err(OzonReportSourceError::InvalidPricesResponse)
         );
 
         let bounded = OzonReportSource::new(FixtureTransport(Mutex::new(
@@ -1023,6 +1160,63 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(snapshots.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn complete_collection_accepts_the_production_clock_after_sources_finish() {
+        let transport = FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(json!({"result":{"data":[]}})),
+            Ok(json!({"accrual_types":[]})),
+            Ok(json!({"accruals":[],"last_id":""})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"items":[],"cursor":""})),
+        ])));
+        let cutoff_at = Utc::now();
+        let offset = FixedOffset::east_opt(5 * 60 * 60).unwrap();
+        let local_midnight = cutoff_at
+            .with_timezone(&offset)
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let period_end = offset
+            .from_local_datetime(&local_midnight)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let period_start = period_end - Duration::days(1);
+
+        let snapshots = collect_complete_snapshots(
+            &transport,
+            Vec::new(),
+            "ozon".to_owned(),
+            cutoff_at,
+            Utc::now,
+            period_start,
+            period_end,
+            "test-1".to_owned(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshots.len(), 5);
+        assert!(transport.0.lock().unwrap().is_empty());
+
+        assert_eq!(
+            collect_complete_snapshots(
+                &transport,
+                Vec::new(),
+                "ozon".to_owned(),
+                cutoff_at,
+                Utc::now,
+                period_end,
+                period_end,
+                "test-1".to_owned(),
+            )
+            .await,
+            Err(OzonReportSourceError::InvalidSnapshotInput)
+        );
+        assert!(transport.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1130,6 +1324,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(seller_only.len(), 4);
+        assert_eq!(
+            facts.clone().into_complete_snapshots_extended(
+                Vec::new(),
+                vec![CollectedAdvertisingExpenseFact {
+                    business_date: NaiveDate::from_ymd_opt(2026, 8, 16).unwrap(),
+                    campaign_id: 0,
+                    money_spent_minor: 100,
+                    bonus_spent_minor: 0,
+                    prepayment_spent_minor: 100,
+                }],
+                "ozon".to_owned(),
+                as_of,
+                as_of,
+                start,
+                as_of,
+                "test-1".to_owned(),
+            ),
+            Err(PostgresCollectorError::InvalidInput)
+        );
         let complete = facts
             .into_complete_snapshots(
                 vec![CollectedAdvertisingFact {

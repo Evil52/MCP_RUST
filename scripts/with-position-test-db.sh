@@ -66,6 +66,7 @@ fi
 
 export POSITION_REPOSITORY_TEST_ADMIN_URL="postgresql://position_admin:${admin_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export POSITION_REPOSITORY_TEST_COLLECTOR_URL="postgresql://position_collector:${collector_password}@127.0.0.1:${mapped_port}/ozon_positions"
+export POSITION_REPOSITORY_TEST_READER_URL="postgresql://position_reader:${reader_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export REPORT_OUTBOX_TEST_WORKER_URL="postgresql://report_worker:${report_worker_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export REPORT_SNAPSHOT_TEST_COLLECTOR_URL="postgresql://report_collector:${report_collector_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export POSITION_COLLECTOR_MODE=disabled

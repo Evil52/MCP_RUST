@@ -55,6 +55,36 @@ SELECT
     AND to_regclass('daily_reporting.published_finance_facts') IS NOT NULL
     AND to_regclass('daily_reporting.published_stock_facts') IS NOT NULL
     AND to_regclass('daily_reporting.published_price_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_collection_status') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_published_source_snapshots') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_sales_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_advertising_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_advertising_expense_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_finance_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_stock_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_price_facts') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_ready_reports') IS NOT NULL
+    AND (
+        SELECT count(*) = 9
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'daily_reporting'
+          AND relation.relkind = 'v'
+          AND relation.relname IN (
+              'mcp_collection_status',
+              'mcp_published_source_snapshots',
+              'mcp_sales_facts',
+              'mcp_advertising_facts',
+              'mcp_advertising_expense_facts',
+              'mcp_finance_facts',
+              'mcp_stock_facts',
+              'mcp_price_facts',
+              'mcp_ready_reports'
+          )
+          AND coalesce(relation.reloptions, ARRAY[]::text[])
+              @> ARRAY['security_barrier=true']
+    )
     AND EXISTS (
         SELECT 1
         FROM pg_constraint
@@ -284,6 +314,30 @@ SELECT
           )
           AND column_name = 'run_status'
     )
+    AND (
+        SELECT string_agg(column_name, ',' ORDER BY ordinal_position) =
+               'batch_id,recipient_id,report_version,local_date,report_kind,' ||
+               'scheduled_for,deadline_at,status,delayed,created_at,updated_at,sent_at'
+        FROM information_schema.columns
+        WHERE table_schema = 'daily_reporting'
+          AND table_name = 'mcp_ready_reports'
+    )
+    AND (
+        SELECT count(*) = 0
+        FROM information_schema.columns
+        WHERE table_schema = 'daily_reporting'
+          AND table_name = 'mcp_ready_reports'
+          AND column_name IN (
+              'recipient_email',
+              'provider_message_id',
+              'artifact_object_key',
+              'artifact_sha256',
+              'artifact_html_sha256',
+              'last_error_class',
+              'attempts',
+              'next_attempt_at'
+          )
+    )
     AND has_database_privilege('position_collector', current_database(), 'CONNECT')
     AND has_database_privilege('position_reader', current_database(), 'CONNECT')
     AND NOT has_database_privilege('position_collector', current_database(), 'TEMP')
@@ -459,6 +513,13 @@ SELECT
           AND expanded_acl.grantee = 'position_reader'::regrole
           AND expanded_acl.privilege_type = 'SELECT'
     )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_default_acl AS defaults
+        CROSS JOIN LATERAL aclexplode(defaults.defaclacl) AS expanded_acl
+        WHERE defaults.defaclnamespace = 'daily_reporting'::regnamespace
+          AND expanded_acl.grantee = 'position_reader'::regrole
+    )
     AND NOT has_table_privilege(
         'position_reader', 'search_position.wb_search_snapshots', 'INSERT'
     )
@@ -550,6 +611,64 @@ SELECT
     )
     AND NOT has_table_privilege(
         'position_collector', 'daily_reporting.delivery_batches', 'SELECT'
+    )
+    AND has_schema_privilege(
+        'position_reader', 'daily_reporting', 'USAGE'
+    )
+    AND NOT has_schema_privilege(
+        'position_reader', 'daily_reporting', 'CREATE'
+    )
+    AND (
+        SELECT bool_and(
+            has_table_privilege('position_reader', readable.object_name, 'SELECT')
+            AND NOT has_table_privilege(
+                'position_reader', readable.object_name,
+                'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+            )
+        )
+        FROM unnest(ARRAY[
+            'daily_reporting.mcp_collection_status',
+            'daily_reporting.mcp_published_source_snapshots',
+            'daily_reporting.mcp_sales_facts',
+            'daily_reporting.mcp_advertising_facts',
+            'daily_reporting.mcp_advertising_expense_facts',
+            'daily_reporting.mcp_finance_facts',
+            'daily_reporting.mcp_stock_facts',
+            'daily_reporting.mcp_price_facts',
+            'daily_reporting.mcp_ready_reports'
+        ]::text[]) AS readable(object_name)
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM unnest(ARRAY[
+            'daily_reporting.source_snapshots',
+            'daily_reporting.sales_facts',
+            'daily_reporting.advertising_facts',
+            'daily_reporting.advertising_expense_facts',
+            'daily_reporting.finance_facts',
+            'daily_reporting.stock_facts',
+            'daily_reporting.price_facts',
+            'daily_reporting.unit_economics_inputs',
+            'daily_reporting.collection_claims',
+            'daily_reporting.delivery_batches',
+            'daily_reporting.delivery_coverage',
+            'daily_reporting.delivery_attempts',
+            'daily_reporting.delivery_reconciliations',
+            'daily_reporting.generation_attempts',
+            'daily_reporting.claimable_deliveries',
+            'daily_reporting.generatable_batches',
+            'daily_reporting.stalled_report_work',
+            'daily_reporting.published_source_snapshots',
+            'daily_reporting.published_sales_facts',
+            'daily_reporting.published_advertising_facts',
+            'daily_reporting.published_advertising_expense_facts',
+            'daily_reporting.published_finance_facts',
+            'daily_reporting.published_stock_facts',
+            'daily_reporting.published_price_facts'
+        ]::text[]) AS protected(object_name)
+        WHERE has_table_privilege(
+            'position_reader', protected.object_name, 'SELECT'
+        )
     )
     AND NOT has_table_privilege(
         'position_reader', 'daily_reporting.delivery_batches', 'SELECT'

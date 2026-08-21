@@ -195,21 +195,29 @@ impl OzonPerformanceReportSource {
         let mut expense_keys = BTreeSet::new();
         for chunk in campaign_ids.chunks(CAMPAIGNS_PER_STATISTICS_REQUEST) {
             let response = self.transport.sku_statistics(chunk.to_vec(), date).await?;
-            for row in parse_performance_sku_advertising(&response)? {
-                if row.business_date != date
-                    || !chunk.contains(&row.campaign_id)
-                    || !advertising_keys.insert((row.business_date, row.campaign_id, row.sku))
-                {
+            for row in parse_performance_sku_advertising(&response).map_err(|error| {
+                tracing::warn!(
+                    source = "sku_statistics",
+                    parse_error = ?error,
+                    "Ozon Performance report response was rejected"
+                );
+                OzonPerformanceReportSourceError::from(error)
+            })? {
+                if !valid_advertising_row(&row, date, chunk, &mut advertising_keys) {
                     return Err(OzonPerformanceReportSourceError::InvalidResponse);
                 }
                 advertising.push(row);
             }
             let response = self.transport.expenses(chunk.to_vec(), date).await?;
-            for row in parse_performance_expenses(&response)? {
-                if row.business_date != date
-                    || !chunk.contains(&row.campaign_id)
-                    || !expense_keys.insert((row.business_date, row.campaign_id))
-                {
+            for row in parse_performance_expenses(&response).map_err(|error| {
+                tracing::warn!(
+                    source = "expenses",
+                    parse_error = ?error,
+                    "Ozon Performance report response was rejected"
+                );
+                OzonPerformanceReportSourceError::from(error)
+            })? {
+                if !valid_expense_row(&row, date, chunk, &mut expense_keys) {
                     return Err(OzonPerformanceReportSourceError::InvalidResponse);
                 }
                 expenses.push(row);
@@ -264,6 +272,28 @@ impl OzonPerformanceReportSource {
             page += 1;
         }
     }
+}
+
+fn valid_advertising_row(
+    row: &CollectedAdvertisingFact,
+    date: NaiveDate,
+    campaign_ids: &[u64],
+    keys: &mut BTreeSet<(NaiveDate, u64, u64)>,
+) -> bool {
+    row.business_date == date
+        && campaign_ids.contains(&row.campaign_id)
+        && keys.insert((row.business_date, row.campaign_id, row.sku))
+}
+
+fn valid_expense_row(
+    row: &CollectedAdvertisingExpenseFact,
+    date: NaiveDate,
+    campaign_ids: &[u64],
+    keys: &mut BTreeSet<(NaiveDate, u64)>,
+) -> bool {
+    row.business_date == date
+        && campaign_ids.contains(&row.campaign_id)
+        && keys.insert((row.business_date, row.campaign_id))
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -720,6 +750,31 @@ mod tests {
         assert_eq!(facts.expenses[0].money_spent_minor, 1_234);
         assert_eq!(facts.expenses[0].bonus_spent_minor, 200);
         assert_eq!(facts.expenses[0].prepayment_spent_minor, 950);
+    }
+
+    #[tokio::test]
+    async fn extended_collection_rejects_malformed_statistics_and_expenses() {
+        let report_date = NaiveDate::from_ymd_opt(2026, 8, 18).unwrap();
+        let malformed_statistics = OzonPerformanceReportSource::new(FixtureTransport::new(
+            vec![campaign_page(&[7], 1)],
+            vec![json!({"rows": [{"campaignId": "7"}]})],
+        ));
+        assert_eq!(
+            malformed_statistics.collect_extended(report_date).await,
+            Err(OzonPerformanceReportSourceError::InvalidResponse)
+        );
+
+        let malformed_expenses = OzonPerformanceReportSource::new(
+            FixtureTransport::new(
+                vec![campaign_page(&[7], 1)],
+                vec![statistics(7, 123, "2026-08-18")],
+            )
+            .with_expenses(vec![json!({"rows": [{"id": "7"}]})]),
+        );
+        assert_eq!(
+            malformed_expenses.collect_extended(report_date).await,
+            Err(OzonPerformanceReportSourceError::InvalidResponse)
+        );
     }
 
     #[tokio::test]

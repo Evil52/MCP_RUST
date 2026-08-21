@@ -191,17 +191,27 @@ and collection-claim contracts, explicit delivery error classes, and the
 append-only delivery-reconciliation contract.
 The final migrations also add append-only generation-attempt history, bounded
 retry backoff, an operator-only stalled-work view, and terminal operator
-resolution for an ambiguous Gmail send without permitting an automatic resend.
+resolution for an ambiguous Gmail send without permitting an automatic resend,
+the bounded recovery observation window, and the curated MCP read projections.
 Password rotation and schema migration after initial deployment must use an
 explicit migration, never volume deletion.
 
 ### Existing-volume daily reporting migration
 
-Back up the initialized database first. Create or rotate the restricted
+Back up the initialized database first. Keep the Rust MCP reporting reader
+disabled and leave `MCP_REPORTING_DATABASE_URL` unset until every database
+migration and the authenticated database healthcheck below have succeeded. Do
+not run `down -v`, remove `mcp-ozon-position-data`, or recreate the named volume.
+
+Create or rotate the restricted
 `report_worker` and `report_collector` roles by running the current
 `003_roles.sh` with all five
-password environment variables, then apply the reporting migration exactly
-once as the database owner:
+password environment variables, then apply only the migrations that are
+missing from the inspected schema, in the order shown, as the database owner.
+These SQL files are not a migration ledger. In particular, migration `018` is
+intentionally one-shot: if
+`source_snapshots_recovery_start_window_check` already exists, skip `018` and
+continue with `019`; never run `018` a second time.
 
 ```bash
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
@@ -245,10 +255,22 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
   sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
   < position-monitor/initdb/017_daily_reporting_advertising_extensions.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/018_daily_reporting_recovery_observation_window.sql
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
+  < position-monitor/initdb/019_daily_reporting_mcp_read_views.sql
 ```
 
-The migrations are transactional. The final claim migration gives each exact
-account/marketplace/cutoff a fifteen-minute lease with a monotonically
+Migration `018_daily_reporting_recovery_observation_window.sql` must commit
+before `019_daily_reporting_mcp_read_views.sql`. Migration `019` creates the
+curated MCP projections and converges `position_reader` from any legacy broad
+grants to the explicit read-only view allowlist; do not skip or reverse these
+two migrations.
+
+The migrations are transactional. The collection-claim migration gives each
+exact account/marketplace/cutoff a fifteen-minute lease with a monotonically
 increasing fencing generation. New source snapshots must carry the live claim,
 and completion of all required sources is atomic (five for Ozon, four for
 Wildberries). Existing published snapshots
@@ -258,8 +280,80 @@ claim acquisition; a busy or completed claim reads no marketplace secret. The
 migrations create no scheduler and send no email. The reconciliation migration
 does not infer a provider outcome: it only gives the restricted report worker
 an append-only, exact-attempt path after an operator has checked Gmail.
-Rebuild/recreate only `position-db` afterward to install the matching
-healthcheck, while retaining the named volume.
+
+After all migrations commit, rebuild and recreate only `position-db` to install
+the matching authenticated healthcheck, while retaining the named volume. The
+explicit healthcheck invocation must succeed before the MCP reporting reader is
+enabled:
+
+```bash
+docker compose --env-file .position.env -f compose.position.yaml build position-db
+docker compose --env-file .position.env -f compose.position.yaml up -d \
+  --no-deps --force-recreate --wait position-db
+docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
+  /usr/local/bin/position-db-healthcheck
+```
+
+Only after this database-first gate succeeds may the deployment secret
+`MCP_REPORTING_DATABASE_URL` be configured for `position_reader` and the Rust
+MCP service be recreated. Do not print that URL or its password in logs or shell
+history.
+
+### Enable the MCP reporting reader (explicit opt-in)
+
+`compose.reporting-reader.yaml` is deliberately not part of the default MCP
+deployment. It attaches only the MCP server to the already-created
+`mcp-ozon-position-internal` network and passes one credential: the
+`position_reader` connection URL. It does not start, migrate, or depend on the
+database service, and it does not expose the admin, collector, or worker
+passwords to the MCP container.
+
+Before enabling it, verify an integrity-checked protected backup (encrypt it
+when it leaves the protected host), migrations through `019`, the database
+healthcheck above, and a protected `.position.env` whose reader password is
+URL-safe (the documented hexadecimal bootstrap value is URL-safe).
+Use `.position.env` only for Compose interpolation; never add it as the MCP
+service's `env_file`.
+
+Render-check the exact merged deployment without printing the resolved secret:
+
+```bash
+MCP_ACCESS_CONFIG_HOST="$HOME/.local/share/mcp-ozon-runtime/access.json" \
+docker compose --env-file .position.env \
+  -f compose.yaml -f compose.reporting-reader.yaml \
+  config --quiet
+```
+
+Then recreate only the MCP server. The external database network must already
+exist because the separately managed position stack is running:
+
+```bash
+MCP_ACCESS_CONFIG_HOST="$HOME/.local/share/mcp-ozon-runtime/access.json" \
+docker compose --env-file .position.env \
+  -f compose.yaml -f compose.reporting-reader.yaml \
+  up -d --build --force-recreate --wait --wait-timeout 300 server
+```
+
+If the operator uses another protected access registry, replace the example
+host path above with that exact file. Startup fails closed when the network,
+database, migration, credentials, or read ACL contract is invalid. Verify the
+MCP health endpoint and call `ofk_collection_status` with an authenticated MCP
+client; do not print the container environment or the fully rendered Compose
+JSON during secret-bearing operation.
+
+Rollback is a base-only recreation. It removes the reader URL and detaches the
+MCP server from the database network without stopping PostgreSQL or touching
+the named volume:
+
+```bash
+MCP_ACCESS_CONFIG_HOST="$HOME/.local/share/mcp-ozon-runtime/access.json" \
+docker compose -f compose.yaml \
+  up -d --force-recreate --wait --wait-timeout 300 server
+```
+
+Do not use `down -v`. Re-running `scripts/install-local-runtime-agent.sh`
+currently performs the same base-only MCP recreation and therefore disables
+this opt-in reader; reapply the merged command only after all gates still pass.
 
 ### Existing-volume Ozon collector migration
 

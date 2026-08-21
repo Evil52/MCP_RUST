@@ -28,6 +28,11 @@ const MAX_IN_FLIGHT_REQUESTS_PER_CLIENT: usize = 16;
 const MAX_GLOBAL_IN_FLIGHT_REQUESTS: usize = 32;
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(20);
 const ANALYTICS_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
+// Ozon can return a one-minute Retry-After for the read-only accrual ledger.
+// Reserve that bounded wait in the request deadline so the existing retry
+// policy can honor the upstream cooldown instead of failing a complete daily
+// report immediately.
+const FINANCE_ACCRUAL_RETRY_ALLOWANCE: Duration = Duration::from_secs(60);
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_TOTAL_RETRY_OVERHEAD: Duration = Duration::from_secs(5);
@@ -480,10 +485,12 @@ impl OzonClient {
         if !self.is_endpoint_allowed(path) {
             return Err(OzonError::EndpointNotAllowed(path.to_owned()));
         }
-        let pacing_allowance = if path == ANALYTICS_DATA_PATH {
-            ANALYTICS_REQUEST_INTERVAL
-        } else {
-            Duration::ZERO
+        let pacing_allowance = match path {
+            ANALYTICS_DATA_PATH => ANALYTICS_REQUEST_INTERVAL,
+            "/v1/finance/accrual/types" | "/v1/finance/accrual/by-day" => {
+                FINANCE_ACCRUAL_RETRY_ALLOWANCE
+            }
+            _ => Duration::ZERO,
         };
         let deadline = TokioInstant::now() + self.request_deadline.saturating_add(pacing_allowance);
         self.post_within_deadline(store, path, payload, deadline)
