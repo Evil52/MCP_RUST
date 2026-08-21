@@ -1,4 +1,7 @@
 #!/bin/bash
+# shellcheck disable=SC2016
+# jq filters and nginx snippets below deliberately use single quotes so their
+# dollar-prefixed variables remain literal rather than being expanded by bash.
 
 # Verifies the hardening declared by the Compose files that actually ship.
 #
@@ -1125,10 +1128,14 @@ verify_control_wb_plan() {
   check "control WB plan: base metadata plus read token are the only mounts; no write path exists" "$service" \
     --argjson base "$base_service" \
     --arg read_token "$read_token_file" \
-    '(.volumes | sort_by(.target))
+    'def canonical_mounts:
+       map({type, source, target, read_only,
+            bind: {create_host_path: .bind.create_host_path}})
+       | sort_by(.target);
+     (.volumes | canonical_mounts)
        == (($base.volumes + [
          {"type":"bind","source":$read_token,"target":"/run/mcp-ozon/control-credentials/wb-promotion-read.token","read_only":true,"bind":{"create_host_path":false}}
-       ]) | sort_by(.target))'
+       ]) | canonical_mounts)'
   check "control WB plan: both egress proxies must be healthy before Control starts" "$service" \
     '.depends_on == {
        "control-auth-egress": {"condition":"service_healthy","required":true},
@@ -1238,10 +1245,14 @@ verify_control_wb_live() {
   check "control WB live: the write credential is the only mount added to planner" "$service" \
     --argjson plan "$plan_service" \
     --arg write_token "$write_token_file" \
-    '(.volumes | sort_by(.target))
+    'def canonical_mounts:
+       map({type, source, target, read_only,
+            bind: {create_host_path: .bind.create_host_path}})
+       | sort_by(.target);
+     (.volumes | canonical_mounts)
        == (($plan.volumes + [
          {"type":"bind","source":$write_token,"target":"/run/mcp-ozon/control-credentials/wb-promotion-write.token","read_only":true,"bind":{"create_host_path":false}}
-       ]) | sort_by(.target))'
+       ]) | canonical_mounts)'
 }
 
 main_rendered="$(render_compose "$project_dir/compose.yaml")"
