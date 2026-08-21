@@ -408,18 +408,7 @@ fn response_request_id(response: &reqwest::Response) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub fn campaign_snapshot(
-    response: &Value,
-    seller_sid: &str,
-    advert_id: u64,
-    requested: &[WbBidChange],
-) -> Result<WbCampaignBidSnapshot> {
-    if !is_canonical_uuid(seller_sid) {
-        bail!("WB campaign snapshot имеет неверный seller_sid");
-    }
-    if requested.is_empty() || requested.len() > MAX_CHANGES {
-        bail!("WB campaign snapshot request имеет неверный размер");
-    }
+fn require_exact_advert(response: &Value, advert_id: u64) -> Result<&Value> {
     let adverts = response
         .get("adverts")
         .and_then(Value::as_array)
@@ -433,6 +422,73 @@ pub fn campaign_snapshot(
     if matching_adverts.next().is_some() {
         bail!("WB campaign details содержит повтор запрошенной кампании");
     }
+    Ok(advert)
+}
+
+fn require_exact_nm_setting(nm_settings: &[Value], nm_id: u64) -> Result<&Value> {
+    let mut matching_nm = nm_settings
+        .iter()
+        .filter(|item| item.get("nm_id").and_then(Value::as_u64) == Some(nm_id));
+    let nm = matching_nm
+        .next()
+        .with_context(|| format!("nm_id {nm_id} отсутствует в WB campaign"))?;
+    if matching_nm.next().is_some() {
+        bail!("nm_id {nm_id} повторяется в WB campaign");
+    }
+    Ok(nm)
+}
+
+fn placement_bid(nm: &Value, bid_type: &str, placement: WbBidPlacement) -> Result<u64> {
+    match placement {
+        WbBidPlacement::Combined => {
+            if bid_type != "unified" {
+                bail!("placement combined разрешён только для unified bid_type");
+            }
+            let search = nm
+                .pointer("/bids_kopecks/search")
+                .and_then(Value::as_u64)
+                .context("WB campaign не содержит search bid")?;
+            let recommendations = nm
+                .pointer("/bids_kopecks/recommendations")
+                .and_then(Value::as_u64)
+                .context("WB campaign не содержит recommendations bid")?;
+            if search != recommendations {
+                bail!("unified WB campaign вернула разные ставки размещений");
+            }
+            Ok(search)
+        }
+        WbBidPlacement::Search => {
+            if bid_type != "manual" {
+                bail!("placement search разрешён только для manual bid_type");
+            }
+            nm.pointer("/bids_kopecks/search")
+                .and_then(Value::as_u64)
+                .context("WB campaign не содержит search bid")
+        }
+        WbBidPlacement::Recommendations => {
+            if bid_type != "manual" {
+                bail!("placement recommendations разрешён только для manual bid_type");
+            }
+            nm.pointer("/bids_kopecks/recommendations")
+                .and_then(Value::as_u64)
+                .context("WB campaign не содержит recommendations bid")
+        }
+    }
+}
+
+pub fn campaign_snapshot(
+    response: &Value,
+    seller_sid: &str,
+    advert_id: u64,
+    requested: &[WbBidChange],
+) -> Result<WbCampaignBidSnapshot> {
+    if !is_canonical_uuid(seller_sid) {
+        bail!("WB campaign snapshot имеет неверный seller_sid");
+    }
+    if requested.is_empty() || requested.len() > MAX_CHANGES {
+        bail!("WB campaign snapshot request имеет неверный размер");
+    }
+    let advert = require_exact_advert(response, advert_id)?;
     let status = advert
         .get("status")
         .and_then(Value::as_i64)
@@ -466,50 +522,8 @@ pub fn campaign_snapshot(
     }
     let mut bids = Vec::with_capacity(requested.len());
     for change in requested {
-        let mut matching_nm = nm_settings
-            .iter()
-            .filter(|item| item.get("nm_id").and_then(Value::as_u64) == Some(change.nm_id));
-        let nm = matching_nm
-            .next()
-            .with_context(|| format!("nm_id {} отсутствует в WB campaign", change.nm_id))?;
-        if matching_nm.next().is_some() {
-            bail!("nm_id {} повторяется в WB campaign", change.nm_id);
-        }
-        let before = match change.placement {
-            WbBidPlacement::Combined => {
-                if bid_type != "unified" {
-                    bail!("placement combined разрешён только для unified bid_type");
-                }
-                let search = nm
-                    .pointer("/bids_kopecks/search")
-                    .and_then(Value::as_u64)
-                    .context("WB campaign не содержит search bid")?;
-                let recommendations = nm
-                    .pointer("/bids_kopecks/recommendations")
-                    .and_then(Value::as_u64)
-                    .context("WB campaign не содержит recommendations bid")?;
-                if search != recommendations {
-                    bail!("unified WB campaign вернула разные ставки размещений");
-                }
-                search
-            }
-            WbBidPlacement::Search => {
-                if bid_type != "manual" {
-                    bail!("placement search разрешён только для manual bid_type");
-                }
-                nm.pointer("/bids_kopecks/search")
-                    .and_then(Value::as_u64)
-                    .context("WB campaign не содержит search bid")?
-            }
-            WbBidPlacement::Recommendations => {
-                if bid_type != "manual" {
-                    bail!("placement recommendations разрешён только для manual bid_type");
-                }
-                nm.pointer("/bids_kopecks/recommendations")
-                    .and_then(Value::as_u64)
-                    .context("WB campaign не содержит recommendations bid")?
-            }
-        };
+        let nm = require_exact_nm_setting(nm_settings, change.nm_id)?;
+        let before = placement_bid(nm, &bid_type, change.placement)?;
         bids.push(WbSnapshotBid {
             nm_id: change.nm_id,
             placement: change.placement,

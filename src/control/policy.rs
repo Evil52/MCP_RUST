@@ -10,7 +10,7 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{AccessRegistry, Marketplace, is_canonical_uuid};
+use crate::config::{AccessRegistry, Actor, Marketplace, MarketplaceAccount, is_canonical_uuid};
 
 const CONTROL_POLICY_MAX_BYTES: u64 = 1_048_576;
 const MAX_IDENTIFIER_BYTES: usize = 128;
@@ -184,6 +184,15 @@ fn validate_actor_policy(
         bail!("control policy содержит слишком много WB promotion targets для actor");
     }
 
+    validate_ozon_actor_targets(actor_policy, actor, registry)?;
+    validate_wb_actor_targets(actor_policy, actor, registry)
+}
+
+fn validate_ozon_actor_targets(
+    actor_policy: &ActorControlPolicy,
+    actor: &Actor,
+    registry: &AccessRegistry,
+) -> Result<()> {
     let mut targets = BTreeSet::new();
     for target in &actor_policy.targets {
         validate_identifier("account_id", &target.account_id)?;
@@ -217,7 +226,14 @@ fn validate_actor_policy(
         }
         validate_target(target)?;
     }
+    Ok(())
+}
 
+fn validate_wb_actor_targets(
+    actor_policy: &ActorControlPolicy,
+    actor: &Actor,
+    registry: &AccessRegistry,
+) -> Result<()> {
     let mut wb_targets = BTreeSet::new();
     for target in &actor_policy.wb_promotion_bid_targets {
         validate_identifier("account_id", &target.account_id)?;
@@ -237,22 +253,29 @@ fn validate_actor_policy(
                     target.account_id
                 )
             })?;
-        if !matches!(account.marketplace, Marketplace::Wildberries) || account.wildberries.is_none()
-        {
-            bail!("WB promotion target должен ссылаться на Wildberries account с binding");
-        }
-        let registry_seller_sid = account
-            .wildberries
-            .as_ref()
-            .and_then(|wildberries| wildberries.seller_sid.as_deref())
-            .context("WB promotion target требует reviewed seller_sid в access registry")?;
-        if !is_canonical_uuid(&target.seller_sid) || target.seller_sid != registry_seller_sid {
-            bail!("WB promotion target seller_sid не совпадает с access registry");
-        }
+        validate_wb_account_binding(target, account)?;
         if !actor.can_access_account(account) {
             bail!("actor не имеет базового доступа к WB account из control policy");
         }
         validate_wb_target(target, &actor_policy.actor_id, account, registry)?;
+    }
+    Ok(())
+}
+
+fn validate_wb_account_binding(
+    target: &WbPromotionBidTargetPolicy,
+    account: &MarketplaceAccount,
+) -> Result<()> {
+    if !matches!(account.marketplace, Marketplace::Wildberries) || account.wildberries.is_none() {
+        bail!("WB promotion target должен ссылаться на Wildberries account с binding");
+    }
+    let registry_seller_sid = account
+        .wildberries
+        .as_ref()
+        .and_then(|wildberries| wildberries.seller_sid.as_deref())
+        .context("WB promotion target требует reviewed seller_sid в access registry")?;
+    if !is_canonical_uuid(&target.seller_sid) || target.seller_sid != registry_seller_sid {
+        bail!("WB promotion target seller_sid не совпадает с access registry");
     }
     Ok(())
 }
@@ -307,9 +330,17 @@ fn validate_target(target: &ControlTargetPolicy) -> Result<()> {
 fn validate_wb_target(
     target: &WbPromotionBidTargetPolicy,
     plan_actor_id: &str,
-    account: &crate::config::MarketplaceAccount,
+    account: &MarketplaceAccount,
     registry: &AccessRegistry,
 ) -> Result<()> {
+    validate_wb_nm_ids(target)?;
+    validate_wb_placements(target)?;
+    validate_wb_bid_limits(target)?;
+    validate_wb_approvers(target, plan_actor_id, account, registry)?;
+    validate_wb_action_limits(target.action_limits)
+}
+
+fn validate_wb_nm_ids(target: &WbPromotionBidTargetPolicy) -> Result<()> {
     if target.nm_ids.is_empty() || target.nm_ids.len() > MAX_WB_NM_IDS_PER_TARGET {
         bail!("WB promotion target должен содержать от 1 до {MAX_WB_NM_IDS_PER_TARGET} nm_id");
     }
@@ -321,6 +352,10 @@ fn validate_wb_target(
     {
         bail!("WB nm_ids должны быть положительными уникальными int64");
     }
+    Ok(())
+}
+
+fn validate_wb_placements(target: &WbPromotionBidTargetPolicy) -> Result<()> {
     if target.placements.is_empty() || target.placements.len() > 3 {
         bail!("WB placements должны содержать от 1 до 3 значений");
     }
@@ -328,6 +363,10 @@ fn validate_wb_target(
     if placements.len() != target.placements.len() {
         bail!("WB placements должны быть уникальными");
     }
+    Ok(())
+}
+
+fn validate_wb_bid_limits(target: &WbPromotionBidTargetPolicy) -> Result<()> {
     if target.bid_limits_kopecks.min_minor == 0
         || target.bid_limits_kopecks.max_minor < target.bid_limits_kopecks.min_minor
         || target.bid_limits_kopecks.max_minor > MAX_WB_SIGNED_ID
@@ -337,6 +376,15 @@ fn validate_wb_target(
     if !(1..=100).contains(&target.bid_limits_kopecks.max_delta_percent) {
         bail!("WB max_delta_percent должен быть от 1 до 100");
     }
+    Ok(())
+}
+
+fn validate_wb_approvers(
+    target: &WbPromotionBidTargetPolicy,
+    plan_actor_id: &str,
+    account: &MarketplaceAccount,
+    registry: &AccessRegistry,
+) -> Result<()> {
     if target.approver_actor_ids.is_empty()
         || target.approver_actor_ids.len() > MAX_APPROVERS_PER_TARGET
     {
@@ -358,7 +406,10 @@ fn validate_wb_target(
             bail!("WB approver actor не имеет базового доступа к account");
         }
     }
-    let limits = target.action_limits;
+    Ok(())
+}
+
+fn validate_wb_action_limits(limits: WbActionLimits) -> Result<()> {
     if !(1..=MAX_ACTIONS_PER_HOUR).contains(&limits.max_actions_per_hour) {
         bail!("WB max_actions_per_hour должен быть от 1 до {MAX_ACTIONS_PER_HOUR}");
     }
