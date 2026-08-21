@@ -1126,16 +1126,16 @@ verify_control_wb_plan() {
      })
      and ([.environment[] | select(type == "string" and contains("verification-"))] | length == 0)'
   check "control WB plan: base metadata plus read token are the only mounts; no write path exists" "$service" \
-    --argjson base "$base_service" \
+    --arg access "$project_dir/config/access.example.json" \
+    --arg policy "$project_dir/config/control-policy.example.json" \
     --arg read_token "$read_token_file" \
-    'def canonical_mounts:
-       map({type, source, target, read_only,
-            bind: {create_host_path: .bind.create_host_path}})
-       | sort_by(.target);
-     (.volumes | canonical_mounts)
-       == (($base.volumes + [
-         {"type":"bind","source":$read_token,"target":"/run/mcp-ozon/control-credentials/wb-promotion-read.token","read_only":true,"bind":{"create_host_path":false}}
-       ]) | canonical_mounts)'
+    '((.volumes // []) | map(del(.bind)) | sort_by(.target)) == [
+       {"type":"bind","source":$access,"target":"/etc/mcp-ozon/access.json","read_only":true},
+       {"type":"bind","source":$policy,"target":"/etc/mcp-ozon/control-policy.json","read_only":true},
+       {"type":"bind","source":$read_token,"target":"/run/mcp-ozon/control-credentials/wb-promotion-read.token","read_only":true}
+     ]
+     and all((.volumes // [])[];
+       .bind == null or .bind == {} or .bind == {"create_host_path":false})'
   check "control WB plan: both egress proxies must be healthy before Control starts" "$service" \
     '.depends_on == {
        "control-auth-egress": {"condition":"service_healthy","required":true},
@@ -1243,16 +1243,18 @@ verify_control_wb_live() {
        "CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE": "/run/mcp-ozon/control-credentials/wb-promotion-write.token"
      })'
   check "control WB live: the write credential is the only mount added to planner" "$service" \
-    --argjson plan "$plan_service" \
+    --arg access "$project_dir/config/access.example.json" \
+    --arg policy "$project_dir/config/control-policy.example.json" \
+    --arg read_token "$read_token_file" \
     --arg write_token "$write_token_file" \
-    'def canonical_mounts:
-       map({type, source, target, read_only,
-            bind: {create_host_path: .bind.create_host_path}})
-       | sort_by(.target);
-     (.volumes | canonical_mounts)
-       == (($plan.volumes + [
-         {"type":"bind","source":$write_token,"target":"/run/mcp-ozon/control-credentials/wb-promotion-write.token","read_only":true,"bind":{"create_host_path":false}}
-       ]) | canonical_mounts)'
+    '((.volumes // []) | map(del(.bind)) | sort_by(.target)) == [
+       {"type":"bind","source":$access,"target":"/etc/mcp-ozon/access.json","read_only":true},
+       {"type":"bind","source":$policy,"target":"/etc/mcp-ozon/control-policy.json","read_only":true},
+       {"type":"bind","source":$read_token,"target":"/run/mcp-ozon/control-credentials/wb-promotion-read.token","read_only":true},
+       {"type":"bind","source":$write_token,"target":"/run/mcp-ozon/control-credentials/wb-promotion-write.token","read_only":true}
+     ]
+     and all((.volumes // [])[];
+       .bind == null or .bind == {} or .bind == {"create_host_path":false})'
 }
 
 main_rendered="$(render_compose "$project_dir/compose.yaml")"
