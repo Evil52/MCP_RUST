@@ -1,13 +1,24 @@
-//! Fail-closed scaffold for a future advertising control MCP.
+//! Fail-closed advertising control MCP.
 //!
-//! This module deliberately contains no marketplace HTTP client, endpoint, or
-//! credential lookup. The first milestone exposes only local policy/status
-//! inspection while every marketplace mutation remains unavailable.
+//! Marketplace writes live here rather than in the analytics server. The WB
+//! flow is a short-lived durable plan followed by a one-time apply and explicit
+//! reconciliation; absent runtime gates keep the original local-only behavior.
 
 mod config;
+mod plan;
 mod policy;
 mod server;
+mod wb;
 
-pub use config::{ControlAppConfig, ControlAuthConfig};
-pub use policy::{ControlMode, ControlPolicy};
-pub use server::ControlMcp;
+pub use config::{
+    ControlAppConfig, ControlAuthConfig, ControlPolicyDatabaseConfig, ControlWbRuntimeConfig,
+};
+pub use plan::{
+    PlanStoreError, WbActionQuota, WbApplyContext, WbControlPlan, WbPlanApproval, WbPlanRepository,
+    WbPlanStatus, WbPrepareReservation,
+};
+pub use policy::{
+    ControlMode, ControlPolicy, WbActionLimits, WbBidPlacement, WbPromotionBidTargetPolicy,
+};
+pub use server::{ControlMcp, WbControlServices};
+pub use wb::{WbBidChange, WbBidWriteClient, WbGuardedWriteError, WbPreparedBidChange};

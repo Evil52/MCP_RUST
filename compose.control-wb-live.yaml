@@ -1,0 +1,14 @@
+services:
+  # This overlay is intentionally only an executor capability addition. Use it
+  # after compose.control-wb-plan.yaml; only this layer mounts the write token.
+  control:
+    environment:
+      CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: ${CONTROL_MCP_MARKETPLACE_WRITES_ENABLED:-false}
+      CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE: /run/mcp-ozon/control-credentials/wb-promotion-write.token
+    volumes:
+      - type: bind
+        source: ${CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST:?CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST is required}
+        target: /run/mcp-ozon/control-credentials/wb-promotion-write.token
+        read_only: true
+        bind:
+          create_host_path: false

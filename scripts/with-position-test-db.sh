@@ -17,6 +17,7 @@ collector_password="position-collector-repository-test"
 reader_password="position-reader-repository-test"
 report_worker_password="report-worker-repository-test"
 report_collector_password="report-collector-repository-test"
+control_writer_password="control-writer-repository-test"
 
 cleanup() {
   docker rm --force "$container" >/dev/null 2>&1 || true
@@ -40,6 +41,7 @@ docker run --detach --rm --name "$container" \
   --env POSITION_READER_DB_PASSWORD="$reader_password" \
   --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   "$image" >/dev/null
 
 ready=false
@@ -69,6 +71,7 @@ export POSITION_REPOSITORY_TEST_COLLECTOR_URL="postgresql://position_collector:$
 export POSITION_REPOSITORY_TEST_READER_URL="postgresql://position_reader:${reader_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export REPORT_OUTBOX_TEST_WORKER_URL="postgresql://report_worker:${report_worker_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export REPORT_SNAPSHOT_TEST_COLLECTOR_URL="postgresql://report_collector:${report_collector_password}@127.0.0.1:${mapped_port}/ozon_positions"
+export WB_CONTROL_TEST_DATABASE_URL="postgresql://control_writer:${control_writer_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export POSITION_COLLECTOR_MODE=disabled
 export POSITION_COLLECTOR_DATABASE_URL="$POSITION_REPOSITORY_TEST_COLLECTOR_URL"
 

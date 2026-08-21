@@ -1,10 +1,12 @@
 {
   "version": 1,
+  "revision": 1,
   "mode": "disabled",
   "actors": [
     {
       "actor_id": "admin",
-      "targets": []
+      "targets": [],
+      "wb_promotion_bid_targets": []
     }
   ]
 }

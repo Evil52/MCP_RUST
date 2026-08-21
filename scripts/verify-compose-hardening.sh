@@ -48,6 +48,7 @@ printf '%s\n' \
   'POSITION_READER_DB_PASSWORD=verify-only-reader-not-a-secret' \
   'REPORT_WORKER_DB_PASSWORD=verify-only-report-worker-not-a-secret' \
   'REPORT_COLLECTOR_DB_PASSWORD=verify-only-report-collector-not-a-secret' \
+  'CONTROL_WRITER_DB_PASSWORD=verify-only-control-writer-not-a-secret' \
   >"$interpolation_env"
 chmod 600 "$interpolation_env"
 
@@ -108,6 +109,47 @@ render_control_compose() {
     docker compose \
       --env-file "$interpolation_env" \
       -f "$project_dir/compose.control.yaml" \
+      config --no-env-resolution --format json
+}
+
+render_control_wb_plan_compose() {
+  local read_token_file="$scratch/wb-promotion-read.token"
+  printf 'verification-read-token-not-a-secret\n' >"$read_token_file"
+  chmod 600 "$read_token_file"
+  CONTROL_MCP_ACCESS_CONFIG_HOST="$project_dir/config/access.example.json" \
+    CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.example.json" \
+    CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE_HOST="$read_token_file" \
+    CONTROL_MCP_JWT_ISSUER="https://auth.example.test/realms/ofk" \
+    CONTROL_MCP_JWT_JWKS_HOST="auth.example.test" \
+    CONTROL_MCP_JWT_JWKS_PATH="/realms/ofk/protocol/openid-connect/certs" \
+    CONTROL_MCP_PUBLIC_URL="https://control.example.test/mcp" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.control.yaml" \
+      -f "$project_dir/compose.control-wb-plan.yaml" \
+      config --no-env-resolution --format json
+}
+
+render_control_wb_live_compose() {
+  local read_token_file="$scratch/wb-promotion-read.token"
+  local write_token_file="$scratch/wb-promotion-write.token"
+  printf 'verification-read-token-not-a-secret\n' >"$read_token_file"
+  printf 'verification-write-token-not-a-secret\n' >"$write_token_file"
+  chmod 600 "$read_token_file" "$write_token_file"
+  CONTROL_MCP_ACCESS_CONFIG_HOST="$project_dir/config/access.example.json" \
+    CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.example.json" \
+    CONTROL_MCP_MARKETPLACE_WRITES_ENABLED="true" \
+    CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE_HOST="$read_token_file" \
+    CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST="$write_token_file" \
+    CONTROL_MCP_JWT_ISSUER="https://auth.example.test/realms/ofk" \
+    CONTROL_MCP_JWT_JWKS_HOST="auth.example.test" \
+    CONTROL_MCP_JWT_JWKS_PATH="/realms/ofk/protocol/openid-connect/certs" \
+    CONTROL_MCP_PUBLIC_URL="https://control.example.test/mcp" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.control.yaml" \
+      -f "$project_dir/compose.control-wb-plan.yaml" \
+      -f "$project_dir/compose.control-wb-live.yaml" \
       config --no-env-resolution --format json
 }
 
@@ -1050,6 +1092,158 @@ verify_control() {
      }'
 }
 
+verify_control_wb_plan() {
+  local rendered="$1" base_rendered="$2" service base_service write_proxy auth_proxy read_token_file expected_database_url
+  service="$(jq -c '.services.control' <<<"$rendered")"
+  base_service="$(jq -c '.services.control' <<<"$base_rendered")"
+  write_proxy="$(jq -c '.services["control-write-egress"]' <<<"$rendered")"
+  auth_proxy="$(jq -c '.services["control-auth-egress"]' <<<"$rendered")"
+  read_token_file="$scratch/wb-promotion-read.token"
+  expected_database_url='postgresql://control_writer:verify-only-control-writer-not-a-secret@position-db:5432/ozon_positions'
+
+  check "control WB plan: only reviewed environment, mounts, networks and proxy dependencies differ from base" "$service" \
+    --argjson base "$base_service" \
+    'del(.depends_on, .environment, .volumes, .networks)
+       == ($base | del(.depends_on, .environment, .volumes, .networks))'
+  check "control WB plan: final environment is exactly base plus reviewed JWT and planner keys" "$service" \
+    --argjson base "$base_service" \
+    --arg database_url "$expected_database_url" \
+    '.environment == ($base.environment + {
+       "CONTROL_MCP_AUTH_MODE": "jwt",
+       "CONTROL_MCP_DATABASE_URL": $database_url,
+       "CONTROL_MCP_JWT_AUDIENCE": "https://control.example.test/mcp",
+       "CONTROL_MCP_JWT_ISSUER": "https://auth.example.test/realms/ofk",
+       "CONTROL_MCP_JWT_JWKS_URL": "http://control-auth-egress:8080/jwks",
+       "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED": "false",
+       "CONTROL_MCP_PUBLIC_URL": "https://control.example.test/mcp",
+       "CONTROL_MCP_WB_ACCOUNT_ID": "ip_domnyshev_wb",
+       "CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE": "/run/mcp-ozon/control-credentials/wb-promotion-read.token",
+       "CONTROL_MCP_WB_PROXY": "http://control-write-egress:3130",
+       "CONTROL_MCP_WB_TIMEOUT_SECONDS": "20"
+     })
+     and ([.environment[] | select(type == "string" and contains("verification-"))] | length == 0)'
+  check "control WB plan: base metadata plus read token are the only mounts; no write path exists" "$service" \
+    --argjson base "$base_service" \
+    --arg read_token "$read_token_file" \
+    '(.volumes | sort_by(.target))
+       == (($base.volumes + [
+         {"type":"bind","source":$read_token,"target":"/run/mcp-ozon/control-credentials/wb-promotion-read.token","read_only":true,"bind":{"create_host_path":false}}
+       ]) | sort_by(.target))'
+  check "control WB plan: both egress proxies must be healthy before Control starts" "$service" \
+    '.depends_on == {
+       "control-auth-egress": {"condition":"service_healthy","required":true},
+       "control-write-egress": {"condition":"service_healthy","required":true}
+     }'
+  check "control WB plan: Control has internal DB/proxy routes and no direct outbound" "$rendered" \
+    '(.services.control.networks | keys | sort) == ["control-auth-egress-internal","control-write-egress-internal","control_isolated","position-internal"]
+     and ((.services.control.networks | has("outbound")) | not)
+     and .networks["position-internal"].name == "mcp-ozon-position-internal"
+     and .networks["position-internal"].external == true
+     and .networks["control-write-egress-internal"].internal == true
+     and .networks["control-auth-egress-internal"].internal == true
+     and .networks.outbound.name == "mcp-ozon-outbound"
+     and .networks.outbound.external == true
+     and .networks.control_isolated.internal == true'
+
+  check "control write egress: service is credentialless, private and exactly connected" "$write_proxy" \
+    '(has("environment") | not)
+     and (has("env_file") | not)
+     and ((.ports // []) | length == 0)
+     and ((.volumes // []) | length == 0)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)
+     and (.networks | keys | sort) == ["control-write-egress-internal","outbound"]'
+  check "control write egress: image, resource and privilege contract is exact" "$write_proxy" \
+    --arg project_dir "$project_dir" \
+    '.image == "mcp-ozon-control-write-egress:local"
+     and .build.context == $project_dir
+     and .build.dockerfile == "Dockerfile.control-write-egress"
+     and .read_only == true
+     and .cap_drop == ["ALL"]
+     and ((.cap_add // []) | length == 0)
+     and ((.security_opt // []) | index("no-new-privileges:true") != null)
+     and (.privileged // false) == false
+     and .mem_limit == "67108864"
+     and .cpus == 0.25
+     and .pids_limit == 32
+     and .stop_grace_period == "10s"
+     and .restart == "unless-stopped"
+     and .logging == {"driver":"json-file","options":{"max-file":"2","max-size":"1m"}}
+     and (.tmpfs | sort) == [
+       "/var/cache/squid:size=4m,mode=1777",
+       "/var/log/squid:size=2m,mode=1777",
+       "/var/run/squid:size=1m,mode=1777"
+     ]'
+  check "control write egress: healthcheck proves deny-by-default listener" "$write_proxy" \
+    '.healthcheck == {
+       "test": ["CMD-SHELL", "printf '"'"'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n'"'"' | nc -w 3 127.0.0.1 3130 | head -1 | grep -q '"'"'403 Forbidden'"'"'"],
+       "timeout":"8s", "interval":"30s", "retries":3, "start_period":"10s"
+     }'
+
+  check "control auth egress: only public exact-host/path metadata is configured" "$auth_proxy" \
+    '.environment == {
+       "CONTROL_AUTH_JWKS_HOST":"auth.example.test",
+       "CONTROL_AUTH_JWKS_PATH":"/realms/ofk/protocol/openid-connect/certs"
+     }
+     and (has("env_file") | not)
+     and ((.ports // []) | length == 0)
+     and ((.volumes // []) | length == 0)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)
+     and (.networks | keys | sort) == ["control-auth-egress-internal","outbound"]'
+  check "control auth egress: image, resource and privilege contract is exact" "$auth_proxy" \
+    --arg project_dir "$project_dir" \
+    '.image == "mcp-ozon-control-auth-egress:local"
+     and .build.context == $project_dir
+     and .build.dockerfile == "Dockerfile.control-auth-egress"
+     and .read_only == true
+     and .cap_drop == ["ALL"]
+     and ((.cap_add // []) | length == 0)
+     and ((.security_opt // []) | index("no-new-privileges:true") != null)
+     and (.privileged // false) == false
+     and .mem_limit == "67108864"
+     and .cpus == 0.25
+     and .pids_limit == 32
+     and .stop_grace_period == "10s"
+     and .restart == "unless-stopped"
+     and .logging == {"driver":"json-file","options":{"max-file":"2","max-size":"1m"}}
+     and .tmpfs == ["/tmp:size=8m,mode=1777"]'
+  check "control auth egress: healthcheck is local and cannot fetch upstream" "$auth_proxy" \
+    '.healthcheck == {
+       "test":["CMD","wget","-q","-T","3","-O","/dev/null","http://127.0.0.1:8080/health"],
+       "timeout":"8s", "interval":"30s", "retries":3, "start_period":"10s"
+     }'
+}
+
+verify_control_wb_live() {
+  local rendered="$1" plan_rendered="$2" service plan_service read_token_file write_token_file
+  service="$(jq -c '.services.control' <<<"$rendered")"
+  plan_service="$(jq -c '.services.control' <<<"$plan_rendered")"
+  read_token_file="$scratch/wb-promotion-read.token"
+  write_token_file="$scratch/wb-promotion-write.token"
+
+  check "control WB live: executor overlay cannot change services or network topology" "$rendered" \
+    --argjson plan "$plan_rendered" \
+    'del(.services.control.environment, .services.control.volumes)
+       == ($plan | del(.services.control.environment, .services.control.volumes))'
+  check "control WB live: executor layer changes only environment and mounted credentials" "$service" \
+    --argjson plan "$plan_service" \
+    'del(.environment, .volumes) == ($plan | del(.environment, .volumes))'
+  check "control WB live: environment differs from verified planner by exactly write opt-in and write-token path" "$service" \
+    --argjson plan "$plan_service" \
+    '.environment == ($plan.environment + {
+       "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED": "true",
+       "CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE": "/run/mcp-ozon/control-credentials/wb-promotion-write.token"
+     })'
+  check "control WB live: the write credential is the only mount added to planner" "$service" \
+    --argjson plan "$plan_service" \
+    --arg write_token "$write_token_file" \
+    '(.volumes | sort_by(.target))
+       == (($plan.volumes + [
+         {"type":"bind","source":$write_token,"target":"/run/mcp-ozon/control-credentials/wb-promotion-write.token","read_only":true,"bind":{"create_host_path":false}}
+       ]) | sort_by(.target))'
+}
+
 main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_position_compose)"
@@ -1059,6 +1253,8 @@ reporting_canary_rendered="$(render_reporting_canary_compose)"
 reporting_mail_canary_rendered="$(render_reporting_mail_canary_compose)"
 reporting_mail_live_rendered="$(render_reporting_mail_live_compose)"
 control_rendered="$(render_control_compose)"
+control_wb_plan_rendered="$(render_control_wb_plan_compose)"
+control_wb_live_rendered="$(render_control_wb_live_compose)"
 
 # Rendering uses isolated, existing placeholder files so the result is the
 # same in a clean checkout and on a developer machine with ignored secrets.
@@ -1095,6 +1291,26 @@ check_contains \
   "control: default policy is the disabled example" \
   "$project_dir/compose.control.yaml" \
   "\${CONTROL_MCP_POLICY_HOST:-./config/control-policy.example.json}"
+check_contains \
+  "control WB plan: JWKS upstream host has no fallback" \
+  "$project_dir/compose.control-wb-plan.yaml" \
+  "\${CONTROL_MCP_JWT_JWKS_HOST:?CONTROL_MCP_JWT_JWKS_HOST is required}"
+check_contains \
+  "control WB plan: JWKS upstream path has no fallback" \
+  "$project_dir/compose.control-wb-plan.yaml" \
+  "\${CONTROL_MCP_JWT_JWKS_PATH:?CONTROL_MCP_JWT_JWKS_PATH is required}"
+check_contains \
+  "control WB plan: read token host path has no fallback" \
+  "$project_dir/compose.control-wb-plan.yaml" \
+  "\${CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE_HOST:?CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE_HOST is required}"
+check_contains \
+  "control WB live: write capability defaults off even when executor overlay is selected" \
+  "$project_dir/compose.control-wb-live.yaml" \
+  "\${CONTROL_MCP_MARKETPLACE_WRITES_ENABLED:-false}"
+check_contains \
+  "control WB live: write token host path has no fallback" \
+  "$project_dir/compose.control-wb-live.yaml" \
+  "\${CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST:?CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST is required}"
 check_control_mount_source_contract \
   "control: both bind mounts exactly refuse implicit host-path creation" \
   "$project_dir/compose.control.yaml"
@@ -1235,6 +1451,50 @@ check_contains \
   "mail egress: proxy denies every other destination" \
   "$project_dir/position-monitor/mail-egress/squid.conf" \
   "http_access deny all"
+check_contains \
+  "control write egress: proxy permits only the fixed WB Promotion host" \
+  "$project_dir/position-monitor/control-write-egress/squid.conf" \
+  "acl wb_promotion_write_api dstdomain advert-api.wildberries.ru"
+check_contains \
+  "control write egress: proxy applies exact CONNECT/TLS policy" \
+  "$project_dir/position-monitor/control-write-egress/squid.conf" \
+  "http_access allow connect wb_promotion_write_api tls_port"
+check_contains \
+  "control write egress: proxy denies every other destination" \
+  "$project_dir/position-monitor/control-write-egress/squid.conf" \
+  "http_access deny all"
+check_contains \
+  "control auth egress: only the exact local JWKS path reaches upstream" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  'location = /jwks {'
+check_contains \
+  "control auth egress: local JWKS query strings are rejected" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  'if ($args != "") { return 404; }'
+check_contains \
+  "control auth egress: upstream host/path are the only routing substitutions" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  'proxy_pass https://${CONTROL_AUTH_JWKS_HOST}${CONTROL_AUTH_JWKS_PATH};'
+check_contains \
+  "control auth egress: upstream certificate verification is mandatory" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  "proxy_ssl_verify on;"
+check_contains \
+  "control auth egress: caller headers are never forwarded" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  "proxy_pass_request_headers off;"
+check_contains \
+  "control auth egress: every other local path is rejected" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  'location / {'
+check_contains \
+  "control auth egress: hostname and path are validated before substitution" \
+  "$project_dir/position-monitor/control-auth-egress/entrypoint.sh" \
+  "CONTROL_AUTH_JWKS_PATH must be one bounded absolute path"
+check_contains \
+  "control auth egress: generated configuration is validated before startup" \
+  "$project_dir/position-monitor/control-auth-egress/entrypoint.sh" \
+  "nginx -t -c /tmp/nginx.conf"
 
 verify_server \
   "main" \
@@ -1275,10 +1535,12 @@ verify_reporting_canary "$reporting_canary_rendered"
 verify_reporting_mail_canary "$reporting_mail_canary_rendered"
 verify_reporting_mail_live "$reporting_mail_live_rendered" "$reporting_mail_canary_rendered"
 verify_control "$control_rendered"
+verify_control_wb_plan "$control_wb_plan_rendered" "$control_rendered"
+verify_control_wb_live "$control_wb_live_rendered" "$control_wb_plan_rendered"
 
 if (( failures > 0 )); then
   echo "compose hardening verification failed with $failures problem(s)" >&2
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, Control, position database, the opt-in MCP reporting reader, Ozon read-API and Gmail egress proxies, disabled collector/reporting runtimes, and the explicit reporting collection/mail canary and live overlays: exact resource/mount/health contracts, loopback-only publication, isolated egress, and internal database networks."
+echo "Compose hardening verified for main, canary, base/plan/executor Control, position database, the opt-in MCP reporting reader, dedicated Control write/JWKS proxies, Ozon read-API and Gmail egress proxies, disabled collector/reporting runtimes, and the explicit reporting collection/mail canary and live overlays: exact resource/mount/health contracts, write-secret separation, loopback-only publication, isolated egress, and internal database networks."

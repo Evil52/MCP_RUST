@@ -15,6 +15,7 @@ services:
       POSITION_READER_DB_PASSWORD: ${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}
       REPORT_WORKER_DB_PASSWORD: ${REPORT_WORKER_DB_PASSWORD:?REPORT_WORKER_DB_PASSWORD is required}
       REPORT_COLLECTOR_DB_PASSWORD: ${REPORT_COLLECTOR_DB_PASSWORD:?REPORT_COLLECTOR_DB_PASSWORD is required}
+      CONTROL_WRITER_DB_PASSWORD: ${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}
     volumes:
       - position-data:/var/lib/postgresql/data
     networks:
@@ -80,11 +81,11 @@ services:
       retries: 3
       start_period: 10s
 
-  # The only component with external connectivity in the reporting stack.
-  # Its in-image Squid policy permits CONNECT tunnels solely to the exact Ozon
-  # Seller/Performance and WB Analytics/Prices/Promotion hosts. Marketplace
-  # credentials remain in report-collector; the proxy receives no secret
-  # environment and cannot select any additional destination.
+  # Shared credentialless API egress proxy. Its in-image Squid policy permits
+  # CONNECT tunnels solely to the exact Ozon Seller/Performance and WB
+  # Analytics/Prices/Promotion hosts. Reporting credentials remain in
+  # report-collector and WB write credentials remain in Control; the proxy
+  # receives neither and cannot select any additional destination.
   ozon-egress:
     image: mcp-ozon-egress:local
     build:

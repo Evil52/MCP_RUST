@@ -1,0 +1,18 @@
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+RUN apk add --no-cache ca-certificates gettext nginx \
+    && mkdir -p /var/lib/nginx /var/log/nginx \
+    && chown -R nginx:nginx /var/lib/nginx /var/log/nginx
+
+COPY position-monitor/control-auth-egress/nginx.conf.template /etc/control-auth-egress/nginx.conf.template
+RUN CONTROL_AUTH_JWKS_HOST=localhost \
+    CONTROL_AUTH_JWKS_PATH=/realms/example/protocol/openid-connect/certs \
+    envsubst '${CONTROL_AUTH_JWKS_HOST} ${CONTROL_AUTH_JWKS_PATH}' \
+        </etc/control-auth-egress/nginx.conf.template >/tmp/nginx.conf \
+    && nginx -t -c /tmp/nginx.conf \
+    && rm /tmp/nginx.conf
+COPY position-monitor/control-auth-egress/entrypoint.sh /usr/local/bin/control-auth-egress
+RUN chmod 0555 /usr/local/bin/control-auth-egress
+
+USER nginx
+ENTRYPOINT ["/usr/local/bin/control-auth-egress"]

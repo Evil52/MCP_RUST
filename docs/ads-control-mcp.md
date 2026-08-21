@@ -1,61 +1,174 @@
-# OzonOFK Control MCP scaffold
+# OzonOFK Control MCP: WB promotion bids
 
-`mcp-ozon-control` is a separate MCP process for the future advertising write
-workflow. It does not extend the existing analytics server and cannot weaken
-its read-only allowlists.
+`mcp-ozon-control` is a separate fail-closed process for marketplace writes.
+It does not extend the analytics server or its read-only allowlists. Without an
+explicit policy, JWT auth, restricted PostgreSQL session, proxy and dedicated
+WB tokens, it starts with all marketplace writes disabled.
 
-## Current milestone: disabled scaffold
+## Implemented scope
 
-The current binary intentionally has no marketplace client, marketplace URL,
-credential lookup, plan store, or write tool. It exposes exactly two local
-read-only tools:
+The first write workflow changes only product-card bids through the official
+WB Promotion endpoint `PATCH /api/advert/v1/bids` on the fixed host
+`advert-api.wildberries.ru`.
 
-- `ozon_ads_control_status` — confirms that marketplace credentials,
-  marketplace egress, persistence, and marketplace writes are disabled;
-- `ozon_ads_control_scope` — shows only the account/campaign/SKU bindings
-  explicitly listed for the current actor in the local policy.
+Available tools:
 
-`ControlAppConfig` reads only variables beginning with `CONTROL_MCP_`. It does
-not load `.env`, and it never resolves credential environment names contained
-in `config/access.json`.
+- `ozon_ads_control_status` — reports static policy/runtime prerequisites and
+  states explicitly that per-target runtime gates are still required;
+- `ozon_ads_control_scope` — shows the actor's exact local Ozon/WB policy;
+- `wb_promotion_prepare_bid_update` — first reserves a bounded preparation
+  attempt, then reads current campaign bids and creates an immutable
+  five-minute PostgreSQL plan;
+- `wb_promotion_approve_bid_plan` — records a distinct authorized actor's
+  append-only approval from `plan_id + plan_digest + approval_reference`;
+- `wb_promotion_apply_bid_plan` — claims an approved plan once, reserves its
+  bounded action quota using `plan_id + plan_digest`, re-reads its precondition,
+  performs one PATCH attempt, and reads the campaign back;
+- `wb_promotion_bid_plan_status` — reads durable plan state without WB egress;
+- `wb_promotion_reconcile_bid_plan` — read-back only; it never repeats a write.
 
-The example Compose network is `internal: true`, so the disabled scaffold has
-no Internet egress. Its port is published only on host loopback. Do not connect
-this dev/no-auth instance to a public tunnel.
+This is a separate seven-tool Control registry. It is not part of the Analytics
+MCP release contract, which remains exactly 75 read-only tools. In Control,
+`prepare`, `approve`, `apply`, and `reconcile` intentionally advertise
+non-read-only annotations because they change durable Control state; only
+`apply` sends a marketplace mutation. `approve` is also marked destructive
+because it grants execution authority, even though it has no WB egress.
 
-## Local start without API keys
+Prices, stocks, product cards, campaign creation/deletion, budgets and search
+cluster bids are not enabled.
 
-```bash
-cp config/control-policy.example.json config/control-policy.json
-chmod 600 config/control-policy.json
-docker compose -f compose.control.yaml up -d --build
-curl -fsS http://127.0.0.1:8790/health
-```
+These seven tools are a supervised execution kernel, not an autonomous store
+manager. There is no scheduled decision worker, bid optimizer, forecast model
+or policy-learning loop in this workflow. ChatGPT can analyze data and prepare
+a bounded proposal, but production execution still requires the independent
+approval identity and short-lived operator leases described below.
 
-The repo-local Codex plugin at `plugins/ozonofk-control` points to
-`http://127.0.0.1:8790/mcp`. No marketplace API key is required or accepted by
-this milestone.
+WB currently documents campaign bid changes for statuses `4`, `9`, and `11`,
+with `combined` placement for a unified bid and `search`/`recommendations` for
+a manual bid. The request is bounded to 50 distinct `nm_id + placement` pairs.
+See the [official WB Promotion API](https://dev.wildberries.ru/docs/openapi/promotion).
 
-## Policy shape
+## Safety contract
 
-Policy is deny-by-default and contains identifiers and limits only:
+Every bid change must pass all of these gates:
+
+1. The authenticated plan actor has basic access to the WB account and an exact
+   `account_id + advert_id + nm_id + placement` policy binding. The same target
+   lists one or more distinct `approver_actor_ids`, each with account access.
+2. The requested bid is inside server-side kopeck limits and its change is no
+   larger than `max_delta_percent`. A zero current bid is rejected for manual
+   review. The target also fixes hourly/daily action ceilings, cooldown and a
+   daily cumulative absolute bid-delta ceiling.
+3. Before its WB read, `prepare` atomically reserves a two-minute append-only
+   attempt. PostgreSQL caps an actor at 60 attempts/hour, a campaign at its
+   policy hourly action limit, and active plans/unconsumed reservations at
+   three. A matching reservation can create at most one plan. The plan stores
+   the current state, exact requested/normalized changes, policy schema
+   version, revision and digest, expires after five minutes, and is immutable.
+4. `approve` accepts only an authenticated actor explicitly listed for that
+   exact target. Self-approval is rejected. PostgreSQL stores an append-only
+   approval bound to `plan_id + plan_digest`, and the approval cannot outlive
+   the plan or two minutes, whichever comes first.
+5. `apply` accepts only `approved` state. Its transaction requires active
+   operator leases at global, account and campaign scope, enforces the plan's
+   hourly/daily/cooldown/cumulative-delta limits, inserts one consumed-attempt
+   reservation, then atomically changes `approved -> applying`. A partial
+   unique index permits only one applying plan per account/campaign, and an
+   unresolved incident blocks another plan for the same campaign.
+6. Immediately before PATCH, the campaign is read again. Any changed
+   precondition rejects the plan without writing. Control then revalidates the
+   exact plan/policy digests, approval, reservation and all runtime leases once
+   more after its writer queue wait.
+7. The dedicated writer makes exactly one HTTP attempt. Timeout, connection
+   loss, any HTTP error after send, or an invalid success body is ambiguous and
+   is never retried; HTTP 4xx is not assumed to prove an atomic no-op.
+8. After HTTP success, Control reads the campaign again. Only a matching state
+   becomes `applied`; otherwise it becomes `reconciliation_required`.
+9. `reconcile` can confirm the expected state, but cannot send PATCH. If a
+   Control process stopped while a plan was `applying`, reconciliation is
+   refused for three minutes, then atomically marks the abandoned attempt
+   `ambiguous` before read-back. It still never repeats PATCH.
+
+Plan and audit rows are durable and append-only from the application workflow.
+The restricted `control_writer` role has no access to reporting or position
+schemas and cannot delete plans or audit events.
+
+Preparation reservations, plans, approvals, write reservations and audit rows
+are deliberately retained for forensic history. Before live activation,
+configure PostgreSQL size alerts and an operator-owned archive/retention job;
+the application role cannot prune this evidence. The DB-backed preparation
+caps bound growth and WB read pressure, but do not replace storage monitoring.
+
+WB documents bid propagation at roughly 30-second intervals, so an immediate
+read-back may legitimately produce `reconciliation_required`; wait for
+propagation and call the read-back reconciliation tool. It may update the local
+plan status but can never repeat the marketplace mutation.
+
+Approval is a persisted two-person boundary, not a client confirmation dialog:
+the author of a plan cannot approve it, and `apply` cannot substitute for
+approval. ChatGPT may prepare and explain a plan under the plan actor, but a
+separately authenticated listed approver must approve its exact digest. Do not
+give one autonomous agent both identities or let it obtain either actor's JWT
+through chat. The operator-owned runtime leases remain an independent kill
+switch even after approval.
+
+The gate is fail-closed authorization for a dispatch, not cancellation of a
+request already authorized in flight. Revoking a lease stops a write that has
+not completed its final database revalidation, but there is an unavoidable
+small interval between that transaction commit and the HTTP send. For the
+supervised singleton pilot, disable gates first and then wait at least the
+configured WB request timeout plus the 250 ms pacing interval before treating
+the executor as quiescent. An instantaneous/HA kill switch requires a
+database-backed executor protocol that holds an operator-visible dispatch lock
+through the bounded send.
+
+`approval_reference` is a short restricted ASCII audit identifier, not a
+free-form instruction. The MCP result returns approval identity/timestamps but
+does not echo this field into the model context.
+
+## Policy for ИП Домнышев
+
+The access registry already binds account `ip_domnyshev_wb` to actor `wb6`
+(`Вахрушева Наталья / Торсунова Вероника`). Campaign and product IDs still need
+to be copied from the actual cabinet; do not use example numbers in production.
+
+`wb6` currently represents two people behind one OIDC username. That is enough
+for a plan-only technical rehearsal, but it is not individual accountability
+for live writes. Before enabling the executor, create separate reviewed actors
+and OIDC principals for Natalia Vakhrusheva and Veronika Torsunova, bind the
+chosen plan author explicitly, and keep every approver/operator identity
+separate. Do not invent those identifiers in this repository before IAM has
+provided their real immutable subjects.
+
+Start with `plan_only`:
 
 ```json
 {
   "version": 1,
-  "mode": "disabled",
+  "revision": 1,
+  "mode": "plan_only",
   "actors": [
     {
-      "actor_id": "manager",
-      "targets": [
+      "actor_id": "wb6",
+      "targets": [],
+      "wb_promotion_bid_targets": [
         {
-          "account_id": "example_ozon",
-          "campaign_id": 42,
-          "skus": [1001],
-          "bid_limits": {
-            "min_minor": 100,
+          "account_id": "ip_domnyshev_wb",
+          "seller_sid": "00000000-0000-0000-0000-000000000000",
+          "advert_id": 12345,
+          "nm_ids": [13335157],
+          "placements": ["search", "recommendations"],
+          "bid_limits_kopecks": {
+            "min_minor": 250,
             "max_minor": 5000,
-            "max_delta_percent": 5
+            "max_delta_percent": 10
+          },
+          "approver_actor_ids": ["rustam_magasumov"],
+          "action_limits": {
+            "max_actions_per_hour": 4,
+            "max_actions_per_day": 12,
+            "cooldown_seconds": 900,
+            "max_cumulative_abs_delta_kopecks_per_day": 5000
           }
         }
       ]
@@ -64,24 +177,209 @@ Policy is deny-by-default and contains identifiers and limits only:
 }
 ```
 
-Even an analytics `admin` receives no Control scope unless that exact actor is
-listed. Policy accounts must already exist in the access registry, belong to
-Ozon with a Performance binding, and be accessible to the actor. Unknown fields
-— including credential-looking fields — fail startup.
+`plan_only` permits preparation, persisted approval and inspection but refuses
+`apply`. After a successful rehearsal, change the policy to `enabled` and
+restart Control.
+Increment `revision` for every effective policy change. `version` identifies
+the JSON schema; `revision` identifies one operator-reviewed policy document,
+and missing or zero revisions fail startup. The exact policy bytes are hashed
+into each plan, so a revision or document change invalidates old execution
+authority. `approver_actor_ids` must contain only distinct actors other than the
+plan author; listing an Analytics admin here is explicit Control authority, not
+an implicit consequence of the admin role. Replace all campaign, product and
+limit numbers in this example with reviewed production values. Replace the
+zero `seller_sid` too: the exact non-zero registry value is required in the
+target and becomes part of the policy/plan digest.
 
-## Next gated milestone
+When `CONTROL_MCP_DATABASE_URL` is present in JWT mode, startup registers the
+current policy revision/digest even if `mode` is `disabled`; no WB token is read
+in that mode. This persists a rollback-prevention tombstone, so an older
+previously enabled revision cannot be restored later. For an emergency stop,
+first disable the operator-owned global DB gate, then restart with a higher
+disabled revision using the planner overlay only (never the live writer
+overlay).
 
-Before any API key or write endpoint is added, the next review must introduce:
+## Dedicated WB tokens
 
-1. a dedicated JWT audience and exact `mcp:ads-control` scope;
-2. a durable PostgreSQL plan/audit store;
-3. `prepare` and `apply(plan_id)` as separate tools;
-4. current-state reread, immutable short-lived plans, one-time execution,
-   per-campaign/SKU locks, and read-back reconciliation;
-5. an exact fixed-host write allowlist with no generic URL/method/body;
-6. no automatic retry after an ambiguous marketplace write;
-7. ChatGPT approval for every apply call and server-side limits independent of
-   the model.
+Do not replace or widen `IP_DOMNYSHEV_WB_API_TOKEN`. That existing token remains
+read-only and belongs to analytics/reporting.
 
-Write credentials must live only in the future Control container. The existing
-Analytics container must remain read-only and must never receive them.
+Create two separate Personal production tokens in the WB cabinet:
+
+- the Control reader token: category **Продвижение** only, read-only access;
+- the Control writer token: category **Продвижение** only, read/write access;
+- no other API categories on either token.
+
+Control locally decodes capability metadata and requires the exact capability
+bits for each purpose. It refuses a non-Personal/test/expired token, a writer
+token in the read-only slot, a read-only token in the writer slot, or either
+token with another API category. WB still verifies the signature on every
+request. The bit definitions and least-privilege guidance are in the
+[official WB token documentation](https://dev.wildberries.ru/ru/openapi/api-information).
+
+Before either Control token is accepted, add the reviewed WB seller UUID from
+the documented `sid` claim to the `ip_domnyshev_wb` registry binding:
+
+```json
+"wildberries": {
+  "api_token_env": "IP_DOMNYSHEV_WB_API_TOKEN",
+  "seller_sid": "00000000-0000-0000-0000-000000000000"
+}
+```
+
+Replace the zero UUID with the actual canonical UUID. It is not the numeric
+`seller_client_id=4389764`. Decode the token only locally or confirm it with
+WB's official `GET https://common-api.wildberries.ru/api/v1/seller-info`.
+Control requires the READ-token `sid`, WRITE-token `sid`, and reviewed registry
+`seller_sid` to be identical; missing, malformed, or cross-cabinet identity
+fails startup. A non-empty `seller_sid` must also be unique across account
+bindings, so aliases cannot split one cabinet's incident locks or action quotas.
+The SID is stamped into the immutable preflight snapshot and exact read-back,
+so an old ambiguous plan cannot be reconciled against a replacement cabinet.
+Never rebind an existing `account_id` to another cabinet: create a new reviewed
+account binding and higher policy revision. Any unresolved old-SID incident is
+intentionally left locked as forensic evidence; do not edit append-only rows to
+make it disappear.
+
+Save each token as one line in its own file; never paste either value into
+policy JSON, chat, git, Compose environment or the analytics `.env`:
+
+```bash
+sudo install -o 10001 -g 10001 -m 0400 /dev/null \
+  /absolute/protected/path/ip-domnyshev-wb-promotion-read.token
+sudo install -o 10001 -g 10001 -m 0400 /dev/null \
+  /absolute/protected/path/ip-domnyshev-wb-promotion-write.token
+# Edit without changing owner/mode; Control runs as uid/gid 10001.
+```
+
+Each token may have one trailing LF/CRLF. Other whitespace is rejected. The
+planning container described below never mounts the writer file. On the target
+Linux host, verify that uid 10001 can read each bind-mounted file; do not relax
+permissions to group/other because startup deliberately rejects those modes.
+
+## PostgreSQL activation
+
+Add a new random `CONTROL_WRITER_DB_PASSWORD` to the ignored `.position.env`.
+For a new database volume, migration `020_wb_control_plans.sql` runs during
+normal initialization. Existing volumes do not rerun init scripts; after the
+database container has the new environment variable, apply the additive role
+and schema steps once:
+
+```bash
+docker compose --env-file .position.env -f compose.position.yaml up -d position-db
+docker compose --env-file .position.env -f compose.position.yaml \
+  exec -T position-db /docker-entrypoint-initdb.d/003_roles.sh
+docker compose --env-file .position.env -f compose.position.yaml \
+  exec -T position-db sh -c \
+  'PGPASSWORD="$POSTGRES_PASSWORD" psql --no-psqlrc --set=ON_ERROR_STOP=1 \
+   --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+   --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql'
+```
+
+Use the repository bootstrap script when creating a fresh position environment:
+
+```bash
+./scripts/bootstrap-position-env.sh .position.env.new
+```
+
+It refuses to overwrite an existing secret file.
+
+Runtime write gates live in PostgreSQL and are fail-closed. Migration creates a
+disabled global gate; `control_writer` can only read gates, never enable them.
+Before an executor can claim a plan, a separate database operator must issue
+short-lived enabled leases (at most 15 minutes) for all three scopes: `global`,
+the exact account and the exact campaign. Missing, disabled, expired or
+temporarily suspended scope refuses the write. Never grant gate mutation to the
+application role; use a reviewed operator procedure with an identified
+`updated_by`, increasing revision and bounded lease.
+
+## Planner and executor container wiring
+
+The base `compose.control.yaml` remains local-only, credentialless and disabled.
+Use two additional layers with different secret boundaries:
+
+- `compose.control-wb-plan.yaml` creates the JWT/DB/proxy runtime, forces
+  marketplace writes off and mounts only the dedicated READ token. The
+  container has no path to the WRITE secret;
+- `compose.control-wb-live.yaml` is a minimal, executor-capability overlay used
+  only after the plan overlay. It adds the WRITE-token path/mount. Even in this
+  layer `CONTROL_MCP_MARKETPLACE_WRITES_ENABLED` defaults to `false`; an
+  operator must explicitly set it to `true` in addition to enabling policy and
+  short-lived database gates.
+
+Run exactly one live executor for each dedicated WRITE token. The 250 ms WB
+write pacer is shared by all clones inside one process, but it is not a
+distributed lock between replicas or separately launched projects. Do not use
+Compose scaling, active/active failover, or reuse this token in another worker.
+The database still prevents concurrent application for one campaign, but a
+multi-replica autonomous deployment needs a database-backed token-wide pacer
+before it can be considered safe.
+
+Both runtimes connect Control only to PostgreSQL and two private proxy
+networks. Control itself is never attached to `outbound`:
+
+- `control-write-egress` is a credentialless CONNECT proxy that permits only
+  TLS 443 to `advert-api.wildberries.ru`. Both WB clients are explicitly forced
+  through it, while the writer independently permits only
+  `PATCH /api/advert/v1/bids`;
+- `control-auth-egress` is an exact-path TLS-verifying reverse proxy for the
+  configured JWKS document. `JwtAuthenticator` deliberately ignores ambient
+  proxy variables, so Control fetches public keys from the proxy's internal
+  `http://control-auth-egress:8080/jwks` endpoint. Only the proxy containers are
+  attached to `outbound`.
+
+The binary rejects plaintext issuer/public URLs and every plaintext JWKS URL
+except that exact internal proxy origin; lookalike hosts, ports, paths, query
+strings and credentials fail startup.
+
+The auth proxy accepts a DNS hostname and absolute path separately, permits no
+port, IP literal, query, fragment or redirect-following, sends no caller headers
+upstream, and verifies the upstream certificate/SNI. Set these values from the
+reviewed OIDC discovery metadata; they are public routing metadata, never a
+token or client secret.
+
+Set the JWT variables and protected READ-token path, point
+`CONTROL_MCP_POLICY_HOST` to the reviewed `plan_only` policy, then start the
+planner-capable runtime:
+
+```bash
+export CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE_HOST=/absolute/protected/path/ip-domnyshev-wb-promotion-read.token
+export CONTROL_MCP_POLICY_HOST=/absolute/protected/path/control-policy.json
+export CONTROL_MCP_ACCESS_CONFIG_HOST=/absolute/protected/path/access.json
+export CONTROL_MCP_JWT_ISSUER=https://auth.example/realms/ofk
+export CONTROL_MCP_JWT_JWKS_HOST=auth.example
+export CONTROL_MCP_JWT_JWKS_PATH=/realms/ofk/protocol/openid-connect/certs
+export CONTROL_MCP_PUBLIC_URL=https://control.example/mcp
+
+docker compose --env-file .position.env \
+  -f compose.control.yaml -f compose.control-wb-plan.yaml \
+  up -d --build
+```
+
+Only after the policy, approval flow, action limits and database-gate procedure
+have passed release review, create the executor-capable runtime by layering the
+live overlay explicitly:
+
+```bash
+export CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST=/absolute/protected/path/ip-domnyshev-wb-promotion-write.token
+export CONTROL_MCP_MARKETPLACE_WRITES_ENABLED=true
+
+docker compose --env-file .position.env \
+  -f compose.control.yaml -f compose.control-wb-plan.yaml \
+  -f compose.control-wb-live.yaml up -d --build
+```
+
+Never use the live overlay without the plan layer, never mount the writer token
+in the planner container, and never expose the base dev/no-auth service through
+a public tunnel. Executor mode requires the exact JWT audience and
+`mcp:ads-control` scope; mounting a writer token is capability provisioning, not
+proof that policy, approval or runtime gates permit a write.
+
+## Operational rule for ambiguous writes
+
+If `apply` returns `ambiguous` or `reconciliation_required`, do not create or
+apply a replacement plan. Call `wb_promotion_reconcile_bid_plan`. The same call
+can safely recover a plan left in `applying` after a process interruption; it
+returns `CONTROL_PLAN_APPLY_IN_PROGRESS` during the three-minute safety window.
+If the state still does not match, stop and compare the WB cabinet/audit trail
+manually.

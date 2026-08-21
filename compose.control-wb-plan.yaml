@@ -1,0 +1,117 @@
+services:
+  control:
+    environment:
+      CONTROL_MCP_AUTH_MODE: jwt
+      CONTROL_MCP_JWT_ISSUER: ${CONTROL_MCP_JWT_ISSUER:?CONTROL_MCP_JWT_ISSUER is required}
+      # JwtAuthenticator deliberately ignores ambient proxies. Point its direct
+      # fetch at the internal exact-path reverse proxy instead; Control itself
+      # has no outbound network attachment.
+      CONTROL_MCP_JWT_JWKS_URL: http://control-auth-egress:8080/jwks
+      CONTROL_MCP_PUBLIC_URL: ${CONTROL_MCP_PUBLIC_URL:?CONTROL_MCP_PUBLIC_URL is required}
+      CONTROL_MCP_JWT_AUDIENCE: ${CONTROL_MCP_PUBLIC_URL:?CONTROL_MCP_PUBLIC_URL is required}
+      # This overlay can prepare/inspect plans but never loads a write secret.
+      CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: "false"
+      CONTROL_MCP_WB_ACCOUNT_ID: ip_domnyshev_wb
+      CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE: /run/mcp-ozon/control-credentials/wb-promotion-read.token
+      CONTROL_MCP_DATABASE_URL: postgresql://control_writer:${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      CONTROL_MCP_WB_PROXY: http://control-write-egress:3130
+      CONTROL_MCP_WB_TIMEOUT_SECONDS: "20"
+    volumes:
+      - type: bind
+        source: ${CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE_HOST:?CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE_HOST is required}
+        target: /run/mcp-ozon/control-credentials/wb-promotion-read.token
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - position-internal
+      - control-write-egress-internal
+      - control-auth-egress-internal
+    depends_on:
+      control-write-egress:
+        condition: service_healthy
+      control-auth-egress:
+        condition: service_healthy
+
+  control-write-egress:
+    image: mcp-ozon-control-write-egress:local
+    build:
+      context: .
+      dockerfile: Dockerfile.control-write-egress
+    networks:
+      - control-write-egress-internal
+      - outbound
+    restart: unless-stopped
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 32
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/squid:size=4m,mode=1777
+      - /var/log/squid:size=2m,mode=1777
+      - /var/run/squid:size=1m,mode=1777
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "printf 'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 3130 | head -1 | grep -q '403 Forbidden'"
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
+
+  control-auth-egress:
+    image: mcp-ozon-control-auth-egress:local
+    build:
+      context: .
+      dockerfile: Dockerfile.control-auth-egress
+    environment:
+      CONTROL_AUTH_JWKS_HOST: ${CONTROL_MCP_JWT_JWKS_HOST:?CONTROL_MCP_JWT_JWKS_HOST is required}
+      CONTROL_AUTH_JWKS_PATH: ${CONTROL_MCP_JWT_JWKS_PATH:?CONTROL_MCP_JWT_JWKS_PATH is required}
+    networks:
+      - control-auth-egress-internal
+      - outbound
+    restart: unless-stopped
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 32
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
+
+networks:
+  position-internal:
+    name: mcp-ozon-position-internal
+    external: true
+  control-write-egress-internal:
+    internal: true
+  control-auth-egress-internal:
+    internal: true
+  outbound:
+    name: mcp-ozon-outbound
+    external: true

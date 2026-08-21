@@ -38,7 +38,8 @@
       "seller_client_id": "replace-me",
       "manager_id": "manager",
       "wildberries": {
-        "api_token_env": "EXAMPLE_WB_API_TOKEN"
+        "api_token_env": "EXAMPLE_WB_API_TOKEN",
+        "seller_sid": "123e4567-e89b-42d3-a456-426614174000"
       }
     }
   ]

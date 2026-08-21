@@ -12,6 +12,7 @@ collector_password="position-collector-schema-test"
 reader_password="position-reader-schema-test"
 report_worker_password="report-worker-schema-test"
 report_collector_password="report-collector-schema-test"
+control_writer_password="control-writer-schema-test"
 
 case "$keep_image" in
   true | false) ;;
@@ -57,6 +58,303 @@ expect_failure_containing() {
   fi
 }
 
+assert_control_schema_contract() {
+  local description="$1" contract
+  shift
+  contract="$({ "$@" --tuples-only --no-align --command "
+    WITH expected_triggers(
+        table_name, trigger_name, function_name, trigger_type
+    ) AS (
+        VALUES
+          ('wb_plans', 'wb_plans_transition_guard',
+           'enforce_wb_plan_transition', 19),
+          ('wb_policy_revisions', 'wb_policy_revisions_validate',
+           'validate_wb_policy_revision_insert', 7),
+          ('wb_policy_revisions', 'wb_policy_revisions_append_only',
+           'reject_wb_append_only_mutation', 27),
+          ('wb_prepare_reservations', 'wb_prepare_reservations_validate',
+           'validate_wb_prepare_reservation_insert', 7),
+          ('wb_prepare_reservations', 'wb_prepare_reservations_append_only',
+           'reject_wb_append_only_mutation', 27),
+          ('wb_plans', 'wb_plans_validate_insert',
+           'validate_wb_plan_insert', 7),
+          ('wb_runtime_gates', 'wb_runtime_gates_validate_write',
+           'validate_wb_runtime_gate_write', 23),
+          ('wb_plan_approvals', 'wb_plan_approvals_validate',
+           'validate_wb_approval_insert', 7),
+          ('wb_plan_approvals', 'wb_plan_approvals_append_only',
+           'reject_wb_append_only_mutation', 27),
+          ('wb_action_reservations', 'wb_action_reservations_validate',
+           'validate_wb_reservation_insert', 7),
+          ('wb_action_reservations', 'wb_action_reservations_append_only',
+           'reject_wb_append_only_mutation', 27),
+          ('wb_audit_events', 'wb_audit_events_append_only',
+           'reject_wb_append_only_mutation', 27)
+    ),
+    other_app_roles(role_name) AS (
+        VALUES
+          ('position_collector'),
+          ('position_reader'),
+          ('report_collector'),
+          ('report_worker')
+    ),
+    actual_triggers(
+        table_name, trigger_name, function_name, trigger_type, enabled
+    ) AS (
+        SELECT relation.relname::text, trigger.tgname::text,
+               routine.proname::text, trigger.tgtype::integer,
+               trigger.tgenabled
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        JOIN pg_proc AS routine ON routine.oid = trigger.tgfoid
+        WHERE namespace.nspname = 'control'
+          AND NOT trigger.tgisinternal
+    )
+    SELECT
+      (
+          SELECT string_agg(relation.relname::text, ',' ORDER BY relation.relname)
+                 = 'wb_action_reservations,wb_audit_events,wb_plan_approvals,' ||
+                   'wb_plans,wb_policy_revisions,wb_prepare_reservations,' ||
+                   'wb_runtime_gates'
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = 'control'
+            AND relation.relkind IN ('r', 'p')
+      )
+      AND (
+          SELECT string_agg(
+                     relation.relname::text || ':' || acl.privilege_type,
+                     ',' ORDER BY relation.relname, acl.privilege_type
+                 ) =
+                 'wb_action_reservations:INSERT,wb_action_reservations:SELECT,' ||
+                 'wb_audit_events:INSERT,wb_audit_events:SELECT,' ||
+                 'wb_plan_approvals:INSERT,wb_plan_approvals:SELECT,' ||
+                 'wb_plans:INSERT,wb_plans:SELECT,' ||
+                 'wb_policy_revisions:INSERT,wb_policy_revisions:SELECT,' ||
+                 'wb_prepare_reservations:INSERT,wb_prepare_reservations:SELECT,' ||
+                 'wb_runtime_gates:SELECT'
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(
+              coalesce(relation.relacl, acldefault('r', relation.relowner))
+          ) AS acl
+          WHERE namespace.nspname = 'control'
+            AND relation.relkind IN ('r', 'p')
+            AND acl.grantee = 'control_writer'::regrole
+      )
+      AND (
+          SELECT string_agg(
+                     relation.relname::text || '.' || attribute.attname::text ||
+                     ':' || acl.privilege_type,
+                     ',' ORDER BY relation.relname, attribute.attname,
+                                  acl.privilege_type
+                 ) =
+                 'wb_plans.apply_started_at:UPDATE,' ||
+                 'wb_plans.finished_at:UPDATE,' ||
+                 'wb_plans.last_error_class:UPDATE,' ||
+                 'wb_plans.readback_json:UPDATE,' ||
+                 'wb_plans.status:UPDATE,' ||
+                 'wb_plans.write_response_json:UPDATE'
+          FROM pg_attribute AS attribute
+          JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+          WHERE namespace.nspname = 'control'
+            AND attribute.attnum > 0
+            AND NOT attribute.attisdropped
+            AND acl.grantee = 'control_writer'::regrole
+      )
+      AND (
+          SELECT string_agg(acl.privilege_type, ',' ORDER BY acl.privilege_type)
+                 = 'USAGE'
+          FROM pg_namespace AS namespace
+          CROSS JOIN LATERAL aclexplode(
+              coalesce(namespace.nspacl, acldefault('n', namespace.nspowner))
+          ) AS acl
+          WHERE namespace.nspname = 'control'
+            AND acl.grantee = 'control_writer'::regrole
+      )
+      AND (
+          SELECT string_agg(acl.privilege_type, ',' ORDER BY acl.privilege_type)
+                 = 'SELECT,USAGE'
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(
+              coalesce(relation.relacl, acldefault('S', relation.relowner))
+          ) AS acl
+          WHERE namespace.nspname = 'control'
+            AND relation.relkind = 'S'
+            AND relation.relname = 'wb_audit_events_id_seq'
+            AND acl.grantee = 'control_writer'::regrole
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_namespace AS namespace
+          CROSS JOIN LATERAL aclexplode(
+              coalesce(namespace.nspacl, acldefault('n', namespace.nspowner))
+          ) AS acl
+          WHERE namespace.nspname = 'control'
+            AND (
+                acl.grantee = 0
+                OR acl.grantee IN (
+                    SELECT role_name::regrole::oid FROM other_app_roles
+                )
+            )
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM other_app_roles
+          WHERE has_schema_privilege(role_name::name, 'control', 'USAGE')
+             OR has_schema_privilege(role_name::name, 'control', 'CREATE')
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_auth_members AS membership
+          WHERE membership.roleid = 'control_writer'::regrole
+             OR membership.member = 'control_writer'::regrole
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_namespace AS namespace
+          CROSS JOIN unnest(ARRAY[
+              'position_collector', 'position_reader', 'report_worker',
+              'report_collector', 'control_writer'
+          ]::name[]) AS application_role(role_name)
+          WHERE namespace.nspname <> 'information_schema'
+            AND namespace.nspname !~ '^pg_'
+            AND has_schema_privilege(
+                role_name, namespace.nspname, 'CREATE'
+            )
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(
+              coalesce(
+                  relation.relacl,
+                  acldefault(
+                      (CASE WHEN relation.relkind = 'S' THEN 'S' ELSE 'r' END)::\"char\",
+                      relation.relowner
+                  )
+              )
+          ) AS acl
+          WHERE namespace.nspname = 'control'
+            AND (
+                acl.grantee = 0
+                OR acl.grantee IN (
+                    SELECT role_name::regrole::oid FROM other_app_roles
+                )
+            )
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_proc AS routine
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = routine.pronamespace
+          CROSS JOIN LATERAL aclexplode(
+              coalesce(routine.proacl, acldefault('f', routine.proowner))
+          ) AS acl
+          WHERE namespace.nspname = 'control'
+            AND (
+                acl.grantee = 0
+                OR acl.grantee = 'control_writer'::regrole
+                OR acl.grantee IN (
+                    SELECT role_name::regrole::oid FROM other_app_roles
+                )
+            )
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM pg_default_acl AS defaults
+          CROSS JOIN LATERAL aclexplode(defaults.defaclacl) AS acl
+          WHERE defaults.defaclnamespace = 'control'::regnamespace
+            AND (
+                acl.grantee = 0
+                OR acl.grantee = 'control_writer'::regrole
+                OR acl.grantee IN (
+                    SELECT role_name::regrole::oid FROM other_app_roles
+                )
+            )
+      )
+      AND (
+          SELECT string_agg(routine.proname::text, ',' ORDER BY routine.proname)
+                 = 'enforce_wb_plan_transition,reject_wb_append_only_mutation,' ||
+                   'validate_wb_approval_insert,validate_wb_plan_insert,' ||
+                   'validate_wb_policy_revision_insert,' ||
+                   'validate_wb_prepare_reservation_insert,' ||
+                   'validate_wb_reservation_insert,validate_wb_runtime_gate_write'
+          FROM pg_proc AS routine
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = routine.pronamespace
+          WHERE namespace.nspname = 'control'
+            AND routine.prorettype = 'trigger'::regtype
+      )
+      AND (
+          SELECT string_agg(
+                     relation.relname::text || ':' || constraint_row.conname ||
+                     ':' || constraint_row.contype::text,
+                     ',' ORDER BY relation.relname, constraint_row.conname
+                 ) =
+                 'wb_plan_approvals:wb_approval_ttl:c,' ||
+                 'wb_plans:wb_plan_state_shape:c,' ||
+                 'wb_plans:wb_plan_ttl:c,' ||
+                 'wb_plans:wb_plans_prepare_reservation_id_fkey:f,' ||
+                 'wb_plans:wb_plans_prepare_reservation_id_key:u,' ||
+                 'wb_prepare_reservations:wb_prepare_reservation_ttl:c,' ||
+                 'wb_prepare_reservations:wb_prepare_reservations_pkey:p,' ||
+                 'wb_prepare_reservations:' ||
+                 'wb_prepare_reservations_policy_revision_fkey:f,' ||
+                 'wb_runtime_gates:wb_runtime_gate_lease_bound:c,' ||
+                 'wb_runtime_gates:wb_runtime_gate_scope:c'
+          FROM pg_constraint AS constraint_row
+          JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+          JOIN pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = 'control'
+            AND constraint_row.conname IN (
+                'wb_approval_ttl',
+                'wb_plan_state_shape',
+                'wb_plan_ttl',
+                'wb_plans_prepare_reservation_id_fkey',
+                'wb_plans_prepare_reservation_id_key',
+                'wb_prepare_reservation_ttl',
+                'wb_prepare_reservations_pkey',
+                'wb_prepare_reservations_policy_revision_fkey',
+                'wb_runtime_gate_lease_bound',
+                'wb_runtime_gate_scope'
+            )
+      )
+      AND (
+          SELECT count(*) = 12
+          FROM actual_triggers
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM expected_triggers AS expected
+          LEFT JOIN actual_triggers AS actual
+            ON actual.table_name = expected.table_name
+           AND actual.trigger_name = expected.trigger_name
+          WHERE actual.trigger_name IS NULL
+             OR actual.function_name <> expected.function_name
+             OR actual.trigger_type <> expected.trigger_type
+             OR actual.enabled <> 'O'
+      )
+  "; } | tr -d '[:space:]')"
+  if [[ "$contract" != t ]]; then
+    echo "$description does not match the exact Control schema/ACL/trigger contract" >&2
+    printf '%s\n' "$contract" >&2
+    exit 1
+  fi
+}
+
 expect_exact_validation_failure \
   "example admin-password validation" \
   "POSTGRES_PASSWORD must not use an example placeholder" \
@@ -68,6 +366,7 @@ expect_exact_validation_failure \
   POSITION_READER_DB_PASSWORD="$reader_password" \
   REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
 
 expect_exact_validation_failure \
@@ -81,6 +380,7 @@ expect_exact_validation_failure \
   POSITION_READER_DB_PASSWORD="$reader_password" \
   REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
 
 docker build --pull --tag "$image" --file "$project_root/position-monitor/Dockerfile" \
@@ -100,6 +400,7 @@ docker run --detach --rm --name "$container" \
   --env POSITION_READER_DB_PASSWORD="$reader_password" \
   --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   "$image" >/dev/null
 
 ready=false
@@ -141,6 +442,84 @@ report_collector_psql=(
   psql --host 127.0.0.1 --username report_collector --dbname ozon_positions
   --no-psqlrc --set ON_ERROR_STOP=1
 )
+control_writer_psql=(
+  docker exec --env PGPASSWORD="$control_writer_password" "$container"
+  psql --host 127.0.0.1 --username control_writer --dbname ozon_positions
+  --no-psqlrc --set ON_ERROR_STOP=1
+)
+
+assert_control_schema_contract \
+  "fresh database" \
+  "${admin_psql[@]}"
+
+"${admin_psql[@]}" --command "
+  GRANT position_reader TO control_writer;
+  GRANT control_writer TO report_worker;
+  GRANT CREATE, CONNECT, TEMPORARY ON DATABASE postgres TO
+      position_collector, position_reader, report_worker,
+      report_collector, control_writer;
+  GRANT CREATE ON SCHEMA public TO
+      position_collector, position_reader, report_worker,
+      report_collector, control_writer;
+" >/dev/null
+seeded_control_memberships="$({ "${admin_psql[@]}" --tuples-only --no-align \
+  --command "
+    SELECT count(*)
+    FROM pg_auth_members AS membership
+    WHERE membership.roleid = 'control_writer'::regrole
+       OR membership.member = 'control_writer'::regrole
+  "; } | tr -d '[:space:]')"
+if [[ "$seeded_control_memberships" != 2 ]]; then
+  echo "failed to seed both stale control_writer membership directions" >&2
+  printf '%s\n' "$seeded_control_memberships" >&2
+  exit 1
+fi
+docker exec \
+  --env POSTGRES_USER=position_admin \
+  --env POSTGRES_PASSWORD="$admin_password" \
+  --env POSTGRES_DB=ozon_positions \
+  --env POSITION_COLLECTOR_DB_PASSWORD="$collector_password" \
+  --env POSITION_READER_DB_PASSWORD="$reader_password" \
+  --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
+  --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  "$container" \
+  /docker-entrypoint-initdb.d/003_roles.sh >/dev/null
+assert_control_schema_contract \
+  "role-bootstrap membership convergence" \
+  "${admin_psql[@]}"
+converged_database_acl="$({ "${admin_psql[@]}" --tuples-only --no-align \
+  --command "
+    SELECT count(*) = 5 AND bool_and(
+        NOT has_database_privilege(role_name, 'postgres', 'CONNECT')
+        AND NOT has_database_privilege(role_name, 'postgres', 'TEMP')
+        AND NOT has_database_privilege(role_name, 'postgres', 'CREATE')
+    )
+    FROM unnest(ARRAY[
+        'position_collector', 'position_reader', 'report_worker',
+        'report_collector', 'control_writer'
+    ]::name[]) AS application_role(role_name)
+  "; } | tr -d '[:space:]')"
+if [[ "$converged_database_acl" != t ]]; then
+  echo "role bootstrap retained stale cross-database application grants" >&2
+  printf '%s\n' "$converged_database_acl" >&2
+  exit 1
+fi
+converged_schema_acl="$({ "${admin_psql[@]}" --tuples-only --no-align \
+  --command "
+    SELECT count(*) = 5 AND bool_and(
+        NOT has_schema_privilege(role_name, 'public', 'CREATE')
+    )
+    FROM unnest(ARRAY[
+        'position_collector', 'position_reader', 'report_worker',
+        'report_collector', 'control_writer'
+    ]::name[]) AS application_role(role_name)
+  "; } | tr -d '[:space:]')"
+if [[ "$converged_schema_acl" != t ]]; then
+  echo "role bootstrap retained stale application schema CREATE grants" >&2
+  printf '%s\n' "$converged_schema_acl" >&2
+  exit 1
+fi
 
 # Prove that every additive migration can be applied safely to an existing
 # database initialized with the original Ozon-only schema and existing roles.
@@ -176,7 +555,7 @@ migration_admin_psql=(
 " >/dev/null
 "${admin_psql[@]}" --command '
   GRANT CONNECT ON DATABASE migration_probe
-      TO position_collector, position_reader, report_worker, report_collector
+      TO position_collector, position_reader, report_worker, report_collector, control_writer
 ' >/dev/null
 "${migration_admin_psql[@]}" --command '
   GRANT USAGE ON SCHEMA search_position
@@ -228,10 +607,14 @@ migration_admin_psql=(
 ' >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -481,6 +864,9 @@ if [[ "$migration_mcp_acl" != t ]]; then
   printf '%s\n' "$migration_mcp_acl" >&2
   exit 1
 fi
+assert_control_schema_contract \
+  "existing-volume migration" \
+  "${migration_admin_psql[@]}"
 "${admin_psql[@]}" --command 'DROP DATABASE migration_probe' >/dev/null
 
 # An incompatible legacy monitor must abort the complete Ozon migration without
@@ -540,6 +926,7 @@ expect_failure_containing \
   --env POSITION_READER_DB_PASSWORD="$rollback_reader_password" \
   --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   "$container" \
   /docker-entrypoint-initdb.d/003_roles.sh
 "${admin_psql[@]}" \
@@ -2333,6 +2720,172 @@ expect_failure_containing \
   --command 'CREATE TEMP TABLE must_be_denied(id integer)'
 
 expect_failure_containing \
+  "control_writer TEMPORARY privilege" \
+  "permission denied to create temporary tables in database" \
+  "${control_writer_psql[@]}" \
+  --command 'CREATE TEMP TABLE must_be_denied(id integer)'
+
+control_runtime_contract="$({ "${control_writer_psql[@]}" --tuples-only --no-align \
+  --command "
+    SELECT
+      current_user = 'control_writer'
+      AND has_database_privilege(current_user, current_database(), 'CONNECT')
+      AND NOT has_database_privilege(current_user, current_database(), 'CREATE')
+      AND NOT has_database_privilege(current_user, current_database(), 'TEMP')
+      AND has_schema_privilege(current_user, 'control', 'USAGE')
+      AND NOT has_schema_privilege(current_user, 'control', 'CREATE')
+      AND has_table_privilege(
+          current_user, 'control.wb_policy_revisions', 'SELECT'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_policy_revisions', 'INSERT'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_policy_revisions', 'UPDATE'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_policy_revisions', 'DELETE'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_prepare_reservations', 'SELECT'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_prepare_reservations', 'INSERT'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_prepare_reservations', 'UPDATE'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_prepare_reservations', 'DELETE'
+      )
+      AND has_table_privilege(current_user, 'control.wb_plans', 'SELECT')
+      AND has_table_privilege(current_user, 'control.wb_plans', 'INSERT')
+      AND NOT has_table_privilege(current_user, 'control.wb_plans', 'UPDATE')
+      AND NOT has_table_privilege(current_user, 'control.wb_plans', 'DELETE')
+      AND has_column_privilege(current_user, 'control.wb_plans', 'status', 'UPDATE')
+      AND NOT has_column_privilege(
+          current_user, 'control.wb_plans', 'plan_digest', 'UPDATE'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_plan_approvals', 'SELECT'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_plan_approvals', 'INSERT'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_plan_approvals', 'UPDATE'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_plan_approvals', 'DELETE'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_runtime_gates', 'SELECT'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_runtime_gates', 'INSERT'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_runtime_gates', 'UPDATE'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_runtime_gates', 'DELETE'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_action_reservations', 'SELECT'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_action_reservations', 'INSERT'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_action_reservations', 'UPDATE'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_action_reservations', 'DELETE'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_audit_events', 'SELECT'
+      )
+      AND has_table_privilege(
+          current_user, 'control.wb_audit_events', 'INSERT'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_audit_events', 'UPDATE'
+      )
+      AND NOT has_table_privilege(
+          current_user, 'control.wb_audit_events', 'DELETE'
+      )
+      AND has_sequence_privilege(
+          current_user, 'control.wb_audit_events_id_seq', 'USAGE'
+      )
+      AND has_sequence_privilege(
+          current_user, 'control.wb_audit_events_id_seq', 'SELECT'
+      )
+      AND NOT has_sequence_privilege(
+          current_user, 'control.wb_audit_events_id_seq', 'UPDATE'
+      )
+      AND NOT has_schema_privilege(current_user, 'daily_reporting', 'USAGE')
+      AND NOT has_schema_privilege(current_user, 'search_position', 'USAGE')
+  "; } | tr -d '[:space:]')"
+if [[ "$control_runtime_contract" != t ]]; then
+  echo "control_writer runtime contract is not least-privilege" >&2
+  exit 1
+fi
+
+expect_failure_containing \
+  "control_writer policy-revision mutation" \
+  "permission denied for table wb_policy_revisions" \
+  "${control_writer_psql[@]}" \
+  --command "UPDATE control.wb_policy_revisions
+             SET registered_at = registered_at WHERE false"
+
+expect_failure_containing \
+  "control_writer prepare-reservation update" \
+  "permission denied for table wb_prepare_reservations" \
+  "${control_writer_psql[@]}" \
+  --command "UPDATE control.wb_prepare_reservations
+             SET reserved_at = reserved_at WHERE false"
+
+expect_failure_containing \
+  "control_writer prepare-reservation deletion" \
+  "permission denied for table wb_prepare_reservations" \
+  "${control_writer_psql[@]}" \
+  --command 'DELETE FROM control.wb_prepare_reservations WHERE false'
+
+expect_failure_containing \
+  "control_writer plan deletion" \
+  "permission denied for table wb_plans" \
+  "${control_writer_psql[@]}" \
+  --command 'DELETE FROM control.wb_plans WHERE false'
+
+expect_failure_containing \
+  "control_writer approval mutation" \
+  "permission denied for table wb_plan_approvals" \
+  "${control_writer_psql[@]}" \
+  --command "UPDATE control.wb_plan_approvals
+             SET reason = reason WHERE false"
+
+expect_failure_containing \
+  "control_writer runtime-gate mutation" \
+  "permission denied for table wb_runtime_gates" \
+  "${control_writer_psql[@]}" \
+  --command "UPDATE control.wb_runtime_gates
+             SET reason = reason WHERE false"
+
+expect_failure_containing \
+  "control_writer reservation mutation" \
+  "permission denied for table wb_action_reservations" \
+  "${control_writer_psql[@]}" \
+  --command "UPDATE control.wb_action_reservations
+             SET reserved_at = reserved_at WHERE false"
+
+expect_failure_containing \
+  "control_writer audit mutation" \
+  "permission denied for table wb_audit_events" \
+  "${control_writer_psql[@]}" \
+  --command "UPDATE control.wb_audit_events
+             SET event_type = event_type WHERE false"
+
+expect_failure_containing \
   "position_reader write access" \
   "permission denied for table monitors" \
   "${reader_psql[@]}" \
@@ -2343,12 +2896,13 @@ expect_failure_containing \
     VALUES ('denied', 'denied', 'denied', 'denied', 'denied')
   "
 
-for role in position_collector position_reader report_collector report_worker; do
+for role in position_collector position_reader report_collector report_worker control_writer; do
   case "$role" in
     position_collector) role_password="$collector_password" ;;
     position_reader) role_password="$reader_password" ;;
     report_worker) role_password="$report_worker_password" ;;
     report_collector) role_password="$report_collector_password" ;;
+    control_writer) role_password="$control_writer_password" ;;
   esac
   expect_failure_containing \
     "$role connection to the postgres database" \
@@ -2405,15 +2959,16 @@ expect_failure_containing \
 
 role_attributes="$("${admin_psql[@]}" --tuples-only --no-align --field-separator=: \
   --command "
-    SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, rolinherit,
+    SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit,
            rolreplication, rolbypassrls, rolconnlimit
     FROM pg_roles
     WHERE rolname IN (
-        'position_collector', 'position_reader', 'report_collector', 'report_worker'
+        'position_collector', 'position_reader', 'report_collector', 'report_worker',
+        'control_writer'
     )
     ORDER BY rolname
   ")"
-expected_attributes=$'position_collector:f:f:f:f:f:f:4\nposition_reader:f:f:f:f:f:f:16\nreport_collector:f:f:f:f:f:f:4\nreport_worker:f:f:f:f:f:f:4'
+expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4'
 if [[ "$role_attributes" != "$expected_attributes" ]]; then
   echo "restricted database role attributes differ from the expected policy" >&2
   printf '%s\n' "$role_attributes" >&2

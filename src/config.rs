@@ -166,6 +166,10 @@ pub struct OzonPerformanceAccount {
 #[serde(deny_unknown_fields)]
 pub struct WildberriesAccount {
     pub api_token_env: String,
+    /// Stable WB seller UUID (`sid` JWT claim). Optional for analytics legacy
+    /// bindings, but mandatory for any Control runtime.
+    #[serde(default)]
+    pub seller_sid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +210,15 @@ fn validate_env_name(value: &str, field: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn is_canonical_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value != "00000000-0000-0000-0000-000000000000"
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
 }
 
 fn validate_credential(value: &str, env_name: &str) -> Result<()> {
@@ -326,9 +339,18 @@ impl AccessRegistry {
 
     fn validate_accounts(&self, actor_ids: &BTreeSet<&str>) -> Result<()> {
         let mut store_ids = BTreeSet::new();
+        let mut wb_seller_sids = BTreeSet::new();
         let mut selectors = self.account_selectors()?;
         for account in &self.accounts {
             Self::validate_account(account, actor_ids, &mut store_ids, &mut selectors)?;
+            if let Some(seller_sid) = account
+                .wildberries
+                .as_ref()
+                .and_then(|wildberries| wildberries.seller_sid.as_deref())
+                && !wb_seller_sids.insert(seller_sid)
+            {
+                bail!("wildberries.seller_sid должен быть уникальным между account bindings");
+            }
         }
         Ok(())
     }
@@ -443,6 +465,11 @@ impl AccessRegistry {
             );
         }
         validate_env_name(&wildberries.api_token_env, "api_token_env")?;
+        if let Some(seller_sid) = &wildberries.seller_sid
+            && !is_canonical_uuid(seller_sid)
+        {
+            bail!("wildberries.seller_sid должен быть canonical UUID");
+        }
         Ok(())
     }
 
@@ -564,6 +591,7 @@ struct WbCredentialBinding {
     account_id: String,
     seller_client_id: String,
     api_token_env: String,
+    seller_sid: Option<String>,
 }
 
 impl WbCredentialBinding {
@@ -576,6 +604,7 @@ impl WbCredentialBinding {
                     account_id: account.id.clone(),
                     seller_client_id: account.seller_client_id.clone(),
                     api_token_env: wildberries.api_token_env.clone(),
+                    seller_sid: wildberries.seller_sid.clone(),
                 })
             })
             .collect()
@@ -1686,6 +1715,7 @@ mod tests {
             ozon: None,
             wildberries: Some(WildberriesAccount {
                 api_token_env: "WB_TOKEN".into(),
+                seller_sid: None,
             }),
         };
         let mut registry = sample_registry();
@@ -1719,6 +1749,13 @@ mod tests {
         blank_binding.accounts.push(invalid);
         assert!(blank_binding.validate().is_err());
 
+        let mut nil_sid = sample_registry();
+        let mut invalid = wb_account.clone();
+        invalid.wildberries.as_mut().unwrap().seller_sid =
+            Some("00000000-0000-0000-0000-000000000000".into());
+        nil_sid.accounts.push(invalid);
+        assert!(nil_sid.validate().is_err());
+
         let mut mixed = sample_registry();
         let mut invalid = wb_account;
         invalid.ozon = mixed.accounts[0].ozon.clone();
@@ -1742,6 +1779,79 @@ mod tests {
     }
 
     #[test]
+    fn wildberries_seller_sid_change_requires_restart() {
+        let mut registry = sample_registry();
+        registry.accounts.push(MarketplaceAccount {
+            id: "wb_shop".into(),
+            organization: "WB Shop".into(),
+            marketplace: Marketplace::Wildberries,
+            seller_client_id: "42".into(),
+            manager_id: "manager".into(),
+            ozon: None,
+            wildberries: Some(WildberriesAccount {
+                api_token_env: "WB_TOKEN".into(),
+                seller_sid: Some("11111111-1111-4111-8111-111111111111".into()),
+            }),
+        });
+        let path = write_registry(&registry);
+        let source = RegistrySource::new(&path).unwrap();
+
+        registry.accounts[1]
+            .wildberries
+            .as_mut()
+            .unwrap()
+            .seller_sid = Some("22222222-2222-4222-8222-222222222222".into());
+        std::fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+
+        let error = source.load().unwrap_err().to_string();
+        assert!(
+            error.starts_with("MCP_ACCESS_CONFIG_RESTART_REQUIRED:"),
+            "{error}"
+        );
+        assert!(error.contains("Wildberries credentials"), "{error}");
+    }
+
+    #[test]
+    fn duplicate_wildberries_seller_sid_fails_registry_hot_reload() {
+        let mut registry = sample_registry();
+        for (id, seller_sid) in [
+            ("wb_one", "11111111-1111-4111-8111-111111111111"),
+            ("wb_two", "22222222-2222-4222-8222-222222222222"),
+        ] {
+            registry.accounts.push(MarketplaceAccount {
+                id: id.into(),
+                organization: id.into(),
+                marketplace: Marketplace::Wildberries,
+                seller_client_id: id.into(),
+                manager_id: "manager".into(),
+                ozon: None,
+                wildberries: Some(WildberriesAccount {
+                    api_token_env: format!("{}_TOKEN", id.to_ascii_uppercase()),
+                    seller_sid: Some(seller_sid.into()),
+                }),
+            });
+        }
+        let path = write_registry(&registry);
+        let source = RegistrySource::new(&path).unwrap();
+
+        registry.accounts[2]
+            .wildberries
+            .as_mut()
+            .unwrap()
+            .seller_sid = registry.accounts[1]
+            .wildberries
+            .as_ref()
+            .unwrap()
+            .seller_sid
+            .clone();
+        std::fs::write(&path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
+
+        let error = source.load().unwrap_err().to_string();
+        assert!(error.contains("seller_sid"), "{error}");
+        assert!(error.contains("уникальным"), "{error}");
+    }
+
+    #[test]
     fn app_config_inserts_only_wildberries_accounts_with_non_empty_tokens() {
         let mut registry = sample_registry();
         for (id, token_env) in [
@@ -1757,6 +1867,7 @@ mod tests {
                 ozon: None,
                 wildberries: Some(WildberriesAccount {
                     api_token_env: token_env.into(),
+                    seller_sid: None,
                 }),
             });
         }
@@ -1833,6 +1944,7 @@ mod tests {
             ozon: None,
             wildberries: Some(WildberriesAccount {
                 api_token_env: "WB_TOKEN".into(),
+                seller_sid: None,
             }),
         });
         let path = write_registry(&registry);
@@ -2671,6 +2783,7 @@ mod tests {
             ozon: None,
             wildberries: Some(WildberriesAccount {
                 api_token_env: "WB_TOKEN".into(),
+                seller_sid: None,
             }),
         });
         wildberries.validate().unwrap();
@@ -2731,6 +2844,7 @@ mod tests {
             ozon: None,
             wildberries: Some(WildberriesAccount {
                 api_token_env: "WB_TOKEN".into(),
+                seller_sid: None,
             }),
         });
         let path = write_registry(&registry);

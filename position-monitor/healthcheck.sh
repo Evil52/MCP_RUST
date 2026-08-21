@@ -64,6 +64,195 @@ SELECT
     AND to_regclass('daily_reporting.mcp_stock_facts') IS NOT NULL
     AND to_regclass('daily_reporting.mcp_price_facts') IS NOT NULL
     AND to_regclass('daily_reporting.mcp_ready_reports') IS NOT NULL
+    AND to_regclass('control.wb_policy_revisions') IS NOT NULL
+    AND to_regclass('control.wb_prepare_reservations') IS NOT NULL
+    AND to_regclass('control.wb_plans') IS NOT NULL
+    AND to_regclass('control.wb_plan_approvals') IS NOT NULL
+    AND to_regclass('control.wb_runtime_gates') IS NOT NULL
+    AND to_regclass('control.wb_action_reservations') IS NOT NULL
+    AND to_regclass('control.wb_audit_events') IS NOT NULL
+    AND to_regprocedure(
+        'control.validate_wb_policy_revision_insert()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'control.validate_wb_prepare_reservation_insert()'
+    ) IS NOT NULL
+    AND to_regprocedure('control.validate_wb_plan_insert()') IS NOT NULL
+    AND to_regprocedure(
+        'control.validate_wb_runtime_gate_write()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'control.reject_wb_append_only_mutation()'
+    ) IS NOT NULL
+    AND to_regprocedure('control.validate_wb_approval_insert()') IS NOT NULL
+    AND to_regprocedure(
+        'control.validate_wb_reservation_insert()'
+    ) IS NOT NULL
+    AND to_regprocedure('control.enforce_wb_plan_transition()') IS NOT NULL
+    AND (
+        SELECT string_agg(relation.relname::text, ',' ORDER BY relation.relname)
+               = 'wb_action_reservations,wb_audit_events,wb_plan_approvals,' ||
+                 'wb_plans,wb_policy_revisions,wb_prepare_reservations,' ||
+                 'wb_runtime_gates'
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'control'
+          AND relation.relkind IN ('r', 'p')
+    )
+    AND (
+        SELECT string_agg(routine.proname::text, ',' ORDER BY routine.proname)
+               = 'enforce_wb_plan_transition,reject_wb_append_only_mutation,' ||
+                 'validate_wb_approval_insert,validate_wb_plan_insert,' ||
+                 'validate_wb_policy_revision_insert,' ||
+                 'validate_wb_prepare_reservation_insert,' ||
+                 'validate_wb_reservation_insert,validate_wb_runtime_gate_write'
+        FROM pg_proc AS routine
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = routine.pronamespace
+        WHERE namespace.nspname = 'control'
+          AND routine.prorettype = 'trigger'::regtype
+    )
+    AND (
+        SELECT count(*) = 12
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'control'
+          AND NOT trigger.tgisinternal
+    )
+    AND (
+        SELECT count(*) = 12
+        FROM pg_trigger AS trigger
+        JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'control'
+          AND NOT trigger.tgisinternal
+          AND trigger.tgenabled = 'O'
+          AND (
+              (
+                  relation.relname = 'wb_plans'
+                  AND trigger.tgname = 'wb_plans_transition_guard'
+                  AND trigger.tgtype = 19
+                  AND trigger.tgfoid =
+                      'control.enforce_wb_plan_transition()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_policy_revisions'
+                  AND trigger.tgname = 'wb_policy_revisions_validate'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_wb_policy_revision_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_policy_revisions'
+                  AND trigger.tgname = 'wb_policy_revisions_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_wb_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_prepare_reservations'
+                  AND trigger.tgname = 'wb_prepare_reservations_validate'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_wb_prepare_reservation_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_prepare_reservations'
+                  AND trigger.tgname = 'wb_prepare_reservations_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_wb_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_plans'
+                  AND trigger.tgname = 'wb_plans_validate_insert'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_wb_plan_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_runtime_gates'
+                  AND trigger.tgname = 'wb_runtime_gates_validate_write'
+                  AND trigger.tgtype = 23
+                  AND trigger.tgfoid =
+                      'control.validate_wb_runtime_gate_write()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_plan_approvals'
+                  AND trigger.tgname = 'wb_plan_approvals_validate'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_wb_approval_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_plan_approvals'
+                  AND trigger.tgname = 'wb_plan_approvals_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_wb_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_action_reservations'
+                  AND trigger.tgname = 'wb_action_reservations_validate'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_wb_reservation_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_action_reservations'
+                  AND trigger.tgname = 'wb_action_reservations_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_wb_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'wb_audit_events'
+                  AND trigger.tgname = 'wb_audit_events_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_wb_append_only_mutation()'::regprocedure
+              )
+          )
+    )
+    AND (
+        SELECT string_agg(
+                   relation.relname::text || ':' || constraint_row.conname ||
+                   ':' || constraint_row.contype::text,
+                   ',' ORDER BY relation.relname, constraint_row.conname
+               ) =
+               'wb_plan_approvals:wb_approval_ttl:c,' ||
+               'wb_plans:wb_plan_state_shape:c,' ||
+               'wb_plans:wb_plan_ttl:c,' ||
+               'wb_plans:wb_plans_prepare_reservation_id_fkey:f,' ||
+               'wb_plans:wb_plans_prepare_reservation_id_key:u,' ||
+               'wb_prepare_reservations:wb_prepare_reservation_ttl:c,' ||
+               'wb_prepare_reservations:wb_prepare_reservations_pkey:p,' ||
+               'wb_prepare_reservations:' ||
+               'wb_prepare_reservations_policy_revision_fkey:f,' ||
+               'wb_runtime_gates:wb_runtime_gate_lease_bound:c,' ||
+               'wb_runtime_gates:wb_runtime_gate_scope:c'
+        FROM pg_constraint AS constraint_row
+        JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'control'
+          AND constraint_row.conname IN (
+              'wb_approval_ttl',
+              'wb_plan_state_shape',
+              'wb_plan_ttl',
+              'wb_plans_prepare_reservation_id_fkey',
+              'wb_plans_prepare_reservation_id_key',
+              'wb_prepare_reservation_ttl',
+              'wb_prepare_reservations_pkey',
+              'wb_prepare_reservations_policy_revision_fkey',
+              'wb_runtime_gate_lease_bound',
+              'wb_runtime_gate_scope'
+          )
+    )
     AND (
         SELECT count(*) = 9
         FROM pg_class AS relation
@@ -736,6 +925,244 @@ SELECT
     )
     AND NOT has_function_privilege(
         'report_collector', 'daily_reporting.enforce_source_snapshot_state()', 'EXECUTE'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM pg_roles
+        WHERE rolname = 'control_writer'
+          AND rolcanlogin
+          AND NOT rolsuper
+          AND NOT rolcreatedb
+          AND NOT rolcreaterole
+          AND NOT rolinherit
+          AND NOT rolreplication
+          AND NOT rolbypassrls
+          AND rolconnlimit = 4
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_auth_members AS membership
+        WHERE membership.roleid = 'control_writer'::regrole
+           OR membership.member = 'control_writer'::regrole
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_namespace AS namespace
+        CROSS JOIN unnest(ARRAY[
+            'position_collector', 'position_reader', 'report_worker',
+            'report_collector', 'control_writer'
+        ]::name[]) AS application_role(role_name)
+        WHERE namespace.nspname <> 'information_schema'
+          AND namespace.nspname !~ '^pg_'
+          AND has_schema_privilege(
+              role_name, namespace.nspname, 'CREATE'
+          )
+    )
+    AND has_database_privilege('control_writer', current_database(), 'CONNECT')
+    AND NOT has_database_privilege('control_writer', current_database(), 'CREATE')
+    AND NOT has_database_privilege('control_writer', current_database(), 'TEMP')
+    AND (
+        SELECT count(*) = 5 AND bool_and(
+            has_database_privilege(role_name, current_database(), 'CONNECT')
+            AND NOT has_database_privilege(
+                role_name, current_database(), 'CREATE'
+            )
+            AND NOT has_database_privilege(
+                role_name, current_database(), 'TEMP'
+            )
+        )
+        FROM unnest(ARRAY[
+            'position_collector', 'position_reader', 'report_worker',
+            'report_collector', 'control_writer'
+        ]::name[]) AS application_role(role_name)
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_database AS database_row
+        CROSS JOIN unnest(ARRAY[
+            'position_collector', 'position_reader', 'report_worker',
+            'report_collector', 'control_writer'
+        ]::name[]) AS application_role(role_name)
+        WHERE database_row.datname <> current_database()
+          AND (
+              has_database_privilege(
+                  role_name, database_row.datname, 'CONNECT'
+              )
+              OR has_database_privilege(
+                  role_name, database_row.datname, 'TEMP'
+              )
+              OR has_database_privilege(
+                  role_name, database_row.datname, 'CREATE'
+              )
+          )
+    )
+    AND has_schema_privilege('control_writer', 'control', 'USAGE')
+    AND NOT has_schema_privilege('control_writer', 'control', 'CREATE')
+    AND NOT has_schema_privilege('control_writer', 'daily_reporting', 'USAGE')
+    AND NOT has_schema_privilege('control_writer', 'search_position', 'USAGE')
+    AND (
+        SELECT string_agg(
+                   relation.relname::text || ':' || acl.privilege_type,
+                   ',' ORDER BY relation.relname, acl.privilege_type
+               ) =
+               'wb_action_reservations:INSERT,wb_action_reservations:SELECT,' ||
+               'wb_audit_events:INSERT,wb_audit_events:SELECT,' ||
+               'wb_plan_approvals:INSERT,wb_plan_approvals:SELECT,' ||
+               'wb_plans:INSERT,wb_plans:SELECT,' ||
+               'wb_policy_revisions:INSERT,wb_policy_revisions:SELECT,' ||
+               'wb_prepare_reservations:INSERT,wb_prepare_reservations:SELECT,' ||
+               'wb_runtime_gates:SELECT'
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(relation.relacl, acldefault('r', relation.relowner))
+        ) AS acl
+        WHERE namespace.nspname = 'control'
+          AND relation.relkind IN ('r', 'p')
+          AND acl.grantee = 'control_writer'::regrole
+    )
+    AND (
+        SELECT string_agg(
+                   relation.relname::text || '.' || attribute.attname::text ||
+                   ':' || acl.privilege_type,
+                   ',' ORDER BY relation.relname, attribute.attname,
+                                acl.privilege_type
+               ) =
+               'wb_plans.apply_started_at:UPDATE,' ||
+               'wb_plans.finished_at:UPDATE,' ||
+               'wb_plans.last_error_class:UPDATE,' ||
+               'wb_plans.readback_json:UPDATE,' ||
+               'wb_plans.status:UPDATE,' ||
+               'wb_plans.write_response_json:UPDATE'
+        FROM pg_attribute AS attribute
+        JOIN pg_class AS relation ON relation.oid = attribute.attrelid
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+        WHERE namespace.nspname = 'control'
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+          AND acl.grantee = 'control_writer'::regrole
+    )
+    AND (
+        SELECT string_agg(acl.privilege_type, ',' ORDER BY acl.privilege_type)
+               = 'USAGE'
+        FROM pg_namespace AS namespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(namespace.nspacl, acldefault('n', namespace.nspowner))
+        ) AS acl
+        WHERE namespace.nspname = 'control'
+          AND acl.grantee = 'control_writer'::regrole
+    )
+    AND (
+        SELECT string_agg(acl.privilege_type, ',' ORDER BY acl.privilege_type)
+               = 'SELECT,USAGE'
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(relation.relacl, acldefault('S', relation.relowner))
+        ) AS acl
+        WHERE namespace.nspname = 'control'
+          AND relation.relkind = 'S'
+          AND relation.relname = 'wb_audit_events_id_seq'
+          AND acl.grantee = 'control_writer'::regrole
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM unnest(ARRAY[
+            'position_collector', 'position_reader',
+            'report_collector', 'report_worker'
+        ]::text[]) AS application_role(role_name)
+        WHERE has_schema_privilege(role_name::name, 'control', 'USAGE')
+           OR has_schema_privilege(role_name::name, 'control', 'CREATE')
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_namespace AS namespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(namespace.nspacl, acldefault('n', namespace.nspowner))
+        ) AS acl
+        WHERE namespace.nspname = 'control'
+          AND (
+              acl.grantee = 0
+              OR acl.grantee IN (
+                  SELECT oid
+                  FROM pg_roles
+                  WHERE rolname IN (
+                      'position_collector', 'position_reader',
+                      'report_collector', 'report_worker'
+                  )
+              )
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(
+                relation.relacl,
+                acldefault(
+                    (CASE WHEN relation.relkind = 'S' THEN 'S' ELSE 'r' END)::"char",
+                    relation.relowner
+                )
+            )
+        ) AS acl
+        WHERE namespace.nspname = 'control'
+          AND (
+              acl.grantee = 0
+              OR acl.grantee IN (
+                  SELECT oid
+                  FROM pg_roles
+                  WHERE rolname IN (
+                      'position_collector', 'position_reader',
+                      'report_collector', 'report_worker'
+                  )
+              )
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_proc AS routine
+        JOIN pg_namespace AS namespace
+          ON namespace.oid = routine.pronamespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(routine.proacl, acldefault('f', routine.proowner))
+        ) AS acl
+        WHERE namespace.nspname = 'control'
+          AND (
+              acl.grantee = 0
+              OR acl.grantee = 'control_writer'::regrole
+              OR acl.grantee IN (
+                  SELECT oid
+                  FROM pg_roles
+                  WHERE rolname IN (
+                      'position_collector', 'position_reader',
+                      'report_collector', 'report_worker'
+                  )
+              )
+          )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_default_acl AS defaults
+        CROSS JOIN LATERAL aclexplode(defaults.defaclacl) AS acl
+        WHERE defaults.defaclnamespace = 'control'::regnamespace
+          AND (
+              acl.grantee = 0
+              OR acl.grantee = 'control_writer'::regrole
+              OR acl.grantee IN (
+                  SELECT oid
+                  FROM pg_roles
+                  WHERE rolname IN (
+                      'position_collector', 'position_reader',
+                      'report_collector', 'report_worker'
+                  )
+              )
+          )
     )
     AND (
         SELECT rolconfig @> ARRAY['default_transaction_read_only=on']

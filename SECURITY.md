@@ -20,10 +20,12 @@ Production credentials must never be used in CI; tests use local mocks only.
 
 The following properties are treated as release gates:
 
-1. Marketplace egress is read-only. `OzonClient::post`, `PerformanceClient::request`, and
-   `WbClient::request` enforce exact allowlists before credentials are selected and before any
-   socket is opened. Chat input cannot supply a host, HTTP method, or path. Redirects and ambient
-   HTTP proxies are disabled.
+1. Analytics MCP marketplace egress is read-only. `OzonClient::post`,
+   `PerformanceClient::request`, and `WbClient::request` enforce exact allowlists before credentials
+   are selected and before any socket is opened. Chat input cannot supply a host, HTTP method, or
+   path. Redirects and ambient HTTP proxies are disabled. The separately inventoried Control MCP
+   has its own narrower write invariant below; its one reviewed PATCH must never be added to an
+   Analytics client or to the 75-tool Analytics registry.
 2. Production Ozon Seller egress uses 35 stable reporting/list/info paths, including the three
    finance-accrual reads promoted after canary validation. Posting lists use only
    `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list`; the superseded
@@ -73,11 +75,19 @@ The following properties are treated as release gates:
 8. Store clients, JWT/JWKS verification, OAuth wire behavior, session limits, schemas, request bodies,
    negative write-paths, retries, compression limits, and RBAC are covered by local mock tests. No
    live marketplace request is part of CI.
-9. The separate `mcp-ozon-control` scaffold is disabled and credentialless. It loads only
-   `CONTROL_MCP_*`, has no marketplace client or endpoint, exposes only local read-only status/scope,
-   and runs on an internal Docker network without Internet egress. No analytics admin receives an
-   implicit Control scope. Adding a key, egress, plan/apply tool, or marketplace write path requires
-   a separate threat-model and release-gate review.
+9. The separate `mcp-ozon-control` process remains disabled and credentialless in base Compose. Its
+   separate seven-tool registry contains status, scope, prepare, approve, apply, plan status and
+   reconcile; only `wb_promotion_apply_bid_plan` can issue a marketplace mutation, fixed to one
+   attempt of `PATCH /api/advert/v1/bids` on `advert-api.wildberries.ru`. Live wiring requires JWT scope
+   `mcp:ads-control`, an explicit positive policy revision and actor/target/approver allowlist,
+   separate dedicated Promotion-only read-only and read/write token files, restricted
+   `control_writer` persistence and every runtime gate. A plan author cannot approve the same plan;
+   approval is an append-only artifact bound to the immutable plan digest.
+   No Analytics admin receives implicit Control scope. Control has no direct outbound network:
+   marketplace reads/writes cross a credentialless CONNECT proxy limited to the one WB host, while
+   the direct `.no_proxy()` JWKS client reaches only an internal exact-path TLS-verifying auth proxy.
+   Only those two credentialless proxies attach to the outbound bridge. Any additional credential,
+   host, method, path or write tool requires a new threat-model and release-gate review.
 
 ## Resource and availability controls
 
@@ -107,6 +117,26 @@ The following properties are treated as release gates:
   the token or decoded payload. This local decode selects the capability/quota policy and does not
   claim to verify the JWT signature; WB verifies authenticity on each request. Service/Base flows
   remain unsupported because they require an explicit `X-Client-Secret` and matching `asid` design.
+- WB Control: one plan contains at most 50 unique `nm_id + placement` changes, has a five-minute
+  lifetime, carries the exact policy revision/digest, and can be claimed once only after a distinct
+  authorized actor persists approval of that digest. The database consumes a preparation
+  reservation before any WB preflight. Both dedicated Control tokens must carry the same canonical seller `sid`, and
+  that UUID must exactly match the reviewed WB account binding in the access registry; a valid
+  token for another cabinet fails startup. The immutable before/read-back snapshot also binds that
+  SID, preventing cross-cabinet reconciliation. A replacement cabinet must receive a new reviewed
+  `account_id`; an unresolved old-SID incident remains locked forensic evidence.
+  The database consumes a write reservation before
+  egress and enforces per-target hourly/daily action ceilings, cooldown and daily cumulative absolute
+  bid-delta. Active short-lived global, account and campaign leases form a fail-closed operator kill
+  switch for writes that have not completed final revalidation; the application role cannot enable
+  them. Revocation cannot cancel an already authorized in-flight HTTP dispatch, so operators must
+  wait one bounded request timeout plus the pacing interval before declaring the executor quiescent.
+  The current campaign is read again before the
+  single PATCH; changed preconditions reject locally. The writer never retries. Timeout, network
+  loss, any HTTP error after send, oversized or malformed success responses are ambiguous and
+  require read-only reconciliation. These controls bound mutation count and bid delta, not marketplace spend or
+  business profitability; autonomous proposal generation must not bypass the independent approver
+  identity or operator leases.
 - MCP HTTP: at most 32 non-GET requests parse and execute inside the MCP service at once; the 33rd
   fails fast with HTTP 503 while `/health` remains available. That ingress permit is released as
   soon as the handler constructs a response. Result-bearing POST responses have a separate hard
@@ -175,6 +205,13 @@ OIDC `sub` bindings, network ACLs, and credential rotation. Prefer vendor-side l
 tokens where the marketplace supports them; the Rust allowlist remains mandatory even when a token
 has broader vendor permissions.
 
+The same JWT validation rules apply to live Control, but with the exact independent
+`mcp:ads-control` scope and audience. Because the shared authenticator intentionally ignores ambient
+proxy variables, live Control sets its JWKS URL to the internal `control-auth-egress` endpoint. The
+auth proxy accepts only one operator-reviewed DNS host and path, verifies upstream TLS/SNI against
+the system CA bundle, forwards no caller headers or body, and does not follow redirects. Public JWKS
+bytes traverse only the dedicated internal proxy network; Control itself has no outbound route.
+
 ## Known residual risks
 
 - The standard Compose file imports `.env` into the container. Keep a dedicated runtime `.env`
@@ -192,13 +229,30 @@ has broader vendor permissions.
 - Vendor API semantics and quotas can change. Endpoint allowlist additions and preview promotion must
   be reviewed against current official documentation and merged through protected CI; never enable a
   generic proxy or dynamic marketplace path.
+- WB Control's persisted two-person approval assumes the OIDC principals and their authenticators
+  remain operationally separate and identify one human each. A shared actor such as the current
+  `wb6` Natalia/Veronika binding is acceptable only for plan-only rehearsal, not live execution.
+  A client or autonomous worker must not hold both the plan actor and approver credentials.
+  Compromise of both identities, or of the database-operator identity that controls runtime leases,
+  remains outside the application boundary and requires independent IAM, audit and incident-response
+  controls.
 
 ## Release checklist
 
 - Run `./scripts/local-ci.sh`, require 100% line coverage, Clippy/rustdoc warnings as errors,
   RustSec/cargo-deny, CodeQL, dependency review, secret scanning, and the hardened-container job.
-- Verify the production tool list contains exactly 75 stable tools, no preview tools, and every
-  tool advertises `readOnlyHint=true`, `destructiveHint=false`, and the expected OAuth/noauth policy.
+- Verify the Analytics MCP production tool list contains exactly 75 stable tools, no preview tools,
+  and every tool advertises `readOnlyHint=true`, `destructiveHint=false`, and the expected
+  OAuth/noauth policy. This count never includes Control MCP tools.
+- Verify the separate Control MCP registry contains exactly seven tools:
+  `ozon_ads_control_status`, `ozon_ads_control_scope`, `wb_promotion_prepare_bid_update`,
+  `wb_promotion_approve_bid_plan`, `wb_promotion_apply_bid_plan`,
+  `wb_promotion_bid_plan_status`, and `wb_promotion_reconcile_bid_plan`. Status, scope and plan status
+  must be read-only; prepare and reconcile must be non-read-only but non-destructive; approval must
+  be non-read-only, destructive, idempotent and closed-world because it grants execution authority;
+  apply must be non-read-only, destructive and idempotent in the sense that a plan can be claimed
+  only once. The combined implementation inventory is 82, but no release check may treat it as one
+  security boundary.
 - Verify `ofk_collection_status`, `ofk_data_completeness`, `ofk_metrics_history`,
   `ofk_manager_actions`, and `ofk_reports` are internal read-only reporting tools with
   `openWorldHint=false`. They must read only curated PostgreSQL views through the restricted
@@ -216,14 +270,41 @@ has broader vendor permissions.
   `/api/client/campaign/all_sku_promo/activate`,
   `/api/client/campaign/all_sku_promo/deactivate`, and
   `/api/client/campaign/all_sku_promo/set_bid` fail locally without credentials or network access.
-- Verify the WB Search namespace contains exactly `wb_search_product_queries` and
+- Verify the Analytics WB Search namespace contains exactly `wb_search_product_queries` and
   `wb_search_orders_positions`. Verify the WB Promotion namespace contains exactly
   `wb_promotion_campaigns`, `wb_promotion_campaign_details`, `wb_promotion_stats`,
   `wb_promotion_minimum_bids`, `wb_promotion_recommended_bids`, and
   `wb_promotion_search_cluster_bids`. Assert that campaign start, pause, stop, delete, budget
   deposit, `PATCH /api/advert/v1/bids`, `POST`/`DELETE /adv/v0/normquery/bids`, minus-phrase
-  changes, SKU-promo activation and deactivation fail locally without credentials or network
-  access, including the mutating operations that use HTTP `GET`.
+  changes, SKU-promo activation and deactivation fail locally in the Analytics client without
+  credentials or network access, including the mutating operations that use HTTP `GET`. The one
+  Control writer PATCH remains confined to the separate process and release inventory.
+- Before any WB Control rollout, require the base plus `compose.control-wb-plan.yaml` to render with
+  writes fixed off, only the read token mounted, no write-token environment/path/mount, and no
+  `outbound` attachment on the Control service. The separate executor composition must add
+  `compose.control-wb-live.yaml` only as a third layer; only that layer may require and mount the
+  write token, and its write-enable interpolation must default to `false` until an operator explicitly
+  opts in. Both compositions may attach Control only to `position-internal`, `control_isolated` and
+  the two dedicated internal proxy networks. Verify `control-write-egress` permits only CONNECT to
+  `advert-api.wildberries.ru:443`, and `control-auth-egress` exposes only internal `/health` and
+  `/jwks`, validates a separately supplied DNS host/path, verifies upstream TLS/SNI, forwards no
+  caller credentials, and rejects every other local path. Only the credentialless proxy services may
+  attach to `outbound`; neither may publish a host port or mount secrets.
+- Run exactly one live Control executor per dedicated WB write token. The current 250 ms token pacer
+  is process-local; do not scale the executor, deploy active/active replicas, or reuse the token in
+  another worker. Require a database-backed token-wide pacer before any HA/autonomous multi-replica
+  rollout.
+- Verify the Control policy has schema `version: 1`, a positive operator-controlled `revision`, exact
+  actor/account/canonical seller `sid`/campaign/product/placement bindings, distinct explicit
+  `approver_actor_ids`, reviewed bid limits and bounded action limits. Increment the revision for
+  every effective policy change and bind both revision and exact policy digest into new plans. A
+  registry cabinet rebind must fail until the target `seller_sid` and revision are updated, thereby
+  invalidating old plans. Require persisted digest-bound approval,
+  database denial of self-approval, consumed-attempt quota reservation, and active bounded global,
+  account and campaign leases before `approved -> applying`. Require JWT mode, exact audience and
+  `mcp:ads-control` scope, separate exact-purpose Promotion read/write token files, the restricted
+  `control_writer` role and a successful plan-store runtime-contract check. Base Compose must remain
+  disabled, credentialless and internal-only.
 - Confirm the runtime registry and `.env` are ignored regular files with mode `600`; never copy their
   contents into logs, screenshots, CI artifacts, or Git.
 - Generate a scheduled-report credential directory only with the policy-scoped
@@ -244,7 +325,7 @@ has broader vendor permissions.
 - Validate routing, report scope and the immutable artifact before OAuth. Perform at most one token
   refresh and one Gmail send per claimed attempt. Only failures that occur before send, plus an
   explicit Gmail rate limit, may be scheduled for a later bounded attempt. A timeout, transport
-  failure, 5xx response, redirect or malformed receipt after send begins has an ambiguous outcome:
+  failure, any HTTP error, redirect or malformed receipt after send begins has an ambiguous outcome:
   keep the outbox row `sending`, never resend it automatically, and require operator reconciliation.
   A database failure while recording any post-claim outcome follows the same rule: leave the claim
   `sending` and never reinterpret it as a retryable pre-send failure.

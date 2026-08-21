@@ -1,0 +1,49 @@
+pid /tmp/nginx.pid;
+error_log /dev/stderr notice;
+
+events {
+    worker_connections 64;
+}
+
+http {
+    access_log off;
+    server_tokens off;
+    client_body_temp_path /tmp/nginx-client;
+    proxy_temp_path /tmp/nginx-proxy;
+
+    server {
+        listen 8080;
+
+        location = /health {
+            return 204;
+        }
+
+        location = /jwks {
+            limit_except GET { deny all; }
+            if ($args != "") { return 404; }
+
+            proxy_pass https://${CONTROL_AUTH_JWKS_HOST}${CONTROL_AUTH_JWKS_PATH};
+            proxy_pass_request_body off;
+            proxy_pass_request_headers off;
+            proxy_set_header Host ${CONTROL_AUTH_JWKS_HOST};
+            proxy_set_header Accept application/json;
+            proxy_set_header User-Agent mcp-ozon-control-auth-egress/1;
+            proxy_set_header Content-Length "";
+            proxy_ssl_server_name on;
+            proxy_ssl_name ${CONTROL_AUTH_JWKS_HOST};
+            proxy_ssl_verify on;
+            proxy_ssl_verify_depth 3;
+            proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+            proxy_ssl_protocols TLSv1.2 TLSv1.3;
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 5s;
+            proxy_read_timeout 10s;
+            proxy_redirect off;
+            proxy_buffering off;
+        }
+
+        location / {
+            return 404;
+        }
+    }
+}

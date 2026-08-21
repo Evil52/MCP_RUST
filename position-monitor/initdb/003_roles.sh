@@ -6,6 +6,7 @@ set -eu
 : "${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}"
 : "${REPORT_WORKER_DB_PASSWORD:?REPORT_WORKER_DB_PASSWORD is required}"
 : "${REPORT_COLLECTOR_DB_PASSWORD:?REPORT_COLLECTOR_DB_PASSWORD is required}"
+: "${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}"
 
 validate_password() {
   label=$1
@@ -27,11 +28,13 @@ validate_password POSITION_COLLECTOR_DB_PASSWORD "$POSITION_COLLECTOR_DB_PASSWOR
 validate_password POSITION_READER_DB_PASSWORD "$POSITION_READER_DB_PASSWORD"
 validate_password REPORT_WORKER_DB_PASSWORD "$REPORT_WORKER_DB_PASSWORD"
 validate_password REPORT_COLLECTOR_DB_PASSWORD "$REPORT_COLLECTOR_DB_PASSWORD"
+validate_password CONTROL_WRITER_DB_PASSWORD "$CONTROL_WRITER_DB_PASSWORD"
 
 if [ "$POSTGRES_USER" = position_collector ] ||
    [ "$POSTGRES_USER" = position_reader ] ||
    [ "$POSTGRES_USER" = report_worker ] ||
-   [ "$POSTGRES_USER" = report_collector ]; then
+   [ "$POSTGRES_USER" = report_collector ] ||
+   [ "$POSTGRES_USER" = control_writer ]; then
   echo "POSTGRES_USER must not reuse a restricted application role" >&2
   exit 1
 fi
@@ -40,14 +43,19 @@ if [ "$POSITION_COLLECTOR_DB_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
    [ "$POSITION_COLLECTOR_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
    [ "$POSITION_READER_DB_PASSWORD" = "$REPORT_WORKER_DB_PASSWORD" ] ||
    [ "$POSITION_READER_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
-   [ "$REPORT_WORKER_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ]; then
+   [ "$REPORT_WORKER_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$CONTROL_WRITER_DB_PASSWORD" = "$POSITION_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$CONTROL_WRITER_DB_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
+   [ "$CONTROL_WRITER_DB_PASSWORD" = "$REPORT_WORKER_DB_PASSWORD" ] ||
+   [ "$CONTROL_WRITER_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ]; then
   echo "all application database passwords must be different" >&2
   exit 1
 fi
 if [ "$POSTGRES_PASSWORD" = "$POSITION_COLLECTOR_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$REPORT_WORKER_DB_PASSWORD" ] ||
-   [ "$POSTGRES_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ]; then
+   [ "$POSTGRES_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$POSTGRES_PASSWORD" = "$CONTROL_WRITER_DB_PASSWORD" ]; then
   echo "application database passwords must differ from the admin password" >&2
   exit 1
 fi
@@ -61,6 +69,7 @@ PGPASSWORD="$POSTGRES_PASSWORD" psql --set=ON_ERROR_STOP=1 \
 \getenv reader_password POSITION_READER_DB_PASSWORD
 \getenv report_worker_password REPORT_WORKER_DB_PASSWORD
 \getenv report_collector_password REPORT_COLLECTOR_DB_PASSWORD
+\getenv control_writer_password CONTROL_WRITER_DB_PASSWORD
 
 BEGIN;
 
@@ -80,6 +89,10 @@ SELECT format('CREATE ROLE report_collector LOGIN PASSWORD %L', :'report_collect
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'report_collector')
 \gexec
 
+SELECT format('CREATE ROLE control_writer LOGIN PASSWORD %L', :'control_writer_password')
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'control_writer')
+\gexec
+
 ALTER ROLE position_collector WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'collector_password';
 ALTER ROLE position_reader WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
@@ -88,6 +101,22 @@ ALTER ROLE report_worker WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'report_worker_password';
 ALTER ROLE report_collector WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'report_collector_password';
+ALTER ROLE control_writer WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+    NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'control_writer_password';
+
+-- Membership is an independent cluster-wide privilege path: NOINHERIT still
+-- permits SET ROLE. Converge both directions so control_writer neither gains
+-- another role nor becomes a grantable privilege bundle for another role.
+SELECT format(
+    'REVOKE %I FROM %I', granted_role.rolname, member_role.rolname
+)
+FROM pg_auth_members AS membership
+JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
+JOIN pg_roles AS member_role ON member_role.oid = membership.member
+WHERE granted_role.rolname = 'control_writer'
+   OR member_role.rolname = 'control_writer'
+ORDER BY granted_role.rolname, member_role.rolname
+\gexec
 
 ALTER ROLE position_collector SET statement_timeout = '60s';
 ALTER ROLE position_collector SET idle_in_transaction_session_timeout = '30s';
@@ -98,25 +127,70 @@ ALTER ROLE report_worker SET statement_timeout = '60s';
 ALTER ROLE report_worker SET idle_in_transaction_session_timeout = '30s';
 ALTER ROLE report_collector SET statement_timeout = '60s';
 ALTER ROLE report_collector SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE control_writer SET statement_timeout = '30s';
+ALTER ROLE control_writer SET idle_in_transaction_session_timeout = '15s';
 
--- Application roles are cluster-wide. Revoke the default PUBLIC ingress and
--- TEMP privilege from every connectable database before explicitly allowing
--- only this application's database below.
-SELECT format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', datname)
+-- Application roles are cluster-wide. Revoke PUBLIC and stale direct ingress
+-- from every database before allowing only this application's database below.
+SELECT format(
+    'REVOKE CREATE, CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', datname
+)
 FROM pg_database
-WHERE datallowconn
+\gexec
+
+SELECT format(
+    'REVOKE CREATE, CONNECT, TEMPORARY ON DATABASE %I FROM %I',
+    database_row.datname, application_role.rolname
+)
+FROM pg_database AS database_row
+CROSS JOIN (
+    VALUES
+      ('position_collector'),
+      ('position_reader'),
+      ('report_worker'),
+      ('report_collector'),
+      ('control_writer')
+) AS application_role(rolname)
+ORDER BY database_row.datname, application_role.rolname
+\gexec
+
+SELECT format(
+    'REVOKE CREATE ON SCHEMA %I FROM PUBLIC', namespace_row.nspname
+)
+FROM pg_namespace AS namespace_row
+WHERE namespace_row.nspname <> 'information_schema'
+  AND namespace_row.nspname !~ '^pg_'
+ORDER BY namespace_row.nspname
+\gexec
+
+SELECT format(
+    'REVOKE CREATE ON SCHEMA %I FROM %I',
+    namespace_row.nspname, application_role.rolname
+)
+FROM pg_namespace AS namespace_row
+CROSS JOIN (
+    VALUES
+      ('position_collector'),
+      ('position_reader'),
+      ('report_worker'),
+      ('report_collector'),
+      ('control_writer')
+) AS application_role(rolname)
+WHERE namespace_row.nspname <> 'information_schema'
+  AND namespace_row.nspname !~ '^pg_'
+ORDER BY namespace_row.nspname, application_role.rolname
 \gexec
 
 GRANT CONNECT ON DATABASE :"db_name" TO position_collector, position_reader, report_worker,
-    report_collector;
+    report_collector, control_writer;
 GRANT USAGE ON SCHEMA search_position TO position_collector, position_reader;
 
 -- Make re-running this role bootstrap converge to the exact ACL instead of
 -- retaining stale grants from an older schema revision.
 REVOKE ALL ON ALL TABLES IN SCHEMA search_position
-    FROM position_collector, position_reader, report_worker, report_collector;
+    FROM position_collector, position_reader, report_worker, report_collector, control_writer;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA search_position
-    FROM position_collector, position_reader, report_worker, report_collector;
+    FROM position_collector, position_reader, report_worker, report_collector, control_writer;
 
 GRANT SELECT ON search_position.monitors TO position_collector;
 GRANT SELECT, INSERT ON search_position.collection_runs TO position_collector;
