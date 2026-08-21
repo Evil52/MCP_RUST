@@ -7,7 +7,7 @@
 
 use std::{future::Future, pin::Pin};
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -129,8 +129,7 @@ fn report_business_dates(
     if period_end <= period_start {
         return Err(OzonReportSourceError::InvalidSnapshotInput);
     }
-    let offset =
-        FixedOffset::east_opt(5 * 60 * 60).expect("the fixed Yekaterinburg UTC offset is valid");
+    let offset = super::yekaterinburg_offset();
     // `period_end > period_start` proves that `period_end` is not the minimum
     // representable instant, so moving the exclusive bound back by 1 ns is safe.
     let inclusive_end = period_end - Duration::nanoseconds(1);
@@ -1173,7 +1172,7 @@ mod tests {
             Ok(json!({"items":[],"cursor":""})),
         ])));
         let cutoff_at = Utc::now();
-        let offset = FixedOffset::east_opt(5 * 60 * 60).unwrap();
+        let offset = crate::reporting::yekaterinburg_offset();
         let local_midnight = cutoff_at
             .with_timezone(&offset)
             .date_naive()

@@ -16,7 +16,7 @@ use std::{
 };
 
 use anyhow::{Result as AnyResult, anyhow};
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveTime, SecondsFormat, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use schemars::JsonSchema;
 use serde::Serialize;
 use tokio_postgres::{Client, Config, Row, config::Host, types::FromSql};
@@ -45,7 +45,6 @@ const MAX_HISTORY_POINTS: u16 = 100;
 const MAX_READY_REPORTS: u16 = 100;
 const MAX_HISTORY_DAYS: i64 = 366;
 const MAX_FACT_ROWS: usize = 25_000;
-const YEKATERINBURG_OFFSET_SECONDS: i32 = 5 * 60 * 60;
 const UTC_03_00: NaiveTime = NaiveTime::from_hms_opt(3, 0, 0).unwrap();
 const UTC_09_00: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
 const UTC_12_00: NaiveTime = NaiveTime::from_hms_opt(12, 0, 0).unwrap();
@@ -722,8 +721,7 @@ fn history_range(
     requested_from: Option<NaiveDate>,
     requested_to: Option<NaiveDate>,
 ) -> Result<HistoryRange, ReportingReadError> {
-    let offset = FixedOffset::east_opt(YEKATERINBURG_OFFSET_SECONDS)
-        .ok_or(ReportingReadError::InvalidRequest)?;
+    let offset = super::yekaterinburg_offset();
     let today = Utc::now().with_timezone(&offset).date_naive();
     let to = requested_to.unwrap_or(today);
     let from = requested_from.unwrap_or_else(|| to - Duration::days(29));
@@ -1895,7 +1893,7 @@ fn valid_warehouse_id(value: &str) -> bool {
 }
 
 fn timestamp_string(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Micros, true)
+    super::business_timestamp(value)
 }
 
 impl ReportingReadRepository for PostgresReportingRepository {
@@ -2808,7 +2806,7 @@ mod tests {
         );
         assert_eq!(
             timestamp_string(Utc.with_ymd_and_hms(2026, 8, 20, 3, 0, 0).unwrap()),
-            "2026-08-20T03:00:00.000000Z"
+            "2026-08-20T08:00:00.000000+05:00"
         );
     }
 

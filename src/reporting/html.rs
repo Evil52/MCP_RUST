@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, fmt::Write};
 use chrono::{DateTime, Utc};
 
 use super::{
+    BUSINESS_TIMEZONE, business_timestamp,
     kpi::{BasisPoints, KpiSummary},
     rules::{PriorityProblem, ProblemKind, Severity},
     snapshot::SnapshotQuality,
@@ -43,10 +44,11 @@ pub fn render_html(report: HtmlReport<'_>) -> Result<String, HtmlReportError> {
     .expect("writing to String cannot fail");
     write!(
         html,
-        "<p class=\"meta\">Период: {} — {} UTC<br>Сформирован: {} UTC<br>Кабинеты: {}</p>",
-        report.interval_start.format("%Y-%m-%d %H:%M"),
-        report.interval_end.format("%Y-%m-%d %H:%M"),
-        report.generated_at.format("%Y-%m-%d %H:%M"),
+        "<p class=\"meta\">Период: {} — {}<br>Сформирован: {}<br>Часовой пояс: {} (UTC+5)<br>Кабинеты: {}</p>",
+        business_timestamp(report.interval_start),
+        business_timestamp(report.interval_end),
+        business_timestamp(report.generated_at),
+        BUSINESS_TIMEZONE,
         report
             .account_ids
             .iter()

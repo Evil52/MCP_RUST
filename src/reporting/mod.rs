@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, SecondsFormat, TimeZone, Utc};
 use thiserror::Error;
 
 pub mod artifact_store;
@@ -46,6 +46,7 @@ pub mod wb_adapter;
 pub mod wb_source;
 pub mod xlsx;
 
+pub const BUSINESS_TIMEZONE: &str = "Asia/Yekaterinburg";
 const YEKATERINBURG_OFFSET_SECONDS: i32 = 5 * 60 * 60;
 const MORNING_HOUR: u32 = 8;
 const MORNING_DEADLINE_HOUR: u32 = 14;
@@ -191,9 +192,16 @@ fn report_time(date: NaiveDate, hour: u32) -> Result<DateTime<FixedOffset>, Repo
         .ok_or(ReportScheduleError::OutOfRange)
 }
 
-fn yekaterinburg_offset() -> FixedOffset {
+pub(crate) fn yekaterinburg_offset() -> FixedOffset {
     FixedOffset::east_opt(YEKATERINBURG_OFFSET_SECONDS)
         .expect("the fixed Yekaterinburg UTC offset is valid")
+}
+
+/// Formats a stored UTC instant for business-facing reports and MCP results.
+pub(crate) fn business_timestamp(value: DateTime<Utc>) -> String {
+    value
+        .with_timezone(&yekaterinburg_offset())
+        .to_rfc3339_opts(SecondsFormat::Micros, false)
 }
 
 /// Deadline after which a scheduled report must not be sent automatically.
@@ -252,8 +260,8 @@ mod tests {
     use chrono::{NaiveDate, TimeZone, Utc};
 
     use super::{
-        ReportKey, ReportKind, ReportScheduleError, delivery_deadline, due_deliveries,
-        report_cutoff, reporting_interval,
+        BUSINESS_TIMEZONE, ReportKey, ReportKind, ReportScheduleError, business_date,
+        business_timestamp, delivery_deadline, due_deliveries, report_cutoff, reporting_interval,
     };
 
     fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> chrono::DateTime<Utc> {
@@ -313,6 +321,19 @@ mod tests {
         assert_eq!(
             report_cutoff(&key(ReportKind::Evening)).unwrap(),
             utc(2026, 8, 16, 12, 0)
+        );
+    }
+
+    #[test]
+    fn business_facing_timestamps_are_always_yekaterinburg_utc_plus_five() {
+        assert_eq!(BUSINESS_TIMEZONE, "Asia/Yekaterinburg");
+        assert_eq!(
+            business_timestamp(utc(2026, 8, 16, 3, 0)),
+            "2026-08-16T08:00:00.000000+05:00"
+        );
+        assert_eq!(
+            business_date(utc(2026, 8, 15, 19, 0)),
+            key(ReportKind::Morning).local_date
         );
     }
 

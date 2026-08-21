@@ -261,20 +261,16 @@ fn write_summary(
     let metadata = [
         ("Менеджер", report.summary.manager_name.to_owned()),
         (
-            "Период UTC",
+            "Период Asia/Yekaterinburg (UTC+5)",
             format!(
                 "{} — {}",
-                report.summary.interval_start.format("%Y-%m-%d %H:%M"),
-                report.summary.interval_end.format("%Y-%m-%d %H:%M")
+                super::business_timestamp(report.summary.interval_start),
+                super::business_timestamp(report.summary.interval_end)
             ),
         ),
         (
-            "Сформирован UTC",
-            report
-                .summary
-                .generated_at
-                .format("%Y-%m-%d %H:%M")
-                .to_string(),
+            "Сформирован Asia/Yekaterinburg (UTC+5)",
+            super::business_timestamp(report.summary.generated_at),
         ),
         (
             "Качество данных",
@@ -421,7 +417,13 @@ fn write_inventory(
         sheet,
         formats,
         header_row,
-        &["Кабинет", "SKU", "Доступный остаток", "Цена", "Срез UTC"],
+        &[
+            "Кабинет",
+            "SKU",
+            "Доступный остаток",
+            "Цена",
+            "Срез Asia/Yekaterinburg (UTC+5)",
+        ],
     )?;
     for (index, item) in rows.iter().enumerate() {
         let row = header_row
@@ -432,11 +434,7 @@ fn write_inventory(
         write_u64(sheet, row, 2, item.sellable_stock)?;
         write_optional_minor(sheet, row, 3, item.price_minor, formats)?;
         sheet
-            .write_string(
-                row,
-                4,
-                item.observed_at.format("%Y-%m-%d %H:%M").to_string(),
-            )
+            .write_string(row, 4, super::business_timestamp(item.observed_at))
             .map_err(map_xlsx)?;
     }
     finish_table(sheet, &[20, 20, 20, 16, 20])
@@ -494,7 +492,13 @@ fn write_quality(
         sheet,
         formats,
         header_row,
-        &["Кабинет", "Источник", "Качество", "Срез UTC", "Строк"],
+        &[
+            "Кабинет",
+            "Источник",
+            "Качество",
+            "Срез Asia/Yekaterinburg (UTC+5)",
+            "Строк",
+        ],
     )?;
     for (index, item) in rows.iter().enumerate() {
         let row = header_row
@@ -508,11 +512,7 @@ fn write_quality(
             .write_string(row, 2, quality_text(item.quality))
             .map_err(map_xlsx)?;
         sheet
-            .write_string(
-                row,
-                3,
-                item.source_as_of.format("%Y-%m-%d %H:%M").to_string(),
-            )
+            .write_string(row, 3, super::business_timestamp(item.source_as_of))
             .map_err(map_xlsx)?;
         write_u64(sheet, row, 4, u64::from(item.row_count))?;
     }

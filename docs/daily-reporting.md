@@ -9,6 +9,9 @@ The first disabled-only phase provides:
 
 - immutable morning and evening identities at 08:00 and 17:00
   `Asia/Yekaterinburg`;
+- UTC storage and marketplace transport timestamps, with every manager-facing
+  HTML, XLSX, email, Dashboard and reporting-MCP timestamp rendered as
+  `Asia/Yekaterinburg` (`UTC+05:00`);
 - deterministic D-1 and preliminary same-day reporting intervals;
 - catch-up after process downtime without duplicate report identities;
 - separate delayed morning and evening deliveries after 17:00 when both were
