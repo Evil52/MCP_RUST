@@ -1,0 +1,8 @@
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+RUN apk add --no-cache socat \
+    && addgroup -S -g 10001 mcp \
+    && adduser -S -D -H -u 10001 -G mcp mcp
+
+USER mcp
+ENTRYPOINT ["socat", "TCP-LISTEN:8790,bind=0.0.0.0,reuseaddr,fork", "TCP:control:8790,connect-timeout=3"]

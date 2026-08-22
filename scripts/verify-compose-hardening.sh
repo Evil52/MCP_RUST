@@ -998,8 +998,9 @@ verify_ozon_egress() {
 # shellcheck disable=SC2016
 verify_control() {
   local rendered="$1"
-  local service
+  local service ingress
   service="$(jq -c '.services.control' <<<"$rendered")"
+  ingress="$(jq -c '.services["control-ingress"]' <<<"$rendered")"
 
   check "control: service exists" "$service" 'type == "object"'
   check "control: no env_file, secrets, or configs are attached" "$service" \
@@ -1050,24 +1051,54 @@ verify_control() {
        or .bind == {}
        or .bind == {"create_host_path": false})'
 
-  check "control: published port is exactly 127.0.0.1:8790" "$service" \
-    '(.ports // []) == [{
-       "mode": "ingress",
-       "host_ip": "127.0.0.1",
-       "target": 8790,
-       "published": "8790",
-       "protocol": "tcp"
-     }]'
-  check "control: only the internal isolated bridge is attached" "$rendered" \
-    '(.services.control.networks | keys) == ["control_isolated"]
+  check "control: has no direct host ingress" "$service" \
+    '((.ports // []) | length) == 0'
+  check "control: only internal bridges are attached" "$rendered" \
+    '(.services.control.networks | keys | sort) == ["control_ingress_internal", "control_isolated"]
      and (.services.control.network_mode? == null)
-     and (.networks | keys) == ["control_isolated"]
+     and (.networks | keys | sort) == ["control_host_ingress", "control_ingress_internal", "control_isolated"]
      and .networks.control_isolated.name == "mcp-ozon-control_control_isolated"
      and .networks.control_isolated.driver == "bridge"
      and .networks.control_isolated.internal == true
      and .networks.control_isolated.driver_opts == {
        "com.docker.network.bridge.enable_icc": "false",
        "com.docker.network.bridge.host_binding_ipv4": "127.0.0.1"
+     }
+     and .networks.control_ingress_internal.internal == true
+     and ((.networks.control_host_ingress.internal // false) | not)'
+
+  check "control ingress: service is credentialless and publishes exactly localhost:8790" "$ingress" \
+    '(.ports // []) == [{
+       "mode": "ingress",
+       "host_ip": "127.0.0.1",
+       "target": 8790,
+       "published": "8790",
+       "protocol": "tcp"
+     }]
+     and (has("environment") | not)
+     and (has("env_file") | not)
+     and ((.volumes // []) | length == 0)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)
+     and (.networks | keys | sort) == ["control_host_ingress", "control_ingress_internal"]'
+  check "control ingress: relay image and hardening are exact" "$ingress" \
+    --arg project_dir "$project_dir" \
+    '.build.context == $project_dir
+     and .build.dockerfile == "Dockerfile.control-ingress"
+     and .read_only == true
+     and .cap_drop == ["ALL"]
+     and ((.cap_add // []) | length == 0)
+     and ((.security_opt // []) | index("no-new-privileges:true") != null)
+     and (.privileged // false) == false
+     and .mem_limit == "33554432"
+     and .cpus == 0.1
+     and .pids_limit == 32
+     and .stop_grace_period == "10s"
+     and .restart == "unless-stopped"
+     and .logging == {"driver":"json-file","options":{"max-file":"2","max-size":"1m"}}
+     and .healthcheck == {
+       "test":["CMD-SHELL","nc -z -w 3 127.0.0.1 8790"],
+       "timeout":"3s", "interval":"10s", "retries":5, "start_period":"10s"
      }'
 
   check "control: filesystem and privilege hardening match the contract" "$service" \
@@ -1155,7 +1186,7 @@ verify_control_wb_plan() {
        "control-write-egress": {"condition":"service_healthy","required":true}
      }'
   check "control WB plan: Control has internal DB/proxy routes and no direct outbound" "$rendered" \
-    '(.services.control.networks | keys | sort) == ["control-auth-egress-internal","control-write-egress-internal","control_isolated","position-internal"]
+    '(.services.control.networks | keys | sort) == ["control-auth-egress-internal","control-write-egress-internal","control_ingress_internal","control_isolated","position-internal"]
      and ((.services.control.networks | has("outbound")) | not)
      and .networks["position-internal"].name == "mcp-ozon-position-internal"
      and .networks["position-internal"].external == true
@@ -1163,7 +1194,8 @@ verify_control_wb_plan() {
      and .networks["control-auth-egress-internal"].internal == true
      and .networks.outbound.name == "mcp-ozon-outbound"
      and .networks.outbound.external == true
-     and .networks.control_isolated.internal == true'
+     and .networks.control_isolated.internal == true
+     and .networks.control_ingress_internal.internal == true'
 
   check "control write egress: service is credentialless, private and exactly connected" "$write_proxy" \
     '(has("environment") | not)

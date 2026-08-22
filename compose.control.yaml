@@ -17,10 +17,9 @@ services:
       CONTROL_MCP_MAX_SESSIONS: "64"
       CONTROL_MCP_SESSION_IDLE_TIMEOUT_SECONDS: "120"
       RUST_LOG: mcp_ozon::control=info,rmcp=info
-    ports:
-      - "127.0.0.1:8790:8790"
     networks:
       - control_isolated
+      - control_ingress_internal
     volumes:
       - type: bind
         source: ${CONTROL_MCP_ACCESS_CONFIG_HOST:-./config/access.example.json}
@@ -58,6 +57,37 @@ services:
       retries: 5
       start_period: 10s
 
+  control-ingress:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-ingress
+    ports:
+      - "127.0.0.1:8790:8790"
+    networks:
+      - control_ingress_internal
+      - control_host_ingress
+    restart: unless-stopped
+    mem_limit: 32m
+    cpus: 0.10
+    pids_limit: 32
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w 3 127.0.0.1 8790"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
 networks:
   control_isolated:
     driver: bridge
@@ -65,3 +95,8 @@ networks:
     driver_opts:
       com.docker.network.bridge.enable_icc: "false"
       com.docker.network.bridge.host_binding_ipv4: "127.0.0.1"
+  control_ingress_internal:
+    driver: bridge
+    internal: true
+  control_host_ingress:
+    driver: bridge
