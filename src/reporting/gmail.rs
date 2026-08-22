@@ -91,8 +91,8 @@ impl GmailClient {
     }
 
     #[cfg(test)]
-    pub(super) fn for_test(send_url: String) -> Self {
-        Self::build(&send_url, None).expect("local test Gmail transport is valid")
+    pub(super) fn for_test(send_url: &str) -> Self {
+        Self::build(send_url, None).expect("local test Gmail transport is valid")
     }
 
     /// Sends exactly once. Transport failures, 5xx responses, redirects, and
@@ -281,7 +281,7 @@ mod tests {
     async fn sends_one_bounded_gmail_request_and_returns_provider_id() {
         let (url, seen, task) =
             server(StatusCode::OK, br#"{"id":"18f-message_1","threadId":"t"}"#).await;
-        let receipt = GmailClient::for_test(url)
+        let receipt = GmailClient::for_test(&url)
             .send("access-token", &email())
             .await
             .unwrap();
@@ -306,7 +306,7 @@ mod tests {
             (StatusCode::INTERNAL_SERVER_ERROR, GmailSendError::Ambiguous),
         ] {
             let (url, _, task) = server(status, b"provider-secret".to_vec()).await;
-            let error = GmailClient::for_test(url)
+            let error = GmailClient::for_test(&url)
                 .send("access-token", &email())
                 .await
                 .unwrap_err();
@@ -327,7 +327,7 @@ mod tests {
         ] {
             let (url, _, task) = server(StatusCode::OK, body).await;
             assert_eq!(
-                GmailClient::for_test(url)
+                GmailClient::for_test(&url)
                     .send("access-token", &email())
                     .await,
                 Err(GmailSendError::Ambiguous)
@@ -339,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_tokens_and_transport_failure_do_not_leak_credentials() {
         for token in ["", "has space", "line\nbreak"] {
-            let error = GmailClient::for_test("http://127.0.0.1:1/send".to_owned())
+            let error = GmailClient::for_test("http://127.0.0.1:1/send")
                 .send(token, &email())
                 .await
                 .unwrap_err();
@@ -350,13 +350,13 @@ mod tests {
         }
         let oversized = "x".repeat(MAX_ACCESS_TOKEN_BYTES + 1);
         assert_eq!(
-            GmailClient::for_test("http://127.0.0.1:1/send".to_owned())
+            GmailClient::for_test("http://127.0.0.1:1/send")
                 .send(&oversized, &email())
                 .await,
             Err(GmailSendError::InvalidCredential)
         );
         assert_eq!(
-            GmailClient::for_test("http://127.0.0.1:1/send".to_owned())
+            GmailClient::for_test("http://127.0.0.1:1/send")
                 .send("access-token", &email())
                 .await,
             Err(GmailSendError::Ambiguous)

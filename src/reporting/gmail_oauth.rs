@@ -225,8 +225,8 @@ impl GmailOAuthClient {
     }
 
     #[cfg(test)]
-    pub(super) fn for_test(token_url: String) -> Self {
-        Self::build(&token_url, None).expect("local test OAuth transport is valid")
+    pub(super) fn for_test(token_url: &str) -> Self {
+        Self::build(token_url, None).expect("local test OAuth transport is valid")
     }
 
     pub async fn refresh(
@@ -476,7 +476,7 @@ mod tests {
             ),
         )
         .await;
-        let token = GmailOAuthClient::for_test(url)
+        let token = GmailOAuthClient::for_test(&url)
             .refresh(&credentials)
             .await
             .unwrap();
@@ -505,7 +505,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            GmailOAuthClient::for_test(url)
+            GmailOAuthClient::for_test(&url)
                 .refresh(&credentials)
                 .await
                 .unwrap()
@@ -532,7 +532,7 @@ mod tests {
             ),
         ] {
             let (url, _, task) = server(status, b"oauth-secret-diagnostic".to_vec()).await;
-            let error = GmailOAuthClient::for_test(url)
+            let error = GmailOAuthClient::for_test(&url)
                 .refresh(&credentials)
                 .await
                 .unwrap_err();
@@ -541,7 +541,7 @@ mod tests {
             task.abort();
         }
         assert_eq!(
-            GmailOAuthClient::for_test("http://127.0.0.1:1/token".to_owned())
+            GmailOAuthClient::for_test("http://127.0.0.1:1/token")
                 .refresh(&credentials)
                 .await,
             Err(GmailOAuthError::Unavailable)
@@ -565,7 +565,7 @@ mod tests {
         ] {
             let (url, _, task) = server(StatusCode::OK, body).await;
             assert_eq!(
-                GmailOAuthClient::for_test(url)
+                GmailOAuthClient::for_test(&url)
                     .refresh(&credentials)
                     .await,
                 Err(GmailOAuthError::InvalidResponse)

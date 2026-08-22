@@ -133,8 +133,8 @@ impl GmailDeliveryService {
     #[cfg(test)]
     pub(super) fn for_test_endpoints(token_url: String, send_url: String) -> Self {
         Self {
-            oauth: Arc::new(GmailOAuthClient::for_test(token_url)),
-            messages: Arc::new(GmailClient::for_test(send_url)),
+            oauth: Arc::new(GmailOAuthClient::for_test(&token_url)),
+            messages: Arc::new(GmailClient::for_test(&send_url)),
         }
     }
 
@@ -393,8 +393,8 @@ mod tests {
         )
         .await;
         let service = GmailDeliveryService {
-            oauth: Arc::new(GmailOAuthClient::for_test(token_url)),
-            messages: Arc::new(GmailClient::for_test(send_url)),
+            oauth: Arc::new(GmailOAuthClient::for_test(&token_url)),
+            messages: Arc::new(GmailClient::for_test(&send_url)),
         };
         let (directory, credentials) = credentials();
         let receipt = service
