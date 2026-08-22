@@ -213,14 +213,11 @@ impl JwtAuthenticator {
         );
         match failure {
             JwtAuthenticationFailure::MissingCredentials => Some(base),
-            _ => Self::oauth_challenge_with_error(base, *failure),
+            _ => Self::oauth_challenge_with_error(&base, *failure),
         }
     }
 
-    fn oauth_challenge_with_error(
-        base: String,
-        failure: JwtAuthenticationFailure,
-    ) -> Option<String> {
+    fn oauth_challenge_with_error(base: &str, failure: JwtAuthenticationFailure) -> Option<String> {
         let (error, error_description) = failure.oauth_error()?;
         Some(format!(
             "{base}, error=\"{error}\", error_description=\"{error_description}\""

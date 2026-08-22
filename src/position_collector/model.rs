@@ -471,7 +471,11 @@ fn validate_text(
     if trimmed.is_empty() || trimmed.len() > max_bytes || trimmed.chars().any(char::is_control) {
         return Err(ValidationError::InvalidText(field, max_bytes));
     }
-    Ok(trimmed.to_owned())
+    if trimmed.len() == value.len() {
+        Ok(value)
+    } else {
+        Ok(trimmed.to_owned())
+    }
 }
 
 fn normalize_phrase(value: &str) -> String {
