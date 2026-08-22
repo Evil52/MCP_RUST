@@ -108,14 +108,14 @@ mod tests {
         ]})).unwrap()
     }
 
-    fn policy(value: serde_json::Value) -> DailyReportPolicy {
-        DailyReportPolicy::from_slice(&serde_json::to_vec(&value).unwrap(), &registry()).unwrap()
+    fn policy(value: &serde_json::Value) -> DailyReportPolicy {
+        DailyReportPolicy::from_slice(&serde_json::to_vec(value).unwrap(), &registry()).unwrap()
     }
 
     #[test]
     fn plan_is_unique_sorted_and_requires_all_report_sources() {
         let policy = policy(
-            json!({"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]},{"actor_id":"anna","account_ids":["wb"]}]}]}),
+            &json!({"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]},{"actor_id":"anna","account_ids":["wb"]}]}]}),
         );
         let plan = build_collection_plan(&policy, &registry()).unwrap();
         assert_eq!(plan.len(), 2);
@@ -129,7 +129,7 @@ mod tests {
         let mut ozon_registry = registry();
         ozon_registry.accounts[0].ozon.as_mut().unwrap().performance = None;
         let ozon_policy = policy(
-            json!({"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]}]}]}),
+            &json!({"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]}]}]}),
         );
         assert_eq!(
             build_collection_plan(&ozon_policy, &ozon_registry),
@@ -144,7 +144,7 @@ mod tests {
         let mut wb_registry = registry();
         wb_registry.accounts[1].wildberries = None;
         let wb_policy = policy(
-            json!({"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"anna","account_ids":["wb"]}]}]}),
+            &json!({"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"anna","account_ids":["wb"]}]}]}),
         );
         assert_eq!(
             build_collection_plan(&wb_policy, &wb_registry),

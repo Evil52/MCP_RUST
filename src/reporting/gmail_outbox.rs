@@ -1208,8 +1208,8 @@ mod tests {
 
         let (base_url, server) = local_mail_server().await;
         let service = GmailDeliveryService::for_test_endpoints(
-            format!("{base_url}/token"),
-            format!("{base_url}/gmail/v1/users/me/messages/send"),
+            &format!("{base_url}/token"),
+            &format!("{base_url}/gmail/v1/users/me/messages/send"),
         );
         let routing_document = serde_json::to_vec(&json!({
             "version": 1,

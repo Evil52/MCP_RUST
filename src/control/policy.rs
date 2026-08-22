@@ -557,15 +557,15 @@ mod tests {
     }
 
     fn parse(value: serde_json::Value) -> Result<ControlPolicy> {
-        parse_with_registry(value, &registry())
+        parse_with_registry(&value, &registry())
     }
 
     fn parse_with_registry(
-        value: serde_json::Value,
+        value: &serde_json::Value,
         registry: &AccessRegistry,
     ) -> Result<ControlPolicy> {
         ControlPolicy::from_slice(
-            &serde_json::to_vec(&value).expect("test policy serializes"),
+            &serde_json::to_vec(value).expect("test policy serializes"),
             Path::new("test-control-policy.json"),
             registry,
         )
@@ -650,7 +650,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .seller_sid = Some("22222222-2222-4222-8222-222222222222".to_owned());
-        assert!(parse_with_registry(value.clone(), &rebound_registry).is_err());
+        assert!(parse_with_registry(&value, &rebound_registry).is_err());
 
         value["actors"][0]["wb_promotion_bid_targets"][0]["nm_ids"] =
             serde_json::json!([1001, 1001]);
@@ -743,11 +743,11 @@ mod tests {
             .as_mut()
             .unwrap()
             .performance = None;
-        assert!(parse_with_registry(valid_policy(), &without_performance).is_err());
+        assert!(parse_with_registry(&valid_policy(), &without_performance).is_err());
 
         let mut wrong_marketplace = registry();
         wrong_marketplace.accounts[0].marketplace = Marketplace::Wildberries;
-        assert!(parse_with_registry(valid_policy(), &wrong_marketplace).is_err());
+        assert!(parse_with_registry(&valid_policy(), &wrong_marketplace).is_err());
 
         let mut denied_registry = registry();
         denied_registry.actors.push(Actor {
@@ -759,7 +759,7 @@ mod tests {
         });
         let mut denied_policy = valid_policy();
         denied_policy["actors"][0]["actor_id"] = serde_json::json!("viewer");
-        assert!(parse_with_registry(denied_policy, &denied_registry).is_err());
+        assert!(parse_with_registry(&denied_policy, &denied_registry).is_err());
     }
 
     #[test]
@@ -896,11 +896,11 @@ mod tests {
 
         let mut wrong_marketplace = registry();
         wrong_marketplace.accounts[1].marketplace = Marketplace::Ozon;
-        assert!(parse_with_registry(valid.clone(), &wrong_marketplace).is_err());
+        assert!(parse_with_registry(&valid, &wrong_marketplace).is_err());
 
         let mut missing_binding = registry();
         missing_binding.accounts[1].wildberries = None;
-        assert!(parse_with_registry(valid.clone(), &missing_binding).is_err());
+        assert!(parse_with_registry(&valid, &missing_binding).is_err());
 
         let mut missing_registry_sid = registry();
         missing_registry_sid.accounts[1]
@@ -908,11 +908,11 @@ mod tests {
             .as_mut()
             .unwrap()
             .seller_sid = None;
-        assert!(parse_with_registry(valid.clone(), &missing_registry_sid).is_err());
+        assert!(parse_with_registry(&valid, &missing_registry_sid).is_err());
 
         let mut denied_actor = registry();
         denied_actor.accounts[1].manager_id = "approver".to_owned();
-        assert!(parse_with_registry(valid.clone(), &denied_actor).is_err());
+        assert!(parse_with_registry(&valid, &denied_actor).is_err());
 
         let mut empty_nm_ids = valid.clone();
         empty_nm_ids["actors"][0]["wb_promotion_bid_targets"][0]["nm_ids"] = serde_json::json!([]);
@@ -955,7 +955,7 @@ mod tests {
 
         let mut denied_approver = registry();
         denied_approver.actors[1].account_ids.clear();
-        assert!(parse_with_registry(valid.clone(), &denied_approver).is_err());
+        assert!(parse_with_registry(&valid, &denied_approver).is_err());
 
         let mut invalid_hourly = valid.clone();
         invalid_hourly["actors"][0]["wb_promotion_bid_targets"][0]["action_limits"]["max_actions_per_hour"] =
@@ -1009,7 +1009,7 @@ mod tests {
             "max_cumulative_abs_delta_kopecks_per_day":
                 MAX_CUMULATIVE_ABS_DELTA_KOPECKS_PER_DAY
         });
-        parse_with_registry(boundary, &boundary_registry).expect("inclusive WB upper boundaries");
+        parse_with_registry(&boundary, &boundary_registry).expect("inclusive WB upper boundaries");
 
         let mut zero_advert = valid_wb_policy();
         zero_advert["actors"][0]["wb_promotion_bid_targets"][0]["advert_id"] = serde_json::json!(0);

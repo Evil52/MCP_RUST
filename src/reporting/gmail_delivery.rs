@@ -131,10 +131,10 @@ impl GmailDeliveryService {
     }
 
     #[cfg(test)]
-    pub(super) fn for_test_endpoints(token_url: String, send_url: String) -> Self {
+    pub(super) fn for_test_endpoints(token_url: &str, send_url: &str) -> Self {
         Self {
-            oauth: Arc::new(GmailOAuthClient::for_test(&token_url)),
-            messages: Arc::new(GmailClient::for_test(&send_url)),
+            oauth: Arc::new(GmailOAuthClient::for_test(token_url)),
+            messages: Arc::new(GmailClient::for_test(send_url)),
         }
     }
 
