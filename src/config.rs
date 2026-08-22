@@ -1596,14 +1596,18 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    // LLVM's line mapper assigns the closing edge of the intentionally racy
-    // `if let` below to a standalone source line. Whether that synthetic edge
-    // executes depends on OS thread scheduling, so instrumenting this test made
-    // the 100% line gate nondeterministic even though both production outcomes
-    // are covered elsewhere.
-    #[cfg_attr(coverage, coverage(off))]
     #[test]
     fn concurrent_readers_never_observe_a_torn_registry_while_it_is_rewritten() {
+        fn assert_whole_generation(registry: &AccessRegistry) {
+            let name = registry.actor("manager").unwrap().name.as_str();
+            assert!(
+                matches!(name, "Manager" | "Renamed manager"),
+                "torn registry generation: {name:?}"
+            );
+            assert_eq!(registry.actors.len(), 2);
+            assert_eq!(registry.accounts.len(), 1);
+        }
+
         // Every tool call loads the registry, so reads run concurrently with an
         // operator editing the file. Each observation must be one whole
         // generation — never a mix — and no reader may panic or deadlock.
@@ -1636,13 +1640,7 @@ mod tests {
                             // A partially written file is a legitimate transient
                             // error; a wrong-but-parsed registry is not.
                             if let Ok(registry) = source.load() {
-                                let name = registry.actor("manager").unwrap().name.clone();
-                                assert!(
-                                    matches!(name.as_str(), "Manager" | "Renamed manager"),
-                                    "torn registry generation: {name:?}"
-                                );
-                                assert_eq!(registry.actors.len(), 2);
-                                assert_eq!(registry.accounts.len(), 1);
+                                assert_whole_generation(&registry);
                                 observed += 1;
                             }
                         }
@@ -1654,8 +1652,7 @@ mod tests {
                         let registry = source
                             .load()
                             .expect("the completed final registry is readable");
-                        assert_eq!(registry.actors.len(), 2);
-                        assert_eq!(registry.accounts.len(), 1);
+                        assert_whole_generation(&registry);
                         observed += 1;
                         observed
                     })
