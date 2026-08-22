@@ -34,7 +34,7 @@ jobs:
 
       - name: Install project Rust with quality components
         run: |
-          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -86,7 +86,7 @@ jobs:
         run: cargo doc --locked --no-deps --all-features
 
   rust-version:
-    name: Rust 1.97.1
+    name: Rust 1.98.0
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -96,13 +96,13 @@ jobs:
           persist-credentials: false
 
       - name: Install project Rust version
-        run: rustup toolchain install 1.97.1 --profile minimal
+        run: rustup toolchain install 1.98.0 --profile minimal
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Test project Rust version
-        run: cargo +1.97.1 test --locked --all-targets --all-features
+        run: cargo +1.98.0 test --locked --all-targets --all-features
 
   coverage:
     name: Coverage 100%
@@ -116,7 +116,7 @@ jobs:
 
       - name: Install project Rust
         run: |
-          rustup toolchain install 1.97.1 --profile minimal --component llvm-tools-preview
+          rustup toolchain install 1.98.0 --profile minimal --component llvm-tools-preview
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -148,7 +148,7 @@ jobs:
           persist-credentials: false
 
       - name: Install project Rust
-        run: rustup toolchain install 1.97.1 --profile minimal
+        run: rustup toolchain install 1.98.0 --profile minimal
 
       - name: Install verified security tools
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
