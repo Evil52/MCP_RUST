@@ -390,6 +390,11 @@ impl PerformanceClient {
         )
     }
 
+    /// Builds an unconfigured client with the fixed production HTTP settings.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reqwest` rejects the crate's fixed HTTP client settings.
     #[must_use]
     pub fn empty(timeout: Duration) -> Self {
         Self::new(timeout, BTreeMap::new()).expect("fixed reqwest client configuration is valid")

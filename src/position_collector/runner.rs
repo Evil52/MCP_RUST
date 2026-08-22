@@ -339,6 +339,11 @@ impl Collector {
     /// `started_at` is the scheduler's actual UTC wake time. The scheduler must
     /// keep the planned boundary separately; this check permits at most a small
     /// wake delay and prevents an old slot from being replayed after restart.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bounded batch budget cannot be represented by Tokio's
+    /// monotonic clock.
     pub async fn collect_at(
         &self,
         plan: &BatchPlan,

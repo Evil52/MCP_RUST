@@ -100,6 +100,10 @@ pub fn sales_request(
 ///
 /// The endpoint is selected from a fixed pair so callers cannot use this
 /// helper to smuggle an arbitrary Seller API path through the report source.
+///
+/// # Panics
+///
+/// Panics if the statically constructed request payload is not a JSON object.
 pub fn warehouse_stock_page_request(
     path: &'static str,
     cursor: Option<&str>,

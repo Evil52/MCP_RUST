@@ -1205,6 +1205,10 @@ impl WbClient {
     /// Personal tokens. WB also documents other token classes with different
     /// quotas; production configuration rejects those unsupported policies,
     /// while this client keeps the selected report quota isolated and fail-fast.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the statically constructed search payload is not a JSON object.
     #[allow(clippy::too_many_arguments)]
     pub async fn search_product_queries(
         &self,

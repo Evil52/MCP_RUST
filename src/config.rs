@@ -695,6 +695,7 @@ impl RegistrySource {
     /// Every tool call needs the registry to resolve the caller's identity and
     /// stores, so the unchanged-file path avoids a full JSON parse, a full
     /// validation pass and a deep clone per call.
+    #[cfg_attr(test, allow(clippy::missing_panics_doc))]
     pub fn load(&self) -> Result<Arc<AccessRegistry>> {
         #[cfg(test)]
         {
