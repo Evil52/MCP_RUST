@@ -21,6 +21,7 @@ use super::{
 };
 
 const PAGE_SIZE: usize = 1_000;
+const PAGE_SIZE_U32: u32 = 1_000;
 const MAX_PAGES: usize = 25;
 const CAMPAIGNS_PER_REQUEST: usize = 50;
 
@@ -336,7 +337,7 @@ impl WbReportSource {
             let (rows, source_rows) = parse_sales_page(
                 &self
                     .transport
-                    .sales_page(date, date, PAGE_SIZE as u32, offset)
+                    .sales_page(date, date, PAGE_SIZE_U32, offset)
                     .await?,
             )
             .map_err(|_| WbReportSourceError::InvalidSalesResponse)?;
@@ -363,7 +364,7 @@ impl WbReportSource {
         for page in 0..max_pages {
             let offset = page_offset(page)?;
             let (rows, source_rows) =
-                parse_stock_page(&self.transport.stock_page(PAGE_SIZE as u32, offset).await?)
+                parse_stock_page(&self.transport.stock_page(PAGE_SIZE_U32, offset).await?)
                     .map_err(|_| WbReportSourceError::InvalidStockResponse)?;
             // Multiple chrt rows can normalize into one SKU/warehouse fact.
             // Only the raw response count proves that the page was short.
@@ -388,7 +389,7 @@ impl WbReportSource {
         for page in 0..max_pages {
             let offset = page_offset(page)?;
             let (rows, source_rows) =
-                parse_price_page(&self.transport.price_page(PAGE_SIZE as u32, offset).await?)
+                parse_price_page(&self.transport.price_page(PAGE_SIZE_U32, offset).await?)
                     .map_err(|_| WbReportSourceError::InvalidPriceResponse)?;
             let complete = source_rows < PAGE_SIZE;
             facts.extend(rows);
@@ -403,7 +404,7 @@ impl WbReportSource {
 fn page_offset(page: usize) -> Result<u32, WbReportSourceError> {
     u32::try_from(page)
         .ok()
-        .and_then(|page| page.checked_mul(PAGE_SIZE as u32))
+        .and_then(|page| page.checked_mul(PAGE_SIZE_U32))
         .ok_or(WbReportSourceError::PaginationLimit)
 }
 

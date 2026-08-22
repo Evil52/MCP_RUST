@@ -2107,7 +2107,7 @@ fn trace_transport_failure(
     error: &WbError,
     will_retry: bool,
 ) {
-    let latency_ms = started.elapsed().as_millis() as u64;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let error_kind = error.kind().code();
     warn!(
         account,
@@ -2126,7 +2126,7 @@ fn trace_response(
     error: Option<&WbError>,
     will_retry: bool,
 ) {
-    let latency_ms = started.elapsed().as_millis() as u64;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     if error.is_none() && !will_retry {
         info!(account, endpoint, attempt, %status, latency_ms, request_id, "WB API request completed");
     } else {
@@ -3271,7 +3271,10 @@ mod tests {
 
         let _all_shared_permits = primary
             .in_flight
-            .try_acquire_many(MAX_IN_FLIGHT_REQUESTS_PER_TOKEN as u32)
+            .try_acquire_many(
+                u32::try_from(MAX_IN_FLIGHT_REQUESTS_PER_TOKEN)
+                    .expect("per-token request limit fits u32"),
+            )
             .unwrap();
         assert_eq!(
             client.ping("alias").await.unwrap_err().kind(),
@@ -3353,7 +3356,10 @@ mod tests {
 
         let all_global_permits = client
             .global_in_flight
-            .try_acquire_many(MAX_GLOBAL_IN_FLIGHT_REQUESTS as u32)
+            .try_acquire_many(
+                u32::try_from(MAX_GLOBAL_IN_FLIGHT_REQUESTS)
+                    .expect("global request limit fits u32"),
+            )
             .unwrap();
         assert_eq!(
             client.ping("account").await.unwrap_err().kind(),
@@ -3391,7 +3397,10 @@ mod tests {
 
         let all_token_permits = limiter
             .in_flight
-            .try_acquire_many(MAX_IN_FLIGHT_REQUESTS_PER_TOKEN as u32)
+            .try_acquire_many(
+                u32::try_from(MAX_IN_FLIGHT_REQUESTS_PER_TOKEN)
+                    .expect("per-token request limit fits u32"),
+            )
             .unwrap();
         assert_eq!(
             client
@@ -4244,7 +4253,10 @@ mod tests {
             let limiter = Arc::clone(client.limiters.get("account").unwrap());
             let held_permits = limiter
                 .in_flight
-                .acquire_many((MAX_IN_FLIGHT_REQUESTS_PER_TOKEN - 1) as u32)
+                .acquire_many(
+                    u32::try_from(MAX_IN_FLIGHT_REQUESTS_PER_TOKEN - 1)
+                        .expect("per-token request limit fits u32"),
+                )
                 .await
                 .unwrap();
 

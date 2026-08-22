@@ -41,8 +41,6 @@ all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 # Remaining structural and public-API documentation debt is explicit. All
 # other current and future pedantic lints remain release-blocking.
-cast_possible_truncation = "allow"
-cast_precision_loss = "allow"
 doc_markdown = "allow"
 large_futures = "allow"
 large_types_passed_by_value = "allow"

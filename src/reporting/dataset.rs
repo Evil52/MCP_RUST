@@ -636,7 +636,16 @@ mod tests {
         excessive.sales = vec![excessive.sales[0].clone(); MAX_DATASET_ROWS + 1];
         assert_eq!(
             validate_row_counts(
-                &manifest_with_counts(&["store"], [MAX_DATASET_ROWS as u32 + 1, 1, 0, 1, 1],),
+                &manifest_with_counts(
+                    &["store"],
+                    [
+                        u32::try_from(MAX_DATASET_ROWS).expect("dataset row limit fits u32") + 1,
+                        1,
+                        0,
+                        1,
+                        1,
+                    ],
+                ),
                 &excessive
             ),
             Err(DatasetError::InvalidFacts)

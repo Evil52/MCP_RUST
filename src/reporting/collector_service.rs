@@ -863,7 +863,12 @@ mod tests {
         assert!(directory.read("BINARY").is_none());
         fs::write(
             root.join("OVERSIZED"),
-            vec![b'x'; MAX_CREDENTIAL_FILE_BYTES as usize + 1],
+            vec![
+                b'x';
+                usize::try_from(MAX_CREDENTIAL_FILE_BYTES)
+                    .expect("credential file limit fits usize")
+                    + 1
+            ],
         )
         .unwrap();
         assert!(directory.read("OVERSIZED").is_none());

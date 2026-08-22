@@ -373,7 +373,8 @@ fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, ArtifactStoreError
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > maximum {
         return Err(ArtifactStoreError::Integrity);
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let capacity = usize::try_from(metadata.len()).map_err(|_| ArtifactStoreError::Integrity)?;
+    let mut bytes = Vec::with_capacity(capacity);
     File::open(path)
         .and_then(|file| file.take(maximum + 1).read_to_end(&mut bytes))
         .map_err(|_| ArtifactStoreError::Unavailable)?;
@@ -561,7 +562,8 @@ mod tests {
             Err(ArtifactStoreError::Integrity)
         ));
         let mut invalid_bundle = bundle();
-        invalid_bundle.html = "x".repeat(MAX_HTML_BYTES as usize + 1);
+        invalid_bundle.html =
+            "x".repeat(usize::try_from(MAX_HTML_BYTES).expect("HTML byte limit fits usize") + 1);
         invalid_bundle.artifact.html_sha256 = sha256(invalid_bundle.html.as_bytes());
         assert!(matches!(
             store.persist(&invalid_bundle),

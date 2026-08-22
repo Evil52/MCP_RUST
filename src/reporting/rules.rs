@@ -154,8 +154,10 @@ fn stock_problem(input: &RuleInput) -> Option<PriorityProblem> {
         sku: input.sku,
         kind: ProblemKind::LowStockCover,
         severity,
-        observed: ((cover_left * 10) / u128::from(input.sold_units)).min(u128::from(u64::MAX))
-            as u64,
+        observed: u64::try_from(
+            ((cover_left * 10) / u128::from(input.sold_units)).min(u128::from(u64::MAX)),
+        )
+        .expect("stock cover is clamped to u64"),
         threshold: u64::from(input.lead_time_days.unwrap_or(3)) * 10,
         impact_minor: input.sales_gmv_minor,
     })
@@ -202,8 +204,11 @@ fn high_drr(input: &RuleInput) -> Option<PriorityProblem> {
     // Rounded exactly like `kpi::percentage`, so the DRR printed in the report
     // and the DRR this rule compares against a threshold can never differ.
     let revenue = u128::from(input.attributed_revenue_minor);
-    let current = ((u128::from(input.ad_spend_minor) * 10_000 + revenue / 2) / revenue)
-        .min(u128::from(u64::MAX)) as u64;
+    let current = u64::try_from(
+        ((u128::from(input.ad_spend_minor) * 10_000 + revenue / 2) / revenue)
+            .min(u128::from(u64::MAX)),
+    )
+    .expect("DRR is clamped to u64");
     let severity = if u128::from(current) * 2 > u128::from(target) * 3
         && current >= target.saturating_add(500)
     {

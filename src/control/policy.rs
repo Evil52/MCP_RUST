@@ -780,7 +780,9 @@ mod tests {
             "mcp-control-oversized-policy-{}-{id}.json",
             std::process::id()
         ));
-        std::fs::write(&path, vec![b' '; (CONTROL_POLICY_MAX_BYTES + 1) as usize]).unwrap();
+        let oversized_length =
+            usize::try_from(CONTROL_POLICY_MAX_BYTES + 1).expect("control policy limit fits usize");
+        std::fs::write(&path, vec![b' '; oversized_length]).unwrap();
         let result = read_policy_bytes(&path);
         std::fs::remove_file(path).unwrap();
         assert!(result.is_err());

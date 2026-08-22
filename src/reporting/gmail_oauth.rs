@@ -259,11 +259,12 @@ impl GmailOAuthClient {
 async fn parse_token_response(
     mut response: reqwest::Response,
 ) -> Result<GmailAccessToken, GmailOAuthError> {
+    let declared_length = response
+        .content_length()
+        .unwrap_or(0)
+        .min(MAX_TOKEN_RESPONSE_BYTES as u64);
     let mut body = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or(0)
-            .min(MAX_TOKEN_RESPONSE_BYTES as u64) as usize,
+        usize::try_from(declared_length).expect("bounded token response length fits usize"),
     );
     while let Some(chunk) = response
         .chunk()

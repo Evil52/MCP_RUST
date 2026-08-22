@@ -4713,7 +4713,11 @@ impl OzonMcp {
                 "offer_ids, product_ids и skus вместе должны содержать не более {MAX_PRODUCT_DIAGNOSTIC_ITEMS} значений"
             ));
         }
-        validate_limit(input.limit, MAX_PRODUCT_DIAGNOSTIC_ITEMS as u32)?;
+        validate_limit(
+            input.limit,
+            u32::try_from(MAX_PRODUCT_DIAGNOSTIC_ITEMS)
+                .expect("product diagnostic item limit fits u32"),
+        )?;
         validate_max_chars("last_id", &input.last_id, MAX_OPAQUE_TOKEN_CHARS)?;
 
         let catalog = self
@@ -6274,7 +6278,10 @@ fn validate_wb_search_product_queries_input(
     )?;
     validate_count("nm_ids", input.nm_ids.len(), 1, MAX_WB_SEARCH_NM_IDS)?;
     validate_unique_positive_ids("nm_ids", &input.nm_ids)?;
-    validate_limit(input.limit, MAX_WB_SEARCH_TEXTS as u32)?;
+    validate_limit(
+        input.limit,
+        u32::try_from(MAX_WB_SEARCH_TEXTS).expect("WB search text limit fits u32"),
+    )?;
     Ok(())
 }
 
@@ -7553,7 +7560,9 @@ mod tests {
         let authenticator = jwt_authenticator(&seed.registry);
         let server = OzonMcp::new_authenticated(seed.client, seed.registry, authenticator);
         let _all_slots = Arc::clone(&server.tool_call_slots)
-            .acquire_many_owned(MAX_IN_FLIGHT_TOOL_CALLS as u32)
+            .acquire_many_owned(
+                u32::try_from(MAX_IN_FLIGHT_TOOL_CALLS).expect("tool call limit fits u32"),
+            )
             .await
             .expect("tool call semaphore stays open");
 

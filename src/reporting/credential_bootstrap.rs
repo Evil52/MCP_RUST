@@ -440,7 +440,10 @@ mod tests {
         write_fixture(&oversized, true, "unused=1\n");
         fs::write(
             oversized.join("source.env"),
-            vec![b'X'; MAX_INPUT_BYTES as usize + 1],
+            vec![
+                b'X';
+                usize::try_from(MAX_INPUT_BYTES).expect("bootstrap input limit fits usize") + 1
+            ],
         )
         .unwrap();
         assert!(

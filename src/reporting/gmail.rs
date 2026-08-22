@@ -144,11 +144,12 @@ pub(super) fn access_token_is_valid(access_token: &str) -> bool {
 async fn parse_success_response(
     mut response: reqwest::Response,
 ) -> Result<GmailSendReceipt, GmailSendError> {
+    let declared_length = response
+        .content_length()
+        .unwrap_or(0)
+        .min(MAX_GMAIL_RESPONSE_BYTES as u64);
     let mut body = Vec::with_capacity(
-        response
-            .content_length()
-            .unwrap_or(0)
-            .min(MAX_GMAIL_RESPONSE_BYTES as u64) as usize,
+        usize::try_from(declared_length).expect("bounded Gmail response length fits usize"),
     );
     while let Some(chunk) = response
         .chunk()

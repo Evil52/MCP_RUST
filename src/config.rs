@@ -1583,7 +1583,9 @@ mod tests {
         // Padding a valid registry with whitespace keeps it parseable, so the
         // only thing under test is the size guard.
         let mut document = serde_json::to_vec(&sample_registry()).unwrap();
-        let padding = MAX_ACCESS_REGISTRY_BYTES as usize - document.len();
+        let padding = usize::try_from(MAX_ACCESS_REGISTRY_BYTES)
+            .expect("access registry limit fits usize")
+            - document.len();
         document.extend(std::iter::repeat_n(b' ', padding));
         assert_eq!(document.len() as u64, MAX_ACCESS_REGISTRY_BYTES);
         std::fs::write(&path, &document).unwrap();

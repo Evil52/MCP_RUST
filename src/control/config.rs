@@ -1417,8 +1417,13 @@ mod tests {
             assert!(normalize_control_token_bytes(invalid).is_err());
         }
         assert!(
-            normalize_control_token_bytes(vec![b'a'; MAX_CONTROL_CREDENTIAL_BYTES as usize + 1])
-                .is_err()
+            normalize_control_token_bytes(vec![
+                b'a';
+                usize::try_from(MAX_CONTROL_CREDENTIAL_BYTES)
+                    .expect("credential limit fits usize")
+                    + 1
+            ])
+            .is_err()
         );
     }
 
@@ -1439,7 +1444,10 @@ mod tests {
 
         let oversized = TempCredential::new(
             "oversized",
-            &"a".repeat(MAX_CONTROL_CREDENTIAL_BYTES as usize + 1),
+            &"a".repeat(
+                usize::try_from(MAX_CONTROL_CREDENTIAL_BYTES).expect("credential limit fits usize")
+                    + 1,
+            ),
         );
         assert!(read_control_token(&oversized.0, "TEST_TOKEN").is_err());
 

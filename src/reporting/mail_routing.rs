@@ -300,7 +300,13 @@ mod tests {
             Err(MailRoutingError::InvalidDocument)
         );
         assert_eq!(
-            MailRouting::from_slice(&vec![b' '; MAX_ROUTING_BYTES as usize + 1], &policy()),
+            MailRouting::from_slice(
+                &vec![
+                    b' ';
+                    usize::try_from(MAX_ROUTING_BYTES).expect("routing limit fits usize") + 1
+                ],
+                &policy(),
+            ),
             Err(MailRoutingError::InvalidDocument)
         );
         let mut too_many = document();
@@ -332,7 +338,9 @@ mod tests {
             Err(MailRoutingError::InvalidFile)
         );
 
-        for value in [Vec::new(), vec![b'x'; MAX_ROUTING_BYTES as usize + 1]] {
+        let oversized_length =
+            usize::try_from(MAX_ROUTING_BYTES).expect("routing limit fits usize") + 1;
+        for value in [Vec::new(), vec![b'x'; oversized_length]] {
             let path = private_file(&value);
             assert_eq!(
                 MailRouting::load(&path, &policy()),

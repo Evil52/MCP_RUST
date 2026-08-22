@@ -579,7 +579,7 @@ fn write_u64(
     value: u64,
 ) -> Result<(), XlsxReportError> {
     sheet
-        .write_number(row, column, value as f64)
+        .write_number(row, column, excel_number(value))
         .map_err(map_xlsx)?;
     Ok(())
 }
@@ -606,7 +606,7 @@ fn write_minor(
     formats: &Formats,
 ) -> Result<(), XlsxReportError> {
     sheet
-        .write_number_with_format(row, column, value as f64 / 100.0, &formats.money)
+        .write_number_with_format(row, column, excel_number(value) / 100.0, &formats.money)
         .map_err(map_xlsx)?;
     Ok(())
 }
@@ -635,13 +635,27 @@ fn write_optional_rate(
 ) -> Result<(), XlsxReportError> {
     if let Some(BasisPoints(points)) = value {
         sheet
-            .write_number_with_format(row, column, points as f64 / 10_000.0, &formats.percent)
+            .write_number_with_format(
+                row,
+                column,
+                excel_number(points) / 10_000.0,
+                &formats.percent,
+            )
             .map_err(map_xlsx)?;
         Ok(())
     } else {
         sheet.write_string(row, column, "N/D").map_err(map_xlsx)?;
         Ok(())
     }
+}
+
+// Every caller is downstream of validate(), which rejects integers above the
+// exact IEEE-754 range accepted by Excel. Keep the unavoidable workbook API
+// conversion in one audited location.
+#[allow(clippy::cast_precision_loss)]
+fn excel_number(value: u64) -> f64 {
+    debug_assert!(value <= MAX_EXACT_EXCEL_INTEGER);
+    value as f64
 }
 
 fn source_text(source: SnapshotSource) -> &'static str {

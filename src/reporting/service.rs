@@ -679,7 +679,9 @@ mod tests {
         entries[1] = (ACCESS_CONFIG_ENV, invalid_registry.display().to_string());
         assert!(config(entries).is_err());
 
-        let oversized = file("oversized", &" ".repeat((MAX_POLICY_BYTES + 1) as usize));
+        let oversized_length =
+            usize::try_from(MAX_POLICY_BYTES + 1).expect("policy limit fits usize");
+        let oversized = file("oversized", &" ".repeat(oversized_length));
         let mut entries = valid_entries(false);
         entries[2] = (POLICY_PATH_ENV, oversized.display().to_string());
         assert!(config(entries).is_err());

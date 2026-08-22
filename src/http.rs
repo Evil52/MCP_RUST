@@ -237,7 +237,8 @@ async fn read_bounded_mcp_body(mut body: Body) -> Result<Vec<u8>, McpBodyReadFai
     if minimum_length > MCP_REQUEST_BODY_LIMIT_BYTES as u64 {
         return Err(McpBodyReadFailure::TooLarge);
     }
-    let mut bytes = Vec::with_capacity(minimum_length as usize);
+    let capacity = usize::try_from(minimum_length).map_err(|_| McpBodyReadFailure::TooLarge)?;
+    let mut bytes = Vec::with_capacity(capacity);
     loop {
         let frame = std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await;
         let Some(frame) = frame else {
