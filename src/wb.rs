@@ -886,6 +886,7 @@ impl WbClient {
     }
 
     #[cfg(test)]
+    #[allow(clippy::large_types_passed_by_value)]
     fn new_for_test_with_policy(
         timeout: Duration,
         accounts: BTreeMap<String, WbCredentials>,
@@ -900,6 +901,7 @@ impl WbClient {
         )
     }
 
+    #[allow(clippy::large_types_passed_by_value)]
     fn build(
         timeout: Duration,
         accounts: BTreeMap<String, WbCredentials>,
@@ -910,6 +912,7 @@ impl WbClient {
             .expect("static WB HTTP client configuration must be valid")
     }
 
+    #[allow(clippy::large_types_passed_by_value)]
     fn try_build(
         timeout: Duration,
         accounts: BTreeMap<String, WbCredentials>,
@@ -1599,7 +1602,7 @@ impl WbClient {
                     .await
             }
             Err(source) => {
-                transport_failure_outcome(context, attempt, started, source, self.policy)
+                transport_failure_outcome(context, attempt, started, source, &self.policy)
             }
         }
     }
@@ -1617,7 +1620,7 @@ impl WbClient {
         let planned_retry = context
             .request_class
             .allows_automatic_retry()
-            .then(|| retry_plan(status, attempt, retry_after, self.policy))
+            .then(|| retry_plan(status, attempt, retry_after, &self.policy))
             .flatten();
         let vendor_cooldown = match retry_after {
             ParsedRetryDelay::Valid(delay)
@@ -1682,7 +1685,7 @@ impl WbClient {
         );
         match result {
             Err(error) if will_retry => Ok(AttemptOutcome::Retry {
-                delay: retry_delay(attempt, None, self.policy),
+                delay: retry_delay(attempt, None, &self.policy),
                 error,
             }),
             result => result.map(AttemptOutcome::Complete),
@@ -1732,7 +1735,7 @@ fn transport_failure_outcome(
     attempt: usize,
     started: Instant,
     source: reqwest::Error,
-    policy: ClientPolicy,
+    policy: &ClientPolicy,
 ) -> Result<AttemptOutcome, WbError> {
     let error = classify_transport_error(source, None);
     let will_retry = context.request_class.allows_automatic_retry()
@@ -2025,7 +2028,7 @@ fn retry_plan(
     status: StatusCode,
     attempt: usize,
     retry_after: ParsedRetryDelay,
-    policy: ClientPolicy,
+    policy: &ClientPolicy,
 ) -> Option<Duration> {
     if !is_retriable(status) || attempt >= policy.max_attempts {
         return None;
@@ -2038,7 +2041,7 @@ fn retry_plan(
     Some(retry_delay(attempt, server_delay, policy))
 }
 
-fn retry_delay(attempt: usize, server_delay: Option<Duration>, policy: ClientPolicy) -> Duration {
+fn retry_delay(attempt: usize, server_delay: Option<Duration>, policy: &ClientPolicy) -> Duration {
     server_delay.unwrap_or_else(|| {
         policy
             .base_retry_delay
@@ -4002,12 +4005,17 @@ mod tests {
                 StatusCode::TOO_MANY_REQUESTS,
                 1,
                 ParsedRetryDelay::Valid(Duration::ZERO),
-                policy,
+                &policy,
             ),
             Some(Duration::ZERO)
         );
         assert_eq!(
-            retry_plan(StatusCode::BAD_GATEWAY, 1, ParsedRetryDelay::Absent, policy,),
+            retry_plan(
+                StatusCode::BAD_GATEWAY,
+                1,
+                ParsedRetryDelay::Absent,
+                &policy,
+            ),
             Some(Duration::ZERO)
         );
         assert_eq!(
@@ -4015,7 +4023,7 @@ mod tests {
                 StatusCode::TOO_MANY_REQUESTS,
                 1,
                 ParsedRetryDelay::Valid(Duration::from_secs(2)),
-                policy,
+                &policy,
             ),
             None
         );
@@ -4024,12 +4032,17 @@ mod tests {
                 StatusCode::TOO_MANY_REQUESTS,
                 1,
                 ParsedRetryDelay::Invalid,
-                policy,
+                &policy,
             ),
             None
         );
         assert_eq!(
-            retry_plan(StatusCode::BAD_REQUEST, 1, ParsedRetryDelay::Absent, policy,),
+            retry_plan(
+                StatusCode::BAD_REQUEST,
+                1,
+                ParsedRetryDelay::Absent,
+                &policy,
+            ),
             None
         );
         assert_eq!(
@@ -4037,7 +4050,7 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 policy.max_attempts,
                 ParsedRetryDelay::Absent,
-                policy,
+                &policy,
             ),
             None
         );
