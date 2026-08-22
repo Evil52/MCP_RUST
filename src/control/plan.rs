@@ -1494,7 +1494,7 @@ impl WbPlanRepository {
     ) -> Result<(), PlanStoreError> {
         // Caller time is observational only. Persisted security timestamps are
         // always taken from PostgreSQL transaction time below.
-        let _caller_observed_at = finish.now;
+        let _ = finish.now;
         if !matches!(
             finish.status,
             WbPlanStatus::Applied

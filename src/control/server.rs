@@ -260,6 +260,7 @@ impl ControlMcp {
         }
     }
 
+    #[must_use]
     pub fn with_wb_control_services(mut self, services: WbControlServices) -> Self {
         if self.authenticator.is_some() {
             self.wb = Some(services);

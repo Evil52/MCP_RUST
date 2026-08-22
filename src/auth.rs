@@ -213,12 +213,11 @@ impl JwtAuthenticator {
         );
         match failure {
             JwtAuthenticationFailure::MissingCredentials => Some(base),
-            _ => self.oauth_challenge_with_error(base, *failure),
+            _ => Self::oauth_challenge_with_error(base, *failure),
         }
     }
 
     fn oauth_challenge_with_error(
-        &self,
         base: String,
         failure: JwtAuthenticationFailure,
     ) -> Option<String> {

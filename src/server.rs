@@ -591,6 +591,7 @@ impl OzonMcp {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn wb_error(&self, account: &str, endpoint: &str, error: crate::wb::WbError) -> String {
         let kind = error.kind().code();
         let request_id = error.request_id().unwrap_or("-");
