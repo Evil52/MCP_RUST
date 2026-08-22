@@ -720,21 +720,21 @@ fn post_requires_response_permit(body: &[u8]) -> bool {
 async fn buffer_mcp_post_body(
     request: Request,
     timeout: Duration,
-) -> Result<(Request, bool), Response> {
+) -> Result<(Request, bool), Box<Response>> {
     let (parts, body) = request.into_parts();
     match tokio::time::timeout(timeout, read_bounded_mcp_body(body)).await {
-        Err(_) => Err(body_failure_response(
+        Err(_) => Err(Box::new(body_failure_response(
             StatusCode::REQUEST_TIMEOUT,
             "MCP request body deadline exceeded",
-        )),
-        Ok(Err(McpBodyReadFailure::TooLarge)) => Err(body_failure_response(
+        ))),
+        Ok(Err(McpBodyReadFailure::TooLarge)) => Err(Box::new(body_failure_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "MCP request body too large",
-        )),
-        Ok(Err(McpBodyReadFailure::Transport)) => Err(body_failure_response(
+        ))),
+        Ok(Err(McpBodyReadFailure::Transport)) => Err(Box::new(body_failure_response(
             StatusCode::BAD_REQUEST,
             "MCP request body could not be read",
-        )),
+        ))),
         Ok(Ok(body)) => {
             let requires_response_permit = post_requires_response_permit(&body);
             Ok((
@@ -932,7 +932,7 @@ async fn limit_mcp_request_concurrency(
                 (request, Some(response_permit))
             }
             Ok((request, false)) => (request, None),
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     } else {
         (request, None)

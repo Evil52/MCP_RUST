@@ -228,8 +228,8 @@ fn jwt_router() -> Router {
 fn jwt_router_for_resource(resource_url: &str) -> Router {
     let registry = registry();
     let mut config = jwt_config();
-    config.audience = resource_url.to_owned();
-    config.resource_url = resource_url.to_owned();
+    resource_url.clone_into(&mut config.audience);
+    resource_url.clone_into(&mut config.resource_url);
     let authenticator = JwtAuthenticator::new(config, registry.clone())
         .expect("test authenticator configuration must be valid");
     let server = OzonMcp::new_authenticated(ozon_client(), registry, authenticator);

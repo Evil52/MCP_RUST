@@ -537,13 +537,29 @@ impl OzonClient {
                     // an unrelated Overloaded error.
                     return Err(previous_retry_error.take().unwrap_or(OzonError::Overloaded));
                 }
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => {
+                    // If a body stream was interrupted and the recovery
+                    // attempt cannot even establish a new connection, retain
+                    // the original marketplace request-id. It is the useful
+                    // diagnostic for the response that was actually started.
+                    if is_retriable_transport(error.kind())
+                        && let Some(previous) = previous_retry_error.take()
+                    {
+                        return Err(previous);
+                    }
+                    return Err(error);
+                }
                 Ok(Ok(outcome)) => outcome,
             };
             match outcome {
                 RequestAttempt::Complete(value) => return Ok(value),
                 RequestAttempt::Retry { delay, error } => {
-                    previous_retry_error = Some(error);
+                    // Prefer the newest upstream diagnostic, but do not erase
+                    // a known request-id merely because a later recovery
+                    // attempt failed before receiving response headers.
+                    if previous_retry_error.is_none() || error.request_id().is_some() {
+                        previous_retry_error = Some(error);
+                    }
                     if timeout_at(deadline, sleep(delay)).await.is_err() {
                         return Err(previous_retry_error
                             .take()
@@ -626,8 +642,28 @@ impl OzonClient {
             .as_ref()
             .err()
             .map_or(OzonErrorKind::Http, OzonError::kind);
-        trace_response(&request_trace, status, request_id.as_deref(), false, kind);
-        result.map(RequestAttempt::Complete)
+        // Receiving a successful status does not mean the complete JSON body
+        // reached us. A proxy or upstream can close the stream between chunks;
+        // all Ozon routes exposed by this client are read-only, so replaying
+        // that interrupted attempt is safe and prevents partial analytics from
+        // surfacing to browser clients.
+        let will_retry = result
+            .as_ref()
+            .is_err_and(|error| is_retriable_transport(error.kind()) && attempt < MAX_ATTEMPTS);
+        trace_response(
+            &request_trace,
+            status,
+            request_id.as_deref(),
+            will_retry,
+            kind,
+        );
+        match result {
+            Err(error) if will_retry => Ok(RequestAttempt::Retry {
+                delay: retry_delay(attempt, None),
+                error,
+            }),
+            result => result.map(RequestAttempt::Complete),
+        }
     }
 
     async fn acquire_request_permits<'a>(
@@ -1817,6 +1853,52 @@ mod tests {
             .unwrap();
 
         assert_eq!(value, serde_json::json!({"ok": true}));
+        assert_request_count(&requests, 2);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_response_body_is_retried_without_returning_partial_data() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, requests) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            sender.send(read_request(&first)).unwrap();
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: close\r\nx-request-id: interrupted\r\n\r\n{\"partial\":true}",
+                )
+                .unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            sender.send(read_request(&second)).unwrap();
+            let body = br#"{"ok":true,"rows":[1,2,3]}"#;
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            second.write_all(body).unwrap();
+        });
+        let client = OzonClient::new(
+            format!("http://{address}"),
+            Duration::from_secs(1),
+            credentials(),
+        )
+        .unwrap();
+
+        let value = client
+            .post(
+                &StoreId::from("ofk"),
+                "/v1/rating/summary",
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(value, serde_json::json!({"ok": true, "rows": [1, 2, 3]}));
         assert_request_count(&requests, 2);
     }
 
