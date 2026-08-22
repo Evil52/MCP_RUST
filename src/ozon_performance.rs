@@ -1476,8 +1476,8 @@ mod tests {
             credentials(),
         );
         let state = client.accounts.get(&StoreId::from("shop")).unwrap();
-        let _first = state.in_flight.acquire().await.unwrap();
-        let _second = state.in_flight.acquire().await.unwrap();
+        let first_permit = state.in_flight.acquire().await.unwrap();
+        let second_permit = state.in_flight.acquire().await.unwrap();
         assert_eq!(
             client
                 .campaigns(&StoreId::from("shop"), campaigns_query())
@@ -1487,8 +1487,8 @@ mod tests {
             PerformanceErrorKind::Overloaded
         );
 
-        drop(_first);
-        drop(_second);
+        drop(first_permit);
+        drop(second_permit);
         let _statistics = state.statistics_in_flight.acquire().await.unwrap();
         assert_eq!(
             client
