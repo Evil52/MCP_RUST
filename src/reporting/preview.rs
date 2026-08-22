@@ -234,7 +234,7 @@ mod tests {
                     (observed, observed)
                 };
                 SnapshotDescriptor::new(
-                    index as i64 + 1,
+                    i64::try_from(index).expect("fixture index fits i64") + 1,
                     "store".to_owned(),
                     Marketplace::Ozon,
                     source,
@@ -361,7 +361,7 @@ mod tests {
                         snapshot.period()
                     };
                     SnapshotDescriptor::new(
-                        index as i64 + 10,
+                        i64::try_from(index).expect("fixture index fits i64") + 10,
                         snapshot.account_id().to_owned(),
                         snapshot.marketplace(),
                         snapshot.source(),

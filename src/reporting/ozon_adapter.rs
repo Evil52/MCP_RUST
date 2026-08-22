@@ -551,14 +551,12 @@ fn parse_count(value: &Value) -> Result<u64, OzonReportParseError> {
                 return Ok(value);
             }
             let value = number.as_f64().ok_or(OzonReportParseError::Value)?;
-            if !value.is_finite()
-                || value.is_sign_negative()
-                || value.fract() != 0.0
-                || value > u64::MAX as f64
-            {
+            if !value.is_finite() || value.is_sign_negative() || value.fract() != 0.0 {
                 return Err(OzonReportParseError::Value);
             }
-            Ok(value as u64)
+            format!("{value:.0}")
+                .parse()
+                .map_err(|_| OzonReportParseError::Value)
         }
         Value::String(_) => parse_u64(value),
         _ => Err(OzonReportParseError::Value),
@@ -796,6 +794,10 @@ mod tests {
             }]}
         }));
         assert_eq!(invalid_kind, Err(OzonReportParseError::Value));
+        assert_eq!(
+            parse_count(&json!(18_446_744_073_709_551_616.0)),
+            Err(OzonReportParseError::Value)
+        );
 
         let string_count = parse_sales_page(&json!({
             "result": {"data": [{

@@ -2083,11 +2083,13 @@ fn parse_retry_delay(headers: &HeaderMap, now: DateTime<Utc>) -> ParsedRetryDela
             return DateTime::parse_from_rfc2822(value).ok().map_or(
                 ParsedRetryDelay::Invalid,
                 |retry_at| {
-                    let seconds = retry_at
+                    let nonnegative_seconds = retry_at
                         .with_timezone(&Utc)
                         .signed_duration_since(now)
                         .num_seconds()
-                        .max(0) as u64;
+                        .max(0);
+                    let seconds = u64::try_from(nonnegative_seconds)
+                        .expect("nonnegative i64 always fits u64");
                     ParsedRetryDelay::Valid(Duration::from_secs(seconds))
                 },
             );

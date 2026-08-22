@@ -1844,7 +1844,7 @@ fn nonnegative_optional_i32(value: Option<i32>) -> Result<Option<u64>, Reporting
 
 fn valid_http_status(value: i16) -> Result<u16, ReportingReadError> {
     if (400..=599).contains(&value) {
-        Ok(value as u16)
+        u16::try_from(value).map_err(|_| ReportingReadError::InvalidPublishedData)
     } else {
         Err(ReportingReadError::InvalidPublishedData)
     }
