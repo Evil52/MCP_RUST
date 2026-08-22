@@ -299,9 +299,7 @@ impl GmailOutboxWorker {
             return Ok(DeliveryTickOutcome::Idle);
         };
 
-        let bundle = if let Ok(bundle) = self.artifacts.load(claim.artifact.clone()).await {
-            bundle
-        } else {
+        let Ok(bundle) = self.artifacts.load(claim.artifact.clone()).await else {
             let finished_at = self.clock.now();
             self.outbox
                 .permanent(
@@ -815,14 +813,8 @@ mod tests {
     fn report_bundle(recipient: &str) -> ReportBundle {
         let html = "<html><body>local Gmail outbox report</body></html>".to_owned();
         let xlsx = b"local-gmail-outbox-xlsx".to_vec();
-        let sha256 = Sha256::digest(&xlsx)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let html_sha256 = Sha256::digest(html.as_bytes())
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let sha256 = hex_sha256(&xlsx);
+        let html_sha256 = hex_sha256(html.as_bytes());
         ReportBundle {
             artifact: ArtifactIdentity {
                 object_key: format!("daily-reports/2098/08/19/{recipient}/v1/evening.xlsx"),
@@ -833,6 +825,16 @@ mod tests {
             html,
             xlsx,
         }
+    }
+
+    fn hex_sha256(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .fold(String::with_capacity(64), |mut output, byte| {
+                use std::fmt::Write as _;
+                write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                output
+            })
     }
 
     fn create_outcome_id(outcome: CreateOutcome) -> i64 {

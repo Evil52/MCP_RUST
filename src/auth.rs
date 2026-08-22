@@ -460,6 +460,7 @@ pub struct ProtectedResourceMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::{
         collections::BTreeMap,
         fs,
@@ -652,15 +653,17 @@ mod tests {
         let mut headers =
             format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n");
         for (name, value) in extra_headers {
-            headers.push_str(&format!("{name}: {value}\r\n"));
+            write!(headers, "{name}: {value}\r\n").expect("writing to String cannot fail");
         }
         if chunked {
             headers.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
         } else {
-            headers.push_str(&format!(
+            write!(
+                headers,
                 "Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
-            ));
+            )
+            .expect("writing to String cannot fail");
         }
 
         stream.write_all(headers.as_bytes())?;
@@ -878,7 +881,7 @@ mod tests {
         let service: StreamableHttpService<OzonMcp, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok((*server).clone()),
-                Default::default(),
+                Arc::default(),
                 StreamableHttpServerConfig::default()
                     .with_legacy_session_mode(false)
                     .with_json_response(true),
@@ -1207,7 +1210,8 @@ mod tests {
             std::time::Instant::now()
                 .checked_sub(FAILED_REFRESH_COOLDOWN)
                 .unwrap()
-                - Duration::from_millis(1),
+                .checked_sub(Duration::from_millis(1))
+                .unwrap(),
         );
         assert_eq!(
             auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "admin")))

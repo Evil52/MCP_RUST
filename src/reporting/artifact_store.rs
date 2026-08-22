@@ -392,8 +392,11 @@ fn validate_loaded_bytes(bytes: &[u8], maximum: u64) -> Result<(), ArtifactStore
 fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            use std::fmt::Write as _;
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
 }
 
 #[cfg(test)]

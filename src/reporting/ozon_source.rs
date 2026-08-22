@@ -1620,7 +1620,7 @@ mod tests {
         let client = OzonClient::new(
             "http://127.0.0.1:1".to_owned(),
             std::time::Duration::from_millis(1),
-            Default::default(),
+            BTreeMap::default(),
         )
         .unwrap();
         let transport = OzonClientReportTransport::new(client, StoreId::from("missing"));

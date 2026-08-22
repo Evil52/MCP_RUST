@@ -87,15 +87,19 @@ fn snapshot_with_status(
 fn artifact(recipient_id: &str) -> ArtifactIdentity {
     ArtifactIdentity {
         object_key: format!("daily-reports/2099/09/16/{recipient_id}/v1/morning.xlsx"),
-        sha256: Sha256::digest(b"mcp-read-integration-xlsx")
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-        html_sha256: Sha256::digest(b"<html>mcp read integration</html>")
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
+        sha256: hex_sha256(b"mcp-read-integration-xlsx"),
+        html_sha256: hex_sha256(b"<html>mcp read integration</html>"),
     }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            use std::fmt::Write as _;
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
 }
 
 #[tokio::test]

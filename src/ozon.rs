@@ -682,9 +682,7 @@ impl OzonClient {
                 .global_in_flight
                 .try_acquire()
                 .map_err(|_| OzonError::Overloaded)?;
-            let client_permit = if let Ok(permit) = limiter.in_flight.try_acquire() {
-                permit
-            } else {
+            let Ok(client_permit) = limiter.in_flight.try_acquire() else {
                 drop(global_permit);
                 return Err(OzonError::Overloaded);
             };
@@ -1024,6 +1022,7 @@ fn elapsed_millis(started_at: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::{
         future::Future,
         io::{BufRead, BufReader, Read, Write},
@@ -1102,10 +1101,11 @@ mod tests {
                     response.status
                 );
                 if response.include_content_length {
-                    head.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
+                    writeln!(head, "Content-Length: {}\r", response.body.len())
+                        .expect("writing to String cannot fail");
                 }
                 for (name, value) in response.headers {
-                    head.push_str(&format!("{name}: {value}\r\n"));
+                    writeln!(head, "{name}: {value}\r").expect("writing to String cannot fail");
                 }
                 head.push_str("\r\n");
                 if stream.write_all(head.as_bytes()).is_ok() {

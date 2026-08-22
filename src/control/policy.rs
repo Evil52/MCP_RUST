@@ -135,10 +135,14 @@ impl ControlPolicy {
         let mut policy: Self = serde_json::from_slice(bytes)
             .with_context(|| format!("не удалось разобрать control policy {}", path.display()))?;
         policy.validate(registry)?;
-        policy.digest = Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        policy.digest =
+            Sha256::digest(bytes)
+                .iter()
+                .fold(String::with_capacity(64), |mut output, byte| {
+                    use std::fmt::Write as _;
+                    write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                    output
+                });
         Ok(policy)
     }
 

@@ -2203,11 +2203,15 @@ fn make_approval_id(
 }
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    use std::fmt::Write as _;
+
+    bytes.as_ref().iter().fold(
+        String::with_capacity(bytes.as_ref().len().saturating_mul(2)),
+        |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        },
+    )
 }
 
 pub fn validate_control_database_url(value: &str) -> Result<Config, PlanStoreError> {

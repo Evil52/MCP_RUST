@@ -1552,9 +1552,7 @@ impl WbClient {
                 .global_in_flight
                 .try_acquire()
                 .map_err(|_| WbError::Overloaded)?;
-            let token_permit = if let Ok(permit) = limiter.in_flight.try_acquire() {
-                permit
-            } else {
+            let Ok(token_permit) = limiter.in_flight.try_acquire() else {
                 drop(global_permit);
                 return Err(WbError::Overloaded);
             };

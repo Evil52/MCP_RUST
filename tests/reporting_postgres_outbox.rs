@@ -36,15 +36,19 @@ fn artifact_for(date: &str, recipient: &str) -> ArtifactIdentity {
 fn artifact_for_kind(date: &str, recipient: &str, kind: &str) -> ArtifactIdentity {
     ArtifactIdentity {
         object_key: format!("daily-reports/{date}/{recipient}/v1/{kind}.xlsx"),
-        sha256: Sha256::digest(b"integration-xlsx")
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-        html_sha256: Sha256::digest(b"<html><body>integration report</body></html>")
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
+        sha256: hex_sha256(b"integration-xlsx"),
+        html_sha256: hex_sha256(b"<html><body>integration report</body></html>"),
     }
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            use std::fmt::Write as _;
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
 }
 
 fn artifact_bundle() -> ReportBundle {

@@ -7077,7 +7077,7 @@ mod tests {
         let service: StreamableHttpService<OzonMcp, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok((*server).clone()),
-                Default::default(),
+                Arc::default(),
                 StreamableHttpServerConfig::default()
                     .with_legacy_session_mode(false)
                     .with_json_response(true),
@@ -12758,7 +12758,7 @@ mod tests {
         let service: StreamableHttpService<OzonMcp, LocalSessionManager> =
             StreamableHttpService::new(
                 move || Ok((*server).clone()),
-                Default::default(),
+                Arc::default(),
                 StreamableHttpServerConfig::default()
                     .with_legacy_session_mode(false)
                     .with_json_response(true),

@@ -258,6 +258,8 @@ pub fn report_cutoff(key: &ReportKey) -> Result<DateTime<Utc>, ReportScheduleErr
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use chrono::{NaiveDate, TimeZone, Utc};
 
     use super::{
@@ -286,7 +288,7 @@ mod tests {
                 utc(2026, 8, 16, 2, 59),
                 "pilot_owner",
                 1,
-                &Default::default()
+                &BTreeSet::default()
             )
             .unwrap()
             .is_empty()
@@ -296,7 +298,7 @@ mod tests {
             utc(2026, 8, 16, 3, 0),
             "pilot_owner",
             1,
-            &Default::default(),
+            &BTreeSet::default(),
         )
         .unwrap();
         assert_eq!(on_time.len(), 1);
@@ -307,7 +309,7 @@ mod tests {
             utc(2026, 8, 16, 5, 0),
             "pilot_owner",
             1,
-            &Default::default(),
+            &BTreeSet::default(),
         )
         .unwrap();
         assert!(late[0].delayed);
@@ -344,7 +346,7 @@ mod tests {
             utc(2026, 8, 16, 13, 30),
             "pilot_owner",
             1,
-            &Default::default(),
+            &BTreeSet::default(),
         )
         .unwrap();
 
@@ -386,7 +388,7 @@ mod tests {
                 utc(2026, 8, 16, 10, 0),
                 "pilot_owner",
                 1,
-                &Default::default()
+                &BTreeSet::default()
             )
             .unwrap()
             .is_empty()
@@ -396,7 +398,7 @@ mod tests {
                 utc(2026, 8, 16, 18, 1),
                 "pilot_owner",
                 1,
-                &Default::default()
+                &BTreeSet::default()
             )
             .unwrap()
             .is_empty()
@@ -427,7 +429,7 @@ mod tests {
     fn invalid_identities_and_unrepresentable_dates_fail_closed() {
         for recipient in ["", "bad recipient", "почта", &"x".repeat(129)] {
             assert_eq!(
-                due_deliveries(utc(2026, 8, 16, 3, 0), recipient, 1, &Default::default()),
+                due_deliveries(utc(2026, 8, 16, 3, 0), recipient, 1, &BTreeSet::default()),
                 Err(ReportScheduleError::InvalidRecipientId)
             );
         }
@@ -436,7 +438,7 @@ mod tests {
                 utc(2026, 8, 16, 3, 0),
                 "pilot_owner",
                 0,
-                &Default::default()
+                &BTreeSet::default()
             ),
             Err(ReportScheduleError::InvalidReportVersion)
         );
