@@ -1596,6 +1596,12 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    // LLVM's line mapper assigns the closing edge of the intentionally racy
+    // `if let` below to a standalone source line. Whether that synthetic edge
+    // executes depends on OS thread scheduling, so instrumenting this test made
+    // the 100% line gate nondeterministic even though both production outcomes
+    // are covered elsewhere.
+    #[cfg_attr(coverage, coverage(off))]
     #[test]
     fn concurrent_readers_never_observe_a_torn_registry_while_it_is_rewritten() {
         // Every tool call loads the registry, so reads run concurrently with an
