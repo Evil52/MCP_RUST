@@ -77,7 +77,9 @@ jobs:
       - name: Verify PostgreSQL repository transaction contract
         run: ./scripts/with-position-test-db.sh ./scripts/test-position-runtime.sh
 
-      - name: Run Clippy with warnings denied
+      - name: Run Clippy with pedantic warnings denied
+        # Cargo.toml sets clippy::all and clippy::pedantic to deny while
+        # retaining the explicit legacy-debt allowlist.
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Build documentation with warnings denied
