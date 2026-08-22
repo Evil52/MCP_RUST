@@ -1263,7 +1263,7 @@ mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::sync::{
-        Mutex,
+        Barrier, Mutex,
         atomic::{AtomicU64, Ordering},
     };
 
@@ -1605,17 +1605,21 @@ mod tests {
             serde_json::to_vec_pretty(&renamed).unwrap(),
         ];
         let source = RegistrySource::new(&path).unwrap();
+        let writes_finished = Arc::new(Barrier::new(5));
 
         std::thread::scope(|scope| {
             let writer_path = path.clone();
+            let writer_finished = Arc::clone(&writes_finished);
             let writer = scope.spawn(move || {
                 for round in 0..200 {
                     std::fs::write(&writer_path, &generations[round % 2]).unwrap();
                 }
+                writer_finished.wait();
             });
             let readers: Vec<_> = (0..4)
                 .map(|_| {
                     let source = source.clone();
+                    let writes_finished = Arc::clone(&writes_finished);
                     scope.spawn(move || {
                         let mut observed = 0_usize;
                         for _ in 0..200 {
@@ -1632,6 +1636,17 @@ mod tests {
                                 observed += 1;
                             }
                         }
+                        // Coverage instrumentation can let the writer finish
+                        // before any reader gets scheduled. Synchronize on the
+                        // completed final write, then require one whole
+                        // generation so the assertion cannot pass vacuously.
+                        writes_finished.wait();
+                        let registry = source
+                            .load()
+                            .expect("the completed final registry is readable");
+                        assert_eq!(registry.actors.len(), 2);
+                        assert_eq!(registry.accounts.len(), 1);
+                        observed += 1;
                         observed
                     })
                 })
