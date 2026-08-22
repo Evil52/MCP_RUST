@@ -149,6 +149,7 @@ pub fn due_deliveries(
 }
 
 /// Converts an instant to the business date used by daily-report identities.
+#[must_use]
 pub fn business_date(now: DateTime<Utc>) -> NaiveDate {
     now.with_timezone(&yekaterinburg_offset()).date_naive()
 }

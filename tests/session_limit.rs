@@ -155,7 +155,12 @@ async fn an_abandoned_initialized_session_expires_and_releases_its_slot() {
     complete_initialize(Arc::clone(&manager), id.clone(), &mut transport).await;
     assert!(manager.has_session(&id).await.unwrap());
 
-    tokio::time::advance(idle_timeout - std::time::Duration::from_millis(1)).await;
+    tokio::time::advance(
+        idle_timeout
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap(),
+    )
+    .await;
     tokio::task::yield_now().await;
     assert!(manager.has_session(&id).await.unwrap());
 
@@ -217,7 +222,12 @@ async fn in_flight_request_suspends_idle_expiry_then_restarts_the_countdown() {
         .expect("handler completes the request");
     tokio::task::yield_now().await;
 
-    tokio::time::advance(idle_timeout - std::time::Duration::from_millis(1)).await;
+    tokio::time::advance(
+        idle_timeout
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap(),
+    )
+    .await;
     tokio::task::yield_now().await;
     assert!(manager.has_session(&id).await.unwrap());
     tokio::time::advance(std::time::Duration::from_millis(1)).await;

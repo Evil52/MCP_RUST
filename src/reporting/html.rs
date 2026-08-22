@@ -222,13 +222,14 @@ fn money(minor: u64) -> String {
 }
 
 fn optional_money(value: Option<u64>) -> String {
-    value.map(money).unwrap_or_else(|| "N/D".to_owned())
+    value.map_or_else(|| "N/D".to_owned(), money)
 }
 
 fn rate(value: Option<BasisPoints>) -> String {
-    value
-        .map(|BasisPoints(points)| format!("{}.{:02}%", points / 100, points % 100))
-        .unwrap_or_else(|| "N/D".to_owned())
+    value.map_or_else(
+        || "N/D".to_owned(),
+        |BasisPoints(points)| format!("{}.{:02}%", points / 100, points % 100),
+    )
 }
 
 #[cfg(test)]

@@ -26,7 +26,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// This bounds the entire manual account run, including pagination and the
 /// transactional snapshot publication, so a slow upstream cannot hold an
 /// operator invocation forever.
-const REPORT_TARGET_TOTAL_DEADLINE: Duration = Duration::from_secs(12 * 60);
+const REPORT_TARGET_TOTAL_DEADLINE: Duration = Duration::from_mins(12);
 const SCHEDULED_TICK: Duration = Duration::from_secs(60);
 const MAX_CONSECUTIVE_SCHEDULER_FAILURES: u32 = 5;
 
@@ -270,7 +270,7 @@ async fn run_collection_scheduler(
     loop {
         tokio::select! {
             biased;
-            _ = cancellation.cancelled() => return Ok(()),
+            () = cancellation.cancelled() => return Ok(()),
             _ = timer.tick() => {}
         }
         match run_due_collection(config, writer, Utc::now(), cancellation).await {
@@ -342,7 +342,7 @@ async fn run_due_collection(
         let deadline = remaining.min(REPORT_TARGET_TOTAL_DEADLINE);
         let outcome = tokio::select! {
             biased;
-            _ = cancellation.cancelled() => {
+            () = cancellation.cancelled() => {
                 let released = writer.release_claim(&claim).await.unwrap_or(false);
                 tracing::info!(
                     account_id = target.account_id,
@@ -669,8 +669,8 @@ async fn shutdown_signal() {
             }
         };
         tokio::select! {
-            _ = ctrl_c => {}
-            _ = terminate => {}
+            () = ctrl_c => {}
+            () = terminate => {}
         }
     }
     #[cfg(not(unix))]

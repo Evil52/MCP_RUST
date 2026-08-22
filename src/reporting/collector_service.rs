@@ -158,10 +158,11 @@ impl ReportCollectorConfig {
             matches!(
                 (mode, policy.enabled, credential_directory.is_some()),
                 (ReportCollectorMode::Disabled, false, false)
-                    | (ReportCollectorMode::OzonDryRun, false, false)
-                    | (ReportCollectorMode::OzonDryRun, false, true)
-                    | (ReportCollectorMode::WbDryRun, false, false)
-                    | (ReportCollectorMode::WbDryRun, false, true)
+                    | (
+                        ReportCollectorMode::OzonDryRun | ReportCollectorMode::WbDryRun,
+                        false,
+                        false | true
+                    )
                     | (ReportCollectorMode::Scheduled, true, true)
             ),
             "report collector mode, policy and credential directory are inconsistent"
@@ -176,18 +177,22 @@ impl ReportCollectorConfig {
         })
     }
 
+    #[must_use]
     pub fn mode(&self) -> ReportCollectorMode {
         self.mode
     }
 
+    #[must_use]
     pub fn policy(&self) -> &DailyReportPolicy {
         &self.policy
     }
 
+    #[must_use]
     pub fn collection_plan(&self) -> &[CollectionTarget] {
         &self.collection_plan
     }
 
+    #[must_use]
     pub fn database_config(&self) -> &Config {
         &self.database
     }

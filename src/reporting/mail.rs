@@ -44,26 +44,32 @@ impl fmt::Debug for ReportEmail {
 }
 
 impl ReportEmail {
+    #[must_use]
     pub fn sender(&self) -> &str {
         &self.sender
     }
 
+    #[must_use]
     pub fn recipient(&self) -> &str {
         &self.recipient
     }
 
+    #[must_use]
     pub fn subject(&self) -> &str {
         &self.subject
     }
 
+    #[must_use]
     pub fn html(&self) -> &str {
         &self.html
     }
 
+    #[must_use]
     pub fn attachment_name(&self) -> &str {
         &self.attachment_name
     }
 
+    #[must_use]
     pub fn xlsx(&self) -> &[u8] {
         &self.xlsx
     }
@@ -73,6 +79,7 @@ impl ReportEmail {
     /// Every interpolated header value was validated or generated locally.
     /// Body parts are base64 encoded and wrapped, so neither HTML nor workbook
     /// bytes can escape their MIME section.
+    #[must_use]
     pub fn gmail_raw(&self) -> String {
         let mut digest = Sha256::new();
         digest.update(self.sender.as_bytes());

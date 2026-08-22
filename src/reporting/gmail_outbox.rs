@@ -38,7 +38,7 @@ type DeliveryFuture<'a> = Pin<
 >;
 
 trait DeliveryOutbox: Send + Sync {
-    fn claim<'a>(&'a self, now: DateTime<Utc>) -> ClaimFuture<'a>;
+    fn claim(&self, now: DateTime<Utc>) -> ClaimFuture<'_>;
 
     fn sent<'a>(
         &'a self,
@@ -75,7 +75,7 @@ trait DeliveryOutbox: Send + Sync {
 }
 
 impl DeliveryOutbox for PostgresOutboxRepository {
-    fn claim<'a>(&'a self, now: DateTime<Utc>) -> ClaimFuture<'a> {
+    fn claim(&self, now: DateTime<Utc>) -> ClaimFuture<'_> {
         Box::pin(async move { self.claim_ready(now).await })
     }
 
@@ -134,11 +134,11 @@ impl DeliveryOutbox for PostgresOutboxRepository {
 }
 
 trait ArtifactLoader: Send + Sync {
-    fn load<'a>(&'a self, artifact: ArtifactIdentity) -> ArtifactFuture<'a>;
+    fn load(&self, artifact: ArtifactIdentity) -> ArtifactFuture<'_>;
 }
 
 impl ArtifactLoader for LocalArtifactStore {
-    fn load<'a>(&'a self, artifact: ArtifactIdentity) -> ArtifactFuture<'a> {
+    fn load(&self, artifact: ArtifactIdentity) -> ArtifactFuture<'_> {
         let store = self.clone();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || LocalArtifactStore::load(&store, &artifact))
@@ -175,6 +175,7 @@ impl fmt::Debug for GmailProvider {
 }
 
 impl GmailProvider {
+    #[must_use]
     pub fn new(
         service: GmailDeliveryService,
         routing: MailRouting,
@@ -258,6 +259,7 @@ impl fmt::Debug for GmailOutboxWorker {
 }
 
 impl GmailOutboxWorker {
+    #[must_use]
     pub fn new(
         outbox: PostgresOutboxRepository,
         artifacts: LocalArtifactStore,
@@ -297,21 +299,20 @@ impl GmailOutboxWorker {
             return Ok(DeliveryTickOutcome::Idle);
         };
 
-        let bundle = match self.artifacts.load(claim.artifact.clone()).await {
-            Ok(bundle) => bundle,
-            Err(_) => {
-                let finished_at = self.clock.now();
-                self.outbox
-                    .permanent(
-                        &claim,
-                        started_at,
-                        finished_at,
-                        DeliveryErrorClass::InvalidArtifact,
-                    )
-                    .await
-                    .map_err(|_| GmailOutboxError::CompletionUncertain)?;
-                return Ok(permanent_outcome(&claim));
-            }
+        let bundle = if let Ok(bundle) = self.artifacts.load(claim.artifact.clone()).await {
+            bundle
+        } else {
+            let finished_at = self.clock.now();
+            self.outbox
+                .permanent(
+                    &claim,
+                    started_at,
+                    finished_at,
+                    DeliveryErrorClass::InvalidArtifact,
+                )
+                .await
+                .map_err(|_| GmailOutboxError::CompletionUncertain)?;
+            return Ok(permanent_outcome(&claim));
         };
 
         let result = self.delivery.deliver(&claim, bundle).await;
@@ -503,7 +504,7 @@ mod tests {
     }
 
     impl DeliveryOutbox for FakeOutbox {
-        fn claim<'a>(&'a self, _now: DateTime<Utc>) -> ClaimFuture<'a> {
+        fn claim(&self, _now: DateTime<Utc>) -> ClaimFuture<'_> {
             Box::pin(async move { self.claims.lock().unwrap().pop_front().unwrap_or(Ok(None)) })
         }
 
@@ -568,7 +569,7 @@ mod tests {
     }
 
     impl ArtifactLoader for FakeArtifacts {
-        fn load<'a>(&'a self, _artifact: ArtifactIdentity) -> ArtifactFuture<'a> {
+        fn load(&self, _artifact: ArtifactIdentity) -> ArtifactFuture<'_> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 if self.fail {

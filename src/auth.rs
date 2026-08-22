@@ -53,6 +53,7 @@ impl JwtAuthenticationFailure {
         }
     }
 
+    #[must_use]
     pub fn public_message(self) -> &'static str {
         match self {
             Self::MissingCredentials => "Требуется авторизация: access token не передан.",
@@ -183,6 +184,7 @@ impl JwtAuthenticator {
         })
     }
 
+    #[must_use]
     pub fn protected_resource_metadata(&self) -> ProtectedResourceMetadata {
         ProtectedResourceMetadata {
             resource: self.config.resource_url.clone(),
@@ -192,14 +194,17 @@ impl JwtAuthenticator {
         }
     }
 
+    #[must_use]
     pub fn required_scopes(&self) -> &[String] {
         &self.config.required_scopes
     }
 
+    #[must_use]
     pub fn resource_metadata_url(&self) -> &str {
         &self.config.resource_metadata_url
     }
 
+    #[must_use]
     pub fn challenge(&self, failure: &JwtAuthenticationFailure) -> Option<String> {
         let base = format!(
             "Bearer resource_metadata=\"{}\", scope=\"{}\"",
@@ -1198,8 +1203,12 @@ mod tests {
 
         // Avoid a real five-second sleep while proving that a later request can
         // retry an empty cache after the global failure cooldown expires.
-        auth.cache.write().await.last_failed_refresh_at =
-            Some(std::time::Instant::now() - FAILED_REFRESH_COOLDOWN - Duration::from_millis(1));
+        auth.cache.write().await.last_failed_refresh_at = Some(
+            std::time::Instant::now()
+                .checked_sub(FAILED_REFRESH_COOLDOWN)
+                .unwrap()
+                - Duration::from_millis(1),
+        );
         assert_eq!(
             auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "admin")))
                 .await
@@ -1819,7 +1828,7 @@ mod tests {
         );
     }
 
-    /// The IdP publishes a key under the exact `kid` the token names, but the
+    /// The `IdP` publishes a key under the exact `kid` the token names, but the
     /// key material itself cannot be turned into an RS256 decoding key. That is
     /// an operator-side outage, not an invalid token: reporting it as
     /// `InvalidToken` would tell the client to re-authorize forever, and

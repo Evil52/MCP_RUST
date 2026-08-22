@@ -231,6 +231,7 @@ where
 }
 
 impl ControlMcp {
+    #[must_use]
     pub fn new_disabled(actor_id: String, registry: RegistrySource, policy: ControlPolicy) -> Self {
         Self {
             policy: Arc::new(policy),
@@ -242,6 +243,7 @@ impl ControlMcp {
         }
     }
 
+    #[must_use]
     pub fn new_authenticated_disabled(
         registry: RegistrySource,
         policy: ControlPolicy,
@@ -332,6 +334,7 @@ impl ControlMcp {
             .map(JwtAuthenticator::protected_resource_metadata)
     }
 
+    #[must_use]
     pub fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
         self.authenticator.as_ref()
     }

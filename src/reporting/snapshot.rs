@@ -90,10 +90,12 @@ impl AccountScope {
         })
     }
 
+    #[must_use]
     pub fn account_id(&self) -> &str {
         &self.account_id
     }
 
+    #[must_use]
     pub fn marketplace(&self) -> Marketplace {
         self.marketplace
     }
@@ -159,46 +161,57 @@ impl SnapshotDescriptor {
         })
     }
 
+    #[must_use]
     pub fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
 
+    #[must_use]
     pub fn account_id(&self) -> &str {
         &self.account_id
     }
 
+    #[must_use]
     pub fn marketplace(&self) -> Marketplace {
         self.marketplace
     }
 
+    #[must_use]
     pub fn source(&self) -> SnapshotSource {
         self.source
     }
 
+    #[must_use]
     pub fn cutoff_at(&self) -> DateTime<Utc> {
         self.cutoff_at
     }
 
+    #[must_use]
     pub fn source_as_of(&self) -> DateTime<Utc> {
         self.source_as_of
     }
 
+    #[must_use]
     pub fn period(&self) -> (DateTime<Utc>, DateTime<Utc>) {
         (self.period_start, self.period_end)
     }
 
+    #[must_use]
     pub fn row_count(&self) -> u32 {
         self.row_count
     }
 
+    #[must_use]
     pub fn pagination_complete(&self) -> bool {
         self.pagination_complete
     }
 
+    #[must_use]
     pub fn status(&self) -> SnapshotStatus {
         self.status
     }
 
+    #[must_use]
     pub fn quality(&self) -> SnapshotQuality {
         let completeness = if self.status == SnapshotStatus::Partial || !self.pagination_complete {
             SnapshotQuality::Partial
@@ -284,18 +297,22 @@ impl FrozenSnapshotManifest {
         })
     }
 
+    #[must_use]
     pub fn cutoff_at(&self) -> DateTime<Utc> {
         self.cutoff_at
     }
 
+    #[must_use]
     pub fn snapshots(&self) -> &[SnapshotDescriptor] {
         &self.snapshots
     }
 
+    #[must_use]
     pub fn quality(&self) -> SnapshotQuality {
         self.quality
     }
 
+    #[must_use]
     pub fn recommendations_allowed(&self) -> bool {
         self.quality == SnapshotQuality::Complete
     }

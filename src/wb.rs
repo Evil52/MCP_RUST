@@ -322,6 +322,7 @@ pub enum WbErrorKind {
 }
 
 impl WbErrorKind {
+    #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
             Self::EndpointNotAllowed => "endpoint_not_allowed",
@@ -417,6 +418,7 @@ impl fmt::Debug for WbError {
 }
 
 impl WbError {
+    #[must_use]
     pub const fn kind(&self) -> WbErrorKind {
         match self {
             Self::EndpointNotAllowed { .. } => WbErrorKind::EndpointNotAllowed,
@@ -435,6 +437,7 @@ impl WbError {
         }
     }
 
+    #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::Unauthorized { request_id }
@@ -838,6 +841,7 @@ enum AttemptOutcome {
 }
 
 impl WbClient {
+    #[must_use]
     pub fn new(timeout: Duration, accounts: BTreeMap<String, WbCredentials>) -> Self {
         Self::build(
             timeout,
@@ -958,10 +962,12 @@ impl WbClient {
         })
     }
 
+    #[must_use]
     pub fn empty(timeout: Duration) -> Self {
         Self::new(timeout, BTreeMap::new())
     }
 
+    #[must_use]
     pub fn is_configured(&self, account: &str) -> bool {
         self.accounts.contains_key(account)
     }
@@ -1546,12 +1552,11 @@ impl WbClient {
                 .global_in_flight
                 .try_acquire()
                 .map_err(|_| WbError::Overloaded)?;
-            let token_permit = match limiter.in_flight.try_acquire() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    drop(global_permit);
-                    return Err(WbError::Overloaded);
-                }
+            let token_permit = if let Ok(permit) = limiter.in_flight.try_acquire() {
+                permit
+            } else {
+                drop(global_permit);
+                return Err(WbError::Overloaded);
             };
             if limiter.try_claim(request_class, interval).await.is_ok() {
                 return Ok((global_permit, token_permit));
@@ -2077,17 +2082,17 @@ fn parse_retry_delay(headers: &HeaderMap, now: DateTime<Utc>) -> ParsedRetryDela
             return ParsedRetryDelay::Valid(Duration::from_secs(seconds));
         }
         if name == RETRY_AFTER.as_str() {
-            return DateTime::parse_from_rfc2822(value)
-                .ok()
-                .map(|retry_at| {
+            return DateTime::parse_from_rfc2822(value).ok().map_or(
+                ParsedRetryDelay::Invalid,
+                |retry_at| {
                     let seconds = retry_at
                         .with_timezone(&Utc)
                         .signed_duration_since(now)
                         .num_seconds()
                         .max(0) as u64;
                     ParsedRetryDelay::Valid(Duration::from_secs(seconds))
-                })
-                .unwrap_or(ParsedRetryDelay::Invalid);
+                },
+            );
         }
         return ParsedRetryDelay::Invalid;
     }
@@ -2613,11 +2618,11 @@ mod tests {
         let (base_url, requests) = mock_http(vec![
             (200, r#"{"Status":"OK"}"#.to_owned()),
             (200, r#"{"data":{"products":[]}}"#.to_owned()),
-            (200, r#"[]"#.to_owned()),
+            (200, "[]".to_owned()),
             (200, r#"{"data":[]}"#.to_owned()),
             (200, r#"{"items":[]}"#.to_owned()),
-            (200, r#"[]"#.to_owned()),
-            (200, r#"[]"#.to_owned()),
+            (200, "[]".to_owned()),
+            (200, "[]".to_owned()),
         ]);
         let client = client(&format!("{base_url}/"));
         assert!(client.is_configured("account"));
@@ -2857,16 +2862,15 @@ mod tests {
                     .to_ascii_lowercase()
                     .contains("authorization: bearer test-token")
             );
-            match body {
-                Some(expected) => assert_eq!(
+            if let Some(expected) = body {
+                assert_eq!(
                     serde_json::from_str::<Value>(request.split_once("\r\n\r\n").unwrap().1)
                         .unwrap(),
                     expected
-                ),
-                None => {
-                    assert!(request.ends_with("\r\n\r\n"));
-                    assert!(!request.to_ascii_lowercase().contains("content-type:"));
-                }
+                )
+            } else {
+                assert!(request.ends_with("\r\n\r\n"));
+                assert!(!request.to_ascii_lowercase().contains("content-type:"));
             }
         }
         assert!(requests.try_recv().is_err());
@@ -2881,8 +2885,8 @@ mod tests {
             (200, r#"{"response":{"data":{}}}"#.to_owned()),
             (200, r#"{"response":{"data":{}}}"#.to_owned()),
             (200, r#"{"response":{"data":{}}}"#.to_owned()),
-            (200, r#"[]"#.to_owned()),
-            (200, r#"[]"#.to_owned()),
+            (200, "[]".to_owned()),
+            (200, "[]".to_owned()),
         ]);
         let client = client(&base_url);
         let cards_payload = json!({
@@ -3523,14 +3527,14 @@ mod tests {
             vec![(200, r#"{"Status":"OK"}"#.to_owned()); 2 * MAX_IN_FLIGHT_REQUESTS_PER_TOKEN + 1];
         let (base_url, requests) = mock_http(responses);
         let client = WbClient::new_for_test(Duration::from_secs(2), accounts, &base_url, &base_url);
-        let noisy_a = Arc::clone(client.limiters.get("noisy-a").unwrap());
-        let noisy_b = Arc::clone(client.limiters.get("noisy-b").unwrap());
+        let first_noisy = Arc::clone(client.limiters.get("noisy-a").unwrap());
+        let second_noisy = Arc::clone(client.limiters.get("noisy-b").unwrap());
 
         // Holding both departure gates deterministically leaves all noisy
         // requests waiting in pacing. Four calls per token used to acquire all
         // eight global permits before reaching these locks.
-        let noisy_a_gate = noisy_a.analytics_ping.next_allowed.lock().await;
-        let noisy_b_gate = noisy_b.analytics_ping.next_allowed.lock().await;
+        let first_gate = first_noisy.analytics_ping.next_allowed.lock().await;
+        let second_gate = second_noisy.analytics_ping.next_allowed.lock().await;
         let barrier = Arc::new(tokio::sync::Barrier::new(
             2 * MAX_IN_FLIGHT_REQUESTS_PER_TOKEN + 1,
         ));
@@ -3556,11 +3560,11 @@ mod tests {
             "pacing waiters must not reserve the shared network budget"
         );
         assert_eq!(
-            noisy_a.in_flight.available_permits(),
+            first_noisy.in_flight.available_permits(),
             MAX_IN_FLIGHT_REQUESTS_PER_TOKEN
         );
         assert_eq!(
-            noisy_b.in_flight.available_permits(),
+            second_noisy.in_flight.available_permits(),
             MAX_IN_FLIGHT_REQUESTS_PER_TOKEN
         );
         let quiet = tokio::time::timeout(Duration::from_secs(1), client.ping("quiet"))
@@ -3575,7 +3579,7 @@ mod tests {
                 .starts_with("GET /ping HTTP/1.1\r\n")
         );
 
-        drop((noisy_a_gate, noisy_b_gate));
+        drop((first_gate, second_gate));
         for request in noisy_requests {
             assert_eq!(request.await.unwrap().unwrap()["Status"], "OK");
             assert!(

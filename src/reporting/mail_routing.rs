@@ -56,10 +56,12 @@ impl fmt::Debug for MailRoute {
 }
 
 impl MailRoute {
+    #[must_use]
     pub fn sender(&self) -> &str {
         &self.sender
     }
 
+    #[must_use]
     pub fn recipient(&self) -> &str {
         &self.recipient
     }
@@ -165,7 +167,7 @@ impl MailRouting {
 fn private_permissions(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
 
-    metadata.permissions().mode() & 0o077 == 0
+    metadata.permissions().mode().trailing_zeros() >= 6
 }
 
 #[cfg(not(unix))]

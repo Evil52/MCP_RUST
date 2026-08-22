@@ -102,62 +102,77 @@ impl PersistenceBatch {
         })
     }
 
+    #[must_use]
     pub fn scheduled_for(&self) -> DateTime<Utc> {
         self.scheduled_for
     }
 
+    #[must_use]
     pub fn started_at(&self) -> DateTime<Utc> {
         self.started_at
     }
 
+    #[must_use]
     pub fn finished_at(&self) -> DateTime<Utc> {
         self.finished_at
     }
 
+    #[must_use]
     pub fn collector_version(&self) -> &str {
         &self.collector_version
     }
 
+    #[must_use]
     pub fn status(&self) -> BatchStatus {
         self.status
     }
 
+    #[must_use]
     pub fn monitors_planned(&self) -> usize {
         self.monitors_planned
     }
 
+    #[must_use]
     pub fn monitors_attempted(&self) -> usize {
         self.monitors_attempted
     }
 
+    #[must_use]
     pub fn monitors_succeeded(&self) -> usize {
         self.monitors_succeeded
     }
 
+    #[must_use]
     pub fn queries_planned(&self) -> usize {
         self.queries_planned
     }
 
+    #[must_use]
     pub fn queries_attempted(&self) -> usize {
         self.queries_attempted
     }
 
+    #[must_use]
     pub fn queries_succeeded(&self) -> usize {
         self.queries_succeeded
     }
 
+    #[must_use]
     pub fn error_class(&self) -> Option<ErrorClass> {
         self.error_class
     }
 
+    #[must_use]
     pub fn http_status(&self) -> Option<u16> {
         self.http_status
     }
 
+    #[must_use]
     pub fn circuit_reason(&self) -> Option<CircuitReason> {
         self.circuit_reason
     }
 
+    #[must_use]
     pub fn measurements(&self) -> &[MeasurementRecord] {
         &self.measurements
     }
@@ -177,6 +192,7 @@ pub enum ErrorClass {
 }
 
 impl ErrorClass {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SourceDisabled => "source_disabled",
@@ -191,6 +207,7 @@ impl ErrorClass {
         }
     }
 
+    #[must_use]
     pub fn http_status(self) -> Option<u16> {
         match self {
             Self::HttpForbidden => Some(403),
@@ -223,6 +240,7 @@ pub enum CircuitReason {
 }
 
 impl CircuitReason {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Captcha => "captcha",
@@ -268,30 +286,37 @@ pub struct MeasurementRecord {
 }
 
 impl MeasurementRecord {
+    #[must_use]
     pub fn monitor_id(&self) -> i64 {
         self.monitor_id
     }
 
+    #[must_use]
     pub fn observed_at(&self) -> DateTime<Utc> {
         self.observed_at
     }
 
+    #[must_use]
     pub fn outcome(&self) -> PersistedOutcome {
         self.outcome
     }
 
+    #[must_use]
     pub fn overall_position(&self) -> Option<u16> {
         self.overall_position
     }
 
+    #[must_use]
     pub fn placement(&self) -> Option<PlacementKind> {
         self.placement
     }
 
+    #[must_use]
     pub fn organic_position(&self) -> Option<u16> {
         self.organic_position
     }
 
+    #[must_use]
     pub fn sponsored_position(&self) -> Option<u16> {
         self.sponsored_position
     }

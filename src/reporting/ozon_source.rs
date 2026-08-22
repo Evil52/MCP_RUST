@@ -5,7 +5,7 @@
 //! exact contract in `ozon_adapter` and every response is normalized before it
 //! can reach report persistence.
 
-use std::{future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde_json::Value;
@@ -165,6 +165,7 @@ pub struct OzonClientReportTransport {
 }
 
 impl OzonClientReportTransport {
+    #[must_use]
     pub fn new(client: OzonClient, store: StoreId) -> Self {
         Self { client, store }
     }
@@ -412,6 +413,7 @@ pub enum OzonReportSourceError {
 
 impl OzonReportSourceError {
     /// A stable, non-sensitive diagnostic code suitable for operator logs.
+    #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
             Self::Upstream(kind) => kind.code(),
@@ -429,6 +431,7 @@ impl OzonReportSourceError {
     /// A value-free, bounded structural fingerprint for the one sales parse
     /// failure that needs operator investigation. It never includes an Ozon
     /// response value, identifier, amount, name, or credential.
+    #[must_use]
     pub fn diagnostic(&self) -> Option<&str> {
         match self {
             Self::InvalidSalesResponse { shape } => Some(shape),
@@ -547,6 +550,7 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         scheme: &'static str,
     ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
         let mut cursor = None;
+        let mut seen_cursors = BTreeSet::new();
         let mut facts = Vec::new();
         for _ in 0..MAX_PRODUCT_PAGES {
             let request = warehouse_stock_page_request(path, cursor.as_deref())
@@ -558,6 +562,12 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             );
             cursor = next_warehouse_stock_cursor(&response)
                 .map_err(|_| OzonReportSourceError::InvalidStocksResponse)?;
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor| !seen_cursors.insert(cursor.clone()))
+            {
+                return Err(OzonReportSourceError::InvalidStocksResponse);
+            }
             if cursor.is_none() {
                 return Ok(facts);
             }
@@ -587,6 +597,7 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         F: Fn(&Value) -> Result<Vec<Fact>, OzonReportParseError> + Copy,
     {
         let mut cursor = None;
+        let mut seen_cursors = BTreeSet::new();
         let mut facts = Vec::new();
         for _ in 0..MAX_PRODUCT_PAGES {
             let request = product_page_request(path, cursor.as_deref())
@@ -594,6 +605,12 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             let response = self.transport.post(request).await?;
             facts.extend(parse(&response).map_err(|_| invalid_response.clone())?);
             cursor = next_cursor(&response, invalid_response.clone())?;
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor| !seen_cursors.insert(cursor.clone()))
+            {
+                return Err(invalid_response);
+            }
             if cursor.is_none() {
                 return Ok(facts);
             }
@@ -1041,6 +1058,15 @@ mod tests {
             invalid.collect_stock_pages().await,
             Err(OzonReportSourceError::InvalidStocksResponse)
         );
+
+        let repeated = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(json!({"products":[],"cursor":"same","has_next":true})),
+            Ok(json!({"products":[],"cursor":"same","has_next":true})),
+        ]))));
+        assert_eq!(
+            repeated.collect_stock_pages().await,
+            Err(OzonReportSourceError::InvalidStocksResponse)
+        );
     }
 
     #[tokio::test]
@@ -1079,9 +1105,18 @@ mod tests {
             Err(OzonReportSourceError::InvalidPricesResponse)
         );
 
+        let repeated = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(json!({"items": [], "cursor": "same"})),
+            Ok(json!({"items": [], "cursor": "same"})),
+        ]))));
+        assert_eq!(
+            repeated.collect_price_pages().await,
+            Err(OzonReportSourceError::InvalidPricesResponse)
+        );
+
         let bounded = OzonReportSource::new(FixtureTransport(Mutex::new(
-            std::iter::repeat_with(|| Ok(json!({"items": [], "cursor": "next"})))
-                .take(MAX_PRODUCT_PAGES)
+            (0..MAX_PRODUCT_PAGES)
+                .map(|page| Ok(json!({"items": [], "cursor": format!("next-{page}")})))
                 .collect(),
         )));
         assert_eq!(
@@ -1549,8 +1584,14 @@ mod tests {
         );
 
         let cursor = OzonReportSource::new(FixtureTransport(Mutex::new(
-            std::iter::repeat_with(|| Ok(json!({"products":[],"cursor":"next","has_next":true})))
-                .take(MAX_PRODUCT_PAGES)
+            (0..MAX_PRODUCT_PAGES)
+                .map(|page| {
+                    Ok(json!({
+                        "products":[],
+                        "cursor":format!("next-{page}"),
+                        "has_next":true
+                    }))
+                })
                 .collect(),
         )));
         assert_eq!(

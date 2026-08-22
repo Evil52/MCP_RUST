@@ -268,6 +268,7 @@ impl OzonMcp {
         tool_router
     }
 
+    #[must_use]
     pub fn new(client: OzonClient, actor_id: String, registry: RegistrySource) -> Self {
         Self {
             client,
@@ -282,6 +283,7 @@ impl OzonMcp {
         }
     }
 
+    #[must_use]
     pub fn new_authenticated(
         client: OzonClient,
         registry: RegistrySource,
@@ -313,7 +315,7 @@ impl OzonMcp {
         let admission = std::future::ready(self.tool_call_slots.try_acquire());
         let _tool_call_slot = tokio::select! {
             biased;
-            _ = &mut cancellation => return Ok(tool_call_cancelled_response()),
+            () = &mut cancellation => return Ok(tool_call_cancelled_response()),
             permit = admission => match permit {
                 Ok(permit) => permit,
                 Err(_) => return Ok(tool_call_overloaded_response()),
@@ -323,21 +325,24 @@ impl OzonMcp {
         tokio::pin!(dispatch);
         tokio::select! {
             biased;
-            _ = &mut cancellation => Ok(tool_call_cancelled_response()),
+            () = &mut cancellation => Ok(tool_call_cancelled_response()),
             result = &mut dispatch => result,
         }
     }
 
+    #[must_use]
     pub fn with_wildberries_client(mut self, wb_client: WbClient) -> Self {
         self.wb_client = wb_client;
         self
     }
 
+    #[must_use]
     pub fn with_performance_client(mut self, performance_client: PerformanceClient) -> Self {
         self.performance_client = performance_client;
         self
     }
 
+    #[must_use]
     pub fn with_reporting_reader(mut self, reporting_reader: ReportingReader) -> Self {
         self.reporting_reader = reporting_reader;
         self
@@ -353,6 +358,7 @@ impl OzonMcp {
         self.authenticator.as_ref()
     }
 
+    #[must_use]
     pub fn with_preview_features(
         mut self,
         _postings_vnext: bool,
@@ -3770,7 +3776,7 @@ impl OzonMcp {
         Ok(Self::wb_result(account, endpoint, data))
     }
 
-    /// Получает read-only список заказов Wildberries, изменённых после date_from.
+    /// Получает read-only список заказов Wildberries, изменённых после `date_from`.
     #[tool(
         name = "wb_orders",
         annotations(title = "Заказы Wildberries", read_only_hint = true)
@@ -3792,7 +3798,7 @@ impl OzonMcp {
         Ok(Self::wb_result(account, endpoint, data))
     }
 
-    /// Получает read-only список продаж и возвратов Wildberries, изменённых после date_from.
+    /// Получает read-only список продаж и возвратов Wildberries, изменённых после `date_from`.
     #[tool(
         name = "wb_sales",
         annotations(title = "Продажи и возвраты Wildberries", read_only_hint = true)
@@ -4389,7 +4395,7 @@ impl OzonMcp {
         .await
     }
 
-    /// Возвращает текущие остатки товаров Ozon с фильтрацией по offer_id или product_id.
+    /// Возвращает текущие остатки товаров Ozon с фильтрацией по `offer_id` или `product_id`.
     #[tool(
         name = "ozon_product_stocks",
         annotations(title = "Остатки товаров Ozon", read_only_hint = true)
@@ -5196,7 +5202,7 @@ impl OzonMcp {
         .await
     }
 
-    /// Устаревающий метод финансовых транзакций Ozon, отключение 2026-09-08. Для новых сценариев используйте методы ozon_finance_accrual_*.
+    /// Устаревающий метод финансовых транзакций Ozon, отключение 2026-09-08. Для новых сценариев используйте методы `ozon_finance_accrual`_*.
     #[tool(
         name = "ozon_finance_transactions",
         annotations(title = "Финансовые транзакции Ozon", read_only_hint = true)
@@ -5250,7 +5256,7 @@ impl OzonMcp {
         .await
     }
 
-    /// Устаревающий метод финансовых итогов Ozon, отключение 2026-09-08. Для новых сценариев используйте методы ozon_finance_accrual_*.
+    /// Устаревающий метод финансовых итогов Ozon, отключение 2026-09-08. Для новых сценариев используйте методы `ozon_finance_accrual`_*.
     #[tool(
         name = "ozon_finance_totals",
         annotations(title = "Финансовые итоги Ozon", read_only_hint = true)
@@ -5338,7 +5344,7 @@ impl OzonMcp {
         .await
     }
 
-    /// Получает начисления Ozon за один день с пагинацией last_id.
+    /// Получает начисления Ozon за один день с пагинацией `last_id`.
     #[tool(
         name = "ozon_finance_accrual_by_day",
         annotations(title = "Начисления Ozon за день", read_only_hint = true)
@@ -5798,20 +5804,19 @@ impl ServerHandler for OzonMcp {
             context.extensions.insert(registry);
         }
         if let Some(authenticator) = &self.authenticator {
-            let actor = match authenticated_actor(&context).cloned() {
-                Some(actor) => actor,
-                None => {
-                    let headers = request_headers(&context);
-                    match authenticator.authenticate_with_registry(&headers).await {
-                        Ok(access) => {
-                            context
-                                .extensions
-                                .insert(RequestRegistry::Loaded(access.registry));
-                            access.actor
-                        }
-                        Err(failure) => {
-                            return Ok(authentication_failure_response(authenticator, failure));
-                        }
+            let actor = if let Some(actor) = authenticated_actor(&context).cloned() {
+                actor
+            } else {
+                let headers = request_headers(&context);
+                match authenticator.authenticate_with_registry(&headers).await {
+                    Ok(access) => {
+                        context
+                            .extensions
+                            .insert(RequestRegistry::Loaded(access.registry));
+                        access.actor
+                    }
+                    Err(failure) => {
+                        return Ok(authentication_failure_response(authenticator, failure));
                     }
                 }
             };
@@ -7142,7 +7147,7 @@ mod tests {
             "total": 1,
             "items": [{
                 "offer_id": "OЛ661308916",
-                "product_id": 181028826,
+                "product_id": 181_028_826,
                 "price": {
                     "currency_code": "RUB",
                     "old_price": 1457,
@@ -8713,7 +8718,7 @@ mod tests {
                     "account": "account_wb",
                     "date_from": "2026-08-04",
                     "date_to": "2026-08-10",
-                    "nm_ids": [123456],
+                    "nm_ids": [123_456],
                     "skip_deleted_nm": true,
                     "aggregation_level": "day"
                 }),
@@ -8753,8 +8758,8 @@ mod tests {
                 "wb_warehouse_stocks",
                 json!({
                     "account": "account_wb",
-                    "nm_ids": [123456],
-                    "chrt_ids": [654321],
+                    "nm_ids": [123_456],
+                    "chrt_ids": [654_321],
                     "limit": 100,
                     "offset": 0
                 }),
@@ -8830,7 +8835,7 @@ mod tests {
             body,
             json!({
                 "selectedPeriod": {"start": "2026-08-04", "end": "2026-08-10"},
-                "nmIds": [123456],
+                "nmIds": [123_456],
                 "skipDeletedNm": true,
                 "aggregationLevel": "day"
             })
@@ -8854,7 +8859,7 @@ mod tests {
         assert_eq!(path, "/api/analytics/v1/stocks-report/wb-warehouses");
         assert_eq!(
             body,
-            json!({"nmIds": [123456], "chrtIds": [654321], "limit": 100, "offset": 0})
+            json!({"nmIds": [123_456], "chrtIds": [654_321], "limit": 100, "offset": 0})
         );
         let orders_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(orders_request.starts_with(
@@ -8913,7 +8918,7 @@ mod tests {
             json!({
                 "date_from": "2026-08-04",
                 "date_to": "2026-08-10",
-                "nm_ids": [123456]
+                "nm_ids": [123_456]
             }),
         )
         .await;

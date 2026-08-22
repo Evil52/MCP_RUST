@@ -116,6 +116,7 @@ impl fmt::Debug for ReportingReader {
 
 impl ReportingReader {
     /// Constructs the shipped no-database mode.
+    #[must_use]
     pub fn disabled() -> Self {
         Self::from_repository(Arc::new(DisabledReportingRepository))
     }
@@ -144,6 +145,7 @@ impl ReportingReader {
         Self { repository }
     }
 
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.repository.enabled()
     }

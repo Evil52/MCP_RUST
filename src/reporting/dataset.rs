@@ -86,7 +86,7 @@ impl ReportDataset {
         let expected_accounts = manifest
             .snapshots()
             .iter()
-            .map(|snapshot| snapshot.account_id())
+            .map(super::snapshot::SnapshotDescriptor::account_id)
             .collect::<std::collections::BTreeSet<_>>();
         if facts
             .sales
@@ -263,6 +263,7 @@ impl ReportDataset {
         })
     }
 
+    #[must_use]
     pub fn sales_details(&self) -> Vec<SalesDetail<'_>> {
         self.sales
             .iter()
@@ -277,6 +278,7 @@ impl ReportDataset {
             .collect()
     }
 
+    #[must_use]
     pub fn advertising_details(&self) -> Vec<AdvertisingDetail<'_>> {
         self.advertising
             .iter()
@@ -293,6 +295,7 @@ impl ReportDataset {
             .collect()
     }
 
+    #[must_use]
     pub fn inventory_details(&self) -> Vec<InventoryDetail<'_>> {
         self.inventory
             .iter()
@@ -306,6 +309,7 @@ impl ReportDataset {
             .collect()
     }
 
+    #[must_use]
     pub fn quality_details(&self) -> Vec<SourceQualityDetail<'_>> {
         self.source_quality
             .iter()

@@ -204,9 +204,9 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         false,
         CollectedFacts::Sales(vec![CollectedSalesFact {
             business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
-            sku: 3411079879,
+            sku: 3_411_079_879,
             ordered_units: 3,
-            operational_gmv_minor: 202500,
+            operational_gmv_minor: 202_500,
             cancelled_units: Some(0),
             returned_units: Some(0),
         }]),
@@ -219,13 +219,13 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         true,
         CollectedFacts::Advertising(vec![CollectedAdvertisingFact {
             business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
-            campaign_id: 35751912,
-            sku: 3411079879,
+            campaign_id: 35_751_912,
+            sku: 3_411_079_879,
             impressions: 1000,
             clicks: 20,
             spend_minor: 12000,
             attributed_orders: 2,
-            attributed_revenue_minor: 135000,
+            attributed_revenue_minor: 135_000,
             basket_additions: 0,
             model_attributed_orders: 0,
             model_attributed_revenue_minor: 0,
@@ -237,7 +237,7 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     )
     .with_advertising_expenses(vec![CollectedAdvertisingExpenseFact {
         business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
-        campaign_id: 35751912,
+        campaign_id: 35_751_912,
         money_spent_minor: 12_000,
         bonus_spent_minor: 2_500,
         prepayment_spent_minor: 9_000,
@@ -251,7 +251,7 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         false,
         CollectedFacts::Finance(vec![CollectedFinanceFact {
             business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
-            sku: Some(3411079879),
+            sku: Some(3_411_079_879),
             category: FinanceCategory::Sale,
             amount_minor: 180_000,
             line_count: 2,
@@ -265,7 +265,7 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         timestamp("2098-08-16T02:45:00Z"),
         false,
         CollectedFacts::Stocks(vec![CollectedStockFact {
-            sku: 3411079879,
+            sku: 3_411_079_879,
             warehouse_id: "fbo-msk".to_owned(),
             sellable_units: 19,
         }]),
@@ -277,7 +277,7 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         timestamp("2098-08-16T02:40:00Z"),
         false,
         CollectedFacts::Prices(vec![CollectedPriceFact {
-            sku: 3411079879,
+            sku: 3_411_079_879,
             price_minor: 67500,
             old_price_minor: Some(70200),
         }]),
@@ -389,19 +389,19 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(facts.sales.len(), 1);
     assert_eq!(facts.sales[0].account_id, account_id);
     assert_eq!(facts.sales[0].business_date.to_string(), "2098-08-15");
-    assert_eq!(facts.sales[0].sku, 3411079879);
+    assert_eq!(facts.sales[0].sku, 3_411_079_879);
     assert_eq!(facts.sales[0].ordered_units, 3);
-    assert_eq!(facts.sales[0].operational_gmv_minor, 202500);
+    assert_eq!(facts.sales[0].operational_gmv_minor, 202_500);
     assert_eq!(facts.sales[0].cancelled_units, Some(0));
     assert_eq!(facts.sales[0].returned_units, Some(0));
     assert_eq!(facts.advertising.len(), 1);
-    assert_eq!(facts.advertising[0].campaign_id, 35751912);
-    assert_eq!(facts.advertising[0].sku, 3411079879);
+    assert_eq!(facts.advertising[0].campaign_id, 35_751_912);
+    assert_eq!(facts.advertising[0].sku, 3_411_079_879);
     assert_eq!(facts.advertising[0].impressions, 1000);
     assert_eq!(facts.advertising[0].clicks, 20);
     assert_eq!(facts.advertising[0].spend_minor, 12000);
     assert_eq!(facts.advertising[0].attributed_orders, 2);
-    assert_eq!(facts.advertising[0].attributed_revenue_minor, 135000);
+    assert_eq!(facts.advertising[0].attributed_revenue_minor, 135_000);
     assert_eq!(facts.advertising_expenses.len(), 1);
     assert_eq!(facts.advertising_expenses[0].money_spent_minor, 12_000);
     assert_eq!(facts.advertising_expenses[0].bonus_spent_minor, 2_500);
@@ -482,7 +482,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
         Ok(json!({"accruals":[],"last_id":""})),
         Ok(json!({
             "products":[{
-                "sku":3411079879_u64,
+                "sku":3_411_079_879_u64,
                 "warehouse_id":1001,
                 "present":21,
                 "reserved":2
@@ -491,7 +491,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
             "has_next":false
         })),
         Ok(json!({"products":[],"cursor":"","has_next":false})),
-        Ok(json!({"items":[{"product_id":3411079879_u64,"price":{
+        Ok(json!({"items":[{"product_id":3_411_079_879_u64,"price":{
             "currency_code":"RUB","price":"675.00","old_price":"702.00"
         }}],"cursor":""})),
     ])));

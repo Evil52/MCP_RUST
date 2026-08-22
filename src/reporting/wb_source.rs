@@ -64,6 +64,7 @@ pub struct WbClientReportTransport {
 }
 
 impl WbClientReportTransport {
+    #[must_use]
     pub fn new(client: WbClient, account_id: String) -> Self {
         Self { client, account_id }
     }
@@ -251,6 +252,7 @@ pub enum WbReportSourceError {
 }
 
 impl WbReportSourceError {
+    #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
             Self::Upstream(kind) => kind.code(),

@@ -128,7 +128,7 @@ fn read_private_value(path: PathBuf, limit: usize) -> Result<String, GmailCreden
 fn private_permissions(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
 
-    metadata.permissions().mode() & 0o077 == 0
+    metadata.permissions().mode().trailing_zeros() >= 6
 }
 
 #[cfg(not(unix))]
@@ -171,10 +171,12 @@ impl fmt::Debug for GmailAccessToken {
 }
 
 impl GmailAccessToken {
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.value
     }
 
+    #[must_use]
     pub fn expires_in_seconds(&self) -> u64 {
         self.expires_in_seconds
     }
@@ -442,7 +444,7 @@ mod tests {
                 Mutation::MissingFile => fs::remove_file(directory.join(CLIENT_ID_FILE)).unwrap(),
                 Mutation::EmptyValue => fs::write(directory.join(CLIENT_SECRET_FILE), "").unwrap(),
                 Mutation::Whitespace => {
-                    fs::write(directory.join(REFRESH_TOKEN_FILE), "has space").unwrap()
+                    fs::write(directory.join(REFRESH_TOKEN_FILE), "has space").unwrap();
                 }
                 Mutation::NonUtf8 => fs::write(directory.join(CLIENT_ID_FILE), [0xff]).unwrap(),
                 Mutation::Oversized => fs::write(

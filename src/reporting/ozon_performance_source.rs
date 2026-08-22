@@ -62,6 +62,7 @@ pub struct PerformanceClientReportTransport {
 }
 
 impl PerformanceClientReportTransport {
+    #[must_use]
     pub fn new(client: PerformanceClient, store: StoreId) -> Self {
         Self { client, store }
     }
@@ -311,6 +312,7 @@ pub enum OzonPerformanceReportSourceError {
 }
 
 impl OzonPerformanceReportSourceError {
+    #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
             Self::Upstream(kind) => kind.code(),

@@ -144,6 +144,7 @@ impl PostgresOutboxRepository {
         })
     }
 
+    #[must_use]
     pub fn from_client(client: Client) -> Self {
         Self {
             client: std::sync::Arc::new(SupervisedClient::preconnected(

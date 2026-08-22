@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn documented_sales_stock_and_price_shapes_are_normalized() {
         let sales = parse_sales_history(&json!([{
-            "product":{"nmId":268913787},"currency":"RUB",
+            "product":{"nmId":268_913_787},"currency":"RUB",
             "history":[{"date":"2026-08-17","orderCount":19,"orderSum":1262.5,
                 "cancelCount":2,"returnCount":1}]
         }]))
@@ -474,10 +474,10 @@ mod tests {
             sales[0].business_date,
             NaiveDate::from_ymd_opt(2026, 8, 17).unwrap()
         );
-        assert_eq!((sales[0].sku, sales[0].ordered_units), (268913787, 19));
+        assert_eq!((sales[0].sku, sales[0].ordered_units), (268_913_787, 19));
         assert_eq!(
             (sales[0].operational_gmv_minor, sales[0].cancelled_units),
-            (126250, Some(2))
+            (126_250, Some(2))
         );
 
         let (stocks, stock_rows) = parse_stock_page(&json!({"data":{"items":[
@@ -526,7 +526,7 @@ mod tests {
         );
 
         let (anonymous_warehouse, _) = parse_stock_page(&json!({"data":{"items":[
-            {"nmId":7,"warehouseId":-999999,"warehouseName":"Central","regionName":"Ural","quantity":3}
+            {"nmId":7,"warehouseId":-999_999,"warehouseName":"Central","regionName":"Ural","quantity":3}
         ]}}))
         .unwrap();
         assert!(
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(
             anonymous_warehouse,
             parse_stock_page(&json!({"data":{"items":[
-                {"nmId":7,"warehouseId":-999999,"warehouseName":"Central","regionName":"Ural","quantity":3}
+                {"nmId":7,"warehouseId":-999_999,"warehouseName":"Central","regionName":"Ural","quantity":3}
             ]}}))
             .unwrap()
             .0
@@ -637,7 +637,7 @@ mod tests {
         for label in ["", "bad\nlabel"] {
             assert!(
                 parse_stock_page(&json!({"data":{"items":[{
-                "nmId":1,"warehouseId":-999999,"quantity":1,
+                "nmId":1,"warehouseId":-999_999,"quantity":1,
                     "warehouseName":label,"regionName":"region"
                 }]}}))
                 .is_err()

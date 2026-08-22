@@ -232,6 +232,7 @@ impl WbPlanRepository {
         })
     }
 
+    #[must_use]
     pub fn from_client(client: Client) -> Self {
         Self {
             client: Arc::new(SupervisedClient::preconnected(client, COMPONENT)),
@@ -250,7 +251,7 @@ impl WbPlanRepository {
             .map_err(|_| PlanStoreError::Unavailable)?;
         let row = client
             .query_one(
-                r#"SELECT current_user = 'control_writer'
+                r"SELECT current_user = 'control_writer'
                     AND EXISTS (
                         SELECT 1 FROM pg_catalog.pg_roles runtime_role
                         WHERE runtime_role.rolname=current_user
@@ -498,7 +499,7 @@ impl WbPlanRepository {
                         'wb_approval_ttl', 'wb_plan_state_shape', 'wb_plan_ttl',
                         'wb_prepare_reservation_ttl', 'wb_runtime_gate_lease_bound',
                         'wb_runtime_gate_scope'
-                    ]::text[]"#,
+                    ]::text[]",
                 &[],
             )
             .await
@@ -1820,10 +1821,10 @@ async fn reserve_action_quota(
         .map_err(|_| PlanStoreError::Unavailable)?;
     let actions_hour: i64 = row.get(0);
     let actions_day: i64 = row.get(1);
-    let delta_day: i64 = row.get(2);
+    let reserved_delta_day: i64 = row.get(2);
     let last_reserved_at: Option<DateTime<Utc>> = row.get(3);
     let action_delta_u64 = cumulative_abs_delta(&plan.changes)?;
-    let action_delta_i64 =
+    let requested_delta =
         i64::try_from(action_delta_u64).map_err(|_| PlanStoreError::InvalidPlan)?;
     let max_hour = i64::from(plan.action_quota.max_actions_per_hour);
     let max_day = i64::from(plan.action_quota.max_actions_per_day);
@@ -1834,7 +1835,7 @@ async fn reserve_action_quota(
 
     if actions_hour >= max_hour
         || actions_day >= max_day
-        || delta_day.saturating_add(action_delta_i64) > max_delta
+        || reserved_delta_day.saturating_add(requested_delta) > max_delta
         || last_reserved_at.is_some_and(|last| last + Duration::seconds(cooldown) > now)
     {
         return Err(PlanStoreError::QuotaExceeded);
@@ -1857,7 +1858,7 @@ async fn reserve_action_quota(
                 &plan.plan_id,
                 &plan.account_id,
                 &advert_id_i64,
-                &action_delta_i64,
+                &requested_delta,
                 &max_actions_per_hour,
                 &max_actions_per_day,
                 &cooldown_seconds,
@@ -1939,8 +1940,8 @@ fn plan_from_row(row: &Row) -> Result<WbControlPlan, PlanStoreError> {
     let cooldown_seconds: i32 = row.get(10);
     let quota_delta: i64 = row.get(11);
     let approval_id: Option<String> = row.get(23);
-    let approval = match approval_id {
-        Some(approval_id) => Some(WbPlanApproval {
+    let approval = if let Some(approval_id) = approval_id {
+        Some(WbPlanApproval {
             approval_id,
             approver_id: row
                 .get::<_, Option<String>>(24)
@@ -1954,17 +1955,16 @@ fn plan_from_row(row: &Row) -> Result<WbControlPlan, PlanStoreError> {
             expires_at: row
                 .get::<_, Option<DateTime<Utc>>>(27)
                 .ok_or(PlanStoreError::Unavailable)?,
-        }),
-        None => {
-            if row.get::<_, Option<String>>(24).is_some()
-                || row.get::<_, Option<String>>(25).is_some()
-                || row.get::<_, Option<DateTime<Utc>>>(26).is_some()
-                || row.get::<_, Option<DateTime<Utc>>>(27).is_some()
-            {
-                return Err(PlanStoreError::Unavailable);
-            }
-            None
+        })
+    } else {
+        if row.get::<_, Option<String>>(24).is_some()
+            || row.get::<_, Option<String>>(25).is_some()
+            || row.get::<_, Option<DateTime<Utc>>>(26).is_some()
+            || row.get::<_, Option<DateTime<Utc>>>(27).is_some()
+        {
+            return Err(PlanStoreError::Unavailable);
         }
+        None
     };
     Ok(WbControlPlan {
         plan_id: row.get(0),
@@ -2216,9 +2216,7 @@ pub fn validate_control_database_url(value: &str) -> Result<Config, PlanStoreErr
         .map_err(|_| PlanStoreError::InvalidPlan)?;
     let exactly_one_tcp_host = matches!(config.get_hosts(), [Host::Tcp(host)] if !host.is_empty());
     if config.get_user() != Some("control_writer")
-        || config
-            .get_password()
-            .is_none_or(|password| password.is_empty())
+        || config.get_password().is_none_or(<[u8]>::is_empty)
         || config.get_dbname().is_none_or(str::is_empty)
         || !exactly_one_tcp_host
         || !config.get_hostaddrs().is_empty()

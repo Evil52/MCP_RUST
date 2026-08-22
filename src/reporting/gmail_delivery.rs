@@ -79,6 +79,7 @@ pub enum GmailDeliveryError {
 impl GmailDeliveryError {
     /// Safe means a new outbox attempt may be scheduled later. This method
     /// never performs that retry and never marks an ambiguous send as safe.
+    #[must_use]
     pub const fn retry_safe(self) -> bool {
         matches!(
             self,
@@ -89,6 +90,7 @@ impl GmailDeliveryError {
         )
     }
 
+    #[must_use]
     pub const fn is_ambiguous(self) -> bool {
         matches!(self, Self::Ambiguous)
     }

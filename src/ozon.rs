@@ -116,6 +116,7 @@ pub enum OzonErrorKind {
 }
 
 impl OzonErrorKind {
+    #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
             Self::EndpointNotAllowed => "endpoint_not_allowed",
@@ -209,6 +210,7 @@ impl fmt::Debug for OzonError {
 }
 
 impl OzonError {
+    #[must_use]
     pub fn kind(&self) -> OzonErrorKind {
         match self {
             Self::EndpointNotAllowed(_) => OzonErrorKind::EndpointNotAllowed,
@@ -227,6 +229,7 @@ impl OzonError {
         }
     }
 
+    #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::EndpointNotAllowed(_)
@@ -459,12 +462,14 @@ impl OzonClient {
         })
     }
 
+    #[must_use]
     pub fn is_configured(&self, store: &StoreId) -> bool {
         self.stores.contains_key(store)
     }
 
     /// Backwards-compatible no-op retained for one release after finance
     /// accrual methods moved into the stable read-only allowlist.
+    #[must_use]
     pub fn with_finance_accruals_preview(self, _enabled: bool) -> Self {
         self
     }
@@ -677,12 +682,11 @@ impl OzonClient {
                 .global_in_flight
                 .try_acquire()
                 .map_err(|_| OzonError::Overloaded)?;
-            let client_permit = match limiter.in_flight.try_acquire() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    drop(global_permit);
-                    return Err(OzonError::Overloaded);
-                }
+            let client_permit = if let Ok(permit) = limiter.in_flight.try_acquire() {
+                permit
+            } else {
+                drop(global_permit);
+                return Err(OzonError::Overloaded);
             };
             #[cfg(test)]
             if let Some((reached, resume)) = limiter.before_claim.lock().await.take() {
@@ -942,8 +946,7 @@ fn parse_retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> ParsedRetryAfte
         return value
             .parse::<u64>()
             .map(Duration::from_secs)
-            .map(ParsedRetryAfter::Valid)
-            .unwrap_or(ParsedRetryAfter::Invalid);
+            .map_or(ParsedRetryAfter::Invalid, ParsedRetryAfter::Valid);
     }
 
     let Ok(retry_at) = DateTime::parse_from_rfc2822(value) else {

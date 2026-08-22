@@ -95,14 +95,17 @@ impl MonitorTarget {
         })
     }
 
+    #[must_use]
     pub fn monitor_id(&self) -> i64 {
         self.monitor_id
     }
 
+    #[must_use]
     pub fn store_id(&self) -> &str {
         &self.store_id
     }
 
+    #[must_use]
     pub fn product_id(&self) -> &str {
         &self.product_id
     }
@@ -122,10 +125,12 @@ pub struct QueryPlan {
 }
 
 impl QueryPlan {
+    #[must_use]
     pub fn request(&self) -> &QueryRequest {
         &self.request
     }
 
+    #[must_use]
     pub fn targets(&self) -> &[MonitorTarget] {
         &self.targets
     }
@@ -142,26 +147,32 @@ pub struct QueryRequest {
 }
 
 impl QueryRequest {
+    #[must_use]
     pub fn slot(&self) -> DateTime<Utc> {
         self.slot
     }
 
+    #[must_use]
     pub fn region_code(&self) -> &str {
         &self.region_code
     }
 
+    #[must_use]
     pub fn region_name(&self) -> &str {
         &self.region_name
     }
 
+    #[must_use]
     pub fn search_phrase(&self) -> &str {
         &self.search_phrase
     }
 
+    #[must_use]
     pub fn max_position(&self) -> u16 {
         self.max_position
     }
 
+    #[must_use]
     pub fn product_ids(&self) -> &[String] {
         &self.product_ids
     }
@@ -250,14 +261,17 @@ impl BatchPlan {
         })
     }
 
+    #[must_use]
     pub fn slot(&self) -> DateTime<Utc> {
         self.slot
     }
 
+    #[must_use]
     pub fn queries(&self) -> &[QueryPlan] {
         &self.queries
     }
 
+    #[must_use]
     pub fn target_count(&self) -> usize {
         self.target_count
     }
@@ -432,14 +446,17 @@ pub struct Observation {
 }
 
 impl Observation {
+    #[must_use]
     pub fn monitor_id(&self) -> i64 {
         self.monitor_id
     }
 
+    #[must_use]
     pub fn observed_at(&self) -> DateTime<Utc> {
         self.observed_at
     }
 
+    #[must_use]
     pub fn outcome(&self) -> ObservationOutcome {
         self.outcome
     }

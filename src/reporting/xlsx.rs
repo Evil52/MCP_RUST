@@ -116,19 +116,19 @@ impl Formats {
             title: Format::new()
                 .set_bold()
                 .set_font_size(16)
-                .set_font_color(Color::RGB(0x173B70)),
+                .set_font_color(Color::RGB(0x17_3B70)),
             header: Format::new()
                 .set_bold()
                 .set_font_color(Color::White)
-                .set_background_color(Color::RGB(0x2563EB)),
+                .set_background_color(Color::RGB(0x25_63EB)),
             money: Format::new().set_num_format("#,##0.00 [$₽-419]"),
             percent: Format::new().set_num_format("0.00%"),
             red: Format::new()
                 .set_bold()
-                .set_font_color(Color::RGB(0xB42318)),
+                .set_font_color(Color::RGB(0xB4_2318)),
             yellow: Format::new()
                 .set_bold()
-                .set_font_color(Color::RGB(0xB54708)),
+                .set_font_color(Color::RGB(0xB5_4708)),
         }
     }
 }
@@ -590,12 +590,11 @@ fn write_optional_u64(
     column: u16,
     value: Option<u64>,
 ) -> Result<(), XlsxReportError> {
-    match value {
-        Some(value) => write_u64(sheet, row, column, value),
-        None => {
-            sheet.write_string(row, column, "N/D").map_err(map_xlsx)?;
-            Ok(())
-        }
+    if let Some(value) = value {
+        write_u64(sheet, row, column, value)
+    } else {
+        sheet.write_string(row, column, "N/D").map_err(map_xlsx)?;
+        Ok(())
     }
 }
 

@@ -19,6 +19,7 @@ pub enum DeliveryStatus {
 }
 
 impl DeliveryStatus {
+    #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Sent | Self::Expired | Self::PermanentFailure)
     }
@@ -131,10 +132,12 @@ impl DeliveryRecord {
         })
     }
 
+    #[must_use]
     pub fn covered_keys(&self) -> &[ReportKey] {
         &self.covered_keys
     }
 
+    #[must_use]
     pub fn scheduled_for(&self) -> DateTime<Utc> {
         self.scheduled_for
     }
@@ -145,30 +148,37 @@ impl DeliveryRecord {
             .ok_or(OutboxError::InvalidSchedule)
     }
 
+    #[must_use]
     pub fn status(&self) -> DeliveryStatus {
         self.status
     }
 
+    #[must_use]
     pub fn delayed(&self) -> bool {
         self.delayed
     }
 
+    #[must_use]
     pub fn attempts(&self) -> u8 {
         self.attempts
     }
 
+    #[must_use]
     pub fn artifact(&self) -> Option<&ArtifactIdentity> {
         self.artifact.as_ref()
     }
 
+    #[must_use]
     pub fn next_attempt_at(&self) -> Option<DateTime<Utc>> {
         self.next_attempt_at
     }
 
+    #[must_use]
     pub fn provider_message_id(&self) -> Option<&str> {
         self.provider_message_id.as_deref()
     }
 
+    #[must_use]
     pub fn last_error(&self) -> Option<DeliveryErrorClass> {
         self.last_error
     }

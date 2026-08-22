@@ -601,8 +601,8 @@ fn validate_bid_delta(limits: &BidLimits, before: u64, after: u64) -> Result<()>
     if before == after {
         bail!("WB bid change не должен быть no-op");
     }
-    let delta = before.abs_diff(after) as u128;
-    if delta * 100 > before as u128 * limits.max_delta_percent as u128 {
+    let delta = u128::from(before.abs_diff(after));
+    if delta * 100 > u128::from(before) * u128::from(limits.max_delta_percent) {
         bail!("изменение WB bid превышает max_delta_percent");
     }
     Ok(())
@@ -705,7 +705,7 @@ mod tests {
 
     fn prepared_change() -> WbPreparedBidChange {
         WbPreparedBidChange {
-            nm_id: 13335157,
+            nm_id: 13_335_157,
             placement: WbBidPlacement::Recommendations,
             before_bid_kopecks: 240,
             bid_kopecks: 250,
@@ -1549,7 +1549,7 @@ mod tests {
                 "bids": [{
                     "advert_id": 12345,
                     "nm_bids": [{
-                        "nm_id": 13335157,
+                        "nm_id": 13_335_157,
                         "bid_kopecks": 250,
                         "placement": "recommendations"
                     }]

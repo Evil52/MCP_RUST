@@ -118,12 +118,14 @@ pub struct OidcIdentity {
 }
 
 impl Actor {
+    #[must_use]
     pub fn can_access_account(&self, account: &MarketplaceAccount) -> bool {
         self.role == Role::Admin
             || account.manager_id == self.id
             || self.account_ids.contains(&account.id)
     }
 
+    #[must_use]
     pub fn can_access_store(&self, store: &StoreId, registry: &AccessRegistry) -> bool {
         registry
             .account_for_store(store)
@@ -531,6 +533,7 @@ impl AccessRegistry {
             .with_context(|| format!("неизвестный MCP_ACTOR_ID={id:?}"))
     }
 
+    #[must_use]
     pub fn account_for_store(&self, store: &StoreId) -> Option<&MarketplaceAccount> {
         self.accounts.iter().find(|account| {
             account
@@ -540,6 +543,7 @@ impl AccessRegistry {
         })
     }
 
+    #[must_use]
     pub fn account_for_store_selector(&self, selector: &StoreId) -> Option<&MarketplaceAccount> {
         self.accounts.iter().find(|account| {
             account
@@ -757,6 +761,7 @@ impl RegistrySource {
         self.cache.write().unwrap_or_else(PoisonError::into_inner)
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -815,9 +820,8 @@ fn validate_unique_performance_client_ids(
             bail!(
                 "Performance client_id нельзя совместно использовать для разных магазинов: {first_store} и {store}"
             );
-        } else {
-            first_by_client_id.insert(credentials.client_id.as_str(), store);
         }
+        first_by_client_id.insert(credentials.client_id.as_str(), store);
     }
     Ok(())
 }
@@ -1609,12 +1613,12 @@ mod tests {
 
         std::thread::scope(|scope| {
             let writer_path = path.clone();
-            let writer_finished = Arc::clone(&writes_finished);
-            let writer = scope.spawn(move || {
+            let writer_barrier = Arc::clone(&writes_finished);
+            let writer_thread = scope.spawn(move || {
                 for round in 0..200 {
                     std::fs::write(&writer_path, &generations[round % 2]).unwrap();
                 }
-                writer_finished.wait();
+                writer_barrier.wait();
             });
             let readers: Vec<_> = (0..4)
                 .map(|_| {
@@ -1651,7 +1655,7 @@ mod tests {
                     })
                 })
                 .collect();
-            writer.join().unwrap();
+            writer_thread.join().unwrap();
             let observed: usize = readers
                 .into_iter()
                 .map(|reader| reader.join().unwrap())

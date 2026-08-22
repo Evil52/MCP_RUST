@@ -88,6 +88,7 @@ pub enum WbBidPlacement {
 }
 
 impl WbBidPlacement {
+    #[must_use]
     pub const fn as_api_str(self) -> &'static str {
         match self {
             Self::Combined => "combined",
@@ -141,10 +142,12 @@ impl ControlPolicy {
         Ok(policy)
     }
 
+    #[must_use]
     pub fn digest(&self) -> &str {
         &self.digest
     }
 
+    #[must_use]
     pub fn actor_policy(&self, actor_id: &str) -> Option<&ActorControlPolicy> {
         self.actors.iter().find(|actor| actor.actor_id == actor_id)
     }
@@ -830,14 +833,14 @@ mod tests {
                 Mutation::Campaign => value["actors"][0]["targets"][0]["campaign_id"] = replacement,
                 Mutation::Sku => value["actors"][0]["targets"][0]["skus"] = replacement,
                 Mutation::Minimum => {
-                    value["actors"][0]["targets"][0]["bid_limits"]["min_minor"] = replacement
+                    value["actors"][0]["targets"][0]["bid_limits"]["min_minor"] = replacement;
                 }
                 Mutation::Range => {
-                    value["actors"][0]["targets"][0]["bid_limits"]["max_minor"] = replacement
+                    value["actors"][0]["targets"][0]["bid_limits"]["max_minor"] = replacement;
                 }
                 Mutation::Delta => {
                     value["actors"][0]["targets"][0]["bid_limits"]["max_delta_percent"] =
-                        replacement
+                        replacement;
                 }
             }
             assert!(parse(value).is_err(), "mutation {label} must fail");

@@ -147,7 +147,7 @@ impl HttpBody for PermitBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         let frame = Pin::new(&mut this.inner).poll_frame(cx);
-        if matches!(&frame, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+        if matches!(&frame, Poll::Ready(None | Some(Err(_)))) {
             this.permit.take();
         }
         frame

@@ -114,6 +114,7 @@ impl PostgresSnapshotRepository {
         Ok(Self { client })
     }
 
+    #[must_use]
     pub fn from_client(client: Client) -> Self {
         Self {
             client: SupervisedClient::preconnected(client, "mcp-ozon-report-worker"),
@@ -231,7 +232,7 @@ impl PostgresSnapshotRepository {
         let expected_accounts = manifest
             .snapshots()
             .iter()
-            .map(|snapshot| snapshot.account_id())
+            .map(super::snapshot::SnapshotDescriptor::account_id)
             .collect::<BTreeSet<_>>();
         let client = self
             .client

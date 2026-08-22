@@ -1340,7 +1340,7 @@ mod tests {
             wb_token_with_sid(3, WB_PROMOTION_BIT, future, serde_json::Value::Null);
         assert!(validate_wb_writer_token(&missing_seller, TEST_WB_SELLER_SID).is_err());
         let ill_typed_seller =
-            wb_token_with_sid(3, WB_PROMOTION_BIT, future, serde_json::json!(4389764));
+            wb_token_with_sid(3, WB_PROMOTION_BIT, future, serde_json::json!(4_389_764));
         assert!(validate_wb_writer_token(&ill_typed_seller, TEST_WB_SELLER_SID).is_err());
         assert!(
             validate_wb_writer_token(&wb_token(3, WB_PROMOTION_BIT, 1), TEST_WB_SELLER_SID)

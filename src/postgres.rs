@@ -120,6 +120,7 @@ impl SupervisedClient {
     /// Such a session is never reconnected: the caller owns its lifecycle and
     /// silently substituting a fresh one could cross a transactional boundary
     /// the test is asserting on.
+    #[must_use]
     pub fn preconnected(client: Client, component: &'static str) -> Self {
         Self {
             component,

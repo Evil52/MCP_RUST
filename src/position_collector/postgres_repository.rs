@@ -29,6 +29,7 @@ impl PostgresRepository {
         Ok(Self { client })
     }
 
+    #[must_use]
     pub fn from_client(client: Client) -> Self {
         Self {
             client: SupervisedClient::preconnected(client, "mcp-ozon-position-collector"),
@@ -178,7 +179,9 @@ impl PostgresRepository {
                     &to_i32(batch.monitors_succeeded())?,
                     &to_i32(batch.queries_attempted())?,
                     &to_i32(batch.queries_succeeded())?,
-                    &batch.error_class().map(|value| value.as_str()),
+                    &batch
+                        .error_class()
+                        .map(super::repository::ErrorClass::as_str),
                     &batch.http_status().map(|value| {
                         i16::try_from(value).expect("HTTP status fits PostgreSQL int2")
                     }),
@@ -330,7 +333,12 @@ fn payload_digest(batch: &PersistenceBatch) -> String {
             u64::try_from(value).expect("usize always fits u64"),
         );
     }
-    hash_optional_text(&mut digest, batch.error_class().map(|value| value.as_str()));
+    hash_optional_text(
+        &mut digest,
+        batch
+            .error_class()
+            .map(super::repository::ErrorClass::as_str),
+    );
     hash_optional_u16(&mut digest, batch.http_status());
     hash_optional_text(
         &mut digest,

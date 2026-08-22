@@ -39,9 +39,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 # not only for the CI invocation.
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
-# Existing debt is enumerated instead of disabling `pedantic` wholesale. This
-# keeps every other current and future pedantic lint release-blocking while the
-# large documentation/style backlog is paid down incrementally.
+# Remaining structural and public-API documentation debt is explicit. All
+# other current and future pedantic lints remain release-blocking.
 cast_lossless = "allow"
 cast_possible_truncation = "allow"
 cast_possible_wrap = "allow"
@@ -63,13 +62,11 @@ map_unwrap_or = "allow"
 missing_errors_doc = "allow"
 missing_fields_in_debug = "allow"
 missing_panics_doc = "allow"
-must_use_candidate = "allow"
 needless_for_each = "allow"
 needless_pass_by_value = "allow"
 needless_raw_string_hashes = "allow"
 no_effect_underscore_binding = "allow"
 option_option = "allow"
-redundant_closure_for_method_calls = "allow"
 redundant_else = "allow"
 return_self_not_must_use = "allow"
 semicolon_if_nothing_returned = "allow"
@@ -79,13 +76,10 @@ struct_excessive_bools = "allow"
 too_many_lines = "allow"
 unchecked_time_subtraction = "allow"
 unnecessary_wraps = "allow"
-unnested_or_patterns = "allow"
-unreadable_literal = "allow"
 unused_async = "allow"
 unused_async_trait_impl = "allow"
 unused_self = "allow"
 used_underscore_binding = "allow"
-verbose_bit_mask = "allow"
 dbg_macro = "deny"
 mem_forget = "deny"
 todo = "deny"

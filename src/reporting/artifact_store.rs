@@ -217,7 +217,7 @@ impl LocalArtifactStore {
 
     fn ensure_directory(&self, relative: &Path) -> Result<PathBuf, ArtifactStoreError> {
         let mut current = self.root.clone();
-        for segment in relative.iter() {
+        for segment in relative {
             current.push(segment);
             match fs::symlink_metadata(&current) {
                 Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -549,7 +549,7 @@ mod tests {
         invalid_bundle.artifact.object_key = "../escape.xlsx".to_owned();
         assert!(matches!(
             store.persist(&invalid_bundle),
-            Err(ArtifactStoreError::InvalidObjectKey) | Err(ArtifactStoreError::Integrity)
+            Err(ArtifactStoreError::InvalidObjectKey | ArtifactStoreError::Integrity)
         ));
         let mut invalid_bundle = bundle();
         invalid_bundle.html.clear();

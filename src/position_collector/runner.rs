@@ -75,6 +75,7 @@ impl PositionSource for DisabledSource {
 }
 
 impl SourceError {
+    #[must_use]
     pub fn is_protective(&self) -> bool {
         matches!(
             self,
@@ -134,30 +135,37 @@ pub struct BatchResult {
 }
 
 impl BatchResult {
+    #[must_use]
     pub fn status(&self) -> BatchStatus {
         self.status
     }
 
+    #[must_use]
     pub fn planned_queries(&self) -> usize {
         self.planned_queries
     }
 
+    #[must_use]
     pub fn attempted_queries(&self) -> usize {
         self.attempted_queries
     }
 
+    #[must_use]
     pub fn succeeded_queries(&self) -> usize {
         self.succeeded_queries
     }
 
+    #[must_use]
     pub fn stopped_early(&self) -> bool {
         self.stopped_early
     }
 
+    #[must_use]
     pub fn stop_reason(&self) -> BatchStopReason {
         self.stop_reason
     }
 
+    #[must_use]
     pub fn results(&self) -> &[QueryResult] {
         &self.results
     }
@@ -219,7 +227,7 @@ async fn collect_batch(
         let monitor_ids = query
             .targets()
             .iter()
-            .map(|target| target.monitor_id())
+            .map(super::model::MonitorTarget::monitor_id)
             .collect::<Vec<_>>();
         match scan_query(source, query, &request, batch_deadline).await {
             Ok(observations) => {
@@ -915,7 +923,7 @@ mod tests {
         let expected_deadline_monitor_ids = plan.queries()[13]
             .targets()
             .iter()
-            .map(|target| target.monitor_id())
+            .map(super::super::model::MonitorTarget::monitor_id)
             .collect::<Vec<_>>();
 
         let result = collector.collect_at(&plan, planned_start()).await.unwrap();

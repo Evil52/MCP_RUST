@@ -238,7 +238,7 @@ async fn main() -> Result<()> {
             );
             tokio::select! {
                 result = run_dry_scheduler(&config, &outbox, &snapshots) => result?,
-                _ = shutdown_signal() => {}
+                () = shutdown_signal() => {}
             }
         }
         (ReportWorkerMode::DeliveryCanary, true) => {
@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
             );
             tokio::select! {
                 result = run_delivery_scheduler(&config, &outbox, &snapshots, &delivery) => result?,
-                _ = shutdown_signal() => {}
+                () = shutdown_signal() => {}
             }
         }
         _ => bail!("report-worker mode and policy enabled flag are inconsistent"),
@@ -590,8 +590,8 @@ async fn shutdown_signal() {
             }
         };
         tokio::select! {
-            _ = ctrl_c => {}
-            _ = terminate => {}
+            () = ctrl_c => {}
+            () = terminate => {}
         }
     }
     #[cfg(not(unix))]

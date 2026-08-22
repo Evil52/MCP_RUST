@@ -42,6 +42,7 @@ impl CollectorRuntimeConfig {
         Ok(Self { database, mode })
     }
 
+    #[must_use]
     pub fn mode(&self) -> CollectorRuntimeMode {
         self.mode
     }
@@ -53,9 +54,7 @@ impl CollectorRuntimeConfig {
 
 fn validate_database_config(config: &Config) -> Result<(), RuntimeConfigError> {
     if config.get_user() != Some("position_collector")
-        || config
-            .get_password()
-            .is_none_or(|password| password.is_empty())
+        || config.get_password().is_none_or(<[u8]>::is_empty)
         || config.get_dbname().is_none_or(str::is_empty)
         || config.get_hosts().len() != 1
         || !matches!(config.get_hosts(), [Host::Tcp(host)] if !host.trim().is_empty())

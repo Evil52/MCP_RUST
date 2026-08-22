@@ -30,7 +30,7 @@ const CAMPAIGN_RESOURCE_PREFIX: &str = "/api/client/campaign/";
 const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1_048_576;
 const MAX_TOKEN_BODY_BYTES: usize = 64 * 1_024;
 const MAX_ACCESS_TOKEN_BYTES: usize = 16 * 1_024;
-const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(86_400);
+const MAX_TOKEN_LIFETIME: Duration = Duration::from_hours(24);
 const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_SKEW: Duration = Duration::from_secs(60);
 /// How long a failed token request suppresses further attempts.
@@ -142,6 +142,7 @@ pub enum PerformanceClientBuildError {
 }
 
 impl PerformanceErrorKind {
+    #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
             Self::EndpointNotAllowed => "endpoint_not_allowed",
@@ -220,6 +221,7 @@ impl fmt::Debug for PerformanceError {
 }
 
 impl PerformanceError {
+    #[must_use]
     pub const fn kind(&self) -> PerformanceErrorKind {
         match self {
             Self::EndpointNotAllowed { .. } => PerformanceErrorKind::EndpointNotAllowed,
@@ -238,6 +240,7 @@ impl PerformanceError {
         }
     }
 
+    #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::Unauthorized { request_id }
@@ -387,6 +390,7 @@ impl PerformanceClient {
         )
     }
 
+    #[must_use]
     pub fn empty(timeout: Duration) -> Self {
         Self::new(timeout, BTreeMap::new()).expect("fixed reqwest client configuration is valid")
     }

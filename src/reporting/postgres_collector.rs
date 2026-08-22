@@ -74,6 +74,7 @@ pub enum FinanceCategory {
 }
 
 impl FinanceCategory {
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Sale => "sale",
@@ -267,14 +268,17 @@ pub struct CollectionClaim {
 }
 
 impl CollectionClaim {
+    #[must_use]
     pub fn account_id(&self) -> &str {
         &self.account_id
     }
 
+    #[must_use]
     pub fn marketplace(&self) -> Marketplace {
         self.marketplace
     }
 
+    #[must_use]
     pub fn lease_until(&self) -> DateTime<Utc> {
         self.lease_until
     }
@@ -309,6 +313,7 @@ impl PostgresSnapshotWriter {
         Ok(Self { client })
     }
 
+    #[must_use]
     pub fn from_client(client: Client) -> Self {
         Self {
             client: SupervisedClient::preconnected(client, "mcp-ozon-report-collector"),
