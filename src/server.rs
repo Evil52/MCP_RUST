@@ -1142,7 +1142,7 @@ fn diagnostic_text(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn redact_urls(value: String) -> String {
+fn redact_urls(value: &str) -> String {
     value
         .split_whitespace()
         .map(|token| {
@@ -1181,7 +1181,7 @@ fn diagnostic_error(source: &'static str, value: &Value) -> Option<OzonProductCo
         .and_then(Value::as_object)
         .and_then(|texts| diagnostic_text(texts.get("description")))
         .or_else(|| diagnostic_text(error.get("message")))
-        .map(redact_urls);
+        .map(|value| redact_urls(&value));
     Some(OzonProductContentError {
         source,
         code: diagnostic_text(error.get("code")),
@@ -1288,7 +1288,7 @@ fn normalize_product_content_diagnostics(
                     .and_then(|value| diagnostic_text(value.get("status_failed"))),
                 status_tooltip: statuses
                     .and_then(|value| diagnostic_text(value.get("status_tooltip")))
-                    .map(redact_urls),
+                    .map(|value| redact_urls(&value)),
                 moderate_status: statuses
                     .and_then(|value| diagnostic_text(value.get("moderate_status"))),
                 validation_status: statuses

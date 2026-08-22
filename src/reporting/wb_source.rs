@@ -186,16 +186,16 @@ impl WbCollectedFacts {
     #[allow(clippy::too_many_arguments)]
     pub fn into_snapshots(
         self,
-        account_id: String,
+        account_id: &str,
         cutoff_at: DateTime<Utc>,
         source_as_of: DateTime<Utc>,
         period_start: DateTime<Utc>,
         period_end: DateTime<Utc>,
-        collector_version: String,
+        collector_version: &str,
     ) -> Result<Vec<CollectedSnapshot>, PostgresCollectorError> {
         let period = |facts| {
             CollectedSnapshot::new(
-                account_id.clone(),
+                account_id.to_owned(),
                 Marketplace::Wildberries,
                 cutoff_at,
                 source_as_of,
@@ -203,13 +203,13 @@ impl WbCollectedFacts {
                 period_end,
                 SnapshotStatus::Succeeded,
                 true,
-                collector_version.clone(),
+                collector_version.to_owned(),
                 facts,
             )
         };
         let point = |facts| {
             CollectedSnapshot::new(
-                account_id.clone(),
+                account_id.to_owned(),
                 Marketplace::Wildberries,
                 cutoff_at,
                 source_as_of,
@@ -217,7 +217,7 @@ impl WbCollectedFacts {
                 source_as_of,
                 SnapshotStatus::Succeeded,
                 true,
-                collector_version.clone(),
+                collector_version.to_owned(),
                 facts,
             )
         };
@@ -603,12 +603,12 @@ mod tests {
         let cutoff = Utc.with_ymd_and_hms(2026, 8, 18, 3, 0, 0).unwrap();
         let snapshots = facts
             .into_snapshots(
-                "wb_account".to_owned(),
+                "wb_account",
                 cutoff,
                 cutoff,
                 Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap(),
                 Utc.with_ymd_and_hms(2026, 8, 17, 19, 0, 0).unwrap(),
-                "test-1".to_owned(),
+                "test-1",
             )
             .unwrap();
         assert_eq!(snapshots.len(), 4);

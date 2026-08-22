@@ -446,12 +446,12 @@ async fn collect_scheduled_target(
                 .map_err(|error| anyhow::anyhow!("wb_{}", error.code()))?;
             let snapshots = facts
                 .into_snapshots(
-                    target.account_id.clone(),
+                    &target.account_id,
                     occurrence.cutoff_at,
                     Utc::now(),
                     occurrence.period_start,
                     occurrence.period_end,
-                    env!("CARGO_PKG_VERSION").to_owned(),
+                    env!("CARGO_PKG_VERSION"),
                 )
                 .map_err(|_| anyhow::anyhow!("invalid_wb_snapshot_input"))?;
             writer
@@ -495,12 +495,12 @@ async fn run_wb_dry_run(
         let source_as_of = Utc::now();
         let snapshots = facts
             .into_snapshots(
-                account_id.to_owned(),
+                account_id,
                 cutoff_at,
                 source_as_of,
                 period_start,
                 period_end,
-                env!("CARGO_PKG_VERSION").to_owned(),
+                env!("CARGO_PKG_VERSION"),
             )
             .map_err(|_| anyhow::anyhow!("invalid_wb_snapshot_input"))?;
         writer
