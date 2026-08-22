@@ -1024,6 +1024,7 @@ impl<R: ServiceRole> Peer<R> {
         *self.info.write().expect("peer info lock poisoned") = Some(Arc::new(info));
     }
 
+    #[cfg(feature = "client")]
     pub(crate) fn set_client_request_metadata(&self, metadata: ClientRequestMetadata) {
         let result = self.client_request_metadata.set(metadata);
         debug_assert!(result.is_ok(), "client request metadata set more than once");

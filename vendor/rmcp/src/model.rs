@@ -248,6 +248,7 @@ impl NumberOrString {
         }
     }
 
+    #[cfg(feature = "client")]
     pub(crate) fn matches_response_id(&self, response_id: &Self) -> bool {
         self == response_id
             || matches!(
