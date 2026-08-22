@@ -5023,15 +5023,15 @@ mod tests {
     #[tokio::test]
     async fn repository_enforces_approval_gates_incidents_and_quotas_when_test_database_is_available()
      {
-        run_repository_scenarios_with_optional_test_database(
+        Box::pin(run_repository_scenarios_with_optional_test_database(
             std::env::var("WB_CONTROL_TEST_DATABASE_URL"),
             std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),
-        )
+        ))
         .await;
-        run_repository_scenarios_with_optional_test_database(
+        Box::pin(run_repository_scenarios_with_optional_test_database(
             Err(std::env::VarError::NotPresent),
             Err(std::env::VarError::NotPresent),
-        )
+        ))
         .await;
     }
 }

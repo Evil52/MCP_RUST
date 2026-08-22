@@ -3085,15 +3085,15 @@ mod tests {
 
     #[tokio::test]
     async fn wb_runtime_happy_path_is_durable_and_uses_exact_http_calls() {
-        run_wb_runtime_happy_path(
+        Box::pin(run_wb_runtime_happy_path(
             Err(std::env::VarError::NotPresent),
             Err(std::env::VarError::NotPresent),
-        )
+        ))
         .await;
-        run_wb_runtime_happy_path(
+        Box::pin(run_wb_runtime_happy_path(
             std::env::var("WB_CONTROL_TEST_DATABASE_URL"),
             std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),
-        )
+        ))
         .await;
     }
 
