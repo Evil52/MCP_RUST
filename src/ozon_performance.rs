@@ -727,7 +727,10 @@ impl PerformanceClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        request.send().await.map_err(classify_transport)
+        request
+            .send()
+            .await
+            .map_err(|error| classify_transport(&error))
     }
 
     async fn invalidate_token_if_current(&self, state: &AccountState, used_token: &str) {
@@ -795,7 +798,7 @@ impl PerformanceClient {
             }))
             .send()
             .await
-            .map_err(classify_transport)?;
+            .map_err(|error| classify_transport(&error))?;
         let request_id = safe_request_id(response.headers());
         let status = response.status();
         if !status.is_success() {
@@ -831,7 +834,7 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-fn classify_transport(error: reqwest::Error) -> PerformanceError {
+fn classify_transport(error: &reqwest::Error) -> PerformanceError {
     if error.is_timeout() {
         PerformanceError::Timeout
     } else {
@@ -880,7 +883,11 @@ async fn read_body(
         .unwrap_or_default()
         .min(limit);
     let mut body = Vec::with_capacity(initial_capacity);
-    while let Some(chunk) = response.chunk().await.map_err(classify_transport)? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| classify_transport(&error))?
+    {
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(PerformanceError::ResponseTooLarge {
                 limit_bytes: limit,
@@ -1536,7 +1543,7 @@ mod tests {
 
         assert!(error.is_timeout());
         assert_eq!(
-            classify_transport(error).kind(),
+            classify_transport(&error).kind(),
             PerformanceErrorKind::Timeout
         );
         server.join().unwrap();

@@ -115,7 +115,7 @@ const FINANCE_ENDPOINTS: &[&str] = &[
 const UNTRUSTED_DATA_CLASSIFICATION: &str = "untrusted_external_marketplace_data";
 const REDACTED_VALUE: &str = "[REDACTED]";
 
-fn config_error(error: anyhow::Error) -> String {
+fn config_error(error: &anyhow::Error) -> String {
     let message = error.to_string();
     if message.starts_with("MCP_ACCESS_CONFIG_RESTART_REQUIRED:") {
         message
@@ -384,7 +384,10 @@ impl OzonMcp {
             .as_deref()
             .or(self.default_actor_id.as_deref())
             .ok_or_else(|| "ACCESS_DENIED: отсутствует проверенная идентичность".to_owned())?;
-        let actor = registry.actor(actor_id).map_err(config_error)?.clone();
+        let actor = registry
+            .actor(actor_id)
+            .map_err(|error| config_error(&error))?
+            .clone();
         Ok((registry, actor))
     }
 
@@ -394,7 +397,7 @@ impl OzonMcp {
         // snapshot before extracting `RequestIdentity`; retaining this
         // defensive fallback also preserves the original fail-closed behavior
         // if an internal caller ever bypasses the router.
-        self.registry.load().map_err(config_error)
+        self.registry.load().map_err(|error| config_error(&error))
     }
 
     fn resolve_store_for_actor(
@@ -797,7 +800,7 @@ impl RequestRegistry {
     async fn load(source: &RegistrySource) -> Self {
         match source.load_async().await {
             Ok(registry) => Self::Loaded(registry),
-            Err(error) => Self::Failed(config_error(error)),
+            Err(error) => Self::Failed(config_error(&error)),
         }
     }
 }
