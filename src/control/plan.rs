@@ -2164,6 +2164,10 @@ fn make_prepare_reservation_id(
     hex_digest(hasher.finalize())
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err needs the owned error function to keep coverage complete"
+)]
 fn map_prepare_insert_error(error: tokio_postgres::Error) -> PlanStoreError {
     let Some(database_error) = error.as_db_error() else {
         return PlanStoreError::Unavailable;

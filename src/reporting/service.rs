@@ -415,7 +415,7 @@ mod tests {
         )
     }
 
-    fn config(entries: Vec<(&str, String)>) -> Result<ReportWorkerConfig> {
+    fn config(entries: &[(&str, String)]) -> Result<ReportWorkerConfig> {
         ReportWorkerConfig::from_lookup(|key| {
             entries
                 .iter()
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn disabled_worker_loads_only_registry_metadata_and_policy() {
-        let config = config(valid_entries(false)).unwrap();
+        let config = config(&valid_entries(false)).unwrap();
         assert_eq!(config.mode(), ReportWorkerMode::Disabled);
         assert!(!config.policy().enabled);
         assert_eq!(config.policy().audiences[0].id, "pilot_owner");
@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn invalid_runtime_mode_database_and_required_paths_fail_closed() {
-        assert!(config(Vec::new()).is_err());
+        assert!(config(&Vec::new()).is_err());
         for url in [
             "not-a-url",
             "postgresql://position_reader:password@position-db/ozon_positions",
@@ -517,17 +517,17 @@ mod tests {
         ] {
             let mut entries = valid_entries(false);
             entries[0] = (DATABASE_URL_ENV, url.to_owned());
-            assert!(config(entries).is_err());
+            assert!(config(&entries).is_err());
         }
         let mut entries = valid_entries(false);
         entries.push((MODE_ENV, "live".to_owned()));
-        assert!(config(entries).is_err());
+        assert!(config(&entries).is_err());
         let mut entries = valid_entries(false);
         entries.retain(|(key, _)| *key != POLICY_PATH_ENV);
-        assert!(config(entries).is_err());
+        assert!(config(&entries).is_err());
         let mut entries = valid_entries(false);
         entries.retain(|(key, _)| *key != ARTIFACT_ROOT_ENV);
-        assert!(config(entries).is_err());
+        assert!(config(&entries).is_err());
         let mut entries = valid_entries(false);
         entries
             .iter_mut()
@@ -536,12 +536,12 @@ mod tests {
             .1 = file("artifact-file", "not a directory")
             .display()
             .to_string();
-        assert!(config(entries).is_err());
+        assert!(config(&entries).is_err());
     }
 
     #[test]
     fn single_manager_generation_uses_the_authoritative_actor_name() {
-        let mut entries = valid_entries(false);
+        let entries = valid_entries(false);
         let policy_path = entries
             .iter()
             .find(|(key, _)| *key == POLICY_PATH_ENV)
@@ -552,7 +552,7 @@ mod tests {
             r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{"id":"diana","email_env":"DIANA_EMAIL","managers":[{"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]}]}]}"#,
         )
         .unwrap();
-        let config = config(std::mem::take(&mut entries)).unwrap();
+        let config = config(&entries).unwrap();
         let scope = config
             .generation_scope(&ReportKey {
                 local_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 18).unwrap(),
@@ -569,7 +569,7 @@ mod tests {
     fn explicit_dry_run_mode_is_available_without_mail_configuration() {
         let mut entries = valid_entries(true);
         entries.push((MODE_ENV, "dry_run".to_owned()));
-        let config = config(entries).unwrap();
+        let config = config(&entries).unwrap();
         assert_eq!(config.mode(), ReportWorkerMode::DryRun);
         assert!(config.policy().enabled);
     }
@@ -595,12 +595,12 @@ mod tests {
 
     #[test]
     fn delivery_canary_requires_enabled_policy_and_exact_private_mail_files() {
-        let canary = config(canary_entries()).unwrap();
+        let canary = config(&canary_entries()).unwrap();
         assert_eq!(canary.mode(), ReportWorkerMode::DeliveryCanary);
         assert!(canary.policy().enabled);
         assert!(canary.mail_provider.is_some());
 
-        let scheduled = config(scheduled_delivery_entries()).unwrap();
+        let scheduled = config(&scheduled_delivery_entries()).unwrap();
         assert_eq!(scheduled.mode(), ReportWorkerMode::ScheduledDelivery);
         assert!(scheduled.policy().enabled);
         assert!(scheduled.mail_provider.is_some());
@@ -608,19 +608,19 @@ mod tests {
 
         let mut entries = scheduled_delivery_entries();
         entries.retain(|(key, _)| *key != MAIL_CANARY_AUDIENCE_ENV);
-        assert!(config(entries).is_err());
+        assert!(config(&entries).is_err());
         let mut entries = scheduled_delivery_entries();
         entries
             .iter_mut()
             .find(|(key, _)| *key == MAIL_CANARY_AUDIENCE_ENV)
             .unwrap()
             .1 = "outside_policy".to_owned();
-        assert!(config(entries).is_err());
+        assert!(config(&entries).is_err());
 
         for missing in [MAIL_ROUTING_PATH_ENV, GMAIL_CREDENTIAL_DIR_ENV] {
             let mut entries = canary_entries();
             entries.retain(|(key, _)| *key != missing);
-            assert!(config(entries).is_err());
+            assert!(config(&entries).is_err());
         }
 
         let disabled_policy = canary_entries();
@@ -631,7 +631,7 @@ mod tests {
             .1
             .clone();
         fs::write(policy_path, policy(false)).unwrap();
-        assert!(config(disabled_policy).is_err());
+        assert!(config(&disabled_policy).is_err());
 
         let mut invalid_routing = canary_entries();
         invalid_routing
@@ -639,7 +639,7 @@ mod tests {
             .find(|(key, _)| *key == MAIL_ROUTING_PATH_ENV)
             .unwrap()
             .1 = private_file("bad-routing", "{}").display().to_string();
-        assert!(config(invalid_routing).is_err());
+        assert!(config(&invalid_routing).is_err());
 
         let mut invalid_credentials = canary_entries();
         invalid_credentials
@@ -647,7 +647,7 @@ mod tests {
             .find(|(key, _)| *key == GMAIL_CREDENTIAL_DIR_ENV)
             .unwrap()
             .1 = std::env::temp_dir().display().to_string();
-        assert!(config(invalid_credentials).is_err());
+        assert!(config(&invalid_credentials).is_err());
     }
 
     #[cfg_attr(
@@ -664,7 +664,7 @@ mod tests {
             .find(|(key, _)| *key == DATABASE_URL_ENV)
             .unwrap()
             .1 = database_url;
-        let mut config = config(entries).unwrap();
+        let mut config = config(&entries).unwrap();
         let (outbox, _) = config.connect().await.unwrap();
         let worker = config.delivery_worker(outbox.clone()).unwrap();
         assert!(format!("{worker:?}").contains("single-attempt"));
@@ -677,19 +677,19 @@ mod tests {
         let invalid_registry = file("bad-registry", "{}");
         let mut entries = valid_entries(false);
         entries[1] = (ACCESS_CONFIG_ENV, invalid_registry.display().to_string());
-        assert!(config(entries).is_err());
+        assert!(config(&entries).is_err());
 
         let oversized_length =
             usize::try_from(MAX_POLICY_BYTES + 1).expect("policy limit fits usize");
         let oversized = file("oversized", &" ".repeat(oversized_length));
         let mut entries = valid_entries(false);
         entries[2] = (POLICY_PATH_ENV, oversized.display().to_string());
-        assert!(config(entries).is_err());
+        assert!(config(&entries).is_err());
 
         let invalid_policy = file("bad-policy", "{}");
         let mut entries = valid_entries(true);
         entries[2] = (POLICY_PATH_ENV, invalid_policy.display().to_string());
-        assert!(config(entries).is_err());
+        assert!(config(&entries).is_err());
     }
 
     #[test]
