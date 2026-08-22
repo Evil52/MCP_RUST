@@ -913,12 +913,13 @@ mod tests {
             bid_kopecks: 1050,
         };
         let recommendations = WbBidChange {
+            nm_id: search.nm_id,
             placement: WbBidPlacement::Recommendations,
-            ..search.clone()
+            bid_kopecks: search.bid_kopecks,
         };
         let combined = WbBidChange {
             placement: WbBidPlacement::Combined,
-            ..search.clone()
+            ..search
         };
 
         let unified = campaign_snapshot(
@@ -1090,7 +1091,7 @@ mod tests {
             .is_err()
         );
 
-        let mut missing_snapshot_bid = no_op_snapshot.clone();
+        let mut missing_snapshot_bid = no_op_snapshot;
         missing_snapshot_bid.bids.clear();
         assert!(
             prepare_changes(
@@ -1146,7 +1147,7 @@ mod tests {
             },
             WbPreparedBidChange {
                 bid_kopecks: u64::MAX,
-                ..change.clone()
+                ..change
             },
         ] {
             assert!(validate_write_request(1, &[invalid]).is_err());

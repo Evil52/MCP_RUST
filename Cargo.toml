@@ -45,6 +45,7 @@ missing_errors_doc = "allow"
 too_many_lines = "allow"
 dbg_macro = "deny"
 mem_forget = "deny"
+redundant_clone = "deny"
 todo = "deny"
 unimplemented = "deny"
 

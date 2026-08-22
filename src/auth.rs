@@ -1070,7 +1070,7 @@ mod tests {
         });
         assert_eq!(
             parse_bounded_jwks(
-                serde_json::to_string(&json!({"keys": [valid_key.clone()]}))
+                serde_json::to_string(&json!({"keys": [valid_key]}))
                     .unwrap()
                     .as_bytes()
             )
@@ -1810,7 +1810,7 @@ mod tests {
             // trust anchor and must not be cached as one.
             json!({"keys": []}),
             // JSON member names are case sensitive: `Keys` is not `keys`.
-            json!({"Keys": [valid_key.clone()]}),
+            json!({"Keys": [valid_key]}),
             // A top-level array is not a JWKS document.
             json!([valid_key]),
         ] {

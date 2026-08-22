@@ -638,7 +638,7 @@ mod tests {
             Err(ArtifactStoreError::Integrity)
         ));
         fs::write(&html_path, [0xff]).unwrap();
-        let mut non_utf8_artifact = bundle.artifact.clone();
+        let mut non_utf8_artifact = bundle.artifact;
         non_utf8_artifact.html_sha256 = sha256(&[0xff]);
         assert!(matches!(
             store.load(&non_utf8_artifact),

@@ -1476,7 +1476,7 @@ mod tests {
         assert!(Arc::ptr_eq(&reloaded, &source.load().unwrap()));
 
         // A clone shares the cache rather than starting a cold one.
-        assert!(Arc::ptr_eq(&reloaded, &source.clone().load().unwrap()));
+        assert!(Arc::ptr_eq(&reloaded, &source.load().unwrap()));
 
         // A file that becomes invalid keeps failing instead of serving the
         // last good parse out of the cache.
