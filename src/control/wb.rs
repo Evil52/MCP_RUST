@@ -766,7 +766,7 @@ mod tests {
         response
     }
 
-    fn flag_permit(flag: Arc<AtomicBool>) -> std::future::Ready<Result<(), ()>> {
+    fn flag_permit(flag: &Arc<AtomicBool>) -> std::future::Ready<Result<(), ()>> {
         std::future::ready(if flag.load(Ordering::SeqCst) {
             Ok(())
         } else {
@@ -774,7 +774,7 @@ mod tests {
         })
     }
 
-    fn mark_operation(flag: Arc<AtomicBool>) -> std::future::Ready<Result<(), ()>> {
+    fn mark_operation(flag: &Arc<AtomicBool>) -> std::future::Ready<Result<(), ()>> {
         flag.store(true, Ordering::SeqCst);
         std::future::ready(Ok(()))
     }
@@ -785,7 +785,7 @@ mod tests {
         operation_ran: Arc<AtomicBool>,
     ) -> Result<(), ()> {
         pacer
-            .run_guarded(|| flag_permit(permit), || mark_operation(operation_ran))
+            .run_guarded(|| flag_permit(&permit), || mark_operation(&operation_ran))
             .await
     }
 

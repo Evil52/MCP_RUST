@@ -1262,9 +1262,9 @@ mod tests {
             .nest("/mcp", mcp_router)
     }
 
-    fn middleware_request_at(uri: &str, method: Method, body: Body) -> HttpRequest<Body> {
+    fn middleware_request_at(uri: &str, method: &Method, body: Body) -> HttpRequest<Body> {
         let mut builder = HttpRequest::builder()
-            .method(method.clone())
+            .method(method)
             .uri(uri)
             .header(HOST, "localhost");
         if method == Method::POST {
@@ -1277,22 +1277,22 @@ mod tests {
         builder.body(body).expect("test request builds")
     }
 
-    fn middleware_request(method: Method, body: Body) -> HttpRequest<Body> {
+    fn middleware_request(method: &Method, body: Body) -> HttpRequest<Body> {
         middleware_request_at("/mcp", method, body)
     }
 
-    fn control_notification_request(method: &str, params: Value) -> HttpRequest<Body> {
+    fn control_notification_request(method: &str, params: &Value) -> HttpRequest<Body> {
         control_notification_request_at("/mcp", method, params)
     }
 
     fn control_notification_request_at(
         uri: &str,
         method: &str,
-        params: Value,
+        params: &Value,
     ) -> HttpRequest<Body> {
         middleware_request_at(
             uri,
-            Method::POST,
+            &Method::POST,
             Body::from(
                 json!({
                     "jsonrpc": "2.0",
@@ -1321,7 +1321,7 @@ mod tests {
             let request = control_notification_request_at(
                 "/mcp?pending-handler=1",
                 "notifications/initialized",
-                json!({}),
+                &json!({}),
             );
             active_requests.push(tokio::spawn(router.clone().oneshot(request)));
         }
@@ -1337,7 +1337,7 @@ mod tests {
             .clone()
             .oneshot(control_notification_request(
                 "notifications/initialized",
-                json!({}),
+                &json!({}),
             ))
             .await
             .expect("router responds");
@@ -1365,7 +1365,7 @@ mod tests {
         let recovered = router
             .oneshot(control_notification_request(
                 "notifications/initialized",
-                json!({}),
+                &json!({}),
             ))
             .await
             .expect("router responds");
@@ -1391,7 +1391,7 @@ mod tests {
             .clone()
             .oneshot(middleware_request_at(
                 "/mcp?short=1",
-                Method::GET,
+                &Method::GET,
                 Body::empty(),
             ))
             .await
@@ -1403,7 +1403,7 @@ mod tests {
         for _ in 0..MCP_MAX_IN_FLIGHT_STREAMS {
             let response = router
                 .clone()
-                .oneshot(middleware_request(Method::GET, Body::empty()))
+                .oneshot(middleware_request(&Method::GET, Body::empty()))
                 .await
                 .expect("router responds");
             assert_eq!(response.status(), StatusCode::OK);
@@ -1416,7 +1416,7 @@ mod tests {
 
         let overloaded = router
             .clone()
-            .oneshot(middleware_request(Method::GET, Body::empty()))
+            .oneshot(middleware_request(&Method::GET, Body::empty()))
             .await
             .expect("router responds");
         assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1427,7 +1427,7 @@ mod tests {
 
         let post = router
             .clone()
-            .oneshot(middleware_request(Method::POST, Body::empty()))
+            .oneshot(middleware_request(&Method::POST, Body::empty()))
             .await
             .expect("router responds");
         assert_eq!(post.status(), StatusCode::OK);
@@ -1447,7 +1447,7 @@ mod tests {
 
         drop(streams.pop());
         let recovered = router
-            .oneshot(middleware_request(Method::GET, Body::empty()))
+            .oneshot(middleware_request(&Method::GET, Body::empty()))
             .await
             .expect("router responds");
         assert_eq!(recovered.status(), StatusCode::OK);
@@ -1465,7 +1465,7 @@ mod tests {
             Duration::from_millis(250),
             router
                 .clone()
-                .oneshot(middleware_request(Method::POST, Body::new(PendingBody))),
+                .oneshot(middleware_request(&Method::POST, Body::new(PendingBody))),
         )
         .await
         .expect("test deadline is bounded")
@@ -1476,7 +1476,7 @@ mod tests {
         let oversized = router
             .clone()
             .oneshot(middleware_request(
-                Method::POST,
+                &Method::POST,
                 Body::from(vec![0; MCP_REQUEST_BODY_LIMIT_BYTES + 1]),
             ))
             .await
@@ -1486,7 +1486,7 @@ mod tests {
 
         let failed = router
             .clone()
-            .oneshot(middleware_request(Method::POST, Body::new(FailingBody)))
+            .oneshot(middleware_request(&Method::POST, Body::new(FailingBody)))
             .await
             .expect("router responds");
         assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
@@ -1494,7 +1494,7 @@ mod tests {
 
         let accepted = router
             .clone()
-            .oneshot(middleware_request(Method::POST, Body::from("abc")))
+            .oneshot(middleware_request(&Method::POST, Body::from("abc")))
             .await
             .expect("router responds");
         assert_eq!(accepted.status(), StatusCode::OK);
@@ -1505,7 +1505,7 @@ mod tests {
         assert_eq!(reached.load(Ordering::SeqCst), 1);
 
         let deleted = router
-            .oneshot(middleware_request(Method::DELETE, Body::empty()))
+            .oneshot(middleware_request(&Method::DELETE, Body::empty()))
             .await
             .expect("router responds");
         assert_eq!(deleted.status(), StatusCode::OK);
@@ -1520,38 +1520,38 @@ mod tests {
 
         let mut cases = Vec::new();
 
-        let mut bad_host = middleware_request(Method::POST, Body::new(PendingBody));
+        let mut bad_host = middleware_request(&Method::POST, Body::new(PendingBody));
         bad_host
             .headers_mut()
             .insert(HOST, HeaderValue::from_static("evil.example"));
         cases.push((bad_host, StatusCode::FORBIDDEN));
 
-        let mut bad_origin = middleware_request(Method::POST, Body::new(PendingBody));
+        let mut bad_origin = middleware_request(&Method::POST, Body::new(PendingBody));
         bad_origin
             .headers_mut()
             .insert(ORIGIN, HeaderValue::from_static("https://evil.example"));
         cases.push((bad_origin, StatusCode::FORBIDDEN));
 
-        let mut bad_accept = middleware_request(Method::POST, Body::new(PendingBody));
+        let mut bad_accept = middleware_request(&Method::POST, Body::new(PendingBody));
         bad_accept
             .headers_mut()
             .insert(ACCEPT, HeaderValue::from_static("application/json"));
         cases.push((bad_accept, StatusCode::NOT_ACCEPTABLE));
 
-        let mut bad_content_type = middleware_request(Method::POST, Body::new(PendingBody));
+        let mut bad_content_type = middleware_request(&Method::POST, Body::new(PendingBody));
         bad_content_type
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
         cases.push((bad_content_type, StatusCode::UNSUPPORTED_MEDIA_TYPE));
 
-        let mut substring_accept = middleware_request(Method::POST, Body::new(PendingBody));
+        let mut substring_accept = middleware_request(&Method::POST, Body::new(PendingBody));
         substring_accept.headers_mut().insert(
             ACCEPT,
             HeaderValue::from_static("xapplication/json, text/event-stream-evil"),
         );
         cases.push((substring_accept, StatusCode::NOT_ACCEPTABLE));
 
-        let mut prefixed_content_type = middleware_request(Method::POST, Body::new(PendingBody));
+        let mut prefixed_content_type = middleware_request(&Method::POST, Body::new(PendingBody));
         prefixed_content_type.headers_mut().insert(
             CONTENT_TYPE,
             HeaderValue::from_static("application/json-malformed"),
@@ -1560,7 +1560,7 @@ mod tests {
 
         for value in ["application/json,text/plain", "application/json;"] {
             let mut malformed_content_type =
-                middleware_request(Method::POST, Body::new(PendingBody));
+                middleware_request(&Method::POST, Body::new(PendingBody));
             malformed_content_type
                 .headers_mut()
                 .insert(CONTENT_TYPE, HeaderValue::from_static(value));
@@ -1578,7 +1578,7 @@ mod tests {
         }
         assert_eq!(reached.load(Ordering::SeqCst), 0);
 
-        let mut valid = middleware_request(Method::POST, Body::from("abc"));
+        let mut valid = middleware_request(&Method::POST, Body::from("abc"));
         valid.headers_mut().remove(ACCEPT);
         valid
             .headers_mut()
@@ -1605,7 +1605,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             Duration::from_millis(250),
-            router.oneshot(middleware_request(Method::POST, Body::new(PendingBody))),
+            router.oneshot(middleware_request(&Method::POST, Body::new(PendingBody))),
         )
         .await
         .expect("JWT rejection must not poll the pending body")
@@ -1632,7 +1632,7 @@ mod tests {
             .expect("fresh JWT gate has capacity");
         let response = tokio::time::timeout(
             Duration::from_millis(250),
-            router.oneshot(middleware_request(Method::POST, Body::new(PendingBody))),
+            router.oneshot(middleware_request(&Method::POST, Body::new(PendingBody))),
         )
         .await
         .expect("JWT gate overload must not poll the pending body")
@@ -1801,7 +1801,7 @@ mod tests {
         let pending_request = || {
             middleware_request_at(
                 "/mcp?pending-response=1",
-                Method::POST,
+                &Method::POST,
                 Body::from(
                     json!({
                         "jsonrpc": "2.0",
@@ -1841,7 +1841,7 @@ mod tests {
 
         let malformed = router
             .clone()
-            .oneshot(middleware_request(Method::POST, Body::from("not json")))
+            .oneshot(middleware_request(&Method::POST, Body::from("not json")))
             .await
             .expect("router responds");
         assert_eq!(malformed.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1853,11 +1853,11 @@ mod tests {
         let mut unread_controls = Vec::with_capacity(MCP_MAX_IN_FLIGHT_REQUESTS);
         for index in 0..MCP_MAX_IN_FLIGHT_REQUESTS {
             let request = if index % 2 == 0 {
-                control_notification_request("notifications/initialized", json!({}))
+                control_notification_request("notifications/initialized", &json!({}))
             } else {
                 control_notification_request(
                     "notifications/cancelled",
-                    json!({"requestId": index, "reason": "test"}),
+                    &json!({"requestId": index, "reason": "test"}),
                 )
             };
             let response = router
