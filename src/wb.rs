@@ -2865,7 +2865,7 @@ mod tests {
                     serde_json::from_str::<Value>(request.split_once("\r\n\r\n").unwrap().1)
                         .unwrap(),
                     expected
-                )
+                );
             } else {
                 assert!(request.ends_with("\r\n\r\n"));
                 assert!(!request.to_ascii_lowercase().contains("content-type:"));

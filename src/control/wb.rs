@@ -762,17 +762,17 @@ mod tests {
         response
     }
 
-    async fn flag_permit(flag: Arc<AtomicBool>) -> Result<(), ()> {
-        if flag.load(Ordering::SeqCst) {
+    fn flag_permit(flag: Arc<AtomicBool>) -> std::future::Ready<Result<(), ()>> {
+        std::future::ready(if flag.load(Ordering::SeqCst) {
             Ok(())
         } else {
             Err(())
-        }
+        })
     }
 
-    async fn mark_operation(flag: Arc<AtomicBool>) -> Result<(), ()> {
+    fn mark_operation(flag: Arc<AtomicBool>) -> std::future::Ready<Result<(), ()>> {
         flag.store(true, Ordering::SeqCst);
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     async fn run_flag_guarded(

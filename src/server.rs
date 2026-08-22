@@ -5790,6 +5790,7 @@ impl OzonMcp {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for OzonMcp {
     async fn call_tool(
@@ -10785,6 +10786,7 @@ mod tests {
     /// fully accessible to the default actor, so validation is the only thing
     /// that can stop a call here: a validator dropped from any one tool shows up
     /// as a leaked request rather than as a quietly relaxed bound.
+    #[allow(clippy::items_after_statements)]
     #[tokio::test]
     async fn every_bounded_ozon_tool_input_is_rejected_before_any_network_call() {
         let (server, requests) = mock_server(0);
@@ -11098,6 +11100,7 @@ mod tests {
     /// input must be refused before the request leaves the process. The actor
     /// here *does* own `account_wb`, so RBAC cannot mask a missing bound — only
     /// input validation stands between these calls and the upstream.
+    #[allow(clippy::items_after_statements)]
     #[tokio::test]
     async fn every_bounded_wildberries_tool_input_is_rejected_before_any_network_call() {
         let (server, requests) = mock_wb_server_for("admin", 0);

@@ -1144,6 +1144,7 @@ fn write_failure_finish(error: &WbWriteError) -> (WbPlanStatus, &'static str) {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ControlMcp {
     fn get_info(&self) -> ServerInfo {
@@ -2249,6 +2250,12 @@ mod tests {
         database_url: Result<String, std::env::VarError>,
         admin_url: Result<String, std::env::VarError>,
     ) {
+        enum Revocation {
+            MissingFile,
+            MissingActor,
+            RevokedAccess,
+        }
+
         let (Ok(database_url), Ok(admin_url)) = (database_url, admin_url) else {
             return;
         };
@@ -2762,11 +2769,6 @@ mod tests {
         );
 
         let original_registry = fs::read(&fixtures.registry_path).unwrap();
-        enum Revocation {
-            MissingFile,
-            MissingActor,
-            RevokedAccess,
-        }
         for (advert_id, revocation) in [
             (86, Revocation::MissingFile),
             (87, Revocation::MissingActor),

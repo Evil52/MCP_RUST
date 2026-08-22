@@ -6,6 +6,12 @@ use mcp_ozon::position_collector::{CollectorRuntimeConfig, CollectorRuntimeMode}
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+enum Command {
+    Serve,
+    Healthcheck,
+    CanaryPlan(DateTime<FixedOffset>),
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
@@ -16,11 +22,6 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    enum Command {
-        Serve,
-        Healthcheck,
-        CanaryPlan(DateTime<FixedOffset>),
-    }
     let command = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
         [] => Command::Serve,
         [argument] if argument == "healthcheck" => Command::Healthcheck,

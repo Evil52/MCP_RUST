@@ -313,6 +313,8 @@ fn to_i32(value: usize) -> Result<i32, RepositoryError> {
 }
 
 fn payload_digest(batch: &PersistenceBatch) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
     let mut digest = Sha256::new();
     digest.update(b"mcp-ozon-position-persistence-v1\0");
     hash_i64(&mut digest, batch.scheduled_for().timestamp_micros());
@@ -362,7 +364,6 @@ fn payload_digest(batch: &PersistenceBatch) -> String {
     }
     let bytes = digest.finalize();
     let mut encoded = String::with_capacity(bytes.len() * 2);
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in bytes {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));

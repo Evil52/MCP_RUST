@@ -72,9 +72,9 @@ pub fn priority_problems(
         if !seen.insert((input.account_id.as_str(), input.sku)) {
             return Err(RuleError::DuplicateSku);
         }
-        stock_problem(input)
-            .into_iter()
-            .for_each(|item| problems.push(item));
+        if let Some(item) = stock_problem(input) {
+            problems.push(item);
+        }
         if let Some(item) = spend_without_orders(input, store_min_ad_spend_minor) {
             problems.push(item);
         }
