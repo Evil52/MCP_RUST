@@ -687,7 +687,9 @@ impl OzonClient {
                 return Err(OzonError::Overloaded);
             };
             #[cfg(test)]
-            if let Some((reached, resume)) = limiter.before_claim.lock().await.take() {
+            let before_claim = limiter.before_claim.lock().await.take();
+            #[cfg(test)]
+            if let Some((reached, resume)) = before_claim {
                 let _ = reached.send(());
                 let _ = resume.await;
             }

@@ -46,6 +46,7 @@ too_many_lines = "allow"
 dbg_macro = "deny"
 mem_forget = "deny"
 redundant_clone = "deny"
+significant_drop_in_scrutinee = "deny"
 todo = "deny"
 unimplemented = "deny"
 
