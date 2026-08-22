@@ -260,6 +260,7 @@ fn body_failure_response(status: StatusCode, message: &'static str) -> Response 
 
 #[derive(serde::Deserialize)]
 #[serde(field_identifier)]
+#[derive(Clone, Copy)]
 enum JsonRpcEnvelopeField {
     #[serde(rename = "jsonrpc")]
     JsonRpc,
@@ -378,6 +379,7 @@ struct JsonRpcErrorObject;
 
 #[derive(serde::Deserialize)]
 #[serde(field_identifier)]
+#[derive(Clone, Copy)]
 enum JsonRpcErrorField {
     #[serde(rename = "code")]
     Code,
