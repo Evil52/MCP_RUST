@@ -10,7 +10,7 @@ services:
       CONTROL_MCP_TRANSPORT: http
       CONTROL_MCP_BIND: 0.0.0.0:8790
       CONTROL_MCP_AUTH_MODE: dev
-      CONTROL_MCP_ACTOR_ID: admin
+      CONTROL_MCP_ACTOR_ID: ${CONTROL_MCP_ACTOR_ID:-admin}
       CONTROL_MCP_DEV_ALLOW_NON_LOOPBACK: "true"
       CONTROL_MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
       CONTROL_MCP_POLICY: /etc/mcp-ozon/control-policy.json

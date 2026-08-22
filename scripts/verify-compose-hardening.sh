@@ -103,12 +103,14 @@ render_compose() {
 }
 
 render_control_compose() {
+  local actor_id="${1:-admin}"
   # Shell variables take precedence over `--env-file` in Compose. Pin both
   # interpolated bind sources explicitly so an operator's ambient environment
   # cannot make this release-gate inspect a different file. The shipped
   # defaults are checked independently below.
   CONTROL_MCP_ACCESS_CONFIG_HOST="$project_dir/config/access.example.json" \
     CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.example.json" \
+    CONTROL_MCP_ACTOR_ID="$actor_id" \
     docker compose \
       --env-file "$interpolation_env" \
       -f "$project_dir/compose.control.yaml" \
@@ -1095,6 +1097,17 @@ verify_control() {
      }'
 }
 
+verify_control_actor_override() {
+  local rendered="$1" baseline="$2"
+  check "control: explicit dev actor override changes only the actor identity" "$rendered" \
+    --argjson baseline "$baseline" \
+    '.services.control.environment.CONTROL_MCP_ACTOR_ID == "verify_actor"
+     and (.services.control.environment
+          | .CONTROL_MCP_ACTOR_ID = "admin") == $baseline.services.control.environment
+     and (del(.services.control.environment.CONTROL_MCP_ACTOR_ID)
+          == ($baseline | del(.services.control.environment.CONTROL_MCP_ACTOR_ID)))'
+}
+
 verify_control_wb_plan() {
   local rendered="$1" base_rendered="$2" service base_service write_proxy auth_proxy read_token_file expected_database_url
   service="$(jq -c '.services.control' <<<"$rendered")"
@@ -1266,6 +1279,7 @@ reporting_canary_rendered="$(render_reporting_canary_compose)"
 reporting_mail_canary_rendered="$(render_reporting_mail_canary_compose)"
 reporting_mail_live_rendered="$(render_reporting_mail_live_compose)"
 control_rendered="$(render_control_compose)"
+control_actor_override_rendered="$(render_control_compose verify_actor)"
 control_wb_plan_rendered="$(render_control_wb_plan_compose)"
 control_wb_live_rendered="$(render_control_wb_live_compose)"
 
@@ -1548,6 +1562,7 @@ verify_reporting_canary "$reporting_canary_rendered"
 verify_reporting_mail_canary "$reporting_mail_canary_rendered"
 verify_reporting_mail_live "$reporting_mail_live_rendered" "$reporting_mail_canary_rendered"
 verify_control "$control_rendered"
+verify_control_actor_override "$control_actor_override_rendered" "$control_rendered"
 verify_control_wb_plan "$control_wb_plan_rendered" "$control_rendered"
 verify_control_wb_live "$control_wb_live_rendered" "$control_wb_plan_rendered"
 
