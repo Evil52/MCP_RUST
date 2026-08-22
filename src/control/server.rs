@@ -75,6 +75,9 @@ impl std::fmt::Debug for WbControlServices {
 pub struct EmptyInput {}
 
 #[derive(Debug, Serialize, JsonSchema)]
+// These are independent, externally visible capability facts rather than one
+// state machine; collapsing them would make the status contract less precise.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ControlStatusResult {
     pub actor_id: String,
     pub policy_schema_version: u32,

@@ -597,6 +597,9 @@ impl<'de> Deserialize<'de> for JsonRpcIdShape {
 }
 
 #[derive(Default)]
+// Each flag records whether a distinct JSON-RPC field was observed so duplicate
+// and mutually exclusive fields can be rejected without retaining their data.
+#[allow(clippy::struct_excessive_bools)]
 struct JsonRpcEnvelopeShape {
     jsonrpc: bool,
     method: bool,
