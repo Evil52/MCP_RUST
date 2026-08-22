@@ -572,7 +572,7 @@ impl PostgresReportingRepository {
             return Ok(unavailable_completeness(account));
         };
         let descriptors = self.load_descriptors(account, cutoff).await?;
-        completeness_from_descriptors(account, cutoff, descriptors)
+        completeness_from_descriptors(account, cutoff, &descriptors)
     }
 
     async fn resolve_cutoff(
@@ -860,7 +860,7 @@ fn validate_descriptor_cutoff(
 fn completeness_from_descriptors(
     account: &AccountScope,
     cutoff: DateTime<Utc>,
-    descriptors: Vec<SnapshotDescriptor>,
+    descriptors: &[SnapshotDescriptor],
 ) -> Result<DataCompletenessResult, ReportingReadError> {
     if descriptors.is_empty() {
         let mut result = unavailable_completeness(account);
@@ -869,7 +869,7 @@ fn completeness_from_descriptors(
     }
     let required = SnapshotSource::required_for(account.marketplace());
     let mut by_source = BTreeMap::new();
-    for descriptor in &descriptors {
+    for descriptor in descriptors {
         if descriptor.account_id() != account.account_id()
             || descriptor.marketplace() != account.marketplace()
             || descriptor.cutoff_at() != cutoff
@@ -881,7 +881,7 @@ fn completeness_from_descriptors(
     }
     let manifest = if by_source.len() == required.len() {
         Some(
-            FrozenSnapshotManifest::new(cutoff, vec![account.clone()], descriptors.clone())
+            FrozenSnapshotManifest::new(cutoff, vec![account.clone()], descriptors.to_vec())
                 .map_err(|_| ReportingReadError::InvalidPublishedData)?,
         )
     } else {
@@ -3131,8 +3131,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let complete =
-            completeness_from_descriptors(&account, cutoff, descriptors.clone()).unwrap();
+        let complete = completeness_from_descriptors(&account, cutoff, &descriptors).unwrap();
         assert_eq!(complete.state, DataState::Complete);
         assert!(complete.recommendations_allowed);
         assert!(complete.sources.iter().all(|source| source.available));
@@ -3141,8 +3140,7 @@ mod tests {
             Ok(DataState::Complete)
         );
 
-        let partial =
-            completeness_from_descriptors(&account, cutoff, descriptors[..2].to_vec()).unwrap();
+        let partial = completeness_from_descriptors(&account, cutoff, &descriptors[..2]).unwrap();
         assert_eq!(partial.state, DataState::Partial);
         assert!(!partial.recommendations_allowed);
         assert!(partial.sources.iter().any(|source| !source.available));
@@ -3155,14 +3153,14 @@ mod tests {
             Ok(DataState::Unavailable)
         );
 
-        let unavailable = completeness_from_descriptors(&account, cutoff, Vec::new()).unwrap();
+        let unavailable = completeness_from_descriptors(&account, cutoff, &[]).unwrap();
         assert_eq!(unavailable.state, DataState::Unavailable);
         assert!(unavailable.cutoff_at.is_some());
 
         let mut duplicate = descriptors.clone();
         duplicate.push(descriptors[0].clone());
         assert_eq!(
-            completeness_from_descriptors(&account, cutoff, duplicate.clone()),
+            completeness_from_descriptors(&account, cutoff, &duplicate),
             Err(ReportingReadError::InvalidPublishedData)
         );
         assert_eq!(
@@ -3179,7 +3177,7 @@ mod tests {
             Duration::minutes(30),
         )];
         assert_eq!(
-            completeness_from_descriptors(&account, cutoff, wrong_scope.clone()),
+            completeness_from_descriptors(&account, cutoff, &wrong_scope),
             Err(ReportingReadError::InvalidPublishedData)
         );
         assert_eq!(
@@ -3195,7 +3193,7 @@ mod tests {
             SnapshotStatus::Partial,
             Duration::minutes(30),
         );
-        let degraded = completeness_from_descriptors(&account, cutoff, degraded).unwrap();
+        let degraded = completeness_from_descriptors(&account, cutoff, &degraded).unwrap();
         assert_eq!(degraded.state, DataState::Partial);
         assert!(!degraded.recommendations_allowed);
         assert_eq!(
