@@ -595,7 +595,7 @@ impl OzonMcp {
     }
 
     #[allow(clippy::unused_self)]
-    fn wb_error(&self, account: &str, endpoint: &str, error: crate::wb::WbError) -> String {
+    fn wb_error(&self, account: &str, endpoint: &str, error: &crate::wb::WbError) -> String {
         let kind = error.kind().code();
         let request_id = error.request_id().unwrap_or("-");
         format!(
@@ -3616,7 +3616,7 @@ impl OzonMcp {
             .wb_client
             .ping(&account)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3661,7 +3661,7 @@ impl OzonMcp {
                 }),
             )
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3692,7 +3692,7 @@ impl OzonMcp {
                 }),
             )
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3737,7 +3737,7 @@ impl OzonMcp {
                 }),
             )
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3776,7 +3776,7 @@ impl OzonMcp {
                 }),
             )
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3798,7 +3798,7 @@ impl OzonMcp {
             .wb_client
             .orders(&account, input.date_from, input.flag)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3820,7 +3820,7 @@ impl OzonMcp {
             .wb_client
             .sales(&account, input.date_from, input.flag)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3842,7 +3842,7 @@ impl OzonMcp {
             .wb_client
             .product_cards(&account, locale, payload)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3875,7 +3875,7 @@ impl OzonMcp {
             .wb_client
             .product_prices(&account, input.nm_id, limit, input.offset)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3896,7 +3896,7 @@ impl OzonMcp {
             .wb_client
             .tariff_commissions(&account, locale)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3917,7 +3917,7 @@ impl OzonMcp {
             .wb_client
             .tariff_boxes(&account, input.date)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3938,7 +3938,7 @@ impl OzonMcp {
             .wb_client
             .tariff_pallets(&account, input.date)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3959,7 +3959,7 @@ impl OzonMcp {
             .wb_client
             .tariff_returns(&account, input.date)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -3981,7 +3981,7 @@ impl OzonMcp {
             .wb_client
             .acceptance_coefficients(&account, input.warehouse_ids)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -4006,7 +4006,7 @@ impl OzonMcp {
             .wb_client
             .promotion_campaigns(&account)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -4048,7 +4048,7 @@ impl OzonMcp {
                     .map(|payment_type| payment_type.as_str().to_owned()),
             )
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -4086,7 +4086,7 @@ impl OzonMcp {
                 input.end_date,
             )
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -4121,7 +4121,7 @@ impl OzonMcp {
                 input.limit,
             )
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -4154,7 +4154,7 @@ impl OzonMcp {
                 input.search_texts,
             )
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -4191,7 +4191,7 @@ impl OzonMcp {
                     .collect(),
             )
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -4225,7 +4225,7 @@ impl OzonMcp {
             .wb_client
             .promotion_recommended_bids(&account, input.campaign_id, input.nm_id)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -4257,7 +4257,7 @@ impl OzonMcp {
             .wb_client
             .promotion_search_cluster_bids(&account, items)
             .await
-            .map_err(|error| self.wb_error(&account, endpoint, error))?;
+            .map_err(|error| self.wb_error(&account, endpoint, &error))?;
         Ok(Self::wb_result(account, endpoint, data))
     }
 
@@ -10528,7 +10528,7 @@ mod tests {
         let error = server.wb_error(
             "account_wb",
             "common:/ping",
-            crate::wb::WbError::Forbidden {
+            &crate::wb::WbError::Forbidden {
                 request_id: Some("safe-id".to_owned()),
             },
         );
