@@ -762,7 +762,7 @@ async fn insert_advertising_expenses(
     Ok(())
 }
 
-fn map_snapshot_insert_error(error: tokio_postgres::Error) -> PostgresCollectorError {
+fn map_snapshot_insert_error(error: &tokio_postgres::Error) -> PostgresCollectorError {
     classify_snapshot_insert_code(error.code())
 }
 
@@ -809,7 +809,7 @@ async fn insert_snapshot(
             ],
         )
         .await
-        .map_err(map_snapshot_insert_error)?;
+        .map_err(|error| map_snapshot_insert_error(&error))?;
     row.map(|row| row.get(0))
         .ok_or(PostgresCollectorError::Conflict)
 }
