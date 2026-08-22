@@ -1092,11 +1092,11 @@ mod tests {
     }
 
     fn wb_token(acc: u8, mask: u64, exp: u64) -> String {
-        wb_token_with_sid(acc, mask, exp, serde_json::json!(TEST_WB_SELLER_SID))
+        wb_token_with_sid(acc, mask, exp, &serde_json::json!(TEST_WB_SELLER_SID))
     }
 
-    fn wb_token_with_sid(acc: u8, mask: u64, exp: u64, sid: serde_json::Value) -> String {
-        wb_token_from_claims(serde_json::json!({
+    fn wb_token_with_sid(acc: u8, mask: u64, exp: u64, sid: &serde_json::Value) -> String {
+        wb_token_from_claims(&serde_json::json!({
             "acc": acc,
             "for": "self",
             "t": false,
@@ -1106,15 +1106,15 @@ mod tests {
         }))
     }
 
-    fn wb_token_from_claims(claims: serde_json::Value) -> String {
+    fn wb_token_from_claims(claims: &serde_json::Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
         let signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
         format!("{header}.{payload}.{signature}")
     }
 
     fn wb_token_without_sid(mask: u64, exp: u64) -> String {
-        wb_token_from_claims(serde_json::json!({
+        wb_token_from_claims(&serde_json::json!({
             "acc": 3,
             "for": "self",
             "t": false,
@@ -1326,7 +1326,7 @@ mod tests {
             3,
             WB_PROMOTION_BIT,
             future,
-            serde_json::json!("123e4567-e89b-42d3-a456-426614174001"),
+            &serde_json::json!("123e4567-e89b-42d3-a456-426614174001"),
         );
         assert!(validate_wb_writer_token(&other_seller, TEST_WB_SELLER_SID).is_err());
         assert!(
@@ -1337,10 +1337,10 @@ mod tests {
             .is_err()
         );
         let missing_seller =
-            wb_token_with_sid(3, WB_PROMOTION_BIT, future, serde_json::Value::Null);
+            wb_token_with_sid(3, WB_PROMOTION_BIT, future, &serde_json::Value::Null);
         assert!(validate_wb_writer_token(&missing_seller, TEST_WB_SELLER_SID).is_err());
         let ill_typed_seller =
-            wb_token_with_sid(3, WB_PROMOTION_BIT, future, serde_json::json!(4_389_764));
+            wb_token_with_sid(3, WB_PROMOTION_BIT, future, &serde_json::json!(4_389_764));
         assert!(validate_wb_writer_token(&ill_typed_seller, TEST_WB_SELLER_SID).is_err());
         assert!(
             validate_wb_writer_token(&wb_token(3, WB_PROMOTION_BIT, 1), TEST_WB_SELLER_SID)
@@ -1366,7 +1366,7 @@ mod tests {
         ] {
             assert!(
                 validate_wb_writer_token(
-                    &wb_token_from_claims(invalid_identity_claims),
+                    &wb_token_from_claims(&invalid_identity_claims),
                     TEST_WB_SELLER_SID,
                 )
                 .is_err()

@@ -567,7 +567,7 @@ mod tests {
     }
 
     fn registry() -> RegistrySource {
-        registry_with_actors(json!([{
+        registry_with_actors(&json!([{
             "id": "admin",
             "name": "Administrator",
             "role": "admin",
@@ -575,7 +575,7 @@ mod tests {
         }]))
     }
 
-    fn registry_with_actors(actors: serde_json::Value) -> RegistrySource {
+    fn registry_with_actors(actors: &serde_json::Value) -> RegistrySource {
         let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("mcp-ozon-auth-{}-{id}.json", std::process::id()));
@@ -1347,7 +1347,7 @@ mod tests {
 
     #[tokio::test]
     async fn subject_pinned_actor_rejects_fallback_claims_for_a_mismatched_sub() {
-        let registry = registry_with_actors(json!([{
+        let registry = registry_with_actors(&json!([{
             "id": "pinned",
             "name": "Pinned Actor",
             "role": "admin",
@@ -1394,7 +1394,7 @@ mod tests {
 
     #[tokio::test]
     async fn email_fallback_requires_email_verified_true() {
-        let registry = registry_with_actors(json!([{
+        let registry = registry_with_actors(&json!([{
             "id": "email-fallback",
             "name": "Email Fallback",
             "role": "manager",
@@ -1439,7 +1439,7 @@ mod tests {
 
     #[tokio::test]
     async fn ambiguous_username_and_verified_email_fallback_is_rejected() {
-        let registry = registry_with_actors(json!([
+        let registry = registry_with_actors(&json!([
             {
                 "id": "username-fallback",
                 "name": "Username Fallback",

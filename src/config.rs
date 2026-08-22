@@ -1282,12 +1282,12 @@ mod tests {
         format!("{header}.{claims}.{signature}")
     }
 
-    fn wb_token_with_claims(claims: serde_json::Value) -> String {
-        wb_token_with_payload(&serde_json::to_vec(&claims).unwrap())
+    fn wb_token_with_claims(claims: &serde_json::Value) -> String {
+        wb_token_with_payload(&serde_json::to_vec(claims).unwrap())
     }
 
     fn personal_wb_token() -> String {
-        wb_token_with_claims(serde_json::json!({"acc": 3}))
+        wb_token_with_claims(&serde_json::json!({"acc": 3}))
     }
 
     fn write_registry(registry: &AccessRegistry) -> PathBuf {
@@ -1928,13 +1928,13 @@ mod tests {
         let payload = URL_SAFE_NO_PAD.encode(br#"{"acc":3}"#);
         let signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
         let rejected = [
-            wb_token_with_claims(serde_json::json!({"acc": 1})),
-            wb_token_with_claims(serde_json::json!({"acc": 2})),
-            wb_token_with_claims(serde_json::json!({"acc": 4})),
-            wb_token_with_claims(serde_json::json!({"acc": 0})),
-            wb_token_with_claims(serde_json::json!({"acc": 255})),
-            wb_token_with_claims(serde_json::json!({"acc": "3"})),
-            wb_token_with_claims(serde_json::json!({})),
+            wb_token_with_claims(&serde_json::json!({"acc": 1})),
+            wb_token_with_claims(&serde_json::json!({"acc": 2})),
+            wb_token_with_claims(&serde_json::json!({"acc": 4})),
+            wb_token_with_claims(&serde_json::json!({"acc": 0})),
+            wb_token_with_claims(&serde_json::json!({"acc": 255})),
+            wb_token_with_claims(&serde_json::json!({"acc": "3"})),
+            wb_token_with_claims(&serde_json::json!({})),
             wb_token_with_payload(br#"{"acc":"super-secret"}"#),
             "not-a-jwt".to_owned(),
             format!("{header}.{payload}.{signature}.extra"),
@@ -1974,7 +1974,7 @@ mod tests {
         });
         let path = write_registry(&registry);
         for acc in [1, 2, 4, 5] {
-            let token = wb_token_with_claims(serde_json::json!({"acc": acc}));
+            let token = wb_token_with_claims(&serde_json::json!({"acc": acc}));
             let values = BTreeMap::from([
                 ("MCP_ACTOR_ID", "admin"),
                 ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
