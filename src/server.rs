@@ -694,7 +694,7 @@ impl OzonMcp {
     fn performance_error(
         store: &StoreId,
         endpoint: &'static str,
-        error: crate::ozon_performance::PerformanceError,
+        error: &crate::ozon_performance::PerformanceError,
     ) -> String {
         let kind = error.kind().code();
         let request_id = error.request_id().unwrap_or("-");
@@ -5473,7 +5473,7 @@ impl OzonMcp {
                 },
             )
             .await
-            .map_err(|error| Self::performance_error(&store, CAMPAIGNS_PATH, error))?;
+            .map_err(|error| Self::performance_error(&store, CAMPAIGNS_PATH, &error))?;
         Ok(Self::performance_result(store, CAMPAIGNS_PATH, data))
     }
 
@@ -5492,7 +5492,7 @@ impl OzonMcp {
             .performance_client
             .limits(&store)
             .await
-            .map_err(|error| Self::performance_error(&store, LIMITS_PATH, error))?;
+            .map_err(|error| Self::performance_error(&store, LIMITS_PATH, &error))?;
         Ok(Self::performance_result(store, LIMITS_PATH, data))
     }
 
@@ -5513,7 +5513,7 @@ impl OzonMcp {
             .campaign_objects(&store, input.campaign_id)
             .await
             .map_err(|error| {
-                Self::performance_error(&store, CAMPAIGN_OBJECTS_PATH_TEMPLATE, error)
+                Self::performance_error(&store, CAMPAIGN_OBJECTS_PATH_TEMPLATE, &error)
             })?;
         Ok(Self::performance_result(
             store,
@@ -5551,7 +5551,7 @@ impl OzonMcp {
             )
             .await
             .map_err(|error| {
-                Self::performance_error(&store, CAMPAIGN_PRODUCTS_PATH_TEMPLATE, error)
+                Self::performance_error(&store, CAMPAIGN_PRODUCTS_PATH_TEMPLATE, &error)
             })?;
         Ok(Self::performance_result(
             store,
@@ -5588,7 +5588,7 @@ impl OzonMcp {
                 },
             )
             .await
-            .map_err(|error| Self::performance_error(&store, DAILY_STATS_PATH, error))?;
+            .map_err(|error| Self::performance_error(&store, DAILY_STATS_PATH, &error))?;
         Ok(Self::performance_result(store, DAILY_STATS_PATH, data))
     }
 
@@ -5620,7 +5620,7 @@ impl OzonMcp {
                 },
             )
             .await
-            .map_err(|error| Self::performance_error(&store, PRODUCT_SKU_STATS_PATH, error))?;
+            .map_err(|error| Self::performance_error(&store, PRODUCT_SKU_STATS_PATH, &error))?;
         Ok(Self::performance_result(
             store,
             PRODUCT_SKU_STATS_PATH,
@@ -5656,7 +5656,7 @@ impl OzonMcp {
                 },
             )
             .await
-            .map_err(|error| Self::performance_error(&store, EXPENSES_PATH, error))?;
+            .map_err(|error| Self::performance_error(&store, EXPENSES_PATH, &error))?;
         Ok(Self::performance_result(store, EXPENSES_PATH, data))
     }
 
@@ -17053,7 +17053,7 @@ mod tests {
         let structured = OzonMcp::performance_error(
             &StoreId::from("store_a"),
             DAILY_STATS_PATH,
-            crate::ozon_performance::PerformanceError::RateLimited {
+            &crate::ozon_performance::PerformanceError::RateLimited {
                 request_id: Some("safe/id:1".to_owned()),
             },
         );
