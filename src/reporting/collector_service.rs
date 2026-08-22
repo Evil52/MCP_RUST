@@ -178,12 +178,12 @@ impl ReportCollectorConfig {
     }
 
     #[must_use]
-    pub fn mode(&self) -> ReportCollectorMode {
+    pub const fn mode(&self) -> ReportCollectorMode {
         self.mode
     }
 
     #[must_use]
-    pub fn policy(&self) -> &DailyReportPolicy {
+    pub const fn policy(&self) -> &DailyReportPolicy {
         &self.policy
     }
 
@@ -193,7 +193,7 @@ impl ReportCollectorConfig {
     }
 
     #[must_use]
-    pub fn database_config(&self) -> &Config {
+    pub const fn database_config(&self) -> &Config {
         &self.database
     }
 
@@ -213,11 +213,10 @@ impl ReportCollectorConfig {
             !self.policy.enabled,
             "Ozon dry-run credentials require a disabled daily report policy"
         );
-        if let Some(directory) = &self.credential_directory {
-            self.resolve_ozon_claim(claim, &mut |name| directory.read(name))
-        } else {
-            self.resolve_ozon_claim(claim, lookup)
-        }
+        self.credential_directory.as_ref().map_or_else(
+            || self.resolve_ozon_claim(claim, lookup),
+            |directory| self.resolve_ozon_claim(claim, &mut |name| directory.read(name)),
+        )
     }
 
     /// Resolves the exact Ozon account for an enabled scheduled run. The
@@ -325,11 +324,10 @@ impl ReportCollectorConfig {
             !self.policy.enabled,
             "WB dry-run credentials require a disabled daily report policy"
         );
-        if let Some(directory) = &self.credential_directory {
-            self.resolve_wb_claim(claim, &mut |name| directory.read(name))
-        } else {
-            self.resolve_wb_claim(claim, lookup)
-        }
+        self.credential_directory.as_ref().map_or_else(
+            || self.resolve_wb_claim(claim, lookup),
+            |directory| self.resolve_wb_claim(claim, &mut |name| directory.read(name)),
+        )
     }
 
     /// Resolves the exact WB account for an enabled scheduled run. The database

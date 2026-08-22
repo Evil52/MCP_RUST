@@ -324,7 +324,7 @@ impl ReportDataset {
     }
 }
 
-fn sales_metric(fact: &PublishedSalesFact) -> SalesMetricInput {
+const fn sales_metric(fact: &PublishedSalesFact) -> SalesMetricInput {
     SalesMetricInput {
         ordered_units: fact.ordered_units,
         operational_gmv_minor: fact.operational_gmv_minor,
@@ -367,7 +367,7 @@ fn validate_row_counts(
     }
 }
 
-fn map_kpi(error: KpiError) -> DatasetError {
+const fn map_kpi(error: KpiError) -> DatasetError {
     match error {
         KpiError::InvalidAdvertisingCounters => DatasetError::InvalidFacts,
         KpiError::Overflow => DatasetError::Overflow,

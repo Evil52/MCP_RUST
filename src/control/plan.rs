@@ -1,3 +1,8 @@
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "PostgreSQL transactions borrow the supervised session guard until commit"
+)]
+
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -83,6 +88,7 @@ impl WbPlanStatus {
 }
 
 /// Immutable rolling limits copied from the policy into the plan digest.
+///
 /// A reservation is consumed as soon as apply is claimed, including definite
 /// failures and ambiguous outcomes, so retries cannot bypass these limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -164,6 +170,10 @@ pub struct WbControlPlan {
     pub readback: Option<WbCampaignBidSnapshot>,
 }
 
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-only intent remains explicit if the parent module becomes public"
+)]
 pub(crate) struct WbPlanFinish<'a> {
     pub status: WbPlanStatus,
     pub error_class: Option<&'a str>,
@@ -2236,6 +2246,10 @@ pub fn validate_control_database_url(value: &str) -> Result<Config, PlanStoreErr
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "the shared test lock is deliberately restricted to this crate"
+)]
 pub(crate) static CONTROL_DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
@@ -4965,7 +4979,7 @@ mod tests {
                 now,
             ),
         );
-        let concurrent_attempts = [attempt_a, attempt_b, attempt_c, attempt_d];
+        let concurrent_attempts: [_; 4] = (attempt_a, attempt_b, attempt_c, attempt_d).into();
         assert_eq!(
             concurrent_attempts
                 .iter()

@@ -39,12 +39,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 # not only for the CI invocation.
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
 # Remaining structural and public-API documentation debt is explicit. All
 # other current and future pedantic lints remain release-blocking.
 missing_errors_doc = "allow"
 too_many_lines = "allow"
 dbg_macro = "deny"
 mem_forget = "deny"
+missing_const_for_fn = "deny"
 redundant_clone = "deny"
 significant_drop_in_scrutinee = "deny"
 todo = "deny"

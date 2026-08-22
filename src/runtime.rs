@@ -33,7 +33,7 @@ impl TcpAcceptor for tokio::net::TcpListener {
         &self,
     ) -> Pin<Box<dyn Future<Output = std::io::Result<AcceptedTcpStream>> + Send + '_>> {
         Box::pin(async move {
-            let (stream, peer_addr) = tokio::net::TcpListener::accept(self).await?;
+            let (stream, peer_addr) = Self::accept(self).await?;
             let nodelay_result = stream.set_nodelay(true);
             Ok(AcceptedTcpStream {
                 stream,

@@ -177,7 +177,7 @@ impl GmailAccessToken {
     }
 
     #[must_use]
-    pub fn expires_in_seconds(&self) -> u64 {
+    pub const fn expires_in_seconds(&self) -> u64 {
         self.expires_in_seconds
     }
 
@@ -495,6 +495,7 @@ mod tests {
             assert!(body.contains("client_secret=client%2Fsecret"));
             assert!(body.contains("refresh_token=refresh_token-value"));
             assert!(body.contains("grant_type=refresh_token"));
+            drop(seen);
         }
         task.abort();
 

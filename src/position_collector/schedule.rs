@@ -57,6 +57,10 @@ pub fn slot_for_planned_execution(
     Ok(planned_execution_at - Duration::minutes(i64::from(EXECUTION_OFFSET_MINUTES)))
 }
 
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "crate-only intent remains explicit if the parent module becomes public"
+)]
 pub(crate) fn is_aligned_slot(slot: DateTime<Utc>) -> bool {
     slot.minute().is_multiple_of(COLLECTION_INTERVAL_MINUTES)
         && slot.second() == 0

@@ -36,7 +36,9 @@ pub enum CollectionPlanError {
 }
 
 /// Builds the exact account/source inventory that a future collector must
-/// complete before a report can be generated. Every marketplace-specific
+/// complete before a report can be generated.
+///
+/// Every marketplace-specific
 /// source is mandatory: missing data is a preflight error, not a silently
 /// zero-valued KPI.
 pub fn build_collection_plan(
@@ -164,7 +166,7 @@ mod tests {
                 email_env: "OWNER".to_owned(),
                 managers: vec![ManagerScope {
                     actor_id: "diana".to_owned(),
-                    account_ids: ["missing".to_owned()].into_iter().collect(),
+                    account_ids: std::iter::once("missing".to_owned()).collect(),
                 }],
             }],
         };

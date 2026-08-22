@@ -303,6 +303,10 @@ impl OzonMcp {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "tokio::select owns the admission future inside its generated state"
+    )]
     async fn run_tool_call_with_admission(
         &self,
         cancellation: tokio_util::sync::CancellationToken,
@@ -354,7 +358,7 @@ impl OzonMcp {
             .map(JwtAuthenticator::protected_resource_metadata)
     }
 
-    pub(crate) fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
+    pub(crate) const fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
         self.authenticator.as_ref()
     }
 
@@ -913,7 +917,7 @@ enum PostingKind {
 }
 
 impl PostingKind {
-    fn endpoint(self) -> &'static str {
+    const fn endpoint(self) -> &'static str {
         match self {
             Self::Fbs => "/v4/posting/fbs/list",
             Self::Fbo => "/v3/posting/fbo/list",
@@ -998,7 +1002,7 @@ pub enum OzonSppPriceAvailability {
     Unavailable,
 }
 
-#[derive(Debug, Serialize, JsonSchema, PartialEq)]
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct OzonLiveMarketingAction {
     pub title: Option<String>,
     pub value: Option<Value>,
@@ -1006,7 +1010,7 @@ pub struct OzonLiveMarketingAction {
     pub date_to: Option<String>,
 }
 
-#[derive(Debug, Serialize, JsonSchema, PartialEq)]
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct OzonLivePriceItem {
     pub offer_id: String,
     pub product_id: Option<String>,
@@ -1027,7 +1031,7 @@ pub struct OzonLivePriceItem {
     pub marketing_actions: Vec<OzonLiveMarketingAction>,
 }
 
-#[derive(Debug, Serialize, JsonSchema, PartialEq)]
+#[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct OzonLivePricesResult {
     pub store: StoreId,
     pub endpoint: &'static str,
@@ -1751,7 +1755,7 @@ pub struct WbProductCardsInput {
     pub limit: u32,
 }
 
-fn default_wb_cards_limit() -> u32 {
+const fn default_wb_cards_limit() -> u32 {
     50
 }
 
@@ -1775,7 +1779,7 @@ pub struct WbProductPricesInput {
     pub offset: u32,
 }
 
-fn default_wb_prices_limit() -> u32 {
+const fn default_wb_prices_limit() -> u32 {
     1_000
 }
 
@@ -1961,7 +1965,7 @@ pub struct WbSearchProductQueriesInput {
     pub limit: u32,
 }
 
-fn default_wb_search_limit() -> u32 {
+const fn default_wb_search_limit() -> u32 {
     30
 }
 
@@ -2241,7 +2245,7 @@ pub struct AnalyticsInput {
     pub sort_direction: SortDirection,
 }
 
-fn default_analytics_limit() -> u32 {
+const fn default_analytics_limit() -> u32 {
     1_000
 }
 
@@ -2293,7 +2297,7 @@ pub struct ProductPriceFilterInput {
     pub cursor: Option<String>,
 }
 
-fn default_product_limit() -> u32 {
+const fn default_product_limit() -> u32 {
     100
 }
 
@@ -2449,7 +2453,7 @@ pub struct ProductPicturesInfoInput {
     pub product_ids: Vec<String>,
 }
 
-fn default_content_diagnostic_visibility() -> CatalogVisibility {
+const fn default_content_diagnostic_visibility() -> CatalogVisibility {
     CatalogVisibility::StateFailed
 }
 
@@ -2625,7 +2629,7 @@ pub struct SupplyOrderListInput {
     pub sort_dir: SupplyOrderSortDirection,
 }
 
-fn default_supply_order_limit() -> u32 {
+const fn default_supply_order_limit() -> u32 {
     100
 }
 
@@ -2715,7 +2719,7 @@ period_input!(
     }
 );
 
-fn default_posting_limit() -> u32 {
+const fn default_posting_limit() -> u32 {
     100
 }
 
@@ -2793,7 +2797,7 @@ pub enum ReturnSchema {
 }
 
 impl ReturnSchema {
-    fn as_ozon_str(self) -> &'static str {
+    const fn as_ozon_str(self) -> &'static str {
         match self {
             Self::Fbo => "FBO",
             Self::Fbs => "FBS",
@@ -2823,7 +2827,7 @@ period_input!(
     }
 );
 
-fn default_returns_limit() -> u32 {
+const fn default_returns_limit() -> u32 {
     500
 }
 
@@ -2850,7 +2854,7 @@ period_input!(
     }
 );
 
-fn default_rfbs_returns_limit() -> u32 {
+const fn default_rfbs_returns_limit() -> u32 {
     100
 }
 
@@ -2881,11 +2885,11 @@ fn default_transaction_type() -> String {
     "all".to_owned()
 }
 
-fn default_page() -> u32 {
+const fn default_page() -> u32 {
     1
 }
 
-fn default_finance_page_size() -> u32 {
+const fn default_finance_page_size() -> u32 {
     1_000
 }
 
@@ -3085,7 +3089,7 @@ pub struct PerformanceCampaignsInput {
     pub page_size: u32,
 }
 
-fn default_performance_page_size() -> u32 {
+const fn default_performance_page_size() -> u32 {
     100
 }
 
@@ -3213,7 +3217,7 @@ pub struct RatingHistoryInput {
     pub with_premium_scores: bool,
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -3257,7 +3261,7 @@ pub struct ReviewsInput {
     pub direction: SortDirection,
 }
 
-fn default_reviews_limit() -> u32 {
+const fn default_reviews_limit() -> u32 {
     100
 }
 
@@ -3289,15 +3293,15 @@ pub struct QuestionsInput {
     pub last_id: String,
 }
 
-fn default_reporting_status_limit() -> u16 {
+const fn default_reporting_status_limit() -> u16 {
     20
 }
 
-fn default_reporting_history_limit() -> u16 {
+const fn default_reporting_history_limit() -> u16 {
     14
 }
 
-fn default_reporting_reports_limit() -> u16 {
+const fn default_reporting_reports_limit() -> u16 {
     20
 }
 
@@ -4279,19 +4283,24 @@ impl OzonMcp {
                 .iter()
                 .filter(|account| actor.can_access_account(account))
                 .map(|account| {
-                    let (integration_status, configured) = if let Some(ozon) = &account.ozon {
-                        (
-                            "read_only_ozon_api",
-                            self.client.is_configured(&ozon.store_id),
-                        )
-                    } else if account.wildberries.is_some() {
-                        (
-                            "read_only_wildberries_api",
-                            self.wb_client.is_configured(&account.id),
-                        )
-                    } else {
-                        ("directory_only", false)
-                    };
+                    let (integration_status, configured) = account.ozon.as_ref().map_or_else(
+                        || {
+                            if account.wildberries.is_some() {
+                                (
+                                    "read_only_wildberries_api",
+                                    self.wb_client.is_configured(&account.id),
+                                )
+                            } else {
+                                ("directory_only", false)
+                            }
+                        },
+                        |ozon| {
+                            (
+                                "read_only_ozon_api",
+                                self.client.is_configured(&ozon.store_id),
+                            )
+                        },
+                    );
                     let manager = registry
                         .actor(&account.manager_id)
                         .expect("validated manager");
@@ -8687,7 +8696,7 @@ mod tests {
         let status = result_text(&status);
         assert_eq!(status["default_account"], json!("account_wb"));
         assert_eq!(status["accounts"][0]["configured"], json!(true));
-        assert!(status.to_string().find("test-wb-token").is_none());
+        assert!(!status.to_string().contains("test-wb-token"));
 
         let ping = call_tool_over_http(server.clone(), "wb_ping", json!({})).await;
         let ping = result_text(&ping);

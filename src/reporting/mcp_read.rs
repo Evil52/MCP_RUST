@@ -1,3 +1,8 @@
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "query rows borrow data associated with the supervised PostgreSQL session"
+)]
+
 //! Least-privilege read projection for deterministic daily-report data.
 //!
 //! The main MCP process may connect only as `position_reader`. It reads the
@@ -996,7 +1001,7 @@ fn validate_expected_fact_rows(rows: usize) -> Result<(), ReportingReadError> {
         .ok_or(ReportingReadError::InvalidRequest)
 }
 
-fn metric_fact_count(
+const fn metric_fact_count(
     source: SnapshotSource,
     sales_count: usize,
     advertising_count: usize,
@@ -1737,7 +1742,7 @@ fn parse_marketplace(value: &str) -> Result<Marketplace, ReportingReadError> {
     }
 }
 
-fn marketplace_str(value: Marketplace) -> &'static str {
+const fn marketplace_str(value: Marketplace) -> &'static str {
     match value {
         Marketplace::Ozon => "ozon",
         Marketplace::Wildberries => "wildberries",

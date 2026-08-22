@@ -87,7 +87,9 @@ pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
     "/v5/product/info/prices",
 ];
 
-/// Reserved for future canary-only read endpoints. The finance accrual
+/// Reserved for future canary-only read endpoints.
+///
+/// The finance accrual
 /// contracts have completed their canary period and now live in the stable
 /// allowlist above. The empty constant keeps the feature-flag API compatible
 /// while callers migrate away from the old preview switch.
@@ -211,7 +213,7 @@ impl fmt::Debug for OzonError {
 
 impl OzonError {
     #[must_use]
-    pub fn kind(&self) -> OzonErrorKind {
+    pub const fn kind(&self) -> OzonErrorKind {
         match self {
             Self::EndpointNotAllowed(_) => OzonErrorKind::EndpointNotAllowed,
             Self::MissingCredentials(_) => OzonErrorKind::MissingCredentials,
@@ -331,6 +333,8 @@ impl RateLimiter {
         if let Some(next_allowed) = analytics_next_allowed.as_deref_mut() {
             *next_allowed = now + ANALYTICS_REQUEST_INTERVAL;
         }
+        drop(analytics_next_allowed);
+        drop(next_allowed);
         Ok(())
     }
 
@@ -470,7 +474,7 @@ impl OzonClient {
     /// Backwards-compatible no-op retained for one release after finance
     /// accrual methods moved into the stable read-only allowlist.
     #[must_use]
-    pub fn with_finance_accruals_preview(self, _enabled: bool) -> Self {
+    pub const fn with_finance_accruals_preview(self, _enabled: bool) -> Self {
         self
     }
 
@@ -878,7 +882,7 @@ fn is_retriable(status: StatusCode) -> bool {
     )
 }
 
-fn is_retriable_transport(kind: OzonErrorKind) -> bool {
+const fn is_retriable_transport(kind: OzonErrorKind) -> bool {
     matches!(kind, OzonErrorKind::Timeout | OzonErrorKind::Network)
 }
 

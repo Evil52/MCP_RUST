@@ -148,17 +148,17 @@ impl ReportWorkerConfig {
     }
 
     #[must_use]
-    pub fn mode(&self) -> ReportWorkerMode {
+    pub const fn mode(&self) -> ReportWorkerMode {
         self.mode
     }
 
     #[must_use]
-    pub fn policy(&self) -> &DailyReportPolicy {
+    pub const fn policy(&self) -> &DailyReportPolicy {
         &self.policy
     }
 
     #[must_use]
-    pub fn artifact_store(&self) -> &LocalArtifactStore {
+    pub const fn artifact_store(&self) -> &LocalArtifactStore {
         &self.artifact_store
     }
 

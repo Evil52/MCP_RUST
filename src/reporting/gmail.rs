@@ -290,6 +290,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0[AUTHORIZATION], "Bearer access-token");
         let request: serde_json::Value = serde_json::from_slice(&seen[0].1).unwrap();
+        drop(seen);
         assert!(request["raw"].as_str().unwrap().len() > 100);
         assert_eq!(request.as_object().unwrap().len(), 1);
         task.abort();

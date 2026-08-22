@@ -141,6 +141,10 @@ impl HttpBody for PermitBody {
     type Data = <Body as HttpBody>::Data;
     type Error = <Body as HttpBody>::Error;
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the mutable body projection is required to poll and release its permit"
+    )]
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -659,7 +663,7 @@ impl JsonRpcEnvelopeShape {
         Ok(())
     }
 
-    fn requires_response_permit(&self) -> bool {
+    const fn requires_response_permit(&self) -> bool {
         if !self.jsonrpc || self.unknown {
             return true;
         }
@@ -812,19 +816,23 @@ fn exact_origin_from_resource_url(resource_url: &str) -> Option<String> {
 }
 
 fn allowed_mcp_origins(protected_resource_url: Option<&str>) -> Vec<String> {
-    match protected_resource_url {
-        Some(resource_url) => vec![
-            // AppConfig validates production resource URLs. Retaining one
-            // deliberately invalid entry if a programmatic caller bypasses
-            // that boundary keeps Origin-bearing requests fail-closed rather
-            // than accidentally disabling validation with an empty list.
-            exact_origin_from_resource_url(resource_url).unwrap_or_default(),
-        ],
-        None => DEV_MCP_ALLOWED_ORIGINS
-            .iter()
-            .map(|origin| (*origin).to_owned())
-            .collect(),
-    }
+    protected_resource_url.map_or_else(
+        || {
+            DEV_MCP_ALLOWED_ORIGINS
+                .iter()
+                .map(|origin| (*origin).to_owned())
+                .collect()
+        },
+        |resource_url| {
+            vec![
+                // AppConfig validates production resource URLs. Retaining one
+                // deliberately invalid entry if a programmatic caller bypasses
+                // that boundary keeps Origin-bearing requests fail-closed rather
+                // than accidentally disabling validation with an empty list.
+                exact_origin_from_resource_url(resource_url).unwrap_or_default(),
+            ]
+        },
+    )
 }
 
 fn exact_host_from_resource_url(resource_url: &str) -> Option<String> {
@@ -840,18 +848,22 @@ fn exact_host_from_resource_url(resource_url: &str) -> Option<String> {
 }
 
 fn allowed_mcp_hosts(protected_resource_url: Option<&str>) -> Vec<String> {
-    match protected_resource_url {
-        Some(resource_url) => vec![
-            // Keep a non-empty, non-matching policy when a programmatic caller
-            // bypasses AppConfig validation. An empty allowlist would disable
-            // rmcp's Host validation entirely.
-            exact_host_from_resource_url(resource_url).unwrap_or_default(),
-        ],
-        None => DEV_MCP_ALLOWED_HOSTS
-            .iter()
-            .map(|host| (*host).to_owned())
-            .collect(),
-    }
+    protected_resource_url.map_or_else(
+        || {
+            DEV_MCP_ALLOWED_HOSTS
+                .iter()
+                .map(|host| (*host).to_owned())
+                .collect()
+        },
+        |resource_url| {
+            vec![
+                // Keep a non-empty, non-matching policy when a programmatic caller
+                // bypasses AppConfig validation. An empty allowlist would disable
+                // rmcp's Host validation entirely.
+                exact_host_from_resource_url(resource_url).unwrap_or_default(),
+            ]
+        },
+    )
 }
 
 fn hold_permit_through_body(response: Response, permit: OwnedSemaphorePermit) -> Response {

@@ -166,7 +166,7 @@ pub struct OzonClientReportTransport {
 
 impl OzonClientReportTransport {
     #[must_use]
-    pub fn new(client: OzonClient, store: StoreId) -> Self {
+    pub const fn new(client: OzonClient, store: StoreId) -> Self {
         Self { client, store }
     }
 }
@@ -237,7 +237,9 @@ pub struct OzonReportSource<T> {
     transport: T,
 }
 
-/// Complete in-memory Ozon Seller input for one report cutoff. It is only
+/// Complete in-memory Ozon Seller input for one report cutoff.
+///
+/// It is only
 /// returned after all requested sources have succeeded, so callers can pass
 /// it to the transactional PostgreSQL writer without mixing partial data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -384,7 +386,7 @@ fn snapshot_validation_error(
 }
 
 impl<T> OzonReportSource<T> {
-    pub fn new(transport: T) -> Self {
+    pub const fn new(transport: T) -> Self {
         Self { transport }
     }
 }
@@ -650,10 +652,10 @@ fn sales_response_shape(response: &Value) -> String {
             "root={},result={},data={}",
             json_kind(response),
             result.is_some(),
-            data.map_or("not_array".to_owned(), |rows| format!(
-                "array:{}",
-                rows.len()
-            ))
+            data.map_or_else(
+                || "not_array".to_owned(),
+                |rows| format!("array:{}", rows.len())
+            )
         );
     };
     let dimensions = first.get("dimensions").and_then(Value::as_array);
@@ -692,7 +694,7 @@ fn sales_response_shape(response: &Value) -> String {
     )
 }
 
-fn json_kind(value: &Value) -> &'static str {
+const fn json_kind(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "bool",
@@ -733,13 +735,16 @@ mod tests {
         let forced_failure = std::cell::Cell::new(None);
         let mut attempt_once = || async {
             calls.set(calls.get() + 1);
-            if let Some(kind) = forced_failure.get() {
-                Err(kind)
-            } else if calls.get() < 3 {
-                Err(OzonErrorKind::Overloaded)
-            } else {
-                Ok(serde_json::json!({"result": "ok"}))
-            }
+            forced_failure.get().map_or_else(
+                || {
+                    if calls.get() < 3 {
+                        Err(OzonErrorKind::Overloaded)
+                    } else {
+                        Ok(serde_json::json!({"result": "ok"}))
+                    }
+                },
+                Err,
+            )
         };
         let value = retry_local_overload("/v3/posting/fbo/list", &mut attempt_once)
             .await

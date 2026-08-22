@@ -40,14 +40,14 @@ impl SnapshotSource {
         Self::Prices,
     ];
 
-    pub(crate) fn required_for(marketplace: Marketplace) -> &'static [Self] {
+    pub(crate) const fn required_for(marketplace: Marketplace) -> &'static [Self] {
         match marketplace {
             Marketplace::Ozon => &Self::OZON,
             Marketplace::Wildberries => &Self::BASE,
         }
     }
 
-    fn freshness_sla(self) -> Duration {
+    const fn freshness_sla(self) -> Duration {
         match self {
             Self::Sales | Self::Finance => Duration::hours(6),
             Self::Advertising => Duration::hours(2),
@@ -55,7 +55,7 @@ impl SnapshotSource {
         }
     }
 
-    fn is_period_source(self) -> bool {
+    const fn is_period_source(self) -> bool {
         matches!(self, Self::Sales | Self::Advertising | Self::Finance)
     }
 }
@@ -96,7 +96,7 @@ impl AccountScope {
     }
 
     #[must_use]
-    pub fn marketplace(&self) -> Marketplace {
+    pub const fn marketplace(&self) -> Marketplace {
         self.marketplace
     }
 }
@@ -162,7 +162,7 @@ impl SnapshotDescriptor {
     }
 
     #[must_use]
-    pub fn snapshot_id(&self) -> i64 {
+    pub const fn snapshot_id(&self) -> i64 {
         self.snapshot_id
     }
 
@@ -172,42 +172,42 @@ impl SnapshotDescriptor {
     }
 
     #[must_use]
-    pub fn marketplace(&self) -> Marketplace {
+    pub const fn marketplace(&self) -> Marketplace {
         self.marketplace
     }
 
     #[must_use]
-    pub fn source(&self) -> SnapshotSource {
+    pub const fn source(&self) -> SnapshotSource {
         self.source
     }
 
     #[must_use]
-    pub fn cutoff_at(&self) -> DateTime<Utc> {
+    pub const fn cutoff_at(&self) -> DateTime<Utc> {
         self.cutoff_at
     }
 
     #[must_use]
-    pub fn source_as_of(&self) -> DateTime<Utc> {
+    pub const fn source_as_of(&self) -> DateTime<Utc> {
         self.source_as_of
     }
 
     #[must_use]
-    pub fn period(&self) -> (DateTime<Utc>, DateTime<Utc>) {
+    pub const fn period(&self) -> (DateTime<Utc>, DateTime<Utc>) {
         (self.period_start, self.period_end)
     }
 
     #[must_use]
-    pub fn row_count(&self) -> u32 {
+    pub const fn row_count(&self) -> u32 {
         self.row_count
     }
 
     #[must_use]
-    pub fn pagination_complete(&self) -> bool {
+    pub const fn pagination_complete(&self) -> bool {
         self.pagination_complete
     }
 
     #[must_use]
-    pub fn status(&self) -> SnapshotStatus {
+    pub const fn status(&self) -> SnapshotStatus {
         self.status
     }
 
@@ -298,7 +298,7 @@ impl FrozenSnapshotManifest {
     }
 
     #[must_use]
-    pub fn cutoff_at(&self) -> DateTime<Utc> {
+    pub const fn cutoff_at(&self) -> DateTime<Utc> {
         self.cutoff_at
     }
 
@@ -308,7 +308,7 @@ impl FrozenSnapshotManifest {
     }
 
     #[must_use]
-    pub fn quality(&self) -> SnapshotQuality {
+    pub const fn quality(&self) -> SnapshotQuality {
         self.quality
     }
 

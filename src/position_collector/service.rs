@@ -43,7 +43,7 @@ impl CollectorRuntimeConfig {
     }
 
     #[must_use]
-    pub fn mode(&self) -> CollectorRuntimeMode {
+    pub const fn mode(&self) -> CollectorRuntimeMode {
         self.mode
     }
 

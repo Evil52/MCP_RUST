@@ -76,7 +76,7 @@ impl PositionSource for DisabledSource {
 
 impl SourceError {
     #[must_use]
-    pub fn is_protective(&self) -> bool {
+    pub const fn is_protective(&self) -> bool {
         matches!(
             self,
             Self::Captcha | Self::HttpForbidden | Self::RateLimited
@@ -136,32 +136,32 @@ pub struct BatchResult {
 
 impl BatchResult {
     #[must_use]
-    pub fn status(&self) -> BatchStatus {
+    pub const fn status(&self) -> BatchStatus {
         self.status
     }
 
     #[must_use]
-    pub fn planned_queries(&self) -> usize {
+    pub const fn planned_queries(&self) -> usize {
         self.planned_queries
     }
 
     #[must_use]
-    pub fn attempted_queries(&self) -> usize {
+    pub const fn attempted_queries(&self) -> usize {
         self.attempted_queries
     }
 
     #[must_use]
-    pub fn succeeded_queries(&self) -> usize {
+    pub const fn succeeded_queries(&self) -> usize {
         self.succeeded_queries
     }
 
     #[must_use]
-    pub fn stopped_early(&self) -> bool {
+    pub const fn stopped_early(&self) -> bool {
         self.stopped_early
     }
 
     #[must_use]
-    pub fn stop_reason(&self) -> BatchStopReason {
+    pub const fn stop_reason(&self) -> BatchStopReason {
         self.stop_reason
     }
 
@@ -285,7 +285,11 @@ async fn collect_batch(
     }
 }
 
-fn batch_status(blocked: bool, succeeded_queries: usize, planned_queries: usize) -> BatchStatus {
+const fn batch_status(
+    blocked: bool,
+    succeeded_queries: usize,
+    planned_queries: usize,
+) -> BatchStatus {
     if blocked {
         BatchStatus::Blocked
     } else if succeeded_queries == planned_queries {
@@ -879,6 +883,7 @@ mod tests {
             starts[1].duration_since(starts[0])
                 >= Duration::from_secs(super::MIN_QUERY_INTERVAL_SECONDS)
         );
+        drop(starts);
     }
 
     #[tokio::test(start_paused = true)]

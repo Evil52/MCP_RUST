@@ -1,3 +1,8 @@
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "the supervised session guard must remain valid while its client is borrowed"
+)]
+
 //! Supervised PostgreSQL connectivity shared by the isolated worker binaries.
 //!
 //! Every worker owns exactly one logical database session. Three properties

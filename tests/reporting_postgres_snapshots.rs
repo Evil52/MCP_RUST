@@ -592,9 +592,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
             )
             .await
             .unwrap(),
-        [(account_id.clone(), Marketplace::Ozon)]
-            .into_iter()
-            .collect()
+        std::iter::once((account_id.clone(), Marketplace::Ozon)).collect()
     );
     let wrong_marketplace = collection_target(&account_id, Marketplace::Wildberries);
     assert_eq!(

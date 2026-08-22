@@ -168,15 +168,15 @@ fn checked_add(left: u64, right: u64) -> Result<u64, PreviewError> {
     left.checked_add(right).ok_or(PreviewError::InvalidRules)
 }
 
-fn map_dataset(_: DatasetError) -> PreviewError {
+const fn map_dataset(_: DatasetError) -> PreviewError {
     PreviewError::InvalidDataset
 }
 
-fn map_rules(_: RuleError) -> PreviewError {
+const fn map_rules(_: RuleError) -> PreviewError {
     PreviewError::InvalidRules
 }
 
-fn map_bundle(error: BundleError) -> PreviewError {
+const fn map_bundle(error: BundleError) -> PreviewError {
     match error {
         BundleError::InvalidInput => PreviewError::InvalidDataset,
         BundleError::Rendering | BundleError::Integrity => PreviewError::Rendering,

@@ -46,7 +46,9 @@ const MAX_IN_FLIGHT_PER_CLIENT: usize = 2;
 const MAX_GLOBAL_IN_FLIGHT: usize = 8;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 
-/// Exact fixed business endpoints that may leave this process. The two
+/// Exact fixed business endpoints that may leave this process.
+///
+/// The two
 /// campaign-ID routes are admitted separately by a structural matcher. The
 /// OAuth token endpoint is deliberately internal and is never model-callable.
 pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[(Method, &str)] = &[
@@ -744,6 +746,10 @@ impl PerformanceClient {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the token mutex deliberately provides a single-flight OAuth exchange"
+    )]
     async fn access_token(&self, state: &AccountState) -> Result<String, PerformanceError> {
         let mut slot = state.token.lock().await;
         let now = Instant::now();
@@ -2218,6 +2224,11 @@ mod tests {
     /// left completely free here, so only the global budget can explain the
     /// refusal — and releasing one permit must restore service immediately.
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        clippy::collection_is_never_read,
+        reason = "the retained permits intentionally keep the global budget exhausted"
+    )]
     async fn the_global_performance_budget_fails_fast_while_the_account_gate_is_free() {
         let client = PerformanceClient::new_for_test(
             "http://127.0.0.1:1".to_owned(),

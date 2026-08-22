@@ -31,7 +31,7 @@ trait OAuthProvider: Send + Sync {
 
 impl OAuthProvider for GmailOAuthClient {
     fn refresh<'a>(&'a self, credentials: &'a GmailOAuthCredentials) -> OAuthFuture<'a> {
-        Box::pin(async move { GmailOAuthClient::refresh(self, credentials).await })
+        Box::pin(async move { Self::refresh(self, credentials).await })
     }
 }
 
@@ -41,7 +41,7 @@ trait MessageProvider: Send + Sync {
 
 impl MessageProvider for GmailClient {
     fn send<'a>(&'a self, access_token: &'a str, email: &'a ReportEmail) -> SendFuture<'a> {
-        Box::pin(async move { GmailClient::send(self, access_token, email).await })
+        Box::pin(async move { Self::send(self, access_token, email).await })
     }
 }
 
@@ -163,7 +163,7 @@ impl GmailDeliveryService {
     }
 }
 
-fn map_oauth_error(error: GmailOAuthError) -> GmailDeliveryError {
+const fn map_oauth_error(error: GmailOAuthError) -> GmailDeliveryError {
     match error {
         GmailOAuthError::Rejected => GmailDeliveryError::Authentication,
         GmailOAuthError::RateLimited => GmailDeliveryError::OAuthRateLimited,
@@ -172,7 +172,7 @@ fn map_oauth_error(error: GmailOAuthError) -> GmailDeliveryError {
     }
 }
 
-fn map_send_error(error: GmailSendError) -> GmailDeliveryError {
+const fn map_send_error(error: GmailSendError) -> GmailDeliveryError {
     match error {
         GmailSendError::InvalidCredential | GmailSendError::Authentication => {
             GmailDeliveryError::Authentication

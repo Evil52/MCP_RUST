@@ -63,7 +63,7 @@ pub struct PerformanceClientReportTransport {
 
 impl PerformanceClientReportTransport {
     #[must_use]
-    pub fn new(client: PerformanceClient, store: StoreId) -> Self {
+    pub const fn new(client: PerformanceClient, store: StoreId) -> Self {
         Self { client, store }
     }
 }

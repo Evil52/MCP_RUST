@@ -5,6 +5,10 @@ use std::{
     thread,
 };
 
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "the shared fixture is deliberately restricted to this crate's tests"
+)]
 pub(crate) fn mock_http(responses: Vec<(u16, String)>) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

@@ -94,7 +94,7 @@ pub async fn persist_and_mark_ready(
     Ok(receipt)
 }
 
-fn map_outbox(_: PostgresOutboxError) -> ArtifactPublicationError {
+const fn map_outbox(_: PostgresOutboxError) -> ArtifactPublicationError {
     ArtifactPublicationError::Outbox
 }
 
@@ -382,7 +382,7 @@ fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, ArtifactStoreError
     Ok(bytes)
 }
 
-fn validate_loaded_bytes(bytes: &[u8], maximum: u64) -> Result<(), ArtifactStoreError> {
+const fn validate_loaded_bytes(bytes: &[u8], maximum: u64) -> Result<(), ArtifactStoreError> {
     if bytes.is_empty() || bytes.len() as u64 > maximum {
         Err(ArtifactStoreError::Integrity)
     } else {

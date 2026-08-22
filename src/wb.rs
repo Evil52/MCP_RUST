@@ -553,7 +553,7 @@ impl ClientPolicy {
         }
     }
 
-    fn interval(self, request_class: RequestClass) -> Duration {
+    const fn interval(self, request_class: RequestClass) -> Duration {
         match request_class {
             RequestClass::AnalyticsPing => self.ping_interval,
             RequestClass::AnalyticsReport => self.analytics_interval,
@@ -604,8 +604,11 @@ impl PacingGate {
 
     /// Checks availability without consuming a minute-scale quota slot.
     async fn ensure_ready_now(&self) -> Result<(), Duration> {
-        let next_allowed = self.next_allowed.lock().await;
-        let wait = next_allowed.saturating_duration_since(Instant::now());
+        let wait = self
+            .next_allowed
+            .lock()
+            .await
+            .saturating_duration_since(Instant::now());
         if !wait.is_zero() {
             return Err(wait);
         }
@@ -629,6 +632,7 @@ impl PacingGate {
             return Err(wait);
         }
         *next_allowed = Instant::now() + interval;
+        drop(next_allowed);
         Ok(())
     }
 
@@ -683,7 +687,7 @@ impl TokenLimiter {
         }
     }
 
-    fn gate(&self, request_class: RequestClass) -> &PacingGate {
+    const fn gate(&self, request_class: RequestClass) -> &PacingGate {
         match request_class {
             RequestClass::AnalyticsPing => &self.analytics_ping,
             RequestClass::AnalyticsReport => &self.analytics_reports,
@@ -1705,7 +1709,7 @@ fn retry_wait_fits_deadline(
     retry_delay.max(quota_wait) < remaining
 }
 
-fn is_local_admission_error(error: &WbError) -> bool {
+const fn is_local_admission_error(error: &WbError) -> bool {
     matches!(
         error,
         WbError::LocalRateLimited { .. } | WbError::Overloaded
@@ -2024,7 +2028,7 @@ fn is_retriable(status: StatusCode) -> bool {
     )
 }
 
-fn is_retriable_transport(kind: WbErrorKind) -> bool {
+const fn is_retriable_transport(kind: WbErrorKind) -> bool {
     matches!(kind, WbErrorKind::Timeout | WbErrorKind::Network)
 }
 

@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     fmt,
     sync::Arc,
     time::{Duration, Instant},
@@ -40,7 +39,7 @@ pub enum JwtAuthenticationFailure {
 }
 
 impl JwtAuthenticationFailure {
-    fn oauth_error(self) -> Option<(&'static str, &'static str)> {
+    const fn oauth_error(self) -> Option<(&'static str, &'static str)> {
         match self {
             Self::MissingCredentials | Self::AccessDenied | Self::VerifierUnavailable => None,
             Self::InvalidToken => Some(("invalid_token", "The access token is invalid")),
@@ -54,7 +53,7 @@ impl JwtAuthenticationFailure {
     }
 
     #[must_use]
-    pub fn public_message(self) -> &'static str {
+    pub const fn public_message(self) -> &'static str {
         match self {
             Self::MissingCredentials => "Требуется авторизация: access token не передан.",
             Self::InvalidToken => "Требуется повторная авторизация: access token недействителен.",
@@ -237,18 +236,12 @@ impl JwtAuthenticator {
         {
             return Err(JwtAuthenticationFailure::InsufficientScope);
         }
-        let granted = scope_claim
-            .split(' ')
-            .filter(|scope| !scope.is_empty())
-            .collect::<BTreeSet<_>>();
-        let missing = self
-            .config
-            .required_scopes
-            .iter()
-            .filter(|scope| !granted.contains(scope.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
+        let has_missing_scope = self.config.required_scopes.iter().any(|required| {
+            !scope_claim
+                .split(' ')
+                .any(|granted| granted == required.as_str())
+        });
+        if has_missing_scope {
             return Err(JwtAuthenticationFailure::InsufficientScope);
         }
         Ok(())
@@ -359,6 +352,7 @@ impl JwtAuthenticator {
                 if refresh_is_for_unknown_kid {
                     state.last_unknown_kid_refresh_at = Some(failed_at);
                 }
+                drop(state);
                 return Err(error);
             }
         };
@@ -370,6 +364,7 @@ impl JwtAuthenticator {
         state.last_failed_refresh_at = None;
         state.last_unknown_kid_refresh_at =
             (refresh_is_for_unknown_kid || missing_after_refresh).then_some(fetched_at);
+        drop(state);
         key.map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?
             .ok_or(JwtAuthenticationFailure::InvalidToken)
     }

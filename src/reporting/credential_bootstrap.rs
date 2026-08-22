@@ -182,6 +182,10 @@ fn valid_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+#[expect(
+    clippy::or_fun_call,
+    reason = "eager Path view construction is allocation-free and keeps the fallback branch inert"
+)]
 fn create_credential_directory(path: &Path, values: &BTreeMap<String, String>) -> Result<()> {
     let file_name = path
         .file_name()
@@ -229,11 +233,11 @@ struct IncompleteDirectory {
 }
 
 impl IncompleteDirectory {
-    fn new(path: PathBuf) -> Self {
+    const fn new(path: PathBuf) -> Self {
         Self { path, armed: true }
     }
 
-    fn disarm(&mut self) {
+    const fn disarm(&mut self) {
         self.armed = false;
     }
 }

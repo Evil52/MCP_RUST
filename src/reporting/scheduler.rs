@@ -123,8 +123,13 @@ mod tests {
             recipient_id: "pilot_owner".to_owned(),
             report_version: 1,
         };
-        let plans =
-            due_for_audience(utc(13), "pilot_owner", 1, &[morning].into_iter().collect()).unwrap();
+        let plans = due_for_audience(
+            utc(13),
+            "pilot_owner",
+            1,
+            &std::iter::once(morning).collect(),
+        )
+        .unwrap();
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].delivery.covered_keys.len(), 1);
         assert_eq!(plans[0].delivery.covered_keys[0].kind, ReportKind::Evening);
@@ -153,7 +158,7 @@ mod tests {
                     email_env: "DIANA_EMAIL".to_owned(),
                     managers: vec![ManagerScope {
                         actor_id: "diana_serafimovich".to_owned(),
-                        account_ids: ["furnitura_dlya_doma".to_owned()].into_iter().collect(),
+                        account_ids: std::iter::once("furnitura_dlya_doma".to_owned()).collect(),
                     }],
                 },
                 AudiencePolicy {
@@ -161,7 +166,7 @@ mod tests {
                     email_env: "OWNER_EMAIL".to_owned(),
                     managers: vec![ManagerScope {
                         actor_id: "anna_agzamova".to_owned(),
-                        account_ids: ["ofk_region_wb".to_owned()].into_iter().collect(),
+                        account_ids: std::iter::once("ofk_region_wb".to_owned()).collect(),
                     }],
                 },
             ],
@@ -184,7 +189,7 @@ mod tests {
                 email_env: "OWNER_EMAIL".to_owned(),
                 managers: vec![ManagerScope {
                     actor_id: "anna_agzamova".to_owned(),
-                    account_ids: ["ofk_region_wb".to_owned()].into_iter().collect(),
+                    account_ids: std::iter::once("ofk_region_wb".to_owned()).collect(),
                 }],
             }],
         };

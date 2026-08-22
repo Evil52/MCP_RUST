@@ -141,7 +141,7 @@ impl ArtifactLoader for LocalArtifactStore {
     fn load(&self, artifact: ArtifactIdentity) -> ArtifactFuture<'_> {
         let store = self.clone();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || LocalArtifactStore::load(&store, &artifact))
+            tokio::task::spawn_blocking(move || Self::load(&store, &artifact))
                 .await
                 .map_err(|_| ArtifactStoreError::Unavailable)?
         })
@@ -176,7 +176,7 @@ impl fmt::Debug for GmailProvider {
 
 impl GmailProvider {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         service: GmailDeliveryService,
         routing: MailRouting,
         credentials: GmailOAuthCredentials,
@@ -411,14 +411,14 @@ impl GmailOutboxWorker {
     }
 }
 
-fn permanent_outcome(claim: &ClaimedDelivery) -> DeliveryTickOutcome {
+const fn permanent_outcome(claim: &ClaimedDelivery) -> DeliveryTickOutcome {
     DeliveryTickOutcome::PermanentFailure {
         batch_id: claim.batch_id,
         attempt_no: claim.attempt_no,
     }
 }
 
-fn permanent_class(error: GmailDeliveryError) -> Option<DeliveryErrorClass> {
+const fn permanent_class(error: GmailDeliveryError) -> Option<DeliveryErrorClass> {
     match error {
         GmailDeliveryError::Routing => Some(DeliveryErrorClass::InvalidRouting),
         GmailDeliveryError::Message => Some(DeliveryErrorClass::InvalidArtifact),
@@ -432,7 +432,7 @@ fn permanent_class(error: GmailDeliveryError) -> Option<DeliveryErrorClass> {
     }
 }
 
-fn transient_class(error: GmailDeliveryError) -> Option<DeliveryErrorClass> {
+const fn transient_class(error: GmailDeliveryError) -> Option<DeliveryErrorClass> {
     match error {
         GmailDeliveryError::OAuthRateLimited | GmailDeliveryError::ProviderRateLimited => {
             Some(DeliveryErrorClass::RateLimited)
@@ -1178,13 +1178,12 @@ mod tests {
         let recipient = format!("gmail_e2e_{}", std::process::id());
         let config = Config::from_str(database_url).unwrap();
         let setup = PostgresOutboxRepository::connect(&config).await.unwrap();
-        let covered_morning = [ReportKey {
+        let covered_morning = std::iter::once(ReportKey {
             local_date: NaiveDate::from_ymd_opt(2098, 8, 19).unwrap(),
             kind: ReportKind::Morning,
             recipient_id: recipient.clone(),
             report_version: 1,
-        }]
-        .into_iter()
+        })
         .collect();
         let delivery = due_deliveries(at(12, 0), &recipient, 1, &covered_morning)
             .unwrap()

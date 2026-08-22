@@ -66,7 +66,7 @@ pub struct WbClientReportTransport {
 
 impl WbClientReportTransport {
     #[must_use]
-    pub fn new(client: WbClient, account_id: String) -> Self {
+    pub const fn new(client: WbClient, account_id: String) -> Self {
         Self { client, account_id }
     }
 }

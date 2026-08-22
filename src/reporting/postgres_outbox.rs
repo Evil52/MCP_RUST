@@ -1,3 +1,8 @@
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "PostgreSQL transactions borrow the supervised session guard until commit"
+)]
+
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, Utc};
@@ -1130,14 +1135,14 @@ async fn create_planned_inner(
     Ok(CreateOutcome::Inserted(batch_id))
 }
 
-fn kind_text(kind: ReportKind) -> &'static str {
+const fn kind_text(kind: ReportKind) -> &'static str {
     match kind {
         ReportKind::Morning => "morning",
         ReportKind::Evening => "evening",
     }
 }
 
-fn attempt_outcome_text(outcome: AttemptOutcome) -> &'static str {
+const fn attempt_outcome_text(outcome: AttemptOutcome) -> &'static str {
     match outcome {
         AttemptOutcome::Sent => "sent",
         AttemptOutcome::Transient => "transient",
@@ -1162,7 +1167,9 @@ fn parse_generation_status(value: &str) -> Result<GenerationStatus, PostgresOutb
     }
 }
 
-fn transient_error_text(class: DeliveryErrorClass) -> Result<&'static str, PostgresOutboxError> {
+const fn transient_error_text(
+    class: DeliveryErrorClass,
+) -> Result<&'static str, PostgresOutboxError> {
     match class {
         DeliveryErrorClass::RateLimited => Ok("rate_limited"),
         DeliveryErrorClass::ProviderUnavailable => Ok("provider_unavailable"),
@@ -1175,7 +1182,9 @@ fn transient_error_text(class: DeliveryErrorClass) -> Result<&'static str, Postg
     }
 }
 
-fn permanent_error_text(class: DeliveryErrorClass) -> Result<&'static str, PostgresOutboxError> {
+const fn permanent_error_text(
+    class: DeliveryErrorClass,
+) -> Result<&'static str, PostgresOutboxError> {
     match class {
         DeliveryErrorClass::Authentication => Ok("authentication"),
         DeliveryErrorClass::InvalidRecipient => Ok("invalid_recipient"),
@@ -1199,7 +1208,7 @@ fn validate_attempt_times(
     }
 }
 
-fn exactly_one(changed: u64) -> Result<(), PostgresOutboxError> {
+const fn exactly_one(changed: u64) -> Result<(), PostgresOutboxError> {
     if changed == 1 {
         Ok(())
     } else {

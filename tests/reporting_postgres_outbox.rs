@@ -71,7 +71,7 @@ fn disabled_policy(recipient_id: String) -> DailyReportPolicy {
             email_env: "DAILY_REPORT_PILOT_RECIPIENT_EMAIL".to_owned(),
             managers: vec![ManagerScope {
                 actor_id: "diana_serafimovich".to_owned(),
-                account_ids: ["furnitura_dlya_doma".to_owned()].into_iter().collect(),
+                account_ids: std::iter::once("furnitura_dlya_doma".to_owned()).collect(),
             }],
         }],
     }

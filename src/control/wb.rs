@@ -45,6 +45,10 @@ impl WritePacer {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "write serialization intentionally spans the complete request"
+    )]
     async fn run<T, F, Fut>(&self, operation: F) -> T
     where
         F: FnOnce() -> Fut,
@@ -58,6 +62,10 @@ impl WritePacer {
         operation().await
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "write serialization intentionally spans permit validation and the response"
+    )]
     async fn run_guarded<T, E, P, PermitFuture, F, Fut>(
         &self,
         permit: P,
@@ -1325,6 +1333,7 @@ mod tests {
         let starts = starts.lock().await;
         assert_eq!(starts.len(), 2);
         assert!(starts[1].duration_since(starts[0]) >= minimum_interval);
+        drop(starts);
     }
 
     #[tokio::test]

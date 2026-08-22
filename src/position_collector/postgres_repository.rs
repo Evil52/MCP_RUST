@@ -1,3 +1,8 @@
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "PostgreSQL transactions borrow the supervised session guard until commit"
+)]
+
 use std::{future::Future, pin::Pin};
 
 use chrono::{DateTime, Utc};
@@ -284,7 +289,7 @@ async fn insert_measurements(
     Ok(())
 }
 
-fn status_text(status: BatchStatus) -> &'static str {
+const fn status_text(status: BatchStatus) -> &'static str {
     match status {
         BatchStatus::Succeeded => "succeeded",
         BatchStatus::Partial => "partial",
@@ -293,14 +298,14 @@ fn status_text(status: BatchStatus) -> &'static str {
     }
 }
 
-fn outcome_text(outcome: PersistedOutcome) -> &'static str {
+const fn outcome_text(outcome: PersistedOutcome) -> &'static str {
     match outcome {
         PersistedOutcome::Found => "found",
         PersistedOutcome::NotFound => "not_found",
     }
 }
 
-fn placement_text(placement: PlacementKind) -> &'static str {
+const fn placement_text(placement: PlacementKind) -> &'static str {
     match placement {
         PlacementKind::Organic => "organic",
         PlacementKind::Sponsored => "sponsored",

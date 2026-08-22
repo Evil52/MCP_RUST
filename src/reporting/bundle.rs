@@ -177,7 +177,7 @@ fn attachment_name(key: &ReportKey) -> String {
     )
 }
 
-fn kind_name(kind: ReportKind) -> &'static str {
+const fn kind_name(kind: ReportKind) -> &'static str {
     match kind {
         ReportKind::Morning => "morning",
         ReportKind::Evening => "evening",
@@ -194,11 +194,11 @@ fn sha256(bytes: &[u8]) -> String {
         })
 }
 
-fn map_html(_: HtmlReportError) -> BundleError {
+const fn map_html(_: HtmlReportError) -> BundleError {
     BundleError::InvalidInput
 }
 
-fn map_xlsx(error: XlsxReportError) -> BundleError {
+const fn map_xlsx(error: XlsxReportError) -> BundleError {
     match error {
         XlsxReportError::InvalidInput => BundleError::InvalidInput,
         XlsxReportError::Generation | XlsxReportError::OutputTooLarge => BundleError::Rendering,

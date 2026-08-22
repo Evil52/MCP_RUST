@@ -193,7 +193,7 @@ fn report_time(date: NaiveDate, hour: u32) -> Result<DateTime<FixedOffset>, Repo
         .ok_or(ReportScheduleError::OutOfRange)
 }
 
-pub(crate) fn yekaterinburg_offset() -> FixedOffset {
+pub(crate) const fn yekaterinburg_offset() -> FixedOffset {
     FixedOffset::east_opt(YEKATERINBURG_OFFSET_SECONDS)
         .expect("the fixed Yekaterinburg UTC offset is valid")
 }
@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn sent_keys_prevent_duplicates_and_allow_the_missing_companion() {
-        let sent = [key(ReportKind::Morning)].into_iter().collect();
+        let sent = std::iter::once(key(ReportKind::Morning)).collect();
         let deliveries = due_deliveries(utc(2026, 8, 16, 12, 0), "pilot_owner", 1, &sent).unwrap();
 
         assert_eq!(deliveries[0].covered_keys, vec![key(ReportKind::Evening)]);

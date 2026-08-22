@@ -188,7 +188,7 @@ fn validate(report: &XlsxReport<'_>) -> Result<(), XlsxReportError> {
     Ok(())
 }
 
-fn validate_output_size(size: usize) -> Result<(), XlsxReportError> {
+const fn validate_output_size(size: usize) -> Result<(), XlsxReportError> {
     if size > MAX_OUTPUT_BYTES {
         Err(XlsxReportError::OutputTooLarge)
     } else {
@@ -642,11 +642,10 @@ fn write_optional_rate(
                 &formats.percent,
             )
             .map_err(map_xlsx)?;
-        Ok(())
     } else {
         sheet.write_string(row, column, "N/D").map_err(map_xlsx)?;
-        Ok(())
     }
+    Ok(())
 }
 
 // Every caller is downstream of validate(), which rejects integers above the
@@ -658,7 +657,7 @@ fn excel_number(value: u64) -> f64 {
     value as f64
 }
 
-fn source_text(source: SnapshotSource) -> &'static str {
+const fn source_text(source: SnapshotSource) -> &'static str {
     match source {
         SnapshotSource::Sales => "Продажи",
         SnapshotSource::Advertising => "Реклама",
@@ -668,7 +667,7 @@ fn source_text(source: SnapshotSource) -> &'static str {
     }
 }
 
-fn quality_text(quality: SnapshotQuality) -> &'static str {
+const fn quality_text(quality: SnapshotQuality) -> &'static str {
     match quality {
         SnapshotQuality::Complete => "Полные и свежие",
         SnapshotQuality::Partial => "Частичные",
@@ -677,7 +676,7 @@ fn quality_text(quality: SnapshotQuality) -> &'static str {
     }
 }
 
-fn problem_text(kind: ProblemKind) -> (&'static str, &'static str) {
+const fn problem_text(kind: ProblemKind) -> (&'static str, &'static str) {
     match kind {
         ProblemKind::AdvertisedWithoutStock => (
             "Реклама при нулевом остатке",

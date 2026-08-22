@@ -20,7 +20,7 @@ pub enum DeliveryStatus {
 
 impl DeliveryStatus {
     #[must_use]
-    pub fn is_terminal(self) -> bool {
+    pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Sent | Self::Expired | Self::PermanentFailure)
     }
 }
@@ -38,7 +38,7 @@ pub enum DeliveryErrorClass {
 }
 
 impl DeliveryErrorClass {
-    fn is_transient(self) -> bool {
+    const fn is_transient(self) -> bool {
         matches!(
             self,
             Self::RateLimited | Self::ProviderUnavailable | Self::Transport
@@ -138,7 +138,7 @@ impl DeliveryRecord {
     }
 
     #[must_use]
-    pub fn scheduled_for(&self) -> DateTime<Utc> {
+    pub const fn scheduled_for(&self) -> DateTime<Utc> {
         self.scheduled_for
     }
 
@@ -149,27 +149,27 @@ impl DeliveryRecord {
     }
 
     #[must_use]
-    pub fn status(&self) -> DeliveryStatus {
+    pub const fn status(&self) -> DeliveryStatus {
         self.status
     }
 
     #[must_use]
-    pub fn delayed(&self) -> bool {
+    pub const fn delayed(&self) -> bool {
         self.delayed
     }
 
     #[must_use]
-    pub fn attempts(&self) -> u8 {
+    pub const fn attempts(&self) -> u8 {
         self.attempts
     }
 
     #[must_use]
-    pub fn artifact(&self) -> Option<&ArtifactIdentity> {
+    pub const fn artifact(&self) -> Option<&ArtifactIdentity> {
         self.artifact.as_ref()
     }
 
     #[must_use]
-    pub fn next_attempt_at(&self) -> Option<DateTime<Utc>> {
+    pub const fn next_attempt_at(&self) -> Option<DateTime<Utc>> {
         self.next_attempt_at
     }
 
@@ -179,7 +179,7 @@ impl DeliveryRecord {
     }
 
     #[must_use]
-    pub fn last_error(&self) -> Option<DeliveryErrorClass> {
+    pub const fn last_error(&self) -> Option<DeliveryErrorClass> {
         self.last_error
     }
 

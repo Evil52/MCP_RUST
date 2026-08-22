@@ -469,7 +469,7 @@ mod tests {
                     id: "approver".to_owned(),
                     name: "Approver".to_owned(),
                     role: Role::Finance,
-                    account_ids: ["wb_one".to_owned()].into_iter().collect(),
+                    account_ids: std::iter::once("wb_one".to_owned()).collect(),
                     oidc: Some(OidcIdentity {
                         username: Some("approver".to_owned()),
                         ..OidcIdentity::default()
@@ -983,7 +983,7 @@ mod tests {
                 id: actor_id.clone(),
                 name: format!("Approver {index}"),
                 role: Role::Finance,
-                account_ids: ["wb_one".to_owned()].into_iter().collect(),
+                account_ids: std::iter::once("wb_one".to_owned()).collect(),
                 oidc: Some(OidcIdentity {
                     username: Some(actor_id.clone()),
                     ..OidcIdentity::default()

@@ -238,7 +238,7 @@ struct WbTokenTypeClaims {
     acc: u8,
 }
 
-fn decoded_base64url_len(encoded_len: usize) -> Option<usize> {
+const fn decoded_base64url_len(encoded_len: usize) -> Option<usize> {
     let remainder = encoded_len % 4;
     // A non-padded base64url value can never have one trailing symbol.
     if remainder == 1 {
@@ -561,12 +561,13 @@ impl AccessRegistry {
     ) -> Result<&Actor> {
         let mut matches = self.actors.iter().filter(|actor| {
             actor.oidc.as_ref().is_some_and(|identity| {
-                if let Some(expected_subject) = identity.subject.as_deref() {
-                    expected_subject == subject
-                } else {
-                    username.is_some_and(|value| identity.username.as_deref() == Some(value))
-                        || email.is_some_and(|value| identity.email.as_deref() == Some(value))
-                }
+                identity.subject.as_deref().map_or_else(
+                    || {
+                        username.is_some_and(|value| identity.username.as_deref() == Some(value))
+                            || email.is_some_and(|value| identity.email.as_deref() == Some(value))
+                    },
+                    |expected_subject| expected_subject == subject,
+                )
             })
         });
         let actor = matches
@@ -749,7 +750,9 @@ impl RegistrySource {
     fn cached(&self, raw: &[u8]) -> Option<Arc<AccessRegistry>> {
         let cache = self.read_cache();
         let cached = cache.as_ref()?;
-        (cached.raw == raw).then(|| Arc::clone(&cached.registry))
+        let registry = (cached.raw == raw).then(|| Arc::clone(&cached.registry));
+        drop(cache);
+        registry
     }
 
     // Nothing that can panic runs while either guard is held, so a poisoned
@@ -1600,6 +1603,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::needless_collect,
+        reason = "all reader threads must start before the writer is joined"
+    )]
     fn concurrent_readers_never_observe_a_torn_registry_while_it_is_rewritten() {
         fn assert_whole_generation(registry: &AccessRegistry) {
             let name = registry.actor("manager").unwrap().name.as_str();

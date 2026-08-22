@@ -1,3 +1,8 @@
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "PostgreSQL transactions borrow the supervised session guard until commit"
+)]
+
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -128,7 +133,7 @@ pub enum CollectedFacts {
 }
 
 impl CollectedFacts {
-    fn source(&self) -> SnapshotSource {
+    const fn source(&self) -> SnapshotSource {
         match self {
             Self::Sales(_) => SnapshotSource::Sales,
             Self::Advertising(_) => SnapshotSource::Advertising,
@@ -138,7 +143,7 @@ impl CollectedFacts {
         }
     }
 
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         match self {
             Self::Sales(facts) => facts.len(),
             Self::Advertising(facts) => facts.len(),
@@ -274,12 +279,12 @@ impl CollectionClaim {
     }
 
     #[must_use]
-    pub fn marketplace(&self) -> Marketplace {
+    pub const fn marketplace(&self) -> Marketplace {
         self.marketplace
     }
 
     #[must_use]
-    pub fn lease_until(&self) -> DateTime<Utc> {
+    pub const fn lease_until(&self) -> DateTime<Utc> {
         self.lease_until
     }
 
@@ -684,7 +689,7 @@ fn validate_coverage_targets(targets: &[CollectionTarget]) -> Result<(), Postgre
     }
 }
 
-fn marketplace_name(marketplace: Marketplace) -> &'static str {
+const fn marketplace_name(marketplace: Marketplace) -> &'static str {
     match marketplace {
         Marketplace::Ozon => "ozon",
         Marketplace::Wildberries => "wildberries",

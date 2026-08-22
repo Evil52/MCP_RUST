@@ -1,3 +1,8 @@
+#![expect(
+    clippy::significant_drop_tightening,
+    reason = "query rows borrow data associated with the supervised PostgreSQL session"
+)]
+
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -569,7 +574,7 @@ mod tests {
 
     #[test]
     fn database_scalar_mappings_reject_foreign_or_negative_values() {
-        let accounts = ["expected"].into_iter().collect();
+        let accounts = std::iter::once("expected").collect();
         assert_eq!(
             checked_account("expected".to_owned(), &accounts),
             Ok("expected".to_owned())

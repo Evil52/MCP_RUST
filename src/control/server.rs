@@ -339,7 +339,7 @@ impl ControlMcp {
     }
 
     #[must_use]
-    pub fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
+    pub const fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
         self.authenticator.as_ref()
     }
 
@@ -963,6 +963,10 @@ fn authorize_plan_approval(
     Ok(())
 }
 
+#[expect(
+    clippy::suspicious_operation_groupings,
+    reason = "all comparisons independently bind the plan to its actor and runtime scope"
+)]
 fn authorize_plan_account_access<'a>(
     registry: &'a AccessRegistry,
     actor: &Actor,
@@ -1116,7 +1120,7 @@ fn plan_store_error(error: PlanStoreError) -> String {
     }
 }
 
-fn guarded_write_permit_error_class(error: &WritePermitFailure) -> &'static str {
+const fn guarded_write_permit_error_class(error: &WritePermitFailure) -> &'static str {
     match error {
         WritePermitFailure::Authorization => "access_revoked",
         WritePermitFailure::PreflightRead => "preflight_read_failed",
@@ -1141,7 +1145,7 @@ fn guarded_write_permit_error_class(error: &WritePermitFailure) -> &'static str 
     }
 }
 
-fn write_failure_finish(error: &WbWriteError) -> (WbPlanStatus, &'static str) {
+const fn write_failure_finish(error: &WbWriteError) -> (WbPlanStatus, &'static str) {
     match error.outcome_kind() {
         WbWriteOutcomeKind::DefiniteFailure => (WbPlanStatus::Failed, "wb_write_rejected"),
         WbWriteOutcomeKind::Ambiguous => (WbPlanStatus::Ambiguous, "wb_write_ambiguous"),
@@ -1564,8 +1568,9 @@ mod tests {
             &read_base_url,
             &read_base_url,
         );
-        let (writer, write_requests) = match write_responses {
-            Some(responses) => {
+        let (writer, write_requests) = write_responses.map_or_else(
+            || (None, None),
+            |responses| {
                 let (write_base_url, requests) = mock_http(responses);
                 (
                     Some(Arc::new(WbBidWriteClient::new_for_test(
@@ -1575,9 +1580,8 @@ mod tests {
                     ))),
                     Some(requests),
                 )
-            }
-            None => (None, None),
-        };
+            },
+        );
         (
             WbControlServices {
                 account_id: "wb_one".to_owned(),

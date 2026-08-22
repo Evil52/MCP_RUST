@@ -99,6 +99,10 @@ fn stores() -> BTreeMap<StoreId, StoreCredentials> {
     )])
 }
 
+#[expect(
+    clippy::collection_is_never_read,
+    reason = "retaining accepted streams keeps all upstream requests in flight"
+)]
 async fn exercise_real_report_transport_overload() {
     const HELD_REQUESTS: usize = 16;
 

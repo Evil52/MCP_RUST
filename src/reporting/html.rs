@@ -130,7 +130,7 @@ fn escape(value: &str) -> String {
     escaped
 }
 
-fn quality_label(quality: SnapshotQuality) -> (&'static str, bool) {
+const fn quality_label(quality: SnapshotQuality) -> (&'static str, bool) {
     match quality {
         SnapshotQuality::Complete => ("полные и свежие", false),
         SnapshotQuality::Partial => ("частичные", true),
@@ -195,7 +195,7 @@ fn write_problems(html: &mut String, problems: &[PriorityProblem], suppressed: b
     }
 }
 
-fn problem_label(kind: ProblemKind) -> (&'static str, &'static str) {
+const fn problem_label(kind: ProblemKind) -> (&'static str, &'static str) {
     match kind {
         ProblemKind::AdvertisedWithoutStock => (
             "реклама расходуется при нулевом остатке",

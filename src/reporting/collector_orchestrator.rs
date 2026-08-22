@@ -53,7 +53,7 @@ pub async fn plan_due_collection(
     }))
 }
 
-fn map_repository_error(_: PostgresCollectorError) -> CollectionOrchestrationError {
+const fn map_repository_error(_: PostgresCollectorError) -> CollectionOrchestrationError {
     CollectionOrchestrationError::Repository
 }
 

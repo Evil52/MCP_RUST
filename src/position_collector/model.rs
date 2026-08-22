@@ -96,7 +96,7 @@ impl MonitorTarget {
     }
 
     #[must_use]
-    pub fn monitor_id(&self) -> i64 {
+    pub const fn monitor_id(&self) -> i64 {
         self.monitor_id
     }
 
@@ -126,7 +126,7 @@ pub struct QueryPlan {
 
 impl QueryPlan {
     #[must_use]
-    pub fn request(&self) -> &QueryRequest {
+    pub const fn request(&self) -> &QueryRequest {
         &self.request
     }
 
@@ -148,7 +148,7 @@ pub struct QueryRequest {
 
 impl QueryRequest {
     #[must_use]
-    pub fn slot(&self) -> DateTime<Utc> {
+    pub const fn slot(&self) -> DateTime<Utc> {
         self.slot
     }
 
@@ -168,7 +168,7 @@ impl QueryRequest {
     }
 
     #[must_use]
-    pub fn max_position(&self) -> u16 {
+    pub const fn max_position(&self) -> u16 {
         self.max_position
     }
 
@@ -262,7 +262,7 @@ impl BatchPlan {
     }
 
     #[must_use]
-    pub fn slot(&self) -> DateTime<Utc> {
+    pub const fn slot(&self) -> DateTime<Utc> {
         self.slot
     }
 
@@ -272,7 +272,7 @@ impl BatchPlan {
     }
 
     #[must_use]
-    pub fn target_count(&self) -> usize {
+    pub const fn target_count(&self) -> usize {
         self.target_count
     }
 }
@@ -447,17 +447,17 @@ pub struct Observation {
 
 impl Observation {
     #[must_use]
-    pub fn monitor_id(&self) -> i64 {
+    pub const fn monitor_id(&self) -> i64 {
         self.monitor_id
     }
 
     #[must_use]
-    pub fn observed_at(&self) -> DateTime<Utc> {
+    pub const fn observed_at(&self) -> DateTime<Utc> {
         self.observed_at
     }
 
     #[must_use]
-    pub fn outcome(&self) -> ObservationOutcome {
+    pub const fn outcome(&self) -> ObservationOutcome {
         self.outcome
     }
 }

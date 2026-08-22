@@ -32,7 +32,9 @@ const MAX_CURSOR_BYTES: usize = 4_096;
 const MAX_CAMPAIGN_TITLE_BYTES: usize = 512;
 
 /// One campaign-day aggregate from the verified Ozon Performance daily
-/// statistics response. This is deliberately not a `CollectedAdvertisingFact`:
+/// statistics response.
+///
+/// This is deliberately not a `CollectedAdvertisingFact`:
 /// the endpoint has no SKU dimension, so treating a campaign aggregate as a
 /// per-SKU fact would produce a false attribution in a manager report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +53,7 @@ pub struct OzonPerformanceDailyCampaignFact {
 ///
 /// The network runtime must submit it through [`crate::ozon::OzonClient`],
 /// whose fixed read-only allowlist is the final egress control.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OzonReportRequest {
     pub path: &'static str,
     pub payload: Value,
@@ -356,7 +358,9 @@ pub fn parse_performance_daily_campaigns(
 }
 
 /// Converts the verified campaign-level Performance response into the
-/// persistence contract. `sku = 0` is the explicit campaign-wide sentinel in
+/// persistence contract.
+///
+/// `sku = 0` is the explicit campaign-wide sentinel in
 /// `daily_reporting.advertising_facts`; it must be rendered as unavailable,
 /// never as a real product identifier.
 pub fn parse_performance_daily_advertising(
