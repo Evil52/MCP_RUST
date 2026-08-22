@@ -160,6 +160,10 @@ impl WbWriteError {
     }
 
     #[cfg(test)]
+    // The nested option is intentional test introspection: the outer layer
+    // identifies the HttpStatus variant, while the inner layer preserves a
+    // present or absent upstream request id.
+    #[allow(clippy::option_option)]
     fn http_status_request_id(&self) -> Option<Option<&str>> {
         match self {
             Self::HttpStatus { request_id, .. } => Some(request_id.as_deref()),
@@ -185,7 +189,7 @@ impl fmt::Debug for WbBidWriteClient {
             .field("authorization", &"<redacted>")
             .field("timeout", &self.timeout)
             .field("minimum_write_interval", &self.pacer.minimum_interval)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

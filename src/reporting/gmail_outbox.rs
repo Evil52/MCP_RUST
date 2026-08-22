@@ -703,6 +703,10 @@ mod tests {
         )
     }
 
+    // FakeDelivery consumes the production Result shape; keeping that shape in
+    // the success fixture makes every call site explicit and symmetric with
+    // failure fixtures.
+    #[allow(clippy::unnecessary_wraps)]
     fn receipt() -> Result<GmailSendReceipt, GmailDeliveryError> {
         Ok(GmailSendReceipt {
             provider_message_id: "message-1".to_owned(),
