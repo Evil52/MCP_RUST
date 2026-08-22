@@ -730,7 +730,7 @@ impl WbPlanRepository {
                 ],
             )
             .await
-            .map_err(|error| map_prepare_insert_error(&error))?;
+            .map_err(map_prepare_insert_error)?;
         let reserved_at: DateTime<Utc> = inserted_reservation.get(0);
         let expires_at: DateTime<Utc> = inserted_reservation.get(1);
         transaction
@@ -2164,7 +2164,7 @@ fn make_prepare_reservation_id(
     hex_digest(hasher.finalize())
 }
 
-fn map_prepare_insert_error(error: &tokio_postgres::Error) -> PlanStoreError {
+fn map_prepare_insert_error(error: tokio_postgres::Error) -> PlanStoreError {
     let Some(database_error) = error.as_db_error() else {
         return PlanStoreError::Unavailable;
     };
@@ -2456,10 +2456,7 @@ mod tests {
         let error = connect_result
             .err()
             .expect("closed local socket must fail PostgreSQL startup");
-        assert_eq!(
-            map_prepare_insert_error(&error),
-            PlanStoreError::Unavailable
-        );
+        assert_eq!(map_prepare_insert_error(error), PlanStoreError::Unavailable);
     }
 
     async fn classify_database_failures_with_optional_test_database(
@@ -2487,7 +2484,7 @@ mod tests {
             let statement =
                 format!("DO $coverage$ BEGIN RAISE EXCEPTION '{message}'; END $coverage$");
             let error = admin.batch_execute(&statement).await.unwrap_err();
-            assert_eq!(map_prepare_insert_error(&error), expected);
+            assert_eq!(map_prepare_insert_error(error), expected);
         }
 
         admin
@@ -2502,7 +2499,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(
-            map_prepare_insert_error(&unique_error),
+            map_prepare_insert_error(unique_error),
             PlanStoreError::InvalidState
         );
 
