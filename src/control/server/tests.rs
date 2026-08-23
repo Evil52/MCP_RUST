@@ -24,9 +24,11 @@ use crate::{
     auth::AuthenticatedActor,
     config::JwtConfig,
     control::{
-        plan::{CONTROL_DB_TEST_LOCK, WbPlanApproval},
+        plan::{CONTROL_DB_TEST_LOCK, PlanStoreError, WbPlanApproval},
         policy::WbBidPlacement,
-        wb::{WbBidChange, WbPreparedBidChange, WbSnapshotBid},
+        wb::{
+            WbBidChange, WbCampaignBidSnapshot, WbPreparedBidChange, WbSnapshotBid, WbWriteError,
+        },
     },
     http::build_router_for_server_with_cancellation_and_session_idle_timeout,
     test_support::mock_http,
