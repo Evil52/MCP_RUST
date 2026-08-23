@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::JwtConfig;
 
+use super::validation::value_or;
+
 pub(super) const CONTROL_REQUIRED_SCOPE: &str = "mcp:ads-control";
 pub(super) const CONTROL_INTERNAL_JWKS_URL: &str = "http://control-auth-egress:8080/jwks";
 
@@ -26,7 +28,7 @@ pub(super) fn load_jwt_config(lookup: &mut dyn FnMut(&str) -> Option<String>) ->
     let jwks_url = lookup("CONTROL_MCP_JWT_JWKS_URL")
         .unwrap_or_else(|| format!("{issuer}/protocol/openid-connect/certs"));
     validate_jwks_url(&jwks_url)?;
-    let scopes = super::value_or(
+    let scopes = value_or(
         lookup,
         "CONTROL_MCP_JWT_REQUIRED_SCOPES",
         CONTROL_REQUIRED_SCOPE,
@@ -36,7 +38,7 @@ pub(super) fn load_jwt_config(lookup: &mut dyn FnMut(&str) -> Option<String>) ->
             "CONTROL_MCP_JWT_REQUIRED_SCOPES должен быть ровно {CONTROL_REQUIRED_SCOPE}; analytics scope не подходит"
         );
     }
-    let ttl = super::value_or(lookup, "CONTROL_MCP_JWKS_CACHE_TTL_SECONDS", "300")
+    let ttl = value_or(lookup, "CONTROL_MCP_JWKS_CACHE_TTL_SECONDS", "300")
         .parse::<u64>()
         .context("CONTROL_MCP_JWKS_CACHE_TTL_SECONDS должен быть целым числом")?;
     if !(30..=86_400).contains(&ttl) {

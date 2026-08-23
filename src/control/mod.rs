@@ -8,8 +8,6 @@ pub use config::{
     ControlAppConfig, ControlAuthConfig, ControlPolicyDatabaseConfig, ControlWbRuntimeConfig,
 };
 pub use plan::{PlanStoreError, WbActionQuota, WbPlanRepository, WbPlanStatus};
-pub use policy::{
-    ControlMode, ControlPolicy, WbActionLimits, WbBidPlacement, WbPromotionBidTargetPolicy,
-};
+pub use policy::{ControlMode, ControlPolicy, WbActionLimits, WbBidPlacement};
 pub use server::{ControlMcp, WbControlServices};
-pub use wb::{WbBidChange, WbBidWriteClient, WbGuardedWriteError, WbPreparedBidChange};
+pub use wb::{WbBidChange, WbBidWriteClient, WbPreparedBidChange};

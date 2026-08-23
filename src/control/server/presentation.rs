@@ -5,7 +5,7 @@ use crate::control::{
     wb::{WbCampaignBidSnapshot, WbWriteError, WbWriteOutcomeKind},
 };
 
-use super::{WbPlanApprovalResult, WbPlanResult};
+use super::contract::{WbPlanApprovalResult, WbPlanResult};
 
 #[derive(Debug)]
 pub(super) enum WritePermitFailure {

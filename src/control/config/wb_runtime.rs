@@ -17,7 +17,10 @@ use crate::{
     },
 };
 
-use super::{ControlAuthConfig, ControlPolicyDatabaseConfig, ControlWbRuntimeConfig};
+use super::{
+    ControlAuthConfig, ControlPolicyDatabaseConfig, ControlWbRuntimeConfig,
+    validation::{parse_strict_bool, value_or},
+};
 
 pub(super) const MAX_CONTROL_CREDENTIAL_BYTES: u64 = 16_384;
 pub(super) const WB_PROMOTION_BIT: u64 = 1 << 6;
@@ -41,8 +44,8 @@ pub(super) fn load_wb_runtime(
     registry: &AccessRegistry,
     policy_database: Option<&ControlPolicyDatabaseConfig>,
 ) -> Result<Option<ControlWbRuntimeConfig>> {
-    let writes_enabled = super::parse_strict_bool(
-        &super::value_or(lookup, "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED", "false"),
+    let writes_enabled = parse_strict_bool(
+        &value_or(lookup, "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED", "false"),
         "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED",
     )?;
     if policy.mode == ControlMode::Disabled {
@@ -102,7 +105,7 @@ pub(super) fn load_wb_runtime(
         .clone();
     let proxy_url = required_nonempty(lookup, "CONTROL_MCP_WB_PROXY")?;
     validate_proxy_url(&proxy_url)?;
-    let timeout_seconds = super::value_or(lookup, "CONTROL_MCP_WB_TIMEOUT_SECONDS", "20")
+    let timeout_seconds = value_or(lookup, "CONTROL_MCP_WB_TIMEOUT_SECONDS", "20")
         .parse::<u64>()
         .context("CONTROL_MCP_WB_TIMEOUT_SECONDS должен быть целым числом")?;
     if !(1..=30).contains(&timeout_seconds) {
