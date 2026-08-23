@@ -21,6 +21,7 @@ use tower::ServiceExt;
 
 use super::*;
 use crate::{
+    auth::AuthenticatedActor,
     config::JwtConfig,
     control::{
         plan::{CONTROL_DB_TEST_LOCK, WbPlanApproval},
