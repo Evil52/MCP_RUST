@@ -5,6 +5,14 @@ calculation, HTML/XLSX generation and email delivery must not depend on a
 ChatGPT task. The ChatGPT task is a second, read-only control surface that
 explains the same published facts and warns when a report is missing or stale.
 
+For an evidence-locked Ozon-only analysis, use the repository skill at
+[`skills/ozon-daily-manager-report/SKILL.md`](../skills/ozon-daily-manager-report/SKILL.md).
+Its role matrix reflects the actual OzonOFK RBAC and its report contract adds
+cutoff-safe comparisons, an evidence ledger and bounded QA gates. Keep the
+prompt below self-contained for scheduled environments that cannot load a
+repository skill. The existing prompt also covers WB; the Ozon-only skill must
+not be applied to WB accounts.
+
 ## Schedule
 
 Create one recurring ChatGPT task named `Контроль ежедневного отчета OFK` with
