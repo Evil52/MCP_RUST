@@ -30,7 +30,7 @@ echo "==> Formatting"
 cargo fmt --all -- --check
 
 echo "==> Tests"
-cargo test --locked --all-targets --all-features
+cargo test --locked --all-targets --all-features -- --test-threads=1
 cargo test --locked --all-targets --all-features -- --list 2>/dev/null \
   | sed -n 's/: test$//p' > "$test_list"
 
