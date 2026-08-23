@@ -129,6 +129,13 @@ Ozon account and the Vahrusheva/Torsunova Wildberries account. Sender and recipi
 addresses are referenced only by environment-variable names. Passwords, OAuth
 tokens and actual addresses must not be committed.
 
+`config/daily-report-mail-routing.example.json` documents the exact private
+routing-file shape with reserved `example.test` addresses. Copy its structure
+to the ignored `config/daily-report-mail-routing.json`, replace both addresses
+locally and set mode `0600`; never put real addresses in the example or Git.
+Keep the three Gmail OAuth files in the ignored `report-gmail-oauth/` directory
+with directory mode `0700` and file mode `0600`.
+
 ## Remaining rollout gates
 
 The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot
@@ -501,3 +508,9 @@ an ambiguous provider result is never retried automatically.
 ChatGPT remains the interactive analytics interface. Scheduled collection,
 calculation, artifact generation and delivery must remain server-side so they
 continue to work when ChatGPT is unavailable.
+
+An optional read-only ChatGPT task may check and explain the same published
+projections after each collection window. Its exact schedule, fail-closed data
+rules and reusable prompt are documented in
+[`chatgpt-daily-manager-task.md`](chatgpt-daily-manager-task.md). This companion
+does not replace the server-side outbox or prove email delivery.

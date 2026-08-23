@@ -11,7 +11,9 @@ sonar.env
 /config/access.canary.json
 /config/control-policy.json
 /config/daily-report-policy.json
+/config/daily-report-mail-routing.json
 /report-credentials/
+/report-gmail-oauth/
 .DS_Store
 /nvim.log
 /README.md

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "routes": [
+    {
+      "name": "DAILY_REPORT_SENDER_EMAIL",
+      "address": "reports@example.test"
+    },
+    {
+      "name": "DAILY_REPORT_PILOT_RECIPIENT_EMAIL",
+      "address": "owner@example.test"
+    }
+  ]
+}
