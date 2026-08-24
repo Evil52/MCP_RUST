@@ -46,7 +46,8 @@ impl std::fmt::Debug for ControlPolicyDatabaseConfig {
 pub struct ControlWbRuntimeConfig {
     pub account_id: String,
     pub seller_sid: String,
-    /// Dedicated Personal production token with only Promotion read access.
+    /// Personal production read-only token with Promotion access. Additional
+    /// read categories require an explicit runtime opt-in.
     pub reader_token: String,
     /// Dedicated Personal production token with only Promotion read/write access.
     /// It is absent in `plan_only`, so that process cannot construct a writer.

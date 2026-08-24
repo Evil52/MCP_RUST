@@ -93,7 +93,7 @@ async fn response_server(
                     .strip_prefix("content-length:")
                     .and_then(|value| value.trim().parse::<usize>().ok())
             })
-            .unwrap();
+            .unwrap_or(0);
         let received = request.len();
         request.resize(headers_end + 4 + content_length, 0);
         socket.read_exact(&mut request[received..]).await.unwrap();
@@ -695,6 +695,54 @@ async fn guarded_write_distinguishes_validation_permit_and_write_results() {
         .unwrap();
     assert_eq!(result, serde_json::json!({"applied": true}));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn campaign_pause_and_start_are_single_guarded_get_writes() {
+    for (pause, expected_path) in [
+        (true, "GET /adv/v0/pause?id=42 HTTP/1.1\r\n"),
+        (false, "GET /adv/v0/start?id=42 HTTP/1.1\r\n"),
+    ] {
+        let (base_url, server) =
+            response_server(http_response("200 OK", "", b""), Duration::ZERO).await;
+        let client =
+            WbBidWriteClient::new_for_test(&base_url, "test-token", Duration::from_secs(1));
+        let result = if pause {
+            client
+                .pause_campaign_with_permit(42, || async { Ok::<(), ()>(()) })
+                .await
+        } else {
+            client
+                .start_campaign_with_permit(42, || async { Ok::<(), ()>(()) })
+                .await
+        };
+        assert_eq!(result.unwrap(), Value::Null);
+        let request = server.await.unwrap();
+        assert!(request.starts_with(expected_path), "{request}");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-token\r\n")
+        );
+        assert_eq!(request.split_once("\r\n\r\n").unwrap().1, "");
+    }
+
+    let offline =
+        WbBidWriteClient::new_for_test("http://127.0.0.1:1", "test-token", Duration::from_secs(1));
+    assert!(matches!(
+        offline
+            .pause_campaign_with_permit(0, || async { Ok::<(), ()>(()) })
+            .await,
+        Err(WbGuardedWriteError::Write(WbWriteError::InvalidRequest(
+            "advert_id"
+        )))
+    ));
+    assert!(matches!(
+        offline
+            .start_campaign_with_permit(42, || async { Err::<(), _>("revoked") })
+            .await,
+        Err(WbGuardedWriteError::Permit("revoked"))
+    ));
 }
 
 #[tokio::test]

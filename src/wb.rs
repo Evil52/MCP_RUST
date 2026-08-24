@@ -41,6 +41,7 @@ const TARIFF_RETURNS_PATH: &str = "/api/v1/tariffs/return";
 const ACCEPTANCE_COEFFICIENTS_PATH: &str = "/api/tariffs/v1/acceptance/coefficients";
 pub(crate) const PROMOTION_CAMPAIGNS_PATH: &str = "/adv/v1/promotion/count";
 pub(crate) const PROMOTION_DETAILS_PATH: &str = "/api/advert/v2/adverts";
+pub(crate) const PROMOTION_BUDGET_PATH: &str = "/adv/v1/budget";
 pub(crate) const PROMOTION_STATS_PATH: &str = "/adv/v3/fullstats";
 pub(crate) const SEARCH_PRODUCT_QUERIES_PATH: &str = "/api/v2/search-report/product/search-texts";
 pub(crate) const SEARCH_ORDERS_POSITIONS_PATH: &str = "/api/v2/search-report/product/orders";
@@ -62,7 +63,7 @@ const PRICES_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(600);
 const COMMISSION_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
 const LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const ACCEPTANCE_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
-const PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(200);
+const PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
 const PROMOTION_STATS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
 const SEARCH_REPORT_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
 const PROMOTION_MINIMUM_BIDS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
@@ -243,6 +244,13 @@ const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
         method: Method::GET,
         path: PROMOTION_DETAILS_PATH,
         label: "promotion:/api/advert/v2/adverts",
+        host: ApiHost::Promotion,
+        request_class: RequestClass::PromotionCampaign,
+    },
+    EndpointPolicy {
+        method: Method::GET,
+        path: PROMOTION_BUDGET_PATH,
+        label: "promotion:/adv/v1/budget",
         host: ApiHost::Promotion,
         request_class: RequestClass::PromotionCampaign,
     },
@@ -1397,6 +1405,23 @@ impl WbClient {
             .await
     }
 
+    /// Returns the remaining budget for exactly one promotion campaign.
+    pub async fn promotion_campaign_budget(
+        &self,
+        account: &str,
+        advert_id: u64,
+    ) -> Result<Value, WbError> {
+        validate_positive_unique_ids(&[advert_id], 1, "advert_id", Some(MAX_WB_SIGNED_ID))?;
+        self.request(
+            account,
+            Method::GET,
+            PROMOTION_BUDGET_PATH,
+            Some(vec![("id", advert_id.to_string())]),
+            None,
+        )
+        .await
+    }
+
     async fn statistics_report(
         &self,
         account: &str,
@@ -2282,7 +2307,7 @@ mod tests {
         );
         assert_eq!(
             policy.interval(RequestClass::PromotionCampaign),
-            Duration::from_millis(200)
+            Duration::from_millis(250)
         );
         assert_eq!(
             policy.interval(RequestClass::PromotionStats),
@@ -2366,6 +2391,10 @@ mod tests {
         );
         assert_eq!(
             RequestClass::for_request(&Method::GET, PROMOTION_CAMPAIGNS_PATH),
+            Some(RequestClass::PromotionCampaign)
+        );
+        assert_eq!(
+            RequestClass::for_request(&Method::GET, PROMOTION_BUDGET_PATH),
             Some(RequestClass::PromotionCampaign)
         );
         assert_eq!(
@@ -2544,6 +2573,13 @@ mod tests {
                 Method::GET,
                 PROMOTION_DETAILS_PATH,
                 "promotion:/api/advert/v2/adverts",
+                ApiHost::Promotion,
+                RequestClass::PromotionCampaign,
+            ),
+            (
+                Method::GET,
+                PROMOTION_BUDGET_PATH,
+                "promotion:/adv/v1/budget",
                 ApiHost::Promotion,
                 RequestClass::PromotionCampaign,
             ),
@@ -3025,6 +3061,7 @@ mod tests {
             (200, r#"{"adverts":[],"all":0}"#.to_owned()),
             (200, r#"{"adverts":[]}"#.to_owned()),
             (200, r#"{"adverts":[]}"#.to_owned()),
+            (200, r#"{"cash":0,"netting":100,"total":100}"#.to_owned()),
             (200, "[]".to_owned()),
         ]);
         let client = WbClient::build(
@@ -3076,6 +3113,10 @@ mod tests {
             .unwrap();
         client
             .promotion_campaign_details("account", vec![56], Vec::new(), None)
+            .await
+            .unwrap();
+        client
+            .promotion_campaign_budget("account", 56)
             .await
             .unwrap();
         client
@@ -3139,6 +3180,7 @@ mod tests {
             "GET /adv/v1/promotion/count HTTP/1.1\r\n",
             "GET /api/advert/v2/adverts?ids=12%2C34&statuses=9%2C11&payment_type=cpm HTTP/1.1\r\n",
             "GET /api/advert/v2/adverts?ids=56 HTTP/1.1\r\n",
+            "GET /adv/v1/budget?id=56 HTTP/1.1\r\n",
             "GET /adv/v3/fullstats?ids=12%2C34&beginDate=2026-08-01&endDate=2026-08-11 HTTP/1.1\r\n",
         ] {
             let request = promotion_requests
@@ -5273,6 +5315,15 @@ mod tests {
                 field: "payment_type"
             }
         ));
+        for advert_id in [0, i64::MAX as u64 + 1] {
+            assert!(matches!(
+                client
+                    .promotion_campaign_budget("account", advert_id)
+                    .await
+                    .unwrap_err(),
+                WbError::InvalidArguments { field: "advert_id" }
+            ));
+        }
 
         for ids in [Vec::new(), vec![0], vec![1, 1], (1..=51).collect()] {
             let error = client
@@ -5567,6 +5618,7 @@ mod tests {
             // Wrong methods for the three newly allowlisted read endpoints.
             (Method::POST, PROMOTION_CAMPAIGNS_PATH),
             (Method::POST, PROMOTION_DETAILS_PATH),
+            (Method::POST, PROMOTION_BUDGET_PATH),
             (Method::POST, PROMOTION_STATS_PATH),
             (Method::GET, SEARCH_PRODUCT_QUERIES_PATH),
             (Method::GET, SEARCH_ORDERS_POSITIONS_PATH),
@@ -5578,6 +5630,7 @@ mod tests {
             (Method::GET, "/api/v1/tariffs/commission/"),
             (Method::GET, "/adv/v1/promotion/count/"),
             (Method::GET, "/api/advert/v2/adverts/"),
+            (Method::GET, "/adv/v1/budget/"),
             (Method::GET, "/adv/v3/fullstats/"),
             (Method::POST, "/api/v2/search-report/product/search-texts/"),
             (Method::POST, "/api/v2/search-report/product/orders/"),
@@ -5661,7 +5714,11 @@ mod tests {
             RequestClass::for_request(&Method::GET, ACCEPTANCE_COEFFICIENTS_PATH),
             Some(RequestClass::AcceptanceTariff)
         );
-        for path in [PROMOTION_CAMPAIGNS_PATH, PROMOTION_DETAILS_PATH] {
+        for path in [
+            PROMOTION_CAMPAIGNS_PATH,
+            PROMOTION_DETAILS_PATH,
+            PROMOTION_BUDGET_PATH,
+        ] {
             assert_eq!(
                 RequestClass::for_request(&Method::GET, path),
                 Some(RequestClass::PromotionCampaign)

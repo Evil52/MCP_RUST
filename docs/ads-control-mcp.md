@@ -217,6 +217,13 @@ token with another API category. WB still verifies the signature on every
 request. The bit definitions and least-privilege guidance are in the
 [official WB token documentation](https://dev.wildberries.ru/ru/openapi/api-information).
 
+For a temporary local migration, an existing Personal production read-only
+token may be accepted when it includes Promotion plus other read categories by
+setting `CONTROL_MCP_ALLOW_BROAD_READ_TOKEN=true`. The default remains `false`,
+the writer token is always Promotion-only, and the egress proxy still permits
+only the Promotion API host. Replace the broad reader with a dedicated token
+before production rollout.
+
 Before either Control token is accepted, add the reviewed WB seller UUID from
 the documented `sid` claim to the `ip_domnyshev_wb` registry binding:
 

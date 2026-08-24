@@ -48,6 +48,10 @@ pub(super) fn load_wb_runtime(
         &value_or(lookup, "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED", "false"),
         "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED",
     )?;
+    let allow_broad_reader = parse_strict_bool(
+        &value_or(lookup, "CONTROL_MCP_ALLOW_BROAD_READ_TOKEN", "false"),
+        "CONTROL_MCP_ALLOW_BROAD_READ_TOKEN",
+    )?;
     if policy.mode == ControlMode::Disabled {
         return Ok(None);
     }
@@ -84,7 +88,7 @@ pub(super) fn load_wb_runtime(
         &reader_token_path,
         "CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE",
     )?;
-    validate_wb_reader_token(&reader_token, expected_seller_sid)?;
+    validate_wb_reader_token(&reader_token, expected_seller_sid, allow_broad_reader)?;
     let writer_token = if policy.mode == ControlMode::Enabled && writes_enabled {
         let writer_token_path = PathBuf::from(required_nonempty(
             lookup,
@@ -145,7 +149,7 @@ fn required_nonempty(lookup: &mut dyn FnMut(&str) -> Option<String>, key: &str) 
         .with_context(|| format!("{key} обязателен для WB Control runtime"))
 }
 
-pub(super) fn read_control_token(path: &Path, variable_name: &str) -> Result<String> {
+pub(in crate::control) fn read_control_token(path: &Path, variable_name: &str) -> Result<String> {
     let file = File::open(path)
         .with_context(|| format!("не удалось прочитать {variable_name} {}", path.display()))?;
     let metadata = file
@@ -206,18 +210,28 @@ fn decode_wb_control_token(token: &str, purpose: &str) -> Result<WbControlTokenC
     Ok(claims)
 }
 
-pub(super) fn validate_wb_reader_token(token: &str, expected_seller_sid: &str) -> Result<()> {
+pub(in crate::control) fn validate_wb_reader_token(
+    token: &str,
+    expected_seller_sid: &str,
+    allow_broad_reader: bool,
+) -> Result<()> {
     let claims = decode_wb_control_token(token, "read")?;
     validate_wb_token_seller(&claims, expected_seller_sid, "read")?;
-    if claims.s != (WB_PROMOTION_BIT | WB_READ_ONLY_BIT) {
+    let required_scope = WB_PROMOTION_BIT | WB_READ_ONLY_BIT;
+    if claims.s & required_scope != required_scope
+        || (!allow_broad_reader && claims.s != required_scope)
+    {
         bail!(
-            "WB promotion read token должен быть узким: только категория Продвижение в режиме чтения"
+            "WB promotion read token должен быть read-only и содержать категорию Продвижение; дополнительные категории требуют CONTROL_MCP_ALLOW_BROAD_READ_TOKEN=true"
         );
     }
     Ok(())
 }
 
-pub(super) fn validate_wb_writer_token(token: &str, expected_seller_sid: &str) -> Result<()> {
+pub(in crate::control) fn validate_wb_writer_token(
+    token: &str,
+    expected_seller_sid: &str,
+) -> Result<()> {
     let claims = decode_wb_control_token(token, "write")?;
     validate_wb_token_seller(&claims, expected_seller_sid, "write")?;
     if claims.s != WB_PROMOTION_BIT {

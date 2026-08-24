@@ -278,6 +278,7 @@ fn process_environment_loader_reads_only_the_control_namespace() {
         "CONTROL_MCP_AUTH_MODE",
         "CONTROL_MCP_DEV_ALLOW_NON_LOOPBACK",
         "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED",
+        "CONTROL_MCP_ALLOW_BROAD_READ_TOKEN",
         "CONTROL_MCP_WB_ACCOUNT_ID",
         "CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE",
         "CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE",
@@ -760,16 +761,25 @@ fn wb_tokens_must_be_personal_narrow_and_have_exact_access_mode() {
         + 3600;
     let reader = wb_token(3, WB_PROMOTION_BIT | WB_READ_ONLY_BIT, future);
     let writer = wb_token(3, WB_PROMOTION_BIT, future);
-    assert!(validate_wb_reader_token(&reader, TEST_WB_SELLER_SID).is_ok());
+    assert!(validate_wb_reader_token(&reader, TEST_WB_SELLER_SID, false).is_ok());
     assert!(validate_wb_writer_token(&writer, TEST_WB_SELLER_SID).is_ok());
-    assert!(validate_wb_reader_token(&writer, TEST_WB_SELLER_SID).is_err());
+    assert!(validate_wb_reader_token(&writer, TEST_WB_SELLER_SID, false).is_err());
     assert!(validate_wb_writer_token(&reader, TEST_WB_SELLER_SID).is_err());
     assert!(
         validate_wb_reader_token(
             &wb_token(3, WB_PROMOTION_BIT | WB_READ_ONLY_BIT | (1 << 3), future),
-            TEST_WB_SELLER_SID
+            TEST_WB_SELLER_SID,
+            false,
         )
         .is_err()
+    );
+    assert!(
+        validate_wb_reader_token(
+            &wb_token(3, WB_PROMOTION_BIT | WB_READ_ONLY_BIT | (1 << 3), future),
+            TEST_WB_SELLER_SID,
+            true,
+        )
+        .is_ok()
     );
     assert!(
         validate_wb_writer_token(

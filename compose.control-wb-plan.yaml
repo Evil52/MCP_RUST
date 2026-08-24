@@ -11,6 +11,7 @@ services:
       CONTROL_MCP_JWT_AUDIENCE: ${CONTROL_MCP_PUBLIC_URL:?CONTROL_MCP_PUBLIC_URL is required}
       # This overlay can prepare/inspect plans but never loads a write secret.
       CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: "false"
+      CONTROL_MCP_ALLOW_BROAD_READ_TOKEN: ${CONTROL_MCP_ALLOW_BROAD_READ_TOKEN:-false}
       CONTROL_MCP_WB_ACCOUNT_ID: ip_domnyshev_wb
       CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE: /run/mcp-ozon/control-credentials/wb-promotion-read.token
       CONTROL_MCP_DATABASE_URL: postgresql://control_writer:${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}

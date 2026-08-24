@@ -16,6 +16,8 @@ use super::{MAX_CHANGES, WbGuardedWriteError, WbPreparedBidChange, WbWriteError}
 
 const WB_PROMOTION_BASE_URL: &str = "https://advert-api.wildberries.ru";
 const CHANGE_BIDS_PATH: &str = "/api/advert/v1/bids";
+const PAUSE_CAMPAIGN_PATH: &str = "/adv/v0/pause";
+const START_CAMPAIGN_PATH: &str = "/adv/v0/start";
 const MAX_WRITE_RESPONSE_BYTES: usize = 1_048_576;
 pub(super) const MAX_ERROR_RESPONSE_BYTES: usize = 4_096;
 pub(super) const MAX_REQUEST_ID_BYTES: usize = 128;
@@ -215,6 +217,55 @@ impl WbBidWriteClient {
             .await
     }
 
+    pub(in crate::control) async fn pause_campaign_with_permit<E, F, Fut>(
+        &self,
+        advert_id: u64,
+        permit: F,
+    ) -> Result<Value, WbGuardedWriteError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        self.campaign_status_with_permit(advert_id, PAUSE_CAMPAIGN_PATH, permit)
+            .await
+    }
+
+    pub(in crate::control) async fn start_campaign_with_permit<E, F, Fut>(
+        &self,
+        advert_id: u64,
+        permit: F,
+    ) -> Result<Value, WbGuardedWriteError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        self.campaign_status_with_permit(advert_id, START_CAMPAIGN_PATH, permit)
+            .await
+    }
+
+    async fn campaign_status_with_permit<E, F, Fut>(
+        &self,
+        advert_id: u64,
+        path: &'static str,
+        permit: F,
+    ) -> Result<Value, WbGuardedWriteError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        validate_advert_id(advert_id).map_err(WbGuardedWriteError::Write)?;
+        self.pacer
+            .run_guarded(
+                || async { permit().await.map_err(WbGuardedWriteError::Permit) },
+                || async {
+                    self.change_campaign_status_once(advert_id, path)
+                        .await
+                        .map_err(WbGuardedWriteError::Write)
+                },
+            )
+            .await
+    }
+
     async fn change_bids_once(
         &self,
         advert_id: u64,
@@ -272,15 +323,67 @@ impl WbBidWriteClient {
         }
         Err(WbWriteError::HttpStatus { status, request_id })
     }
+
+    async fn change_campaign_status_once(
+        &self,
+        advert_id: u64,
+        path: &'static str,
+    ) -> Result<Value, WbWriteError> {
+        let send = self
+            .http
+            .get(format!("{}{}", self.base_url, path))
+            .header(AUTHORIZATION, self.authorization.clone())
+            .query(&[("id", advert_id)])
+            .send();
+        let response = timeout(self.timeout, send)
+            .await
+            .map_err(|_| WbWriteError::Ambiguous {
+                reason: "timeout",
+                request_id: None,
+            })?
+            .map_err(|_| WbWriteError::Ambiguous {
+                reason: "network_error",
+                request_id: None,
+            })?;
+        let status = response.status();
+        let request_id = response_request_id(&response);
+        let limit = if status.is_success() {
+            MAX_WRITE_RESPONSE_BYTES
+        } else {
+            MAX_ERROR_RESPONSE_BYTES
+        };
+        let bytes =
+            read_bounded(response, limit)
+                .await
+                .map_err(|reason| WbWriteError::Ambiguous {
+                    reason,
+                    request_id: request_id.clone(),
+                })?;
+        if status == StatusCode::OK {
+            if bytes.is_empty() {
+                return Ok(Value::Null);
+            }
+            return serde_json::from_slice(&bytes).map_err(|_| WbWriteError::Ambiguous {
+                reason: "invalid_success_json",
+                request_id,
+            });
+        }
+        Err(WbWriteError::HttpStatus { status, request_id })
+    }
+}
+
+const fn validate_advert_id(advert_id: u64) -> Result<(), WbWriteError> {
+    if advert_id == 0 || advert_id > i64::MAX as u64 {
+        return Err(WbWriteError::InvalidRequest("advert_id"));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_write_request(
     advert_id: u64,
     changes: &[WbPreparedBidChange],
 ) -> Result<(), WbWriteError> {
-    if advert_id == 0 || advert_id > i64::MAX as u64 {
-        return Err(WbWriteError::InvalidRequest("advert_id"));
-    }
+    validate_advert_id(advert_id)?;
     if changes.is_empty() || changes.len() > MAX_CHANGES {
         return Err(WbWriteError::InvalidRequest("changes"));
     }

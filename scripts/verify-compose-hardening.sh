@@ -1161,6 +1161,7 @@ verify_control_wb_plan() {
        "CONTROL_MCP_JWT_AUDIENCE": "https://control.example.test/mcp",
        "CONTROL_MCP_JWT_ISSUER": "https://auth.example.test/realms/ofk",
        "CONTROL_MCP_JWT_JWKS_URL": "http://control-auth-egress:8080/jwks",
+       "CONTROL_MCP_ALLOW_BROAD_READ_TOKEN": "false",
        "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED": "false",
        "CONTROL_MCP_PUBLIC_URL": "https://control.example.test/mcp",
        "CONTROL_MCP_WB_ACCOUNT_ID": "ip_domnyshev_wb",

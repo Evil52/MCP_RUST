@@ -6,8 +6,10 @@ pub use model::{
 #[cfg(test)]
 use wb_runtime::{
     MAX_CONTROL_CREDENTIAL_BYTES, WB_PROMOTION_BIT, WB_READ_ONLY_BIT, load_policy_database,
-    normalize_control_token_bytes, read_control_token, validate_proxy_url,
-    validate_wb_reader_token, validate_wb_writer_token,
+    normalize_control_token_bytes, validate_proxy_url,
+};
+pub(in crate::control) use wb_runtime::{
+    read_control_token, validate_wb_reader_token, validate_wb_writer_token,
 };
 
 mod jwt;
