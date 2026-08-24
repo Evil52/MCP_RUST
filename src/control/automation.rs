@@ -159,100 +159,109 @@ pub fn evaluate_wb_automation(
         action,
     };
 
+    if let Some(action) = campaign_gate(policy, observation) {
+        return Ok(decision(action));
+    }
+    if let Some(action) = hard_stop(policy, &observations)? {
+        return Ok(decision(action));
+    }
+
+    let mut changes = Vec::new();
+    for nm_id in &policy.nm_ids {
+        if let Some(change) = bid_change(policy, observations[nm_id])? {
+            changes.push(change);
+        }
+    }
+    Ok(decision(if changes.is_empty() {
+        WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::NoMaterialChange,
+        }
+    } else {
+        WbAutomationAction::ChangeBids { changes }
+    }))
+}
+
+/// Campaign-wide guards, evaluated in fixed priority order before any per-SKU
+/// reasoning. Returns the action to take, or `None` when the campaign is clear
+/// to be judged SKU by SKU.
+///
+/// The daily-cap pause and its resume deliberately precede the quota and
+/// cooldown checks: honouring the spend cap must never be blocked by the
+/// rate limits that govern ordinary bid changes.
+fn campaign_gate(
+    policy: &WbAutomationPolicy,
+    observation: &WbAutomationObservation,
+) -> Option<WbAutomationAction> {
+    let hold = |reason| Some(WbAutomationAction::Hold { reason });
     if observation.observed_at < policy.authorized_at {
-        return Ok(decision(WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::AuthorizationNotActive,
-        }));
+        return hold(WbAutomationHoldReason::AuthorizationNotActive);
     }
     if observation.observed_at >= policy.authorization_expires_at {
-        return Ok(decision(WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::AuthorizationExpired,
-        }));
+        return hold(WbAutomationHoldReason::AuthorizationExpired);
     }
     if observation.observed_at < policy.observe_until {
-        return Ok(decision(WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::ObserveOnly,
-        }));
+        return hold(WbAutomationHoldReason::ObserveOnly);
     }
     if observation.budget_remaining_minor == 0 {
-        return Ok(decision(WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::BudgetExhausted,
-        }));
+        return hold(WbAutomationHoldReason::BudgetExhausted);
     }
     if observation.campaign_status == ACTIVE_CAMPAIGN_STATUS
         && observation.daily_spend_minor >= policy.daily_pause_threshold_minor
     {
-        return Ok(decision(WbAutomationAction::PauseCampaignForDailyCap));
+        return Some(WbAutomationAction::PauseCampaignForDailyCap);
     }
     if observation.campaign_status == PAUSED_CAMPAIGN_STATUS
         && observation.paused_by_automation
         && observation.daily_spend_minor < policy.daily_pause_threshold_minor
     {
-        return Ok(decision(WbAutomationAction::ResumeCampaignAfterDailyCap));
+        return Some(WbAutomationAction::ResumeCampaignAfterDailyCap);
     }
     if observation.campaign_status != ACTIVE_CAMPAIGN_STATUS {
-        return Ok(decision(WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::CampaignNotActive,
-        }));
+        return hold(WbAutomationHoldReason::CampaignNotActive);
     }
     if observation.actions_today >= policy.max_actions_per_day {
-        return Ok(decision(WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::ActionQuotaExhausted,
-        }));
+        return hold(WbAutomationHoldReason::ActionQuotaExhausted);
     }
     if observation.last_action_at.is_some_and(|last_action| {
         observation.observed_at
             < last_action + Duration::seconds(i64::from(policy.cooldown_seconds))
     }) {
-        return Ok(decision(WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::CooldownActive,
-        }));
+        return hold(WbAutomationHoldReason::CooldownActive);
     }
     if !observation.attribution_complete {
-        return Ok(decision(WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::AttributionIncomplete,
-        }));
+        return hold(WbAutomationHoldReason::AttributionIncomplete);
     }
+    None
+}
 
+/// Per-SKU stops that pre-empt any bid change. The first SKU that trips a stop
+/// wins, so one action per run stays the invariant.
+fn hard_stop(
+    policy: &WbAutomationPolicy,
+    observations: &BTreeMap<u64, &WbAutomationSkuObservation>,
+) -> Result<Option<WbAutomationAction>, WbAutomationDecisionError> {
     for nm_id in &policy.nm_ids {
         let sku = observations[nm_id];
-        if sku.sellable_stock <= policy.min_sellable_stock {
-            return Ok(decision(WbAutomationAction::DisableSku {
-                nm_id: *nm_id,
-                reason: WbAutomationDisableReason::LowStock,
-            }));
-        }
-        if sku.attributed_orders == 0
+        let reason = if sku.sellable_stock <= policy.min_sellable_stock {
+            Some(WbAutomationDisableReason::LowStock)
+        } else if sku.attributed_orders == 0
             && (sku.clicks >= policy.no_order_disable_clicks
                 || sku.spend_minor >= policy.no_order_disable_spend_minor)
         {
-            return Ok(decision(WbAutomationAction::DisableSku {
+            Some(WbAutomationDisableReason::NoOrdersHardStop)
+        } else if drr_basis_points(sku)?.is_some_and(|drr| drr > policy.hard_drr_basis_points) {
+            Some(WbAutomationDisableReason::HardDrrExceeded)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Ok(Some(WbAutomationAction::DisableSku {
                 nm_id: *nm_id,
-                reason: WbAutomationDisableReason::NoOrdersHardStop,
+                reason,
             }));
         }
-        if drr_basis_points(sku)?.is_some_and(|drr| drr > policy.hard_drr_basis_points) {
-            return Ok(decision(WbAutomationAction::DisableSku {
-                nm_id: *nm_id,
-                reason: WbAutomationDisableReason::HardDrrExceeded,
-            }));
-        }
     }
-
-    let mut changes = Vec::new();
-    for nm_id in &policy.nm_ids {
-        let sku = observations[nm_id];
-        if let Some(change) = bid_change(policy, sku)? {
-            changes.push(change);
-        }
-    }
-    if changes.is_empty() {
-        Ok(decision(WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::NoMaterialChange,
-        }))
-    } else {
-        Ok(decision(WbAutomationAction::ChangeBids { changes }))
-    }
+    Ok(None)
 }
 
 pub fn validate_wb_automation_policy(
