@@ -64,3 +64,42 @@ ofk_data_completeness вернул recommendations_allowed=true. Если дан
 After creating the task, keep ChatGPT notifications enabled. This companion
 must not be treated as proof that the manager email was delivered; provider
 delivery is proven only by the server-side outbox and Gmail audit state.
+
+## One-time verification after the seven-store rollout
+
+For the 25 August 2026 rollout, create a separate one-time ChatGPT task named
+`Проверка рассылки Ozon — 25.08.2026` for 09:15 in
+`Asia/Yekaterinburg`. This delay leaves time for the 08:00–08:30 collection,
+artifact generation and the bounded Gmail delivery pass. Use these exact task
+instructions:
+
+```text
+Проверь серверную утреннюю рассылку Ozon за завершенный бизнес-день
+24.08.2026, cutoff 25.08.2026 08:00 Asia/Yekaterinburg.
+
+Используй $ozon-daily-manager-report. Сначала определи текущую роль и доступные
+Ozon-кабинеты. Для каждого из семи кабинетов вызови ofk_collection_status и
+ofk_data_completeness:
+- furnitura_dlya_doma — Серафимович Диана;
+- evromebelkomplekt — Рогова Юлия;
+- dom_mebelnoy_furnitury — Карпова Екатерина;
+- ofk_komplekt_ozon — Лаптова Юлия;
+- mebelnaya_furniturnaya_kompaniya — Артем Сиринов;
+- tsentr_mebelnoy_furnitury — Кремнев Максим;
+- megamarket_ozon — Казакова Наталья.
+
+Если роль разрешает, вызови ofk_reports и проверь, что для каждого кабинета
+есть отдельный утренний отчет в состоянии sent для указанной даты и cutoff.
+Не показывай адреса получателей, provider message ID, пути, хеши или секреты.
+Не предпринимай повторную отправку и не заменяй отсутствующий sent косвенным
+признаком.
+
+Верни компактную таблицу: кабинет, менеджер, completeness, cutoff, состояние
+отчета. Итог должен быть ровно одним из вариантов: «7/7 подтверждено» или
+«рассылка не подтверждена: N/7» с перечислением отсутствующих кабинетов и
+одной P1 диагностической задачей. Если ofk_reports недоступен по RBAC, явно
+напиши, что Gmail delivery audit не подтвержден в ChatGPT.
+```
+
+This task is an independent read-only verification. It must never trigger or
+retry mail delivery.

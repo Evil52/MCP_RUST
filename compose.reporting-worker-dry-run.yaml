@@ -1,0 +1,10 @@
+name: mcp-ozon-position
+
+# Explicit opt-in artifact generation without mail delivery. This overlay can
+# plan and render ready outbox artifacts, but it mounts neither mail routing
+# nor Gmail OAuth and therefore cannot contact a mail provider.
+services:
+  report-worker:
+    command: []
+    environment:
+      REPORT_WORKER_MODE: dry_run
