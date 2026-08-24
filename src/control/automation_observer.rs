@@ -378,7 +378,13 @@ fn build_observation(
         daily_spend_minor,
         actions_today: state.actions_today,
         last_action_at: state.last_action_at,
-        attribution_complete: !campaign_level_previous,
+        // A previous business date carrying no per-SKU row at all is missing
+        // evidence, not proof of zero delivery: the decision engine cannot tell
+        // an idle campaign from a WB aggregation gap, and would read the
+        // resulting zeros as low exposure and raise every bid. Holding is the
+        // fail-closed reading. One present SKU row is enough to trust the
+        // response, because WB omits SKUs that genuinely did not deliver.
+        attribution_complete: !campaign_level_previous && !previous.is_empty(),
         skus,
     })
 }
@@ -951,6 +957,68 @@ mod tests {
                 )
                 .await
                 .is_err()
+        );
+    }
+
+    /// A WB `fullstats` response can legitimately contain no rows for the
+    /// previous business date (delivery gap, late aggregation, or an API
+    /// hiccup). `build_observation` then reports every SKU with zero
+    /// impressions and zero clicks while `attribution_complete` stays true,
+    /// because only a campaign-level previous row lowers that flag. The
+    /// decision engine reads those zeros as genuine low exposure and raises
+    /// every bid, so missing evidence turns into a spend increase.
+    #[tokio::test]
+    async fn absent_previous_day_stats_must_not_be_read_as_low_exposure() {
+        let fixture = Fixture::new();
+        let mut observer = fixture.observer(None);
+        // Identical to `stats_response`, minus every previous-day (2026-08-24)
+        // row: the campaign reported only current-day delivery.
+        let stats_without_previous_day = serde_json::json!([{
+            "advertId": 39_682_633,
+            "stats": [
+                {"date": "2026-08-25", "nm_id": 449_627_598_u64, "views": 5, "clicks": 1, "sum": 1.5, "orders": 0, "sumPrice": 0}
+            ]
+        }]);
+        let (base_url, _requests) = mock_http(vec![
+            (200, campaign_response().to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, stats_without_previous_day.to_string()),
+            (200, stocks_response().to_string()),
+        ]);
+        observer.replace_client_for_test(WbClient::new_for_test(
+            Duration::from_secs(2),
+            BTreeMap::from([(
+                observer.policy.account_id.clone(),
+                WbCredentials {
+                    token: "test-token".to_owned(),
+                },
+            )]),
+            &base_url,
+            &base_url,
+        ));
+        let snapshot = observer
+            .observe(
+                Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap(),
+                WbAutomationStateView::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot
+                .observation
+                .skus
+                .iter()
+                .all(|sku| sku.impressions == 0 && sku.clicks == 0),
+            "absent previous-day rows collapse to zero evidence: {:?}",
+            snapshot.observation.skus
+        );
+        assert!(
+            !snapshot.observation.attribution_complete,
+            "a business date with no advertising rows at all is missing \
+             attribution evidence and must hold, but the observation reported \
+             attribution_complete=true and produced {:?}",
+            snapshot.decision.action
         );
     }
 }
