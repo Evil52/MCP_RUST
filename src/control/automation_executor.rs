@@ -158,6 +158,23 @@ impl WbAutomationExecutor {
             save_execution_state(&self.state_directory, &state)?;
             return Ok(receipt(snapshot_path, decision, outcome));
         }
+        // `daily_pause_threshold_minor` is validated to sit at or below
+        // `daily_spend_cap_minor`, so an unpaused run that has already reached
+        // the cap means the soft pause did not hold: it was never sent, WB did
+        // not apply it, or spend outran the observe-write-reconcile cycle.
+        // Nothing is in flight to correct it at this point, so stop automating
+        // and leave the campaign for an operator rather than issuing further
+        // spend-affecting writes.
+        if snapshot.observation.daily_spend_minor >= self.observer.policy().daily_spend_cap_minor {
+            state.incident_class = Some("daily_spend_cap_breached".to_owned());
+            save_execution_state(&self.state_directory, &state)?;
+            return Ok(receipt(
+                snapshot_path,
+                decision,
+                WbAutomationExecutionOutcome::IncidentLocked,
+            ));
+        }
+
         let Some(pending) = pending_from_decision(
             &decision.action,
             &snapshot.observation,
@@ -1205,6 +1222,77 @@ mod tests {
         save_execution_state(&fixture.root, &stored).unwrap();
         let executor = fixture.executor("http://127.0.0.1:1", "http://127.0.0.1:1");
         assert!(executor.send_pending(&pending).await.is_err());
+    }
+
+    /// `daily_pause_threshold_minor` (250 RUB) is the soft pause and
+    /// `daily_spend_cap_minor` (300 RUB) is the ceiling that pause exists to
+    /// defend. Observing spend at or above the ceiling with nothing in flight
+    /// means the pause did not hold, so the executor stops automating and
+    /// leaves the campaign to an operator instead of issuing further
+    /// spend-affecting writes.
+    #[tokio::test]
+    async fn reaching_the_daily_spend_cap_locks_an_incident_without_writing() {
+        let fixture = Fixture::new();
+        let (reader_url, _) = reader_server(9, 102, "2026-08-25", Some(300), 10);
+        // An unroutable writer proves no write is attempted on this path.
+        let executor = fixture.executor(&reader_url, "http://127.0.0.1:1");
+
+        let receipt = executor.run_once(now()).await.unwrap();
+
+        assert_eq!(
+            receipt.outcome,
+            WbAutomationExecutionOutcome::IncidentLocked
+        );
+        let state = read_state_file(&fixture.root.join("execution-state.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.incident_class.as_deref(),
+            Some("daily_spend_cap_breached")
+        );
+        assert!(
+            state.pending.is_none(),
+            "a breach must not reserve a further write"
+        );
+
+        // The lock is sticky: a later run reports the incident and still does
+        // not act, even though the reader now serves a clean observation.
+        let (clean_url, _) = reader_server(9, 102, "2026-08-25", None, 10);
+        let relocked = fixture.executor(&clean_url, "http://127.0.0.1:1");
+        assert_eq!(
+            relocked
+                .run_once(now() + ChronoDuration::minutes(1))
+                .await
+                .unwrap()
+                .outcome,
+            WbAutomationExecutionOutcome::IncidentLocked
+        );
+    }
+
+    /// Spend below the ceiling still follows the ordinary soft-pause path.
+    #[tokio::test]
+    async fn spend_below_the_daily_cap_still_pauses_rather_than_locking() {
+        let fixture = Fixture::new();
+        let (reader_url, _) = reader_server(9, 102, "2026-08-25", Some(250), 10);
+        let (writer_url, writer_requests) = mock_http(vec![(200, "{}".to_owned())]);
+        let executor = fixture.executor(&reader_url, &writer_url);
+
+        let receipt = executor.run_once(now()).await.unwrap();
+
+        assert_eq!(
+            receipt.outcome,
+            WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+        );
+        assert!(
+            writer_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /adv/v0/pause")
+        );
+        let state = read_state_file(&fixture.root.join("execution-state.json"))
+            .unwrap()
+            .unwrap();
+        assert!(state.incident_class.is_none());
     }
 
     #[tokio::test]
