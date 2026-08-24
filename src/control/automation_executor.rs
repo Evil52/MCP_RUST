@@ -158,7 +158,6 @@ impl WbAutomationExecutor {
             save_execution_state(&self.state_directory, &state)?;
             return Ok(receipt(snapshot_path, decision, outcome));
         }
-
         let Some(pending) = pending_from_decision(
             &decision.action,
             &snapshot.observation,
@@ -893,6 +892,24 @@ mod tests {
             .kind,
             PendingActionKind::ChangeBids { .. }
         ));
+        // Defence in depth. The decision engine no longer emits a stop for a
+        // SKU already at the floor, so this guard is unreachable through
+        // `run_once`; it stays because reserving a write that changes nothing
+        // would burn an action from the daily quota for no effect.
+        assert!(
+            pending_from_decision(
+                &WbAutomationAction::DisableSku {
+                    nm_id: 1,
+                    reason: WbAutomationDisableReason::LowStock,
+                },
+                &observation(9, 102),
+                102,
+                at,
+            )
+            .is_none(),
+            "a stop on an already floored SKU reserves no write"
+        );
+
         for (reason, expected) in [
             (
                 WbAutomationDisableReason::LowStock,

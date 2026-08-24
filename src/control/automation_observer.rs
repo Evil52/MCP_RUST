@@ -32,7 +32,9 @@ use super::{
     config::{read_control_token, validate_wb_reader_token},
 };
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+// Version 2 adds `unresolved_stops` to the persisted decision: SKUs that
+// still qualify for a hard stop while already floored.
+const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 

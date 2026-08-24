@@ -102,12 +102,27 @@ pub struct WbAutomationBidChange {
     pub reason: WbAutomationBidReason,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WbAutomationDisableReason {
     LowStock,
     NoOrdersHardStop,
     HardDrrExceeded,
+}
+
+/// A SKU that still qualifies for a hard stop while its bid already sits at
+/// `min_bid_kopecks`.
+///
+/// Lowering the bid is the strongest per-SKU lever the WB promotion API
+/// exposes — there is no per-SKU disable endpoint — so such a SKU cannot be
+/// stopped any further by this automation. Recording it keeps that unresolved
+/// state visible in the snapshot instead of leaving an operator to infer it
+/// from a run that reports no action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WbAutomationSkuStop {
+    pub nm_id: u64,
+    pub reason: WbAutomationDisableReason,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +149,10 @@ pub struct WbAutomationDecision {
     pub campaign_id: u64,
     pub observed_at: DateTime<Utc>,
     pub action: WbAutomationAction,
+    /// SKUs under a hard stop that are already floored, so `action` cannot
+    /// address them. Empty whenever a campaign-wide guard held before any
+    /// per-SKU reasoning ran.
+    pub unresolved_stops: Vec<WbAutomationSkuStop>,
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -152,33 +171,71 @@ pub fn evaluate_wb_automation(
 ) -> Result<WbAutomationDecision, WbAutomationDecisionError> {
     validate_policy(policy)?;
     let observations = validate_observation(policy, observation)?;
-    let decision = |action| WbAutomationDecision {
+    let decision = |action, unresolved_stops| WbAutomationDecision {
         account_id: policy.account_id.clone(),
         campaign_id: policy.campaign_id,
         observed_at: observation.observed_at,
         action,
+        unresolved_stops,
     };
 
     if let Some(action) = campaign_gate(policy, observation) {
-        return Ok(decision(action));
+        return Ok(decision(action, Vec::new()));
     }
-    if let Some(action) = hard_stop(policy, &observations)? {
-        return Ok(decision(action));
+
+    let stops = sku_stops(policy, &observations)?;
+    // A stopped SKU whose bid is already at the floor has had every available
+    // lever applied. It must not abort the run: doing so would freeze bid
+    // management for every healthy SKU in the campaign for as long as the stop
+    // lasts, which for a sold-out SKU can be indefinitely.
+    let unresolved = policy
+        .nm_ids
+        .iter()
+        .filter_map(|nm_id| {
+            stops
+                .get(nm_id)
+                .filter(|_| observations[nm_id].current_bid_kopecks == policy.min_bid_kopecks)
+                .map(|reason| WbAutomationSkuStop {
+                    nm_id: *nm_id,
+                    reason: *reason,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    if let Some((nm_id, reason)) = policy.nm_ids.iter().find_map(|nm_id| {
+        stops
+            .get(nm_id)
+            .filter(|_| observations[nm_id].current_bid_kopecks > policy.min_bid_kopecks)
+            .map(|reason| (*nm_id, *reason))
+    }) {
+        return Ok(decision(
+            WbAutomationAction::DisableSku { nm_id, reason },
+            unresolved,
+        ));
     }
 
     let mut changes = Vec::new();
     for nm_id in &policy.nm_ids {
+        // Never bid a stopped SKU back up. Without this a sold-out SKU parked
+        // at the floor would match the low-exposure rule on its own suppressed
+        // traffic and be raised straight off the floor.
+        if stops.contains_key(nm_id) {
+            continue;
+        }
         if let Some(change) = bid_change(policy, observations[nm_id])? {
             changes.push(change);
         }
     }
-    Ok(decision(if changes.is_empty() {
-        WbAutomationAction::Hold {
-            reason: WbAutomationHoldReason::NoMaterialChange,
-        }
-    } else {
-        WbAutomationAction::ChangeBids { changes }
-    }))
+    Ok(decision(
+        if changes.is_empty() {
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::NoMaterialChange,
+            }
+        } else {
+            WbAutomationAction::ChangeBids { changes }
+        },
+        unresolved,
+    ))
 }
 
 /// Campaign-wide guards, evaluated in fixed priority order before any per-SKU
@@ -234,12 +291,12 @@ fn campaign_gate(
     None
 }
 
-/// Per-SKU stops that pre-empt any bid change. The first SKU that trips a stop
-/// wins, so one action per run stays the invariant.
-fn hard_stop(
+/// Every SKU that currently qualifies for a hard stop, keyed by SKU.
+fn sku_stops(
     policy: &WbAutomationPolicy,
     observations: &BTreeMap<u64, &WbAutomationSkuObservation>,
-) -> Result<Option<WbAutomationAction>, WbAutomationDecisionError> {
+) -> Result<BTreeMap<u64, WbAutomationDisableReason>, WbAutomationDecisionError> {
+    let mut stops = BTreeMap::new();
     for nm_id in &policy.nm_ids {
         let sku = observations[nm_id];
         let reason = if sku.sellable_stock <= policy.min_sellable_stock {
@@ -255,13 +312,10 @@ fn hard_stop(
             None
         };
         if let Some(reason) = reason {
-            return Ok(Some(WbAutomationAction::DisableSku {
-                nm_id: *nm_id,
-                reason,
-            }));
+            stops.insert(*nm_id, reason);
         }
     }
-    Ok(None)
+    Ok(stops)
 }
 
 pub fn validate_wb_automation_policy(
@@ -515,6 +569,99 @@ mod tests {
             attribution_complete: true,
             skus: policy().nm_ids.into_iter().map(sku).collect(),
         }
+    }
+
+    /// A SKU whose bid already sits at the floor cannot be stopped any further,
+    /// because the WB promotion API exposes no per-SKU disable. It must not
+    /// abort the run: returning its stop as the decision would freeze bid
+    /// management for every healthy SKU in the campaign for as long as the stop
+    /// lasts, which for a sold-out SKU is indefinite.
+    #[test]
+    fn a_floored_stopped_sku_does_not_freeze_the_rest_of_the_campaign() {
+        let mut input = observation();
+        input.skus[0].sellable_stock = 0;
+        input.skus[0].current_bid_kopecks = 102;
+
+        let decision = evaluate_wb_automation(&policy(), &input).unwrap();
+
+        assert_eq!(
+            decision.unresolved_stops,
+            vec![WbAutomationSkuStop {
+                nm_id: 449_627_598,
+                reason: WbAutomationDisableReason::LowStock,
+            }],
+            "the stop that no action can address stays visible in the decision"
+        );
+        assert_eq!(
+            decision.action,
+            WbAutomationAction::ChangeBids {
+                changes: vec![
+                    WbAutomationBidChange {
+                        nm_id: 449_627_015,
+                        from_bid_kopecks: 200,
+                        to_bid_kopecks: 230,
+                        reason: WbAutomationBidReason::EfficientSales,
+                    },
+                    WbAutomationBidChange {
+                        nm_id: 497_424_314,
+                        from_bid_kopecks: 200,
+                        to_bid_kopecks: 230,
+                        reason: WbAutomationBidReason::EfficientSales,
+                    },
+                ],
+            },
+            "the two healthy SKUs are still managed and the floored SKU is absent"
+        );
+    }
+
+    /// The same SKU above the floor still yields a stop, and that stop keeps
+    /// priority over any bid change, so one action per run remains the rule.
+    #[test]
+    fn a_stopped_sku_above_the_floor_is_still_lowered_first() {
+        let mut input = observation();
+        input.skus[0].sellable_stock = 0;
+
+        let decision = evaluate_wb_automation(&policy(), &input).unwrap();
+
+        assert_eq!(
+            decision.action,
+            WbAutomationAction::DisableSku {
+                nm_id: 449_627_598,
+                reason: WbAutomationDisableReason::LowStock,
+            }
+        );
+        assert!(
+            decision.unresolved_stops.is_empty(),
+            "a stop the action addresses is not unresolved"
+        );
+    }
+
+    /// With every SKU stopped and floored there is nothing left to change, and
+    /// the run must say so explicitly rather than silently reporting no action.
+    #[test]
+    fn every_sku_stopped_at_the_floor_holds_with_all_stops_recorded() {
+        let mut input = observation();
+        for sku in &mut input.skus {
+            sku.sellable_stock = 0;
+            sku.current_bid_kopecks = 102;
+        }
+
+        let decision = evaluate_wb_automation(&policy(), &input).unwrap();
+
+        assert_eq!(
+            decision.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::NoMaterialChange
+            }
+        );
+        assert_eq!(
+            decision
+                .unresolved_stops
+                .iter()
+                .map(|stop| stop.nm_id)
+                .collect::<Vec<_>>(),
+            vec![449_627_598, 449_627_015, 497_424_314]
+        );
     }
 
     #[test]
