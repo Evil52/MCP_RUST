@@ -651,6 +651,232 @@ mod tests {
 
     use super::*;
 
+    /// Ozon envelopes feed the sales, stock and price columns of the daily
+    /// report, so a malformed page must be refused rather than normalized into
+    /// a zero that reads like a real measurement. Each case mutates one part of
+    /// a payload the baseline assertion proves valid.
+    #[test]
+    fn malformed_ozon_envelopes_are_rejected_field_by_field() {
+        let sales_row = |row: Value| json!({"result": {"data": [row]}});
+        assert!(
+            parse_sales_page(&sales_row(json!({
+                "dimensions": [{"id": "123"}, {"id": "2026-08-16"}],
+                "metrics": ["12.34", 5]
+            })))
+            .is_ok(),
+            "sales baseline must parse"
+        );
+        let sales_cases: Vec<(&str, Value, OzonReportParseError)> = vec![
+            ("result is missing", json!({}), OzonReportParseError::Shape),
+            (
+                "data is missing",
+                json!({"result": {}}),
+                OzonReportParseError::Shape,
+            ),
+            (
+                "row is not an object",
+                sales_row(json!(7)),
+                OzonReportParseError::Shape,
+            ),
+            (
+                "dimensions is missing",
+                sales_row(json!({"metrics": ["1", 1]})),
+                OzonReportParseError::Shape,
+            ),
+            (
+                "dimensions does not carry exactly SKU and date",
+                sales_row(json!({"dimensions": [{"id": "1"}], "metrics": ["1", 1]})),
+                OzonReportParseError::Shape,
+            ),
+            (
+                "the SKU dimension is not an object",
+                sales_row(json!({"dimensions": [7, {"id": "2026-08-16"}], "metrics": ["1", 1]})),
+                OzonReportParseError::Shape,
+            ),
+            (
+                "the SKU is not an unsigned integer",
+                sales_row(json!({
+                    "dimensions": [{"id": "-1"}, {"id": "2026-08-16"}],
+                    "metrics": ["1", 1]
+                })),
+                OzonReportParseError::Value,
+            ),
+            (
+                "the date dimension is not a calendar date",
+                sales_row(json!({
+                    "dimensions": [{"id": "1"}, {"id": "2026-13-40"}],
+                    "metrics": ["1", 1]
+                })),
+                OzonReportParseError::Value,
+            ),
+            (
+                "metrics does not carry exactly revenue and units",
+                sales_row(json!({
+                    "dimensions": [{"id": "1"}, {"id": "2026-08-16"}],
+                    "metrics": ["1"]
+                })),
+                OzonReportParseError::Shape,
+            ),
+            (
+                "the revenue metric is not a number",
+                sales_row(json!({
+                    "dimensions": [{"id": "1"}, {"id": "2026-08-16"}],
+                    "metrics": ["abc", 1]
+                })),
+                OzonReportParseError::Value,
+            ),
+        ];
+        for (description, payload, expected) in sales_cases {
+            assert_eq!(
+                parse_sales_page(&payload),
+                Err(expected),
+                "{description} must be rejected"
+            );
+        }
+
+        let warehouse = |product: Value| json!({"products": [product]});
+        assert!(
+            parse_warehouse_stock_page(
+                &warehouse(json!({"sku": 1, "present": 5, "reserved": 2, "warehouse_id": 9})),
+                "fbo",
+            )
+            .is_ok(),
+            "warehouse stock baseline must parse"
+        );
+        let warehouse_cases: Vec<(&str, Value, &'static str, OzonReportParseError)> = vec![
+            (
+                "the fulfillment scheme is not one of the two supported values",
+                warehouse(json!({"sku": 1, "present": 5, "reserved": 2, "warehouse_id": 9})),
+                "crossborder",
+                OzonReportParseError::Value,
+            ),
+            (
+                "products is missing",
+                json!({}),
+                "fbo",
+                OzonReportParseError::Shape,
+            ),
+            (
+                "present is missing",
+                warehouse(json!({"sku": 1, "reserved": 2, "warehouse_id": 9})),
+                "fbo",
+                OzonReportParseError::Shape,
+            ),
+            (
+                "reserved exceeds present, which would underflow",
+                warehouse(json!({"sku": 1, "present": 2, "reserved": 5, "warehouse_id": 9})),
+                "fbo",
+                OzonReportParseError::Value,
+            ),
+            (
+                "an FBS page has no free_stock",
+                warehouse(json!({"sku": 1, "present": 5, "warehouse_id": 9})),
+                "fbs",
+                OzonReportParseError::Shape,
+            ),
+            (
+                "warehouse_id is zero",
+                warehouse(json!({"sku": 1, "present": 5, "reserved": 2, "warehouse_id": 0})),
+                "fbo",
+                OzonReportParseError::Value,
+            ),
+        ];
+        for (description, payload, scheme, expected) in warehouse_cases {
+            assert_eq!(
+                parse_warehouse_stock_page(&payload, scheme),
+                Err(expected),
+                "{description} must be rejected"
+            );
+        }
+
+        let priced = |item: Value| json!({"items": [item]});
+        assert!(
+            parse_price_page(&priced(json!({
+                "product_id": 1,
+                "price": {"currency_code": "RUB", "price": "10.00", "old_price": "0"}
+            })))
+            .is_ok(),
+            "price baseline must parse"
+        );
+        let price_cases: Vec<(&str, Value, OzonReportParseError)> = vec![
+            ("items is missing", json!({}), OzonReportParseError::Shape),
+            (
+                "item is not an object",
+                priced(json!(7)),
+                OzonReportParseError::Shape,
+            ),
+            (
+                "price is missing",
+                priced(json!({"product_id": 1})),
+                OzonReportParseError::Shape,
+            ),
+            (
+                "the currency is not RUB",
+                priced(json!({
+                    "product_id": 1,
+                    "price": {"currency_code": "USD", "price": "10.00", "old_price": "0"}
+                })),
+                OzonReportParseError::Currency,
+            ),
+            (
+                "old_price is not a number",
+                priced(json!({
+                    "product_id": 1,
+                    "price": {"currency_code": "RUB", "price": "10.00", "old_price": "abc"}
+                })),
+                OzonReportParseError::Value,
+            ),
+        ];
+        for (description, payload, expected) in price_cases {
+            assert_eq!(
+                parse_price_page(&payload),
+                Err(expected),
+                "{description} must be rejected"
+            );
+        }
+
+        // The cursor drives pagination: a bad cursor must stop the walk rather
+        // than silently truncate a page set into a short, plausible report.
+        assert_eq!(
+            next_warehouse_stock_cursor(&json!({"has_next": false, "cursor": ""})).unwrap(),
+            None
+        );
+        assert_eq!(
+            next_warehouse_stock_cursor(&json!({"has_next": true, "cursor": "next"})).unwrap(),
+            Some("next".to_owned())
+        );
+        assert_eq!(
+            next_warehouse_stock_cursor(&json!([])),
+            Err(OzonReportParseError::Shape),
+            "a non-object response must be rejected"
+        );
+        assert_eq!(
+            next_warehouse_stock_cursor(&json!({"cursor": "next"})),
+            Err(OzonReportParseError::Shape),
+            "a missing has_next flag must be rejected"
+        );
+        assert_eq!(
+            next_warehouse_stock_cursor(&json!({"has_next": "yes", "cursor": "next"})),
+            Err(OzonReportParseError::Shape),
+            "a non-boolean has_next must be rejected"
+        );
+        assert_eq!(
+            next_warehouse_stock_cursor(&json!({"has_next": true, "cursor": 7})),
+            Err(OzonReportParseError::Shape),
+            "a non-string cursor must be rejected"
+        );
+        assert_eq!(
+            next_warehouse_stock_cursor(&json!({"has_next": true, "cursor": ""})),
+            Err(OzonReportParseError::Value),
+            "an empty cursor cannot advance pagination"
+        );
+        assert_eq!(
+            next_warehouse_stock_cursor(&json!({"has_next": false, "cursor": "a\u{7f}b"})),
+            Err(OzonReportParseError::Value),
+            "a control character in a terminal cursor must be rejected"
+        );
+    }
+
     #[test]
     fn verified_ozon_envelopes_normalize_without_guessing() {
         let sales = parse_sales_page(&json!({

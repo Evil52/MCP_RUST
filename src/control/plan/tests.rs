@@ -2788,3 +2788,142 @@ async fn repository_enforces_approval_gates_incidents_and_quotas_when_test_datab
     ))
     .await;
 }
+
+/// Every repository entry point must report `Unavailable` — never a fabricated
+/// success or a misleading `NotFound`/`InvalidPlan` — when the database
+/// connection is gone. Aborting the connection task leaves the client alive but
+/// unable to reach PostgreSQL, which is what a mid-flight backend restart or a
+/// severed socket looks like to this code. These are the error arms that the
+/// happy-path scenarios never exercise.
+#[tokio::test]
+async fn every_repository_entry_point_fails_closed_when_the_database_is_gone() {
+    verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(Err(
+        std::env::VarError::NotPresent,
+    ))
+    .await;
+    verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(std::env::var(
+        "WB_CONTROL_TEST_DATABASE_URL",
+    ))
+    .await;
+}
+
+async fn verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(
+    database_url: Result<String, std::env::VarError>,
+) {
+    let Ok(database_url) = database_url else {
+        return;
+    };
+    let _database_guard = CONTROL_DB_TEST_LOCK.lock().await;
+    let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection_task = tokio::spawn(connection);
+    let repository = WbPlanRepository::from_client(client);
+    // The repository is genuinely healthy before the connection disappears, so
+    // the assertions below cannot pass for a trivial reason.
+    repository.verify_runtime_contract().await.unwrap();
+
+    connection_task.abort();
+    let _ = connection_task.await;
+
+    let now = Utc::now();
+    let plan_id = "a".repeat(64);
+    let (requested, changes, before) = fixture(1);
+
+    assert_eq!(
+        repository.verify_runtime_contract().await,
+        Err(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository.register_policy(1, 7, POLICY_DIGEST, now).await,
+        Err(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .reserve_prepare_attempt("actor", "account", 1, 1, 7, POLICY_DIGEST, quota(), now)
+            .await
+            .err(),
+        Some(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .create(
+                "actor",
+                "account",
+                1,
+                1,
+                7,
+                POLICY_DIGEST,
+                quota(),
+                FIXTURE_PREPARE_RESERVATION_ID,
+                &requested,
+                &changes,
+                &before,
+                now,
+            )
+            .await
+            .err(),
+        Some(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository.load_for_actor(&plan_id, "actor").await.err(),
+        Some(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository.load_by_id_for_approval(&plan_id).await.err(),
+        Some(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .approve(&plan_id, "approver", POLICY_DIGEST, "reason", now)
+            .await
+            .err(),
+        Some(PlanStoreError::Unavailable)
+    );
+
+    let context = || WbApplyContext {
+        plan_id: &plan_id,
+        actor_id: "actor",
+        expected_plan_digest: POLICY_DIGEST,
+        expected_schema_version: 1,
+        expected_policy_revision: 7,
+        expected_policy_digest: POLICY_DIGEST,
+        now,
+    };
+    assert_eq!(
+        repository.claim_for_apply(context()).await.err(),
+        Some(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository.revalidate_before_write(context()).await,
+        Err(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .mark_stale_applying_ambiguous(&plan_id, "actor", now)
+            .await,
+        Err(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .finish(
+                &plan_id,
+                "actor",
+                WbPlanFinish {
+                    status: WbPlanStatus::Applied,
+                    error_class: None,
+                    write_response: None,
+                    readback: None,
+                    now,
+                },
+            )
+            .await,
+        Err(PlanStoreError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .confirm_reconciled(&plan_id, "actor", &before, now)
+            .await,
+        Err(PlanStoreError::Unavailable)
+    );
+}

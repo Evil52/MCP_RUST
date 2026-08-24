@@ -11,8 +11,9 @@ use mcp_ozon::reporting::{
     outbox::{ArtifactIdentity, DeliveryErrorClass},
     policy::{AudiencePolicy, DailyReportPolicy, ManagerScope},
     postgres_outbox::{
-        CreateOutcome, GenerationErrorClass, GenerationStatus, PostgresOutboxError,
-        PostgresOutboxRepository, ReconciliationDecision, ReconciliationOutcome,
+        ClaimedDelivery, CreateOutcome, GenerationErrorClass, GenerationStatus,
+        PostgresOutboxError, PostgresOutboxRepository, ReconciliationDecision,
+        ReconciliationOutcome,
     },
     service::ReportWorkerConfig,
 };
@@ -1216,5 +1217,147 @@ async fn a_failing_generation_backs_off_and_then_exhausts_its_budget() {
             .collect::<Vec<_>>(),
         vec!["generation_exhausted".to_owned()],
         "an exhausted batch is visible to operators instead of vanishing"
+    );
+}
+
+/// Once the outbox has claimed a delivery the worker is already committed to
+/// sending mail, so a database that disappears mid-flight must be reported as
+/// `Unavailable` on every entry point. Silently succeeding would let the worker
+/// believe a send was recorded; silently returning "nothing to do" would hide a
+/// pending delivery. Aborting the connection task reproduces a severed socket
+/// or a backend restart while the client handle is still alive.
+#[tokio::test]
+async fn every_outbox_entry_point_reports_unavailable_when_the_database_is_gone() {
+    verify_every_outbox_entry_point_reports_unavailable(None).await;
+    verify_every_outbox_entry_point_reports_unavailable(
+        std::env::var("REPORT_OUTBOX_TEST_WORKER_URL").ok(),
+    )
+    .await;
+}
+
+async fn verify_every_outbox_entry_point_reports_unavailable(url: Option<String>) {
+    let Some(url) = url else {
+        return;
+    };
+    let _guard = DB_TEST_LOCK.lock().await;
+    let (client, connection) = Config::from_str(&url)
+        .unwrap()
+        .connect(tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection_task = tokio::spawn(connection);
+    let repository = PostgresOutboxRepository::from_client(client);
+    // The repository is genuinely healthy before the connection disappears, so
+    // none of the assertions below can pass for a trivial reason.
+    repository.verify_runtime_contract().await.unwrap();
+
+    connection_task.abort();
+    let _ = connection_task.await;
+
+    let now = utc(13, 30);
+    let recipient = format!("unavailable_{}", std::process::id());
+    let mut due = due_deliveries(now, &recipient, 1, &BTreeSet::new()).unwrap();
+    let planned = due.remove(0);
+    let covered_keys = planned.covered_keys.clone();
+    let claim = ClaimedDelivery {
+        batch_id: 1,
+        recipient_id: recipient.clone(),
+        report_version: 1,
+        attempt_no: 1,
+        artifact: artifact(),
+        covered_keys: covered_keys.clone(),
+        deadline_at: utc(18, 0),
+    };
+
+    assert_eq!(
+        repository.verify_runtime_contract().await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository.verify_mail_activation(&recipient, 1, now).await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository.create_planned(planned).await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository.covered_keys(now, &recipient, 1).await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .plan_due(now, &disabled_policy(recipient.clone()))
+            .await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository.start_generation(1).await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository.generation_candidate(1, now).await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository.pending_generation_ids(now, 10).await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .record_generation_failure(1, now, GenerationErrorClass::Failed)
+            .await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository.mark_ready(1, &artifact()).await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository.claim_ready(now).await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .reconcile_sending(
+                1,
+                1,
+                &recipient,
+                1,
+                now,
+                &ReconciliationDecision::SuppressedUnknown,
+            )
+            .await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .record_sent(&claim, now, now, "provider-message-id")
+            .await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .record_transient_failure(
+                &claim,
+                now,
+                now,
+                DeliveryErrorClass::Transport,
+                now + Duration::minutes(5),
+            )
+            .await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .record_permanent_failure(&claim, now, now, DeliveryErrorClass::ProviderRejected)
+            .await,
+        Err(PostgresOutboxError::Unavailable)
+    );
+    assert_eq!(
+        repository
+            .record_exhausted_failure(&claim, now, now, DeliveryErrorClass::Transport)
+            .await,
+        Err(PostgresOutboxError::Unavailable)
     );
 }
