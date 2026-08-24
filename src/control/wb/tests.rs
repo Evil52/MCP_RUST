@@ -746,6 +746,147 @@ async fn campaign_pause_and_start_are_single_guarded_get_writes() {
 }
 
 #[tokio::test]
+async fn campaign_status_response_failures_remain_ambiguous_and_bounded() {
+    for (status, headers, body, expected_reason) in [
+        (
+            "200 OK",
+            "x-request-id: invalid-status-json\r\n",
+            b"not-json".as_slice(),
+            "invalid_success_json",
+        ),
+        (
+            "400 Bad Request",
+            "x-request-id: rejected-status\r\n",
+            b"{}".as_slice(),
+            "http_status",
+        ),
+    ] {
+        let (base_url, server) =
+            response_server(http_response(status, headers, body), Duration::ZERO).await;
+        let client =
+            WbBidWriteClient::new_for_test(&base_url, "test-token", Duration::from_secs(1));
+        let error = client
+            .pause_campaign_with_permit(42, || async { Ok::<(), ()>(()) })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                WbGuardedWriteError::Write(WbWriteError::Ambiguous { reason, .. })
+                    if *reason == expected_reason
+            ) || matches!(
+                &error,
+                WbGuardedWriteError::Write(WbWriteError::HttpStatus { .. })
+                    if expected_reason == "http_status"
+            )
+        );
+        server.await.unwrap();
+    }
+
+    let (base_url, server) = response_server(
+        http_response("200 OK", "", br#"{"ok":true}"#),
+        Duration::ZERO,
+    )
+    .await;
+    let client = WbBidWriteClient::new_for_test(&base_url, "test-token", Duration::from_secs(1));
+    assert_eq!(
+        client
+            .start_campaign_with_permit(42, || async { Ok::<(), ()>(()) })
+            .await
+            .unwrap(),
+        serde_json::json!({"ok": true})
+    );
+    server.await.unwrap();
+
+    let oversized_body = vec![b'x'; MAX_ERROR_RESPONSE_BYTES + 1];
+    let (base_url, server) = response_server(
+        http_response(
+            "400 Bad Request",
+            "x-request-id: oversized-status\r\n",
+            &oversized_body,
+        ),
+        Duration::ZERO,
+    )
+    .await;
+    let client = WbBidWriteClient::new_for_test(&base_url, "test-token", Duration::from_secs(1));
+    assert!(matches!(
+        client
+            .pause_campaign_with_permit(42, || async { Ok::<(), ()>(()) })
+            .await,
+        Err(WbGuardedWriteError::Write(WbWriteError::Ambiguous {
+            reason: "response_too_large",
+            ..
+        }))
+    ));
+    server.await.unwrap();
+
+    let (base_url, server) = response_server(
+        b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\nconnection: close\r\n\r\n{".to_vec(),
+        Duration::ZERO,
+    )
+    .await;
+    let client = WbBidWriteClient::new_for_test(&base_url, "test-token", Duration::from_secs(1));
+    assert!(matches!(
+        client
+            .pause_campaign_with_permit(42, || async { Ok::<(), ()>(()) })
+            .await,
+        Err(WbGuardedWriteError::Write(WbWriteError::Ambiguous {
+            reason: "response_body_error",
+            ..
+        }))
+    ));
+    server.await.unwrap();
+
+    let (base_url, server) = response_server(
+        http_response("200 OK", "", b"{}"),
+        Duration::from_millis(50),
+    )
+    .await;
+    let http = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let client = WbBidWriteClient::from_parts(
+        http,
+        &base_url,
+        "test-token",
+        Duration::from_millis(5),
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(matches!(
+        client
+            .pause_campaign_with_permit(42, || async { Ok::<(), ()>(()) })
+            .await,
+        Err(WbGuardedWriteError::Write(WbWriteError::Ambiguous {
+            reason: "timeout",
+            request_id: None
+        }))
+    ));
+    server.await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_address = listener.local_addr().unwrap();
+    drop(listener);
+    let client = WbBidWriteClient::new_for_test(
+        &format!("http://{closed_address}"),
+        "test-token",
+        Duration::from_secs(1),
+    );
+    assert!(matches!(
+        client
+            .pause_campaign_with_permit(42, || async { Ok::<(), ()>(()) })
+            .await,
+        Err(WbGuardedWriteError::Write(WbWriteError::Ambiguous {
+            reason: "network_error",
+            request_id: None
+        }))
+    ));
+}
+
+#[tokio::test]
 async fn write_response_handling_is_bounded_and_ambiguity_preserving() {
     for (body, expected) in [
         (Vec::new(), Value::Null),

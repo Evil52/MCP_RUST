@@ -136,6 +136,11 @@ impl WbAutomationObserver {
         &self.policy_sha256
     }
 
+    #[cfg(test)]
+    pub(super) fn replace_client_for_test(&mut self, client: WbClient) {
+        self.client = client;
+    }
+
     pub async fn observe(
         &self,
         observed_at: DateTime<Utc>,
@@ -424,6 +429,15 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn write_atomic_file(directory: &Path, name: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_file_with(directory, name, bytes, write_and_sync)
+}
+
+fn write_atomic_file_with(
+    directory: &Path,
+    name: &Path,
+    bytes: &[u8],
+    write: fn(&mut File, &[u8]) -> Result<()>,
+) -> Result<()> {
     let temporary = directory.join(format!(".latest-{}.tmp", std::process::id()));
     let mut file = OpenOptions::new()
         .write(true)
@@ -431,7 +445,7 @@ fn write_atomic_file(directory: &Path, name: &Path, bytes: &[u8]) -> Result<()> 
         .mode(0o600)
         .open(&temporary)
         .context("WB automation temporary snapshot недоступен")?;
-    if let Err(error) = write_and_sync(&mut file, bytes) {
+    if let Err(error) = write(&mut file, bytes) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
@@ -452,12 +466,25 @@ fn write_and_sync(file: &mut File, bytes: &[u8]) -> Result<()> {
 }
 
 fn read_regular_file(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>> {
+    read_regular_file_with(path, maximum, label, read_file)
+}
+
+fn read_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    fs::read(path)
+}
+
+fn read_regular_file_with(
+    path: &Path,
+    maximum: u64,
+    label: &str,
+    read: fn(&Path) -> std::io::Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} недоступен"))?;
     ensure!(
         metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= maximum,
         "{label} должен быть обычным bounded-файлом"
     );
-    fs::read(path).with_context(|| format!("{label} нельзя прочитать"))
+    read(path).with_context(|| format!("{label} нельзя прочитать"))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -470,4 +497,460 @@ fn sha256_hex(bytes: &[u8]) -> String {
             write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
             output
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::test_support::mock_http;
+
+    const TEST_SELLER_SID: &str = "123e4567-e89b-42d3-a456-426614174000";
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct Fixture {
+        root: PathBuf,
+        policy: PathBuf,
+        registry: PathBuf,
+        reader_token: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let id = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!(
+                "mcp-wb-automation-observer-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let policy = root.join("policy.json");
+            let registry = root.join("access.json");
+            let reader_token = root.join("reader.token");
+            fs::write(
+                &policy,
+                serde_json::to_vec_pretty(&policy_fixture()).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                &registry,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "actors": [{
+                        "id": "manager",
+                        "name": "Manager",
+                        "role": "manager",
+                        "oidc": {"username": "manager"}
+                    }],
+                    "accounts": [{
+                        "id": "ip_domnyshev_wb",
+                        "organization": "Test WB",
+                        "marketplace": "wildberries",
+                        "seller_client_id": "seller",
+                        "manager_id": "manager",
+                        "wildberries": {
+                            "api_token_env": "UNUSED_WB_TOKEN",
+                            "seller_sid": TEST_SELLER_SID
+                        }
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(&reader_token, wb_token((1_u64 << 6) | (1_u64 << 30))).unwrap();
+            fs::set_permissions(&reader_token, fs::Permissions::from_mode(0o600)).unwrap();
+            Self {
+                root,
+                policy,
+                registry,
+                reader_token,
+            }
+        }
+
+        fn observer(&self, proxy_url: Option<&str>) -> WbAutomationObserver {
+            WbAutomationObserver::from_files(
+                &self.policy,
+                &self.registry,
+                &self.reader_token,
+                false,
+                Duration::from_secs(2),
+                proxy_url,
+            )
+            .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn policy_fixture() -> WbAutomationPolicy {
+        serde_json::from_str(include_str!("../../config/wb-automation-robot.json")).unwrap()
+    }
+
+    fn wb_token(scope: u64) -> String {
+        let expires = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+        let claims = serde_json::json!({
+            "acc": 3,
+            "for": "self",
+            "t": false,
+            "s": scope,
+            "exp": expires,
+            "sid": TEST_SELLER_SID
+        });
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
+        format!("{header}.{payload}.{signature}")
+    }
+
+    fn install_test_client(observer: &mut WbAutomationObserver, base_url: &str) {
+        let account_id = observer.policy.account_id.clone();
+        observer.replace_client_for_test(WbClient::new_for_test(
+            Duration::from_secs(2),
+            BTreeMap::from([(
+                account_id,
+                WbCredentials {
+                    token: "test-token".to_owned(),
+                },
+            )]),
+            base_url,
+            base_url,
+        ));
+    }
+
+    fn campaign_response() -> Value {
+        serde_json::json!({
+            "adverts": [{
+                "id": 39_682_633,
+                "status": 9,
+                "bid_type": "manual",
+                "settings": {
+                    "name": "Робот",
+                    "payment_type": "cpc",
+                    "placements": {"search": true, "recommendations": false}
+                },
+                "nm_settings": [
+                    {"nm_id": 449_627_598_u64, "bids_kopecks": {"search": 102, "recommendations": 0}},
+                    {"nm_id": 449_627_015_u64, "bids_kopecks": {"search": 102, "recommendations": 0}},
+                    {"nm_id": 497_424_314_u64, "bids_kopecks": {"search": 102, "recommendations": 0}}
+                ]
+            }]
+        })
+    }
+
+    fn stats_response() -> Value {
+        serde_json::json!([{
+            "advertId": 39_682_633,
+            "stats": [
+                {"date": "2026-08-24", "nm_id": 449_627_598_u64, "views": 100, "clicks": 10, "sum": 2, "orders": 1, "sumPrice": 100},
+                {"date": "2026-08-24", "nm_id": 449_627_015_u64, "views": 80, "clicks": 8, "sum": 1, "orders": 1, "sumPrice": 80},
+                {"date": "2026-08-24", "nm_id": 497_424_314_u64, "views": 60, "clicks": 6, "sum": 1, "orders": 1, "sumPrice": 60},
+                {"date": "2026-08-25", "nm_id": 449_627_598_u64, "views": 5, "clicks": 1, "sum": 1.5, "orders": 0, "sumPrice": 0}
+            ]
+        }])
+    }
+
+    fn stocks_response() -> Value {
+        serde_json::json!({"data": {"items": [
+            {"nmId": 449_627_598_u64, "warehouseId": 1, "quantity": 10},
+            {"nmId": 449_627_015_u64, "warehouseId": 1, "quantity": 12},
+            {"nmId": 497_424_314_u64, "warehouseId": 1, "quantity": 8}
+        ]}})
+    }
+
+    #[tokio::test]
+    async fn files_network_observation_and_snapshot_persistence_form_one_closed_path() {
+        let fixture = Fixture::new();
+        let mut observer = fixture.observer(None);
+        let (base_url, requests) = mock_http(vec![
+            (200, campaign_response().to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, stats_response().to_string()),
+            (200, stocks_response().to_string()),
+        ]);
+        observer.replace_client_for_test(WbClient::new_for_test(
+            Duration::from_secs(2),
+            BTreeMap::from([(
+                observer.policy.account_id.clone(),
+                WbCredentials {
+                    token: "test-token".to_owned(),
+                },
+            )]),
+            &base_url,
+            &base_url,
+        ));
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
+        let snapshot = observer
+            .observe(
+                observed_at,
+                WbAutomationStateView {
+                    paused_by_automation: false,
+                    actions_today: 1,
+                    last_action_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(observer.policy().campaign_id, 39_682_633);
+        assert_eq!(observer.policy_sha256().len(), 64);
+        assert!(format!("{observer:?}").contains("ip_domnyshev_wb"));
+        assert_eq!(snapshot.previous_business_date.to_string(), "2026-08-24");
+        assert_eq!(snapshot.observation.budget_remaining_minor, 100_000);
+        assert_eq!(snapshot.observation.daily_spend_minor, 150);
+        assert!(snapshot.observation.attribution_complete);
+        assert_eq!(snapshot.observation.skus[0].sellable_stock, 10);
+
+        let history = persist_wb_automation_snapshot(&fixture.root, &snapshot).unwrap();
+        assert!(history.is_file());
+        assert_eq!(
+            serde_json::from_slice::<WbAutomationSnapshot>(
+                &fs::read(fixture.root.join("latest.json")).unwrap()
+            )
+            .unwrap(),
+            snapshot
+        );
+        for _ in 0..4 {
+            assert!(
+                requests
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .contains("authorization: Bearer test-token")
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_construction_and_parser_guards_are_exercised() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            fixture
+                .observer(Some("http://127.0.0.1:3128"))
+                .policy()
+                .account_id,
+            "ip_domnyshev_wb"
+        );
+        let policy = policy_fixture();
+        assert_eq!(
+            parse_campaign(&campaign_response(), &policy)
+                .unwrap()
+                .status,
+            9
+        );
+        assert!(parse_campaign(&serde_json::json!({"adverts": []}), &policy).is_err());
+        assert_eq!(
+            parse_budget_minor(&serde_json::json!({"total": 7})).unwrap(),
+            700
+        );
+        assert!(parse_budget_minor(&serde_json::json!({"total": u64::MAX})).is_err());
+        assert_eq!(sha256_hex(b"test").len(), 64);
+        assert!(read_regular_file(&fixture.policy, MAX_POLICY_BYTES, "policy").is_ok());
+        assert!(
+            read_regular_file(
+                &fixture.root.join("missing-policy"),
+                MAX_POLICY_BYTES,
+                "policy"
+            )
+            .is_err()
+        );
+        assert!(
+            read_regular_file_with(&fixture.policy, MAX_POLICY_BYTES, "policy", |_| Err(
+                std::io::Error::other("injected read failure")
+            ))
+            .is_err()
+        );
+
+        let campaign = parse_campaign(&campaign_response(), &policy).unwrap();
+        let advertising = parse_promotion_stats(&serde_json::json!([{
+            "advertId": 39_682_633,
+            "stats": [{
+                "date": "2026-08-24",
+                "views": 1,
+                "clicks": 0,
+                "sum": 0,
+                "orders": 0,
+                "sumPrice": 0
+            }]
+        }]))
+        .unwrap();
+        let (stocks, _) = parse_stock_page(&stocks_response()).unwrap();
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
+        assert!(
+            !build_observation(
+                &policy,
+                observed_at,
+                observed_at.date_naive(),
+                observed_at.date_naive().pred_opt().unwrap(),
+                &campaign,
+                100_000,
+                &advertising,
+                &stocks,
+                WbAutomationStateView::default()
+            )
+            .unwrap()
+            .attribution_complete
+        );
+
+        assert!(
+            WbAutomationObserver::from_files(
+                &fixture.policy,
+                &fixture.registry,
+                &fixture.reader_token,
+                false,
+                Duration::from_secs(2),
+                Some("http://[::1"),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_policy_observation_and_atomic_write_fail_closed() {
+        let fixture = Fixture::new();
+        let mut invalid_policy = policy_fixture();
+        invalid_policy.allow_budget_top_up = true;
+        fs::write(
+            &fixture.policy,
+            serde_json::to_vec(&invalid_policy).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            WbAutomationObserver::from_files(
+                &fixture.policy,
+                &fixture.registry,
+                &fixture.reader_token,
+                false,
+                Duration::from_secs(2),
+                None,
+            )
+            .is_err()
+        );
+        fs::write(
+            &fixture.policy,
+            serde_json::to_vec(&policy_fixture()).unwrap(),
+        )
+        .unwrap();
+
+        let mut observer = fixture.observer(None);
+        let (base_url, _) = mock_http(vec![
+            (200, campaign_response().to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (
+                200,
+                serde_json::json!([{
+                    "advertId": 1,
+                    "stats": [{"date": "2026-08-24", "nm_id": 449_627_598_u64, "views": 1, "clicks": 0, "sum": 0, "orders": 0, "sumPrice": 0}]
+                }])
+                .to_string(),
+            ),
+            (200, stocks_response().to_string()),
+        ]);
+        let account_id = observer.policy.account_id.clone();
+        observer.replace_client_for_test(WbClient::new_for_test(
+            Duration::from_secs(2),
+            BTreeMap::from([(
+                account_id,
+                WbCredentials {
+                    token: "test-token".to_owned(),
+                },
+            )]),
+            &base_url,
+            &base_url,
+        ));
+        assert!(
+            observer
+                .observe(
+                    Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap(),
+                    WbAutomationStateView::default()
+                )
+                .await
+                .is_err()
+        );
+
+        assert!(
+            write_atomic_file_with(
+                &fixture.root,
+                Path::new("never-published.json"),
+                b"snapshot",
+                |_, _| Err(anyhow::anyhow!("injected write failure"))
+            )
+            .is_err()
+        );
+        assert!(!fixture.root.join("never-published.json").exists());
+    }
+
+    #[tokio::test]
+    async fn response_shape_and_decision_error_mappers_are_executed() {
+        let fixture = Fixture::new();
+
+        let mut invalid_stats = fixture.observer(None);
+        let (stats_url, _) = mock_http(vec![
+            (200, campaign_response().to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::json!({}).to_string()),
+        ]);
+        install_test_client(&mut invalid_stats, &stats_url);
+        assert!(
+            invalid_stats
+                .observe(
+                    Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap(),
+                    WbAutomationStateView::default()
+                )
+                .await
+                .is_err()
+        );
+
+        let mut invalid_stocks = fixture.observer(None);
+        let (stocks_url, _) = mock_http(vec![
+            (200, campaign_response().to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::Value::Null.to_string()),
+            (200, serde_json::json!({}).to_string()),
+        ]);
+        install_test_client(&mut invalid_stocks, &stocks_url);
+        assert!(
+            invalid_stocks
+                .observe(
+                    Utc.with_ymd_and_hms(2026, 8, 25, 12, 1, 0).unwrap(),
+                    WbAutomationStateView::default()
+                )
+                .await
+                .is_err()
+        );
+
+        let mut invalid_campaign_bid = campaign_response();
+        invalid_campaign_bid["adverts"][0]["nm_settings"][0]["bids_kopecks"]["search"] =
+            serde_json::json!(101);
+        let mut invalid_decision = fixture.observer(None);
+        let (decision_url, _) = mock_http(vec![
+            (200, invalid_campaign_bid.to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::Value::Null.to_string()),
+            (200, stocks_response().to_string()),
+        ]);
+        install_test_client(&mut invalid_decision, &decision_url);
+        assert!(
+            invalid_decision
+                .observe(
+                    Utc.with_ymd_and_hms(2026, 8, 25, 12, 2, 0).unwrap(),
+                    WbAutomationStateView::default()
+                )
+                .await
+                .is_err()
+        );
+    }
 }

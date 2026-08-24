@@ -621,55 +621,42 @@ mod tests {
         input.skus[2].attributed_orders = 0;
         input.skus[2].attributed_revenue_minor = 0;
 
-        let WbAutomationAction::ChangeBids { changes } =
-            evaluate_wb_automation(&policy(), &input).unwrap().action
-        else {
-            panic!("expected bid changes");
-        };
-        assert_eq!(changes.len(), 3);
         assert_eq!(
-            changes
-                .iter()
-                .map(|change| (
-                    change.nm_id,
-                    change.from_bid_kopecks,
-                    change.to_bid_kopecks,
-                    change.reason.clone()
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    449_627_598,
-                    200,
-                    170,
-                    WbAutomationBidReason::TargetDrrExceeded
-                ),
-                (
-                    449_627_015,
-                    200,
-                    230,
-                    WbAutomationBidReason::LowExposureExploration
-                ),
-                (
-                    497_424_314,
-                    200,
-                    170,
-                    WbAutomationBidReason::NoOrdersAfterClicks
-                ),
-            ]
+            evaluate_wb_automation(&policy(), &input).unwrap().action,
+            WbAutomationAction::ChangeBids {
+                changes: vec![
+                    WbAutomationBidChange {
+                        nm_id: 449_627_598,
+                        from_bid_kopecks: 200,
+                        to_bid_kopecks: 170,
+                        reason: WbAutomationBidReason::TargetDrrExceeded,
+                    },
+                    WbAutomationBidChange {
+                        nm_id: 449_627_015,
+                        from_bid_kopecks: 200,
+                        to_bid_kopecks: 230,
+                        reason: WbAutomationBidReason::LowExposureExploration,
+                    },
+                    WbAutomationBidChange {
+                        nm_id: 497_424_314,
+                        from_bid_kopecks: 200,
+                        to_bid_kopecks: 170,
+                        reason: WbAutomationBidReason::NoOrdersAfterClicks,
+                    },
+                ],
+            }
         );
     }
 
     #[test]
     fn efficient_sales_increase_and_limits_prevent_extra_actions() {
-        let WbAutomationAction::ChangeBids { changes } =
-            evaluate_wb_automation(&policy(), &observation())
-                .unwrap()
-                .action
-        else {
-            panic!("expected efficient increases");
-        };
-        assert!(changes.iter().all(|change| change.to_bid_kopecks == 230));
+        let decision = evaluate_wb_automation(&policy(), &observation()).unwrap();
+        assert!(matches!(
+            decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes.len() == 3
+                    && changes.iter().all(|change| change.to_bid_kopecks == 230)
+        ));
 
         let mut quota = observation();
         quota.actions_today = 2;
@@ -718,6 +705,92 @@ mod tests {
         assert_eq!(
             evaluate_wb_automation(&policy(), &impossible_clicks),
             Err(WbAutomationDecisionError::InvalidObservation)
+        );
+    }
+
+    #[test]
+    fn authorization_attribution_and_no_change_holds_are_explicit() {
+        let mut not_active = observation();
+        not_active.observed_at = policy().authorized_at - Duration::seconds(1);
+        assert_eq!(
+            evaluate_wb_automation(&policy(), &not_active)
+                .unwrap()
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AuthorizationNotActive
+            }
+        );
+
+        let mut expired = observation();
+        expired.observed_at = policy().authorization_expires_at;
+        assert_eq!(
+            evaluate_wb_automation(&policy(), &expired).unwrap().action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AuthorizationExpired
+            }
+        );
+
+        let mut incomplete = observation();
+        incomplete.attribution_complete = false;
+        assert_eq!(
+            evaluate_wb_automation(&policy(), &incomplete)
+                .unwrap()
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AttributionIncomplete
+            }
+        );
+
+        let mut unchanged = observation();
+        for sku in &mut unchanged.skus {
+            sku.attributed_orders = 1;
+        }
+        assert_eq!(
+            evaluate_wb_automation(&policy(), &unchanged)
+                .unwrap()
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::NoMaterialChange
+            }
+        );
+        assert_eq!(validate_wb_automation_policy(&policy()), Ok(()));
+    }
+
+    #[test]
+    fn future_actions_and_arithmetic_overflow_fail_closed() {
+        let mut future_action = observation();
+        future_action.last_action_at = Some(now() + Duration::seconds(1));
+        assert_eq!(
+            evaluate_wb_automation(&policy(), &future_action),
+            Err(WbAutomationDecisionError::InvalidObservation)
+        );
+
+        let mut zero_click_conversion = observation();
+        zero_click_conversion.skus[0].clicks = 0;
+        zero_click_conversion.skus[0].impressions = 0;
+        assert!(matches!(
+            evaluate_wb_automation(&policy(), &zero_click_conversion)
+                .unwrap()
+                .action,
+            WbAutomationAction::ChangeBids { .. }
+        ));
+
+        let mut overflow_policy = policy();
+        overflow_policy.max_bid_kopecks = u64::MAX;
+        let mut overflow = observation();
+        overflow.skus[0].current_bid_kopecks = u64::MAX;
+        overflow.skus[0].impressions = 0;
+        overflow.skus[0].clicks = 0;
+        overflow.skus[0].attributed_orders = 0;
+        overflow.skus[0].attributed_revenue_minor = 0;
+        assert_eq!(
+            evaluate_wb_automation(&overflow_policy, &overflow),
+            Err(WbAutomationDecisionError::Overflow)
+        );
+
+        assert_eq!(
+            ratio_basis_points(u64::MAX, 1),
+            Err(WbAutomationDecisionError::Overflow)
         );
     }
 

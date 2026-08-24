@@ -968,6 +968,13 @@ fn wb_runtime_refuses_dev_auth_invalid_gate_and_missing_scope() {
     );
     assert!(from(&invalid_gate).is_err());
 
+    let mut invalid_reader_gate = jwt_values(&fixtures);
+    invalid_reader_gate.insert(
+        "CONTROL_MCP_ALLOW_BROAD_READ_TOKEN".to_owned(),
+        "TRUE".to_owned(),
+    );
+    assert!(from(&invalid_reader_gate).is_err());
+
     assert!(
         from(&fixtures.values()).is_err(),
         "non-disabled WB runtime must require JWT auth"
