@@ -26,13 +26,16 @@ use crate::{
 
 use super::{
     automation::{
-        WbAutomationDecision, WbAutomationObservation, WbAutomationPolicy,
-        WbAutomationSkuObservation, evaluate_wb_automation, validate_wb_automation_policy,
+        WbAutomationCampaignMetrics, WbAutomationDecision, WbAutomationObservation,
+        WbAutomationPolicy, WbAutomationSkuObservation, evaluate_wb_automation,
+        validate_wb_automation_policy,
     },
     config::{read_control_token, validate_wb_reader_token},
 };
 
-const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+// Version 3 distinguishes exact SKU attribution from genuine campaign-level
+// totals, without copying aggregate delivery into fabricated per-SKU rows.
+const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
@@ -326,16 +329,29 @@ fn build_observation(
         }),
         "WB automation stats вышли за campaign/date/SKU scope"
     );
-    let mut daily_spend_minor = 0_u64;
+    let mut current_sku_spend_minor = 0_u64;
+    let mut current_campaign_spend_minor = None;
     let mut previous = BTreeMap::<u64, &CollectedAdvertisingFact>::new();
-    let mut campaign_level_previous = false;
+    let mut campaign_level_previous = None;
     for fact in advertising {
         if fact.business_date == current_date {
-            daily_spend_minor = daily_spend_minor
-                .checked_add(fact.spend_minor)
-                .context("WB automation daily spend overflow")?;
+            if fact.sku == 0 {
+                ensure!(
+                    current_campaign_spend_minor
+                        .replace(fact.spend_minor)
+                        .is_none(),
+                    "WB automation stats содержат duplicate campaign total"
+                );
+            } else {
+                current_sku_spend_minor = current_sku_spend_minor
+                    .checked_add(fact.spend_minor)
+                    .context("WB automation daily spend overflow")?;
+            }
         } else if fact.sku == 0 {
-            campaign_level_previous = true;
+            ensure!(
+                campaign_level_previous.replace(fact).is_none(),
+                "WB automation stats содержат duplicate campaign total"
+            );
         } else {
             ensure!(
                 previous.insert(fact.sku, fact).is_none(),
@@ -343,6 +359,15 @@ fn build_observation(
             );
         }
     }
+    ensure!(
+        current_campaign_spend_minor.is_none() || current_sku_spend_minor == 0,
+        "WB automation stats смешивают campaign и SKU totals за текущую дату"
+    );
+    ensure!(
+        campaign_level_previous.is_none() || previous.is_empty(),
+        "WB automation stats смешивают campaign и SKU totals за предыдущую дату"
+    );
+    let daily_spend_minor = current_campaign_spend_minor.unwrap_or(current_sku_spend_minor);
     let mut stock_totals = BTreeMap::<u64, u64>::new();
     for stock in stocks.iter().filter(|stock| allowed.contains(&stock.sku)) {
         let total = stock_totals.entry(stock.sku).or_default();
@@ -378,7 +403,18 @@ fn build_observation(
         daily_spend_minor,
         actions_today: state.actions_today,
         last_action_at: state.last_action_at,
-        attribution_complete: !campaign_level_previous,
+        // One present SKU row is enough for exact attribution because WB omits
+        // SKUs that genuinely did not deliver. A campaign-level row is retained
+        // separately for symmetric decisions and is never copied into SKU
+        // facts. No row in either scope remains missing evidence and holds.
+        attribution_complete: campaign_level_previous.is_none() && !previous.is_empty(),
+        campaign_level_metrics: campaign_level_previous.map(|fact| WbAutomationCampaignMetrics {
+            impressions: fact.impressions,
+            clicks: fact.clicks,
+            spend_minor: fact.spend_minor,
+            attributed_orders: fact.attributed_orders,
+            attributed_revenue_minor: fact.attributed_revenue_minor,
+        }),
         skus,
     })
 }
@@ -510,6 +546,9 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
+    use crate::control::automation::{
+        WbAutomationAction, WbAutomationBidReason, WbAutomationHoldReason,
+    };
     use crate::test_support::mock_http;
 
     const TEST_SELLER_SID: &str = "123e4567-e89b-42d3-a456-426614174000";
@@ -664,6 +703,40 @@ mod tests {
         }])
     }
 
+    fn campaign_level_stats_response() -> Value {
+        serde_json::json!([{
+            "advertId": 39_682_633,
+            "days": [
+                {
+                    "date": "2026-08-24",
+                    "views": 30,
+                    "clicks": 3,
+                    "sum": 3.06,
+                    "orders": 0,
+                    "sumPrice": 0,
+                    "apps": [
+                        {"appType": 1},
+                        {"appType": 2},
+                        {"appType": 64}
+                    ]
+                },
+                {
+                    "date": "2026-08-25",
+                    "views": 10,
+                    "clicks": 1,
+                    "sum": 1.02,
+                    "orders": 0,
+                    "sumPrice": 0,
+                    "apps": [
+                        {"appType": 1},
+                        {"appType": 2},
+                        {"appType": 64}
+                    ]
+                }
+            ]
+        }])
+    }
+
     fn stocks_response() -> Value {
         serde_json::json!({"data": {"items": [
             {"nmId": 449_627_598_u64, "warehouseId": 1, "quantity": 10},
@@ -732,6 +805,57 @@ mod tests {
                     .contains("authorization: Bearer test-token")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn real_cpc_campaign_totals_enable_a_uniform_safe_auto_decision() {
+        let fixture = Fixture::new();
+        let mut observer = fixture.observer(None);
+        let (base_url, _requests) = mock_http(vec![
+            (200, campaign_response().to_string()),
+            (200, serde_json::json!({"total": 995}).to_string()),
+            (200, campaign_level_stats_response().to_string()),
+            (200, stocks_response().to_string()),
+        ]);
+        install_test_client(&mut observer, &base_url);
+
+        let snapshot = observer
+            .observe(
+                Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap(),
+                WbAutomationStateView::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!snapshot.observation.attribution_complete);
+        assert_eq!(
+            snapshot.observation.campaign_level_metrics,
+            Some(WbAutomationCampaignMetrics {
+                impressions: 30,
+                clicks: 3,
+                spend_minor: 306,
+                attributed_orders: 0,
+                attributed_revenue_minor: 0,
+            })
+        );
+        assert_eq!(snapshot.observation.daily_spend_minor, 102);
+        assert!(snapshot.observation.skus.iter().all(|sku| {
+            sku.impressions == 0
+                && sku.clicks == 0
+                && sku.spend_minor == 0
+                && sku.attributed_orders == 0
+                && sku.attributed_revenue_minor == 0
+        }));
+        assert!(matches!(
+            snapshot.decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes.len() == 3
+                    && changes.iter().all(|change| {
+                        change.from_bid_kopecks == 102
+                            && change.to_bid_kopecks == 117
+                            && change.reason == WbAutomationBidReason::LowExposureExploration
+                    })
+        ));
     }
 
     #[test]
@@ -951,6 +1075,75 @@ mod tests {
                 )
                 .await
                 .is_err()
+        );
+    }
+
+    /// A WB `fullstats` response can legitimately contain no rows for the
+    /// previous business date (delivery gap, late aggregation, or an API
+    /// hiccup). `build_observation` then reports every SKU with zero
+    /// impressions and zero clicks while `attribution_complete` stays true,
+    /// because only a campaign-level previous row lowers that flag. The
+    /// decision engine reads those zeros as genuine low exposure and raises
+    /// every bid, so missing evidence turns into a spend increase.
+    #[tokio::test]
+    async fn absent_previous_day_stats_must_not_be_read_as_low_exposure() {
+        let fixture = Fixture::new();
+        let mut observer = fixture.observer(None);
+        // Identical to `stats_response`, minus every previous-day (2026-08-24)
+        // row: the campaign reported only current-day delivery.
+        let stats_without_previous_day = serde_json::json!([{
+            "advertId": 39_682_633,
+            "stats": [
+                {"date": "2026-08-25", "nm_id": 449_627_598_u64, "views": 5, "clicks": 1, "sum": 1.5, "orders": 0, "sumPrice": 0}
+            ]
+        }]);
+        let (base_url, _requests) = mock_http(vec![
+            (200, campaign_response().to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, stats_without_previous_day.to_string()),
+            (200, stocks_response().to_string()),
+        ]);
+        observer.replace_client_for_test(WbClient::new_for_test(
+            Duration::from_secs(2),
+            BTreeMap::from([(
+                observer.policy.account_id.clone(),
+                WbCredentials {
+                    token: "test-token".to_owned(),
+                },
+            )]),
+            &base_url,
+            &base_url,
+        ));
+        let snapshot = observer
+            .observe(
+                Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap(),
+                WbAutomationStateView::default(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            snapshot
+                .observation
+                .skus
+                .iter()
+                .all(|sku| sku.impressions == 0 && sku.clicks == 0),
+            "absent previous-day rows collapse to zero evidence: {:?}",
+            snapshot.observation.skus
+        );
+        assert!(
+            !snapshot.observation.attribution_complete,
+            "a business date with no advertising rows at all is missing \
+             attribution evidence and must hold, but the observation reported \
+             attribution_complete=true and produced {:?}",
+            snapshot.decision.action
+        );
+        assert!(snapshot.observation.campaign_level_metrics.is_none());
+        assert_eq!(
+            snapshot.decision.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AttributionIncomplete,
+            }
         );
     }
 }

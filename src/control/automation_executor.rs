@@ -158,6 +158,22 @@ impl WbAutomationExecutor {
             save_execution_state(&self.state_directory, &state)?;
             return Ok(receipt(snapshot_path, decision, outcome));
         }
+        // `daily_pause_threshold_minor` is validated to sit at or below
+        // `daily_spend_cap_minor`, so an unpaused run that has already reached
+        // the cap means the soft pause did not hold: it was never sent, WB did
+        // not apply it, or spend outran the observe-write-reconcile cycle.
+        // Nothing is in flight to correct it at this point, so stop automating
+        // and leave the campaign for an operator rather than issuing further
+        // spend-affecting writes.
+        if snapshot.observation.daily_spend_minor >= self.observer.policy().daily_spend_cap_minor {
+            state.incident_class = Some("daily_spend_cap_breached".to_owned());
+            save_execution_state(&self.state_directory, &state)?;
+            return Ok(receipt(
+                snapshot_path,
+                decision,
+                WbAutomationExecutionOutcome::IncidentLocked,
+            ));
+        }
 
         let Some(pending) = pending_from_decision(
             &decision.action,
@@ -328,7 +344,13 @@ fn reconcile_pending(
     if applied {
         match pending.kind {
             PendingActionKind::PauseCampaignForDailyCap => {
-                state.paused_for_daily_cap_on = Some(state.business_date);
+                // The pause belongs to the business date it was reserved on.
+                // A reconciliation that lands after the Yekaterinburg rollover
+                // sees the next business date, and recording that instead would
+                // keep `paused_by_automation` false for the whole new day and
+                // hold the campaign paused one day longer than the cap requires.
+                state.paused_for_daily_cap_on =
+                    Some(crate::reporting::business_date(pending.reserved_at));
             }
             PendingActionKind::ResumeCampaignAfterDailyCap => {
                 state.paused_for_daily_cap_on = None;
@@ -648,20 +670,42 @@ mod tests {
         daily_spend_rubles: Option<u64>,
         stock: u64,
     ) -> (String, std::sync::mpsc::Receiver<String>) {
-        let advertising_payload = daily_spend_rubles.map_or(serde_json::Value::Null, |spend| {
-            serde_json::json!([{
-                "advertId": 39_682_633,
-                "stats": [{
-                    "date": current_date,
-                    "nm_id": 449_627_598_u64,
-                    "views": 10,
-                    "clicks": 1,
-                    "sum": spend,
-                    "orders": 0,
-                    "sumPrice": 0
-                }]
-            }])
-        });
+        // The previous business date must carry at least one per-SKU row.
+        // Without it the observation has no attribution evidence at all and
+        // holds fail-closed, so every write path below would stop being
+        // exercised. The row is deliberately low-exposure (few views, no
+        // orders) so the engine still reaches its bid-exploration branch.
+        let previous_date = current_date
+            .parse::<NaiveDate>()
+            .expect("fixture current_date")
+            .pred_opt()
+            .expect("fixture previous_date")
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut stat_rows = vec![serde_json::json!({
+            "date": previous_date,
+            "nm_id": 449_627_598_u64,
+            "views": 10,
+            "clicks": 1,
+            "sum": 1,
+            "orders": 0,
+            "sumPrice": 0
+        })];
+        if let Some(spend) = daily_spend_rubles {
+            stat_rows.push(serde_json::json!({
+                "date": current_date,
+                "nm_id": 449_627_598_u64,
+                "views": 10,
+                "clicks": 1,
+                "sum": spend,
+                "orders": 0,
+                "sumPrice": 0
+            }));
+        }
+        let advertising_payload = serde_json::json!([{
+            "advertId": 39_682_633,
+            "stats": stat_rows
+        }]);
         mock_http(vec![
             (200, campaign_response(status, bid).to_string()),
             (200, serde_json::json!({"total": 1_000}).to_string()),
@@ -707,6 +751,7 @@ mod tests {
             actions_today: 0,
             last_action_at: None,
             attribution_complete: true,
+            campaign_level_metrics: None,
             skus: vec![WbAutomationSkuObservation {
                 nm_id: 1,
                 current_bid_kopecks: bid,
@@ -767,6 +812,46 @@ mod tests {
         assert_eq!(paused.paused_for_daily_cap_on, Some(now().date_naive()));
     }
 
+    /// A pause reserved just before the Yekaterinburg business-date rollover is
+    /// reconciled by the next run, which already sees the following business
+    /// date. Recording the reconciliation date rather than the reservation date
+    /// would make `paused_by_automation` (`paused_on < business_date`) false for
+    /// the whole of the new day, so the campaign would stay paused an extra day.
+    #[test]
+    fn daily_pause_reconciled_after_rollover_records_the_reservation_date() {
+        // 18:50 UTC is 23:50 in Yekaterinburg: still business date 2026-08-25.
+        let reserved_at = Utc.with_ymd_and_hms(2026, 8, 25, 18, 50, 0).unwrap();
+        // 19:30 UTC is 00:30 the next day: business date 2026-08-26.
+        let reconciled_at = Utc.with_ymd_and_hms(2026, 8, 25, 19, 30, 0).unwrap();
+        let reserved_date = crate::reporting::business_date(reserved_at);
+        let reconciled_date = crate::reporting::business_date(reconciled_at);
+        assert_eq!(reserved_date.succ_opt().unwrap(), reconciled_date);
+
+        let pause = PendingAction {
+            reserved_at,
+            kind: PendingActionKind::PauseCampaignForDailyCap,
+        };
+        let mut paused = state(pause.clone());
+        // `run_once` rolls the stored business date forward before reconciling.
+        paused.business_date = reconciled_date;
+        assert_eq!(
+            reconcile_pending(&observation(11, 115), &mut paused, &pause),
+            WbAutomationExecutionOutcome::Reconciled
+        );
+
+        assert_eq!(
+            paused.paused_for_daily_cap_on,
+            Some(reserved_date),
+            "the pause belongs to the business date it was reserved on"
+        );
+        assert!(
+            paused
+                .paused_for_daily_cap_on
+                .is_some_and(|paused_on| paused_on < reconciled_date),
+            "the campaign must be resumable on the new business date, not the day after"
+        );
+    }
+
     #[test]
     fn ambiguous_write_waits_then_locks_without_retry() {
         let pending = PendingAction {
@@ -825,6 +910,24 @@ mod tests {
             .kind,
             PendingActionKind::ChangeBids { .. }
         ));
+        // Defence in depth. The decision engine no longer emits a stop for a
+        // SKU already at the floor, so this guard is unreachable through
+        // `run_once`; it stays because reserving a write that changes nothing
+        // would burn an action from the daily quota for no effect.
+        assert!(
+            pending_from_decision(
+                &WbAutomationAction::DisableSku {
+                    nm_id: 1,
+                    reason: WbAutomationDisableReason::LowStock,
+                },
+                &observation(9, 102),
+                102,
+                at,
+            )
+            .is_none(),
+            "a stop on an already floored SKU reserves no write"
+        );
+
         for (reason, expected) in [
             (
                 WbAutomationDisableReason::LowStock,
@@ -1120,6 +1223,77 @@ mod tests {
         save_execution_state(&fixture.root, &stored).unwrap();
         let executor = fixture.executor("http://127.0.0.1:1", "http://127.0.0.1:1");
         assert!(executor.send_pending(&pending).await.is_err());
+    }
+
+    /// `daily_pause_threshold_minor` (250 RUB) is the soft pause and
+    /// `daily_spend_cap_minor` (300 RUB) is the ceiling that pause exists to
+    /// defend. Observing spend at or above the ceiling with nothing in flight
+    /// means the pause did not hold, so the executor stops automating and
+    /// leaves the campaign to an operator instead of issuing further
+    /// spend-affecting writes.
+    #[tokio::test]
+    async fn reaching_the_daily_spend_cap_locks_an_incident_without_writing() {
+        let fixture = Fixture::new();
+        let (reader_url, _) = reader_server(9, 102, "2026-08-25", Some(300), 10);
+        // An unroutable writer proves no write is attempted on this path.
+        let executor = fixture.executor(&reader_url, "http://127.0.0.1:1");
+
+        let receipt = executor.run_once(now()).await.unwrap();
+
+        assert_eq!(
+            receipt.outcome,
+            WbAutomationExecutionOutcome::IncidentLocked
+        );
+        let state = read_state_file(&fixture.root.join("execution-state.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state.incident_class.as_deref(),
+            Some("daily_spend_cap_breached")
+        );
+        assert!(
+            state.pending.is_none(),
+            "a breach must not reserve a further write"
+        );
+
+        // The lock is sticky: a later run reports the incident and still does
+        // not act, even though the reader now serves a clean observation.
+        let (clean_url, _) = reader_server(9, 102, "2026-08-25", None, 10);
+        let relocked = fixture.executor(&clean_url, "http://127.0.0.1:1");
+        assert_eq!(
+            relocked
+                .run_once(now() + ChronoDuration::minutes(1))
+                .await
+                .unwrap()
+                .outcome,
+            WbAutomationExecutionOutcome::IncidentLocked
+        );
+    }
+
+    /// Spend below the ceiling still follows the ordinary soft-pause path.
+    #[tokio::test]
+    async fn spend_below_the_daily_cap_still_pauses_rather_than_locking() {
+        let fixture = Fixture::new();
+        let (reader_url, _) = reader_server(9, 102, "2026-08-25", Some(250), 10);
+        let (writer_url, writer_requests) = mock_http(vec![(200, "{}".to_owned())]);
+        let executor = fixture.executor(&reader_url, &writer_url);
+
+        let receipt = executor.run_once(now()).await.unwrap();
+
+        assert_eq!(
+            receipt.outcome,
+            WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+        );
+        assert!(
+            writer_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /adv/v0/pause")
+        );
+        let state = read_state_file(&fixture.root.join("execution-state.json"))
+            .unwrap()
+            .unwrap();
+        assert!(state.incident_class.is_none());
     }
 
     #[tokio::test]

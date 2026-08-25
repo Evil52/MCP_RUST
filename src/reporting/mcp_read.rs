@@ -483,6 +483,13 @@ impl PostgresReportingRepository {
         Ok(repository)
     }
 
+    #[cfg(test)]
+    fn from_client(client: tokio_postgres::Client) -> Self {
+        Self {
+            client: SupervisedClient::preconnected(client, READER_COMPONENT),
+        }
+    }
+
     async fn verify_runtime_contract(&self) -> Result<(), ReportingReadError> {
         self.client
             .verify_session_bounds()
@@ -2398,6 +2405,70 @@ mod tests {
         assert_eq!(
             format!("{reader:?}"),
             "ReportingReader { enabled: false, .. }"
+        );
+    }
+
+    /// The reader is the MCP surface a manager queries directly, so a database
+    /// that disappears mid-session must surface as `Unavailable` on every tool
+    /// rather than as an empty result set that reads like "there is no data".
+    /// Aborting the connection task reproduces a severed socket or a backend
+    /// restart while the client handle is still alive.
+    #[tokio::test]
+    async fn every_read_reports_unavailable_when_the_database_is_gone() {
+        verify_every_read_reports_unavailable_when_the_database_is_gone(None).await;
+        verify_every_read_reports_unavailable_when_the_database_is_gone(
+            std::env::var("POSITION_REPOSITORY_TEST_READER_URL").ok(),
+        )
+        .await;
+    }
+
+    async fn verify_every_read_reports_unavailable_when_the_database_is_gone(
+        reader_url: Option<String>,
+    ) {
+        let Some(reader_url) = reader_url else {
+            return;
+        };
+        let (client, connection) = Config::from_str(&reader_url)
+            .unwrap()
+            .connect(tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let connection_task = tokio::spawn(connection);
+        let repository = PostgresReportingRepository::from_client(client);
+        // Prove the repository is genuinely healthy first, so the assertions
+        // below cannot pass because the fixture was broken all along.
+        repository.verify_runtime_contract().await.unwrap();
+
+        connection_task.abort();
+        let _ = connection_task.await;
+
+        let account = account();
+        assert_eq!(
+            repository.verify_runtime_contract().await,
+            Err(ReportingReadError::Unavailable)
+        );
+        assert_eq!(
+            repository.collection_status(&account, 10).await.err(),
+            Some(ReportingReadError::Unavailable)
+        );
+        assert_eq!(
+            repository.data_completeness(&account, None).await.err(),
+            Some(ReportingReadError::Unavailable)
+        );
+        assert_eq!(
+            repository
+                .metrics_history(&account, None, None, 10)
+                .await
+                .err(),
+            Some(ReportingReadError::Unavailable)
+        );
+        assert_eq!(
+            repository.manager_actions(&account, None).await.err(),
+            Some(ReportingReadError::Unavailable)
+        );
+        assert_eq!(
+            repository.ready_reports(10).await.err(),
+            Some(ReportingReadError::Unavailable)
         );
     }
 

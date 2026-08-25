@@ -462,6 +462,369 @@ mod tests {
 
     use super::*;
 
+    /// A malformed Wildberries payload must be rejected, never coerced into a
+    /// plausible-looking fact: these numbers drive bid and spend decisions, so a
+    /// silently defaulted field is worse than a hard failure. Each case mutates
+    /// exactly one part of a known-good payload, so a passing assertion pins one
+    /// specific rejection arm rather than an incidental earlier failure.
+    #[test]
+    fn malformed_sales_history_payloads_are_rejected_field_by_field() {
+        let valid = json!([{
+            "product":{"nmId":268_913_787},"currency":"RUB",
+            "history":[{"date":"2026-08-17","orderCount":19,"orderSum":1262.5,
+                "cancelCount":2,"returnCount":1}]
+        }]);
+        assert!(parse_sales_history(&valid).is_ok(), "baseline must parse");
+
+        let history = |row: Value| {
+            json!([{
+                "product":{"nmId":268_913_787},"currency":"RUB",
+                "history":[row]
+            }])
+        };
+        let product = |value: Value| json!([value]);
+        let cases: Vec<(&str, Value, WbReportParseError)> = vec![
+            (
+                "response is not an array",
+                json!({}),
+                WbReportParseError::Shape,
+            ),
+            (
+                "product is not an object",
+                product(json!(7)),
+                WbReportParseError::Shape,
+            ),
+            (
+                "product identity is missing",
+                product(json!({"currency":"RUB","history":[]})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "product identity is not an object",
+                product(json!({"product":7,"currency":"RUB","history":[]})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "nmId is missing",
+                product(json!({"product":{},"currency":"RUB","history":[]})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "nmId is not an unsigned integer",
+                product(json!({"product":{"nmId":-1},"currency":"RUB","history":[]})),
+                WbReportParseError::Value,
+            ),
+            (
+                "nmId is zero",
+                product(json!({"product":{"nmId":0},"currency":"RUB","history":[]})),
+                WbReportParseError::Value,
+            ),
+            (
+                "currency is missing",
+                product(json!({"product":{"nmId":1},"history":[]})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "currency is not RUB",
+                product(json!({"product":{"nmId":1},"currency":"USD","history":[]})),
+                WbReportParseError::Value,
+            ),
+            (
+                "history is missing",
+                product(json!({"product":{"nmId":1},"currency":"RUB"})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "history is not an array",
+                product(json!({"product":{"nmId":1},"currency":"RUB","history":7})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "history row is not an object",
+                history(json!(7)),
+                WbReportParseError::Shape,
+            ),
+            (
+                "date is missing",
+                history(json!({"orderCount":1,"orderSum":1.0})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "date is not a calendar date",
+                history(json!({"date":"2026-13-40","orderCount":1,"orderSum":1.0})),
+                WbReportParseError::Value,
+            ),
+            (
+                "orderCount is missing",
+                history(json!({"date":"2026-08-17","orderSum":1.0})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "orderCount is negative",
+                history(json!({"date":"2026-08-17","orderCount":-1,"orderSum":1.0})),
+                WbReportParseError::Value,
+            ),
+            (
+                "orderSum is missing",
+                history(json!({"date":"2026-08-17","orderCount":1})),
+                WbReportParseError::Shape,
+            ),
+            (
+                // A numeric string is deliberately accepted: WB returns money
+                // that way. A non-numeric value must still be rejected.
+                "orderSum is neither a number nor a numeric string",
+                history(json!({"date":"2026-08-17","orderCount":1,"orderSum":"abc"})),
+                WbReportParseError::Value,
+            ),
+            (
+                "orderSum carries more precision than kopecks",
+                history(json!({"date":"2026-08-17","orderCount":1,"orderSum":"1.234"})),
+                WbReportParseError::Value,
+            ),
+            (
+                "orderSum is negative",
+                history(json!({"date":"2026-08-17","orderCount":1,"orderSum":-1.0})),
+                WbReportParseError::Value,
+            ),
+            (
+                "cancelCount is not an unsigned integer",
+                history(
+                    json!({"date":"2026-08-17","orderCount":1,"orderSum":1.0,"cancelCount":-1}),
+                ),
+                WbReportParseError::Value,
+            ),
+            (
+                "returnCount is not an unsigned integer",
+                history(
+                    json!({"date":"2026-08-17","orderCount":1,"orderSum":1.0,"returnCount":-1}),
+                ),
+                WbReportParseError::Value,
+            ),
+            (
+                "the same date and SKU appear twice",
+                json!([{
+                    "product":{"nmId":1},"currency":"RUB",
+                    "history":[
+                        {"date":"2026-08-17","orderCount":1,"orderSum":1.0},
+                        {"date":"2026-08-17","orderCount":2,"orderSum":2.0}
+                    ]
+                }]),
+                WbReportParseError::Value,
+            ),
+        ];
+
+        for (description, payload, expected) in cases {
+            assert_eq!(
+                parse_sales_history(&payload),
+                Err(expected),
+                "{description} must be rejected"
+            );
+        }
+    }
+
+    /// Stock, price and campaign payloads feed the low-stock guard, the unit
+    /// economics and the campaign scope check respectively, so each one must
+    /// reject a malformed shape instead of defaulting a field to zero. Every
+    /// case mutates one part of a payload proven valid by its baseline
+    /// assertion.
+    #[test]
+    fn malformed_stock_price_and_campaign_payloads_are_rejected_field_by_field() {
+        let stock_row = |row: Value| json!({"data":{"items":[row]}});
+        assert!(
+            parse_stock_page(&stock_row(json!({"nmId":7,"warehouseId":507,"quantity":1}))).is_ok(),
+            "stock baseline must parse"
+        );
+        let stock_cases: Vec<(&str, Value, WbReportParseError)> = vec![
+            (
+                "response is not an object",
+                json!([]),
+                WbReportParseError::Shape,
+            ),
+            ("data is missing", json!({}), WbReportParseError::Shape),
+            (
+                "items is missing",
+                json!({"data":{}}),
+                WbReportParseError::Shape,
+            ),
+            (
+                "items is not an array",
+                json!({"data":{"items":7}}),
+                WbReportParseError::Shape,
+            ),
+            (
+                "item is not an object",
+                stock_row(json!(7)),
+                WbReportParseError::Shape,
+            ),
+            (
+                "nmId is missing",
+                stock_row(json!({"warehouseId":507,"quantity":1})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "nmId is zero",
+                stock_row(json!({"nmId":0,"warehouseId":507,"quantity":1})),
+                WbReportParseError::Value,
+            ),
+            (
+                "warehouseId is missing",
+                stock_row(json!({"nmId":7,"quantity":1})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "a negative warehouseId is not the documented sentinel",
+                stock_row(json!({"nmId":7,"warehouseId":-1,"quantity":1})),
+                WbReportParseError::Value,
+            ),
+            (
+                "the sentinel warehouse has no regionName",
+                stock_row(json!({"nmId":7,"warehouseId":-999_999,"quantity":1})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "the sentinel warehouse has an empty label",
+                stock_row(json!({
+                    "nmId":7,"warehouseId":-999_999,"quantity":1,
+                    "regionName":"","warehouseName":"w"
+                })),
+                WbReportParseError::Value,
+            ),
+            (
+                "quantity is missing",
+                stock_row(json!({"nmId":7,"warehouseId":507})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "quantity is negative",
+                stock_row(json!({"nmId":7,"warehouseId":507,"quantity":-1})),
+                WbReportParseError::Value,
+            ),
+            (
+                "the same SKU and warehouse overflow when summed",
+                json!({"data":{"items":[
+                    {"nmId":7,"warehouseId":507,"quantity":u64::MAX},
+                    {"nmId":7,"warehouseId":507,"quantity":1}
+                ]}}),
+                WbReportParseError::Value,
+            ),
+        ];
+        for (description, payload, expected) in stock_cases {
+            assert_eq!(
+                parse_stock_page(&payload),
+                Err(expected),
+                "{description} must be rejected"
+            );
+        }
+
+        let good = |value: Value| json!({"data":{"listGoods":[value]}});
+        assert!(
+            parse_price_page(&good(json!({
+                "currencyIsoCode4217":"RUB","nmID":7,
+                "sizes":[{"discountedPrice":10.0,"price":20.0}]
+            })))
+            .is_ok(),
+            "price baseline must parse"
+        );
+        let price_cases: Vec<(&str, Value, WbReportParseError)> = vec![
+            (
+                "currency is not RUB",
+                good(json!({
+                    "currencyIsoCode4217":"USD","nmID":7,
+                    "sizes":[{"discountedPrice":10.0,"price":20.0}]
+                })),
+                WbReportParseError::Value,
+            ),
+            (
+                "nmID is zero",
+                good(json!({
+                    "currencyIsoCode4217":"RUB","nmID":0,
+                    "sizes":[{"discountedPrice":10.0,"price":20.0}]
+                })),
+                WbReportParseError::Value,
+            ),
+            (
+                "sizes is missing",
+                good(json!({"currencyIsoCode4217":"RUB","nmID":7})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "a good carries no size at all",
+                good(json!({"currencyIsoCode4217":"RUB","nmID":7,"sizes":[]})),
+                WbReportParseError::Shape,
+            ),
+            (
+                "the discounted price exceeds the old price",
+                good(json!({
+                    "currencyIsoCode4217":"RUB","nmID":7,
+                    "sizes":[{"discountedPrice":30.0,"price":20.0}]
+                })),
+                WbReportParseError::Value,
+            ),
+            (
+                "the same SKU appears twice",
+                json!({"data":{"listGoods":[
+                    {"currencyIsoCode4217":"RUB","nmID":7,
+                     "sizes":[{"discountedPrice":10.0,"price":20.0}]},
+                    {"currencyIsoCode4217":"RUB","nmID":7,
+                     "sizes":[{"discountedPrice":11.0,"price":21.0}]}
+                ]}}),
+                WbReportParseError::Value,
+            ),
+        ];
+        for (description, payload, expected) in price_cases {
+            assert_eq!(
+                parse_price_page(&payload),
+                Err(expected),
+                "{description} must be rejected"
+            );
+        }
+
+        assert_eq!(
+            parse_campaign_ids(&json!({"adverts":[
+                {"status":9,"advert_list":[{"advertId":11}]},
+                {"status":4,"advert_list":[{"advertId":12}]}
+            ]}))
+            .unwrap(),
+            vec![11],
+            "only campaigns in a live status are in scope"
+        );
+        let campaign_cases: Vec<(&str, Value, WbReportParseError)> = vec![
+            (
+                "response is not an object",
+                json!([]),
+                WbReportParseError::Shape,
+            ),
+            ("adverts is missing", json!({}), WbReportParseError::Shape),
+            (
+                "a group is not an object",
+                json!({"adverts":[7]}),
+                WbReportParseError::Shape,
+            ),
+            (
+                "a group has no status",
+                json!({"adverts":[{"advert_list":[]}]}),
+                WbReportParseError::Shape,
+            ),
+            (
+                "advert_list is missing",
+                json!({"adverts":[{"status":9}]}),
+                WbReportParseError::Shape,
+            ),
+            (
+                "an advert id is zero",
+                json!({"adverts":[{"status":9,"advert_list":[{"advertId":0}]}]}),
+                WbReportParseError::Value,
+            ),
+        ];
+        for (description, payload, expected) in campaign_cases {
+            assert_eq!(
+                parse_campaign_ids(&payload),
+                Err(expected),
+                "{description} must be rejected"
+            );
+        }
+    }
+
     #[test]
     fn documented_sales_stock_and_price_shapes_are_normalized() {
         let sales = parse_sales_history(&json!([{
