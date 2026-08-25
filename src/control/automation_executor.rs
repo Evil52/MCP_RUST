@@ -16,7 +16,10 @@ use crate::{
 };
 
 use super::{
-    automation::{WbAutomationAction, WbAutomationBidChange, WbAutomationDecision},
+    automation::{
+        WbAutomationAction, WbAutomationBidChange, WbAutomationDecision,
+        wb_automation_business_date,
+    },
     automation_observer::{
         WbAutomationObserver, WbAutomationStateView, persist_wb_automation_snapshot,
     },
@@ -122,13 +125,14 @@ impl WbAutomationExecutor {
         &self,
         observed_at: DateTime<Utc>,
     ) -> Result<WbAutomationExecutionReceipt> {
-        let business_date = crate::reporting::business_date(observed_at);
+        let business_date = wb_automation_business_date(observed_at);
         let mut state = load_execution_state(
             &self.state_directory,
             self.observer.policy_sha256(),
             self.observer.policy().account_id.as_str(),
             self.observer.policy().campaign_id,
             business_date,
+            !self.observer.policy().write_enabled,
         )?;
         if state.business_date != business_date {
             state.business_date = business_date;
@@ -290,9 +294,14 @@ fn pending_from_decision(
 ) -> Option<PendingAction> {
     let kind = match action {
         WbAutomationAction::Hold { .. } => return None,
-        WbAutomationAction::ChangeBids { changes } => PendingActionKind::ChangeBids {
-            changes: changes.clone(),
-        },
+        WbAutomationAction::ChangeBids { changes } => {
+            if changes.len() != 1 {
+                return None;
+            }
+            PendingActionKind::ChangeBids {
+                changes: changes.clone(),
+            }
+        }
         WbAutomationAction::DisableSku { nm_id, reason } => {
             let current = observation
                 .skus
@@ -350,7 +359,7 @@ fn reconcile_pending(
                 // keep `paused_by_automation` false for the whole new day and
                 // hold the campaign paused one day longer than the cap requires.
                 state.paused_for_daily_cap_on =
-                    Some(crate::reporting::business_date(pending.reserved_at));
+                    Some(wb_automation_business_date(pending.reserved_at));
             }
             PendingActionKind::ResumeCampaignAfterDailyCap => {
                 state.paused_for_daily_cap_on = None;
@@ -393,9 +402,10 @@ fn load_execution_state(
     account_id: &str,
     campaign_id: u64,
     business_date: NaiveDate,
+    allow_shadow_policy_migration: bool,
 ) -> Result<ExecutionState> {
     let path = directory.join("execution-state.json");
-    let Some(state) = read_state_file(&path)? else {
+    let Some(mut state) = read_state_file(&path)? else {
         return Ok(ExecutionState {
             schema_version: STATE_SCHEMA_VERSION,
             policy_sha256: policy_sha256.to_owned(),
@@ -411,11 +421,20 @@ fn load_execution_state(
     };
     ensure!(
         state.schema_version == STATE_SCHEMA_VERSION
-            && state.policy_sha256 == policy_sha256
             && state.account_id == account_id
             && state.campaign_id == campaign_id,
         "WB automation execution state не соответствует policy"
     );
+    if state.policy_sha256 != policy_sha256 {
+        ensure!(
+            allow_shadow_policy_migration,
+            "WB automation execution state не соответствует policy"
+        );
+        // A shadow policy cannot emit writes. Updating only its digest keeps
+        // pending/cooldown/pause/incident state intact so a policy rollout does
+        // not erase an in-flight reconciliation or create a fresh action slot.
+        policy_sha256.clone_into(&mut state.policy_sha256);
+    }
     Ok(state)
 }
 
@@ -508,7 +527,7 @@ mod tests {
     use crate::{
         control::automation::{
             WbAutomationBidReason, WbAutomationDisableReason, WbAutomationHoldReason,
-            WbAutomationObservation, WbAutomationSkuObservation,
+            WbAutomationObservation, WbAutomationPolicy, WbAutomationSkuObservation,
         },
         test_support::mock_http,
         wb::{WbClient, WbCredentials},
@@ -538,11 +557,12 @@ mod tests {
             let registry = root.join("access.json");
             let reader_token = root.join("reader.token");
             let writer_token = root.join("writer.token");
-            fs::write(
-                &policy,
-                include_bytes!("../../config/wb-automation-robot.json"),
-            )
+            let mut test_policy = serde_json::from_slice::<WbAutomationPolicy>(include_bytes!(
+                "../../config/wb-automation-robot.json"
+            ))
             .unwrap();
+            test_policy.write_enabled = true;
+            fs::write(&policy, serde_json::to_vec_pretty(&test_policy).unwrap()).unwrap();
             fs::write(
                 &registry,
                 serde_json::to_vec(&serde_json::json!({
@@ -748,6 +768,7 @@ mod tests {
             paused_by_automation: false,
             budget_remaining_minor: 100_000,
             daily_spend_minor: 0,
+            daily_spend_complete: true,
             actions_today: 0,
             last_action_at: None,
             attribution_complete: true,
@@ -900,7 +921,7 @@ mod tests {
         assert!(matches!(
             pending_from_decision(
                 &WbAutomationAction::ChangeBids {
-                    changes: vec![change]
+                    changes: vec![change.clone()]
                 },
                 &observed,
                 102,
@@ -910,6 +931,18 @@ mod tests {
             .kind,
             PendingActionKind::ChangeBids { .. }
         ));
+        assert!(
+            pending_from_decision(
+                &WbAutomationAction::ChangeBids {
+                    changes: vec![change.clone(), change],
+                },
+                &observed,
+                102,
+                at,
+            )
+            .is_none(),
+            "the executor independently refuses multi-SKU decisions"
+        );
         // Defence in depth. The decision engine no longer emits a stop for a
         // SKU already at the floor, so this guard is unreachable through
         // `run_once`; it stays because reserving a write that changes nothing
@@ -1018,6 +1051,7 @@ mod tests {
             "ip_domnyshev_wb",
             39_682_633,
             business_date,
+            false,
         )
         .unwrap();
         assert_eq!(initial.schema_version, STATE_SCHEMA_VERSION);
@@ -1036,7 +1070,8 @@ mod tests {
                 "a",
                 "ip_domnyshev_wb",
                 39_682_633,
-                business_date
+                business_date,
+                false
             )
             .unwrap(),
             stored
@@ -1055,10 +1090,23 @@ mod tests {
                 "wrong",
                 "ip_domnyshev_wb",
                 39_682_633,
-                business_date
+                business_date,
+                false
             )
             .is_err()
         );
+        let migrated = load_execution_state(
+            &fixture.root,
+            "shadow-policy",
+            "ip_domnyshev_wb",
+            39_682_633,
+            business_date,
+            true,
+        )
+        .unwrap();
+        assert_eq!(migrated.policy_sha256, "shadow-policy");
+        assert_eq!(migrated.pending.as_ref(), Some(&pending));
+        assert_eq!(migrated.actions_today, stored.actions_today);
 
         fs::write(fixture.root.join("execution-state.json"), b"not-json").unwrap();
         assert!(read_state_file(&fixture.root.join("execution-state.json")).is_err());
@@ -1105,7 +1153,7 @@ mod tests {
     #[tokio::test]
     async fn executor_writes_once_reconciles_and_locks_incidents() {
         let fixture = Fixture::new();
-        let (reader_url, _) = reader_server(9, 102, "2026-08-25", None, 10);
+        let (reader_url, _) = reader_server(9, 102, "2026-08-25", Some(0), 10);
         let (writer_url, writer_requests) = mock_http(vec![(200, "{}".to_owned())]);
         let mut executor = fixture.executor(&reader_url, &writer_url);
         assert!(format!("{executor:?}").contains("ip_domnyshev_wb"));

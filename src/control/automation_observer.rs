@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 use crate::{
     config::{Marketplace, RegistrySource},
     reporting::{
-        business_date,
         postgres_collector::CollectedAdvertisingFact,
         wb_adapter::{parse_promotion_stats, parse_stock_page},
     },
@@ -28,14 +27,15 @@ use super::{
     automation::{
         WbAutomationCampaignMetrics, WbAutomationDecision, WbAutomationObservation,
         WbAutomationPolicy, WbAutomationSkuObservation, evaluate_wb_automation,
-        validate_wb_automation_policy,
+        validate_wb_automation_policy, wb_automation_business_date,
     },
     config::{read_control_token, validate_wb_reader_token},
 };
 
-// Version 3 distinguishes exact SKU attribution from genuine campaign-level
-// totals, without copying aggregate delivery into fabricated per-SKU rows.
-const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+// Version 4 adds explicit current-day spend completeness and the versioned
+// WB ADS ROBOT v1 policy contract. Missing current-day delivery is no longer
+// serialized as a trusted zero that could authorize a write.
+const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
@@ -149,7 +149,7 @@ impl WbAutomationObserver {
         observed_at: DateTime<Utc>,
         state: WbAutomationStateView,
     ) -> Result<WbAutomationSnapshot> {
-        let current_date = business_date(observed_at);
+        let current_date = wb_automation_business_date(observed_at);
         let previous_date = current_date
             .pred_opt()
             .context("WB automation business date вышла за диапазон")?;
@@ -330,6 +330,7 @@ fn build_observation(
         "WB automation stats вышли за campaign/date/SKU scope"
     );
     let mut current_sku_spend_minor = 0_u64;
+    let mut current_sku_rows = 0_u64;
     let mut current_campaign_spend_minor = None;
     let mut previous = BTreeMap::<u64, &CollectedAdvertisingFact>::new();
     let mut campaign_level_previous = None;
@@ -343,6 +344,9 @@ fn build_observation(
                     "WB automation stats содержат duplicate campaign total"
                 );
             } else {
+                current_sku_rows = current_sku_rows
+                    .checked_add(1)
+                    .context("WB automation current stats row count overflow")?;
                 current_sku_spend_minor = current_sku_spend_minor
                     .checked_add(fact.spend_minor)
                     .context("WB automation daily spend overflow")?;
@@ -367,6 +371,7 @@ fn build_observation(
         campaign_level_previous.is_none() || previous.is_empty(),
         "WB automation stats смешивают campaign и SKU totals за предыдущую дату"
     );
+    let daily_spend_complete = current_campaign_spend_minor.is_some() || current_sku_rows > 0;
     let daily_spend_minor = current_campaign_spend_minor.unwrap_or(current_sku_spend_minor);
     let mut stock_totals = BTreeMap::<u64, u64>::new();
     for stock in stocks.iter().filter(|stock| allowed.contains(&stock.sku)) {
@@ -401,6 +406,7 @@ fn build_observation(
         paused_by_automation: state.paused_by_automation,
         budget_remaining_minor,
         daily_spend_minor,
+        daily_spend_complete,
         actions_today: state.actions_today,
         last_action_at: state.last_action_at,
         // One present SKU row is enough for exact attribution because WB omits
@@ -546,9 +552,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::*;
-    use crate::control::automation::{
-        WbAutomationAction, WbAutomationBidReason, WbAutomationHoldReason,
-    };
+    use crate::control::automation::{WbAutomationAction, WbAutomationHoldReason};
     use crate::test_support::mock_http;
 
     const TEST_SELLER_SID: &str = "123e4567-e89b-42d3-a456-426614174000";
@@ -633,7 +637,12 @@ mod tests {
     }
 
     fn policy_fixture() -> WbAutomationPolicy {
-        serde_json::from_str(include_str!("../../config/wb-automation-robot.json")).unwrap()
+        let mut policy = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+            "../../config/wb-automation-robot.json"
+        ))
+        .unwrap();
+        policy.write_enabled = true;
+        policy
     }
 
     fn wb_token(scope: u64) -> String {
@@ -808,7 +817,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_cpc_campaign_totals_enable_a_uniform_safe_auto_decision() {
+    async fn real_cpc_campaign_totals_hold_without_per_sku_attribution() {
         let fixture = Fixture::new();
         let mut observer = fixture.observer(None);
         let (base_url, _requests) = mock_http(vec![
@@ -846,16 +855,12 @@ mod tests {
                 && sku.attributed_orders == 0
                 && sku.attributed_revenue_minor == 0
         }));
-        assert!(matches!(
+        assert_eq!(
             snapshot.decision.action,
-            WbAutomationAction::ChangeBids { ref changes }
-                if changes.len() == 3
-                    && changes.iter().all(|change| {
-                        change.from_bid_kopecks == 102
-                            && change.to_bid_kopecks == 117
-                            && change.reason == WbAutomationBidReason::LowExposureExploration
-                    })
-        ));
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AttributionIncomplete,
+            }
+        );
     }
 
     #[test]
@@ -1143,6 +1148,48 @@ mod tests {
             snapshot.decision.action,
             WbAutomationAction::Hold {
                 reason: WbAutomationHoldReason::AttributionIncomplete,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_current_day_stats_are_not_a_trusted_zero_spend() {
+        let fixture = Fixture::new();
+        let mut observer = fixture.observer(None);
+        let previous_only = serde_json::json!([{
+            "advertId": 39_682_633,
+            "stats": [{
+                "date": "2026-08-24",
+                "nm_id": 449_627_598_u64,
+                "views": 10,
+                "clicks": 1,
+                "sum": 1,
+                "orders": 0,
+                "sumPrice": 0
+            }]
+        }]);
+        let (base_url, _) = mock_http(vec![
+            (200, campaign_response().to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, previous_only.to_string()),
+            (200, stocks_response().to_string()),
+        ]);
+        install_test_client(&mut observer, &base_url);
+
+        let snapshot = observer
+            .observe(
+                Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap(),
+                WbAutomationStateView::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.observation.daily_spend_minor, 0);
+        assert!(!snapshot.observation.daily_spend_complete);
+        assert_eq!(
+            snapshot.decision.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::SpendDataIncomplete,
             }
         );
     }
