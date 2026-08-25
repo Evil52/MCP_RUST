@@ -10,6 +10,11 @@ const BASIS_POINTS: u128 = 10_000;
 const MOSCOW_OFFSET_SECONDS: i32 = 3 * 60 * 60;
 
 #[must_use]
+/// Returns the Moscow advertising business date for a UTC instant.
+///
+/// # Panics
+///
+/// Panics only if the compile-time UTC+3 offset cannot be constructed.
 pub fn wb_automation_business_date(now: DateTime<Utc>) -> NaiveDate {
     now.with_timezone(
         &FixedOffset::east_opt(MOSCOW_OFFSET_SECONDS)

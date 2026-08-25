@@ -52,6 +52,7 @@ printf '%s\n' \
   'REPORT_WORKER_DB_PASSWORD=verify-only-report-worker-not-a-secret' \
   'REPORT_COLLECTOR_DB_PASSWORD=verify-only-report-collector-not-a-secret' \
   'CONTROL_WRITER_DB_PASSWORD=verify-only-control-writer-not-a-secret' \
+  'WB_AUTOMATION_DB_PASSWORD=verify-only-wb-automation-not-a-secret' \
   >"$interpolation_env"
 chmod 600 "$interpolation_env"
 
@@ -164,6 +165,26 @@ render_position_compose() {
     docker compose \
       --env-file "$interpolation_env" \
       -f "$project_dir/compose.position.yaml" \
+      config --no-env-resolution --format json
+}
+
+render_wb_automation_shadow_compose() {
+  local policy="$scratch/wb-automation-policy.json"
+  local access="$scratch/wb-automation-access.json"
+  local read_token="$scratch/wb-automation-read.token"
+  local legacy_state="$scratch/wb-automation-legacy-state.json"
+  printf '{}\n' >"$policy"
+  printf '{}\n' >"$access"
+  printf 'verification-read-token-not-a-secret\n' >"$read_token"
+  printf '{}\n' >"$legacy_state"
+  chmod 600 "$policy" "$access" "$read_token" "$legacy_state"
+  WB_AUTOMATION_POLICY_HOST="$policy" \
+    WB_AUTOMATION_ACCESS_CONFIG_HOST="$access" \
+    WB_AUTOMATION_READ_TOKEN_FILE_HOST="$read_token" \
+    WB_AUTOMATION_LEGACY_STATE_HOST="$legacy_state" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.wb-automation-shadow.yaml" \
       config --no-env-resolution --format json
 }
 
@@ -503,6 +524,70 @@ verify_position_collector() {
        "test": ["CMD", "/usr/local/bin/position-collector", "healthcheck"],
        "timeout": "8s", "interval": "30s", "retries": 3,
        "start_period": "10s"
+     }'
+}
+
+verify_wb_automation_shadow() {
+  local rendered="$1" service expected_database_url
+  service="$(jq -c '.services["wb-automation-shadow"]' <<<"$rendered")"
+  expected_database_url='postgresql://wb_automation_writer:verify-only-wb-automation-not-a-secret@position-db:5432/ozon_positions'
+
+  check "WB automation shadow: service exists" "$service" 'type == "object"'
+  check "WB automation shadow: has no host ingress or persistent writable mount" "$service" \
+    '((.ports // []) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)
+     and (.volumes | length == 4)
+     and all(.volumes[]; .type == "bind" and .read_only == true)'
+  # shellcheck disable=SC2016
+  check "WB automation shadow: only least-privilege DB URL and safe logging are present" "$service" \
+    --arg database_url "$expected_database_url" \
+    '.environment == {
+       "RUST_LOG": "mcp_ozon::control=info",
+       "WB_AUTOMATION_DATABASE_URL": $database_url
+     }'
+  check "WB automation shadow: command has read token and no writer capability" "$service" \
+    '.command == [
+       "shadow-once-pg",
+       "/etc/mcp-ozon/wb-automation-policy.json",
+       "/etc/mcp-ozon/access.json",
+       "/run/secrets/wb-promotion-read.token",
+       "/var/lib/mcp-ozon-legacy/execution-state.json",
+       "true",
+       "http://ozon-egress:3128"
+     ]
+     and ([.volumes[].target] | index("/run/secrets/wb-promotion-write.token") == null)'
+  check "WB automation shadow: mounts are exact and fail closed" "$service" \
+    '([.volumes[].target] | sort) == [
+       "/etc/mcp-ozon/access.json",
+       "/etc/mcp-ozon/wb-automation-policy.json",
+       "/run/secrets/wb-promotion-read.token",
+       "/var/lib/mcp-ozon-legacy/execution-state.json"
+     ]'
+  check "WB automation shadow: only internal DB and credentialless read-egress networks exist" "$rendered" \
+    '(.services["wb-automation-shadow"].networks | keys | sort)
+       == ["ozon-egress-internal", "position-internal"]
+     and (.networks | keys | sort)
+       == ["ozon-egress-internal", "position-internal"]
+     and .networks["position-internal"].name == "mcp-ozon-position-internal"
+     and .networks["position-internal"].external == true
+     and .networks["ozon-egress-internal"].name == "mcp-ozon-egress-internal"
+     and .networks["ozon-egress-internal"].external == true'
+  check "WB automation shadow: one-shot filesystem and privilege hardening are exact" "$service" \
+    '.restart == "no"
+     and .read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false
+     and .tmpfs == ["/tmp:size=8m,mode=1777"]'
+  check "WB automation shadow: resources and logs are bounded" "$service" \
+    '.mem_limit == "134217728"
+     and .cpus == 0.25
+     and .pids_limit == 64
+     and .logging == {
+       "driver": "json-file",
+       "options": {"max-file": "2", "max-size": "1m"}
      }'
 }
 
@@ -1306,6 +1391,7 @@ verify_control_wb_live() {
 main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_position_compose)"
+wb_automation_shadow_rendered="$(render_wb_automation_shadow_compose)"
 reporting_reader_rendered="$(render_reporting_reader_compose)"
 reporting_live_rendered="$(render_reporting_live_compose)"
 reporting_canary_rendered="$(render_reporting_canary_compose)"
@@ -1573,6 +1659,7 @@ verify_server \
 verify_reporting_reader "$reporting_reader_rendered" "$main_rendered"
 verify_position "$position_rendered"
 verify_position_collector "$position_rendered"
+verify_wb_automation_shadow "$wb_automation_shadow_rendered"
 verify_ozon_egress "$position_rendered"
 verify_reporting_service \
   "$position_rendered" \
@@ -1604,4 +1691,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, base/plan/executor Control, position database, the opt-in MCP reporting reader, dedicated Control write/JWKS proxies, Ozon read-API and Gmail egress proxies, disabled collector/reporting runtimes, and the explicit reporting collection/mail canary and live overlays: exact resource/mount/health contracts, write-secret separation, loopback-only publication, isolated egress, and internal database networks."
+echo "Compose hardening verified for main, canary, base/plan/executor Control, position database, PostgreSQL-backed WB automation shadow, the opt-in MCP reporting reader, dedicated Control write/JWKS proxies, Ozon read-API and Gmail egress proxies, disabled collector/reporting runtimes, and the explicit reporting collection/mail canary and live overlays: exact resource/mount/health contracts, write-secret separation, loopback-only publication, isolated egress, and internal database networks."

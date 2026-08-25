@@ -1,23 +1,122 @@
 #![forbid(unsafe_code)]
 
-use std::{path::PathBuf, time::Duration};
-
-use anyhow::{Result, bail};
-use chrono::Utc;
-use mcp_ozon::control::{
-    WbAutomationExecutor, WbAutomationObserver, WbAutomationStateView,
-    persist_wb_automation_snapshot,
+use std::{
+    fmt::Write as _,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
 };
 
+use anyhow::{Context, Result, bail, ensure};
+use chrono::{DateTime, NaiveDate, Utc};
+use mcp_ozon::control::{
+    WbAutomationExecutor, WbAutomationLegacyStateSeed, WbAutomationObserver,
+    WbAutomationPostgresStore, WbAutomationStateView, persist_wb_automation_snapshot,
+    wb_automation_business_date,
+};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tokio_postgres::Config;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_LEGACY_STATE_BYTES: u64 = 256 * 1024;
+const DATABASE_URL_ENV: &str = "WB_AUTOMATION_DATABASE_URL";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     match parse_command(&std::env::args().skip(1).collect::<Vec<_>>())? {
         Command::Observe(options) => observe_once(options).await,
+        Command::ShadowPostgres(options) => shadow_postgres_once(options).await,
         Command::Execute(options) => execute_once(options).await,
         Command::Auto(options) => auto_once(options).await,
     }
+}
+
+async fn shadow_postgres_once(options: ShadowPostgresOptions) -> Result<()> {
+    let observer = build_observer(&options.observer)?;
+    ensure!(
+        !observer.policy().write_enabled,
+        "PostgreSQL shadow runtime refuses a write-enabled policy"
+    );
+    let legacy = load_legacy_state(
+        &options.legacy_state,
+        observer.policy().account_id.as_str(),
+        observer.policy().campaign_id,
+        observer.policy_sha256(),
+    )?;
+    let database_url =
+        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
+    let database_config =
+        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
+    let store = WbAutomationPostgresStore::connect(&database_config).await?;
+    store.verify_runtime_contract().await?;
+    let Some(mut lease) = store
+        .try_acquire_campaign(
+            observer.policy().account_id.as_str(),
+            observer.policy().campaign_id,
+        )
+        .await?
+    else {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "account_id": observer.policy().account_id,
+                "campaign_id": observer.policy().campaign_id,
+                "outcome": "lock_contended",
+            }))?
+        );
+        return Ok(());
+    };
+    let imported = lease.initialize_from_legacy(&legacy).await?;
+    let state = lease
+        .load_state()
+        .await?
+        .context("WB automation PostgreSQL state is unavailable")?;
+    let now = Utc::now();
+    let business_date = wb_automation_business_date(now);
+    let state_view = WbAutomationStateView {
+        paused_by_automation: state
+            .paused_for_daily_cap_on
+            .is_some_and(|paused_on| paused_on < business_date),
+        actions_today: if state.business_date == business_date {
+            state.actions_today
+        } else {
+            0
+        },
+        last_action_at: state.last_action_at,
+    };
+    let snapshot = observer.observe(now, state_view).await?;
+    let snapshot_json = serde_json::to_string(&snapshot)?;
+    let decision_json = serde_json::to_string(&snapshot.decision)?;
+    let cycle_id = sha256_domain("wb-automation-cycle-v1", snapshot_json.as_bytes());
+    let inserted = lease
+        .persist_shadow_cycle(
+            &cycle_id,
+            observer.policy_sha256(),
+            snapshot.observation.observed_at,
+            business_date,
+            state.revision,
+            &snapshot_json,
+            &decision_json,
+        )
+        .await?;
+    lease.release().await?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "account_id": &snapshot.decision.account_id,
+            "campaign_id": snapshot.decision.campaign_id,
+            "observed_at": snapshot.observation.observed_at,
+            "decision": &snapshot.decision.action,
+            "outcome": "shadow_persisted",
+            "cycle_id": cycle_id,
+            "cycle_inserted": inserted,
+            "legacy_imported": imported,
+        }))?
+    );
+    Ok(())
 }
 
 async fn observe_once(options: ObserveOptions) -> Result<()> {
@@ -91,8 +190,14 @@ async fn persist_observation(
 
 enum Command {
     Observe(ObserveOptions),
+    ShadowPostgres(ShadowPostgresOptions),
     Execute(ExecuteOptions),
     Auto(ExecuteOptions),
+}
+
+struct ShadowPostgresOptions {
+    observer: ObserveOptions,
+    legacy_state: PathBuf,
 }
 
 struct ObserveOptions {
@@ -129,6 +234,29 @@ impl ExecuteOptions {
 }
 
 fn parse_command(arguments: &[String]) -> Result<Command> {
+    if let [
+        command,
+        policy,
+        registry,
+        reader_token,
+        legacy_state,
+        broad_reader,
+        tail @ ..,
+    ] = arguments
+        && command == "shadow-once-pg"
+    {
+        return Ok(Command::ShadowPostgres(ShadowPostgresOptions {
+            observer: ObserveOptions {
+                policy: policy.into(),
+                registry: registry.into(),
+                reader_token: reader_token.into(),
+                state_directory: PathBuf::new(),
+                allow_broad_reader: parse_bool(broad_reader)?,
+                reader_proxy_url: optional_proxy(tail)?,
+            },
+            legacy_state: legacy_state.into(),
+        }));
+    }
     if let [
         command,
         policy,
@@ -209,6 +337,82 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
+        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyExecutionState {
+    schema_version: u32,
+    policy_sha256: String,
+    account_id: String,
+    campaign_id: u64,
+    business_date: NaiveDate,
+    actions_today: u32,
+    last_action_at: Option<DateTime<Utc>>,
+    paused_for_daily_cap_on: Option<NaiveDate>,
+    pending: Option<serde_json::Value>,
+    incident_class: Option<String>,
+}
+
+fn load_legacy_state(
+    path: &Path,
+    account_id: &str,
+    campaign_id: u64,
+    current_policy_digest: &str,
+) -> Result<WbAutomationLegacyStateSeed> {
+    let metadata = fs::symlink_metadata(path)
+        .context("WB automation legacy execution state is unavailable")?;
+    ensure!(
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() <= MAX_LEGACY_STATE_BYTES
+            && metadata.permissions().mode().is_multiple_of(0o100),
+        "WB automation legacy execution state is unsafe"
+    );
+    let bytes = fs::read(path).context("WB automation legacy execution state cannot be read")?;
+    let state = serde_json::from_slice::<LegacyExecutionState>(&bytes)
+        .context("WB automation legacy execution state is invalid")?;
+    ensure!(
+        state.schema_version == 1
+            && state.account_id == account_id
+            && state.campaign_id == campaign_id
+            && is_lower_sha256(&state.policy_sha256),
+        "WB automation legacy execution state does not match policy"
+    );
+    ensure!(
+        state.pending.is_none(),
+        "WB automation refuses to import an unresolved legacy write"
+    );
+    Ok(WbAutomationLegacyStateSeed {
+        policy_digest: current_policy_digest.to_owned(),
+        business_date: state.business_date,
+        actions_today: state.actions_today,
+        last_action_at: state.last_action_at,
+        paused_for_daily_cap_on: state.paused_for_daily_cap_on,
+        incident_class: state.incident_class,
+        legacy_digest: sha256_domain("wb-automation-legacy-state-v1", &bytes),
+    })
+}
+
+fn sha256_domain(domain: &str, bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain.as_bytes());
+    digest.update([0]);
+    digest.update(bytes);
+    digest
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+            output
+        })
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }

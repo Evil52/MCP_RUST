@@ -40,6 +40,33 @@ remaining mandatory data and execution guards are implemented and replayed.
 - A shadow-policy digest migration preserves pending, cooldown, pause and
   incident state instead of resetting the robot.
 
+## P1 durable shadow state
+
+The next runtime is intentionally separate from the legacy host executor and
+still cannot write to WB:
+
+- `wb_automation_writer` owns no schema and receives only the exact
+  `wb_automation` table/sequence privileges needed for durable state.
+- Immutable cycles, action attempts and audit events are append-only; campaign
+  execution state has monotonic revision and safety-state triggers.
+- The automation and manual Control paths use the same PostgreSQL advisory key
+  (`wb/<account>/<campaign>`), so they cannot act on one campaign concurrently.
+- A permanent idempotency key and a partial unique index allow at most one
+  unresolved action for a campaign.
+- `shadow-once-pg` accepts only a shadow policy, read token, reviewed registry,
+  legacy state and the restricted PostgreSQL role. It has no writer-token
+  argument and persists the observation/decision atomically.
+- Legacy import is content-addressed and idempotent. It preserves action count,
+  cooldown, protective pause and incident state, and refuses migration while a
+  legacy marketplace write is unresolved.
+- The one-shot Compose service joins only the internal database network and the
+  credentialless read-egress network. It has no writer secret, writer egress,
+  host port or writable persistent volume.
+
+This P1 path remains shadow-only. It does not replace or enable the production
+executor until its rollout SHA passes CI and the old timer is explicitly
+stopped during a guarded migration.
+
 ## CPC compatibility corrections
 
 The supplied prompt names recommended-bid and search-cluster statistics as

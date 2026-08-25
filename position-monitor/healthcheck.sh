@@ -71,6 +71,33 @@ SELECT
     AND to_regclass('control.wb_runtime_gates') IS NOT NULL
     AND to_regclass('control.wb_action_reservations') IS NOT NULL
     AND to_regclass('control.wb_audit_events') IS NOT NULL
+    AND to_regclass('wb_automation.cycles') IS NOT NULL
+    AND to_regclass('wb_automation.action_attempts') IS NOT NULL
+    AND to_regclass('wb_automation.execution_state') IS NOT NULL
+    AND to_regclass('wb_automation.audit_events') IS NOT NULL
+    AND to_regprocedure(
+        'wb_automation.reject_append_only_mutation()'
+    ) IS NOT NULL
+    AND to_regprocedure('wb_automation.stamp_cycle_insert()') IS NOT NULL
+    AND to_regprocedure(
+        'wb_automation.enforce_action_transition()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'wb_automation.enforce_state_transition()'
+    ) IS NOT NULL
+    AND to_regprocedure('wb_automation.stamp_audit_insert()') IS NOT NULL
+    AND EXISTS (
+        SELECT 1 FROM pg_roles
+        WHERE rolname = 'wb_automation_writer'
+          AND rolcanlogin
+          AND NOT rolsuper
+          AND NOT rolcreatedb
+          AND NOT rolcreaterole
+          AND NOT rolinherit
+          AND NOT rolreplication
+          AND NOT rolbypassrls
+          AND rolconnlimit = 2
+    )
     AND to_regprocedure(
         'control.validate_wb_policy_revision_insert()'
     ) IS NOT NULL

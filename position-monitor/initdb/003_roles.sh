@@ -7,6 +7,7 @@ set -eu
 : "${REPORT_WORKER_DB_PASSWORD:?REPORT_WORKER_DB_PASSWORD is required}"
 : "${REPORT_COLLECTOR_DB_PASSWORD:?REPORT_COLLECTOR_DB_PASSWORD is required}"
 : "${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}"
+: "${WB_AUTOMATION_DB_PASSWORD:?WB_AUTOMATION_DB_PASSWORD is required}"
 
 validate_password() {
   label=$1
@@ -29,12 +30,14 @@ validate_password POSITION_READER_DB_PASSWORD "$POSITION_READER_DB_PASSWORD"
 validate_password REPORT_WORKER_DB_PASSWORD "$REPORT_WORKER_DB_PASSWORD"
 validate_password REPORT_COLLECTOR_DB_PASSWORD "$REPORT_COLLECTOR_DB_PASSWORD"
 validate_password CONTROL_WRITER_DB_PASSWORD "$CONTROL_WRITER_DB_PASSWORD"
+validate_password WB_AUTOMATION_DB_PASSWORD "$WB_AUTOMATION_DB_PASSWORD"
 
 if [ "$POSTGRES_USER" = position_collector ] ||
    [ "$POSTGRES_USER" = position_reader ] ||
    [ "$POSTGRES_USER" = report_worker ] ||
    [ "$POSTGRES_USER" = report_collector ] ||
-   [ "$POSTGRES_USER" = control_writer ]; then
+   [ "$POSTGRES_USER" = control_writer ] ||
+   [ "$POSTGRES_USER" = wb_automation_writer ]; then
   echo "POSTGRES_USER must not reuse a restricted application role" >&2
   exit 1
 fi
@@ -47,7 +50,12 @@ if [ "$POSITION_COLLECTOR_DB_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
    [ "$CONTROL_WRITER_DB_PASSWORD" = "$POSITION_COLLECTOR_DB_PASSWORD" ] ||
    [ "$CONTROL_WRITER_DB_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
    [ "$CONTROL_WRITER_DB_PASSWORD" = "$REPORT_WORKER_DB_PASSWORD" ] ||
-   [ "$CONTROL_WRITER_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ]; then
+   [ "$CONTROL_WRITER_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$WB_AUTOMATION_DB_PASSWORD" = "$POSITION_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$WB_AUTOMATION_DB_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
+   [ "$WB_AUTOMATION_DB_PASSWORD" = "$REPORT_WORKER_DB_PASSWORD" ] ||
+   [ "$WB_AUTOMATION_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$WB_AUTOMATION_DB_PASSWORD" = "$CONTROL_WRITER_DB_PASSWORD" ]; then
   echo "all application database passwords must be different" >&2
   exit 1
 fi
@@ -55,7 +63,8 @@ if [ "$POSTGRES_PASSWORD" = "$POSITION_COLLECTOR_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$REPORT_WORKER_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
-   [ "$POSTGRES_PASSWORD" = "$CONTROL_WRITER_DB_PASSWORD" ]; then
+   [ "$POSTGRES_PASSWORD" = "$CONTROL_WRITER_DB_PASSWORD" ] ||
+   [ "$POSTGRES_PASSWORD" = "$WB_AUTOMATION_DB_PASSWORD" ]; then
   echo "application database passwords must differ from the admin password" >&2
   exit 1
 fi
@@ -70,6 +79,7 @@ PGPASSWORD="$POSTGRES_PASSWORD" psql --set=ON_ERROR_STOP=1 \
 \getenv report_worker_password REPORT_WORKER_DB_PASSWORD
 \getenv report_collector_password REPORT_COLLECTOR_DB_PASSWORD
 \getenv control_writer_password CONTROL_WRITER_DB_PASSWORD
+\getenv wb_automation_password WB_AUTOMATION_DB_PASSWORD
 
 BEGIN;
 
@@ -93,6 +103,13 @@ SELECT format('CREATE ROLE control_writer LOGIN PASSWORD %L', :'control_writer_p
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'control_writer')
 \gexec
 
+SELECT format(
+    'CREATE ROLE wb_automation_writer LOGIN PASSWORD %L',
+    :'wb_automation_password'
+)
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wb_automation_writer')
+\gexec
+
 ALTER ROLE position_collector WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'collector_password';
 ALTER ROLE position_reader WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
@@ -103,18 +120,21 @@ ALTER ROLE report_collector WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'report_collector_password';
 ALTER ROLE control_writer WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'control_writer_password';
+ALTER ROLE wb_automation_writer WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+    NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 2
+    PASSWORD :'wb_automation_password';
 
 -- Membership is an independent cluster-wide privilege path: NOINHERIT still
--- permits SET ROLE. Converge both directions so control_writer neither gains
--- another role nor becomes a grantable privilege bundle for another role.
+-- permits SET ROLE. Converge both directions so neither marketplace writer
+-- gains another role or becomes a grantable privilege bundle for one.
 SELECT format(
     'REVOKE %I FROM %I', granted_role.rolname, member_role.rolname
 )
 FROM pg_auth_members AS membership
 JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
 JOIN pg_roles AS member_role ON member_role.oid = membership.member
-WHERE granted_role.rolname = 'control_writer'
-   OR member_role.rolname = 'control_writer'
+WHERE granted_role.rolname IN ('control_writer', 'wb_automation_writer')
+   OR member_role.rolname IN ('control_writer', 'wb_automation_writer')
 ORDER BY granted_role.rolname, member_role.rolname
 \gexec
 
@@ -129,6 +149,8 @@ ALTER ROLE report_collector SET statement_timeout = '60s';
 ALTER ROLE report_collector SET idle_in_transaction_session_timeout = '30s';
 ALTER ROLE control_writer SET statement_timeout = '30s';
 ALTER ROLE control_writer SET idle_in_transaction_session_timeout = '15s';
+ALTER ROLE wb_automation_writer SET statement_timeout = '30s';
+ALTER ROLE wb_automation_writer SET idle_in_transaction_session_timeout = '15s';
 
 -- Application roles are cluster-wide. Revoke PUBLIC and stale direct ingress
 -- from every database before allowing only this application's database below.
@@ -149,7 +171,8 @@ CROSS JOIN (
       ('position_reader'),
       ('report_worker'),
       ('report_collector'),
-      ('control_writer')
+      ('control_writer'),
+      ('wb_automation_writer')
 ) AS application_role(rolname)
 ORDER BY database_row.datname, application_role.rolname
 \gexec
@@ -174,7 +197,8 @@ CROSS JOIN (
       ('position_reader'),
       ('report_worker'),
       ('report_collector'),
-      ('control_writer')
+      ('control_writer'),
+      ('wb_automation_writer')
 ) AS application_role(rolname)
 WHERE namespace_row.nspname <> 'information_schema'
   AND namespace_row.nspname !~ '^pg_'
@@ -182,15 +206,17 @@ ORDER BY namespace_row.nspname, application_role.rolname
 \gexec
 
 GRANT CONNECT ON DATABASE :"db_name" TO position_collector, position_reader, report_worker,
-    report_collector, control_writer;
+    report_collector, control_writer, wb_automation_writer;
 GRANT USAGE ON SCHEMA search_position TO position_collector, position_reader;
 
 -- Make re-running this role bootstrap converge to the exact ACL instead of
 -- retaining stale grants from an older schema revision.
 REVOKE ALL ON ALL TABLES IN SCHEMA search_position
-    FROM position_collector, position_reader, report_worker, report_collector, control_writer;
+    FROM position_collector, position_reader, report_worker, report_collector,
+    control_writer, wb_automation_writer;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA search_position
-    FROM position_collector, position_reader, report_worker, report_collector, control_writer;
+    FROM position_collector, position_reader, report_worker, report_collector,
+    control_writer, wb_automation_writer;
 
 GRANT SELECT ON search_position.monitors TO position_collector;
 GRANT SELECT, INSERT ON search_position.collection_runs TO position_collector;
