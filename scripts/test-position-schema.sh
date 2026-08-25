@@ -452,12 +452,6 @@ control_writer_psql=(
   psql --host 127.0.0.1 --username control_writer --dbname ozon_positions
   --no-psqlrc --set ON_ERROR_STOP=1
 )
-wb_automation_psql=(
-  docker exec --env PGPASSWORD="$wb_automation_password" "$container"
-  psql --host 127.0.0.1 --username wb_automation_writer --dbname ozon_positions
-  --no-psqlrc --set ON_ERROR_STOP=1
-)
-
 assert_control_schema_contract \
   "fresh database" \
   "${admin_psql[@]}"
