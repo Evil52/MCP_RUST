@@ -13,6 +13,7 @@ reader_password="position-reader-schema-test"
 report_worker_password="report-worker-schema-test"
 report_collector_password="report-collector-schema-test"
 control_writer_password="control-writer-schema-test"
+wb_automation_password="wb-automation-schema-test"
 
 case "$keep_image" in
   true | false) ;;
@@ -96,7 +97,8 @@ assert_control_schema_contract() {
           ('position_collector'),
           ('position_reader'),
           ('report_collector'),
-          ('report_worker')
+          ('report_worker'),
+          ('wb_automation_writer')
     ),
     actual_triggers(
         table_name, trigger_name, function_name, trigger_type, enabled
@@ -224,7 +226,7 @@ assert_control_schema_contract() {
           FROM pg_namespace AS namespace
           CROSS JOIN unnest(ARRAY[
               'position_collector', 'position_reader', 'report_worker',
-              'report_collector', 'control_writer'
+              'report_collector', 'control_writer', 'wb_automation_writer'
           ]::name[]) AS application_role(role_name)
           WHERE namespace.nspname <> 'information_schema'
             AND namespace.nspname !~ '^pg_'
@@ -367,6 +369,7 @@ expect_exact_validation_failure \
   REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
 
 expect_exact_validation_failure \
@@ -381,6 +384,7 @@ expect_exact_validation_failure \
   REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
 
 docker build --pull --tag "$image" --file "$project_root/position-monitor/Dockerfile" \
@@ -401,6 +405,7 @@ docker run --detach --rm --name "$container" \
   --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$image" >/dev/null
 
 ready=false
@@ -447,7 +452,6 @@ control_writer_psql=(
   psql --host 127.0.0.1 --username control_writer --dbname ozon_positions
   --no-psqlrc --set ON_ERROR_STOP=1
 )
-
 assert_control_schema_contract \
   "fresh database" \
   "${admin_psql[@]}"
@@ -457,10 +461,10 @@ assert_control_schema_contract \
   GRANT control_writer TO report_worker;
   GRANT CREATE, CONNECT, TEMPORARY ON DATABASE postgres TO
       position_collector, position_reader, report_worker,
-      report_collector, control_writer;
+      report_collector, control_writer, wb_automation_writer;
   GRANT CREATE ON SCHEMA public TO
       position_collector, position_reader, report_worker,
-      report_collector, control_writer;
+      report_collector, control_writer, wb_automation_writer;
 " >/dev/null
 seeded_control_memberships="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "
@@ -483,6 +487,7 @@ docker exec \
   --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$container" \
   /docker-entrypoint-initdb.d/003_roles.sh >/dev/null
 assert_control_schema_contract \
@@ -490,14 +495,14 @@ assert_control_schema_contract \
   "${admin_psql[@]}"
 converged_database_acl="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "
-    SELECT count(*) = 5 AND bool_and(
+    SELECT count(*) = 6 AND bool_and(
         NOT has_database_privilege(role_name, 'postgres', 'CONNECT')
         AND NOT has_database_privilege(role_name, 'postgres', 'TEMP')
         AND NOT has_database_privilege(role_name, 'postgres', 'CREATE')
     )
     FROM unnest(ARRAY[
         'position_collector', 'position_reader', 'report_worker',
-        'report_collector', 'control_writer'
+        'report_collector', 'control_writer', 'wb_automation_writer'
     ]::name[]) AS application_role(role_name)
   "; } | tr -d '[:space:]')"
 if [[ "$converged_database_acl" != t ]]; then
@@ -507,12 +512,12 @@ if [[ "$converged_database_acl" != t ]]; then
 fi
 converged_schema_acl="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "
-    SELECT count(*) = 5 AND bool_and(
+    SELECT count(*) = 6 AND bool_and(
         NOT has_schema_privilege(role_name, 'public', 'CREATE')
     )
     FROM unnest(ARRAY[
         'position_collector', 'position_reader', 'report_worker',
-        'report_collector', 'control_writer'
+        'report_collector', 'control_writer', 'wb_automation_writer'
     ]::name[]) AS application_role(role_name)
   "; } | tr -d '[:space:]')"
 if [[ "$converged_schema_acl" != t ]]; then
@@ -555,7 +560,8 @@ migration_admin_psql=(
 " >/dev/null
 "${admin_psql[@]}" --command '
   GRANT CONNECT ON DATABASE migration_probe
-      TO position_collector, position_reader, report_worker, report_collector, control_writer
+      TO position_collector, position_reader, report_worker, report_collector,
+      control_writer, wb_automation_writer
 ' >/dev/null
 "${migration_admin_psql[@]}" --command '
   GRANT USAGE ON SCHEMA search_position
@@ -609,12 +615,16 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/021_wb_automation_state.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/021_wb_automation_state.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -927,6 +937,7 @@ expect_failure_containing \
   --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$container" \
   /docker-entrypoint-initdb.d/003_roles.sh
 "${admin_psql[@]}" \
@@ -2896,13 +2907,14 @@ expect_failure_containing \
     VALUES ('denied', 'denied', 'denied', 'denied', 'denied')
   "
 
-for role in position_collector position_reader report_collector report_worker control_writer; do
+for role in position_collector position_reader report_collector report_worker control_writer wb_automation_writer; do
   case "$role" in
     position_collector) role_password="$collector_password" ;;
     position_reader) role_password="$reader_password" ;;
     report_worker) role_password="$report_worker_password" ;;
     report_collector) role_password="$report_collector_password" ;;
     control_writer) role_password="$control_writer_password" ;;
+    wb_automation_writer) role_password="$wb_automation_password" ;;
   esac
   expect_failure_containing \
     "$role connection to the postgres database" \
@@ -2964,11 +2976,11 @@ role_attributes="$("${admin_psql[@]}" --tuples-only --no-align --field-separator
     FROM pg_roles
     WHERE rolname IN (
         'position_collector', 'position_reader', 'report_collector', 'report_worker',
-        'control_writer'
+        'control_writer', 'wb_automation_writer'
     )
     ORDER BY rolname
   ")"
-expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4'
+expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4\nwb_automation_writer:t:f:f:f:f:f:f:2'
 if [[ "$role_attributes" != "$expected_attributes" ]]; then
   echo "restricted database role attributes differ from the expected policy" >&2
   printf '%s\n' "$role_attributes" >&2

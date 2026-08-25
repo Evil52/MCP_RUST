@@ -21,6 +21,7 @@ COPY --chmod=0644 initdb/017_daily_reporting_advertising_extensions.sql /docker-
 COPY --chmod=0644 initdb/018_daily_reporting_recovery_observation_window.sql /docker-entrypoint-initdb.d/018_daily_reporting_recovery_observation_window.sql
 COPY --chmod=0644 initdb/019_daily_reporting_mcp_read_views.sql /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql
 COPY --chmod=0644 initdb/020_wb_control_plans.sql /docker-entrypoint-initdb.d/020_wb_control_plans.sql
+COPY --chmod=0644 initdb/021_wb_automation_state.sql /docker-entrypoint-initdb.d/021_wb_automation_state.sql
 COPY --chmod=0755 healthcheck.sh /usr/local/bin/position-db-healthcheck
 
 # This image always runs as postgres, so the root-only privilege-drop helper is

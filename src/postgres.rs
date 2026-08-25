@@ -270,6 +270,18 @@ impl DerefMut for ClientGuard<'_> {
     }
 }
 
+impl ClientGuard<'_> {
+    /// Removes the current session from the supervised slot instead of
+    /// returning it to the next caller.
+    ///
+    /// A session-level advisory-lock guard uses this on every abnormal drop:
+    /// PostgreSQL releases the lock when the connection closes, while reusing
+    /// an uncertain session could leave a marketplace campaign locked forever.
+    pub(crate) fn discard(mut self) {
+        self.slot.client.take();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

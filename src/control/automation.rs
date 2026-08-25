@@ -1,19 +1,39 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const ACTIVE_CAMPAIGN_STATUS: i32 = 9;
 const PAUSED_CAMPAIGN_STATUS: i32 = 11;
 const BASIS_POINTS: u128 = 10_000;
+const MOSCOW_OFFSET_SECONDS: i32 = 3 * 60 * 60;
+
+#[must_use]
+/// Returns the Moscow advertising business date for a UTC instant.
+///
+/// # Panics
+///
+/// Panics only if the compile-time UTC+3 offset cannot be constructed.
+pub fn wb_automation_business_date(now: DateTime<Utc>) -> NaiveDate {
+    now.with_timezone(
+        &FixedOffset::east_opt(MOSCOW_OFFSET_SECONDS)
+            .expect("the fixed Moscow UTC offset is valid"),
+    )
+    .date_naive()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WbAutomationPolicy {
+    pub policy_version: String,
+    pub write_enabled: bool,
     pub account_id: String,
     pub campaign_id: u64,
     pub campaign_name: String,
+    pub payment_type: String,
+    pub placement: String,
+    pub timezone: String,
     pub authorized_by_actor_id: String,
     pub authorization_reference: String,
     pub authorized_at: DateTime<Utc>,
@@ -21,6 +41,7 @@ pub struct WbAutomationPolicy {
     pub nm_ids: Vec<u64>,
     pub target_drr_basis_points: u32,
     pub hard_drr_basis_points: u32,
+    pub target_impressions_per_day: u64,
     pub min_bid_kopecks: u64,
     pub max_bid_kopecks: u64,
     pub bid_step_percent: u8,
@@ -48,6 +69,7 @@ pub struct WbAutomationObservation {
     pub paused_by_automation: bool,
     pub budget_remaining_minor: u64,
     pub daily_spend_minor: u64,
+    pub daily_spend_complete: bool,
     pub actions_today: u32,
     pub last_action_at: Option<DateTime<Utc>>,
     pub attribution_complete: bool,
@@ -86,9 +108,12 @@ pub struct WbAutomationSkuObservation {
 pub enum WbAutomationHoldReason {
     AuthorizationNotActive,
     AuthorizationExpired,
+    PolicyShadowOnly,
     ObserveOnly,
     AttributionIncomplete,
     CampaignNotActive,
+    ProtectivePauseRequiresApproval,
+    SpendDataIncomplete,
     BudgetExhausted,
     ActionQuotaExhausted,
     CooldownActive,
@@ -198,7 +223,7 @@ pub fn evaluate_wb_automation(
     }
 
     if !observation.attribution_complete {
-        let (action, unresolved_stops) = campaign_level_action(policy, observation, &observations)?;
+        let (action, unresolved_stops) = campaign_level_action(policy, observation, &observations);
         return Ok(decision(action, unresolved_stops));
     }
 
@@ -245,6 +270,10 @@ pub fn evaluate_wb_automation(
             changes.push(change);
         }
     }
+    // A cycle may execute at most one minimal SKU action. The policy order is
+    // stable, while the six-hour cooldown forces the next choice to use a
+    // fresh observation instead of batching speculative changes.
+    changes.truncate(1);
     Ok(decision(
         if changes.is_empty() {
             WbAutomationAction::Hold {
@@ -261,9 +290,8 @@ pub fn evaluate_wb_automation(
 /// reasoning. Returns the action to take, or `None` when the campaign is clear
 /// to be judged SKU by SKU.
 ///
-/// The daily-cap pause and its resume deliberately precede the quota and
-/// cooldown checks: honouring the spend cap must never be blocked by the
-/// rate limits that govern ordinary bid changes.
+/// The emergency daily-cap pause precedes quota and cooldown checks: honouring
+/// the spend cap must never be blocked by rate limits for ordinary bid changes.
 fn campaign_gate(
     policy: &WbAutomationPolicy,
     observation: &WbAutomationObservation,
@@ -275,22 +303,28 @@ fn campaign_gate(
     if observation.observed_at >= policy.authorization_expires_at {
         return hold(WbAutomationHoldReason::AuthorizationExpired);
     }
+    if !policy.write_enabled {
+        return hold(WbAutomationHoldReason::PolicyShadowOnly);
+    }
     if observation.observed_at < policy.observe_until {
         return hold(WbAutomationHoldReason::ObserveOnly);
     }
     if observation.budget_remaining_minor == 0 {
         return hold(WbAutomationHoldReason::BudgetExhausted);
     }
+    if !observation.daily_spend_complete {
+        return hold(WbAutomationHoldReason::SpendDataIncomplete);
+    }
     if observation.campaign_status == ACTIVE_CAMPAIGN_STATUS
         && observation.daily_spend_minor >= policy.daily_pause_threshold_minor
     {
         return Some(WbAutomationAction::PauseCampaignForDailyCap);
     }
-    if observation.campaign_status == PAUSED_CAMPAIGN_STATUS
-        && observation.paused_by_automation
-        && observation.daily_spend_minor < policy.daily_pause_threshold_minor
-    {
-        return Some(WbAutomationAction::ResumeCampaignAfterDailyCap);
+    // WB ADS ROBOT v1 never resumes a campaign automatically after a
+    // protective pause. A new explicit authorization or a separately reviewed
+    // resume rule is required, even after the business date changes.
+    if observation.campaign_status == PAUSED_CAMPAIGN_STATUS && observation.paused_by_automation {
+        return hold(WbAutomationHoldReason::ProtectivePauseRequiresApproval);
     }
     if observation.campaign_status != ACTIVE_CAMPAIGN_STATUS {
         return hold(WbAutomationHoldReason::CampaignNotActive);
@@ -307,22 +341,23 @@ fn campaign_gate(
     None
 }
 
-/// Use genuine campaign totals without pretending that they belong to any
-/// particular SKU. An aggregate decision may only move a uniform set of bids,
-/// so the next observation can still be interpreted coherently. Missing
-/// totals, mixed bids, or a floored low-stock SKU hold fail closed.
+/// Campaign totals are useful for campaign-wide reporting, but cannot identify
+/// which SKU has the best probability of an economical order. WB ADS ROBOT v1
+/// permits at most one SKU change per cycle, so aggregate delivery must never
+/// be expanded into fabricated SKU decisions. Per-SKU low-stock protection is
+/// retained because stock remains genuinely attributable by SKU.
 fn campaign_level_action(
     policy: &WbAutomationPolicy,
     observation: &WbAutomationObservation,
     observations: &BTreeMap<u64, &WbAutomationSkuObservation>,
-) -> Result<(WbAutomationAction, Vec<WbAutomationSkuStop>), WbAutomationDecisionError> {
-    let Some(metrics) = observation.campaign_level_metrics.as_ref() else {
-        return Ok((
+) -> (WbAutomationAction, Vec<WbAutomationSkuStop>) {
+    let Some(_metrics) = observation.campaign_level_metrics.as_ref() else {
+        return (
             WbAutomationAction::Hold {
                 reason: WbAutomationHoldReason::AttributionIncomplete,
             },
             Vec::new(),
-        ));
+        );
     };
 
     let unresolved_stops = policy
@@ -343,99 +378,29 @@ fn campaign_level_action(
         sku.sellable_stock <= policy.min_sellable_stock
             && sku.current_bid_kopecks > policy.min_bid_kopecks
     }) {
-        return Ok((
+        return (
             WbAutomationAction::DisableSku {
                 nm_id: *nm_id,
                 reason: WbAutomationDisableReason::LowStock,
             },
             unresolved_stops,
-        ));
+        );
     }
     if !unresolved_stops.is_empty() {
-        return Ok((
+        return (
             WbAutomationAction::Hold {
                 reason: WbAutomationHoldReason::NoMaterialChange,
             },
             unresolved_stops,
-        ));
+        );
     }
 
-    let bids = observations
-        .values()
-        .map(|sku| sku.current_bid_kopecks)
-        .collect::<BTreeSet<_>>();
-    if bids.len() != 1 {
-        return Ok((
-            WbAutomationAction::Hold {
-                reason: WbAutomationHoldReason::AttributionIncomplete,
-            },
-            Vec::new(),
-        ));
-    }
-
-    let drr = drr_basis_points_from(metrics.spend_minor, metrics.attributed_revenue_minor)?;
-    let reason_and_direction = if metrics.attributed_orders == 0
-        && (metrics.clicks >= policy.no_order_disable_clicks
-            || metrics.spend_minor >= policy.no_order_disable_spend_minor)
-    {
-        Some((WbAutomationBidReason::NoOrdersHardStop, false, true))
-    } else if drr.is_some_and(|value| value > policy.hard_drr_basis_points) {
-        Some((WbAutomationBidReason::HardDrrExceeded, false, true))
-    } else if metrics.attributed_orders == 0 && metrics.clicks >= policy.no_order_reduce_clicks {
-        Some((WbAutomationBidReason::NoOrdersAfterClicks, false, false))
-    } else if drr.is_some_and(|value| value > policy.target_drr_basis_points) {
-        Some((WbAutomationBidReason::TargetDrrExceeded, false, false))
-    } else if metrics.attributed_orders >= policy.efficient_min_orders
-        && conversion_basis_points_from(metrics.attributed_orders, metrics.clicks)?
-            >= policy.efficient_min_conversion_basis_points
-        && drr.is_some_and(|value| value <= policy.target_drr_basis_points)
-    {
-        Some((WbAutomationBidReason::EfficientSales, true, false))
-    } else if metrics.impressions < policy.low_exposure_max_impressions
-        && metrics.clicks < policy.low_exposure_max_clicks
-    {
-        Some((WbAutomationBidReason::LowExposureExploration, true, false))
-    } else {
-        None
-    };
-    let Some((reason, increase, hard_stop)) = reason_and_direction else {
-        return Ok((
-            WbAutomationAction::Hold {
-                reason: WbAutomationHoldReason::NoMaterialChange,
-            },
-            Vec::new(),
-        ));
-    };
-
-    let mut changes = Vec::new();
-    for nm_id in &policy.nm_ids {
-        let sku = observations[nm_id];
-        let to_bid_kopecks = if hard_stop {
-            policy.min_bid_kopecks
-        } else if increase {
-            increase_bid(policy, sku.current_bid_kopecks)?
-        } else {
-            decrease_bid(policy, sku.current_bid_kopecks)
-        };
-        if to_bid_kopecks != sku.current_bid_kopecks {
-            changes.push(WbAutomationBidChange {
-                nm_id: *nm_id,
-                from_bid_kopecks: sku.current_bid_kopecks,
-                to_bid_kopecks,
-                reason: reason.clone(),
-            });
-        }
-    }
-    Ok((
-        if changes.is_empty() {
-            WbAutomationAction::Hold {
-                reason: WbAutomationHoldReason::NoMaterialChange,
-            }
-        } else {
-            WbAutomationAction::ChangeBids { changes }
+    (
+        WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::AttributionIncomplete,
         },
         Vec::new(),
-    ))
+    )
 }
 
 /// Every SKU that currently qualifies for a hard stop, keyed by SKU.
@@ -492,7 +457,11 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
         && policy.authorized_at < policy.observe_until
         && policy.observe_until < policy.authorization_expires_at;
     let nm_ids = policy.nm_ids.iter().copied().collect::<BTreeSet<_>>();
-    if !identifiers_valid
+    if policy.policy_version != "wb_ads_robot.v1"
+        || policy.payment_type != "cpc"
+        || policy.placement != "search"
+        || policy.timezone != "Europe/Moscow"
+        || !identifiers_valid
         || !campaign_name_valid
         || !authorization_valid
         || policy.campaign_id == 0
@@ -503,6 +472,7 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
         || policy.target_drr_basis_points == 0
         || policy.hard_drr_basis_points <= policy.target_drr_basis_points
         || policy.hard_drr_basis_points > 10_000
+        || policy.target_impressions_per_day == 0
         || policy.min_bid_kopecks == 0
         || policy.max_bid_kopecks < policy.min_bid_kopecks
         || !(1..=25).contains(&policy.bid_step_percent)
@@ -680,9 +650,14 @@ mod tests {
 
     fn policy() -> WbAutomationPolicy {
         WbAutomationPolicy {
+            policy_version: "wb_ads_robot.v1".to_owned(),
+            write_enabled: true,
             account_id: "ip_domnyshev_wb".to_owned(),
             campaign_id: 39_682_633,
             campaign_name: "Робот".to_owned(),
+            payment_type: "cpc".to_owned(),
+            placement: "search".to_owned(),
+            timezone: "Europe/Moscow".to_owned(),
             authorized_by_actor_id: "rustam_magasumov".to_owned(),
             authorization_reference: "chat/2026-08-24/safe-auto-robot".to_owned(),
             authorized_at: Utc.with_ymd_and_hms(2026, 8, 24, 7, 0, 0).unwrap(),
@@ -690,6 +665,7 @@ mod tests {
             nm_ids: vec![449_627_598, 449_627_015, 497_424_314],
             target_drr_basis_points: 1_500,
             hard_drr_basis_points: 2_500,
+            target_impressions_per_day: 5_000,
             min_bid_kopecks: 102,
             max_bid_kopecks: 600,
             bid_step_percent: 15,
@@ -700,7 +676,7 @@ mod tests {
             min_sellable_stock: 3,
             no_order_reduce_clicks: 30,
             no_order_disable_clicks: 50,
-            no_order_disable_spend_minor: 15_000,
+            no_order_disable_spend_minor: 25_000,
             efficient_min_orders: 2,
             efficient_min_conversion_basis_points: 200,
             low_exposure_max_impressions: 200,
@@ -730,6 +706,7 @@ mod tests {
             paused_by_automation: false,
             budget_remaining_minor: 100_000,
             daily_spend_minor: 10_000,
+            daily_spend_complete: true,
             actions_today: 0,
             last_action_at: None,
             attribution_complete: true,
@@ -776,22 +753,14 @@ mod tests {
         assert_eq!(
             decision.action,
             WbAutomationAction::ChangeBids {
-                changes: vec![
-                    WbAutomationBidChange {
-                        nm_id: 449_627_015,
-                        from_bid_kopecks: 200,
-                        to_bid_kopecks: 230,
-                        reason: WbAutomationBidReason::EfficientSales,
-                    },
-                    WbAutomationBidChange {
-                        nm_id: 497_424_314,
-                        from_bid_kopecks: 200,
-                        to_bid_kopecks: 230,
-                        reason: WbAutomationBidReason::EfficientSales,
-                    },
-                ],
+                changes: vec![WbAutomationBidChange {
+                    nm_id: 449_627_015,
+                    from_bid_kopecks: 200,
+                    to_bid_kopecks: 230,
+                    reason: WbAutomationBidReason::EfficientSales,
+                }],
             },
-            "the two healthy SKUs are still managed and the floored SKU is absent"
+            "one healthy SKU is managed and the floored SKU is absent"
         );
     }
 
@@ -882,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn daily_cap_pause_and_next_day_resume_have_priority() {
+    fn daily_cap_pause_has_priority_and_never_auto_resumes() {
         let mut capped = observation();
         capped.daily_spend_minor = 25_000;
         capped.actions_today = policy().max_actions_per_day;
@@ -899,7 +868,9 @@ mod tests {
             evaluate_wb_automation(&policy(), &resumable)
                 .unwrap()
                 .action,
-            WbAutomationAction::ResumeCampaignAfterDailyCap
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::ProtectivePauseRequiresApproval
+            }
         );
     }
 
@@ -961,26 +932,12 @@ mod tests {
         assert_eq!(
             evaluate_wb_automation(&policy(), &input).unwrap().action,
             WbAutomationAction::ChangeBids {
-                changes: vec![
-                    WbAutomationBidChange {
-                        nm_id: 449_627_598,
-                        from_bid_kopecks: 200,
-                        to_bid_kopecks: 170,
-                        reason: WbAutomationBidReason::TargetDrrExceeded,
-                    },
-                    WbAutomationBidChange {
-                        nm_id: 449_627_015,
-                        from_bid_kopecks: 200,
-                        to_bid_kopecks: 230,
-                        reason: WbAutomationBidReason::LowExposureExploration,
-                    },
-                    WbAutomationBidChange {
-                        nm_id: 497_424_314,
-                        from_bid_kopecks: 200,
-                        to_bid_kopecks: 170,
-                        reason: WbAutomationBidReason::NoOrdersAfterClicks,
-                    },
-                ],
+                changes: vec![WbAutomationBidChange {
+                    nm_id: 449_627_598,
+                    from_bid_kopecks: 200,
+                    to_bid_kopecks: 170,
+                    reason: WbAutomationBidReason::TargetDrrExceeded,
+                }],
             }
         );
     }
@@ -991,8 +948,7 @@ mod tests {
         assert!(matches!(
             decision.action,
             WbAutomationAction::ChangeBids { ref changes }
-                if changes.len() == 3
-                    && changes.iter().all(|change| change.to_bid_kopecks == 230)
+                if changes.len() == 1 && changes[0].to_bid_kopecks == 230
         ));
 
         let mut quota = observation();
@@ -1015,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn campaign_totals_drive_uniform_exploration_without_fake_sku_attribution() {
+    fn campaign_totals_never_select_a_sku_for_exploration() {
         let input = campaign_level_observation(WbAutomationCampaignMetrics {
             impressions: 30,
             clicks: 3,
@@ -1026,17 +982,8 @@ mod tests {
 
         assert_eq!(
             evaluate_wb_automation(&policy(), &input).unwrap().action,
-            WbAutomationAction::ChangeBids {
-                changes: policy()
-                    .nm_ids
-                    .into_iter()
-                    .map(|nm_id| WbAutomationBidChange {
-                        nm_id,
-                        from_bid_kopecks: 200,
-                        to_bid_kopecks: 230,
-                        reason: WbAutomationBidReason::LowExposureExploration,
-                    })
-                    .collect(),
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AttributionIncomplete,
             }
         );
         assert!(input.skus.iter().all(|sku| {
@@ -1049,63 +996,39 @@ mod tests {
     }
 
     #[test]
-    fn campaign_totals_apply_performance_guards_to_all_uniform_bids() {
-        let no_orders = campaign_level_observation(WbAutomationCampaignMetrics {
-            impressions: 500,
-            clicks: 30,
-            spend_minor: 2_000,
-            attributed_orders: 0,
-            attributed_revenue_minor: 0,
-        });
-        assert!(matches!(
-            evaluate_wb_automation(&policy(), &no_orders)
-                .unwrap()
-                .action,
-            WbAutomationAction::ChangeBids { ref changes }
-                if changes.len() == 3
-                    && changes.iter().all(|change| {
-                        change.to_bid_kopecks == 170
-                            && change.reason == WbAutomationBidReason::NoOrdersAfterClicks
-                    })
-        ));
-
-        let hard_drr = campaign_level_observation(WbAutomationCampaignMetrics {
-            impressions: 500,
-            clicks: 20,
-            spend_minor: 3_000,
-            attributed_orders: 2,
-            attributed_revenue_minor: 10_000,
-        });
-        assert!(matches!(
-            evaluate_wb_automation(&policy(), &hard_drr)
-                .unwrap()
-                .action,
-            WbAutomationAction::ChangeBids { ref changes }
-                if changes.len() == 3
-                    && changes.iter().all(|change| {
-                        change.to_bid_kopecks == 102
-                            && change.reason == WbAutomationBidReason::HardDrrExceeded
-                    })
-        ));
-
-        let efficient = campaign_level_observation(WbAutomationCampaignMetrics {
-            impressions: 500,
-            clicks: 20,
-            spend_minor: 2_000,
-            attributed_orders: 2,
-            attributed_revenue_minor: 20_000,
-        });
-        assert!(matches!(
-            evaluate_wb_automation(&policy(), &efficient)
-                .unwrap()
-                .action,
-            WbAutomationAction::ChangeBids { ref changes }
-                if changes.len() == 3
-                    && changes.iter().all(|change| {
-                        change.to_bid_kopecks == 230
-                            && change.reason == WbAutomationBidReason::EfficientSales
-                    })
-        ));
+    fn campaign_totals_never_drive_sku_performance_changes() {
+        for metrics in [
+            WbAutomationCampaignMetrics {
+                impressions: 500,
+                clicks: 30,
+                spend_minor: 2_000,
+                attributed_orders: 0,
+                attributed_revenue_minor: 0,
+            },
+            WbAutomationCampaignMetrics {
+                impressions: 500,
+                clicks: 20,
+                spend_minor: 3_000,
+                attributed_orders: 2,
+                attributed_revenue_minor: 10_000,
+            },
+            WbAutomationCampaignMetrics {
+                impressions: 500,
+                clicks: 20,
+                spend_minor: 2_000,
+                attributed_orders: 2,
+                attributed_revenue_minor: 20_000,
+            },
+        ] {
+            assert_eq!(
+                evaluate_wb_automation(&policy(), &campaign_level_observation(metrics))
+                    .unwrap()
+                    .action,
+                WbAutomationAction::Hold {
+                    reason: WbAutomationHoldReason::AttributionIncomplete,
+                }
+            );
+        }
     }
 
     #[test]
@@ -1156,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn campaign_fallback_covers_hard_target_and_no_signal_boundaries() {
+    fn campaign_fallback_holds_across_performance_boundaries() {
         let no_orders_hard_stop = campaign_level_observation(WbAutomationCampaignMetrics {
             impressions: 500,
             clicks: 50,
@@ -1164,17 +1087,14 @@ mod tests {
             attributed_orders: 0,
             attributed_revenue_minor: 0,
         });
-        assert!(matches!(
+        assert_eq!(
             evaluate_wb_automation(&policy(), &no_orders_hard_stop)
                 .unwrap()
                 .action,
-            WbAutomationAction::ChangeBids { ref changes }
-                if changes.len() == 3
-                    && changes.iter().all(|change| {
-                        change.to_bid_kopecks == 102
-                            && change.reason == WbAutomationBidReason::NoOrdersHardStop
-                    })
-        ));
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AttributionIncomplete,
+            }
+        );
 
         let target_drr = campaign_level_observation(WbAutomationCampaignMetrics {
             impressions: 500,
@@ -1183,17 +1103,14 @@ mod tests {
             attributed_orders: 2,
             attributed_revenue_minor: 10_000,
         });
-        assert!(matches!(
+        assert_eq!(
             evaluate_wb_automation(&policy(), &target_drr)
                 .unwrap()
                 .action,
-            WbAutomationAction::ChangeBids { ref changes }
-                if changes.len() == 3
-                    && changes.iter().all(|change| {
-                        change.to_bid_kopecks == 170
-                            && change.reason == WbAutomationBidReason::TargetDrrExceeded
-                    })
-        ));
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AttributionIncomplete,
+            }
+        );
 
         let no_signal = campaign_level_observation(WbAutomationCampaignMetrics {
             impressions: 500,
@@ -1207,7 +1124,7 @@ mod tests {
                 .unwrap()
                 .action,
             WbAutomationAction::Hold {
-                reason: WbAutomationHoldReason::NoMaterialChange,
+                reason: WbAutomationHoldReason::AttributionIncomplete,
             }
         );
 
@@ -1220,7 +1137,7 @@ mod tests {
                 .unwrap()
                 .action,
             WbAutomationAction::Hold {
-                reason: WbAutomationHoldReason::NoMaterialChange,
+                reason: WbAutomationHoldReason::AttributionIncomplete,
             }
         );
     }
@@ -1368,7 +1285,46 @@ mod tests {
     }
 
     #[test]
-    fn robot_policy_is_valid_and_starts_in_observe_only_mode() {
+    fn moscow_business_date_changes_at_21_00_utc() {
+        let before = Utc.with_ymd_and_hms(2026, 8, 25, 20, 59, 59).unwrap();
+        let after = Utc.with_ymd_and_hms(2026, 8, 25, 21, 0, 0).unwrap();
+        assert_eq!(
+            wb_automation_business_date(before),
+            NaiveDate::from_ymd_opt(2026, 8, 25).unwrap()
+        );
+        assert_eq!(
+            wb_automation_business_date(after),
+            NaiveDate::from_ymd_opt(2026, 8, 26).unwrap()
+        );
+    }
+
+    #[test]
+    fn shadow_policy_and_missing_today_spend_block_actions() {
+        let mut shadow = policy();
+        shadow.write_enabled = false;
+        assert_eq!(
+            evaluate_wb_automation(&shadow, &observation())
+                .unwrap()
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::PolicyShadowOnly,
+            }
+        );
+
+        let mut incomplete = observation();
+        incomplete.daily_spend_complete = false;
+        assert_eq!(
+            evaluate_wb_automation(&policy(), &incomplete)
+                .unwrap()
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::SpendDataIncomplete,
+            }
+        );
+    }
+
+    #[test]
+    fn robot_v1_policy_is_valid_and_starts_in_shadow_mode() {
         let robot_policy = serde_json::from_str::<WbAutomationPolicy>(include_str!(
             "../../config/wb-automation-robot.json"
         ))
@@ -1393,6 +1349,7 @@ mod tests {
             paused_by_automation: false,
             budget_remaining_minor: 100_000,
             daily_spend_minor: 0,
+            daily_spend_complete: true,
             actions_today: 0,
             last_action_at: None,
             attribution_complete: false,
@@ -1405,9 +1362,10 @@ mod tests {
                 .unwrap()
                 .action,
             WbAutomationAction::Hold {
-                reason: WbAutomationHoldReason::ObserveOnly
+                reason: WbAutomationHoldReason::PolicyShadowOnly
             }
         );
+        assert!(!robot_policy.write_enabled);
         assert!(!robot_policy.allow_budget_top_up);
     }
 }

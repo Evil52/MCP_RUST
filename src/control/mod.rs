@@ -1,6 +1,7 @@
 mod automation;
 mod automation_executor;
 mod automation_observer;
+mod automation_postgres;
 mod config;
 mod plan;
 mod policy;
@@ -12,6 +13,7 @@ pub use automation::{
     WbAutomationDecision, WbAutomationDecisionError, WbAutomationDisableReason,
     WbAutomationHoldReason, WbAutomationObservation, WbAutomationPolicy,
     WbAutomationSkuObservation, evaluate_wb_automation, validate_wb_automation_policy,
+    wb_automation_business_date,
 };
 pub use automation_executor::{
     WbAutomationExecutionOutcome, WbAutomationExecutionReceipt, WbAutomationExecutor,
@@ -19,6 +21,10 @@ pub use automation_executor::{
 pub use automation_observer::{
     WbAutomationObserver, WbAutomationSnapshot, WbAutomationStateView,
     persist_wb_automation_snapshot,
+};
+pub use automation_postgres::{
+    WbAutomationCampaignLease, WbAutomationDatabaseState, WbAutomationLegacyStateSeed,
+    WbAutomationPostgresError, WbAutomationPostgresStore,
 };
 pub use config::{
     ControlAppConfig, ControlAuthConfig, ControlPolicyDatabaseConfig, ControlWbRuntimeConfig,

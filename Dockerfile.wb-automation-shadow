@@ -1,0 +1,23 @@
+FROM rust:1.98.0-alpine3.23@sha256:4743b6231029d726d7a0f81d730a7c9f4eff23225a4499c01e275efb5e260235 AS builder
+
+RUN apk add --no-cache clang cmake
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
+COPY src ./src
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    cargo build --locked --release --bin wb-automation \
+    && cp /build/target/release/wb-automation /build/wb-automation
+
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS runtime
+
+RUN addgroup -S -g 10001 automation \
+    && adduser -S -D -H -u 10001 -G automation automation
+
+COPY --from=builder /build/wb-automation /usr/local/bin/wb-automation
+
+USER automation
+ENTRYPOINT ["/usr/local/bin/wb-automation"]
