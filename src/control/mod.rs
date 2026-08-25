@@ -8,10 +8,10 @@ mod server;
 mod wb;
 
 pub use automation::{
-    WbAutomationAction, WbAutomationBidChange, WbAutomationBidReason, WbAutomationDecision,
-    WbAutomationDecisionError, WbAutomationDisableReason, WbAutomationHoldReason,
-    WbAutomationObservation, WbAutomationPolicy, WbAutomationSkuObservation,
-    evaluate_wb_automation, validate_wb_automation_policy,
+    WbAutomationAction, WbAutomationBidChange, WbAutomationBidReason, WbAutomationCampaignMetrics,
+    WbAutomationDecision, WbAutomationDecisionError, WbAutomationDisableReason,
+    WbAutomationHoldReason, WbAutomationObservation, WbAutomationPolicy,
+    WbAutomationSkuObservation, evaluate_wb_automation, validate_wb_automation_policy,
 };
 pub use automation_executor::{
     WbAutomationExecutionOutcome, WbAutomationExecutionReceipt, WbAutomationExecutor,

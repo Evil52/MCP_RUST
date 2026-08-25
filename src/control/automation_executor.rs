@@ -751,6 +751,7 @@ mod tests {
             actions_today: 0,
             last_action_at: None,
             attribution_complete: true,
+            campaign_level_metrics: None,
             skus: vec![WbAutomationSkuObservation {
                 nm_id: 1,
                 current_bid_kopecks: bid,
