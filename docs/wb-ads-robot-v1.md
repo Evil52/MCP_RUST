@@ -67,6 +67,30 @@ This P1 path remains shadow-only. It does not replace or enable the production
 executor until its rollout SHA passes CI and the old timer is explicitly
 stopped during a guarded migration.
 
+### Guarded local shadow rollout
+
+On the production Mac, install the five-minute PostgreSQL shadow only after the
+release SHA and local gates have passed:
+
+```bash
+./scripts/install-wb-automation-shadow-agent.sh \
+  --confirm-stop-legacy-writer-and-start-shadow
+```
+
+The installer fails unless the legacy state has no pending write. It stops the
+legacy safe-auto LaunchAgent first, stops the WB write-egress container, creates
+the restricted database role and schema on the existing position volume, then
+starts `com.ofk.mcp-ozon-wb-automation-shadow`. The shadow LaunchAgent mounts no
+writer token and invokes only `shadow-once-pg` every five minutes. The legacy
+plist is retained with the `.shadow-disabled` suffix, so a router reset, host
+restart or login cannot accidentally load both state owners.
+
+This command deliberately suspends automatic WB mutations. Do not bootstrap the
+legacy agent while the PostgreSQL shadow is active: both runtimes must never own
+campaign state concurrently. Enabling writes again requires a separate reviewed
+PostgreSQL executor and an explicit cutover; changing `write_enabled` alone is
+not a cutover.
+
 ## CPC compatibility corrections
 
 The supplied prompt names recommended-bid and search-cluster statistics as

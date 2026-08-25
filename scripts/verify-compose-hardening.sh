@@ -1574,6 +1574,32 @@ check_contains \
   "$project_dir/scripts/start-report-mail-scheduler.sh" \
   'mail-preflight "$REPORT_MAIL_CANARY_AUDIENCE_ID"'
 check_contains \
+  "WB automation shadow installer requires explicit legacy-writer shutdown" \
+  "$project_dir/scripts/install-wb-automation-shadow-agent.sh" \
+  "--confirm-stop-legacy-writer-and-start-shadow"
+check_contains \
+  "WB automation shadow installer stops the legacy LaunchAgent" \
+  "$project_dir/scripts/install-wb-automation-shadow-agent.sh" \
+  'launchctl bootout "$domain/$legacy_label"'
+check_contains \
+  "WB automation shadow installer disables legacy restart persistence" \
+  "$project_dir/scripts/install-wb-automation-shadow-agent.sh" \
+  'mv "$legacy_plist" "$legacy_plist_disabled"'
+check_contains \
+  "WB automation shadow installer removes legacy write egress" \
+  "$project_dir/scripts/install-wb-automation-shadow-agent.sh" \
+  'stop write-egress'
+check_contains \
+  "WB automation shadow runner uses an ephemeral no-dependency job" \
+  "$project_dir/scripts/run-wb-automation-shadow.sh" \
+  'run --rm --no-deps wb-automation-shadow'
+if grep -Fq -- 'WRITE_TOKEN' "$project_dir/scripts/run-wb-automation-shadow.sh"; then
+  printf 'FAIL WB automation shadow runner references a writer token\n' >&2
+  failures=$((failures + 1))
+else
+  printf 'ok   WB automation shadow runner has no writer-token capability\n'
+fi
+check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
   "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"
