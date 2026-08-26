@@ -1590,6 +1590,14 @@ check_contains \
   "$project_dir/scripts/install-wb-automation-shadow-agent.sh" \
   'stop write-egress'
 check_contains \
+  "WB automation shadow installer proves read egress before cutover" \
+  "$project_dir/scripts/install-wb-automation-shadow-agent.sh" \
+  'up -d --no-deps --wait --wait-timeout 60 ozon-egress'
+check_contains \
+  "WB automation shadow runner reads protected env outside Documents" \
+  "$project_dir/scripts/run-wb-automation-shadow.sh" \
+  'position_env="${WB_AUTOMATION_POSITION_ENV:-$runtime_dir/position.env}"'
+check_contains \
   "WB automation shadow runner uses an ephemeral no-dependency job" \
   "$project_dir/scripts/run-wb-automation-shadow.sh" \
   'run --rm --no-deps wb-automation-shadow'
