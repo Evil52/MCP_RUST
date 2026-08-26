@@ -119,6 +119,32 @@ pub struct WbAutomationStateTransitionReceipt {
     pub state_revision: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyTransition {
+    ProtectiveLive,
+    BidWrites,
+}
+
+impl PolicyTransition {
+    const fn event_type(self) -> &'static str {
+        match self {
+            Self::ProtectiveLive => "protective_live_activated",
+            Self::BidWrites => "bid_writes_activated",
+        }
+    }
+
+    const fn mode(self) -> &'static str {
+        match self {
+            Self::ProtectiveLive => "protective_live",
+            Self::BidWrites => "bid_live",
+        }
+    }
+
+    const fn bid_writes_enabled(self) -> bool {
+        matches!(self, Self::BidWrites)
+    }
+}
+
 #[derive(Debug)]
 struct LockedStateSummary {
     business_date: NaiveDate,
@@ -371,9 +397,39 @@ impl WbAutomationCampaignLease<'_> {
         shadow_policy_digest: &str,
         live_policy_digest: &str,
     ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
-        validate_digest(shadow_policy_digest)?;
-        validate_digest(live_policy_digest)?;
-        if shadow_policy_digest == live_policy_digest {
+        self.activate_policy_transition(
+            shadow_policy_digest,
+            live_policy_digest,
+            PolicyTransition::ProtectiveLive,
+        )
+        .await
+    }
+
+    /// Enables the exact reviewed bid policy from protective live mode while
+    /// preserving every mutable campaign guard. No unresolved write or
+    /// incident may exist, and replaying the same activation is idempotent.
+    pub async fn activate_bid_writes_policy(
+        &mut self,
+        protective_policy_digest: &str,
+        bid_policy_digest: &str,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        self.activate_policy_transition(
+            protective_policy_digest,
+            bid_policy_digest,
+            PolicyTransition::BidWrites,
+        )
+        .await
+    }
+
+    async fn activate_policy_transition(
+        &mut self,
+        source_policy_digest: &str,
+        target_policy_digest: &str,
+        transition: PolicyTransition,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        validate_digest(source_policy_digest)?;
+        validate_digest(target_policy_digest)?;
+        if source_policy_digest == target_policy_digest {
             return Err(WbAutomationPostgresError::InvalidInput);
         }
         let client = self
@@ -399,7 +455,7 @@ impl WbAutomationCampaignLease<'_> {
         let incident = state.get::<_, Option<&str>>(2);
         let revision = state.get::<_, i64>(3);
         ensure_protective_live_guard(pending.is_none() && incident.is_none() && revision > 0)?;
-        if current_digest == live_policy_digest {
+        if current_digest == target_policy_digest {
             let state_revision =
                 u64::try_from(revision).map_err(|_| WbAutomationPostgresError::StateChanged)?;
             transaction
@@ -411,7 +467,7 @@ impl WbAutomationCampaignLease<'_> {
                 state_revision,
             });
         }
-        if current_digest != shadow_policy_digest {
+        if current_digest != source_policy_digest {
             return Err(WbAutomationPostgresError::StateChanged);
         }
         let unresolved = transaction
@@ -432,7 +488,7 @@ impl WbAutomationCampaignLease<'_> {
                 "SELECT cycle_id FROM wb_automation.cycles \
                  WHERE account_id=$1 AND advert_id=$2 AND policy_digest=$3 \
                  ORDER BY observed_at DESC LIMIT 1",
-                &[&self.account_id, &self.campaign_id, &shadow_policy_digest],
+                &[&self.account_id, &self.campaign_id, &source_policy_digest],
             )
             .await
             .map_err(|_| WbAutomationPostgresError::Unavailable)?
@@ -451,9 +507,9 @@ impl WbAutomationCampaignLease<'_> {
                 &[
                     &self.account_id,
                     &self.campaign_id,
-                    &live_policy_digest,
+                    &target_policy_digest,
                     &next_revision,
-                    &shadow_policy_digest,
+                    &source_policy_digest,
                     &revision,
                 ],
             )
@@ -461,15 +517,15 @@ impl WbAutomationCampaignLease<'_> {
             .map_err(|_| WbAutomationPostgresError::Unavailable)?;
         ensure_one_row(updated)?;
         let event_key = audit_event_key(
-            shadow_policy_digest,
-            "protective_live_activated",
-            live_policy_digest,
+            source_policy_digest,
+            transition.event_type(),
+            target_policy_digest,
         );
         let payload_json = serde_json::json!({
-            "from_policy_sha256": shadow_policy_digest,
-            "to_policy_sha256": live_policy_digest,
-            "mode": "protective_live",
-            "bid_writes_enabled": false,
+            "from_policy_sha256": source_policy_digest,
+            "to_policy_sha256": target_policy_digest,
+            "mode": transition.mode(),
+            "bid_writes_enabled": transition.bid_writes_enabled(),
             "state_revision": next_revision,
         })
         .to_string();
@@ -480,7 +536,7 @@ impl WbAutomationCampaignLease<'_> {
                 cycle_id: &cycle_id,
                 account_id: &self.account_id,
                 campaign_id: self.campaign_id,
-                event_type: "protective_live_activated",
+                event_type: transition.event_type(),
                 idempotency_key: None,
                 payload_json: &payload_json,
             },

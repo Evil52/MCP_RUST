@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
         Command::ActivateProtectiveLivePostgres(options) => {
             activate_protective_live_postgres(options).await
         }
+        Command::ActivateBidWritesPostgres(options) => activate_bid_writes_postgres(options).await,
         Command::ExecutePostgres(options) => execute_postgres_once(options).await,
         Command::Execute(options) => execute_once(options).await,
         Command::Auto(options) => auto_once(options).await,
@@ -39,14 +40,14 @@ async fn main() -> Result<()> {
 }
 
 async fn activate_protective_live_postgres(options: ActivatePolicyOptions) -> Result<()> {
-    let shadow = build_observer(&options.shadow)?;
+    let shadow = build_observer(&options.source)?;
     let live = build_observer(&ObserveOptions {
-        policy: options.live_policy,
-        registry: options.shadow.registry.clone(),
-        reader_token: options.shadow.reader_token.clone(),
+        policy: options.target_policy,
+        registry: options.source.registry.clone(),
+        reader_token: options.source.reader_token.clone(),
         state_directory: PathBuf::new(),
-        allow_broad_reader: options.shadow.allow_broad_reader,
-        reader_proxy_url: options.shadow.reader_proxy_url.clone(),
+        allow_broad_reader: options.source.allow_broad_reader,
+        reader_proxy_url: options.source.reader_proxy_url.clone(),
     })?;
     ensure!(
         !shadow.policy().write_enabled
@@ -95,6 +96,70 @@ async fn activate_protective_live_postgres(options: ActivatePolicyOptions) -> Re
             },
             "state_revision": receipt.state_revision,
             "bid_writes_enabled": false,
+        })
+    );
+    Ok(())
+}
+
+async fn activate_bid_writes_postgres(options: ActivatePolicyOptions) -> Result<()> {
+    let protective = build_observer(&options.source)?;
+    let bid_live = build_observer(&ObserveOptions {
+        policy: options.target_policy,
+        registry: options.source.registry.clone(),
+        reader_token: options.source.reader_token.clone(),
+        state_directory: PathBuf::new(),
+        allow_broad_reader: options.source.allow_broad_reader,
+        reader_proxy_url: options.source.reader_proxy_url.clone(),
+    })?;
+    ensure!(
+        protective.policy().write_enabled
+            && !protective.policy().bid_writes_enabled
+            && bid_live.policy().write_enabled
+            && bid_live.policy().bid_writes_enabled,
+        "WB automation bid-live cutover policy modes are invalid"
+    );
+    let mut expected_protective = bid_live.policy().clone();
+    expected_protective.bid_writes_enabled = false;
+    ensure!(
+        protective.policy() == &expected_protective,
+        "WB automation bid-live policy expands the reviewed protective scope"
+    );
+    let now = Utc::now();
+    ensure!(
+        now >= bid_live.policy().authorized_at && now < bid_live.policy().authorization_expires_at,
+        "WB automation bid-live authorization is not active"
+    );
+    let database_url =
+        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
+    let database_config =
+        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
+    let store = WbAutomationPostgresStore::connect(&database_config).await?;
+    store.verify_runtime_contract().await?;
+    let Some(mut lease) = store
+        .try_acquire_campaign(
+            bid_live.policy().account_id.as_str(),
+            bid_live.policy().campaign_id,
+        )
+        .await?
+    else {
+        bail!("WB automation bid-live campaign lock is contended");
+    };
+    let receipt = lease
+        .activate_bid_writes_policy(protective.policy_sha256(), bid_live.policy_sha256())
+        .await?;
+    lease.release().await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "account_id": bid_live.policy().account_id,
+            "campaign_id": bid_live.policy().campaign_id,
+            "outcome": if receipt.changed {
+                "bid_writes_activated"
+            } else {
+                "bid_writes_already_active"
+            },
+            "state_revision": receipt.state_revision,
+            "bid_writes_enabled": true,
         })
     );
     Ok(())
@@ -303,14 +368,15 @@ enum Command {
     Observe(ObserveOptions),
     ShadowPostgres(ShadowPostgresOptions),
     ActivateProtectiveLivePostgres(ActivatePolicyOptions),
+    ActivateBidWritesPostgres(ActivatePolicyOptions),
     ExecutePostgres(PostgresExecuteOptions),
     Execute(ExecuteOptions),
     Auto(ExecuteOptions),
 }
 
 struct ActivatePolicyOptions {
-    shadow: ObserveOptions,
-    live_policy: PathBuf,
+    source: ObserveOptions,
+    target_policy: PathBuf,
 }
 
 struct ShadowPostgresOptions {
@@ -370,7 +436,7 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
     {
         return Ok(Command::ActivateProtectiveLivePostgres(
             ActivatePolicyOptions {
-                shadow: ObserveOptions {
+                source: ObserveOptions {
                     policy: shadow_policy.into(),
                     registry: registry.into(),
                     reader_token: reader_token.into(),
@@ -378,9 +444,32 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
                     allow_broad_reader: parse_bool(broad_reader)?,
                     reader_proxy_url: optional_proxy(tail)?,
                 },
-                live_policy: live_policy.into(),
+                target_policy: live_policy.into(),
             },
         ));
+    }
+    if let [
+        command,
+        protective_policy,
+        bid_policy,
+        registry,
+        reader_token,
+        broad_reader,
+        tail @ ..,
+    ] = arguments
+        && command == "activate-bid-writes-pg"
+    {
+        return Ok(Command::ActivateBidWritesPostgres(ActivatePolicyOptions {
+            source: ObserveOptions {
+                policy: protective_policy.into(),
+                registry: registry.into(),
+                reader_token: reader_token.into(),
+                state_directory: PathBuf::new(),
+                allow_broad_reader: parse_bool(broad_reader)?,
+                reader_proxy_url: optional_proxy(tail)?,
+            },
+            target_policy: bid_policy.into(),
+        }));
     }
     if let [
         command,
@@ -512,7 +601,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
+        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
     )
 }
 

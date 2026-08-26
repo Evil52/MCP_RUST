@@ -1735,6 +1735,42 @@ check_contains \
   "$project_dir/scripts/install-wb-automation-live-agent.sh" \
   "activate-protective-live-pg"
 check_contains \
+  "WB automation bid-live installer requires explicit bid-write cutover" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  "--confirm-enable-reviewed-bid-writes"
+check_contains \
+  "WB automation bid-live installer proves the new observer without writes" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  "observe-once"
+check_contains \
+  "WB automation bid-live installer validates the read-only preflight" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  'WB automation bid-live read-only preflight did not complete'
+check_contains \
+  "WB automation bid-live installer stops the protective LaunchAgent" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  'launchctl bootout "$domain/$label"'
+check_contains \
+  "WB automation bid-live installer waits for the one-shot worker" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  'label=com.docker.compose.service=wb-automation-live'
+check_contains \
+  "WB automation bid-live installer uses the audited PostgreSQL transition" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  "activate-bid-writes-pg"
+check_contains \
+  "WB automation bid-live installer validates activation outcome" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  '.outcome == "bid_writes_activated"'
+check_contains \
+  "WB automation bid-live installer enables the runner mode explicitly" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  "WB_AUTOMATION_BID_WRITES_ENABLED=true"
+check_contains \
+  "WB automation protective installer pins bid writes off" \
+  "$project_dir/scripts/install-wb-automation-live-agent.sh" \
+  's|__BID_WRITES_ENABLED__|false|g'
+check_contains \
   "WB automation live runner uses an ephemeral no-dependency job" \
   "$project_dir/scripts/run-wb-automation-live.sh" \
   'run --rm --no-deps wb-automation-live'
