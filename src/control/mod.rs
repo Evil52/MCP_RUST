@@ -17,6 +17,7 @@ pub use automation::{
 };
 pub use automation_executor::{
     WbAutomationExecutionOutcome, WbAutomationExecutionReceipt, WbAutomationExecutor,
+    WbAutomationPostgresExecutionReceipt,
 };
 pub use automation_observer::{
     WbAutomationObserver, WbAutomationSnapshot, WbAutomationStateView,

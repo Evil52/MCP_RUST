@@ -361,6 +361,46 @@ impl WbAutomationCampaignLease<'_> {
         row.as_ref().map(parse_state).transpose()
     }
 
+    /// Loads the exact unresolved action referenced by the locked campaign
+    /// state. The revision check prevents a stale observation from being used
+    /// to reconcile a newer action.
+    pub async fn load_pending_action(
+        &mut self,
+        idempotency_key: &str,
+        expected_state_revision: u64,
+    ) -> Result<WbAutomationDurableAction, WbAutomationPostgresError> {
+        validate_digest(idempotency_key)?;
+        let expected_revision = to_i64(expected_state_revision)?;
+        let client = self
+            .client
+            .as_mut()
+            .ok_or(WbAutomationPostgresError::Unavailable)?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+        verify_pending_state(
+            &transaction,
+            &self.account_id,
+            self.campaign_id,
+            idempotency_key,
+            expected_revision,
+        )
+        .await?;
+        let action = load_action_in_transaction(
+            &transaction,
+            &self.account_id,
+            self.campaign_id,
+            idempotency_key,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+        Ok(action)
+    }
+
     /// Persists one immutable shadow observation while checking the exact
     /// state revision under the campaign lock. Duplicate delivery of the same
     /// cycle is accepted only when every persisted field is identical.
@@ -688,6 +728,107 @@ impl WbAutomationCampaignLease<'_> {
             ResolutionKind::ReconciliationRequired,
         )
         .await
+    }
+
+    /// Locks a campaign after a safety invariant fails before any marketplace
+    /// write is reserved. The incident is sticky by database trigger and every
+    /// transition is tied to an already persisted observation cycle.
+    pub async fn mark_incident_without_action(
+        &mut self,
+        cycle_id: &str,
+        expected_state_revision: u64,
+        business_date: NaiveDate,
+        incident_class: &str,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        validate_digest(cycle_id)?;
+        if !validate_error_class(incident_class) {
+            return Err(WbAutomationPostgresError::InvalidInput);
+        }
+        let expected_revision = to_i64(expected_state_revision)?;
+        let client = self
+            .client
+            .as_mut()
+            .ok_or(WbAutomationPostgresError::Unavailable)?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+        let state =
+            load_locked_state_summary(&transaction, &self.account_id, self.campaign_id).await?;
+        if state.revision != expected_revision
+            || state.pending_idempotency_key.is_some()
+            || state.incident_class.is_some()
+            || business_date < state.business_date
+        {
+            return Err(WbAutomationPostgresError::StateChanged);
+        }
+        let cycle_matches = transaction
+            .query_opt(
+                "SELECT 1 FROM wb_automation.cycles \
+                 WHERE cycle_id=$1 AND account_id=$2 AND advert_id=$3 \
+                   AND business_date=$4 AND state_revision=$5",
+                &[
+                    &cycle_id,
+                    &self.account_id,
+                    &self.campaign_id,
+                    &business_date,
+                    &expected_revision,
+                ],
+            )
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?
+            .is_some();
+        if !cycle_matches {
+            return Err(WbAutomationPostgresError::StateChanged);
+        }
+        let new_revision = expected_revision
+            .checked_add(1)
+            .ok_or(WbAutomationPostgresError::InvalidInput)?;
+        let updated = transaction
+            .execute(
+                "UPDATE wb_automation.execution_state SET \
+                    business_date=$3, \
+                    actions_today=CASE WHEN business_date < $3 THEN 0 ELSE actions_today END, \
+                    incident_class=$4, revision=$5 \
+                 WHERE account_id=$1 AND advert_id=$2 AND revision=$6",
+                &[
+                    &self.account_id,
+                    &self.campaign_id,
+                    &business_date,
+                    &incident_class,
+                    &new_revision,
+                    &expected_revision,
+                ],
+            )
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+        ensure_one_row(updated)?;
+        let payload = serde_json::to_string(&serde_json::json!({
+            "incident_class": incident_class,
+        }))
+        .map_err(|_| WbAutomationPostgresError::InvalidInput)?;
+        insert_audit_event(
+            &transaction,
+            &AuditEvent {
+                event_key: &audit_event_key(cycle_id, "incident_locked", incident_class),
+                cycle_id,
+                account_id: &self.account_id,
+                campaign_id: self.campaign_id,
+                event_type: "incident_locked",
+                idempotency_key: None,
+                payload_json: &payload,
+            },
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+        Ok(WbAutomationStateTransitionReceipt {
+            changed: true,
+            state_revision: u64::try_from(new_revision)
+                .map_err(|_| WbAutomationPostgresError::Unavailable)?,
+        })
     }
 
     async fn resolve_without_write(

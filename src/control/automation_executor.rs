@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::{Marketplace, RegistrySource},
@@ -23,8 +24,13 @@ use super::{
     automation_observer::{
         WbAutomationObserver, WbAutomationStateView, persist_wb_automation_snapshot,
     },
+    automation_postgres::{
+        WbAutomationActionReservation, WbAutomationCampaignLease, WbAutomationDurableAction,
+        WbAutomationDurableActionKind, WbAutomationDurableActionStatus,
+        WbAutomationLegacyStateSeed, WbAutomationPostgresStore,
+    },
     config::{read_control_token, validate_wb_writer_token},
-    wb::{WbBidWriteClient, WbPreparedBidChange},
+    wb::{WbBidWriteClient, WbGuardedWriteError, WbPreparedBidChange},
 };
 
 const STATE_SCHEMA_VERSION: u32 = 1;
@@ -35,6 +41,7 @@ const READBACK_GRACE: ChronoDuration = ChronoDuration::minutes(5);
 #[serde(rename_all = "snake_case")]
 pub enum WbAutomationExecutionOutcome {
     Observed,
+    ReservationCancelled,
     WriteSentReconciliationRequired,
     AwaitingReadback,
     Reconciled,
@@ -48,6 +55,18 @@ pub struct WbAutomationExecutionReceipt {
     pub decision: WbAutomationDecision,
     pub outcome: WbAutomationExecutionOutcome,
     pub snapshot_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WbAutomationPostgresExecutionReceipt {
+    pub observed_at: DateTime<Utc>,
+    pub decision: WbAutomationDecision,
+    pub outcome: WbAutomationExecutionOutcome,
+    pub cycle_id: String,
+    pub cycle_inserted: bool,
+    pub legacy_imported: bool,
+    pub state_revision: u64,
 }
 
 pub struct WbAutomationExecutor {
@@ -207,6 +226,214 @@ impl WbAutomationExecutor {
         ))
     }
 
+    #[must_use]
+    pub const fn policy(&self) -> &super::automation::WbAutomationPolicy {
+        self.observer.policy()
+    }
+
+    #[must_use]
+    pub fn policy_sha256(&self) -> &str {
+        self.observer.policy_sha256()
+    }
+
+    /// Executes one write-capable cycle using PostgreSQL as the only mutable
+    /// source of truth. `None` means the campaign advisory lock is owned by a
+    /// different runtime or operator and no observation or write was attempted.
+    pub async fn run_once_postgres(
+        &self,
+        store: &WbAutomationPostgresStore,
+        legacy: &WbAutomationLegacyStateSeed,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<WbAutomationPostgresExecutionReceipt>> {
+        let policy = self.observer.policy();
+        ensure!(
+            policy.write_enabled,
+            "PostgreSQL executor refuses a shadow-only policy"
+        );
+        let Some(mut lease) = store
+            .try_acquire_campaign(&policy.account_id, policy.campaign_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let existing = lease.load_state().await?;
+        let legacy_imported = if let Some(existing) = existing.as_ref() {
+            ensure!(
+                existing.policy_digest == self.observer.policy_sha256()
+                    && existing.imported_legacy_digest.as_deref()
+                        == Some(legacy.legacy_digest.as_str()),
+                "WB automation PostgreSQL state does not match policy or legacy seed"
+            );
+            false
+        } else {
+            lease.initialize_from_legacy(legacy).await?
+        };
+        let state = match existing {
+            Some(state) => state,
+            None => lease
+                .load_state()
+                .await?
+                .context("WB automation PostgreSQL state is unavailable")?,
+        };
+        let business_date = wb_automation_business_date(observed_at);
+        let state_view = WbAutomationStateView {
+            paused_by_automation: state
+                .paused_for_daily_cap_on
+                .is_some_and(|paused_on| paused_on < business_date),
+            actions_today: if state.business_date == business_date {
+                state.actions_today
+            } else {
+                0
+            },
+            last_action_at: state.last_action_at,
+        };
+        let snapshot = self.observer.observe(observed_at, state_view).await?;
+        let snapshot_json = serde_json::to_string(&snapshot)?;
+        let decision_json = serde_json::to_string(&snapshot.decision)?;
+        let cycle_id = sha256_domain("wb-automation-cycle-v1", snapshot_json.as_bytes());
+        let cycle_inserted = lease
+            .persist_shadow_cycle(
+                &cycle_id,
+                self.observer.policy_sha256(),
+                snapshot.observation.observed_at,
+                business_date,
+                state.revision,
+                &snapshot_json,
+                &decision_json,
+            )
+            .await?;
+        let decision = snapshot.decision.clone();
+
+        if let Some(idempotency_key) = state.pending_idempotency_key.as_deref() {
+            let action = lease
+                .load_pending_action(idempotency_key, state.revision)
+                .await?;
+            let (outcome, state_revision) = reconcile_postgres_pending(
+                &snapshot.observation,
+                &mut lease,
+                &action,
+                state.revision,
+                &cycle_id,
+            )
+            .await?;
+            lease.release().await?;
+            return Ok(Some(postgres_receipt(
+                decision,
+                outcome,
+                cycle_id,
+                cycle_inserted,
+                legacy_imported,
+                state_revision,
+            )));
+        }
+        if state.incident_class.is_some() {
+            lease.release().await?;
+            return Ok(Some(postgres_receipt(
+                decision,
+                WbAutomationExecutionOutcome::IncidentLocked,
+                cycle_id,
+                cycle_inserted,
+                legacy_imported,
+                state.revision,
+            )));
+        }
+        if snapshot.observation.daily_spend_minor >= policy.daily_spend_cap_minor {
+            let transition = lease
+                .mark_incident_without_action(
+                    &cycle_id,
+                    state.revision,
+                    business_date,
+                    "daily_spend_cap_breached",
+                )
+                .await?;
+            lease.release().await?;
+            return Ok(Some(postgres_receipt(
+                decision,
+                WbAutomationExecutionOutcome::IncidentLocked,
+                cycle_id,
+                cycle_inserted,
+                legacy_imported,
+                transition.state_revision,
+            )));
+        }
+
+        let Some(pending) = pending_from_decision(
+            &decision.action,
+            &snapshot.observation,
+            policy.min_bid_kopecks,
+            observed_at,
+        ) else {
+            lease.release().await?;
+            return Ok(Some(postgres_receipt(
+                decision,
+                WbAutomationExecutionOutcome::Observed,
+                cycle_id,
+                cycle_inserted,
+                legacy_imported,
+                state.revision,
+            )));
+        };
+        let request_json = serde_json::to_string(&pending.kind)?;
+        let request_digest = sha256_domain("wb-automation-request-v1", request_json.as_bytes());
+        let idempotency_material = format!("{cycle_id}:{request_digest}");
+        let idempotency_key =
+            sha256_domain("wb-automation-action-v1", idempotency_material.as_bytes());
+        let reservation = WbAutomationActionReservation {
+            idempotency_key: idempotency_key.clone(),
+            cycle_id: cycle_id.clone(),
+            policy_digest: self.observer.policy_sha256().to_owned(),
+            request_digest,
+            action_kind: durable_action_kind(&pending.kind)
+                .context("WB automation PostgreSQL action kind is unsupported")?,
+            request_json,
+            business_date,
+            expected_state_revision: state.revision,
+            max_actions_per_day: policy.max_actions_per_day,
+        };
+        let reservation = lease.reserve_action(&reservation).await?;
+        let write_result = self
+            .send_pending_postgres(
+                &pending,
+                &mut lease,
+                &idempotency_key,
+                reservation.state_revision,
+            )
+            .await;
+        let (outcome, state_revision) = match classify_postgres_write(&write_result)? {
+            PostgresWriteResult::Sent => {
+                lease
+                    .mark_awaiting_readback(&idempotency_key, reservation.state_revision)
+                    .await?;
+                (
+                    WbAutomationExecutionOutcome::WriteSentReconciliationRequired,
+                    reservation.state_revision,
+                )
+            }
+            PostgresWriteResult::Ambiguous => {
+                let transition = lease
+                    .mark_reconciliation_required(
+                        &idempotency_key,
+                        reservation.state_revision,
+                        "write_result_ambiguous",
+                    )
+                    .await?;
+                (
+                    WbAutomationExecutionOutcome::WriteSentReconciliationRequired,
+                    transition.state_revision,
+                )
+            }
+        };
+        lease.release().await?;
+        Ok(Some(postgres_receipt(
+            decision,
+            outcome,
+            cycle_id,
+            cycle_inserted,
+            legacy_imported,
+            state_revision,
+        )))
+    }
+
     async fn send_pending(&self, pending: &PendingAction) -> Result<()> {
         let expected = pending.clone();
         let state_path = self.state_directory.join("execution-state.json");
@@ -241,6 +468,47 @@ impl WbAutomationExecutor {
             .map(|_| ())
             .map_err(|_| anyhow::anyhow!("WB automation write требует readback reconciliation"))
     }
+
+    async fn send_pending_postgres(
+        &self,
+        pending: &PendingAction,
+        lease: &mut WbAutomationCampaignLease<'_>,
+        idempotency_key: &str,
+        state_revision: u64,
+    ) -> Result<(), WbGuardedWriteError<super::automation_postgres::WbAutomationPostgresError>>
+    {
+        let permit = move || async move {
+            lease
+                .mark_write_started(idempotency_key, state_revision)
+                .await
+                .map(|_| ())
+        };
+        match &pending.kind {
+            PendingActionKind::ChangeBids { changes } => {
+                let prepared = changes
+                    .iter()
+                    .map(|change| WbPreparedBidChange {
+                        nm_id: change.nm_id,
+                        placement: WbBidPlacement::Search,
+                        before_bid_kopecks: change.from_bid_kopecks,
+                        bid_kopecks: change.to_bid_kopecks,
+                    })
+                    .collect::<Vec<_>>();
+                self.writer
+                    .change_bids_with_permit(self.observer.policy().campaign_id, &prepared, permit)
+                    .await
+                    .map(|_| ())
+            }
+            PendingActionKind::PauseCampaignForDailyCap => self
+                .writer
+                .pause_campaign_with_permit(self.observer.policy().campaign_id, permit)
+                .await
+                .map(|_| ()),
+            PendingActionKind::ResumeCampaignAfterDailyCap => Err(WbGuardedWriteError::Permit(
+                super::automation_postgres::WbAutomationPostgresError::InvalidInput,
+            )),
+        }
+    }
 }
 
 const fn receipt(
@@ -254,6 +522,172 @@ const fn receipt(
         outcome,
         snapshot_path,
     }
+}
+
+const fn postgres_receipt(
+    decision: WbAutomationDecision,
+    outcome: WbAutomationExecutionOutcome,
+    cycle_id: String,
+    cycle_inserted: bool,
+    legacy_imported: bool,
+    state_revision: u64,
+) -> WbAutomationPostgresExecutionReceipt {
+    WbAutomationPostgresExecutionReceipt {
+        observed_at: decision.observed_at,
+        decision,
+        outcome,
+        cycle_id,
+        cycle_inserted,
+        legacy_imported,
+        state_revision,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostgresWriteResult {
+    Sent,
+    Ambiguous,
+}
+
+fn classify_postgres_write(
+    result: &Result<(), WbGuardedWriteError<super::automation_postgres::WbAutomationPostgresError>>,
+) -> Result<PostgresWriteResult> {
+    match result {
+        Ok(()) => Ok(PostgresWriteResult::Sent),
+        Err(WbGuardedWriteError::Permit(error)) => Err(anyhow::Error::new(*error)
+            .context("WB automation final PostgreSQL permit is unavailable")),
+        Err(WbGuardedWriteError::Write(_)) => Ok(PostgresWriteResult::Ambiguous),
+    }
+}
+
+async fn reconcile_postgres_pending(
+    observation: &super::automation::WbAutomationObservation,
+    lease: &mut WbAutomationCampaignLease<'_>,
+    action: &WbAutomationDurableAction,
+    state_revision: u64,
+    readback_cycle_id: &str,
+) -> Result<(WbAutomationExecutionOutcome, u64)> {
+    let pending = pending_from_durable_action(action)?;
+    if action.status == WbAutomationDurableActionStatus::Reserved {
+        let transition = lease
+            .cancel_reserved(&action.idempotency_key, state_revision, "write_not_started")
+            .await?;
+        return Ok((
+            WbAutomationExecutionOutcome::ReservationCancelled,
+            transition.state_revision,
+        ));
+    }
+    ensure!(
+        !matches!(
+            action.status,
+            WbAutomationDurableActionStatus::Applied | WbAutomationDurableActionStatus::Cancelled
+        ),
+        "WB automation PostgreSQL pending action is already resolved"
+    );
+    if pending_is_visible(observation, &pending) {
+        let paused_on = durable_pause_date(&pending)?;
+        let transition = lease
+            .mark_applied(
+                &action.idempotency_key,
+                state_revision,
+                readback_cycle_id,
+                paused_on,
+            )
+            .await?;
+        return Ok((
+            WbAutomationExecutionOutcome::Reconciled,
+            transition.state_revision,
+        ));
+    }
+    if action.status == WbAutomationDurableActionStatus::ReconciliationRequired {
+        return Ok((WbAutomationExecutionOutcome::IncidentLocked, state_revision));
+    }
+    let write_started_at = action
+        .write_started_at
+        .context("WB automation PostgreSQL write timestamp is unavailable")?;
+    if observation.observed_at < write_started_at + READBACK_GRACE {
+        if action.status == WbAutomationDurableActionStatus::WriteStarted {
+            lease
+                .mark_awaiting_readback(&action.idempotency_key, state_revision)
+                .await?;
+        }
+        return Ok((
+            WbAutomationExecutionOutcome::AwaitingReadback,
+            state_revision,
+        ));
+    }
+    let transition = lease
+        .mark_reconciliation_required(
+            &action.idempotency_key,
+            state_revision,
+            "write_not_reconciled",
+        )
+        .await?;
+    Ok((
+        WbAutomationExecutionOutcome::IncidentLocked,
+        transition.state_revision,
+    ))
+}
+
+fn pending_from_durable_action(action: &WbAutomationDurableAction) -> Result<PendingAction> {
+    let kind = serde_json::from_str::<PendingActionKind>(&action.request_json)
+        .context("WB automation PostgreSQL action payload is invalid")?;
+    ensure!(
+        durable_action_kind(&kind) == Some(action.action_kind),
+        "WB automation PostgreSQL action payload does not match its kind"
+    );
+    Ok(PendingAction {
+        reserved_at: action.reserved_at,
+        kind,
+    })
+}
+
+fn pending_is_visible(
+    observation: &super::automation::WbAutomationObservation,
+    pending: &PendingAction,
+) -> bool {
+    match &pending.kind {
+        PendingActionKind::ChangeBids { changes } => changes
+            .iter()
+            .all(|change| bid_change_is_visible(observation, change)),
+        PendingActionKind::PauseCampaignForDailyCap => observation.campaign_status == 11,
+        PendingActionKind::ResumeCampaignAfterDailyCap => observation.campaign_status == 9,
+    }
+}
+
+fn durable_pause_date(pending: &PendingAction) -> Result<Option<NaiveDate>> {
+    match pending.kind {
+        PendingActionKind::PauseCampaignForDailyCap => {
+            Ok(Some(wb_automation_business_date(pending.reserved_at)))
+        }
+        PendingActionKind::ChangeBids { .. } => Ok(None),
+        PendingActionKind::ResumeCampaignAfterDailyCap => {
+            anyhow::bail!("PostgreSQL durable actions never contain automatic resume")
+        }
+    }
+}
+
+const fn durable_action_kind(kind: &PendingActionKind) -> Option<WbAutomationDurableActionKind> {
+    match kind {
+        PendingActionKind::ChangeBids { .. } => Some(WbAutomationDurableActionKind::ChangeBids),
+        PendingActionKind::PauseCampaignForDailyCap => {
+            Some(WbAutomationDurableActionKind::PauseCampaignForDailyCap)
+        }
+        PendingActionKind::ResumeCampaignAfterDailyCap => None,
+    }
+}
+
+fn sha256_domain(domain: &str, bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain.as_bytes());
+    digest.update([0]);
+    digest.update(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest.finalize() {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,12 +950,14 @@ fn validate_private_directory(path: &Path) -> Result<()> {
 mod tests {
     use std::{
         collections::BTreeMap,
+        str::FromStr,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use chrono::{TimeZone, Utc};
+    use tokio_postgres::Config;
 
     use super::*;
     use crate::{
@@ -535,6 +971,7 @@ mod tests {
 
     const TEST_SELLER_SID: &str = "123e4567-e89b-42d3-a456-426614174000";
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    static POSTGRES_EXECUTOR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct Fixture {
         root: PathBuf,
@@ -546,6 +983,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::new_for_campaign(39_682_633)
+        }
+
+        fn new_for_campaign(campaign_id: u64) -> Self {
             let id = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let root = std::env::temp_dir().join(format!(
                 "mcp-wb-automation-executor-{}-{id}",
@@ -562,6 +1003,7 @@ mod tests {
             ))
             .unwrap();
             test_policy.write_enabled = true;
+            test_policy.campaign_id = campaign_id;
             fs::write(&policy, serde_json::to_vec_pretty(&test_policy).unwrap()).unwrap();
             fs::write(
                 &registry,
@@ -663,10 +1105,10 @@ mod tests {
         format!("{header}.{payload}.{signature}")
     }
 
-    fn campaign_response(status: i32, bid: u64) -> serde_json::Value {
+    fn campaign_response_for(campaign_id: u64, status: i32, bid: u64) -> serde_json::Value {
         serde_json::json!({
             "adverts": [{
-                "id": 39_682_633,
+                "id": campaign_id,
                 "status": status,
                 "bid_type": "manual",
                 "settings": {
@@ -684,6 +1126,24 @@ mod tests {
     }
 
     fn reader_server(
+        status: i32,
+        bid: u64,
+        current_date: &str,
+        daily_spend_rubles: Option<u64>,
+        stock: u64,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        reader_server_for(
+            39_682_633,
+            status,
+            bid,
+            current_date,
+            daily_spend_rubles,
+            stock,
+        )
+    }
+
+    fn reader_server_for(
+        campaign_id: u64,
         status: i32,
         bid: u64,
         current_date: &str,
@@ -723,11 +1183,14 @@ mod tests {
             }));
         }
         let advertising_payload = serde_json::json!([{
-            "advertId": 39_682_633,
+            "advertId": campaign_id,
             "stats": stat_rows
         }]);
         mock_http(vec![
-            (200, campaign_response(status, bid).to_string()),
+            (
+                200,
+                campaign_response_for(campaign_id, status, bid).to_string(),
+            ),
             (200, serde_json::json!({"total": 1_000}).to_string()),
             (200, advertising_payload.to_string()),
             (
@@ -799,6 +1262,656 @@ mod tests {
             pending: Some(pending),
             incident_class: None,
         }
+    }
+
+    #[test]
+    fn durable_payloads_are_typed_visible_and_domain_separated() {
+        let change = WbAutomationBidChange {
+            nm_id: 1,
+            from_bid_kopecks: 100,
+            to_bid_kopecks: 115,
+            reason: WbAutomationBidReason::LowExposureExploration,
+        };
+        let request = PendingActionKind::ChangeBids {
+            changes: vec![change],
+        };
+        let mut action = WbAutomationDurableAction {
+            idempotency_key: "1".repeat(64),
+            cycle_id: "2".repeat(64),
+            policy_digest: "3".repeat(64),
+            request_digest: "4".repeat(64),
+            action_kind: WbAutomationDurableActionKind::ChangeBids,
+            request_json: serde_json::to_string(&request).unwrap(),
+            status: WbAutomationDurableActionStatus::AwaitingReadback,
+            reserved_at: now(),
+            write_started_at: Some(now()),
+            resolved_at: None,
+            readback_cycle_id: None,
+            last_error_class: None,
+        };
+        let pending = pending_from_durable_action(&action).unwrap();
+        assert_eq!(pending.kind, request);
+        assert!(pending_is_visible(&observation(9, 115), &pending));
+        assert!(!pending_is_visible(&observation(9, 114), &pending));
+        assert_eq!(
+            durable_action_kind(&pending.kind),
+            Some(WbAutomationDurableActionKind::ChangeBids)
+        );
+
+        let pause = PendingAction {
+            reserved_at: now(),
+            kind: PendingActionKind::PauseCampaignForDailyCap,
+        };
+        assert!(pending_is_visible(&observation(11, 100), &pause));
+        assert!(!pending_is_visible(&observation(9, 100), &pause));
+        assert_eq!(
+            durable_action_kind(&pause.kind),
+            Some(WbAutomationDurableActionKind::PauseCampaignForDailyCap)
+        );
+        assert_eq!(
+            durable_pause_date(&pause).unwrap(),
+            Some(wb_automation_business_date(now()))
+        );
+        let resume = PendingAction {
+            reserved_at: now(),
+            kind: PendingActionKind::ResumeCampaignAfterDailyCap,
+        };
+        assert!(pending_is_visible(&observation(9, 100), &resume));
+        assert_eq!(durable_action_kind(&resume.kind), None);
+        assert!(durable_pause_date(&resume).is_err());
+        assert_eq!(durable_pause_date(&pending).unwrap(), None);
+        assert_eq!(
+            classify_postgres_write(&Ok(())).unwrap(),
+            PostgresWriteResult::Sent
+        );
+        assert!(
+            classify_postgres_write(&Err(WbGuardedWriteError::Permit(
+                crate::control::automation_postgres::WbAutomationPostgresError::StateChanged,
+            )))
+            .is_err()
+        );
+        assert_eq!(
+            classify_postgres_write(&Err(WbGuardedWriteError::Write(
+                crate::control::wb::WbWriteError::InvalidRequest("coverage"),
+            )))
+            .unwrap(),
+            PostgresWriteResult::Ambiguous
+        );
+
+        action.action_kind = WbAutomationDurableActionKind::PauseCampaignForDailyCap;
+        assert!(pending_from_durable_action(&action).is_err());
+        action.request_json = "{".to_owned();
+        assert!(pending_from_durable_action(&action).is_err());
+        assert_ne!(
+            sha256_domain("wb-automation-cycle-v1", b"same"),
+            sha256_domain("wb-automation-action-v1", b"same")
+        );
+
+        let decision = WbAutomationDecision {
+            account_id: "account".to_owned(),
+            campaign_id: 1,
+            observed_at: now(),
+            action: WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::NoMaterialChange,
+            },
+            unresolved_stops: Vec::new(),
+        };
+        let receipt = postgres_receipt(
+            decision,
+            WbAutomationExecutionOutcome::Observed,
+            "5".repeat(64),
+            true,
+            false,
+            7,
+        );
+        assert_eq!(receipt.state_revision, 7);
+        assert!(receipt.cycle_inserted);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the PostgreSQL campaign lease is consumed by explicit async release"
+    )]
+    async fn postgres_executor_reserves_writes_and_reconciles_from_readback() {
+        #[cfg(coverage)]
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
+        #[cfg(not(coverage))]
+        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
+        let fixture = Fixture::new();
+        let observed_at = Utc::now();
+        let current_date = wb_automation_business_date(observed_at)
+            .format("%Y-%m-%d")
+            .to_string();
+        let (reader_url, _) = reader_server(9, 102, &current_date, Some(0), 10);
+        let (writer_url, writer_requests) = mock_http(vec![(200, "{}".to_owned())]);
+        let mut executor = fixture.executor(&reader_url, &writer_url);
+        let config = Config::from_str(&database_url).unwrap();
+        let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        store.verify_runtime_contract().await.unwrap();
+        let legacy = WbAutomationLegacyStateSeed {
+            policy_digest: executor.policy_sha256().to_owned(),
+            business_date: wb_automation_business_date(observed_at),
+            actions_today: 0,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: "f".repeat(64),
+        };
+
+        let first = executor
+            .run_once_postgres(&store, &legacy, observed_at)
+            .await
+            .unwrap()
+            .expect("campaign lock is available");
+        assert_eq!(
+            first.outcome,
+            WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+        );
+        assert_eq!(first.state_revision, 2);
+        assert!(first.cycle_inserted);
+        assert!(first.legacy_imported);
+        assert!(
+            writer_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("PATCH /api/advert/v1/bids")
+        );
+
+        let (readback_url, _) = reader_server(9, 117, &current_date, None, 10);
+        executor
+            .observer
+            .replace_client_for_test(WbClient::new_for_test(
+                Duration::from_secs(2),
+                BTreeMap::from([(
+                    "ip_domnyshev_wb".to_owned(),
+                    WbCredentials {
+                        token: "test-reader".to_owned(),
+                    },
+                )]),
+                &readback_url,
+                &readback_url,
+            ));
+        let reconciled = executor
+            .run_once_postgres(&store, &legacy, observed_at + ChronoDuration::minutes(1))
+            .await
+            .unwrap()
+            .expect("campaign lock is available");
+        assert_eq!(reconciled.outcome, WbAutomationExecutionOutcome::Reconciled);
+        assert_eq!(reconciled.state_revision, 3);
+        assert!(!reconciled.legacy_imported);
+
+        let lease = store
+            .try_acquire_campaign("ip_domnyshev_wb", 39_682_633)
+            .await
+            .unwrap()
+            .expect("executor released its campaign lock");
+        let state = lease.load_state().await.unwrap().unwrap();
+        assert_eq!(state.actions_today, 1);
+        assert!(state.pending_idempotency_key.is_none());
+        assert_eq!(state.revision, 3);
+        lease.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_executor_covers_holds_caps_pauses_and_ambiguous_readback() {
+        #[cfg(coverage)]
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
+        #[cfg(not(coverage))]
+        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
+        let config = Config::from_str(&database_url).unwrap();
+        let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        let observed_at = Utc::now();
+        let current_date = wb_automation_business_date(observed_at)
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let observed_campaign = 39_682_700;
+        let observed_fixture = Fixture::new_for_campaign(observed_campaign);
+        let (reader_url, _) = reader_server_for(observed_campaign, 9, 102, &current_date, None, 3);
+        let observed_executor = observed_fixture.executor(&reader_url, "http://127.0.0.1:1");
+        assert_eq!(observed_executor.policy().campaign_id, observed_campaign);
+        let observed_legacy = postgres_legacy(&observed_executor, observed_at, None);
+        assert_eq!(
+            observed_executor
+                .run_once_postgres(&store, &observed_legacy, observed_at)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            WbAutomationExecutionOutcome::Observed
+        );
+
+        let cap_campaign = 39_682_701;
+        let cap_fixture = Fixture::new_for_campaign(cap_campaign);
+        let (cap_url, _) = reader_server_for(cap_campaign, 9, 102, &current_date, Some(300), 10);
+        let mut cap_executor = cap_fixture.executor(&cap_url, "http://127.0.0.1:1");
+        let cap_legacy = postgres_legacy(&cap_executor, observed_at, None);
+        let capped = cap_executor
+            .run_once_postgres(&store, &cap_legacy, observed_at)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(capped.outcome, WbAutomationExecutionOutcome::IncidentLocked);
+        assert_eq!(capped.state_revision, 2);
+        let (clean_url, _) = reader_server_for(cap_campaign, 9, 102, &current_date, None, 10);
+        cap_executor
+            .observer
+            .replace_client_for_test(test_reader(&clean_url));
+        assert_eq!(
+            cap_executor
+                .run_once_postgres(
+                    &store,
+                    &cap_legacy,
+                    observed_at + ChronoDuration::minutes(1),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            WbAutomationExecutionOutcome::IncidentLocked
+        );
+
+        let pause_campaign = 39_682_702;
+        let pause_fixture = Fixture::new_for_campaign(pause_campaign);
+        let (pause_url, _) =
+            reader_server_for(pause_campaign, 9, 102, &current_date, Some(250), 10);
+        let (pause_writer_url, pause_requests) = mock_http(vec![(200, "{}".to_owned())]);
+        let mut pause_executor = pause_fixture.executor(&pause_url, &pause_writer_url);
+        let pause_legacy = postgres_legacy(&pause_executor, observed_at, None);
+        pause_executor
+            .run_once_postgres(&store, &pause_legacy, observed_at)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pause_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /adv/v0/pause")
+        );
+        let (pause_readback_url, _) =
+            reader_server_for(pause_campaign, 11, 102, &current_date, None, 10);
+        pause_executor
+            .observer
+            .replace_client_for_test(test_reader(&pause_readback_url));
+        assert_eq!(
+            pause_executor
+                .run_once_postgres(
+                    &store,
+                    &pause_legacy,
+                    observed_at + ChronoDuration::minutes(1),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            WbAutomationExecutionOutcome::Reconciled
+        );
+        let next_day = observed_at + ChronoDuration::days(1);
+        let next_date = wb_automation_business_date(next_day)
+            .format("%Y-%m-%d")
+            .to_string();
+        let (resume_url, _) = reader_server_for(pause_campaign, 11, 102, &next_date, None, 10);
+        pause_executor
+            .observer
+            .replace_client_for_test(test_reader(&resume_url));
+        let resume = pause_executor
+            .run_once_postgres(&store, &pause_legacy, next_day)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resume.outcome, WbAutomationExecutionOutcome::Observed);
+        assert_eq!(resume.state_revision, 3);
+
+        let ambiguous_campaign = 39_682_703;
+        let ambiguous_fixture = Fixture::new_for_campaign(ambiguous_campaign);
+        let (ambiguous_url, _) =
+            reader_server_for(ambiguous_campaign, 9, 102, &current_date, Some(0), 10);
+        let (ambiguous_writer_url, _) = mock_http(vec![(500, "{}".to_owned())]);
+        let ambiguous_executor = ambiguous_fixture.executor(&ambiguous_url, &ambiguous_writer_url);
+        let ambiguous_legacy = postgres_legacy(&ambiguous_executor, observed_at, None);
+        let ambiguous = ambiguous_executor
+            .run_once_postgres(&store, &ambiguous_legacy, observed_at)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ambiguous.outcome,
+            WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+        );
+        assert_eq!(ambiguous.state_revision, 3);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "campaign leases are deliberately held across lock-contention assertions"
+    )]
+    async fn postgres_executor_recovers_each_preexisting_pending_state_without_retry() {
+        #[cfg(coverage)]
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
+        #[cfg(not(coverage))]
+        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
+        let config = Config::from_str(&database_url).unwrap();
+        let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        let observed_at = Utc::now();
+        let current_date = wb_automation_business_date(observed_at)
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let locked_campaign = 39_682_710;
+        let locked_fixture = Fixture::new_for_campaign(locked_campaign);
+        let (locked_url, _) = reader_server_for(locked_campaign, 9, 102, &current_date, None, 3);
+        let locked_executor = locked_fixture.executor(&locked_url, "http://127.0.0.1:1");
+        let locked_legacy = postgres_legacy(&locked_executor, observed_at, None);
+        let lock_owner = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        let held = lock_owner
+            .try_acquire_campaign("ip_domnyshev_wb", locked_campaign)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            locked_executor
+                .run_once_postgres(&store, &locked_legacy, observed_at)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        held.release().await.unwrap();
+        let mut resume_lease = lock_owner
+            .try_acquire_campaign("ip_domnyshev_wb", locked_campaign)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            locked_executor
+                .send_pending_postgres(
+                    &PendingAction {
+                        reserved_at: observed_at,
+                        kind: PendingActionKind::ResumeCampaignAfterDailyCap,
+                    },
+                    &mut resume_lease,
+                    &"0".repeat(64),
+                    1,
+                )
+                .await,
+            Err(WbGuardedWriteError::Permit(
+                crate::control::automation_postgres::WbAutomationPostgresError::InvalidInput
+            ))
+        ));
+        resume_lease.release().await.unwrap();
+
+        let rollover_campaign = 39_682_711;
+        let rollover_fixture = Fixture::new_for_campaign(rollover_campaign);
+        let (rollover_url, _) =
+            reader_server_for(rollover_campaign, 9, 102, &current_date, None, 3);
+        let rollover_executor = rollover_fixture.executor(&rollover_url, "http://127.0.0.1:1");
+        let mut rollover_legacy = postgres_legacy(&rollover_executor, observed_at, None);
+        rollover_legacy.business_date = rollover_legacy.business_date.pred_opt().unwrap();
+        rollover_legacy.actions_today = 2;
+        rollover_legacy.last_action_at = Some(observed_at - ChronoDuration::hours(1));
+        assert_eq!(
+            rollover_executor
+                .run_once_postgres(&store, &rollover_legacy, observed_at)
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            WbAutomationExecutionOutcome::Observed
+        );
+
+        let cancelled_campaign = 39_682_712;
+        let cancelled_fixture = Fixture::new_for_campaign(cancelled_campaign);
+        let (cancelled_url, _) =
+            reader_server_for(cancelled_campaign, 9, 102, &current_date, None, 10);
+        let cancelled_executor = cancelled_fixture.executor(&cancelled_url, "http://127.0.0.1:1");
+        let cancelled_legacy = postgres_legacy(&cancelled_executor, observed_at, None);
+        seed_postgres_bid_action(
+            &store,
+            &cancelled_executor,
+            &cancelled_legacy,
+            observed_at,
+            false,
+        )
+        .await;
+        let cancelled = cancelled_executor
+            .run_once_postgres(
+                &store,
+                &cancelled_legacy,
+                observed_at + ChronoDuration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cancelled.outcome,
+            WbAutomationExecutionOutcome::ReservationCancelled
+        );
+        assert_eq!(cancelled.state_revision, 3);
+
+        let pending_campaign = 39_682_713;
+        let pending_fixture = Fixture::new_for_campaign(pending_campaign);
+        let (pending_url, _) = reader_server_for(pending_campaign, 9, 102, &current_date, None, 10);
+        let mut pending_executor = pending_fixture.executor(&pending_url, "http://127.0.0.1:1");
+        let pending_legacy = postgres_legacy(&pending_executor, observed_at, None);
+        seed_postgres_bid_action(
+            &store,
+            &pending_executor,
+            &pending_legacy,
+            observed_at,
+            true,
+        )
+        .await;
+        let awaiting = pending_executor
+            .run_once_postgres(
+                &store,
+                &pending_legacy,
+                observed_at + ChronoDuration::minutes(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            awaiting.outcome,
+            WbAutomationExecutionOutcome::AwaitingReadback
+        );
+        assert_eq!(awaiting.state_revision, 2);
+        let (still_waiting_url, _) =
+            reader_server_for(pending_campaign, 9, 102, &current_date, None, 10);
+        pending_executor
+            .observer
+            .replace_client_for_test(test_reader(&still_waiting_url));
+        assert_eq!(
+            pending_executor
+                .run_once_postgres(
+                    &store,
+                    &pending_legacy,
+                    observed_at + ChronoDuration::minutes(2),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            WbAutomationExecutionOutcome::AwaitingReadback
+        );
+        let (stale_url, _) = reader_server_for(pending_campaign, 9, 102, &current_date, None, 10);
+        pending_executor
+            .observer
+            .replace_client_for_test(test_reader(&stale_url));
+        let incident = pending_executor
+            .run_once_postgres(
+                &store,
+                &pending_legacy,
+                observed_at + ChronoDuration::minutes(10),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            incident.outcome,
+            WbAutomationExecutionOutcome::IncidentLocked
+        );
+        assert_eq!(incident.state_revision, 3);
+        let (locked_readback_url, _) =
+            reader_server_for(pending_campaign, 9, 102, &current_date, None, 10);
+        pending_executor
+            .observer
+            .replace_client_for_test(test_reader(&locked_readback_url));
+        assert_eq!(
+            pending_executor
+                .run_once_postgres(
+                    &store,
+                    &pending_legacy,
+                    observed_at + ChronoDuration::seconds(630),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .outcome,
+            WbAutomationExecutionOutcome::IncidentLocked
+        );
+        let (late_readback_url, _) =
+            reader_server_for(pending_campaign, 9, 117, &current_date, None, 10);
+        pending_executor
+            .observer
+            .replace_client_for_test(test_reader(&late_readback_url));
+        let recovered = pending_executor
+            .run_once_postgres(
+                &store,
+                &pending_legacy,
+                observed_at + ChronoDuration::minutes(11),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.outcome, WbAutomationExecutionOutcome::Reconciled);
+        assert_eq!(recovered.state_revision, 4);
+
+        let mut wrong_legacy = pending_legacy;
+        wrong_legacy.legacy_digest = "0".repeat(64);
+        assert!(
+            pending_executor
+                .run_once_postgres(
+                    &store,
+                    &wrong_legacy,
+                    observed_at + ChronoDuration::minutes(12),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    fn postgres_legacy(
+        executor: &WbAutomationExecutor,
+        observed_at: DateTime<Utc>,
+        incident_class: Option<&str>,
+    ) -> WbAutomationLegacyStateSeed {
+        WbAutomationLegacyStateSeed {
+            policy_digest: executor.policy_sha256().to_owned(),
+            business_date: wb_automation_business_date(observed_at),
+            actions_today: 0,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: incident_class.map(str::to_owned),
+            legacy_digest: sha256_domain(
+                "wb-automation-test-legacy-v1",
+                executor.policy_sha256().as_bytes(),
+            ),
+        }
+    }
+
+    fn test_reader(base_url: &str) -> WbClient {
+        WbClient::new_for_test(
+            Duration::from_secs(2),
+            BTreeMap::from([(
+                "ip_domnyshev_wb".to_owned(),
+                WbCredentials {
+                    token: "test-reader".to_owned(),
+                },
+            )]),
+            base_url,
+            base_url,
+        )
+    }
+
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the helper consumes its campaign lease through explicit async release"
+    )]
+    async fn seed_postgres_bid_action(
+        store: &WbAutomationPostgresStore,
+        executor: &WbAutomationExecutor,
+        legacy: &WbAutomationLegacyStateSeed,
+        observed_at: DateTime<Utc>,
+        write_started: bool,
+    ) {
+        let campaign_id = executor.policy().campaign_id;
+        let mut lease = store
+            .try_acquire_campaign("ip_domnyshev_wb", campaign_id)
+            .await
+            .unwrap()
+            .unwrap();
+        lease.initialize_from_legacy(legacy).await.unwrap();
+        let cycle_id = sha256_domain(
+            "wb-automation-test-cycle-v1",
+            campaign_id.to_string().as_bytes(),
+        );
+        lease
+            .persist_shadow_cycle(
+                &cycle_id,
+                executor.policy_sha256(),
+                observed_at - ChronoDuration::minutes(1),
+                wb_automation_business_date(observed_at),
+                1,
+                "{}",
+                "{}",
+            )
+            .await
+            .unwrap();
+        let request = PendingActionKind::ChangeBids {
+            changes: vec![WbAutomationBidChange {
+                nm_id: 449_627_598,
+                from_bid_kopecks: 102,
+                to_bid_kopecks: 117,
+                reason: WbAutomationBidReason::LowExposureExploration,
+            }],
+        };
+        let request_json = serde_json::to_string(&request).unwrap();
+        let idempotency_key = sha256_domain(
+            "wb-automation-test-action-v1",
+            campaign_id.to_string().as_bytes(),
+        );
+        lease
+            .reserve_action(&WbAutomationActionReservation {
+                idempotency_key: idempotency_key.clone(),
+                cycle_id,
+                policy_digest: executor.policy_sha256().to_owned(),
+                request_digest: sha256_domain(
+                    "wb-automation-test-request-v1",
+                    request_json.as_bytes(),
+                ),
+                action_kind: WbAutomationDurableActionKind::ChangeBids,
+                request_json,
+                business_date: wb_automation_business_date(observed_at),
+                expected_state_revision: 1,
+                max_actions_per_day: 2,
+            })
+            .await
+            .unwrap();
+        if write_started {
+            lease.mark_write_started(&idempotency_key, 2).await.unwrap();
+        }
+        lease.release().await.unwrap();
     }
 
     #[test]

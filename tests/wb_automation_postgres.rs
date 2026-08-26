@@ -306,12 +306,35 @@ async fn automation_state_is_isolated_locked_and_idempotent() {
         reserved.action.status,
         WbAutomationDurableActionStatus::Reserved
     );
+    assert_eq!(
+        lease.load_pending_action("short", 2).await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    assert_eq!(
+        lease
+            .load_pending_action(&reservation.idempotency_key, 1)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert_eq!(
+        lease
+            .load_pending_action(&reservation.idempotency_key, 2)
+            .await
+            .expect("pending action is loaded by exact state revision"),
+        reserved.action
+    );
     admin
         .batch_execute("REVOKE SELECT ON wb_automation.action_attempts FROM wb_automation_writer")
         .await
         .expect("reservation replay read fault is installed");
     assert_eq!(
         lease.reserve_action(&reservation).await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    assert_eq!(
+        lease
+            .load_pending_action(&reservation.idempotency_key, 2)
+            .await,
         Err(WbAutomationPostgresError::Unavailable)
     );
     admin
@@ -881,4 +904,106 @@ async fn automation_state_is_isolated_locked_and_idempotent() {
     admin_connection
         .await
         .expect("admin connection task shuts down");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the campaign lease is consumed by the explicit async release under test"
+)]
+async fn incident_without_action_is_sticky_audited_and_resets_daily_quota() {
+    let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+        return;
+    };
+    let config = Config::from_str(&database_url).expect("test database URL parses");
+    let store = WbAutomationPostgresStore::connect(&config)
+        .await
+        .expect("store connects");
+    let campaign_id = 9_000_000_u64 + CAMPAIGN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let account_id = format!("wb_automation_incident_{}", std::process::id());
+    let policy_digest = "7".repeat(64);
+    let cycle_id = "8".repeat(64);
+    let previous_date = NaiveDate::from_ymd_opt(2026, 8, 25).expect("valid date");
+    let business_date = previous_date.succ_opt().expect("next date exists");
+    let observed_at = Utc
+        .with_ymd_and_hms(2026, 8, 26, 12, 0, 0)
+        .single()
+        .expect("valid timestamp");
+    let mut lease = store
+        .try_acquire_campaign(&account_id, campaign_id)
+        .await
+        .expect("lock query succeeds")
+        .expect("campaign lock is acquired");
+    lease
+        .initialize_from_legacy(&WbAutomationLegacyStateSeed {
+            policy_digest: policy_digest.clone(),
+            business_date: previous_date,
+            actions_today: 2,
+            last_action_at: Some(observed_at - Duration::hours(1)),
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: "9".repeat(64),
+        })
+        .await
+        .expect("legacy state is initialized");
+    lease
+        .persist_shadow_cycle(
+            &cycle_id,
+            &policy_digest,
+            observed_at,
+            business_date,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("incident observation is persisted");
+    assert_eq!(
+        lease
+            .mark_incident_without_action("short", 1, business_date, "manual_resume_required")
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    assert_eq!(
+        lease
+            .mark_incident_without_action(&cycle_id, 1, business_date, "Bad")
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    assert_eq!(
+        lease
+            .mark_incident_without_action(&cycle_id, 2, business_date, "manual_resume_required",)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert_eq!(
+        lease
+            .mark_incident_without_action(&cycle_id, 1, previous_date, "manual_resume_required",)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let transition = lease
+        .mark_incident_without_action(&cycle_id, 1, business_date, "manual_resume_required")
+        .await
+        .expect("incident is locked atomically");
+    assert!(transition.changed);
+    assert_eq!(transition.state_revision, 2);
+    let state = lease
+        .load_state()
+        .await
+        .expect("state query succeeds")
+        .expect("state exists");
+    assert_eq!(state.business_date, business_date);
+    assert_eq!(state.actions_today, 0);
+    assert_eq!(
+        state.incident_class.as_deref(),
+        Some("manual_resume_required")
+    );
+    assert_eq!(
+        lease
+            .mark_incident_without_action(&cycle_id, 1, business_date, "manual_resume_required",)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    lease.release().await.expect("campaign lock is released");
 }

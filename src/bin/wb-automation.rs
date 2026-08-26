@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
     match parse_command(&std::env::args().skip(1).collect::<Vec<_>>())? {
         Command::Observe(options) => observe_once(options).await,
         Command::ShadowPostgres(options) => shadow_postgres_once(options).await,
+        Command::ExecutePostgres(options) => execute_postgres_once(options).await,
         Command::Execute(options) => execute_once(options).await,
         Command::Auto(options) => auto_once(options).await,
     }
@@ -138,6 +139,51 @@ async fn execute_once(options: ExecuteOptions) -> Result<()> {
     execute_once_at(options, Utc::now()).await
 }
 
+async fn execute_postgres_once(options: PostgresExecuteOptions) -> Result<()> {
+    let state_directory = options
+        .legacy_state
+        .parent()
+        .context("WB automation legacy state parent is unavailable")?;
+    let executor = WbAutomationExecutor::from_files(
+        &options.execute.policy,
+        &options.execute.registry,
+        &options.execute.reader_token,
+        &options.execute.writer_token,
+        state_directory,
+        options.execute.allow_broad_reader,
+        REQUEST_TIMEOUT,
+        options.execute.reader_proxy_url.as_deref(),
+        &options.execute.writer_proxy_url,
+    )?;
+    let legacy = load_legacy_state(
+        &options.legacy_state,
+        &executor.policy().account_id,
+        executor.policy().campaign_id,
+        executor.policy_sha256(),
+    )?;
+    let database_url =
+        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
+    let database_config =
+        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
+    let store = WbAutomationPostgresStore::connect(&database_config).await?;
+    store.verify_runtime_contract().await?;
+    match executor
+        .run_once_postgres(&store, &legacy, Utc::now())
+        .await?
+    {
+        Some(receipt) => println!("{}", serde_json::to_string(&receipt)?),
+        None => println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "account_id": executor.policy().account_id,
+                "campaign_id": executor.policy().campaign_id,
+                "outcome": "lock_contended",
+            }))?
+        ),
+    }
+    Ok(())
+}
+
 async fn execute_once_at(options: ExecuteOptions, now: chrono::DateTime<Utc>) -> Result<()> {
     let executor = WbAutomationExecutor::from_files(
         &options.policy,
@@ -191,12 +237,18 @@ async fn persist_observation(
 enum Command {
     Observe(ObserveOptions),
     ShadowPostgres(ShadowPostgresOptions),
+    ExecutePostgres(PostgresExecuteOptions),
     Execute(ExecuteOptions),
     Auto(ExecuteOptions),
 }
 
 struct ShadowPostgresOptions {
     observer: ObserveOptions,
+    legacy_state: PathBuf,
+}
+
+struct PostgresExecuteOptions {
+    execute: ExecuteOptions,
     legacy_state: PathBuf,
 }
 
@@ -252,6 +304,33 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
                 reader_token: reader_token.into(),
                 state_directory: PathBuf::new(),
                 allow_broad_reader: parse_bool(broad_reader)?,
+                reader_proxy_url: optional_proxy(tail)?,
+            },
+            legacy_state: legacy_state.into(),
+        }));
+    }
+    if let [
+        command,
+        policy,
+        registry,
+        reader_token,
+        writer_token,
+        legacy_state,
+        broad_reader,
+        writer_proxy_url,
+        tail @ ..,
+    ] = arguments
+        && command == "execute-once-pg"
+    {
+        return Ok(Command::ExecutePostgres(PostgresExecuteOptions {
+            execute: ExecuteOptions {
+                policy: policy.into(),
+                registry: registry.into(),
+                reader_token: reader_token.into(),
+                writer_token: writer_token.into(),
+                state_directory: PathBuf::new(),
+                allow_broad_reader: parse_bool(broad_reader)?,
+                writer_proxy_url: nonempty(writer_proxy_url)?,
                 reader_proxy_url: optional_proxy(tail)?,
             },
             legacy_state: legacy_state.into(),
@@ -337,7 +416,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
+        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
     )
 }
 
