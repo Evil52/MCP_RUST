@@ -331,9 +331,17 @@ impl WbAutomationExecutor {
             last_action_at: state.last_action_at,
         };
         let mut snapshot = self.observer.observe(observed_at, state_view).await?;
-        if let PostgresExecutionIntent::ExplicitExposureTarget(target_impressions) = intent {
-            snapshot.decision =
-                explicit_exposure_increase_decision(policy, &snapshot, target_impressions)?;
+        match intent {
+            PostgresExecutionIntent::ExplicitExposureTarget(target_impressions) => {
+                snapshot.decision =
+                    explicit_exposure_increase_decision(policy, &snapshot, target_impressions)?;
+            }
+            PostgresExecutionIntent::Automatic if policy.autonomous_pacing.is_enabled() => {
+                if let Some(decision) = autonomous_exposure_pacing_decision(policy, &snapshot)? {
+                    snapshot.decision = decision;
+                }
+            }
+            PostgresExecutionIntent::Automatic => {}
         }
         let snapshot_json = serde_json::to_string(&snapshot)?;
         let decision_json = serde_json::to_string(&snapshot.decision)?;
@@ -629,6 +637,77 @@ fn explicit_exposure_increase_decision(
         },
         unresolved_stops: Vec::new(),
     })
+}
+
+/// Turns an otherwise fail-closed campaign-level attribution hold into one
+/// bounded pacing step. Aggregate metrics may authorize more campaign
+/// exposure, but never pretend to identify SKU economics: the least-bid safe
+/// in-stock SKU is selected deterministically, one at a time.
+fn autonomous_exposure_pacing_decision(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+) -> Result<Option<WbAutomationDecision>> {
+    if !matches!(
+        snapshot.decision.action,
+        WbAutomationAction::Hold {
+            reason: super::automation::WbAutomationHoldReason::AttributionIncomplete
+        }
+    ) {
+        return Ok(None);
+    }
+    let Some(metrics) = snapshot.observation.campaign_level_metrics.as_ref() else {
+        return Ok(None);
+    };
+    let delivery_below_target = metrics.impressions < policy.target_impressions_per_day;
+    let no_order_signal_is_safe = if metrics.attributed_orders == 0 {
+        metrics.attributed_revenue_minor == 0 && metrics.clicks < policy.no_order_reduce_clicks
+    } else {
+        metrics.attributed_revenue_minor > 0
+            && u128::from(metrics.spend_minor) * 10_000
+                <= u128::from(metrics.attributed_revenue_minor)
+                    * u128::from(policy.target_drr_basis_points)
+    };
+    if !delivery_below_target || !no_order_signal_is_safe {
+        return Ok(None);
+    }
+    let Some(sku) = policy
+        .nm_ids
+        .iter()
+        .filter_map(|nm_id| {
+            snapshot
+                .observation
+                .skus
+                .iter()
+                .find(|sku| sku.nm_id == *nm_id)
+        })
+        .filter(|sku| {
+            sku.sellable_stock > policy.min_sellable_stock
+                && sku.current_bid_kopecks < policy.max_bid_kopecks
+        })
+        .min_by_key(|sku| sku.current_bid_kopecks)
+    else {
+        return Ok(None);
+    };
+    let to_bid_kopecks = super::automation::increase_bid(policy, sku.current_bid_kopecks)
+        .context("WB autonomous exposure pacing bid increase is invalid")?;
+    ensure!(
+        to_bid_kopecks > sku.current_bid_kopecks,
+        "WB autonomous exposure pacing bid cannot increase"
+    );
+    Ok(Some(WbAutomationDecision {
+        account_id: policy.account_id.clone(),
+        campaign_id: policy.campaign_id,
+        observed_at: snapshot.observation.observed_at,
+        action: WbAutomationAction::ChangeBids {
+            changes: vec![WbAutomationBidChange {
+                nm_id: sku.nm_id,
+                from_bid_kopecks: sku.current_bid_kopecks,
+                to_bid_kopecks,
+                reason: super::automation::WbAutomationBidReason::AutonomousExposurePacing,
+            }],
+        },
+        unresolved_stops: Vec::new(),
+    }))
 }
 
 const fn receipt(
@@ -1083,7 +1162,8 @@ mod tests {
     use crate::{
         control::automation::{
             WbAutomationBidReason, WbAutomationDisableReason, WbAutomationHoldReason,
-            WbAutomationObservation, WbAutomationPolicy, WbAutomationSkuObservation,
+            WbAutomationObservation, WbAutomationPacingMode, WbAutomationPolicy,
+            WbAutomationSkuObservation,
         },
         test_support::mock_http,
         wb::{WbClient, WbCredentials},
@@ -1682,6 +1762,193 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn autonomous_pacing_uses_target_and_campaign_efficiency_guards() {
+        let (policy, snapshot) = explicit_exposure_snapshot();
+        let decision = autonomous_exposure_pacing_decision(&policy, &snapshot)
+            .unwrap()
+            .expect("campaign below target has a bounded pacing step");
+        assert!(matches!(
+            decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes == &[WbAutomationBidChange {
+                    nm_id: 449_627_598,
+                    from_bid_kopecks: 117,
+                    to_bid_kopecks: 134,
+                    reason: WbAutomationBidReason::AutonomousExposurePacing,
+                }]
+        ));
+
+        let mut delivered = snapshot.clone();
+        delivered
+            .observation
+            .campaign_level_metrics
+            .as_mut()
+            .unwrap()
+            .impressions = policy.target_impressions_per_day;
+        assert_eq!(
+            autonomous_exposure_pacing_decision(&policy, &delivered).unwrap(),
+            None
+        );
+
+        let mut no_orders = snapshot.clone();
+        no_orders
+            .observation
+            .campaign_level_metrics
+            .as_mut()
+            .unwrap()
+            .clicks = policy.no_order_reduce_clicks;
+        assert_eq!(
+            autonomous_exposure_pacing_decision(&policy, &no_orders).unwrap(),
+            None
+        );
+
+        let mut expensive = snapshot.clone();
+        let metrics = expensive
+            .observation
+            .campaign_level_metrics
+            .as_mut()
+            .unwrap();
+        metrics.attributed_orders = 1;
+        metrics.attributed_revenue_minor = 1_000;
+        metrics.spend_minor = 200;
+        assert_eq!(
+            autonomous_exposure_pacing_decision(&policy, &expensive).unwrap(),
+            None
+        );
+
+        let mut guarded = snapshot;
+        guarded.decision.action = WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::CooldownActive,
+        };
+        assert_eq!(
+            autonomous_exposure_pacing_decision(&policy, &guarded).unwrap(),
+            None
+        );
+
+        let (policy, mut missing_metrics) = explicit_exposure_snapshot();
+        missing_metrics.observation.campaign_level_metrics = None;
+        assert_eq!(
+            autonomous_exposure_pacing_decision(&policy, &missing_metrics).unwrap(),
+            None
+        );
+
+        let (policy, mut no_candidate) = explicit_exposure_snapshot();
+        for sku in &mut no_candidate.observation.skus {
+            sku.current_bid_kopecks = policy.max_bid_kopecks;
+        }
+        assert_eq!(
+            autonomous_exposure_pacing_decision(&policy, &no_candidate).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_pacing_executes_only_when_typed_policy_enables_it() {
+        #[cfg(coverage)]
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
+        #[cfg(not(coverage))]
+        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
+        let config = Config::from_str(&database_url).unwrap();
+        let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        store.verify_runtime_contract().await.unwrap();
+        let observed_at = Utc::now();
+        let current_date = wb_automation_business_date(observed_at)
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let enabled_campaign = 39_682_721;
+        let enabled_fixture = Fixture::new_for_campaign(enabled_campaign);
+        let (enabled_reader, _) = campaign_level_reader_server_for(
+            enabled_campaign,
+            9,
+            [117, 117, 117],
+            &current_date,
+            2,
+            10,
+        );
+        let (enabled_writer, enabled_requests) = mock_http(vec![(200, "{}".to_owned())]);
+        let enabled = enabled_fixture.executor(&enabled_reader, &enabled_writer);
+        let enabled_legacy = WbAutomationLegacyStateSeed {
+            policy_digest: enabled.policy_sha256().to_owned(),
+            business_date: wb_automation_business_date(observed_at),
+            actions_today: 0,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: "c".repeat(64),
+        };
+        let paced = enabled
+            .run_once_postgres(&store, &enabled_legacy, observed_at)
+            .await
+            .unwrap()
+            .expect("enabled campaign lock is available");
+        assert_eq!(
+            paced.outcome,
+            WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+        );
+        assert!(matches!(
+            paced.decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes.len() == 1
+                    && changes[0].reason == WbAutomationBidReason::AutonomousExposurePacing
+        ));
+        assert!(
+            enabled_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("PATCH /api/advert/v1/bids")
+        );
+
+        let disabled_campaign = 39_682_722;
+        let disabled_fixture = Fixture::new_for_campaign(disabled_campaign);
+        let mut disabled_policy = serde_json::from_slice::<WbAutomationPolicy>(
+            &fs::read(&disabled_fixture.policy).unwrap(),
+        )
+        .unwrap();
+        disabled_policy.autonomous_pacing = WbAutomationPacingMode::Disabled;
+        fs::write(
+            &disabled_fixture.policy,
+            serde_json::to_vec_pretty(&disabled_policy).unwrap(),
+        )
+        .unwrap();
+        let (disabled_reader, _) = campaign_level_reader_server_for(
+            disabled_campaign,
+            9,
+            [117, 117, 117],
+            &current_date,
+            2,
+            10,
+        );
+        let (disabled_writer, disabled_requests) = mock_http(Vec::new());
+        let disabled = disabled_fixture.executor(&disabled_reader, &disabled_writer);
+        let disabled_legacy = WbAutomationLegacyStateSeed {
+            policy_digest: disabled.policy_sha256().to_owned(),
+            business_date: wb_automation_business_date(observed_at),
+            actions_today: 0,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: "d".repeat(64),
+        };
+        let held = disabled
+            .run_once_postgres(&store, &disabled_legacy, observed_at)
+            .await
+            .unwrap()
+            .expect("disabled campaign lock is available");
+        assert_eq!(held.outcome, WbAutomationExecutionOutcome::Observed);
+        assert!(matches!(
+            held.decision.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AttributionIncomplete
+            }
+        ));
+        assert!(disabled_requests.try_recv().is_err());
     }
 
     #[tokio::test]

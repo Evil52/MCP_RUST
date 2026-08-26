@@ -11,7 +11,7 @@ mod wb;
 pub use automation::{
     WbAutomationAction, WbAutomationBidChange, WbAutomationBidReason, WbAutomationCampaignMetrics,
     WbAutomationDecision, WbAutomationDecisionError, WbAutomationDisableReason,
-    WbAutomationHoldReason, WbAutomationObservation, WbAutomationPolicy,
+    WbAutomationHoldReason, WbAutomationObservation, WbAutomationPacingMode, WbAutomationPolicy,
     WbAutomationSkuObservation, evaluate_wb_automation, validate_wb_automation_policy,
     wb_automation_business_date,
 };

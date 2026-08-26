@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, NaiveDate, Utc};
 use mcp_ozon::control::{
-    WbAutomationExecutor, WbAutomationLegacyStateSeed, WbAutomationObserver,
+    WbAutomationExecutor, WbAutomationLegacyStateSeed, WbAutomationObserver, WbAutomationPolicy,
     WbAutomationPostgresStore, WbAutomationStateView, persist_wb_automation_snapshot,
     wb_automation_business_date,
 };
@@ -33,6 +33,9 @@ async fn main() -> Result<()> {
             activate_protective_live_postgres(options).await
         }
         Command::ActivateBidWritesPostgres(options) => activate_bid_writes_postgres(options).await,
+        Command::ActivateBoundedPacingPostgres(options) => {
+            activate_bounded_pacing_postgres(options).await
+        }
         Command::ExecutePostgres(options) => execute_postgres_once(options).await,
         Command::ExplicitExposureIncreasePostgres(options) => {
             explicit_exposure_increase_postgres_once(options).await
@@ -164,6 +167,95 @@ async fn activate_bid_writes_postgres(options: ActivatePolicyOptions) -> Result<
             "state_revision": receipt.state_revision,
             "bid_writes_enabled": true,
         })
+    );
+    Ok(())
+}
+
+async fn activate_bounded_pacing_postgres(options: ActivatePolicyOptions) -> Result<()> {
+    let source = build_observer(&options.source)?;
+    let target = build_observer(&ObserveOptions {
+        policy: options.target_policy,
+        registry: options.source.registry.clone(),
+        reader_token: options.source.reader_token.clone(),
+        state_directory: PathBuf::new(),
+        allow_broad_reader: options.source.allow_broad_reader,
+        reader_proxy_url: options.source.reader_proxy_url.clone(),
+    })?;
+    validate_bounded_pacing_activation(source.policy(), target.policy())?;
+    let now = Utc::now();
+    ensure!(
+        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
+        "WB automation bounded pacing authorization is not active"
+    );
+    target
+        .observe(now, WbAutomationStateView::default())
+        .await
+        .context("WB automation current bids exceed or do not prove the bounded pacing cap")?;
+    let database_url =
+        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
+    let database_config =
+        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
+    let store = WbAutomationPostgresStore::connect(&database_config).await?;
+    store.verify_runtime_contract().await?;
+    let Some(mut lease) = store
+        .try_acquire_campaign(
+            target.policy().account_id.as_str(),
+            target.policy().campaign_id,
+        )
+        .await?
+    else {
+        bail!("WB automation bounded pacing campaign lock is contended");
+    };
+    let receipt = lease
+        .activate_bounded_pacing_policy(
+            source.policy_sha256(),
+            target.policy_sha256(),
+            source.policy().max_bid_kopecks,
+            target.policy().max_bid_kopecks,
+            target.policy().target_impressions_per_day,
+        )
+        .await?;
+    lease.release().await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "account_id": target.policy().account_id,
+            "campaign_id": target.policy().campaign_id,
+            "outcome": if receipt.changed {
+                "bounded_pacing_activated"
+            } else {
+                "bounded_pacing_already_active"
+            },
+            "state_revision": receipt.state_revision,
+            "max_bid_kopecks": target.policy().max_bid_kopecks,
+            "target_impressions_per_day": target.policy().target_impressions_per_day,
+            "autonomous_pacing_enabled": true,
+            "bid_writes_enabled": true,
+        })
+    );
+    Ok(())
+}
+
+fn validate_bounded_pacing_activation(
+    source: &WbAutomationPolicy,
+    target: &WbAutomationPolicy,
+) -> Result<()> {
+    ensure!(
+        source.write_enabled
+            && source.bid_writes_enabled
+            && target.write_enabled
+            && target.bid_writes_enabled
+            && !source.autonomous_pacing.is_enabled()
+            && target.autonomous_pacing.is_enabled()
+            && target.max_bid_kopecks < source.max_bid_kopecks,
+        "WB automation transition must enable bounded pacing and tighten active bid-live mode"
+    );
+    let mut expected = source.clone();
+    expected.max_bid_kopecks = target.max_bid_kopecks;
+    expected.autonomous_pacing = mcp_ozon::control::WbAutomationPacingMode::Enabled;
+    ensure!(
+        target == &expected,
+        "WB automation bounded pacing transition changes an unapproved policy field"
     );
     Ok(())
 }
@@ -398,6 +490,7 @@ enum Command {
     ShadowPostgres(ShadowPostgresOptions),
     ActivateProtectiveLivePostgres(ActivatePolicyOptions),
     ActivateBidWritesPostgres(ActivatePolicyOptions),
+    ActivateBoundedPacingPostgres(ActivatePolicyOptions),
     ExecutePostgres(PostgresExecuteOptions),
     ExplicitExposureIncreasePostgres(ExplicitExposureIncreaseOptions),
     Execute(ExecuteOptions),
@@ -546,6 +639,31 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
     }
     if let [
         command,
+        source_bid_policy,
+        target_bid_policy,
+        registry,
+        reader_token,
+        broad_reader,
+        tail @ ..,
+    ] = arguments
+        && command == "activate-bounded-pacing-pg"
+    {
+        return Ok(Command::ActivateBoundedPacingPostgres(
+            ActivatePolicyOptions {
+                source: ObserveOptions {
+                    policy: source_bid_policy.into(),
+                    registry: registry.into(),
+                    reader_token: reader_token.into(),
+                    state_directory: PathBuf::new(),
+                    allow_broad_reader: parse_bool(broad_reader)?,
+                    reader_proxy_url: optional_proxy(tail)?,
+                },
+                target_policy: target_bid_policy.into(),
+            },
+        ));
+    }
+    if let [
+        command,
         policy,
         registry,
         reader_token,
@@ -674,7 +792,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
+        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bounded-pacing-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
     )
 }
 
@@ -752,4 +870,35 @@ fn is_lower_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounded_pacing_policies() -> (WbAutomationPolicy, WbAutomationPolicy) {
+        let target = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+            "../../config/wb-automation-robot.bid-live.json"
+        ))
+        .expect("repository bid-live policy parses");
+        let mut source = target.clone();
+        source.max_bid_kopecks = 600;
+        source.autonomous_pacing = mcp_ozon::control::WbAutomationPacingMode::Disabled;
+        (source, target)
+    }
+
+    #[test]
+    fn bounded_pacing_activation_accepts_only_reviewed_changes() {
+        let (source, target) = bounded_pacing_policies();
+        validate_bounded_pacing_activation(&source, &target)
+            .expect("reviewed pacing transition is accepted");
+
+        let mut expanded = target.clone();
+        expanded.daily_spend_cap_minor += 1;
+        assert!(validate_bounded_pacing_activation(&source, &expanded).is_err());
+
+        let mut not_tighter = target;
+        not_tighter.max_bid_kopecks = source.max_bid_kopecks;
+        assert!(validate_bounded_pacing_activation(&source, &not_tighter).is_err());
+    }
 }

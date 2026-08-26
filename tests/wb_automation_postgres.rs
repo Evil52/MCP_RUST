@@ -46,7 +46,9 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     let live_policy_digest = "2".repeat(64);
     let cycle_id = "3".repeat(64);
     let bid_policy_digest = "6".repeat(64);
+    let paced_policy_digest = "7".repeat(64);
     let live_cycle_id = format!("{campaign_id:064x}");
+    let bid_cycle_id = format!("{:064x}", campaign_id + 1);
     let business_date = NaiveDate::from_ymd_opt(2026, 8, 26).expect("valid date");
     let observed_at = Utc
         .with_ymd_and_hms(2026, 8, 26, 12, 0, 0)
@@ -61,8 +63,8 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
         .initialize_from_legacy(&WbAutomationLegacyStateSeed {
             policy_digest: shadow_policy_digest.clone(),
             business_date,
-            actions_today: 0,
-            last_action_at: None,
+            actions_today: 1,
+            last_action_at: Some(observed_at - Duration::hours(1)),
             paused_for_daily_cap_on: None,
             incident_class: None,
             legacy_digest: "4".repeat(64),
@@ -189,6 +191,74 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     assert_eq!(bid_payload["mode"], "bid_live");
     assert_eq!(bid_payload["bid_writes_enabled"], true);
     assert_eq!(bid_payload["state_revision"], 3);
+
+    lease
+        .persist_shadow_cycle(
+            &bid_cycle_id,
+            &bid_policy_digest,
+            observed_at + Duration::seconds(2),
+            business_date,
+            3,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("latest bid-live evidence is persisted");
+    assert_eq!(
+        lease
+            .activate_bounded_pacing_policy(
+                &bid_policy_digest,
+                &paced_policy_digest,
+                500,
+                600,
+                5_000,
+            )
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    let pacing = lease
+        .activate_bounded_pacing_policy(&bid_policy_digest, &paced_policy_digest, 600, 500, 5_000)
+        .await
+        .expect("bounded pacing policy is activated atomically");
+    assert!(pacing.changed);
+    assert_eq!(pacing.state_revision, 4);
+    let paced_state = lease
+        .load_state()
+        .await
+        .expect("paced state query succeeds")
+        .expect("paced state exists");
+    assert_eq!(paced_state.policy_digest, paced_policy_digest);
+    assert_eq!(paced_state.revision, 4);
+    assert_eq!(paced_state.actions_today, 1);
+    assert_eq!(
+        paced_state.last_action_at,
+        Some(observed_at - Duration::hours(1))
+    );
+    let pacing_replay = lease
+        .activate_bounded_pacing_policy(&bid_policy_digest, &paced_policy_digest, 600, 500, 5_000)
+        .await
+        .expect("bounded pacing activation replay is idempotent");
+    assert!(!pacing_replay.changed);
+    assert_eq!(pacing_replay.state_revision, 4);
+    let pacing_audit = admin
+        .query_one(
+            "SELECT cycle_id, payload_json FROM wb_automation.audit_events \
+             WHERE account_id=$1 AND advert_id=$2 AND event_type='bounded_pacing_activated'",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("bounded pacing audit evidence is readable");
+    assert_eq!(pacing_audit.get::<_, String>(0), bid_cycle_id);
+    let pacing_payload =
+        serde_json::from_str::<serde_json::Value>(&pacing_audit.get::<_, String>(1))
+            .expect("bounded pacing audit payload is valid JSON");
+    assert_eq!(pacing_payload["from_policy_sha256"], bid_policy_digest);
+    assert_eq!(pacing_payload["to_policy_sha256"], paced_policy_digest);
+    assert_eq!(pacing_payload["from_max_bid_kopecks"], 600);
+    assert_eq!(pacing_payload["to_max_bid_kopecks"], 500);
+    assert_eq!(pacing_payload["target_impressions_per_day"], 5_000);
+    assert_eq!(pacing_payload["autonomous_pacing_enabled"], true);
+    assert_eq!(pacing_payload["state_revision"], 4);
 
     lease.release().await.expect("campaign lock is released");
     drop(admin);

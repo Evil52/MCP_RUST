@@ -26,6 +26,7 @@ legacy_state="${WB_AUTOMATION_LEGACY_STATE:-$runtime_dir/wb-automation-robot/exe
 shadow_policy_target="$runtime_dir/wb-automation-shadow-policy.json"
 protective_policy_target="$runtime_dir/wb-automation-protective-policy.json"
 bid_policy_target="$runtime_dir/wb-automation-live-policy.json"
+migration_policy_target="$runtime_dir/wb-automation-source-bid-policy.json"
 libexec_dir="$HOME/.local/libexec/mcp-ozon"
 runner_target="$libexec_dir/run-wb-automation-live.sh"
 agent_dir="$HOME/Library/LaunchAgents"
@@ -88,8 +89,10 @@ if ! jq -e '
   and .account_id == "ip_domnyshev_wb"
   and .campaign_id == 39682633
   and .nm_ids == [449627598, 449627015, 497424314]
+  and .target_impressions_per_day == 5000
+  and .autonomous_pacing == "enabled"
   and .min_bid_kopecks == 102
-  and .max_bid_kopecks == 600
+  and .max_bid_kopecks == 500
   and .bid_step_percent == 15
   and .daily_pause_threshold_minor == 25000
   and .daily_spend_cap_minor == 30000
@@ -136,16 +139,47 @@ fi
 
 mkdir -p "$runtime_dir" "$libexec_dir" "$agent_dir" "$log_dir"
 chmod 700 "$runtime_dir" "$libexec_dir"
+if [[ -e "$migration_policy_target" \
+   && ( ! -f "$migration_policy_target" || -L "$migration_policy_target" ) ]]; then
+  echo "WB automation policy migration source is unsafe" >&2
+  exit 1
+fi
+migration_required=false
+if [[ -e "$bid_policy_target" ]]; then
+  if [[ ! -f "$bid_policy_target" || -L "$bid_policy_target" ]]; then
+    echo "installed WB automation bid-live policy is unsafe" >&2
+    exit 1
+  fi
+  installed_policy="$(jq -cS '.' "$bid_policy_target")"
+  target_policy="$(jq -cS '.' "$bid_policy_source")"
+  if [[ "$installed_policy" != "$target_policy" ]]; then
+    migrated_policy="$(jq -cS \
+      '.max_bid_kopecks = 500 | .autonomous_pacing = "enabled"' \
+      "$bid_policy_target")"
+    if ! jq -e '
+      .write_enabled == true
+      and .bid_writes_enabled == true
+      and (.autonomous_pacing // "disabled") == "disabled"
+      and .max_bid_kopecks == 600
+    ' "$bid_policy_target" >/dev/null \
+      || [[ "$migrated_policy" != "$target_policy" ]]; then
+      echo "installed WB automation policy is not an approved migration source" >&2
+      exit 1
+    fi
+    install -m 644 "$bid_policy_target" "$migration_policy_target"
+    migration_required=true
+  fi
+fi
 install -m 700 "$runner_source" "$runner_target"
 install -m 644 "$shadow_policy_source" "$shadow_policy_target"
 install -m 644 "$protective_policy_source" "$protective_policy_target"
 install -m 644 "$bid_policy_source" "$bid_policy_target"
 install -m 600 "$position_env" "$position_env_target"
 
-# Start with the non-writing shadow policy so the new image and the live WB
-# minimum-bid response contract can be proved before the protective timer or
-# the durable policy digest is changed.
-export WB_AUTOMATION_SHADOW_POLICY_HOST="$shadow_policy_target"
+# Mount the target policy in the source slot for the credentialless preflight.
+# `observe-once` cannot write, and proves every current bid is already at or
+# below the new 500-kopeck hard cap before the durable digest is changed.
+export WB_AUTOMATION_SHADOW_POLICY_HOST="$bid_policy_target"
 export WB_AUTOMATION_LIVE_POLICY_HOST="$bid_policy_target"
 export WB_AUTOMATION_ACCESS_CONFIG_HOST="$registry"
 export WB_AUTOMATION_READ_TOKEN_FILE_HOST="$reader_token"
@@ -210,10 +244,15 @@ if ! jq -e '
   exit 1
 fi
 
-# For the one-off durable transition, the shadow-policy mount now carries the
-# exact current protective policy. Scheduled cycles later restore the actual
-# shadow file through the runner and execute only the bid-live target policy.
-export WB_AUTOMATION_SHADOW_POLICY_HOST="$protective_policy_target"
+# For the one-off durable transition, the source-policy mount carries either
+# the current bid-live policy being migrated or the protective policy for a
+# first activation. Scheduled cycles later restore the actual shadow file
+# through the runner and execute only the bid-live target policy.
+if [[ "$migration_required" == "true" ]]; then
+  export WB_AUTOMATION_SHADOW_POLICY_HOST="$migration_policy_target"
+else
+  export WB_AUTOMATION_SHADOW_POLICY_HOST="$protective_policy_target"
+fi
 
 # From this point any failure leaves the single live timer stopped. A running
 # one-shot worker must finish before the digest can change under the same
@@ -238,21 +277,37 @@ if [[ -n "${worker_ids:-}" ]]; then
   exit 1
 fi
 
-activation_output="$("${compose[@]}" run --rm --no-deps wb-automation-live \
-  activate-bid-writes-pg \
-  /etc/mcp-ozon/wb-automation-shadow-policy.json \
-  /etc/mcp-ozon/wb-automation-live-policy.json \
-  /etc/mcp-ozon/access.json \
-  /run/secrets/wb-promotion-read.token \
-  true \
-  http://ozon-egress:3128)"
+if [[ "$migration_required" == "true" ]]; then
+  activation_output="$("${compose[@]}" run --rm --no-deps wb-automation-live \
+    activate-bounded-pacing-pg \
+    /etc/mcp-ozon/wb-automation-shadow-policy.json \
+    /etc/mcp-ozon/wb-automation-live-policy.json \
+    /etc/mcp-ozon/access.json \
+    /run/secrets/wb-promotion-read.token \
+    true \
+    http://ozon-egress:3128)"
+else
+  activation_output="$("${compose[@]}" run --rm --no-deps wb-automation-live \
+    activate-bid-writes-pg \
+    /etc/mcp-ozon/wb-automation-shadow-policy.json \
+    /etc/mcp-ozon/wb-automation-live-policy.json \
+    /etc/mcp-ozon/access.json \
+    /run/secrets/wb-promotion-read.token \
+    true \
+    http://ozon-egress:3128)"
+fi
 printf '%s\n' "$activation_output"
 if ! jq -e '
   .outcome == "bid_writes_activated"
   or .outcome == "bid_writes_already_active"
+  or .outcome == "bounded_pacing_activated"
+  or .outcome == "bounded_pacing_already_active"
 ' <<<"$activation_output" >/dev/null; then
   echo "WB automation bid-live activation did not complete" >&2
   exit 1
+fi
+if [[ "$migration_required" == "true" ]]; then
+  rm -f "$migration_policy_target"
 fi
 
 # The first bid-live cycle may send at most one bounded SKU change. The runner
