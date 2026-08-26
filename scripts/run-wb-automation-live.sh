@@ -11,6 +11,7 @@ registry="${WB_AUTOMATION_ACCESS_CONFIG:-$runtime_dir/access.json}"
 reader_token="${WB_AUTOMATION_READ_TOKEN_FILE:-$runtime_dir/ip-domnyshev-wb-promotion-read.token}"
 writer_token="${WB_AUTOMATION_WRITE_TOKEN_FILE:-$runtime_dir/ip-domnyshev-wb-promotion-write.token}"
 legacy_state="${WB_AUTOMATION_LEGACY_STATE:-$runtime_dir/wb-automation-robot/execution-state.json}"
+bid_writes_enabled="${WB_AUTOMATION_BID_WRITES_ENABLED:-false}"
 compose_file="$project_root/compose.wb-automation-live.yaml"
 lock_directory="${TMPDIR:-/tmp}/mcp-ozon-wb-automation-live.lock"
 lock_pid_file="$lock_directory/pid"
@@ -49,6 +50,10 @@ if [[ ! -d "$project_root" || -L "$project_root" ]]; then
   echo "WB automation project directory is unavailable or unsafe" >&2
   exit 1
 fi
+if [[ "$bid_writes_enabled" != "false" && "$bid_writes_enabled" != "true" ]]; then
+  echo "WB automation bid-writes mode must be true or false" >&2
+  exit 1
+fi
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   env_mode="$(/usr/bin/stat -f '%Lp' "$position_env")"
@@ -80,15 +85,15 @@ if ! jq -e '
   echo "WB automation shadow policy does not match the guarded cutover source" >&2
   exit 1
 fi
-if ! jq -e '
+if ! jq -e --argjson bid_writes_enabled "$bid_writes_enabled" '
   .policy_version == "wb_ads_robot.v1"
   and .write_enabled == true
-  and .bid_writes_enabled == false
+  and .bid_writes_enabled == $bid_writes_enabled
   and .account_id == "ip_domnyshev_wb"
   and .campaign_id == 39682633
   and .allow_budget_top_up == false
 ' "$live_policy" >/dev/null; then
-  echo "WB automation live policy is not the approved protective-only policy" >&2
+  echo "WB automation live policy does not match the approved bid-writes mode" >&2
   exit 1
 fi
 

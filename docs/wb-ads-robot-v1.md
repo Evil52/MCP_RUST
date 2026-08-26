@@ -127,6 +127,35 @@ network and allows only the exact WB write paths. If a write is sent, the runner
 immediately performs a second cycle for read-back; any ambiguity remains a
 durable unresolved action and blocks later writes.
 
+## P3 bounded bid-live runtime
+
+`config/wb-automation-robot.bid-live.json` differs from the protective policy
+only by `bid_writes_enabled=true`. The account, campaign, three SKUs, 6 RUB bid
+ceiling, 15% step, two actions per Moscow day, six-hour cooldown, 250 RUB pause,
+300 RUB hard ceiling and prohibition on budget top-up remain unchanged.
+
+Every cycle reads the official minimum CPC bid for all three SKUs before a
+decision. The response must contain exactly the approved SKU/search scope and
+the reviewed 102-kopeck floor; drift or incomplete data fails closed before a
+write. Campaign details, current spend, budget and stock are also refreshed.
+Incomplete per-SKU attribution still blocks performance-based increases and
+reductions. With only campaign-level attribution, the sole SKU action available
+is lowering a genuinely low-stock SKU to the verified floor.
+
+The audited transition command is wrapped by:
+
+```bash
+./scripts/enable-wb-automation-bid-writes.sh \
+  --confirm-enable-reviewed-bid-writes
+```
+
+The installer builds and health-checks the isolated runtime before stopping the
+protective timer. It waits for any one-shot worker to finish, changes only the
+exact protective-policy digest under the PostgreSQL campaign lock, appends a
+`bid_writes_activated` audit event, runs one bid-live cycle and only then
+reinstalls the five-minute LaunchAgent. A failure after timer shutdown leaves
+automation stopped rather than mixing policy owners.
+
 ## CPC compatibility corrections
 
 The supplied prompt names recommended-bid and search-cluster statistics as
@@ -137,15 +166,13 @@ CPC campaign and must never be fabricated:
 - <https://dev.wildberries.ru/en/docs/openapi/promotion?locale=ru%2F>
 - <https://dev.wildberries.ru/en/news/302>
 
-The current minimum CPC bid endpoint does support CPC and remains a required
-future read-before-write guard.
+The current minimum CPC bid endpoint does support CPC and is the mandatory
+read-before-write guard used by the bounded P3 runtime.
 
-## Required before write enablement
+## Signals outside the bounded bid-live rollout
 
-- Fresh per-SKU minimum bids and complete current spend/revenue attribution.
-- PostgreSQL snapshots, distributed campaign lock, durable pending,
-  idempotency key and append-only audit.
-- Fresh read/compare immediately before one write and immediate read-back.
+- Complete revenue attribution is required before performance-based bid
+  decisions; missing attribution remains an explicit hold.
 - Persistent spend-without-mature-order accounting across Moscow midnight.
 - Approved unit economics or a separately bounded exploration envelope.
 - Typed completeness/freshness for funnel, price, search, position and stock
@@ -153,6 +180,6 @@ future read-before-write guard.
 - Deterministic target pacing, cost forecast and safe/hard CPC formulas backed
   by replay data.
 
-Until these conditions are met, automatic SKU bid writes remain disabled by
-typed policy. The P2 protective campaign pause is the only autonomous WB
-mutation authorized by v1.
+These absent signals are never fabricated and do not participate in the P3
+rules. P3 is the explicitly authorized bounded subset above, not a claim that
+the full natural-language optimization prompt has been implemented.

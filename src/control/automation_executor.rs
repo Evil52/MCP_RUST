@@ -1126,6 +1126,14 @@ mod tests {
         })
     }
 
+    fn minimum_bids_response() -> serde_json::Value {
+        serde_json::json!([
+            {"nm_id": 449_627_598_u64, "bids": [{"type": "search", "value": 102}]},
+            {"nm_id": 449_627_015_u64, "bids": [{"type": "search", "value": 102}]},
+            {"nm_id": 497_424_314_u64, "bids": [{"type": "search", "value": 102}]}
+        ])
+    }
+
     fn reader_server(
         status: i32,
         bid: u64,
@@ -1192,6 +1200,7 @@ mod tests {
                 200,
                 campaign_response_for(campaign_id, status, bid).to_string(),
             ),
+            (200, minimum_bids_response().to_string()),
             (200, serde_json::json!({"total": 1_000}).to_string()),
             (200, advertising_payload.to_string()),
             (
