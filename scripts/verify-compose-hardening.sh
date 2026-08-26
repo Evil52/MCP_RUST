@@ -1779,6 +1779,10 @@ check_contains \
   "$project_dir/position-monitor/control-write-egress/squid.conf" \
   "http_access deny all"
 check_contains \
+  "WB automation runtime: legacy state parent is private to the automation user" \
+  "$project_dir/Dockerfile.wb-automation-shadow" \
+  "&& chmod 0700 /var/lib/mcp-ozon-legacy"
+check_contains \
   "control auth egress: only the exact local JWKS path reaches upstream" \
   "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
   'location = /jwks {'
