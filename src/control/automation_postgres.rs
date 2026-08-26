@@ -398,9 +398,7 @@ impl WbAutomationCampaignLease<'_> {
         let pending = state.get::<_, Option<&str>>(1);
         let incident = state.get::<_, Option<&str>>(2);
         let revision = state.get::<_, i64>(3);
-        if pending.is_some() || incident.is_some() || revision <= 0 {
-            return Err(WbAutomationPostgresError::StateChanged);
-        }
+        ensure_protective_live_guard(pending.is_none() && incident.is_none() && revision > 0)?;
         if current_digest == live_policy_digest {
             let state_revision =
                 u64::try_from(revision).map_err(|_| WbAutomationPostgresError::StateChanged)?;
@@ -428,9 +426,7 @@ impl WbAutomationCampaignLease<'_> {
             .await
             .map_err(|_| WbAutomationPostgresError::Unavailable)?
             .get::<_, bool>(0);
-        if unresolved {
-            return Err(WbAutomationPostgresError::StateChanged);
-        }
+        ensure_protective_live_guard(!unresolved)?;
         let cycle_id = transaction
             .query_opt(
                 "SELECT cycle_id FROM wb_automation.cycles \
@@ -463,9 +459,7 @@ impl WbAutomationCampaignLease<'_> {
             )
             .await
             .map_err(|_| WbAutomationPostgresError::Unavailable)?;
-        if updated != 1 {
-            return Err(WbAutomationPostgresError::StateChanged);
-        }
+        ensure_one_row(updated)?;
         let event_key = audit_event_key(
             shadow_policy_digest,
             "protective_live_activated",
@@ -1730,6 +1724,12 @@ fn ensure_one_row(updated: u64) -> Result<(), WbAutomationPostgresError> {
         .ok_or(WbAutomationPostgresError::StateChanged)
 }
 
+fn ensure_protective_live_guard(allowed: bool) -> Result<(), WbAutomationPostgresError> {
+    allowed
+        .then_some(())
+        .ok_or(WbAutomationPostgresError::StateChanged)
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "a function item keeps async call sites free of per-binary coverage-only closures"
@@ -1857,6 +1857,11 @@ mod tests {
         assert!(ensure_one_row(1).is_ok());
         assert_eq!(
             ensure_one_row(0),
+            Err(WbAutomationPostgresError::StateChanged)
+        );
+        assert!(ensure_protective_live_guard(true).is_ok());
+        assert_eq!(
+            ensure_protective_live_guard(false),
             Err(WbAutomationPostgresError::StateChanged)
         );
         assert_eq!(
