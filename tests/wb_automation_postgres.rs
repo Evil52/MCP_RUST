@@ -11,6 +11,7 @@ use mcp_ozon::control::{
 use tokio_postgres::{Config, NoTls};
 
 static CAMPAIGN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static POSTGRES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn raw_client(config: &Config) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
     let (client, connection) = config.connect(NoTls).await.expect("test database connects");
@@ -29,6 +30,7 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
         return;
     };
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
     let config = Config::from_str(&database_url).expect("test database URL parses");
     let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
         .expect("test wrapper provides the admin URL");
@@ -144,6 +146,7 @@ async fn automation_state_is_isolated_locked_and_idempotent() {
     let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
         return;
     };
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
     let config = Config::from_str(&database_url).expect("test database URL parses");
     let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
         .expect("test wrapper provides the admin URL");
@@ -1028,6 +1031,7 @@ async fn incident_without_action_is_sticky_audited_and_resets_daily_quota() {
     let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
         return;
     };
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
     let config = Config::from_str(&database_url).expect("test database URL parses");
     let store = WbAutomationPostgresStore::connect(&config)
         .await
