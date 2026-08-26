@@ -45,6 +45,8 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     let shadow_policy_digest = "1".repeat(64);
     let live_policy_digest = "2".repeat(64);
     let cycle_id = "3".repeat(64);
+    let bid_policy_digest = "6".repeat(64);
+    let live_cycle_id = format!("{campaign_id:064x}");
     let business_date = NaiveDate::from_ymd_opt(2026, 8, 26).expect("valid date");
     let observed_at = Utc
         .with_ymd_and_hms(2026, 8, 26, 12, 0, 0)
@@ -127,6 +129,66 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     assert_eq!(payload["to_policy_sha256"], live_policy_digest);
     assert_eq!(payload["bid_writes_enabled"], false);
     assert_eq!(payload["state_revision"], 2);
+
+    lease
+        .persist_shadow_cycle(
+            &live_cycle_id,
+            &live_policy_digest,
+            observed_at + Duration::seconds(1),
+            business_date,
+            2,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("latest protective live evidence is persisted");
+    assert_eq!(
+        lease
+            .activate_bid_writes_policy(&live_policy_digest, &live_policy_digest)
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    assert_eq!(
+        lease
+            .activate_bid_writes_policy(&"8".repeat(64), &bid_policy_digest)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let bid_activation = lease
+        .activate_bid_writes_policy(&live_policy_digest, &bid_policy_digest)
+        .await
+        .expect("bid writes policy is activated atomically");
+    assert!(bid_activation.changed);
+    assert_eq!(bid_activation.state_revision, 3);
+    let bid_state = lease
+        .load_state()
+        .await
+        .expect("bid live state query succeeds")
+        .expect("bid live state exists");
+    assert_eq!(bid_state.policy_digest, bid_policy_digest);
+    assert_eq!(bid_state.revision, 3);
+    let bid_replay = lease
+        .activate_bid_writes_policy(&live_policy_digest, &bid_policy_digest)
+        .await
+        .expect("bid activation replay is idempotent");
+    assert!(!bid_replay.changed);
+    assert_eq!(bid_replay.state_revision, 3);
+    let bid_audit = admin
+        .query_one(
+            "SELECT cycle_id, payload_json FROM wb_automation.audit_events \
+             WHERE account_id=$1 AND advert_id=$2 AND event_type='bid_writes_activated'",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("bid activation audit evidence is readable");
+    assert_eq!(bid_audit.get::<_, String>(0), live_cycle_id);
+    let bid_payload = serde_json::from_str::<serde_json::Value>(&bid_audit.get::<_, String>(1))
+        .expect("bid activation audit payload is valid JSON");
+    assert_eq!(bid_payload["from_policy_sha256"], live_policy_digest);
+    assert_eq!(bid_payload["to_policy_sha256"], bid_policy_digest);
+    assert_eq!(bid_payload["mode"], "bid_live");
+    assert_eq!(bid_payload["bid_writes_enabled"], true);
+    assert_eq!(bid_payload["state_revision"], 3);
 
     lease.release().await.expect("campaign lock is released");
     drop(admin);

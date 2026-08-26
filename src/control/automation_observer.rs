@@ -164,6 +164,18 @@ impl WbAutomationObserver {
             .await
             .context("WB automation campaign details недоступны")?;
         let campaign = parse_campaign(&details, &self.policy)?;
+        let minimum_bids = self
+            .client
+            .promotion_minimum_bids(
+                &self.policy.account_id,
+                self.policy.campaign_id,
+                self.policy.nm_ids.clone(),
+                self.policy.payment_type.clone(),
+                vec![self.policy.placement.clone()],
+            )
+            .await
+            .context("WB automation minimum CPC bids недоступны")?;
+        validate_minimum_bids(&minimum_bids, &self.policy)?;
         let budget = self
             .client
             .promotion_campaign_budget(&self.policy.account_id, self.policy.campaign_id)
@@ -306,6 +318,50 @@ fn parse_budget_minor(response: &Value) -> Result<u64> {
     total_rubles
         .checked_mul(100)
         .context("WB automation budget overflow")
+}
+
+fn validate_minimum_bids(response: &Value, policy: &WbAutomationPolicy) -> Result<()> {
+    let rows = response
+        .as_array()
+        .context("WB automation minimum CPC bids имеют неверную форму")?;
+    let mut minimums = BTreeMap::new();
+    for row in rows {
+        let nm_id = row
+            .get("nm_id")
+            .and_then(Value::as_u64)
+            .context("WB automation minimum CPC bid nm_id неверен")?;
+        let bids = row
+            .get("bids")
+            .and_then(Value::as_array)
+            .context("WB automation minimum CPC bid не содержит bids")?;
+        let search = bids
+            .iter()
+            .filter(|bid| bid.get("type").and_then(Value::as_str) == Some("search"))
+            .collect::<Vec<_>>();
+        ensure!(
+            search.len() == 1
+                && bids.len() == 1
+                && minimums
+                    .insert(
+                        nm_id,
+                        search[0]
+                            .get("value")
+                            .and_then(Value::as_u64)
+                            .context("WB automation minimum CPC bid value неверен")?,
+                    )
+                    .is_none(),
+            "WB automation minimum CPC bids содержат duplicate или unexpected placement"
+        );
+    }
+    let expected = policy.nm_ids.iter().copied().collect::<BTreeSet<_>>();
+    ensure!(
+        minimums.keys().copied().collect::<BTreeSet<_>>() == expected
+            && minimums
+                .values()
+                .all(|minimum| *minimum == policy.min_bid_kopecks),
+        "WB automation minimum CPC bid contract изменился"
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -701,6 +757,14 @@ mod tests {
         })
     }
 
+    fn minimum_bids_response() -> Value {
+        serde_json::json!([
+            {"nm_id": 449_627_598_u64, "bids": [{"type": "search", "value": 102}]},
+            {"nm_id": 449_627_015_u64, "bids": [{"type": "search", "value": 102}]},
+            {"nm_id": 497_424_314_u64, "bids": [{"type": "search", "value": 102}]}
+        ])
+    }
+
     fn stats_response() -> Value {
         serde_json::json!([{
             "advertId": 39_682_633,
@@ -761,6 +825,7 @@ mod tests {
         let mut observer = fixture.observer(None);
         let (base_url, requests) = mock_http(vec![
             (200, campaign_response().to_string()),
+            (200, minimum_bids_response().to_string()),
             (200, serde_json::json!({"total": 1_000}).to_string()),
             (200, stats_response().to_string()),
             (200, stocks_response().to_string()),
@@ -807,7 +872,7 @@ mod tests {
             .unwrap(),
             snapshot
         );
-        for _ in 0..4 {
+        for _ in 0..5 {
             assert!(
                 requests
                     .recv_timeout(Duration::from_secs(1))
@@ -823,6 +888,7 @@ mod tests {
         let mut observer = fixture.observer(None);
         let (base_url, _requests) = mock_http(vec![
             (200, campaign_response().to_string()),
+            (200, minimum_bids_response().to_string()),
             (200, serde_json::json!({"total": 995}).to_string()),
             (200, campaign_level_stats_response().to_string()),
             (200, stocks_response().to_string()),
@@ -887,6 +953,26 @@ mod tests {
             700
         );
         assert!(parse_budget_minor(&serde_json::json!({"total": u64::MAX})).is_err());
+        assert!(validate_minimum_bids(&minimum_bids_response(), &policy).is_ok());
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!([{"bids": []}]),
+            serde_json::json!([{"nm_id": 449_627_598_u64}]),
+            serde_json::json!([{"nm_id": 449_627_598_u64, "bids": [{"type": "search"}]}]),
+            serde_json::json!([{"nm_id": 449_627_598_u64, "bids": [{"type": "recommendation", "value": 102}]}]),
+        ] {
+            assert!(validate_minimum_bids(&invalid, &policy).is_err());
+        }
+        let mut changed_minimum = minimum_bids_response();
+        changed_minimum[0]["bids"][0]["value"] = serde_json::json!(103);
+        assert!(validate_minimum_bids(&changed_minimum, &policy).is_err());
+        let mut duplicate_minimum = minimum_bids_response();
+        let duplicate_row = duplicate_minimum[0].clone();
+        duplicate_minimum
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_row);
+        assert!(validate_minimum_bids(&duplicate_minimum, &policy).is_err());
         assert_eq!(sha256_hex(b"test").len(), 64);
         assert!(read_regular_file(&fixture.policy, MAX_POLICY_BYTES, "policy").is_ok());
         assert!(
@@ -978,6 +1064,7 @@ mod tests {
         let mut observer = fixture.observer(None);
         let (base_url, _) = mock_http(vec![
             (200, campaign_response().to_string()),
+            (200, minimum_bids_response().to_string()),
             (200, serde_json::json!({"total": 1_000}).to_string()),
             (
                 200,
@@ -1030,6 +1117,7 @@ mod tests {
         let mut invalid_stats = fixture.observer(None);
         let (stats_url, _) = mock_http(vec![
             (200, campaign_response().to_string()),
+            (200, minimum_bids_response().to_string()),
             (200, serde_json::json!({"total": 1_000}).to_string()),
             (200, serde_json::json!({}).to_string()),
         ]);
@@ -1047,6 +1135,7 @@ mod tests {
         let mut invalid_stocks = fixture.observer(None);
         let (stocks_url, _) = mock_http(vec![
             (200, campaign_response().to_string()),
+            (200, minimum_bids_response().to_string()),
             (200, serde_json::json!({"total": 1_000}).to_string()),
             (200, serde_json::Value::Null.to_string()),
             (200, serde_json::json!({}).to_string()),
@@ -1068,6 +1157,7 @@ mod tests {
         let mut invalid_decision = fixture.observer(None);
         let (decision_url, _) = mock_http(vec![
             (200, invalid_campaign_bid.to_string()),
+            (200, minimum_bids_response().to_string()),
             (200, serde_json::json!({"total": 1_000}).to_string()),
             (200, serde_json::Value::Null.to_string()),
             (200, stocks_response().to_string()),
@@ -1105,6 +1195,7 @@ mod tests {
         }]);
         let (base_url, _requests) = mock_http(vec![
             (200, campaign_response().to_string()),
+            (200, minimum_bids_response().to_string()),
             (200, serde_json::json!({"total": 1_000}).to_string()),
             (200, stats_without_previous_day.to_string()),
             (200, stocks_response().to_string()),
@@ -1171,6 +1262,7 @@ mod tests {
         }]);
         let (base_url, _) = mock_http(vec![
             (200, campaign_response().to_string()),
+            (200, minimum_bids_response().to_string()),
             (200, serde_json::json!({"total": 1_000}).to_string()),
             (200, previous_only.to_string()),
             (200, stocks_response().to_string()),

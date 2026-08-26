@@ -148,6 +148,7 @@ sed \
   -e "s|__LOG_DIR__|$log_dir|g" \
   -e "s|__RUNTIME_DIR__|$runtime_dir|g" \
   -e "s|__PROJECT_DIR__|$project_root|g" \
+  -e "s|__BID_WRITES_ENABLED__|false|g" \
   "$plist_template" >"$temporary_plist"
 plutil -lint "$temporary_plist" >/dev/null
 
