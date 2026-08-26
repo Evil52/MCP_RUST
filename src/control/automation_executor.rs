@@ -22,7 +22,8 @@ use super::{
         wb_automation_business_date,
     },
     automation_observer::{
-        WbAutomationObserver, WbAutomationStateView, persist_wb_automation_snapshot,
+        WbAutomationObserver, WbAutomationSnapshot, WbAutomationStateView,
+        persist_wb_automation_snapshot,
     },
     automation_postgres::{
         WbAutomationActionReservation, WbAutomationCampaignLease, WbAutomationDurableAction,
@@ -245,6 +246,42 @@ impl WbAutomationExecutor {
         legacy: &WbAutomationLegacyStateSeed,
         observed_at: DateTime<Utc>,
     ) -> Result<Option<WbAutomationPostgresExecutionReceipt>> {
+        self.run_once_postgres_with_intent(
+            store,
+            legacy,
+            observed_at,
+            PostgresExecutionIntent::Automatic,
+        )
+        .await
+    }
+
+    /// Executes exactly one explicitly requested low-exposure increase through
+    /// the same durable reservation, final permit and read-back protocol as an
+    /// automatic action. It does not make aggregate campaign metrics look like
+    /// per-SKU attribution and therefore cannot weaken later scheduled cycles.
+    pub async fn run_explicit_exposure_increase_once_postgres(
+        &self,
+        store: &WbAutomationPostgresStore,
+        legacy: &WbAutomationLegacyStateSeed,
+        observed_at: DateTime<Utc>,
+        target_impressions: u64,
+    ) -> Result<Option<WbAutomationPostgresExecutionReceipt>> {
+        self.run_once_postgres_with_intent(
+            store,
+            legacy,
+            observed_at,
+            PostgresExecutionIntent::ExplicitExposureTarget(target_impressions),
+        )
+        .await
+    }
+
+    async fn run_once_postgres_with_intent(
+        &self,
+        store: &WbAutomationPostgresStore,
+        legacy: &WbAutomationLegacyStateSeed,
+        observed_at: DateTime<Utc>,
+        intent: PostgresExecutionIntent,
+    ) -> Result<Option<WbAutomationPostgresExecutionReceipt>> {
         let policy = self.observer.policy();
         ensure!(
             policy.write_enabled,
@@ -276,6 +313,12 @@ impl WbAutomationExecutor {
                 .context("WB automation PostgreSQL state is unavailable")?,
         };
         let business_date = wb_automation_business_date(observed_at);
+        if matches!(intent, PostgresExecutionIntent::ExplicitExposureTarget(_)) {
+            ensure!(
+                state.pending_idempotency_key.is_none() && state.incident_class.is_none(),
+                "WB explicit exposure increase requires clean durable state"
+            );
+        }
         let state_view = WbAutomationStateView {
             paused_by_automation: state
                 .paused_for_daily_cap_on
@@ -287,7 +330,11 @@ impl WbAutomationExecutor {
             },
             last_action_at: state.last_action_at,
         };
-        let snapshot = self.observer.observe(observed_at, state_view).await?;
+        let mut snapshot = self.observer.observe(observed_at, state_view).await?;
+        if let PostgresExecutionIntent::ExplicitExposureTarget(target_impressions) = intent {
+            snapshot.decision =
+                explicit_exposure_increase_decision(policy, &snapshot, target_impressions)?;
+        }
         let snapshot_json = serde_json::to_string(&snapshot)?;
         let decision_json = serde_json::to_string(&snapshot.decision)?;
         let cycle_id = sha256_domain("wb-automation-cycle-v1", snapshot_json.as_bytes());
@@ -509,6 +556,79 @@ impl WbAutomationExecutor {
             )),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostgresExecutionIntent {
+    Automatic,
+    ExplicitExposureTarget(u64),
+}
+
+fn explicit_exposure_increase_decision(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    target_impressions: u64,
+) -> Result<WbAutomationDecision> {
+    ensure!(
+        target_impressions == policy.target_impressions_per_day,
+        "WB explicit exposure target does not match policy"
+    );
+    ensure!(
+        matches!(
+            snapshot.decision.action,
+            WbAutomationAction::Hold {
+                reason: super::automation::WbAutomationHoldReason::AttributionIncomplete
+            }
+        ),
+        "WB explicit exposure increase is blocked by a stronger decision guard"
+    );
+    let metrics = snapshot
+        .observation
+        .campaign_level_metrics
+        .as_ref()
+        .context("WB explicit exposure increase requires campaign delivery metrics")?;
+    ensure!(
+        metrics.impressions < target_impressions
+            && metrics.impressions < policy.low_exposure_max_impressions
+            && metrics.clicks < policy.low_exposure_max_clicks,
+        "WB explicit exposure increase requires verified low exposure"
+    );
+    let sku = policy
+        .nm_ids
+        .iter()
+        .filter_map(|nm_id| {
+            snapshot
+                .observation
+                .skus
+                .iter()
+                .find(|sku| sku.nm_id == *nm_id)
+        })
+        .filter(|sku| {
+            sku.sellable_stock > policy.min_sellable_stock
+                && sku.current_bid_kopecks < policy.max_bid_kopecks
+        })
+        .min_by_key(|sku| sku.current_bid_kopecks)
+        .context("WB explicit exposure increase has no safe SKU candidate")?;
+    let to_bid_kopecks = super::automation::increase_bid(policy, sku.current_bid_kopecks)
+        .context("WB explicit exposure bid increase is invalid")?;
+    ensure!(
+        to_bid_kopecks > sku.current_bid_kopecks,
+        "WB explicit exposure bid cannot increase"
+    );
+    Ok(WbAutomationDecision {
+        account_id: policy.account_id.clone(),
+        campaign_id: policy.campaign_id,
+        observed_at: snapshot.observation.observed_at,
+        action: WbAutomationAction::ChangeBids {
+            changes: vec![WbAutomationBidChange {
+                nm_id: sku.nm_id,
+                from_bid_kopecks: sku.current_bid_kopecks,
+                to_bid_kopecks,
+                reason: super::automation::WbAutomationBidReason::ExplicitExposureTarget,
+            }],
+        },
+        unresolved_stops: Vec::new(),
+    })
 }
 
 const fn receipt(
@@ -1107,6 +1227,14 @@ mod tests {
     }
 
     fn campaign_response_for(campaign_id: u64, status: i32, bid: u64) -> serde_json::Value {
+        campaign_response_with_bids(campaign_id, status, [bid; 3])
+    }
+
+    fn campaign_response_with_bids(
+        campaign_id: u64,
+        status: i32,
+        bids: [u64; 3],
+    ) -> serde_json::Value {
         serde_json::json!({
             "adverts": [{
                 "id": campaign_id,
@@ -1118,9 +1246,9 @@ mod tests {
                     "placements": {"search": true, "recommendations": false}
                 },
                 "nm_settings": [
-                    {"nm_id": 449_627_598_u64, "bids_kopecks": {"search": bid, "recommendations": 0}},
-                    {"nm_id": 449_627_015_u64, "bids_kopecks": {"search": bid, "recommendations": 0}},
-                    {"nm_id": 497_424_314_u64, "bids_kopecks": {"search": bid, "recommendations": 0}}
+                    {"nm_id": 449_627_598_u64, "bids_kopecks": {"search": bids[0], "recommendations": 0}},
+                    {"nm_id": 449_627_015_u64, "bids_kopecks": {"search": bids[1], "recommendations": 0}},
+                    {"nm_id": 497_424_314_u64, "bids_kopecks": {"search": bids[2], "recommendations": 0}}
                 ]
             }]
         })
@@ -1215,6 +1343,123 @@ mod tests {
                 .to_string(),
             ),
         ])
+    }
+
+    fn campaign_level_reader_server_for(
+        campaign_id: u64,
+        status: i32,
+        bids: [u64; 3],
+        current_date: &str,
+        daily_spend_rubles: u64,
+        stock: u64,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let previous_date = current_date
+            .parse::<NaiveDate>()
+            .expect("fixture current_date")
+            .pred_opt()
+            .expect("fixture previous_date")
+            .format("%Y-%m-%d")
+            .to_string();
+        let advertising_payload = serde_json::json!([{
+            "advertId": campaign_id,
+            "stats": [
+                {
+                    "date": previous_date,
+                    "views": 44,
+                    "clicks": 2,
+                    "sum": 2.19,
+                    "orders": 0,
+                    "sumPrice": 0
+                },
+                {
+                    "date": current_date,
+                    "views": 1,
+                    "clicks": 0,
+                    "sum": daily_spend_rubles,
+                    "orders": 0,
+                    "sumPrice": 0
+                }
+            ]
+        }]);
+        mock_http(vec![
+            (
+                200,
+                campaign_response_with_bids(campaign_id, status, bids).to_string(),
+            ),
+            (200, minimum_bids_response().to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, advertising_payload.to_string()),
+            (
+                200,
+                serde_json::json!({"data": {"items": [
+                    {"nmId": 449_627_598_u64, "warehouseId": 1, "quantity": stock},
+                    {"nmId": 449_627_015_u64, "warehouseId": 1, "quantity": stock},
+                    {"nmId": 497_424_314_u64, "warehouseId": 1, "quantity": stock}
+                ]}})
+                .to_string(),
+            ),
+        ])
+    }
+
+    fn explicit_exposure_snapshot() -> (WbAutomationPolicy, WbAutomationSnapshot) {
+        let mut policy = serde_json::from_slice::<WbAutomationPolicy>(include_bytes!(
+            "../../config/wb-automation-robot.json"
+        ))
+        .unwrap();
+        policy.write_enabled = true;
+        policy.bid_writes_enabled = true;
+        let observation = WbAutomationObservation {
+            observed_at: now(),
+            campaign_status: 9,
+            paused_by_automation: false,
+            budget_remaining_minor: 100_000,
+            daily_spend_minor: 234,
+            daily_spend_complete: true,
+            actions_today: 0,
+            last_action_at: None,
+            attribution_complete: false,
+            campaign_level_metrics: Some(crate::control::automation::WbAutomationCampaignMetrics {
+                impressions: 44,
+                clicks: 2,
+                spend_minor: 219,
+                attributed_orders: 0,
+                attributed_revenue_minor: 0,
+            }),
+            skus: policy
+                .nm_ids
+                .iter()
+                .copied()
+                .map(|nm_id| WbAutomationSkuObservation {
+                    nm_id,
+                    current_bid_kopecks: 117,
+                    sellable_stock: 10,
+                    impressions: 0,
+                    clicks: 0,
+                    spend_minor: 0,
+                    attributed_orders: 0,
+                    attributed_revenue_minor: 0,
+                })
+                .collect(),
+        };
+        let decision = WbAutomationDecision {
+            account_id: policy.account_id.clone(),
+            campaign_id: policy.campaign_id,
+            observed_at: observation.observed_at,
+            action: WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::AttributionIncomplete,
+            },
+            unresolved_stops: Vec::new(),
+        };
+        (
+            policy,
+            WbAutomationSnapshot {
+                schema_version: 4,
+                policy_sha256: "a".repeat(64),
+                previous_business_date: now().date_naive().pred_opt().unwrap(),
+                observation,
+                decision,
+            },
+        )
     }
 
     fn execution_state(business_date: NaiveDate) -> ExecutionState {
@@ -1380,6 +1625,65 @@ mod tests {
         assert!(receipt.cycle_inserted);
     }
 
+    #[test]
+    fn explicit_exposure_increase_is_single_step_and_preserves_stronger_guards() {
+        let (policy, snapshot) = explicit_exposure_snapshot();
+        let decision = explicit_exposure_increase_decision(
+            &policy,
+            &snapshot,
+            policy.target_impressions_per_day,
+        )
+        .unwrap();
+        assert!(matches!(
+            decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes == &[WbAutomationBidChange {
+                    nm_id: 449_627_598,
+                    from_bid_kopecks: 117,
+                    to_bid_kopecks: 134,
+                    reason: WbAutomationBidReason::ExplicitExposureTarget,
+                }]
+        ));
+
+        assert!(
+            explicit_exposure_increase_decision(
+                &policy,
+                &snapshot,
+                policy.target_impressions_per_day - 1,
+            )
+            .is_err()
+        );
+
+        let mut guarded = snapshot.clone();
+        guarded.decision.action = WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::CooldownActive,
+        };
+        assert!(
+            explicit_exposure_increase_decision(
+                &policy,
+                &guarded,
+                policy.target_impressions_per_day,
+            )
+            .is_err()
+        );
+
+        let mut delivered = snapshot;
+        delivered
+            .observation
+            .campaign_level_metrics
+            .as_mut()
+            .unwrap()
+            .impressions = policy.low_exposure_max_impressions;
+        assert!(
+            explicit_exposure_increase_decision(
+                &policy,
+                &delivered,
+                policy.target_impressions_per_day,
+            )
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     #[expect(
         clippy::significant_drop_tightening,
@@ -1458,6 +1762,102 @@ mod tests {
 
         let lease = store
             .try_acquire_campaign("ip_domnyshev_wb", 39_682_633)
+            .await
+            .unwrap()
+            .expect("executor released its campaign lock");
+        let state = lease.load_state().await.unwrap().unwrap();
+        assert_eq!(state.actions_today, 1);
+        assert!(state.pending_idempotency_key.is_none());
+        assert_eq!(state.revision, 3);
+        lease.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the PostgreSQL campaign lease is consumed by explicit async release"
+    )]
+    async fn explicit_exposure_increase_uses_durable_write_and_exact_readback() {
+        #[cfg(coverage)]
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
+        #[cfg(not(coverage))]
+        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
+        let campaign_id = 39_682_720;
+        let fixture = Fixture::new_for_campaign(campaign_id);
+        let observed_at = Utc::now();
+        let current_date = wb_automation_business_date(observed_at)
+            .format("%Y-%m-%d")
+            .to_string();
+        let (reader_url, _) =
+            campaign_level_reader_server_for(campaign_id, 9, [117, 117, 117], &current_date, 2, 10);
+        let (writer_url, writer_requests) = mock_http(vec![(200, "{}".to_owned())]);
+        let mut executor = fixture.executor(&reader_url, &writer_url);
+        let config = Config::from_str(&database_url).unwrap();
+        let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        store.verify_runtime_contract().await.unwrap();
+        let legacy = WbAutomationLegacyStateSeed {
+            policy_digest: executor.policy_sha256().to_owned(),
+            business_date: wb_automation_business_date(observed_at),
+            actions_today: 0,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: "e".repeat(64),
+        };
+
+        let first = executor
+            .run_explicit_exposure_increase_once_postgres(&store, &legacy, observed_at, 5_000)
+            .await
+            .unwrap()
+            .expect("campaign lock is available");
+        assert_eq!(
+            first.outcome,
+            WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+        );
+        assert!(matches!(
+            first.decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes == &[WbAutomationBidChange {
+                    nm_id: 449_627_598,
+                    from_bid_kopecks: 117,
+                    to_bid_kopecks: 134,
+                    reason: WbAutomationBidReason::ExplicitExposureTarget,
+                }]
+        ));
+        let write_request = writer_requests
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(write_request.starts_with("PATCH /api/advert/v1/bids"));
+        assert!(write_request.contains("\"nm_id\":449627598"));
+        assert!(write_request.contains("\"bid_kopecks\":134"));
+
+        let (readback_url, _) =
+            campaign_level_reader_server_for(campaign_id, 9, [134, 117, 117], &current_date, 2, 10);
+        executor
+            .observer
+            .replace_client_for_test(WbClient::new_for_test(
+                Duration::from_secs(2),
+                BTreeMap::from([(
+                    "ip_domnyshev_wb".to_owned(),
+                    WbCredentials {
+                        token: "test-reader".to_owned(),
+                    },
+                )]),
+                &readback_url,
+                &readback_url,
+            ));
+        let reconciled = executor
+            .run_once_postgres(&store, &legacy, observed_at + ChronoDuration::minutes(1))
+            .await
+            .unwrap()
+            .expect("campaign lock is available");
+        assert_eq!(reconciled.outcome, WbAutomationExecutionOutcome::Reconciled);
+
+        let lease = store
+            .try_acquire_campaign("ip_domnyshev_wb", campaign_id)
             .await
             .unwrap()
             .expect("executor released its campaign lock");
