@@ -1129,11 +1129,10 @@ mod tests {
     fn minimum_bids_response() -> serde_json::Value {
         serde_json::json!({
             "bids": [
-                {"nm_id": 449_627_598_u64, "bids": [{"type": "search", "value": 102}]},
-                {"nm_id": 449_627_015_u64, "bids": [{"type": "search", "value": 102}]},
-                {"nm_id": 497_424_314_u64, "bids": [{"type": "search", "value": 102}]}
-            ],
-            "currency": "RUB"
+                {"nm_id": 449_627_598_u64, "bids": [{"currency": "RUB", "type": "search", "value": 102}]},
+                {"nm_id": 449_627_015_u64, "bids": [{"currency": "RUB", "type": "search", "value": 102}]},
+                {"nm_id": 497_424_314_u64, "bids": [{"currency": "RUB", "type": "search", "value": 102}]}
+            ]
         })
     }
 

@@ -1743,6 +1743,14 @@ check_contains \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   "observe-once"
 check_contains \
+  "WB automation bid-live preflight uses a private umask" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  "umask 077"
+check_contains \
+  "WB automation bid-live preflight creates its ephemeral state directory" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  'mkdir "$state_directory"'
+check_contains \
   "WB automation bid-live installer validates the read-only preflight" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   'WB automation bid-live read-only preflight did not complete'

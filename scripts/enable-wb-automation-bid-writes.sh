@@ -181,16 +181,25 @@ plutil -lint "$temporary_plist" >/dev/null
 "${compose[@]}" up -d --no-deps --wait --wait-timeout 60 write-egress
 
 # This preflight has no writer-token argument and cannot mutate WB or the
-# PostgreSQL execution state. It proves the exact campaign, SKU and current
-# minimum-bid payload through the newly built observer before cutover.
-preflight_output="$("${compose[@]}" run --rm --no-deps wb-automation-live \
-  observe-once \
-  /etc/mcp-ozon/wb-automation-shadow-policy.json \
-  /etc/mcp-ozon/access.json \
-  /run/secrets/wb-promotion-read.token \
-  /tmp/wb-automation-bid-live-preflight \
-  true \
-  http://ozon-egress:3128)"
+# PostgreSQL execution state. The unprivileged container creates a private
+# snapshot directory on its ephemeral /tmp tmpfs before proving the exact
+# campaign, SKU and current minimum-bid payload through the new observer.
+# shellcheck disable=SC2016 # The inner /bin/sh expands its private path.
+preflight_output="$("${compose[@]}" run --rm --no-deps \
+  --entrypoint /bin/sh \
+  wb-automation-live \
+  -eu -c '
+    umask 077
+    state_directory=/tmp/wb-automation-bid-live-preflight
+    mkdir "$state_directory"
+    exec /usr/local/bin/wb-automation observe-once \
+      /etc/mcp-ozon/wb-automation-shadow-policy.json \
+      /etc/mcp-ozon/access.json \
+      /run/secrets/wb-promotion-read.token \
+      "$state_directory" \
+      true \
+      http://ozon-egress:3128
+  ')"
 printf '%s\n' "$preflight_output"
 if ! jq -e '
   .outcome == "observed"
