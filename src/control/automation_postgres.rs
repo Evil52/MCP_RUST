@@ -123,6 +123,11 @@ pub struct WbAutomationStateTransitionReceipt {
 enum PolicyTransition {
     ProtectiveLive,
     BidWrites,
+    BoundedPacingActivated {
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+        target_impressions_per_day: u64,
+    },
 }
 
 impl PolicyTransition {
@@ -130,18 +135,40 @@ impl PolicyTransition {
         match self {
             Self::ProtectiveLive => "protective_live_activated",
             Self::BidWrites => "bid_writes_activated",
+            Self::BoundedPacingActivated { .. } => "bounded_pacing_activated",
         }
     }
 
     const fn mode(self) -> &'static str {
         match self {
             Self::ProtectiveLive => "protective_live",
-            Self::BidWrites => "bid_live",
+            Self::BidWrites | Self::BoundedPacingActivated { .. } => "bid_live",
         }
     }
 
     const fn bid_writes_enabled(self) -> bool {
-        matches!(self, Self::BidWrites)
+        matches!(self, Self::BidWrites | Self::BoundedPacingActivated { .. })
+    }
+
+    const fn max_bid_change(self) -> Option<(u64, u64)> {
+        match self {
+            Self::BoundedPacingActivated {
+                from_max_bid_kopecks,
+                to_max_bid_kopecks,
+                ..
+            } => Some((from_max_bid_kopecks, to_max_bid_kopecks)),
+            Self::ProtectiveLive | Self::BidWrites => None,
+        }
+    }
+
+    const fn target_impressions_per_day(self) -> Option<u64> {
+        match self {
+            Self::BoundedPacingActivated {
+                target_impressions_per_day,
+                ..
+            } => Some(target_impressions_per_day),
+            Self::ProtectiveLive | Self::BidWrites => None,
+        }
     }
 }
 
@@ -421,6 +448,36 @@ impl WbAutomationCampaignLease<'_> {
         .await
     }
 
+    /// Activates bounded campaign-level exposure pacing while lowering the
+    /// active bid-live maximum. The caller must separately prove that these
+    /// are the only policy changes. Durable counters, cooldown, pause and
+    /// incident state are preserved, and the digest change is audited.
+    pub async fn activate_bounded_pacing_policy(
+        &mut self,
+        source_policy_digest: &str,
+        target_policy_digest: &str,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+        target_impressions_per_day: u64,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        if to_max_bid_kopecks == 0
+            || to_max_bid_kopecks >= from_max_bid_kopecks
+            || target_impressions_per_day == 0
+        {
+            return Err(WbAutomationPostgresError::InvalidInput);
+        }
+        self.activate_policy_transition(
+            source_policy_digest,
+            target_policy_digest,
+            PolicyTransition::BoundedPacingActivated {
+                from_max_bid_kopecks,
+                to_max_bid_kopecks,
+                target_impressions_per_day,
+            },
+        )
+        .await
+    }
+
     async fn activate_policy_transition(
         &mut self,
         source_policy_digest: &str,
@@ -521,14 +578,22 @@ impl WbAutomationCampaignLease<'_> {
             transition.event_type(),
             target_policy_digest,
         );
-        let payload_json = serde_json::json!({
+        let mut payload = serde_json::json!({
             "from_policy_sha256": source_policy_digest,
             "to_policy_sha256": target_policy_digest,
             "mode": transition.mode(),
             "bid_writes_enabled": transition.bid_writes_enabled(),
             "state_revision": next_revision,
-        })
-        .to_string();
+        });
+        if let Some((from_max_bid_kopecks, to_max_bid_kopecks)) = transition.max_bid_change() {
+            payload["from_max_bid_kopecks"] = from_max_bid_kopecks.into();
+            payload["to_max_bid_kopecks"] = to_max_bid_kopecks.into();
+        }
+        if let Some(target_impressions_per_day) = transition.target_impressions_per_day() {
+            payload["target_impressions_per_day"] = target_impressions_per_day.into();
+            payload["autonomous_pacing_enabled"] = true.into();
+        }
+        let payload_json = payload.to_string();
         insert_audit_event(
             &transaction,
             &AuditEvent {

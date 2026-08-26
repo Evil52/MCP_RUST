@@ -14,7 +14,7 @@ represented in typed policy, enforced in code, and covered by tests.
 - Allowed products: `449627598`, `449627015`, `497424314`
 - Advertising timezone: `Europe/Moscow`
 - Target DRR / hard DRR: 15% / 25%
-- Maximum bid: 6 RUB
+- Maximum bid: 5 RUB
 - Maximum ordinary bid step: 15%
 - Cooldown: 6 hours
 - Protective threshold / daily ceiling: 250 RUB / 300 RUB
@@ -130,7 +130,7 @@ durable unresolved action and blocks later writes.
 ## P3 bounded bid-live runtime
 
 `config/wb-automation-robot.bid-live.json` differs from the protective policy
-only by `bid_writes_enabled=true`. The account, campaign, three SKUs, 6 RUB bid
+only by `bid_writes_enabled=true`. The account, campaign, three SKUs, 5 RUB bid
 ceiling, 15% step, two actions per Moscow day, six-hour cooldown, 250 RUB pause,
 300 RUB hard ceiling and prohibition on budget top-up remain unchanged.
 
@@ -139,9 +139,14 @@ decision. Every returned bid must declare `RUB` and contain exactly the approved
 SKU/search scope and the reviewed 102-kopeck floor; currency, shape, value drift
 or incomplete data fails closed before a write. Campaign details, current
 spend, budget and stock are also refreshed.
-Incomplete per-SKU attribution still blocks performance-based increases and
-reductions. With only campaign-level attribution, the sole SKU action available
-is lowering a genuinely low-stock SKU to the verified floor.
+Incomplete per-SKU attribution still blocks SKU-performance claims and
+reductions. With `autonomous_pacing="enabled"`, reviewed campaign totals may
+authorize one exposure step when impressions remain below 5,000, aggregate DRR
+is at or below target (or clicks without orders remain below the reduction
+threshold), and all stronger campaign guards are clear. The least-bid safe
+in-stock SKU is selected deterministically; aggregate totals are never copied
+into SKU rows. A genuinely low-stock SKU is still lowered to the verified floor
+before any pacing step can be considered.
 
 An operator may request one explicit low-exposure step toward the policy's
 5,000-impression target with `explicit-exposure-increase-once-pg`. This is not a
@@ -187,6 +192,16 @@ exact protective-policy digest under the PostgreSQL campaign lock, appends a
 `bid_writes_activated` audit event, runs one bid-live cycle and only then
 reinstalls the five-minute LaunchAgent. A failure after timer shutdown leaves
 automation stopped rather than mixing policy owners.
+
+Re-running the installer for the reviewed autonomous pacing policy uses
+`activate-bounded-pacing-pg`. It accepts two bid-live policies only when the
+target enables `autonomous_pacing="enabled"` and lowers `max_bid_kopecks`, proves
+the current WB bids fit under that cap through the read-only observer, preserves
+the durable action counter and cooldown, and appends
+`bounded_pacing_activated`. The robot then applies at most one 15% step per
+cycle while campaign exposure is below 5,000 and the campaign-level efficiency,
+stock, daily action, cooldown and spend guards remain clear. The 5 RUB cap is
+not a target and is never applied as a one-shot bid.
 
 ## CPC compatibility corrections
 

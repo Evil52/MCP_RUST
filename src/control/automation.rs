@@ -44,6 +44,8 @@ pub struct WbAutomationPolicy {
     pub target_drr_basis_points: u32,
     pub hard_drr_basis_points: u32,
     pub target_impressions_per_day: u64,
+    #[serde(default, skip_serializing_if = "is_pacing_disabled")]
+    pub autonomous_pacing: WbAutomationPacingMode,
     pub min_bid_kopecks: u64,
     pub max_bid_kopecks: u64,
     pub bid_step_percent: u8,
@@ -61,6 +63,21 @@ pub struct WbAutomationPolicy {
     pub low_exposure_max_clicks: u64,
     pub observe_until: DateTime<Utc>,
     pub allow_budget_top_up: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WbAutomationPacingMode {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+impl WbAutomationPacingMode {
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +148,7 @@ pub enum WbAutomationBidReason {
     EfficientSales,
     LowExposureExploration,
     ExplicitExposureTarget,
+    AutonomousExposurePacing,
     LowStockGuard,
     NoOrdersHardStop,
     HardDrrExceeded,
@@ -364,6 +382,14 @@ fn campaign_gate(
 )]
 const fn is_false(value: &bool) -> bool {
     !*value
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a predicate that borrows the field"
+)]
+const fn is_pacing_disabled(value: &WbAutomationPacingMode) -> bool {
+    matches!(value, WbAutomationPacingMode::Disabled)
 }
 
 /// Campaign totals are useful for campaign-wide reporting, but cannot identify
@@ -693,6 +719,7 @@ mod tests {
             target_drr_basis_points: 1_500,
             hard_drr_basis_points: 2_500,
             target_impressions_per_day: 5_000,
+            autonomous_pacing: WbAutomationPacingMode::Enabled,
             min_bid_kopecks: 102,
             max_bid_kopecks: 600,
             bid_step_percent: 15,

@@ -1767,9 +1767,25 @@ check_contains \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   "activate-bid-writes-pg"
 check_contains \
+  "WB automation bid-live installer uses audited bounded pacing migration" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  "activate-bounded-pacing-pg"
+check_contains \
   "WB automation bid-live installer validates activation outcome" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   '.outcome == "bid_writes_activated"'
+check_contains \
+  "WB automation bid-live installer validates bounded pacing outcome" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  '.outcome == "bounded_pacing_activated"'
+check_contains \
+  "WB automation bid-live installer pins five-ruble hard cap" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  '.max_bid_kopecks == 500'
+check_contains \
+  "WB automation bid-live installer pins autonomous pacing" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  '.autonomous_pacing == "enabled"'
 check_contains \
   "WB automation bid-live installer enables the runner mode explicitly" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
