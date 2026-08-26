@@ -695,7 +695,7 @@ verify_wb_automation_live() {
      and .security_opt == ["no-new-privileges:true"]
      and (.privileged // false) == false
      and .restart == "unless-stopped"
-     and .mem_limit == "67108864"
+     and .mem_limit == "268435456"
      and .cpus == 0.25
      and .pids_limit == 32
      and .stop_grace_period == "10s"
@@ -1415,7 +1415,7 @@ verify_control_wb_plan() {
      and ((.cap_add // []) | length == 0)
      and ((.security_opt // []) | index("no-new-privileges:true") != null)
      and (.privileged // false) == false
-     and .mem_limit == "67108864"
+     and .mem_limit == "268435456"
      and .cpus == 0.25
      and .pids_limit == 32
      and .stop_grace_period == "10s"
