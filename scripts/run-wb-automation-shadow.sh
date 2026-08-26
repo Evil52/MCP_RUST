@@ -4,7 +4,7 @@ set -euo pipefail
 
 project_root="${WB_AUTOMATION_PROJECT_DIR:?WB_AUTOMATION_PROJECT_DIR is required}"
 runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
-position_env="${WB_AUTOMATION_POSITION_ENV:-$project_root/.position.env}"
+position_env="${WB_AUTOMATION_POSITION_ENV:-$runtime_dir/position.env}"
 policy="${WB_AUTOMATION_SHADOW_POLICY:-$runtime_dir/wb-automation-shadow-policy.json}"
 registry="${WB_AUTOMATION_ACCESS_CONFIG:-$runtime_dir/access.json}"
 reader_token="${WB_AUTOMATION_READ_TOKEN_FILE:-$runtime_dir/ip-domnyshev-wb-promotion-read.token}"

@@ -85,6 +85,12 @@ writer token and invokes only `shadow-once-pg` every five minutes. The legacy
 plist is retained with the `.shadow-disabled` suffix, so a router reset, host
 restart or login cannot accidentally load both state owners.
 
+The installer also starts and health-checks the credentialless marketplace
+read-egress before stopping the legacy timer. It copies the protected database
+environment to the private runtime directory because macOS LaunchAgents cannot
+reliably read hidden credential files under `Documents`; both copies remain
+mode `0600` and ignored by Git.
+
 This command deliberately suspends automatic WB mutations. Do not bootstrap the
 legacy agent while the PostgreSQL shadow is active: both runtimes must never own
 campaign state concurrently. Enabling writes again requires a separate reviewed

@@ -13,11 +13,13 @@ policy_source="$project_root/config/wb-automation-robot.json"
 runner_source="$project_root/scripts/run-wb-automation-shadow.sh"
 plist_template="$project_root/ops/macos/com.ofk.mcp-ozon-wb-automation-shadow.plist.in"
 shadow_compose="$project_root/compose.wb-automation-shadow.yaml"
+position_compose="$project_root/compose.position.yaml"
 legacy_egress_compose="$project_root/compose.wb-automation-egress.yaml"
 roles_script="$project_root/position-monitor/initdb/003_roles.sh"
 migration="$project_root/position-monitor/initdb/021_wb_automation_state.sql"
 position_env="$project_root/.position.env"
 runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
+position_env_target="$runtime_dir/position.env"
 registry="${WB_AUTOMATION_ACCESS_CONFIG:-$runtime_dir/access.json}"
 reader_token="${WB_AUTOMATION_READ_TOKEN_FILE:-$runtime_dir/ip-domnyshev-wb-promotion-read.token}"
 legacy_state="${WB_AUTOMATION_LEGACY_STATE:-$runtime_dir/wb-automation-robot/execution-state.json}"
@@ -45,7 +47,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 for path in \
   "$policy_source" "$runner_source" "$plist_template" "$shadow_compose" \
-  "$legacy_egress_compose" "$roles_script" "$migration" "$position_env" \
+  "$position_compose" "$legacy_egress_compose" "$roles_script" "$migration" "$position_env" \
   "$registry" "$reader_token" "$legacy_state"; do
   if [[ ! -f "$path" || -L "$path" ]]; then
     echo "required WB automation shadow file is unavailable or unsafe: $path" >&2
@@ -163,6 +165,7 @@ mkdir -p "$runtime_dir" "$libexec_dir" "$agent_dir" "$log_dir"
 chmod 700 "$runtime_dir" "$libexec_dir"
 install -m 700 "$runner_source" "$runner_target"
 install -m 644 "$policy_source" "$policy_target"
+install -m 600 "$position_env" "$position_env_target"
 
 WB_AUTOMATION_POLICY_HOST="$policy_target" \
 WB_AUTOMATION_ACCESS_CONFIG_HOST="$registry" \
@@ -182,6 +185,14 @@ sed \
   -e "s|__PROJECT_DIR__|$project_root|g" \
   "$plist_template" >"$temporary_plist"
 plutil -lint "$temporary_plist" >/dev/null
+
+# The shadow has no direct network route. Prove its credentialless read proxy
+# is healthy before disabling the working legacy timer.
+"$docker_bin" compose \
+  --project-directory "$project_root" \
+  --env-file "$position_env" \
+  -f "$position_compose" \
+  up -d --no-deps --wait --wait-timeout 60 ozon-egress
 
 # The legacy job is the only host process with the WB writer token. Stop it
 # before importing its state, then remove its network write capability. Any
@@ -204,6 +215,7 @@ fi
 # Prove one PostgreSQL-backed read-only cycle before scheduling future cycles.
 WB_AUTOMATION_PROJECT_DIR="$project_root" \
 MCP_RUNTIME_DIR="$runtime_dir" \
+WB_AUTOMATION_POSITION_ENV="$position_env_target" \
   "$runner_target"
 
 launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
