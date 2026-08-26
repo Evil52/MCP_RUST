@@ -143,6 +143,37 @@ Incomplete per-SKU attribution still blocks performance-based increases and
 reductions. With only campaign-level attribution, the sole SKU action available
 is lowering a genuinely low-stock SKU to the verified floor.
 
+An operator may request one explicit low-exposure step toward the policy's
+5,000-impression target with `explicit-exposure-increase-once-pg`. This is not a
+second decision engine: the command accepts only the exact target stored in the
+active policy, requires the ordinary decision to be
+`hold/attribution_incomplete`, verifies campaign impressions and clicks remain
+inside the reviewed low-exposure envelope, and raises exactly one in-stock SKU
+by the ordinary 15% step. Every campaign-wide guard, the daily action quota,
+cooldown, PostgreSQL reservation, final write permit, append-only audit and
+exact WB read-back remain mandatory. A target is an optimization objective, not
+a guarantee of delivery.
+
+The container invocation uses the same secrets and isolated egresses as the
+scheduled worker:
+
+```bash
+docker compose \
+  --project-directory "$WB_AUTOMATION_PROJECT_DIR" \
+  --env-file "$WB_AUTOMATION_POSITION_ENV" \
+  -f compose.wb-automation-live.yaml \
+  run --rm --no-deps wb-automation-live \
+  explicit-exposure-increase-once-pg \
+  /etc/mcp-ozon/wb-automation-live-policy.json \
+  /etc/mcp-ozon/access.json \
+  /run/secrets/wb-promotion-read.token \
+  /run/secrets/wb-promotion-write.token \
+  /var/lib/mcp-ozon-legacy/execution-state.json \
+  true http://write-egress:3130 5000 \
+  --confirm-explicit-exposure-increase \
+  http://ozon-egress:3128
+```
+
 The audited transition command is wrapped by:
 
 ```bash

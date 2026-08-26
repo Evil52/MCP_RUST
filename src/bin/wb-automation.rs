@@ -34,6 +34,9 @@ async fn main() -> Result<()> {
         }
         Command::ActivateBidWritesPostgres(options) => activate_bid_writes_postgres(options).await,
         Command::ExecutePostgres(options) => execute_postgres_once(options).await,
+        Command::ExplicitExposureIncreasePostgres(options) => {
+            explicit_exposure_increase_postgres_once(options).await
+        }
         Command::Execute(options) => execute_once(options).await,
         Command::Auto(options) => auto_once(options).await,
     }
@@ -270,6 +273,23 @@ async fn execute_once(options: ExecuteOptions) -> Result<()> {
 }
 
 async fn execute_postgres_once(options: PostgresExecuteOptions) -> Result<()> {
+    execute_postgres_with_target(options, None).await
+}
+
+async fn explicit_exposure_increase_postgres_once(
+    options: ExplicitExposureIncreaseOptions,
+) -> Result<()> {
+    ensure!(
+        options.confirmation == "--confirm-explicit-exposure-increase",
+        "WB explicit exposure increase confirmation is invalid"
+    );
+    execute_postgres_with_target(options.execute, Some(options.target_impressions)).await
+}
+
+async fn execute_postgres_with_target(
+    options: PostgresExecuteOptions,
+    target_impressions: Option<u64>,
+) -> Result<()> {
     let state_directory = options
         .legacy_state
         .parent()
@@ -297,10 +317,19 @@ async fn execute_postgres_once(options: PostgresExecuteOptions) -> Result<()> {
         Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
     let store = WbAutomationPostgresStore::connect(&database_config).await?;
     store.verify_runtime_contract().await?;
-    match executor
-        .run_once_postgres(&store, &legacy, Utc::now())
-        .await?
-    {
+    let receipt = match target_impressions {
+        Some(target) => {
+            executor
+                .run_explicit_exposure_increase_once_postgres(&store, &legacy, Utc::now(), target)
+                .await?
+        }
+        None => {
+            executor
+                .run_once_postgres(&store, &legacy, Utc::now())
+                .await?
+        }
+    };
+    match receipt {
         Some(receipt) => println!("{}", serde_json::to_string(&receipt)?),
         None => println!(
             "{}",
@@ -370,6 +399,7 @@ enum Command {
     ActivateProtectiveLivePostgres(ActivatePolicyOptions),
     ActivateBidWritesPostgres(ActivatePolicyOptions),
     ExecutePostgres(PostgresExecuteOptions),
+    ExplicitExposureIncreasePostgres(ExplicitExposureIncreaseOptions),
     Execute(ExecuteOptions),
     Auto(ExecuteOptions),
 }
@@ -387,6 +417,12 @@ struct ShadowPostgresOptions {
 struct PostgresExecuteOptions {
     execute: ExecuteOptions,
     legacy_state: PathBuf,
+}
+
+struct ExplicitExposureIncreaseOptions {
+    execute: PostgresExecuteOptions,
+    target_impressions: u64,
+    confirmation: String,
 }
 
 struct ObserveOptions {
@@ -423,6 +459,43 @@ impl ExecuteOptions {
 }
 
 fn parse_command(arguments: &[String]) -> Result<Command> {
+    if let [
+        command,
+        policy,
+        registry,
+        reader_token,
+        writer_token,
+        legacy_state,
+        broad_reader,
+        writer_proxy_url,
+        target_impressions,
+        confirmation,
+        tail @ ..,
+    ] = arguments
+        && command == "explicit-exposure-increase-once-pg"
+    {
+        return Ok(Command::ExplicitExposureIncreasePostgres(
+            ExplicitExposureIncreaseOptions {
+                execute: PostgresExecuteOptions {
+                    execute: ExecuteOptions {
+                        policy: policy.into(),
+                        registry: registry.into(),
+                        reader_token: reader_token.into(),
+                        writer_token: writer_token.into(),
+                        state_directory: PathBuf::new(),
+                        allow_broad_reader: parse_bool(broad_reader)?,
+                        writer_proxy_url: nonempty(writer_proxy_url)?,
+                        reader_proxy_url: optional_proxy(tail)?,
+                    },
+                    legacy_state: legacy_state.into(),
+                },
+                target_impressions: target_impressions
+                    .parse()
+                    .context("WB explicit exposure target is invalid")?,
+                confirmation: confirmation.clone(),
+            },
+        ));
+    }
     if let [
         command,
         shadow_policy,
@@ -601,7 +674,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
+        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
     )
 }
 

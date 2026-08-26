@@ -130,6 +130,7 @@ pub enum WbAutomationBidReason {
     NoOrdersAfterClicks,
     EfficientSales,
     LowExposureExploration,
+    ExplicitExposureTarget,
     LowStockGuard,
     NoOrdersHardStop,
     HardDrrExceeded,
@@ -642,7 +643,7 @@ fn ratio_basis_points(numerator: u64, denominator: u64) -> Result<u32, WbAutomat
     u32::try_from(value).map_err(|_| WbAutomationDecisionError::Overflow)
 }
 
-fn increase_bid(
+pub(super) fn increase_bid(
     policy: &WbAutomationPolicy,
     current: u64,
 ) -> Result<u64, WbAutomationDecisionError> {
