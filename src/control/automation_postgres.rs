@@ -361,6 +361,148 @@ impl WbAutomationCampaignLease<'_> {
         row.as_ref().map(parse_state).transpose()
     }
 
+    /// Activates the reviewed protective live policy without resetting any
+    /// campaign state. The transition is allowed only from the exact shadow
+    /// digest, with no pending write or incident, and is append-only audited
+    /// against the latest persisted shadow cycle. Replaying the same cutover
+    /// is idempotent.
+    pub async fn activate_protective_live_policy(
+        &mut self,
+        shadow_policy_digest: &str,
+        live_policy_digest: &str,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        validate_digest(shadow_policy_digest)?;
+        validate_digest(live_policy_digest)?;
+        if shadow_policy_digest == live_policy_digest {
+            return Err(WbAutomationPostgresError::InvalidInput);
+        }
+        let client = self
+            .client
+            .as_mut()
+            .ok_or(WbAutomationPostgresError::Unavailable)?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+        let state = transaction
+            .query_opt(
+                "SELECT policy_digest, pending_idempotency_key, incident_class, revision \
+                 FROM wb_automation.execution_state \
+                 WHERE account_id=$1 AND advert_id=$2 FOR UPDATE",
+                &[&self.account_id, &self.campaign_id],
+            )
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?
+            .ok_or(WbAutomationPostgresError::StateChanged)?;
+        let current_digest = state.get::<_, &str>(0);
+        let pending = state.get::<_, Option<&str>>(1);
+        let incident = state.get::<_, Option<&str>>(2);
+        let revision = state.get::<_, i64>(3);
+        if pending.is_some() || incident.is_some() || revision <= 0 {
+            return Err(WbAutomationPostgresError::StateChanged);
+        }
+        if current_digest == live_policy_digest {
+            let state_revision =
+                u64::try_from(revision).map_err(|_| WbAutomationPostgresError::StateChanged)?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+            return Ok(WbAutomationStateTransitionReceipt {
+                changed: false,
+                state_revision,
+            });
+        }
+        if current_digest != shadow_policy_digest {
+            return Err(WbAutomationPostgresError::StateChanged);
+        }
+        let unresolved = transaction
+            .query_one(
+                "SELECT EXISTS (\
+                    SELECT 1 FROM wb_automation.action_attempts \
+                    WHERE account_id=$1 AND advert_id=$2 \
+                      AND status IN ('reserved','write_started','awaiting_readback','reconciliation_required')\
+                 )",
+                &[&self.account_id, &self.campaign_id],
+            )
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?
+            .get::<_, bool>(0);
+        if unresolved {
+            return Err(WbAutomationPostgresError::StateChanged);
+        }
+        let cycle_id = transaction
+            .query_opt(
+                "SELECT cycle_id FROM wb_automation.cycles \
+                 WHERE account_id=$1 AND advert_id=$2 AND policy_digest=$3 \
+                 ORDER BY observed_at DESC LIMIT 1",
+                &[&self.account_id, &self.campaign_id, &shadow_policy_digest],
+            )
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?
+            .map(|row| row.get::<_, String>(0))
+            .ok_or(WbAutomationPostgresError::StateChanged)?;
+        let next_revision = revision
+            .checked_add(1)
+            .ok_or(WbAutomationPostgresError::StateChanged)?;
+        let updated = transaction
+            .execute(
+                "UPDATE wb_automation.execution_state \
+                 SET policy_digest=$3, revision=$4 \
+                 WHERE account_id=$1 AND advert_id=$2 AND policy_digest=$5 \
+                   AND revision=$6 AND pending_idempotency_key IS NULL \
+                   AND incident_class IS NULL",
+                &[
+                    &self.account_id,
+                    &self.campaign_id,
+                    &live_policy_digest,
+                    &next_revision,
+                    &shadow_policy_digest,
+                    &revision,
+                ],
+            )
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+        if updated != 1 {
+            return Err(WbAutomationPostgresError::StateChanged);
+        }
+        let event_key = audit_event_key(
+            shadow_policy_digest,
+            "protective_live_activated",
+            live_policy_digest,
+        );
+        let payload_json = serde_json::json!({
+            "from_policy_sha256": shadow_policy_digest,
+            "to_policy_sha256": live_policy_digest,
+            "mode": "protective_live",
+            "bid_writes_enabled": false,
+            "state_revision": next_revision,
+        })
+        .to_string();
+        insert_audit_event(
+            &transaction,
+            &AuditEvent {
+                event_key: &event_key,
+                cycle_id: &cycle_id,
+                account_id: &self.account_id,
+                campaign_id: self.campaign_id,
+                event_type: "protective_live_activated",
+                idempotency_key: None,
+                payload_json: &payload_json,
+            },
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+        Ok(WbAutomationStateTransitionReceipt {
+            changed: true,
+            state_revision: u64::try_from(next_revision)
+                .map_err(|_| WbAutomationPostgresError::StateChanged)?,
+        })
+    }
+
     /// Loads the exact unresolved action referenced by the locked campaign
     /// state. The revision check prevents a stale observation from being used
     /// to reconcile a newer action.

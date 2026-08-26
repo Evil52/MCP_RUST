@@ -642,6 +642,7 @@ mod tests {
         ))
         .unwrap();
         policy.write_enabled = true;
+        policy.bid_writes_enabled = true;
         policy
     }
 

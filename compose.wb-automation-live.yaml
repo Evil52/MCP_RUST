@@ -1,0 +1,131 @@
+name: mcp-ozon-wb-automation-live
+
+services:
+  wb-automation-live:
+    image: mcp-ozon-wb-automation-live:local
+    build:
+      context: .
+      dockerfile: Dockerfile.wb-automation-shadow
+    environment:
+      WB_AUTOMATION_DATABASE_URL: postgresql://wb_automation_writer:${WB_AUTOMATION_DB_PASSWORD:?WB_AUTOMATION_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      RUST_LOG: mcp_ozon::control=info
+    command:
+      - execute-once-pg
+      - /etc/mcp-ozon/wb-automation-live-policy.json
+      - /etc/mcp-ozon/access.json
+      - /run/secrets/wb-promotion-read.token
+      - /run/secrets/wb-promotion-write.token
+      - /var/lib/mcp-ozon-legacy/execution-state.json
+      - "true"
+      - http://write-egress:3130
+      - http://ozon-egress:3128
+    volumes:
+      - type: bind
+        source: ${WB_AUTOMATION_SHADOW_POLICY_HOST:?WB_AUTOMATION_SHADOW_POLICY_HOST is required}
+        target: /etc/mcp-ozon/wb-automation-shadow-policy.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WB_AUTOMATION_LIVE_POLICY_HOST:?WB_AUTOMATION_LIVE_POLICY_HOST is required}
+        target: /etc/mcp-ozon/wb-automation-live-policy.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WB_AUTOMATION_ACCESS_CONFIG_HOST:?WB_AUTOMATION_ACCESS_CONFIG_HOST is required}
+        target: /etc/mcp-ozon/access.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WB_AUTOMATION_READ_TOKEN_FILE_HOST:?WB_AUTOMATION_READ_TOKEN_FILE_HOST is required}
+        target: /run/secrets/wb-promotion-read.token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WB_AUTOMATION_WRITE_TOKEN_FILE_HOST:?WB_AUTOMATION_WRITE_TOKEN_FILE_HOST is required}
+        target: /run/secrets/wb-promotion-write.token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${WB_AUTOMATION_LEGACY_STATE_HOST:?WB_AUTOMATION_LEGACY_STATE_HOST is required}
+        target: /var/lib/mcp-ozon-legacy/execution-state.json
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - position-internal
+      - ozon-egress-internal
+      - write-egress-internal
+    depends_on:
+      write-egress:
+        condition: service_healthy
+    restart: "no"
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+
+  write-egress:
+    container_name: mcp-ozon-wb-automation-live-write-egress
+    image: mcp-ozon-wb-automation-live-write-egress:local
+    build:
+      context: .
+      dockerfile: Dockerfile.control-write-egress
+    networks:
+      - write-egress-internal
+      - outbound
+    restart: unless-stopped
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 32
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /var/cache/squid:size=4m,mode=1777
+      - /var/log/squid:size=2m,mode=1777
+      - /var/run/squid:size=1m,mode=1777
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "printf 'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 3130 | head -1 | grep -q '403 Forbidden'"
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 10s
+
+networks:
+  position-internal:
+    name: mcp-ozon-position-internal
+    external: true
+  ozon-egress-internal:
+    name: mcp-ozon-egress-internal
+    external: true
+  write-egress-internal:
+    internal: true
+  outbound:
+    name: mcp-ozon-outbound
+    external: true

@@ -28,6 +28,8 @@ pub fn wb_automation_business_date(now: DateTime<Utc>) -> NaiveDate {
 pub struct WbAutomationPolicy {
     pub policy_version: String,
     pub write_enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bid_writes_enabled: bool,
     pub account_id: String,
     pub campaign_id: u64,
     pub campaign_name: String,
@@ -109,6 +111,7 @@ pub enum WbAutomationHoldReason {
     AuthorizationNotActive,
     AuthorizationExpired,
     PolicyShadowOnly,
+    BidWritesDisabled,
     ObserveOnly,
     AttributionIncomplete,
     CampaignNotActive,
@@ -220,6 +223,19 @@ pub fn evaluate_wb_automation(
 
     if let Some(action) = campaign_gate(policy, observation) {
         return Ok(decision(action, Vec::new()));
+    }
+
+    // The first PostgreSQL live rollout is deliberately protective-only. It
+    // may pause the whole campaign at the approved spend threshold, but SKU
+    // bid changes stay unavailable until their additional data gates and
+    // minimum-bid read-before-write contract are enabled in typed policy.
+    if !policy.bid_writes_enabled {
+        return Ok(decision(
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::BidWritesDisabled,
+            },
+            Vec::new(),
+        ));
     }
 
     if !observation.attribution_complete {
@@ -341,6 +357,14 @@ fn campaign_gate(
     None
 }
 
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a predicate that borrows the field"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Campaign totals are useful for campaign-wide reporting, but cannot identify
 /// which SKU has the best probability of an economical order. WB ADS ROBOT v1
 /// permits at most one SKU change per cycle, so aggregate delivery must never
@@ -458,6 +482,7 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
         && policy.observe_until < policy.authorization_expires_at;
     let nm_ids = policy.nm_ids.iter().copied().collect::<BTreeSet<_>>();
     if policy.policy_version != "wb_ads_robot.v1"
+        || policy.bid_writes_enabled && !policy.write_enabled
         || policy.payment_type != "cpc"
         || policy.placement != "search"
         || policy.timezone != "Europe/Moscow"
@@ -652,6 +677,7 @@ mod tests {
         WbAutomationPolicy {
             policy_version: "wb_ads_robot.v1".to_owned(),
             write_enabled: true,
+            bid_writes_enabled: true,
             account_id: "ip_domnyshev_wb".to_owned(),
             campaign_id: 39_682_633,
             campaign_name: "Робот".to_owned(),
@@ -871,6 +897,23 @@ mod tests {
             WbAutomationAction::Hold {
                 reason: WbAutomationHoldReason::ProtectivePauseRequiresApproval
             }
+        );
+
+        let mut protective_only = policy();
+        protective_only.bid_writes_enabled = false;
+        assert_eq!(
+            evaluate_wb_automation(&protective_only, &observation())
+                .unwrap()
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::BidWritesDisabled
+            }
+        );
+        assert_eq!(
+            evaluate_wb_automation(&protective_only, &capped)
+                .unwrap()
+                .action,
+            WbAutomationAction::PauseCampaignForDailyCap
         );
     }
 
@@ -1302,6 +1345,7 @@ mod tests {
     fn shadow_policy_and_missing_today_spend_block_actions() {
         let mut shadow = policy();
         shadow.write_enabled = false;
+        shadow.bid_writes_enabled = false;
         assert_eq!(
             evaluate_wb_automation(&shadow, &observation())
                 .unwrap()

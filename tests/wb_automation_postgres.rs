@@ -23,6 +23,119 @@ async fn raw_client(config: &Config) -> (tokio_postgres::Client, tokio::task::Jo
 #[tokio::test]
 #[expect(
     clippy::significant_drop_tightening,
+    reason = "the campaign lease is consumed by the explicit async release under test"
+)]
+async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
+    let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+        return;
+    };
+    let config = Config::from_str(&database_url).expect("test database URL parses");
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
+        .expect("test wrapper provides the admin URL");
+    let admin_config = Config::from_str(&admin_url).expect("admin URL parses");
+    let (admin, admin_connection) = raw_client(&admin_config).await;
+    let store = WbAutomationPostgresStore::connect(&config)
+        .await
+        .expect("store connects");
+    let campaign_id = 7_000_000_u64 + CAMPAIGN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let campaign_id_i64 = i64::try_from(campaign_id).expect("campaign fits i64");
+    let account_id = format!("wb_automation_activation_{}", std::process::id());
+    let shadow_policy_digest = "1".repeat(64);
+    let live_policy_digest = "2".repeat(64);
+    let cycle_id = "3".repeat(64);
+    let business_date = NaiveDate::from_ymd_opt(2026, 8, 26).expect("valid date");
+    let observed_at = Utc
+        .with_ymd_and_hms(2026, 8, 26, 12, 0, 0)
+        .single()
+        .expect("valid timestamp");
+    let mut lease = store
+        .try_acquire_campaign(&account_id, campaign_id)
+        .await
+        .expect("lock query succeeds")
+        .expect("campaign lock is acquired");
+    lease
+        .initialize_from_legacy(&WbAutomationLegacyStateSeed {
+            policy_digest: shadow_policy_digest.clone(),
+            business_date,
+            actions_today: 0,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: "4".repeat(64),
+        })
+        .await
+        .expect("shadow state is initialized");
+    lease
+        .persist_shadow_cycle(
+            &cycle_id,
+            &shadow_policy_digest,
+            observed_at,
+            business_date,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("latest shadow evidence is persisted");
+
+    assert_eq!(
+        lease
+            .activate_protective_live_policy(&shadow_policy_digest, &shadow_policy_digest)
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    assert_eq!(
+        lease
+            .activate_protective_live_policy(&"5".repeat(64), &live_policy_digest)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let activation = lease
+        .activate_protective_live_policy(&shadow_policy_digest, &live_policy_digest)
+        .await
+        .expect("protective live policy is activated atomically");
+    assert!(activation.changed);
+    assert_eq!(activation.state_revision, 2);
+    let state = lease
+        .load_state()
+        .await
+        .expect("state query succeeds")
+        .expect("state exists");
+    assert_eq!(state.policy_digest, live_policy_digest);
+    assert_eq!(state.revision, 2);
+
+    let replay = lease
+        .activate_protective_live_policy(&shadow_policy_digest, &live_policy_digest)
+        .await
+        .expect("activation replay is idempotent");
+    assert!(!replay.changed);
+    assert_eq!(replay.state_revision, 2);
+    let audit = admin
+        .query_one(
+            "SELECT cycle_id, payload_json FROM wb_automation.audit_events \
+             WHERE account_id=$1 AND advert_id=$2 AND event_type='protective_live_activated'",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("activation audit evidence is readable");
+    assert_eq!(audit.get::<_, String>(0), cycle_id);
+    let payload = serde_json::from_str::<serde_json::Value>(&audit.get::<_, String>(1))
+        .expect("activation audit payload is valid JSON");
+    assert_eq!(payload["from_policy_sha256"], shadow_policy_digest);
+    assert_eq!(payload["to_policy_sha256"], live_policy_digest);
+    assert_eq!(payload["bid_writes_enabled"], false);
+    assert_eq!(payload["state_revision"], 2);
+
+    lease.release().await.expect("campaign lock is released");
+    drop(admin);
+    admin_connection
+        .await
+        .expect("admin connection task shuts down");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
     reason = "leases are consumed by explicit async release, which is the behavior under test"
 )]
 async fn automation_state_is_isolated_locked_and_idempotent() {

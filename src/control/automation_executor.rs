@@ -1003,6 +1003,7 @@ mod tests {
             ))
             .unwrap();
             test_policy.write_enabled = true;
+            test_policy.bid_writes_enabled = true;
             test_policy.campaign_id = campaign_id;
             fs::write(&policy, serde_json::to_vec_pretty(&test_policy).unwrap()).unwrap();
             fs::write(
