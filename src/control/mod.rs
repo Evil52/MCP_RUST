@@ -22,9 +22,14 @@ pub use automation_observer::{
     WbAutomationObserver, WbAutomationSnapshot, WbAutomationStateView,
     persist_wb_automation_snapshot,
 };
+#[cfg(coverage)]
+#[doc(hidden)]
+pub use automation_postgres::exercise_coverage_only_database_mappings;
 pub use automation_postgres::{
-    WbAutomationCampaignLease, WbAutomationDatabaseState, WbAutomationLegacyStateSeed,
-    WbAutomationPostgresError, WbAutomationPostgresStore,
+    WbAutomationActionReservation, WbAutomationCampaignLease, WbAutomationDatabaseState,
+    WbAutomationDurableAction, WbAutomationDurableActionKind, WbAutomationDurableActionStatus,
+    WbAutomationLegacyStateSeed, WbAutomationPostgresError, WbAutomationPostgresStore,
+    WbAutomationReservationReceipt, WbAutomationStateTransitionReceipt,
 };
 pub use config::{
     ControlAppConfig, ControlAuthConfig, ControlPolicyDatabaseConfig, ControlWbRuntimeConfig,

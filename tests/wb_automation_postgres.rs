@@ -5,6 +5,7 @@ use std::{
 
 use chrono::{Days, Duration, NaiveDate, TimeZone, Utc};
 use mcp_ozon::control::{
+    WbAutomationActionReservation, WbAutomationDurableActionKind, WbAutomationDurableActionStatus,
     WbAutomationLegacyStateSeed, WbAutomationPostgresError, WbAutomationPostgresStore,
 };
 use tokio_postgres::{Config, NoTls};
@@ -25,10 +26,16 @@ async fn raw_client(config: &Config) -> (tokio_postgres::Client, tokio::task::Jo
     reason = "leases are consumed by explicit async release, which is the behavior under test"
 )]
 async fn automation_state_is_isolated_locked_and_idempotent() {
+    #[cfg(coverage)]
+    mcp_ozon::control::exercise_coverage_only_database_mappings();
     let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
         return;
     };
     let config = Config::from_str(&database_url).expect("test database URL parses");
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
+        .expect("test wrapper provides the admin URL");
+    let admin_config = Config::from_str(&admin_url).expect("admin URL parses");
+    let (admin, admin_connection) = raw_client(&admin_config).await;
     let campaign_id = 8_000_000_u64 + CAMPAIGN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let account_id = format!("wb_automation_test_{}", std::process::id());
     let policy_digest = "a".repeat(64);
@@ -36,6 +43,7 @@ async fn automation_state_is_isolated_locked_and_idempotent() {
     let unique_conflict_cycle_id = "c".repeat(64);
     let invalid_date_cycle_id = "d".repeat(64);
     let stale_revision_cycle_id = "e".repeat(64);
+    let readback_cycle_id = "6".repeat(64);
     let business_date = NaiveDate::from_ymd_opt(2026, 8, 25).expect("valid date");
     let observed_at = Utc
         .with_ymd_and_hms(2026, 8, 25, 12, 0, 0)
@@ -208,7 +216,610 @@ async fn automation_state_is_isolated_locked_and_idempotent() {
             .await,
         Err(WbAutomationPostgresError::StateChanged)
     );
+
+    let reservation = WbAutomationActionReservation {
+        idempotency_key: "1".repeat(64),
+        cycle_id: cycle_id.clone(),
+        policy_digest: policy_digest.clone(),
+        request_digest: "2".repeat(64),
+        action_kind: WbAutomationDurableActionKind::ChangeBids,
+        request_json:
+            "{\"kind\":\"change_bids\",\"changes\":[{\"nm_id\":449627598,\"bid_kopecks\":117}]}"
+                .to_owned(),
+        business_date,
+        expected_state_revision: 1,
+        max_actions_per_day: 2,
+    };
+    let mut invalid_idempotency = reservation.clone();
+    invalid_idempotency.idempotency_key = "short".to_owned();
+    let mut invalid_cycle_digest = reservation.clone();
+    invalid_cycle_digest.cycle_id = "short".to_owned();
+    let mut invalid_policy_digest = reservation.clone();
+    invalid_policy_digest.policy_digest = "short".to_owned();
+    let mut invalid_request_digest = reservation.clone();
+    invalid_request_digest.request_digest = "short".to_owned();
+    let mut invalid_request_json = reservation.clone();
+    invalid_request_json.request_json = "{".to_owned();
+    for invalid_reservation in [
+        invalid_idempotency,
+        invalid_cycle_digest,
+        invalid_policy_digest,
+        invalid_request_digest,
+        invalid_request_json,
+    ] {
+        assert_eq!(
+            lease.reserve_action(&invalid_reservation).await,
+            Err(WbAutomationPostgresError::InvalidInput)
+        );
+    }
+    assert_eq!(
+        lease
+            .cancel_reserved(&reservation.idempotency_key, 1, "Bad")
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    let mut missing_cycle_reservation = reservation.clone();
+    missing_cycle_reservation.cycle_id = "f".repeat(64);
+    assert_eq!(
+        lease.reserve_action(&missing_cycle_reservation).await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let mut old_date_reservation = reservation.clone();
+    old_date_reservation.business_date = business_date
+        .pred_opt()
+        .expect("previous business date is representable");
+    assert_eq!(
+        lease.reserve_action(&old_date_reservation).await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    admin
+        .batch_execute("REVOKE INSERT ON wb_automation.action_attempts FROM wb_automation_writer")
+        .await
+        .expect("reservation insert fault is installed");
+    assert_eq!(
+        lease.reserve_action(&reservation).await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT INSERT ON wb_automation.action_attempts TO wb_automation_writer")
+        .await
+        .expect("reservation insert permission is restored");
+    admin
+        .batch_execute("REVOKE INSERT ON wb_automation.audit_events FROM wb_automation_writer")
+        .await
+        .expect("reservation audit fault is installed");
+    assert_eq!(
+        lease.reserve_action(&reservation).await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT INSERT ON wb_automation.audit_events TO wb_automation_writer")
+        .await
+        .expect("reservation audit permission is restored");
+    let reserved = lease
+        .reserve_action(&reservation)
+        .await
+        .expect("first durable action is reserved");
+    assert!(reserved.inserted);
+    assert_eq!(reserved.state_revision, 2);
+    assert_eq!(
+        reserved.action.status,
+        WbAutomationDurableActionStatus::Reserved
+    );
+    admin
+        .batch_execute("REVOKE SELECT ON wb_automation.action_attempts FROM wb_automation_writer")
+        .await
+        .expect("reservation replay read fault is installed");
+    assert_eq!(
+        lease.reserve_action(&reservation).await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT SELECT ON wb_automation.action_attempts TO wb_automation_writer")
+        .await
+        .expect("reservation replay read permission is restored");
+    let replayed = lease
+        .reserve_action(&reservation)
+        .await
+        .expect("identical reservation replay is idempotent");
+    assert!(!replayed.inserted);
+    assert_eq!(replayed.state_revision, 2);
+    let mut mismatched_replay = reservation.clone();
+    mismatched_replay.request_digest = "4".repeat(64);
+    assert_eq!(
+        lease.reserve_action(&mismatched_replay).await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let mut conflicting_reservation = reservation.clone();
+    conflicting_reservation.idempotency_key = "3".repeat(64);
+    conflicting_reservation.request_digest = "4".repeat(64);
+    assert_eq!(
+        lease.reserve_action(&conflicting_reservation).await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert_eq!(
+        lease
+            .mark_write_started(&reservation.idempotency_key, 1)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert_eq!(
+        lease
+            .mark_applied(
+                &reservation.idempotency_key,
+                2,
+                &cycle_id,
+                Some(business_date),
+            )
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    assert_eq!(
+        lease
+            .mark_applied(&reservation.idempotency_key, 2, &cycle_id, None)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    admin
+        .batch_execute("REVOKE INSERT ON wb_automation.audit_events FROM wb_automation_writer")
+        .await
+        .expect("write-start audit fault is installed");
+    assert_eq!(
+        lease
+            .mark_write_started(&reservation.idempotency_key, 2)
+            .await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT INSERT ON wb_automation.audit_events TO wb_automation_writer")
+        .await
+        .expect("write-start audit permission is restored");
+    admin
+        .batch_execute("REVOKE SELECT ON wb_automation.action_attempts FROM wb_automation_writer")
+        .await
+        .expect("write-start read fault is installed");
+    assert_eq!(
+        lease
+            .mark_write_started(&reservation.idempotency_key, 2)
+            .await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT SELECT ON wb_automation.action_attempts TO wb_automation_writer")
+        .await
+        .expect("write-start read permission is restored");
+    assert!(
+        lease
+            .mark_write_started(&reservation.idempotency_key, 2)
+            .await
+            .expect("reserved action transitions to write-started")
+    );
+    assert!(
+        !lease
+            .mark_write_started(&reservation.idempotency_key, 2)
+            .await
+            .expect("write-started replay is idempotent")
+    );
+    assert!(
+        lease
+            .mark_awaiting_readback(&reservation.idempotency_key, 2)
+            .await
+            .expect("write-started action awaits readback")
+    );
+    assert!(
+        !lease
+            .mark_awaiting_readback(&reservation.idempotency_key, 2)
+            .await
+            .expect("awaiting-readback replay is idempotent")
+    );
+    assert_eq!(
+        lease
+            .mark_write_started(&reservation.idempotency_key, 2)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert_eq!(
+        lease
+            .mark_applied(&reservation.idempotency_key, 2, &cycle_id, None)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert!(
+        lease
+            .persist_shadow_cycle(
+                &readback_cycle_id,
+                &policy_digest,
+                observed_at + Duration::seconds(3),
+                business_date,
+                2,
+                "{\"observation\":\"readback_complete\"}",
+                "{\"action\":\"hold\"}",
+            )
+            .await
+            .expect("post-write readback cycle is persisted")
+    );
+    admin
+        .batch_execute("REVOKE INSERT ON wb_automation.audit_events FROM wb_automation_writer")
+        .await
+        .expect("applied audit fault is installed");
+    assert_eq!(
+        lease
+            .mark_applied(&reservation.idempotency_key, 2, &readback_cycle_id, None)
+            .await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT INSERT ON wb_automation.audit_events TO wb_automation_writer")
+        .await
+        .expect("applied audit permission is restored");
+    admin
+        .batch_execute("REVOKE SELECT ON wb_automation.action_attempts FROM wb_automation_writer")
+        .await
+        .expect("applied read fault is installed");
+    assert_eq!(
+        lease
+            .mark_applied(&reservation.idempotency_key, 2, &readback_cycle_id, None)
+            .await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT SELECT ON wb_automation.action_attempts TO wb_automation_writer")
+        .await
+        .expect("applied read permission is restored");
+    let applied = lease
+        .mark_applied(&reservation.idempotency_key, 2, &readback_cycle_id, None)
+        .await
+        .expect("readback resolves the durable action");
+    assert!(applied.changed);
+    assert_eq!(applied.state_revision, 3);
+    let applied_replay = lease
+        .mark_applied(&reservation.idempotency_key, 2, &readback_cycle_id, None)
+        .await
+        .expect("applied transition replay is idempotent");
+    assert!(!applied_replay.changed);
+    assert_eq!(applied_replay.state_revision, 3);
+    assert_eq!(
+        lease
+            .mark_applied(&reservation.idempotency_key, 2, &"a".repeat(64), None,)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let durable_state = lease
+        .load_state()
+        .await
+        .expect("durable state remains readable")
+        .expect("durable state exists");
+    assert_eq!(durable_state.actions_today, 1);
+    assert_eq!(durable_state.revision, 3);
+    assert!(durable_state.pending_idempotency_key.is_none());
+
+    let cancellation_cycle_id = "7".repeat(64);
+    assert!(
+        lease
+            .persist_shadow_cycle(
+                &cancellation_cycle_id,
+                &policy_digest,
+                observed_at + Duration::seconds(4),
+                business_date,
+                3,
+                "{\"observation\":\"complete\"}",
+                "{\"action\":\"change_bids\"}",
+            )
+            .await
+            .expect("cancellation decision cycle is persisted")
+    );
+    let cancellation = WbAutomationActionReservation {
+        idempotency_key: "8".repeat(64),
+        cycle_id: cancellation_cycle_id,
+        policy_digest: policy_digest.clone(),
+        request_digest: "9".repeat(64),
+        action_kind: WbAutomationDurableActionKind::ChangeBids,
+        request_json:
+            "{\"kind\":\"change_bids\",\"changes\":[{\"nm_id\":449627015,\"bid_kopecks\":118}]}"
+                .to_owned(),
+        business_date,
+        expected_state_revision: 3,
+        max_actions_per_day: 3,
+    };
+    assert_eq!(
+        lease
+            .reserve_action(&cancellation)
+            .await
+            .expect("cancellable action is reserved")
+            .state_revision,
+        4
+    );
+    assert_eq!(
+        lease
+            .cancel_reserved(&cancellation.idempotency_key, 3, "policy_changed")
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    admin
+        .batch_execute("REVOKE INSERT ON wb_automation.audit_events FROM wb_automation_writer")
+        .await
+        .expect("cancellation audit fault is installed");
+    assert_eq!(
+        lease
+            .cancel_reserved(&cancellation.idempotency_key, 4, "policy_changed")
+            .await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT INSERT ON wb_automation.audit_events TO wb_automation_writer")
+        .await
+        .expect("cancellation audit permission is restored");
+    admin
+        .batch_execute("REVOKE SELECT ON wb_automation.action_attempts FROM wb_automation_writer")
+        .await
+        .expect("cancellation read fault is installed");
+    assert_eq!(
+        lease
+            .cancel_reserved(&cancellation.idempotency_key, 4, "policy_changed")
+            .await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT SELECT ON wb_automation.action_attempts TO wb_automation_writer")
+        .await
+        .expect("cancellation read permission is restored");
+    let cancelled = lease
+        .cancel_reserved(&cancellation.idempotency_key, 4, "policy_changed")
+        .await
+        .expect("unstarted write is cancelled durably");
+    assert!(cancelled.changed);
+    assert_eq!(cancelled.state_revision, 5);
+    let cancelled_replay = lease
+        .cancel_reserved(&cancellation.idempotency_key, 4, "policy_changed")
+        .await
+        .expect("cancellation replay is idempotent");
+    assert!(!cancelled_replay.changed);
+    assert_eq!(cancelled_replay.state_revision, 5);
+    assert_eq!(
+        lease
+            .cancel_reserved(&cancellation.idempotency_key, 4, "operator_cancelled")
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+
+    let pause_cycle_id = "0".repeat(64);
+    assert!(
+        lease
+            .persist_shadow_cycle(
+                &pause_cycle_id,
+                &policy_digest,
+                observed_at + Duration::seconds(5),
+                business_date,
+                5,
+                "{\"observation\":\"daily_cap_reached\"}",
+                "{\"action\":\"pause_campaign_for_daily_cap\"}",
+            )
+            .await
+            .expect("protective-pause decision cycle is persisted")
+    );
+    let pause = WbAutomationActionReservation {
+        idempotency_key: "5".repeat(64),
+        cycle_id: pause_cycle_id,
+        policy_digest: policy_digest.clone(),
+        request_digest: "7".repeat(64),
+        action_kind: WbAutomationDurableActionKind::PauseCampaignForDailyCap,
+        request_json: "{\"kind\":\"pause_campaign_for_daily_cap\"}".to_owned(),
+        business_date,
+        expected_state_revision: 5,
+        max_actions_per_day: 3,
+    };
+    let mut exhausted_quota = pause.clone();
+    exhausted_quota.max_actions_per_day = 2;
+    assert_eq!(
+        lease.reserve_action(&exhausted_quota).await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert_eq!(
+        lease
+            .reserve_action(&pause)
+            .await
+            .expect("protective pause is reserved")
+            .state_revision,
+        6
+    );
+    assert!(
+        lease
+            .mark_write_started(&pause.idempotency_key, 6)
+            .await
+            .expect("protective pause write starts")
+    );
+    assert_eq!(
+        lease
+            .cancel_reserved(&pause.idempotency_key, 6, "policy_changed")
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert_eq!(
+        lease
+            .mark_applied(&pause.idempotency_key, 6, &pause.cycle_id, None)
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    assert!(
+        lease
+            .mark_awaiting_readback(&pause.idempotency_key, 6)
+            .await
+            .expect("protective pause awaits readback before reconciliation")
+    );
+    let reconciliation = lease
+        .mark_reconciliation_required(&pause.idempotency_key, 6, "readback_unavailable")
+        .await
+        .expect("ambiguous write enters reconciliation");
+    assert!(reconciliation.changed);
+    assert_eq!(reconciliation.state_revision, 7);
+    let reconciliation_replay = lease
+        .mark_reconciliation_required(&pause.idempotency_key, 6, "readback_unavailable")
+        .await
+        .expect("reconciliation replay is idempotent");
+    assert!(!reconciliation_replay.changed);
+    assert_eq!(reconciliation_replay.state_revision, 7);
+    assert_eq!(
+        lease
+            .mark_reconciliation_required(&pause.idempotency_key, 6, "write_timeout")
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let pause_readback_cycle_id = "9".repeat(64);
+    assert!(
+        lease
+            .persist_shadow_cycle(
+                &pause_readback_cycle_id,
+                &policy_digest,
+                observed_at + Duration::seconds(6),
+                business_date,
+                7,
+                "{\"observation\":\"campaign_paused\"}",
+                "{\"action\":\"hold\"}",
+            )
+            .await
+            .expect("reconciliation readback is persisted")
+    );
+    let pause_applied = lease
+        .mark_applied(
+            &pause.idempotency_key,
+            7,
+            &pause_readback_cycle_id,
+            Some(business_date),
+        )
+        .await
+        .expect("readback resolves reconciliation as applied");
+    assert!(pause_applied.changed);
+    assert_eq!(pause_applied.state_revision, 8);
+    assert_eq!(
+        lease
+            .mark_applied(
+                &pause.idempotency_key,
+                7,
+                &pause_readback_cycle_id,
+                business_date.pred_opt(),
+            )
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let final_state = lease
+        .load_state()
+        .await
+        .expect("final state remains readable")
+        .expect("final state exists");
+    assert_eq!(final_state.actions_today, 3);
+    assert_eq!(final_state.revision, 8);
+    assert!(final_state.pending_idempotency_key.is_none());
+    assert_eq!(final_state.paused_for_daily_cap_on, Some(business_date));
+    assert_eq!(
+        final_state.incident_class.as_deref(),
+        Some("readback_unavailable")
+    );
+
     lease.release().await.expect("lock is explicitly released");
+
+    let rollover_campaign_id = campaign_id + 1_000;
+    let mut rollover = first
+        .try_acquire_campaign(&account_id, rollover_campaign_id)
+        .await
+        .expect("rollover lock query succeeds")
+        .expect("rollover campaign lock is acquired");
+    assert!(
+        rollover
+            .initialize_from_legacy(&legacy_seed)
+            .await
+            .expect("rollover campaign state is initialized")
+    );
+    let next_business_date = business_date
+        .succ_opt()
+        .expect("next business date is representable");
+    let next_date_cycle_id = "a".repeat(64);
+    assert!(
+        rollover
+            .persist_shadow_cycle(
+                &next_date_cycle_id,
+                &policy_digest,
+                observed_at + Duration::days(1),
+                next_business_date,
+                1,
+                "{\"observation\":\"next_business_date\"}",
+                "{\"action\":\"change_bids\"}",
+            )
+            .await
+            .expect("next-date decision cycle is persisted")
+    );
+    let next_date_action = WbAutomationActionReservation {
+        idempotency_key: "b".repeat(64),
+        cycle_id: next_date_cycle_id,
+        policy_digest: policy_digest.clone(),
+        request_digest: "c".repeat(64),
+        action_kind: WbAutomationDurableActionKind::ChangeBids,
+        request_json:
+            "{\"kind\":\"change_bids\",\"changes\":[{\"nm_id\":497424314,\"bid_kopecks\":119}]}"
+                .to_owned(),
+        business_date: next_business_date,
+        expected_state_revision: 1,
+        max_actions_per_day: 3,
+    };
+    let mut globally_conflicting_action = next_date_action.clone();
+    globally_conflicting_action.idempotency_key = reservation.idempotency_key.clone();
+    assert_eq!(
+        rollover.reserve_action(&globally_conflicting_action).await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert_eq!(
+        rollover
+            .reserve_action(&next_date_action)
+            .await
+            .expect("next-date action resets the daily counter")
+            .state_revision,
+        2
+    );
+    assert!(
+        rollover
+            .mark_write_started(&next_date_action.idempotency_key, 2)
+            .await
+            .expect("next-date action starts its write")
+    );
+    assert_eq!(
+        rollover
+            .mark_reconciliation_required(&next_date_action.idempotency_key, 2, "write_ambiguous",)
+            .await
+            .expect("write-started action enters reconciliation")
+            .state_revision,
+        3
+    );
+    let rollover_readback_cycle_id = "d".repeat(64);
+    assert!(
+        rollover
+            .persist_shadow_cycle(
+                &rollover_readback_cycle_id,
+                &policy_digest,
+                observed_at + Duration::days(1) + Duration::seconds(1),
+                next_business_date,
+                3,
+                "{\"observation\":\"next_business_date_readback\"}",
+                "{\"action\":\"hold\"}",
+            )
+            .await
+            .expect("next-date readback cycle is persisted")
+    );
+    assert_eq!(
+        rollover
+            .mark_applied(
+                &next_date_action.idempotency_key,
+                3,
+                &rollover_readback_cycle_id,
+                None,
+            )
+            .await
+            .expect("next-date action is reconciled")
+            .state_revision,
+        4
+    );
+    rollover
+        .release()
+        .await
+        .expect("rollover lock is explicitly released");
 
     let next = second
         .try_acquire_campaign(&account_id, campaign_id)
@@ -224,10 +835,31 @@ async fn automation_state_is_isolated_locked_and_idempotent() {
         .expect("second store reacquires before abnormal drop");
     drop(abandoned);
 
-    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
-        .expect("test wrapper provides the admin URL");
-    let admin_config = Config::from_str(&admin_url).expect("admin URL parses");
-    let (admin, admin_connection) = raw_client(&admin_config).await;
+    let campaign_id_i64 = i64::try_from(campaign_id).expect("campaign fits i64");
+    let action_counts = admin
+        .query(
+            "SELECT status, count(*) FROM wb_automation.action_attempts \
+             WHERE account_id=$1 AND advert_id=$2 GROUP BY status ORDER BY status",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("durable action evidence is readable");
+    let counts = action_counts
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(counts.get("applied"), Some(&2));
+    assert_eq!(counts.get("cancelled"), Some(&1));
+    let audit_count = admin
+        .query_one(
+            "SELECT count(*) FROM wb_automation.audit_events \
+             WHERE account_id=$1 AND advert_id=$2",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("append-only audit evidence is readable")
+        .get::<_, i64>(0);
+    assert_eq!(audit_count, 11);
     admin
         .batch_execute(
             "REVOKE EXECUTE ON FUNCTION pg_catalog.hashtextextended(text, bigint) FROM PUBLIC",
