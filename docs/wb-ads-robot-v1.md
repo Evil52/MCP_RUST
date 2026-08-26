@@ -97,6 +97,36 @@ campaign state concurrently. Enabling writes again requires a separate reviewed
 PostgreSQL executor and an explicit cutover; changing `write_enabled` alone is
 not a cutover.
 
+## P2 protective live runtime
+
+The first live PostgreSQL cutover is intentionally narrower than automatic bid
+management. `config/wb-automation-robot.live.json` sets
+`write_enabled=true` and `bid_writes_enabled=false`. The executor may therefore
+issue only the already approved campaign pause after current-day spend reaches
+250 RUB. It cannot change an SKU bid, replenish a budget or resume a campaign.
+
+The guarded installation command is:
+
+```bash
+./scripts/install-wb-automation-live-agent.sh \
+  --confirm-stop-shadow-and-start-protective-live
+```
+
+The installer builds both isolated services before cutover, proves the read and
+write egress deny-by-default health checks, stops the shadow LaunchAgent and the
+legacy host writer, then atomically migrates only the policy digest under the
+shared PostgreSQL campaign lock. The state, daily action counter, cooldown,
+pause and incident fields are preserved. The transition is recorded in the
+append-only audit table against the latest shadow cycle. A first live-policy
+cycle must succeed before `com.ofk.mcp-ozon-wb-automation-live` is scheduled
+every five minutes.
+
+The live worker mounts the writer token but has no direct outbound network. Its
+dedicated credentialless write proxy is reachable only over an internal Docker
+network and allows only the exact WB write paths. If a write is sent, the runner
+immediately performs a second cycle for read-back; any ambiguity remains a
+durable unresolved action and blocks later writes.
+
 ## CPC compatibility corrections
 
 The supplied prompt names recommended-bid and search-cluster statistics as
@@ -123,5 +153,6 @@ future read-before-write guard.
 - Deterministic target pacing, cost forecast and safe/hard CPC formulas backed
   by replay data.
 
-Until these conditions are met, `policy_shadow_only` is the expected safe
-result and no new WB write is authorized by v1.
+Until these conditions are met, automatic SKU bid writes remain disabled by
+typed policy. The P2 protective campaign pause is the only autonomous WB
+mutation authorized by v1.

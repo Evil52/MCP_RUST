@@ -188,6 +188,34 @@ render_wb_automation_shadow_compose() {
       config --no-env-resolution --format json
 }
 
+render_wb_automation_live_compose() {
+  local shadow_policy="$scratch/wb-automation-shadow-policy.json"
+  local live_policy="$scratch/wb-automation-live-policy.json"
+  local access="$scratch/wb-automation-live-access.json"
+  local read_token="$scratch/wb-automation-live-read.token"
+  local write_token="$scratch/wb-automation-live-write.token"
+  local legacy_state="$scratch/wb-automation-live-legacy-state.json"
+  printf '{}\n' >"$shadow_policy"
+  printf '{}\n' >"$live_policy"
+  printf '{}\n' >"$access"
+  printf 'verification-read-token-not-a-secret\n' >"$read_token"
+  printf 'verification-write-token-not-a-secret\n' >"$write_token"
+  printf '{}\n' >"$legacy_state"
+  chmod 600 \
+    "$shadow_policy" "$live_policy" "$access" "$read_token" \
+    "$write_token" "$legacy_state"
+  WB_AUTOMATION_SHADOW_POLICY_HOST="$shadow_policy" \
+    WB_AUTOMATION_LIVE_POLICY_HOST="$live_policy" \
+    WB_AUTOMATION_ACCESS_CONFIG_HOST="$access" \
+    WB_AUTOMATION_READ_TOKEN_FILE_HOST="$read_token" \
+    WB_AUTOMATION_WRITE_TOKEN_FILE_HOST="$write_token" \
+    WB_AUTOMATION_LEGACY_STATE_HOST="$legacy_state" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.wb-automation-live.yaml" \
+      config --no-env-resolution --format json
+}
+
 render_reporting_reader_compose() {
   MCP_ACCESS_CONFIG_HOST="$main_access" \
     docker compose \
@@ -588,6 +616,92 @@ verify_wb_automation_shadow() {
      and .logging == {
        "driver": "json-file",
        "options": {"max-file": "2", "max-size": "1m"}
+     }'
+}
+
+verify_wb_automation_live() {
+  local rendered="$1" service proxy expected_database_url
+  service="$(jq -c '.services["wb-automation-live"]' <<<"$rendered")"
+  proxy="$(jq -c '.services["write-egress"]' <<<"$rendered")"
+  expected_database_url='postgresql://wb_automation_writer:verify-only-wb-automation-not-a-secret@position-db:5432/ozon_positions'
+
+  check "WB automation live: service exists" "$service" 'type == "object"'
+  check "WB automation live: only exact protected inputs are mounted read-only" "$service" \
+    '((.ports // []) | length == 0)
+     and (has("env_file") | not)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)
+     and (.volumes | length == 6)
+     and all(.volumes[]; .type == "bind" and .read_only == true)
+     and ([.volumes[].target] | sort) == [
+       "/etc/mcp-ozon/access.json",
+       "/etc/mcp-ozon/wb-automation-live-policy.json",
+       "/etc/mcp-ozon/wb-automation-shadow-policy.json",
+       "/run/secrets/wb-promotion-read.token",
+       "/run/secrets/wb-promotion-write.token",
+       "/var/lib/mcp-ozon-legacy/execution-state.json"
+     ]'
+  check "WB automation live: command and database role are exact" "$service" \
+    --arg database_url "$expected_database_url" \
+    '.environment == {
+       "RUST_LOG": "mcp_ozon::control=info",
+       "WB_AUTOMATION_DATABASE_URL": $database_url
+     }
+     and .command == [
+       "execute-once-pg",
+       "/etc/mcp-ozon/wb-automation-live-policy.json",
+       "/etc/mcp-ozon/access.json",
+       "/run/secrets/wb-promotion-read.token",
+       "/run/secrets/wb-promotion-write.token",
+       "/var/lib/mcp-ozon-legacy/execution-state.json",
+       "true",
+       "http://write-egress:3130",
+       "http://ozon-egress:3128"
+     ]'
+  check "WB automation live: worker has only internal DB and proxy routes" "$rendered" \
+    '(.services["wb-automation-live"].networks | keys | sort)
+       == ["ozon-egress-internal", "position-internal", "write-egress-internal"]
+     and ((.services["wb-automation-live"].networks | has("outbound")) | not)
+     and .services["wb-automation-live"].depends_on
+       == {"write-egress":{"condition":"service_healthy","required":true}}
+     and .networks["position-internal"].external == true
+     and .networks["ozon-egress-internal"].external == true
+     and .networks["write-egress-internal"].internal == true
+     and .networks.outbound.external == true'
+  check "WB automation live: one-shot resource and privilege bounds are exact" "$service" \
+    '.restart == "no"
+     and .read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false
+     and .tmpfs == ["/tmp:size=8m,mode=1777"]
+     and .mem_limit == "134217728"
+     and .cpus == 0.25
+     and .pids_limit == 64
+     and .logging == {
+       "driver": "json-file",
+       "options": {"max-file": "2", "max-size": "1m"}
+     }'
+  check "WB automation live: write proxy is credentialless and not host-published" "$proxy" \
+    '(has("environment") | not)
+     and (has("env_file") | not)
+     and ((.ports // []) | length == 0)
+     and ((.volumes // []) | length == 0)
+     and ((.secrets // []) | length == 0)
+     and ((.configs // []) | length == 0)
+     and (.networks | keys | sort) == ["outbound", "write-egress-internal"]
+     and .read_only == true
+     and .cap_drop == ["ALL"]
+     and .security_opt == ["no-new-privileges:true"]
+     and (.privileged // false) == false
+     and .restart == "unless-stopped"
+     and .mem_limit == "268435456"
+     and .cpus == 0.25
+     and .pids_limit == 32
+     and .stop_grace_period == "10s"
+     and .healthcheck == {
+       "test": ["CMD-SHELL", "printf '"'"'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n'"'"' | nc -w 3 127.0.0.1 3130 | head -1 | grep -q '"'"'403 Forbidden'"'"'"],
+       "timeout":"8s", "interval":"30s", "retries":3, "start_period":"10s"
      }'
 }
 
@@ -1301,7 +1415,7 @@ verify_control_wb_plan() {
      and ((.cap_add // []) | length == 0)
      and ((.security_opt // []) | index("no-new-privileges:true") != null)
      and (.privileged // false) == false
-     and .mem_limit == "67108864"
+     and .mem_limit == "268435456"
      and .cpus == 0.25
      and .pids_limit == 32
      and .stop_grace_period == "10s"
@@ -1392,6 +1506,7 @@ main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_position_compose)"
 wb_automation_shadow_rendered="$(render_wb_automation_shadow_compose)"
+wb_automation_live_rendered="$(render_wb_automation_live_compose)"
 reporting_reader_rendered="$(render_reporting_reader_compose)"
 reporting_live_rendered="$(render_reporting_live_compose)"
 reporting_canary_rendered="$(render_reporting_canary_compose)"
@@ -1608,6 +1723,26 @@ else
   printf 'ok   WB automation shadow runner has no writer-token capability\n'
 fi
 check_contains \
+  "WB automation live installer requires explicit shadow-to-live cutover" \
+  "$project_dir/scripts/install-wb-automation-live-agent.sh" \
+  "--confirm-stop-shadow-and-start-protective-live"
+check_contains \
+  "WB automation live installer stops the shadow LaunchAgent" \
+  "$project_dir/scripts/install-wb-automation-live-agent.sh" \
+  'launchctl bootout "$domain/$shadow_label"'
+check_contains \
+  "WB automation live installer activates policy through the audited CLI" \
+  "$project_dir/scripts/install-wb-automation-live-agent.sh" \
+  "activate-protective-live-pg"
+check_contains \
+  "WB automation live runner uses an ephemeral no-dependency job" \
+  "$project_dir/scripts/run-wb-automation-live.sh" \
+  'run --rm --no-deps wb-automation-live'
+check_contains \
+  "WB automation live runner performs immediate bounded read-back" \
+  "$project_dir/scripts/run-wb-automation-live.sh" \
+  'write_sent_reconciliation_required'
+check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
   "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"
@@ -1643,6 +1778,10 @@ check_contains \
   "control write egress: proxy denies every other destination" \
   "$project_dir/position-monitor/control-write-egress/squid.conf" \
   "http_access deny all"
+check_contains \
+  "WB automation runtime: legacy state parent is private to the automation user" \
+  "$project_dir/Dockerfile.wb-automation-shadow" \
+  "&& chmod 0700 /var/lib/mcp-ozon-legacy"
 check_contains \
   "control auth egress: only the exact local JWKS path reaches upstream" \
   "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
@@ -1694,6 +1833,7 @@ verify_reporting_reader "$reporting_reader_rendered" "$main_rendered"
 verify_position "$position_rendered"
 verify_position_collector "$position_rendered"
 verify_wb_automation_shadow "$wb_automation_shadow_rendered"
+verify_wb_automation_live "$wb_automation_live_rendered"
 verify_ozon_egress "$position_rendered"
 verify_reporting_service \
   "$position_rendered" \
