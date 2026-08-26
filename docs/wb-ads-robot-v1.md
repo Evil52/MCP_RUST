@@ -135,7 +135,7 @@ ceiling, 15% step, two actions per Moscow day, six-hour cooldown, 250 RUB pause,
 300 RUB hard ceiling and prohibition on budget top-up remain unchanged.
 
 Every cycle reads the official minimum CPC bid for all three SKUs before a
-decision. The response must declare `RUB` and contain exactly the approved
+decision. Every returned bid must declare `RUB` and contain exactly the approved
 SKU/search scope and the reviewed 102-kopeck floor; currency, shape, value drift
 or incomplete data fails closed before a write. Campaign details, current
 spend, budget and stock are also refreshed.
