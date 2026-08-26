@@ -321,9 +321,17 @@ fn parse_budget_minor(response: &Value) -> Result<u64> {
 }
 
 fn validate_minimum_bids(response: &Value, policy: &WbAutomationPolicy) -> Result<()> {
-    let rows = response
-        .as_array()
+    let envelope = response
+        .as_object()
         .context("WB automation minimum CPC bids имеют неверную форму")?;
+    ensure!(
+        envelope.len() == 2 && envelope.get("currency").and_then(Value::as_str) == Some("RUB"),
+        "WB automation minimum CPC bids имеют неверную валюту или envelope"
+    );
+    let rows = envelope
+        .get("bids")
+        .and_then(Value::as_array)
+        .context("WB automation minimum CPC bids не содержат bids")?;
     let mut minimums = BTreeMap::new();
     for row in rows {
         let nm_id = row
@@ -758,11 +766,14 @@ mod tests {
     }
 
     fn minimum_bids_response() -> Value {
-        serde_json::json!([
-            {"nm_id": 449_627_598_u64, "bids": [{"type": "search", "value": 102}]},
-            {"nm_id": 449_627_015_u64, "bids": [{"type": "search", "value": 102}]},
-            {"nm_id": 497_424_314_u64, "bids": [{"type": "search", "value": 102}]}
-        ])
+        serde_json::json!({
+            "bids": [
+                {"nm_id": 449_627_598_u64, "bids": [{"type": "search", "value": 102}]},
+                {"nm_id": 449_627_015_u64, "bids": [{"type": "search", "value": 102}]},
+                {"nm_id": 497_424_314_u64, "bids": [{"type": "search", "value": 102}]}
+            ],
+            "currency": "RUB"
+        })
     }
 
     fn stats_response() -> Value {
@@ -956,19 +967,21 @@ mod tests {
         assert!(validate_minimum_bids(&minimum_bids_response(), &policy).is_ok());
         for invalid in [
             serde_json::json!({}),
-            serde_json::json!([{"bids": []}]),
-            serde_json::json!([{"nm_id": 449_627_598_u64}]),
-            serde_json::json!([{"nm_id": 449_627_598_u64, "bids": [{"type": "search"}]}]),
-            serde_json::json!([{"nm_id": 449_627_598_u64, "bids": [{"type": "recommendation", "value": 102}]}]),
+            serde_json::json!({"bids": [], "currency": "USD"}),
+            serde_json::json!({"bids": [], "currency": "RUB", "unexpected": true}),
+            serde_json::json!({"bids": [{"bids": []}], "currency": "RUB"}),
+            serde_json::json!({"bids": [{"nm_id": 449_627_598_u64}], "currency": "RUB"}),
+            serde_json::json!({"bids": [{"nm_id": 449_627_598_u64, "bids": [{"type": "search"}]}], "currency": "RUB"}),
+            serde_json::json!({"bids": [{"nm_id": 449_627_598_u64, "bids": [{"type": "recommendation", "value": 102}]}], "currency": "RUB"}),
         ] {
             assert!(validate_minimum_bids(&invalid, &policy).is_err());
         }
         let mut changed_minimum = minimum_bids_response();
-        changed_minimum[0]["bids"][0]["value"] = serde_json::json!(103);
+        changed_minimum["bids"][0]["bids"][0]["value"] = serde_json::json!(103);
         assert!(validate_minimum_bids(&changed_minimum, &policy).is_err());
         let mut duplicate_minimum = minimum_bids_response();
-        let duplicate_row = duplicate_minimum[0].clone();
-        duplicate_minimum
+        let duplicate_row = duplicate_minimum["bids"][0].clone();
+        duplicate_minimum["bids"]
             .as_array_mut()
             .unwrap()
             .push(duplicate_row);
