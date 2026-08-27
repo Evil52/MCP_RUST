@@ -128,6 +128,11 @@ pub struct WbAutomationCampaignMetrics {
 #[serde(deny_unknown_fields)]
 pub struct WbAutomationSkuObservation {
     pub nm_id: u64,
+    /// Current WB-enforced floor for this SKU, payment type and placement.
+    /// Zero exists only for backward-compatible deserialization of old
+    /// snapshots; every fresh observation rejects it.
+    #[serde(default)]
+    pub minimum_bid_kopecks: u64,
     pub current_bid_kopecks: u64,
     pub sellable_stock: u64,
     pub impressions: u64,
@@ -159,6 +164,7 @@ pub enum WbAutomationHoldReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WbAutomationBidReason {
+    PolicyMaximumExceeded,
     TargetDrrExceeded,
     NoOrdersAfterClicks,
     EfficientSales,
@@ -276,6 +282,25 @@ pub fn evaluate_wb_automation(
         ));
     }
 
+    if let Some(sku) = policy
+        .nm_ids
+        .iter()
+        .map(|nm_id| observations[nm_id])
+        .find(|sku| sku.current_bid_kopecks > policy.max_bid_kopecks)
+    {
+        return Ok(decision(
+            WbAutomationAction::ChangeBids {
+                changes: vec![WbAutomationBidChange {
+                    nm_id: sku.nm_id,
+                    from_bid_kopecks: sku.current_bid_kopecks,
+                    to_bid_kopecks: policy.max_bid_kopecks,
+                    reason: WbAutomationBidReason::PolicyMaximumExceeded,
+                }],
+            },
+            Vec::new(),
+        ));
+    }
+
     if !observation.attribution_complete {
         let (action, unresolved_stops) = campaign_level_action(policy, observation, &observations);
         return Ok(decision(action, unresolved_stops));
@@ -292,7 +317,10 @@ pub fn evaluate_wb_automation(
         .filter_map(|nm_id| {
             stops
                 .get(nm_id)
-                .filter(|_| observations[nm_id].current_bid_kopecks == policy.min_bid_kopecks)
+                .filter(|_| {
+                    observations[nm_id].current_bid_kopecks
+                        <= effective_minimum_bid(policy, observations[nm_id])
+                })
                 .map(|reason| WbAutomationSkuStop {
                     nm_id: *nm_id,
                     reason: *reason,
@@ -303,7 +331,10 @@ pub fn evaluate_wb_automation(
     if let Some((nm_id, reason)) = policy.nm_ids.iter().find_map(|nm_id| {
         stops
             .get(nm_id)
-            .filter(|_| observations[nm_id].current_bid_kopecks > policy.min_bid_kopecks)
+            .filter(|_| {
+                observations[nm_id].current_bid_kopecks
+                    > effective_minimum_bid(policy, observations[nm_id])
+            })
             .map(|reason| (*nm_id, *reason))
     }) {
         return Ok(decision(
@@ -436,17 +467,17 @@ fn campaign_level_action(
         .filter_map(|nm_id| {
             let sku = observations[nm_id];
             (sku.sellable_stock <= policy.min_sellable_stock
-                && sku.current_bid_kopecks == policy.min_bid_kopecks)
-                .then_some(WbAutomationSkuStop {
-                    nm_id: *nm_id,
-                    reason: WbAutomationDisableReason::LowStock,
-                })
+                && sku.current_bid_kopecks <= effective_minimum_bid(policy, sku))
+            .then_some(WbAutomationSkuStop {
+                nm_id: *nm_id,
+                reason: WbAutomationDisableReason::LowStock,
+            })
         })
         .collect::<Vec<_>>();
     if let Some(nm_id) = policy.nm_ids.iter().find(|nm_id| {
         let sku = observations[nm_id];
         sku.sellable_stock <= policy.min_sellable_stock
-            && sku.current_bid_kopecks > policy.min_bid_kopecks
+            && sku.current_bid_kopecks > effective_minimum_bid(policy, sku)
     }) {
         return (
             WbAutomationAction::DisableSku {
@@ -617,8 +648,10 @@ fn validate_observation<'a>(
     }
     let mut observations = BTreeMap::new();
     for sku in &observation.skus {
+        let vendor_minimum_valid = (1..=policy.max_bid_kopecks).contains(&sku.minimum_bid_kopecks);
         if sku.nm_id == 0
-            || !(policy.min_bid_kopecks..=policy.max_bid_kopecks).contains(&sku.current_bid_kopecks)
+            || !vendor_minimum_valid
+            || sku.current_bid_kopecks < policy.min_bid_kopecks
             || sku.clicks > sku.impressions
             || observations.insert(sku.nm_id, sku).is_some()
         {
@@ -658,10 +691,11 @@ fn bid_change(
     let Some((reason, increase)) = reason_and_direction else {
         return Ok(None);
     };
+    let minimum = effective_minimum_bid(policy, sku);
     let to_bid_kopecks = if increase {
-        increase_bid(policy, sku.current_bid_kopecks)?
+        increase_bid(policy, sku.current_bid_kopecks, minimum)?
     } else {
-        decrease_bid(policy, sku.current_bid_kopecks)
+        decrease_bid(policy, sku.current_bid_kopecks, minimum)
     };
     Ok(
         (to_bid_kopecks != sku.current_bid_kopecks).then_some(WbAutomationBidChange {
@@ -716,6 +750,7 @@ fn ratio_basis_points(numerator: u64, denominator: u64) -> Result<u32, WbAutomat
 pub(super) fn increase_bid(
     policy: &WbAutomationPolicy,
     current: u64,
+    minimum: u64,
 ) -> Result<u64, WbAutomationDecisionError> {
     let delta = current
         .checked_mul(u64::from(policy.bid_step_percent))
@@ -723,15 +758,20 @@ pub(super) fn increase_bid(
         / 100;
     current
         .checked_add(delta.max(1))
-        .map(|value| value.min(policy.max_bid_kopecks))
+        .map(|value| value.max(minimum).min(policy.max_bid_kopecks))
         .ok_or(WbAutomationDecisionError::Overflow)
 }
 
-fn decrease_bid(policy: &WbAutomationPolicy, current: u64) -> u64 {
+fn decrease_bid(policy: &WbAutomationPolicy, current: u64, minimum: u64) -> u64 {
     let delta = current.saturating_mul(u64::from(policy.bid_step_percent)) / 100;
-    current
-        .saturating_sub(delta.max(1))
-        .max(policy.min_bid_kopecks)
+    current.saturating_sub(delta.max(1)).max(minimum)
+}
+
+pub(super) fn effective_minimum_bid(
+    policy: &WbAutomationPolicy,
+    sku: &WbAutomationSkuObservation,
+) -> u64 {
+    policy.min_bid_kopecks.max(sku.minimum_bid_kopecks)
 }
 
 #[cfg(test)]
@@ -789,6 +829,7 @@ mod tests {
     fn sku(nm_id: u64) -> WbAutomationSkuObservation {
         WbAutomationSkuObservation {
             nm_id,
+            minimum_bid_kopecks: 102,
             current_bid_kopecks: 200,
             sellable_stock: 10,
             impressions: 500,
@@ -1056,6 +1097,64 @@ mod tests {
                     from_bid_kopecks: 200,
                     to_bid_kopecks: 170,
                     reason: WbAutomationBidReason::TargetDrrExceeded,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn vendor_minimum_is_a_dynamic_floor_for_every_bid_direction() {
+        let mut decrease = observation();
+        decrease.skus[0].minimum_bid_kopecks = 190;
+        decrease.skus[0].spend_minor = 4_000;
+        decrease.skus[0].attributed_revenue_minor = 20_000;
+        assert!(matches!(
+            evaluate_wb_automation(&policy(), &decrease).unwrap().action,
+            WbAutomationAction::ChangeBids { changes }
+                if changes[0].to_bid_kopecks == 190
+        ));
+
+        let mut increase = observation();
+        increase.skus[0].minimum_bid_kopecks = 250;
+        assert!(matches!(
+            evaluate_wb_automation(&policy(), &increase).unwrap().action,
+            WbAutomationAction::ChangeBids { changes }
+                if changes[0].to_bid_kopecks == 250
+        ));
+
+        let mut stopped = observation();
+        stopped.skus[0].minimum_bid_kopecks = 190;
+        stopped.skus[0].current_bid_kopecks = 190;
+        stopped.skus[0].sellable_stock = 0;
+        let decision = evaluate_wb_automation(&policy(), &stopped).unwrap();
+        assert!(matches!(
+            decision.action,
+            WbAutomationAction::ChangeBids { .. }
+        ));
+        assert_eq!(decision.unresolved_stops[0].nm_id, 449_627_598);
+    }
+
+    #[test]
+    fn a_bid_above_a_new_policy_ceiling_is_reduced_before_attribution_logic() {
+        let mut tightened = policy();
+        tightened.max_bid_kopecks = 300;
+        let mut input = campaign_level_observation(WbAutomationCampaignMetrics {
+            impressions: 100,
+            clicks: 3,
+            spend_minor: 300,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        });
+        input.skus[0].current_bid_kopecks = 1_274;
+
+        assert_eq!(
+            evaluate_wb_automation(&tightened, &input).unwrap().action,
+            WbAutomationAction::ChangeBids {
+                changes: vec![WbAutomationBidChange {
+                    nm_id: 449_627_598,
+                    from_bid_kopecks: 1_274,
+                    to_bid_kopecks: 300,
+                    reason: WbAutomationBidReason::PolicyMaximumExceeded,
                 }],
             }
         );
@@ -1449,11 +1548,12 @@ mod tests {
             "../../config/wb-automation-robot.json"
         ))
         .unwrap();
-        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 7, 30, 0).unwrap();
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 10, 10, 0).unwrap();
         let live_skus = [(449_627_598, 10), (449_627_015, 12), (497_424_314, 10)]
             .into_iter()
             .map(|(nm_id, sellable_stock)| WbAutomationSkuObservation {
                 nm_id,
+                minimum_bid_kopecks: 102,
                 current_bid_kopecks: 102,
                 sellable_stock,
                 impressions: 0,

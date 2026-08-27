@@ -91,10 +91,10 @@ if ! jq -e '
   and .nm_ids == [449627598, 449627015, 497424314]
   and .target_impressions_per_day == 5000
   and .autonomous_pacing == "traffic_frontier_v2"
-  and .traffic_frontier_bid_kopecks == 1000
+  and .traffic_frontier_bid_kopecks == 700
   and .traffic_frontier_feedback_timeout_seconds == 1800
   and .min_bid_kopecks == 102
-  and .max_bid_kopecks == 3000
+  and .max_bid_kopecks == 1200
   and .bid_step_percent == 5
   and .daily_pause_threshold_minor == 45000
   and .daily_spend_cap_minor == 50000
@@ -173,14 +173,14 @@ if [[ -e "$bid_policy_target" ]]; then
     if ! jq -e '
       .write_enabled == true
       and .bid_writes_enabled == true
-      and .authorization_reference == "chat/2026-08-27/traffic-frontier-v2"
+      and .authorization_reference == "chat/2026-08-27/traffic-frontier-10-daily-500"
       and .autonomous_pacing == "traffic_frontier_v2"
-      and .traffic_frontier_bid_kopecks == 540
+      and .traffic_frontier_bid_kopecks == 1000
       and .traffic_frontier_feedback_timeout_seconds == 1800
       and .max_bid_kopecks == 3000
       and .bid_step_percent == 5
-      and .daily_pause_threshold_minor == 25000
-      and .daily_spend_cap_minor == 30000
+      and .daily_pause_threshold_minor == 45000
+      and .daily_spend_cap_minor == 50000
       and .max_actions_per_day == 50
       and .cooldown_seconds == 300
       and .allow_budget_top_up == false
@@ -201,7 +201,7 @@ install -m 600 "$position_env" "$position_env_target"
 
 # Mount the target policy in the source slot for the credentialless preflight.
 # `observe-once` cannot write, and proves every current bid is already at or
-# below the emergency 3000-kopeck hard cap before the durable digest changes.
+# compatible with the new 1200-kopeck policy before the durable digest changes.
 export WB_AUTOMATION_SHADOW_POLICY_HOST="$bid_policy_target"
 export WB_AUTOMATION_LIVE_POLICY_HOST="$bid_policy_target"
 export WB_AUTOMATION_ACCESS_CONFIG_HOST="$registry"
@@ -302,7 +302,7 @@ fi
 
 if [[ "$migration_required" == "true" ]]; then
   activation_output="$("${compose[@]}" run --rm --no-deps wb-automation-live \
-    raise-traffic-frontier-limits-pg \
+    tighten-traffic-frontier-corridor-pg \
     /etc/mcp-ozon/wb-automation-shadow-policy.json \
     /etc/mcp-ozon/wb-automation-live-policy.json \
     /etc/mcp-ozon/access.json \
@@ -327,6 +327,8 @@ if ! jq -e '
   or .outcome == "traffic_frontier_v2_already_active"
   or .outcome == "traffic_frontier_limits_raised"
   or .outcome == "traffic_frontier_limits_already_active"
+  or .outcome == "traffic_frontier_corridor_tightened"
+  or .outcome == "traffic_frontier_corridor_already_active"
 ' <<<"$activation_output" >/dev/null; then
   echo "WB automation bid-live activation did not complete" >&2
   exit 1
