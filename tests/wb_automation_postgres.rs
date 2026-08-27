@@ -48,9 +48,11 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     let bid_policy_digest = "6".repeat(64);
     let paced_policy_digest = "7".repeat(64);
     let frontier_policy_digest = "8".repeat(64);
+    let frontier_limits_policy_digest = "9".repeat(64);
     let live_cycle_id = format!("{campaign_id:064x}");
     let bid_cycle_id = format!("{:064x}", campaign_id + 1);
     let paced_cycle_id = format!("{:064x}", campaign_id + 2);
+    let frontier_cycle_id = format!("{:064x}", campaign_id + 3);
     let business_date = NaiveDate::from_ymd_opt(2026, 8, 26).expect("valid date");
     let observed_at = Utc
         .with_ymd_and_hms(2026, 8, 26, 12, 0, 0)
@@ -349,6 +351,98 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     assert_eq!(frontier_payload["feedback_timeout_seconds"], 1_800);
     assert_eq!(frontier_payload["autonomous_pacing"], "traffic_frontier_v2");
     assert_eq!(frontier_payload["state_revision"], 5);
+
+    lease
+        .persist_shadow_cycle(
+            &frontier_cycle_id,
+            &frontier_policy_digest,
+            observed_at + Duration::seconds(4),
+            business_date,
+            5,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("latest traffic-frontier evidence is persisted");
+    assert_eq!(
+        lease
+            .activate_traffic_frontier_limits_policy(
+                &frontier_policy_digest,
+                &frontier_limits_policy_digest,
+                540,
+                1_000,
+                25_000,
+                45_000,
+                30_000,
+                40_000,
+            )
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    let limits = lease
+        .activate_traffic_frontier_limits_policy(
+            &frontier_policy_digest,
+            &frontier_limits_policy_digest,
+            540,
+            1_000,
+            25_000,
+            45_000,
+            30_000,
+            50_000,
+        )
+        .await
+        .expect("traffic-frontier limits are raised atomically");
+    assert!(limits.changed);
+    assert_eq!(limits.state_revision, 6);
+    let limits_state = lease
+        .load_state()
+        .await
+        .expect("traffic-frontier limits state query succeeds")
+        .expect("traffic-frontier limits state exists");
+    assert_eq!(limits_state.policy_digest, frontier_limits_policy_digest);
+    assert_eq!(limits_state.revision, 6);
+    assert_eq!(limits_state.actions_today, 1);
+    let limits_replay = lease
+        .activate_traffic_frontier_limits_policy(
+            &frontier_policy_digest,
+            &frontier_limits_policy_digest,
+            540,
+            1_000,
+            25_000,
+            45_000,
+            30_000,
+            50_000,
+        )
+        .await
+        .expect("traffic-frontier limits replay is idempotent");
+    assert!(!limits_replay.changed);
+    assert_eq!(limits_replay.state_revision, 6);
+    let limits_audit = admin
+        .query_one(
+            "SELECT cycle_id, payload_json FROM wb_automation.audit_events \
+             WHERE account_id=$1 AND advert_id=$2 \
+               AND event_type='traffic_frontier_limits_raised'",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("traffic-frontier limits audit evidence is readable");
+    assert_eq!(limits_audit.get::<_, String>(0), frontier_cycle_id);
+    let limits_payload =
+        serde_json::from_str::<serde_json::Value>(&limits_audit.get::<_, String>(1))
+            .expect("traffic-frontier limits audit payload is valid JSON");
+    assert_eq!(limits_payload["from_policy_sha256"], frontier_policy_digest);
+    assert_eq!(
+        limits_payload["to_policy_sha256"],
+        frontier_limits_policy_digest
+    );
+    assert_eq!(limits_payload["from_traffic_frontier_bid_kopecks"], 540);
+    assert_eq!(limits_payload["to_traffic_frontier_bid_kopecks"], 1_000);
+    assert_eq!(limits_payload["from_daily_pause_threshold_minor"], 25_000);
+    assert_eq!(limits_payload["to_daily_pause_threshold_minor"], 45_000);
+    assert_eq!(limits_payload["from_daily_spend_cap_minor"], 30_000);
+    assert_eq!(limits_payload["to_daily_spend_cap_minor"], 50_000);
+    assert_eq!(limits_payload["autonomous_pacing"], "traffic_frontier_v2");
+    assert_eq!(limits_payload["state_revision"], 6);
 
     lease.release().await.expect("campaign lock is released");
     drop(admin);

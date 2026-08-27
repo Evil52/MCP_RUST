@@ -136,6 +136,14 @@ enum PolicyTransition {
         cooldown_seconds: u32,
         feedback_timeout_seconds: u32,
     },
+    TrafficFrontierLimitsRaised {
+        from_frontier_bid_kopecks: u64,
+        to_frontier_bid_kopecks: u64,
+        from_daily_pause_threshold_minor: u64,
+        to_daily_pause_threshold_minor: u64,
+        from_daily_spend_cap_minor: u64,
+        to_daily_spend_cap_minor: u64,
+    },
 }
 
 impl PolicyTransition {
@@ -145,6 +153,7 @@ impl PolicyTransition {
             Self::BidWrites => "bid_writes_activated",
             Self::BoundedPacingActivated { .. } => "bounded_pacing_activated",
             Self::TrafficFrontierV2Activated { .. } => "traffic_frontier_v2_activated",
+            Self::TrafficFrontierLimitsRaised { .. } => "traffic_frontier_limits_raised",
         }
     }
 
@@ -153,7 +162,8 @@ impl PolicyTransition {
             Self::ProtectiveLive => "protective_live",
             Self::BidWrites
             | Self::BoundedPacingActivated { .. }
-            | Self::TrafficFrontierV2Activated { .. } => "bid_live",
+            | Self::TrafficFrontierV2Activated { .. }
+            | Self::TrafficFrontierLimitsRaised { .. } => "bid_live",
         }
     }
 
@@ -163,6 +173,7 @@ impl PolicyTransition {
             Self::BidWrites
                 | Self::BoundedPacingActivated { .. }
                 | Self::TrafficFrontierV2Activated { .. }
+                | Self::TrafficFrontierLimitsRaised { .. }
         )
     }
 
@@ -178,7 +189,9 @@ impl PolicyTransition {
                 to_max_bid_kopecks,
                 ..
             } => Some((from_max_bid_kopecks, to_max_bid_kopecks)),
-            Self::ProtectiveLive | Self::BidWrites => None,
+            Self::ProtectiveLive | Self::BidWrites | Self::TrafficFrontierLimitsRaised { .. } => {
+                None
+            }
         }
     }
 
@@ -188,9 +201,10 @@ impl PolicyTransition {
                 target_impressions_per_day,
                 ..
             } => Some(target_impressions_per_day),
-            Self::ProtectiveLive | Self::BidWrites | Self::TrafficFrontierV2Activated { .. } => {
-                None
-            }
+            Self::ProtectiveLive
+            | Self::BidWrites
+            | Self::TrafficFrontierV2Activated { .. }
+            | Self::TrafficFrontierLimitsRaised { .. } => None,
         }
     }
 }
@@ -541,6 +555,46 @@ impl WbAutomationCampaignLease<'_> {
         .await
     }
 
+    /// Raises the reviewed Traffic Frontier entry and daily budget limits
+    /// without resetting action counters, feedback baselines, incidents or
+    /// pause state. The exact authorized values are checked by the CLI before
+    /// this generic durable transition is called.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn activate_traffic_frontier_limits_policy(
+        &mut self,
+        source_policy_digest: &str,
+        target_policy_digest: &str,
+        from_frontier_bid_kopecks: u64,
+        to_frontier_bid_kopecks: u64,
+        from_daily_pause_threshold_minor: u64,
+        to_daily_pause_threshold_minor: u64,
+        from_daily_spend_cap_minor: u64,
+        to_daily_spend_cap_minor: u64,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        if from_frontier_bid_kopecks == 0
+            || to_frontier_bid_kopecks <= from_frontier_bid_kopecks
+            || from_daily_pause_threshold_minor >= from_daily_spend_cap_minor
+            || to_daily_pause_threshold_minor <= from_daily_pause_threshold_minor
+            || to_daily_pause_threshold_minor >= to_daily_spend_cap_minor
+            || to_daily_spend_cap_minor <= from_daily_spend_cap_minor
+        {
+            return Err(WbAutomationPostgresError::InvalidInput);
+        }
+        self.activate_policy_transition(
+            source_policy_digest,
+            target_policy_digest,
+            PolicyTransition::TrafficFrontierLimitsRaised {
+                from_frontier_bid_kopecks,
+                to_frontier_bid_kopecks,
+                from_daily_pause_threshold_minor,
+                to_daily_pause_threshold_minor,
+                from_daily_spend_cap_minor,
+                to_daily_spend_cap_minor,
+            },
+        )
+        .await
+    }
+
     async fn activate_policy_transition(
         &mut self,
         source_policy_digest: &str,
@@ -669,6 +723,23 @@ impl WbAutomationCampaignLease<'_> {
             payload["max_actions_per_day"] = max_actions_per_day.into();
             payload["cooldown_seconds"] = cooldown_seconds.into();
             payload["feedback_timeout_seconds"] = feedback_timeout_seconds.into();
+        }
+        if let PolicyTransition::TrafficFrontierLimitsRaised {
+            from_frontier_bid_kopecks,
+            to_frontier_bid_kopecks,
+            from_daily_pause_threshold_minor,
+            to_daily_pause_threshold_minor,
+            from_daily_spend_cap_minor,
+            to_daily_spend_cap_minor,
+        } = transition
+        {
+            payload["autonomous_pacing"] = "traffic_frontier_v2".into();
+            payload["from_traffic_frontier_bid_kopecks"] = from_frontier_bid_kopecks.into();
+            payload["to_traffic_frontier_bid_kopecks"] = to_frontier_bid_kopecks.into();
+            payload["from_daily_pause_threshold_minor"] = from_daily_pause_threshold_minor.into();
+            payload["to_daily_pause_threshold_minor"] = to_daily_pause_threshold_minor.into();
+            payload["from_daily_spend_cap_minor"] = from_daily_spend_cap_minor.into();
+            payload["to_daily_spend_cap_minor"] = to_daily_spend_cap_minor.into();
         }
         let payload_json = payload.to_string();
         insert_audit_event(

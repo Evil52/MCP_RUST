@@ -14,13 +14,13 @@ represented in typed policy, enforced in code, and covered by tests.
 - Allowed products: `449627598`, `449627015`, `497424314`
 - Advertising timezone: `Europe/Moscow`
 - Target DRR / hard DRR: 15% / 25%
-- Traffic-frontier entry bid: 5.40 RUB
+- Traffic-frontier entry bid: 10 RUB
 - Emergency absolute bid ceiling: 30 RUB; the ordinary economic ceiling is
   calculated from current spend, clicks, orders and target DRR
 - Maximum ordinary bid step: 5%
 - Evaluation/cooldown: 5 minutes; unchanged WB counters block another write
   for 30 minutes
-- Protective threshold / daily ceiling: 250 RUB / 300 RUB
+- Protective threshold / daily ceiling: 450 RUB / 500 RUB
 - Daily impression target: 5,000, subordinate to financial guards
 - Automatic budget top-up: forbidden
 
@@ -133,9 +133,9 @@ durable unresolved action and blocks later writes.
 ## P3 Traffic Frontier v2 bid-live runtime
 
 `config/wb-automation-robot.bid-live.json` differs from the protective policy
-by `bid_writes_enabled=true`. The account, campaign, three SKUs, 250 RUB pause,
-300 RUB hard ceiling and prohibition on budget top-up remain unchanged.
-`autonomous_pacing="traffic_frontier_v2"` adds a reviewed 5.40 RUB traffic
+by `bid_writes_enabled=true`. The account, campaign, three SKUs, 450 RUB pause,
+500 RUB hard ceiling and prohibition on budget top-up remain unchanged.
+`autonomous_pacing="traffic_frontier_v2"` adds a reviewed 10 RUB traffic
 entry, five-minute feedback cycle, 5% step and at most 50 actions per Moscow
 day.
 
@@ -147,7 +147,7 @@ spend, budget and stock are also refreshed.
 Incomplete per-SKU attribution still blocks SKU-performance claims. Traffic
 Frontier v2 may use only complete current-day campaign totals for symmetric
 exposure control; aggregate totals are never copied into SKU rows. It raises
-the least-bid safe in-stock SKU directly to 5.40 RUB when delivery is below
+the least-bid safe in-stock SKU directly to 10 RUB when delivery is below
 pace, then uses bounded 5% probes. After every applied action, a later cycle
 must observe a change in cumulative impressions, clicks, spend, orders or
 revenue. Unchanged or regressed counters fail closed. A 30-minute feedback
@@ -155,10 +155,10 @@ timeout permits another bounded probe when WB reporting is delayed, limiting
 no-feedback probes to 48 per day even though the policy quota is 50.
 
 The working ceiling is dynamic. Before the first order, exploration is capped
-at 10 RUB because 30 no-order clicks at that CPC consume the 300 RUB daily
-ceiling. After orders arrive, the ceiling is the target-DRR allowable average
+at 16.66 RUB because 30 no-order clicks at that CPC consume no more than the
+500 RUB daily ceiling. After orders arrive, the ceiling is the target-DRR allowable average
 CPC derived from attributed revenue and current clicks. Both are further
-bounded by remaining spend before the 250 RUB pause. The 30 RUB field is only
+bounded by remaining spend before the 450 RUB pause. The 30 RUB field is only
 an emergency schema ceiling: one click cannot consume the 50 RUB reserve
 between the pause and hard daily cap. DRR above 15%, 30 clicks without an order,
 or spend above pace causes a reduction; DRR above 25% and the existing hard
@@ -209,11 +209,11 @@ exact protective-policy digest under the PostgreSQL campaign lock, appends a
 reinstalls the five-minute LaunchAgent. A failure after timer shutdown leaves
 automation stopped rather than mixing policy owners.
 
-Re-running the installer for the reviewed Traffic Frontier v2 policy uses
-`activate-traffic-frontier-v2-pg`. It accepts only the exact reviewed transition,
-performs a read-only preflight, preserves durable counters, cooldown, pause and
-incident state, and appends `traffic_frontier_v2_activated`. A repeated rollout
-is idempotent.
+Re-running the installer for the reviewed 10 RUB / 500 RUB Traffic Frontier
+policy uses `raise-traffic-frontier-limits-pg`. It accepts only the exact
+5.40-to-10 RUB and 300-to-500 RUB transition, performs a read-only preflight,
+preserves durable counters, cooldown, pause and incident state, and appends
+`traffic_frontier_limits_raised`. A repeated rollout is idempotent.
 
 ## CPC compatibility corrections
 
