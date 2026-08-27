@@ -128,6 +128,14 @@ enum PolicyTransition {
         to_max_bid_kopecks: u64,
         target_impressions_per_day: u64,
     },
+    TrafficFrontierV2Activated {
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+        frontier_bid_kopecks: u64,
+        max_actions_per_day: u32,
+        cooldown_seconds: u32,
+        feedback_timeout_seconds: u32,
+    },
 }
 
 impl PolicyTransition {
@@ -136,23 +144,36 @@ impl PolicyTransition {
             Self::ProtectiveLive => "protective_live_activated",
             Self::BidWrites => "bid_writes_activated",
             Self::BoundedPacingActivated { .. } => "bounded_pacing_activated",
+            Self::TrafficFrontierV2Activated { .. } => "traffic_frontier_v2_activated",
         }
     }
 
     const fn mode(self) -> &'static str {
         match self {
             Self::ProtectiveLive => "protective_live",
-            Self::BidWrites | Self::BoundedPacingActivated { .. } => "bid_live",
+            Self::BidWrites
+            | Self::BoundedPacingActivated { .. }
+            | Self::TrafficFrontierV2Activated { .. } => "bid_live",
         }
     }
 
     const fn bid_writes_enabled(self) -> bool {
-        matches!(self, Self::BidWrites | Self::BoundedPacingActivated { .. })
+        matches!(
+            self,
+            Self::BidWrites
+                | Self::BoundedPacingActivated { .. }
+                | Self::TrafficFrontierV2Activated { .. }
+        )
     }
 
     const fn max_bid_change(self) -> Option<(u64, u64)> {
         match self {
             Self::BoundedPacingActivated {
+                from_max_bid_kopecks,
+                to_max_bid_kopecks,
+                ..
+            }
+            | Self::TrafficFrontierV2Activated {
                 from_max_bid_kopecks,
                 to_max_bid_kopecks,
                 ..
@@ -167,7 +188,9 @@ impl PolicyTransition {
                 target_impressions_per_day,
                 ..
             } => Some(target_impressions_per_day),
-            Self::ProtectiveLive | Self::BidWrites => None,
+            Self::ProtectiveLive | Self::BidWrites | Self::TrafficFrontierV2Activated { .. } => {
+                None
+            }
         }
     }
 }
@@ -478,6 +501,46 @@ impl WbAutomationCampaignLease<'_> {
         .await
     }
 
+    /// Activates the reviewed Traffic Frontier v2 controller. This transition
+    /// changes only the immutable policy digest and audit trail; counters,
+    /// unresolved-action guards, incidents and pause state remain intact.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn activate_traffic_frontier_v2_policy(
+        &mut self,
+        source_policy_digest: &str,
+        target_policy_digest: &str,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+        frontier_bid_kopecks: u64,
+        max_actions_per_day: u32,
+        cooldown_seconds: u32,
+        feedback_timeout_seconds: u32,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        if from_max_bid_kopecks == 0
+            || to_max_bid_kopecks <= from_max_bid_kopecks
+            || !(1..=50).contains(&max_actions_per_day)
+            || cooldown_seconds < 300
+            || feedback_timeout_seconds < cooldown_seconds
+            || frontier_bid_kopecks == 0
+            || frontier_bid_kopecks > to_max_bid_kopecks
+        {
+            return Err(WbAutomationPostgresError::InvalidInput);
+        }
+        self.activate_policy_transition(
+            source_policy_digest,
+            target_policy_digest,
+            PolicyTransition::TrafficFrontierV2Activated {
+                from_max_bid_kopecks,
+                to_max_bid_kopecks,
+                frontier_bid_kopecks,
+                max_actions_per_day,
+                cooldown_seconds,
+                feedback_timeout_seconds,
+            },
+        )
+        .await
+    }
+
     async fn activate_policy_transition(
         &mut self,
         source_policy_digest: &str,
@@ -593,6 +656,20 @@ impl WbAutomationCampaignLease<'_> {
             payload["target_impressions_per_day"] = target_impressions_per_day.into();
             payload["autonomous_pacing_enabled"] = true.into();
         }
+        if let PolicyTransition::TrafficFrontierV2Activated {
+            frontier_bid_kopecks,
+            max_actions_per_day,
+            cooldown_seconds,
+            feedback_timeout_seconds,
+            ..
+        } = transition
+        {
+            payload["autonomous_pacing"] = "traffic_frontier_v2".into();
+            payload["traffic_frontier_bid_kopecks"] = frontier_bid_kopecks.into();
+            payload["max_actions_per_day"] = max_actions_per_day.into();
+            payload["cooldown_seconds"] = cooldown_seconds.into();
+            payload["feedback_timeout_seconds"] = feedback_timeout_seconds.into();
+        }
         let payload_json = payload.to_string();
         insert_audit_event(
             &transaction,
@@ -656,6 +733,34 @@ impl WbAutomationCampaignLease<'_> {
             .await
             .map_err(|_| WbAutomationPostgresError::Unavailable)?;
         Ok(action)
+    }
+
+    /// Returns the immutable observation that authorized the most recently
+    /// applied action. Traffic-frontier pacing compares fresh cumulative
+    /// counters with this exact feedback baseline, preventing repeated bid
+    /// changes while WB statistics have not moved.
+    pub async fn load_last_applied_snapshot_json(
+        &mut self,
+    ) -> Result<Option<String>, WbAutomationPostgresError> {
+        let client = self
+            .client
+            .as_mut()
+            .ok_or(WbAutomationPostgresError::Unavailable)?;
+        client
+            .query_opt(
+                "SELECT c.snapshot_json \
+                 FROM wb_automation.action_attempts a \
+                 JOIN wb_automation.cycles c \
+                   ON c.cycle_id=a.cycle_id \
+                  AND c.account_id=a.account_id \
+                  AND c.advert_id=a.advert_id \
+                 WHERE a.account_id=$1 AND a.advert_id=$2 AND a.status='applied' \
+                 ORDER BY a.resolved_at DESC, a.reserved_at DESC LIMIT 1",
+                &[&self.account_id, &self.campaign_id],
+            )
+            .await
+            .map(|row| row.map(|row| row.get(0)))
+            .map_err(|_| WbAutomationPostgresError::Unavailable)
     }
 
     /// Persists one immutable shadow observation while checking the exact

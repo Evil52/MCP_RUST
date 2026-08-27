@@ -330,19 +330,14 @@ impl WbAutomationExecutor {
             },
             last_action_at: state.last_action_at,
         };
+        let last_applied_snapshot = load_traffic_feedback_baseline(policy, &mut lease).await?;
         let mut snapshot = self.observer.observe(observed_at, state_view).await?;
-        match intent {
-            PostgresExecutionIntent::ExplicitExposureTarget(target_impressions) => {
-                snapshot.decision =
-                    explicit_exposure_increase_decision(policy, &snapshot, target_impressions)?;
-            }
-            PostgresExecutionIntent::Automatic if policy.autonomous_pacing.is_enabled() => {
-                if let Some(decision) = autonomous_exposure_pacing_decision(policy, &snapshot)? {
-                    snapshot.decision = decision;
-                }
-            }
-            PostgresExecutionIntent::Automatic => {}
-        }
+        apply_postgres_execution_intent(
+            policy,
+            &mut snapshot,
+            intent,
+            last_applied_snapshot.as_ref(),
+        )?;
         let snapshot_json = serde_json::to_string(&snapshot)?;
         let decision_json = serde_json::to_string(&snapshot.decision)?;
         let cycle_id = sha256_domain("wb-automation-cycle-v1", snapshot_json.as_bytes());
@@ -572,6 +567,47 @@ enum PostgresExecutionIntent {
     ExplicitExposureTarget(u64),
 }
 
+async fn load_traffic_feedback_baseline(
+    policy: &super::automation::WbAutomationPolicy,
+    lease: &mut WbAutomationCampaignLease<'_>,
+) -> Result<Option<WbAutomationSnapshot>> {
+    if !policy.autonomous_pacing.uses_traffic_frontier() {
+        return Ok(None);
+    }
+    lease
+        .load_last_applied_snapshot_json()
+        .await?
+        .map(|snapshot| {
+            serde_json::from_str::<WbAutomationSnapshot>(&snapshot)
+                .context("WB traffic-frontier feedback baseline is invalid")
+        })
+        .transpose()
+}
+
+fn apply_postgres_execution_intent(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &mut WbAutomationSnapshot,
+    intent: PostgresExecutionIntent,
+    last_applied_snapshot: Option<&WbAutomationSnapshot>,
+) -> Result<()> {
+    let replacement = match intent {
+        PostgresExecutionIntent::ExplicitExposureTarget(target_impressions) => Some(
+            explicit_exposure_increase_decision(policy, snapshot, target_impressions)?,
+        ),
+        PostgresExecutionIntent::Automatic if policy.autonomous_pacing.uses_traffic_frontier() => {
+            traffic_frontier_pacing_decision(policy, snapshot, last_applied_snapshot)?
+        }
+        PostgresExecutionIntent::Automatic if policy.autonomous_pacing.is_enabled() => {
+            autonomous_exposure_pacing_decision(policy, snapshot)?
+        }
+        PostgresExecutionIntent::Automatic => None,
+    };
+    if let Some(decision) = replacement {
+        snapshot.decision = decision;
+    }
+    Ok(())
+}
+
 fn explicit_exposure_increase_decision(
     policy: &super::automation::WbAutomationPolicy,
     snapshot: &WbAutomationSnapshot,
@@ -637,6 +673,293 @@ fn explicit_exposure_increase_decision(
         },
         unresolved_stops: Vec::new(),
     })
+}
+
+const PACING_LOWER_BASIS_POINTS: u128 = 8_000;
+const PACING_UPPER_BASIS_POINTS: u128 = 12_000;
+const BASIS_POINTS: u128 = 10_000;
+const SECONDS_PER_DAY: u64 = 86_400;
+const MOSCOW_OFFSET_SECONDS: i64 = 3 * 60 * 60;
+
+/// Maintains a CPC campaign around a measured traffic frontier without
+/// repeatedly acting on the same delayed WB statistics. The initial jump is
+/// explicit policy, while later movement follows cumulative spend/delivery
+/// feedback and the target-DRR economic ceiling.
+fn traffic_frontier_pacing_decision(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    last_applied_snapshot: Option<&WbAutomationSnapshot>,
+) -> Result<Option<WbAutomationDecision>> {
+    use super::automation::{WbAutomationBidReason, WbAutomationHoldReason};
+
+    if !matches!(
+        snapshot.decision.action,
+        WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::AttributionIncomplete
+        }
+    ) {
+        return Ok(None);
+    }
+    let Some(metrics) = snapshot.observation.current_campaign_metrics.as_ref() else {
+        return Ok(Some(traffic_frontier_hold(
+            policy,
+            snapshot,
+            WbAutomationHoldReason::TrafficFeedbackPending,
+        )));
+    };
+    ensure!(
+        metrics.clicks <= metrics.impressions
+            && metrics.attributed_orders <= metrics.clicks
+            && (metrics.attributed_orders > 0 || metrics.attributed_revenue_minor == 0),
+        "WB traffic-frontier current campaign metrics are inconsistent"
+    );
+
+    if !traffic_feedback_is_actionable(policy, snapshot, metrics, last_applied_snapshot)? {
+        return Ok(Some(traffic_frontier_hold(
+            policy,
+            snapshot,
+            WbAutomationHoldReason::TrafficFeedbackPending,
+        )));
+    }
+
+    let drr = campaign_drr_basis_points(metrics)?;
+    let expected_spend = paced_value(
+        policy.daily_pause_threshold_minor,
+        snapshot.observation.observed_at,
+    );
+    let expected_impressions = paced_value(
+        policy.target_impressions_per_day,
+        snapshot.observation.observed_at,
+    );
+    let spend_over_pace = u128::from(metrics.spend_minor) * BASIS_POINTS
+        > u128::from(expected_spend) * PACING_UPPER_BASIS_POINTS;
+    let spend_under_pace = u128::from(metrics.spend_minor) * BASIS_POINTS
+        < u128::from(expected_spend) * PACING_LOWER_BASIS_POINTS;
+    let delivery_under_pace = metrics.impressions < expected_impressions;
+
+    if metrics.attributed_orders == 0 && metrics.clicks >= policy.no_order_reduce_clicks {
+        return Ok(traffic_frontier_decrease(
+            policy,
+            snapshot,
+            WbAutomationBidReason::NoOrdersAfterClicks,
+        ));
+    }
+    if drr.is_some_and(|value| value > policy.target_drr_basis_points) {
+        let reason = if drr.is_some_and(|value| value > policy.hard_drr_basis_points) {
+            WbAutomationBidReason::HardDrrExceeded
+        } else {
+            WbAutomationBidReason::TargetDrrExceeded
+        };
+        return Ok(traffic_frontier_decrease(policy, snapshot, reason));
+    }
+    if spend_over_pace {
+        return Ok(traffic_frontier_decrease(
+            policy,
+            snapshot,
+            WbAutomationBidReason::TrafficFrontierRetentionDecrease,
+        ));
+    }
+    if !spend_under_pace || !delivery_under_pace {
+        return Ok(None);
+    }
+
+    let frontier = policy
+        .traffic_frontier_bid_kopecks
+        .context("WB traffic-frontier entry bid is unavailable")?;
+    let dynamic_cap = traffic_frontier_dynamic_cap(policy, snapshot, metrics)?;
+    if dynamic_cap < frontier {
+        return Ok(None);
+    }
+    let Some(sku) = snapshot
+        .observation
+        .skus
+        .iter()
+        .filter(|sku| {
+            sku.sellable_stock > policy.min_sellable_stock && sku.current_bid_kopecks < dynamic_cap
+        })
+        .min_by_key(|sku| (sku.current_bid_kopecks, sku.nm_id))
+    else {
+        return Ok(None);
+    };
+    let (to_bid_kopecks, reason) = if sku.current_bid_kopecks < frontier {
+        (
+            frontier.min(dynamic_cap),
+            WbAutomationBidReason::TrafficFrontierBootstrap,
+        )
+    } else {
+        (
+            super::automation::increase_bid(policy, sku.current_bid_kopecks)?.min(dynamic_cap),
+            WbAutomationBidReason::TrafficFrontierIncrease,
+        )
+    };
+    Ok(Some(traffic_frontier_change(
+        policy,
+        snapshot,
+        sku.nm_id,
+        sku.current_bid_kopecks,
+        to_bid_kopecks,
+        reason,
+    )))
+}
+
+fn traffic_feedback_is_actionable(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    current: &super::automation::WbAutomationCampaignMetrics,
+    last_applied_snapshot: Option<&WbAutomationSnapshot>,
+) -> Result<bool> {
+    let Some(last_action_at) = snapshot.observation.last_action_at else {
+        return Ok(true);
+    };
+    let feedback_timeout = policy
+        .traffic_frontier_feedback_timeout_seconds
+        .context("WB traffic-frontier feedback timeout is unavailable")?;
+    if snapshot.observation.observed_at
+        >= last_action_at + ChronoDuration::seconds(i64::from(feedback_timeout))
+    {
+        return Ok(true);
+    }
+    let Some(previous) = last_applied_snapshot else {
+        return Ok(false);
+    };
+    if wb_automation_business_date(previous.observation.observed_at)
+        != wb_automation_business_date(snapshot.observation.observed_at)
+    {
+        return Ok(true);
+    }
+    let Some(baseline) = previous.observation.current_campaign_metrics.as_ref() else {
+        return Ok(false);
+    };
+    let monotonic = current.impressions >= baseline.impressions
+        && current.clicks >= baseline.clicks
+        && current.spend_minor >= baseline.spend_minor
+        && current.attributed_orders >= baseline.attributed_orders
+        && current.attributed_revenue_minor >= baseline.attributed_revenue_minor;
+    if !monotonic {
+        return Ok(false);
+    }
+    Ok(current != baseline)
+}
+
+fn traffic_frontier_dynamic_cap(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    metrics: &super::automation::WbAutomationCampaignMetrics,
+) -> Result<u64> {
+    let remaining_to_pause = policy
+        .daily_pause_threshold_minor
+        .saturating_sub(snapshot.observation.daily_spend_minor);
+    let economic_cap = if metrics.attributed_orders == 0 {
+        policy
+            .daily_spend_cap_minor
+            .checked_div(policy.no_order_reduce_clicks)
+            .context("WB traffic-frontier exploration click budget is invalid")?
+    } else {
+        let allowed_spend = u128::from(metrics.attributed_revenue_minor)
+            .checked_mul(u128::from(policy.target_drr_basis_points))
+            .context("WB traffic-frontier economic cap overflow")?
+            / BASIS_POINTS;
+        u64::try_from(allowed_spend / u128::from(metrics.clicks))
+            .context("WB traffic-frontier economic cap is out of range")?
+    };
+    Ok(policy
+        .max_bid_kopecks
+        .min(remaining_to_pause)
+        .min(economic_cap))
+}
+
+fn campaign_drr_basis_points(
+    metrics: &super::automation::WbAutomationCampaignMetrics,
+) -> Result<Option<u32>> {
+    if metrics.attributed_revenue_minor == 0 {
+        return Ok(None);
+    }
+    let value = u128::from(metrics.spend_minor)
+        .checked_mul(BASIS_POINTS)
+        .context("WB traffic-frontier DRR overflow")?
+        / u128::from(metrics.attributed_revenue_minor);
+    Ok(Some(
+        u32::try_from(value).context("WB traffic-frontier DRR is out of range")?,
+    ))
+}
+
+fn paced_value(total: u64, observed_at: DateTime<Utc>) -> u64 {
+    let seconds = (observed_at.timestamp() + MOSCOW_OFFSET_SECONDS)
+        .rem_euclid(i64::try_from(SECONDS_PER_DAY).expect("seconds per day fit i64"));
+    let elapsed = u64::try_from(seconds)
+        .expect("Moscow seconds-of-day are non-negative and fit u64")
+        .max(300);
+    let value = u128::from(total) * u128::from(elapsed) / u128::from(SECONDS_PER_DAY);
+    u64::try_from(value.max(1)).expect("paced value cannot exceed its u64 total")
+}
+
+fn traffic_frontier_decrease(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    reason: super::automation::WbAutomationBidReason,
+) -> Option<WbAutomationDecision> {
+    let sku = snapshot
+        .observation
+        .skus
+        .iter()
+        .filter(|sku| sku.current_bid_kopecks > policy.min_bid_kopecks)
+        .max_by_key(|sku| (sku.current_bid_kopecks, std::cmp::Reverse(sku.nm_id)))?;
+    let to_bid_kopecks = decrease_frontier_bid(policy, sku.current_bid_kopecks);
+    (to_bid_kopecks < sku.current_bid_kopecks).then(|| {
+        traffic_frontier_change(
+            policy,
+            snapshot,
+            sku.nm_id,
+            sku.current_bid_kopecks,
+            to_bid_kopecks,
+            reason,
+        )
+    })
+}
+
+fn decrease_frontier_bid(policy: &super::automation::WbAutomationPolicy, current: u64) -> u64 {
+    let delta = current.saturating_mul(u64::from(policy.bid_step_percent)) / 100;
+    current
+        .saturating_sub(delta.max(1))
+        .max(policy.min_bid_kopecks)
+}
+
+fn traffic_frontier_change(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    nm_id: u64,
+    from_bid_kopecks: u64,
+    to_bid_kopecks: u64,
+    reason: super::automation::WbAutomationBidReason,
+) -> WbAutomationDecision {
+    WbAutomationDecision {
+        account_id: policy.account_id.clone(),
+        campaign_id: policy.campaign_id,
+        observed_at: snapshot.observation.observed_at,
+        action: WbAutomationAction::ChangeBids {
+            changes: vec![WbAutomationBidChange {
+                nm_id,
+                from_bid_kopecks,
+                to_bid_kopecks,
+                reason,
+            }],
+        },
+        unresolved_stops: Vec::new(),
+    }
+}
+
+fn traffic_frontier_hold(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    reason: super::automation::WbAutomationHoldReason,
+) -> WbAutomationDecision {
+    WbAutomationDecision {
+        account_id: policy.account_id.clone(),
+        campaign_id: policy.campaign_id,
+        observed_at: snapshot.observation.observed_at,
+        action: WbAutomationAction::Hold { reason },
+        unresolved_stops: Vec::new(),
+    }
 }
 
 /// Turns an otherwise fail-closed campaign-level attribution hold into one
@@ -1161,9 +1484,9 @@ mod tests {
     use super::*;
     use crate::{
         control::automation::{
-            WbAutomationBidReason, WbAutomationDisableReason, WbAutomationHoldReason,
-            WbAutomationObservation, WbAutomationPacingMode, WbAutomationPolicy,
-            WbAutomationSkuObservation,
+            WbAutomationBidReason, WbAutomationCampaignMetrics, WbAutomationDisableReason,
+            WbAutomationHoldReason, WbAutomationObservation, WbAutomationPacingMode,
+            WbAutomationPolicy, WbAutomationSkuObservation,
         },
         test_support::mock_http,
         wb::{WbClient, WbCredentials},
@@ -1204,6 +1527,14 @@ mod tests {
             .unwrap();
             test_policy.write_enabled = true;
             test_policy.bid_writes_enabled = true;
+            test_policy.autonomous_pacing =
+                crate::control::automation::WbAutomationPacingMode::Enabled;
+            test_policy.traffic_frontier_bid_kopecks = None;
+            test_policy.traffic_frontier_feedback_timeout_seconds = None;
+            test_policy.max_bid_kopecks = 500;
+            test_policy.bid_step_percent = 15;
+            test_policy.max_actions_per_day = 2;
+            test_policy.cooldown_seconds = 21_600;
             test_policy.campaign_id = campaign_id;
             fs::write(&policy, serde_json::to_vec_pretty(&test_policy).unwrap()).unwrap();
             fs::write(
@@ -1488,6 +1819,13 @@ mod tests {
         .unwrap();
         policy.write_enabled = true;
         policy.bid_writes_enabled = true;
+        policy.autonomous_pacing = crate::control::automation::WbAutomationPacingMode::Enabled;
+        policy.traffic_frontier_bid_kopecks = None;
+        policy.traffic_frontier_feedback_timeout_seconds = None;
+        policy.max_bid_kopecks = 500;
+        policy.bid_step_percent = 15;
+        policy.max_actions_per_day = 2;
+        policy.cooldown_seconds = 21_600;
         let observation = WbAutomationObservation {
             observed_at: now(),
             campaign_status: 9,
@@ -1505,6 +1843,15 @@ mod tests {
                 attributed_orders: 0,
                 attributed_revenue_minor: 0,
             }),
+            current_campaign_metrics: Some(
+                crate::control::automation::WbAutomationCampaignMetrics {
+                    impressions: 44,
+                    clicks: 2,
+                    spend_minor: 219,
+                    attributed_orders: 0,
+                    attributed_revenue_minor: 0,
+                },
+            ),
             skus: policy
                 .nm_ids
                 .iter()
@@ -1533,7 +1880,7 @@ mod tests {
         (
             policy,
             WbAutomationSnapshot {
-                schema_version: 4,
+                schema_version: 5,
                 policy_sha256: "a".repeat(64),
                 previous_business_date: now().date_naive().pred_opt().unwrap(),
                 observation,
@@ -1573,6 +1920,7 @@ mod tests {
             last_action_at: None,
             attribution_complete: true,
             campaign_level_metrics: None,
+            current_campaign_metrics: None,
             skus: vec![WbAutomationSkuObservation {
                 nm_id: 1,
                 current_bid_kopecks: bid,
@@ -1845,6 +2193,372 @@ mod tests {
         );
     }
 
+    fn traffic_frontier_snapshot() -> (WbAutomationPolicy, WbAutomationSnapshot) {
+        let (mut policy, mut snapshot) = explicit_exposure_snapshot();
+        policy.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV2;
+        policy.traffic_frontier_bid_kopecks = Some(540);
+        policy.traffic_frontier_feedback_timeout_seconds = Some(1_800);
+        policy.max_bid_kopecks = 3_000;
+        policy.bid_step_percent = 5;
+        policy.max_actions_per_day = 50;
+        policy.cooldown_seconds = 300;
+        snapshot.observation.observed_at = Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
+        snapshot.decision.observed_at = snapshot.observation.observed_at;
+        snapshot.observation.daily_spend_minor = 234;
+        snapshot.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 79,
+            clicks: 2,
+            spend_minor: 234,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        });
+        snapshot.observation.skus[0].current_bid_kopecks = 134;
+        snapshot.observation.skus[1].current_bid_kopecks = 134;
+        snapshot.observation.skus[2].current_bid_kopecks = 117;
+        (policy, snapshot)
+    }
+
+    #[test]
+    fn traffic_frontier_bootstraps_to_the_reviewed_entry_bid() {
+        let (policy, snapshot) = traffic_frontier_snapshot();
+        let decision = traffic_frontier_pacing_decision(&policy, &snapshot, None)
+            .unwrap()
+            .expect("under-paced traffic enters the reviewed frontier");
+        assert!(matches!(
+            decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes == &[WbAutomationBidChange {
+                    nm_id: 497_424_314,
+                    from_bid_kopecks: 117,
+                    to_bid_kopecks: 540,
+                    reason: WbAutomationBidReason::TrafficFrontierBootstrap,
+                }]
+        ));
+    }
+
+    #[test]
+    fn traffic_frontier_waits_for_fresh_feedback_or_the_probe_timeout() {
+        let (policy, mut snapshot) = traffic_frontier_snapshot();
+        snapshot.observation.last_action_at =
+            Some(snapshot.observation.observed_at - ChronoDuration::minutes(10));
+        let mut baseline = snapshot.clone();
+        baseline.observation.observed_at -= ChronoDuration::minutes(10);
+        let held = traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+            .unwrap()
+            .expect("unchanged counters produce an explicit feedback hold");
+        assert_eq!(
+            held.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::TrafficFeedbackPending,
+            }
+        );
+
+        snapshot
+            .observation
+            .current_campaign_metrics
+            .as_mut()
+            .unwrap()
+            .impressions += 1;
+        let fresh = traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+            .unwrap()
+            .expect("fresh delivery feedback permits the next bounded action");
+        assert!(matches!(
+            fresh.action,
+            WbAutomationAction::ChangeBids { .. }
+        ));
+
+        let (_, mut timed_out) = traffic_frontier_snapshot();
+        timed_out.observation.last_action_at =
+            Some(timed_out.observation.observed_at - ChronoDuration::minutes(31));
+        assert!(matches!(
+            traffic_frontier_pacing_decision(&policy, &timed_out, Some(&baseline))
+                .unwrap()
+                .expect("probe timeout permits another observation-driven step")
+                .action,
+            WbAutomationAction::ChangeBids { .. }
+        ));
+    }
+
+    #[test]
+    fn traffic_frontier_retreats_on_bad_economics_or_fast_spend() {
+        let (policy, mut expensive) = traffic_frontier_snapshot();
+        for sku in &mut expensive.observation.skus {
+            sku.current_bid_kopecks = 540;
+        }
+        expensive.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 1_000,
+            clicks: 30,
+            spend_minor: 3_000,
+            attributed_orders: 1,
+            attributed_revenue_minor: 10_000,
+        });
+        let decision = traffic_frontier_pacing_decision(&policy, &expensive, None)
+            .unwrap()
+            .expect("target DRR breach retreats from the frontier");
+        assert!(matches!(
+            decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes[0].to_bid_kopecks == 513
+                    && changes[0].reason == WbAutomationBidReason::HardDrrExceeded
+        ));
+
+        let (_, mut over_pace) = traffic_frontier_snapshot();
+        for sku in &mut over_pace.observation.skus {
+            sku.current_bid_kopecks = 540;
+        }
+        over_pace.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 1_000,
+            clicks: 10,
+            spend_minor: 24_000,
+            attributed_orders: 2,
+            attributed_revenue_minor: 200_000,
+        });
+        assert!(matches!(
+            traffic_frontier_pacing_decision(&policy, &over_pace, None)
+                .unwrap()
+                .expect("spend above its time curve reduces the highest bid")
+                .action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes[0].reason
+                    == WbAutomationBidReason::TrafficFrontierRetentionDecrease
+        ));
+    }
+
+    #[test]
+    fn traffic_frontier_caps_exploration_and_requires_current_metrics() {
+        let (policy, mut snapshot) = traffic_frontier_snapshot();
+        for sku in &mut snapshot.observation.skus {
+            sku.current_bid_kopecks = 990;
+        }
+        let decision = traffic_frontier_pacing_decision(&policy, &snapshot, None)
+            .unwrap()
+            .expect("exploration cap still permits one five-percent step");
+        assert!(matches!(
+            decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes[0].to_bid_kopecks == 1_000
+        ));
+
+        snapshot.observation.current_campaign_metrics = None;
+        assert_eq!(
+            traffic_frontier_pacing_decision(&policy, &snapshot, None)
+                .unwrap()
+                .unwrap()
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::TrafficFeedbackPending,
+            }
+        );
+    }
+
+    #[test]
+    fn traffic_frontier_covers_feedback_pacing_and_fail_closed_edges() {
+        let (policy, snapshot) = traffic_frontier_snapshot();
+
+        let mut stronger_guard = snapshot.clone();
+        stronger_guard.decision.action = WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::CooldownActive,
+        };
+        assert_eq!(
+            traffic_frontier_pacing_decision(&policy, &stronger_guard, None).unwrap(),
+            None
+        );
+
+        let mut no_orders = snapshot.clone();
+        no_orders.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 100,
+            clicks: 30,
+            spend_minor: 3_000,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        });
+        assert!(matches!(
+            traffic_frontier_pacing_decision(&policy, &no_orders, None)
+                .unwrap()
+                .expect("mature no-order traffic retreats")
+                .action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes[0].reason == WbAutomationBidReason::NoOrdersAfterClicks
+        ));
+
+        let mut target_drr = snapshot.clone();
+        target_drr.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 100,
+            clicks: 10,
+            spend_minor: 2_000,
+            attributed_orders: 1,
+            attributed_revenue_minor: 10_000,
+        });
+        assert!(matches!(
+            traffic_frontier_pacing_decision(&policy, &target_drr, None)
+                .unwrap()
+                .expect("target DRR breach retreats")
+                .action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes[0].reason == WbAutomationBidReason::TargetDrrExceeded
+        ));
+
+        let mut on_pace = snapshot.clone();
+        on_pace.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 5_000,
+            clicks: 10,
+            spend_minor: 13_000,
+            attributed_orders: 2,
+            attributed_revenue_minor: 100_000,
+        });
+        assert_eq!(
+            traffic_frontier_pacing_decision(&policy, &on_pace, None).unwrap(),
+            None
+        );
+
+        let mut exhausted_headroom = snapshot.clone();
+        exhausted_headroom.observation.daily_spend_minor = 24_800;
+        assert_eq!(
+            traffic_frontier_pacing_decision(&policy, &exhausted_headroom, None).unwrap(),
+            None
+        );
+
+        let mut no_candidate = snapshot.clone();
+        for sku in &mut no_candidate.observation.skus {
+            sku.sellable_stock = policy.min_sellable_stock;
+        }
+        assert_eq!(
+            traffic_frontier_pacing_decision(&policy, &no_candidate, None).unwrap(),
+            None
+        );
+
+        let mut ordered = snapshot.clone();
+        ordered.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 79,
+            clicks: 2,
+            spend_minor: 234,
+            attributed_orders: 1,
+            attributed_revenue_minor: 10_000,
+        });
+        assert!(matches!(
+            traffic_frontier_pacing_decision(&policy, &ordered, None)
+                .unwrap()
+                .expect("ordered traffic uses the target-DRR CPC cap")
+                .action,
+            WbAutomationAction::ChangeBids { .. }
+        ));
+
+        let mut feedback = snapshot.clone();
+        feedback.observation.last_action_at =
+            Some(feedback.observation.observed_at - ChronoDuration::minutes(10));
+        assert!(
+            !traffic_feedback_is_actionable(
+                &policy,
+                &feedback,
+                feedback
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+                None,
+            )
+            .unwrap()
+        );
+
+        let mut previous_day = feedback.clone();
+        previous_day.observation.observed_at -= ChronoDuration::days(1);
+        assert!(
+            traffic_feedback_is_actionable(
+                &policy,
+                &feedback,
+                feedback
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+                Some(&previous_day),
+            )
+            .unwrap()
+        );
+
+        let mut missing_baseline = feedback.clone();
+        missing_baseline.observation.current_campaign_metrics = None;
+        assert!(
+            !traffic_feedback_is_actionable(
+                &policy,
+                &feedback,
+                feedback
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+                Some(&missing_baseline),
+            )
+            .unwrap()
+        );
+
+        let mut regressed = feedback.clone();
+        regressed
+            .observation
+            .current_campaign_metrics
+            .as_mut()
+            .unwrap()
+            .impressions += 1;
+        assert!(
+            !traffic_feedback_is_actionable(
+                &policy,
+                &feedback,
+                feedback
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+                Some(&regressed),
+            )
+            .unwrap()
+        );
+
+        let mut missing_timeout = policy.clone();
+        missing_timeout.traffic_frontier_feedback_timeout_seconds = None;
+        assert!(
+            traffic_feedback_is_actionable(
+                &missing_timeout,
+                &feedback,
+                feedback
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+                None,
+            )
+            .is_err()
+        );
+
+        let mut missing_frontier = policy.clone();
+        missing_frontier.traffic_frontier_bid_kopecks = None;
+        assert!(traffic_frontier_pacing_decision(&missing_frontier, &snapshot, None).is_err());
+
+        let mut invalid_exploration = policy;
+        invalid_exploration.no_order_reduce_clicks = 0;
+        assert!(
+            traffic_frontier_dynamic_cap(
+                &invalid_exploration,
+                &snapshot,
+                snapshot
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+            )
+            .is_err()
+        );
+        assert!(
+            campaign_drr_basis_points(&WbAutomationCampaignMetrics {
+                impressions: u64::MAX,
+                clicks: u64::MAX,
+                spend_minor: u64::MAX,
+                attributed_orders: 1,
+                attributed_revenue_minor: 1,
+            })
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn automatic_pacing_executes_only_when_typed_policy_enables_it() {
         #[cfg(coverage)]
@@ -1949,6 +2663,119 @@ mod tests {
             }
         ));
         assert!(disabled_requests.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn traffic_frontier_postgres_execution_uses_the_applied_feedback_baseline() {
+        #[cfg(coverage)]
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
+        #[cfg(not(coverage))]
+        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
+        let config = Config::from_str(&database_url).unwrap();
+        let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        store.verify_runtime_contract().await.unwrap();
+        let observed_at = Utc::now();
+        let current_date = wb_automation_business_date(observed_at)
+            .format("%Y-%m-%d")
+            .to_string();
+        let campaign_id = 39_682_723;
+        let fixture = Fixture::new_for_campaign(campaign_id);
+        let mut policy =
+            serde_json::from_slice::<WbAutomationPolicy>(&fs::read(&fixture.policy).unwrap())
+                .unwrap();
+        policy.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV2;
+        policy.traffic_frontier_bid_kopecks = Some(540);
+        policy.traffic_frontier_feedback_timeout_seconds = Some(1_800);
+        policy.max_bid_kopecks = 3_000;
+        policy.bid_step_percent = 5;
+        policy.max_actions_per_day = 50;
+        policy.cooldown_seconds = 300;
+        fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let (reader, _) =
+            campaign_level_reader_server_for(campaign_id, 9, [117, 117, 117], &current_date, 2, 10);
+        let (write_url, write_requests) = mock_http(vec![(200, "{}".to_owned())]);
+        let executor = fixture.executor(&reader, &write_url);
+        let legacy = WbAutomationLegacyStateSeed {
+            policy_digest: executor.policy_sha256().to_owned(),
+            business_date: wb_automation_business_date(observed_at),
+            actions_today: 0,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: "e".repeat(64),
+        };
+        let sent = executor
+            .run_once_postgres(&store, &legacy, observed_at)
+            .await
+            .unwrap()
+            .expect("traffic-frontier campaign lock is available");
+        assert_eq!(
+            sent.outcome,
+            WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+        );
+        assert!(matches!(
+            sent.decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes[0].reason == WbAutomationBidReason::TrafficFrontierBootstrap
+                    && changes[0].nm_id == 449_627_015
+                    && changes[0].to_bid_kopecks == 540
+        ));
+        assert!(
+            write_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("PATCH /api/advert/v1/bids")
+        );
+
+        let (readback_reader, _) =
+            campaign_level_reader_server_for(campaign_id, 9, [117, 540, 117], &current_date, 2, 10);
+        let (readback_url, readback_requests) = mock_http(Vec::new());
+        let readback_executor = fixture.executor(&readback_reader, &readback_url);
+        let applied = readback_executor
+            .run_once_postgres(&store, &legacy, observed_at + ChronoDuration::seconds(1))
+            .await
+            .unwrap()
+            .expect("readback campaign lock is available");
+        assert_eq!(applied.outcome, WbAutomationExecutionOutcome::Reconciled);
+        assert!(readback_requests.try_recv().is_err());
+
+        let (feedback_reader, _) =
+            campaign_level_reader_server_for(campaign_id, 9, [117, 540, 117], &current_date, 2, 10);
+        let (feedback_url, feedback_requests) = mock_http(Vec::new());
+        let feedback_executor = fixture.executor(&feedback_reader, &feedback_url);
+        let held = feedback_executor
+            .run_once_postgres(&store, &legacy, observed_at + ChronoDuration::seconds(301))
+            .await
+            .unwrap()
+            .expect("feedback campaign lock is available");
+        assert_eq!(held.outcome, WbAutomationExecutionOutcome::Observed);
+        assert_eq!(
+            held.decision.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::TrafficFeedbackPending,
+            }
+        );
+        assert!(feedback_requests.try_recv().is_err());
+
+        let (invalid_reader, _) =
+            campaign_level_reader_server_for(campaign_id, 9, [117, 540, 117], &current_date, 2, 10);
+        let (invalid_write_url, invalid_write_requests) = mock_http(Vec::new());
+        let invalid_executor = fixture.executor(&invalid_reader, &invalid_write_url);
+        assert!(
+            invalid_executor
+                .run_explicit_exposure_increase_once_postgres(
+                    &store,
+                    &legacy,
+                    observed_at + ChronoDuration::seconds(302),
+                    policy.target_impressions_per_day - 1,
+                )
+                .await
+                .is_err()
+        );
+        assert!(invalid_write_requests.try_recv().is_err());
     }
 
     #[tokio::test]

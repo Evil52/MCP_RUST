@@ -35,7 +35,7 @@ use super::{
 // Version 4 adds explicit current-day spend completeness and the versioned
 // WB ADS ROBOT v1 policy contract. Missing current-day delivery is no longer
 // serialized as a trusted zero that could authorize a write.
-const SNAPSHOT_SCHEMA_VERSION: u32 = 4;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
@@ -406,16 +406,14 @@ fn build_observation(
     );
     let mut current_sku_spend_minor = 0_u64;
     let mut current_sku_rows = 0_u64;
-    let mut current_campaign_spend_minor = None;
+    let mut current_campaign = None;
     let mut previous = BTreeMap::<u64, &CollectedAdvertisingFact>::new();
     let mut campaign_level_previous = None;
     for fact in advertising {
         if fact.business_date == current_date {
             if fact.sku == 0 {
                 ensure!(
-                    current_campaign_spend_minor
-                        .replace(fact.spend_minor)
-                        .is_none(),
+                    current_campaign.replace(fact).is_none(),
                     "WB automation stats содержат duplicate campaign total"
                 );
             } else {
@@ -439,15 +437,16 @@ fn build_observation(
         }
     }
     ensure!(
-        current_campaign_spend_minor.is_none() || current_sku_spend_minor == 0,
+        current_campaign.is_none() || current_sku_spend_minor == 0,
         "WB automation stats смешивают campaign и SKU totals за текущую дату"
     );
     ensure!(
         campaign_level_previous.is_none() || previous.is_empty(),
         "WB automation stats смешивают campaign и SKU totals за предыдущую дату"
     );
-    let daily_spend_complete = current_campaign_spend_minor.is_some() || current_sku_rows > 0;
-    let daily_spend_minor = current_campaign_spend_minor.unwrap_or(current_sku_spend_minor);
+    let daily_spend_complete = current_campaign.is_some() || current_sku_rows > 0;
+    let daily_spend_minor =
+        current_campaign.map_or(current_sku_spend_minor, |fact| fact.spend_minor);
     let mut stock_totals = BTreeMap::<u64, u64>::new();
     for stock in stocks.iter().filter(|stock| allowed.contains(&stock.sku)) {
         let total = stock_totals.entry(stock.sku).or_default();
@@ -490,6 +489,13 @@ fn build_observation(
         // facts. No row in either scope remains missing evidence and holds.
         attribution_complete: campaign_level_previous.is_none() && !previous.is_empty(),
         campaign_level_metrics: campaign_level_previous.map(|fact| WbAutomationCampaignMetrics {
+            impressions: fact.impressions,
+            clicks: fact.clicks,
+            spend_minor: fact.spend_minor,
+            attributed_orders: fact.attributed_orders,
+            attributed_revenue_minor: fact.attributed_revenue_minor,
+        }),
+        current_campaign_metrics: current_campaign.map(|fact| WbAutomationCampaignMetrics {
             impressions: fact.impressions,
             clicks: fact.clicks,
             spend_minor: fact.spend_minor,
@@ -881,6 +887,7 @@ mod tests {
         assert_eq!(snapshot.previous_business_date.to_string(), "2026-08-24");
         assert_eq!(snapshot.observation.budget_remaining_minor, 100_000);
         assert_eq!(snapshot.observation.daily_spend_minor, 150);
+        assert!(snapshot.observation.current_campaign_metrics.is_none());
         assert!(snapshot.observation.attribution_complete);
         assert_eq!(snapshot.observation.skus[0].sellable_stock, 10);
 
@@ -936,6 +943,16 @@ mod tests {
             })
         );
         assert_eq!(snapshot.observation.daily_spend_minor, 102);
+        assert_eq!(
+            snapshot.observation.current_campaign_metrics,
+            Some(WbAutomationCampaignMetrics {
+                impressions: 10,
+                clicks: 1,
+                spend_minor: 102,
+                attributed_orders: 0,
+                attributed_revenue_minor: 0,
+            })
+        );
         assert!(snapshot.observation.skus.iter().all(|sku| {
             sku.impressions == 0
                 && sku.clicks == 0

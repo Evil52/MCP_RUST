@@ -46,6 +46,10 @@ pub struct WbAutomationPolicy {
     pub target_impressions_per_day: u64,
     #[serde(default, skip_serializing_if = "is_pacing_disabled")]
     pub autonomous_pacing: WbAutomationPacingMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_frontier_bid_kopecks: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_frontier_feedback_timeout_seconds: Option<u32>,
     pub min_bid_kopecks: u64,
     pub max_bid_kopecks: u64,
     pub bid_step_percent: u8,
@@ -71,12 +75,18 @@ pub enum WbAutomationPacingMode {
     #[default]
     Disabled,
     Enabled,
+    TrafficFrontierV2,
 }
 
 impl WbAutomationPacingMode {
     #[must_use]
     pub const fn is_enabled(self) -> bool {
-        matches!(self, Self::Enabled)
+        matches!(self, Self::Enabled | Self::TrafficFrontierV2)
+    }
+
+    #[must_use]
+    pub const fn uses_traffic_frontier(self) -> bool {
+        matches!(self, Self::TrafficFrontierV2)
     }
 }
 
@@ -96,6 +106,11 @@ pub struct WbAutomationObservation {
     /// level. These totals are never copied into individual SKU rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub campaign_level_metrics: Option<WbAutomationCampaignMetrics>,
+    /// Current-business-day campaign totals used only for budget/traffic
+    /// pacing. They remain aggregate evidence and are never attributed to an
+    /// individual SKU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_campaign_metrics: Option<WbAutomationCampaignMetrics>,
     pub skus: Vec<WbAutomationSkuObservation>,
 }
 
@@ -137,6 +152,7 @@ pub enum WbAutomationHoldReason {
     BudgetExhausted,
     ActionQuotaExhausted,
     CooldownActive,
+    TrafficFeedbackPending,
     NoMaterialChange,
 }
 
@@ -149,6 +165,9 @@ pub enum WbAutomationBidReason {
     LowExposureExploration,
     ExplicitExposureTarget,
     AutonomousExposurePacing,
+    TrafficFrontierBootstrap,
+    TrafficFrontierIncrease,
+    TrafficFrontierRetentionDecrease,
     LowStockGuard,
     NoOrdersHardStop,
     HardDrrExceeded,
@@ -525,13 +544,18 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
         || policy.hard_drr_basis_points <= policy.target_drr_basis_points
         || policy.hard_drr_basis_points > 10_000
         || policy.target_impressions_per_day == 0
+        || policy.autonomous_pacing.uses_traffic_frontier()
+            && !valid_traffic_frontier_policy(policy)
+        || !policy.autonomous_pacing.uses_traffic_frontier()
+            && (policy.traffic_frontier_bid_kopecks.is_some()
+                || policy.traffic_frontier_feedback_timeout_seconds.is_some())
         || policy.min_bid_kopecks == 0
         || policy.max_bid_kopecks < policy.min_bid_kopecks
         || !(1..=25).contains(&policy.bid_step_percent)
         || policy.daily_spend_cap_minor == 0
         || policy.daily_pause_threshold_minor == 0
         || policy.daily_pause_threshold_minor > policy.daily_spend_cap_minor
-        || !(1..=24).contains(&policy.max_actions_per_day)
+        || !(1..=50).contains(&policy.max_actions_per_day)
         || !(300..=86_400).contains(&policy.cooldown_seconds)
         || policy.no_order_reduce_clicks == 0
         || policy.no_order_disable_clicks <= policy.no_order_reduce_clicks
@@ -546,6 +570,23 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
         return Err(WbAutomationDecisionError::InvalidPolicy);
     }
     Ok(())
+}
+
+const fn valid_traffic_frontier_policy(policy: &WbAutomationPolicy) -> bool {
+    let Some(frontier) = policy.traffic_frontier_bid_kopecks else {
+        return false;
+    };
+    let Some(feedback_timeout) = policy.traffic_frontier_feedback_timeout_seconds else {
+        return false;
+    };
+    let emergency_headroom = policy
+        .daily_spend_cap_minor
+        .saturating_sub(policy.daily_pause_threshold_minor);
+    frontier > policy.min_bid_kopecks
+        && frontier <= policy.max_bid_kopecks
+        && policy.max_bid_kopecks <= emergency_headroom
+        && feedback_timeout >= policy.cooldown_seconds
+        && feedback_timeout <= 86_400
 }
 
 fn valid_identifier(value: &str) -> bool {
@@ -564,10 +605,13 @@ fn validate_observation<'a>(
         .last_action_at
         .is_some_and(|last_action| last_action > observation.observed_at)
         || observation.attribution_complete && observation.campaign_level_metrics.is_some()
-        || observation
-            .campaign_level_metrics
-            .as_ref()
-            .is_some_and(|metrics| metrics.clicks > metrics.impressions)
+        || [
+            observation.campaign_level_metrics.as_ref(),
+            observation.current_campaign_metrics.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|metrics| metrics.clicks > metrics.impressions)
     {
         return Err(WbAutomationDecisionError::InvalidObservation);
     }
@@ -720,6 +764,8 @@ mod tests {
             hard_drr_basis_points: 2_500,
             target_impressions_per_day: 5_000,
             autonomous_pacing: WbAutomationPacingMode::Enabled,
+            traffic_frontier_bid_kopecks: None,
+            traffic_frontier_feedback_timeout_seconds: None,
             min_bid_kopecks: 102,
             max_bid_kopecks: 600,
             bid_step_percent: 15,
@@ -765,6 +811,7 @@ mod tests {
             last_action_at: None,
             attribution_complete: true,
             campaign_level_metrics: None,
+            current_campaign_metrics: None,
             skus: policy().nm_ids.into_iter().map(sku).collect(),
         }
     }
@@ -773,6 +820,7 @@ mod tests {
         let mut input = observation();
         input.attribution_complete = false;
         input.campaign_level_metrics = Some(metrics);
+        input.current_campaign_metrics = None;
         for sku in &mut input.skus {
             sku.impressions = 0;
             sku.clicks = 0;
@@ -1426,6 +1474,7 @@ mod tests {
             last_action_at: None,
             attribution_complete: false,
             campaign_level_metrics: None,
+            current_campaign_metrics: None,
             skus: live_skus,
         };
 
@@ -1439,5 +1488,49 @@ mod tests {
         );
         assert!(!robot_policy.write_enabled);
         assert!(!robot_policy.allow_budget_top_up);
+    }
+
+    #[test]
+    fn traffic_frontier_policy_is_bounded_by_feedback_and_budget_headroom() {
+        let traffic = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+            "../../config/wb-automation-robot.bid-live.json"
+        ))
+        .unwrap();
+        validate_wb_automation_policy(&traffic).unwrap();
+
+        let mut missing_frontier = traffic.clone();
+        missing_frontier.traffic_frontier_bid_kopecks = None;
+        assert_eq!(
+            validate_wb_automation_policy(&missing_frontier),
+            Err(WbAutomationDecisionError::InvalidPolicy)
+        );
+
+        let mut missing_timeout = traffic.clone();
+        missing_timeout.traffic_frontier_feedback_timeout_seconds = None;
+        assert_eq!(
+            validate_wb_automation_policy(&missing_timeout),
+            Err(WbAutomationDecisionError::InvalidPolicy)
+        );
+
+        let mut no_click_headroom = traffic.clone();
+        no_click_headroom.max_bid_kopecks = 5_001;
+        assert_eq!(
+            validate_wb_automation_policy(&no_click_headroom),
+            Err(WbAutomationDecisionError::InvalidPolicy)
+        );
+
+        let mut stale_feedback = traffic.clone();
+        stale_feedback.traffic_frontier_feedback_timeout_seconds = Some(299);
+        assert_eq!(
+            validate_wb_automation_policy(&stale_feedback),
+            Err(WbAutomationDecisionError::InvalidPolicy)
+        );
+
+        let mut too_many_actions = traffic;
+        too_many_actions.max_actions_per_day = 51;
+        assert_eq!(
+            validate_wb_automation_policy(&too_many_actions),
+            Err(WbAutomationDecisionError::InvalidPolicy)
+        );
     }
 }
