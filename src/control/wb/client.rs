@@ -12,10 +12,18 @@ use tokio::{
     time::{Instant, sleep_until, timeout},
 };
 
-use super::{MAX_CHANGES, WbGuardedWriteError, WbPreparedBidChange, WbWriteError};
+use super::{
+    MAX_CHANGES, WbCampaignBidType, WbCreateCampaignRequest, WbGuardedWriteError,
+    WbPreparedBidChange, WbWriteError,
+};
 
 const WB_PROMOTION_BASE_URL: &str = "https://advert-api.wildberries.ru";
 const CHANGE_BIDS_PATH: &str = "/api/advert/v1/bids";
+#[allow(
+    dead_code,
+    reason = "wired only after the durable campaign-create plan repository lands"
+)]
+const CREATE_CAMPAIGN_PATH: &str = "/adv/v2/seacat/save-ad";
 const PAUSE_CAMPAIGN_PATH: &str = "/adv/v0/pause";
 const START_CAMPAIGN_PATH: &str = "/adv/v0/start";
 const MAX_WRITE_RESPONSE_BYTES: usize = 1_048_576;
@@ -25,6 +33,7 @@ pub(super) const MAX_REQUEST_ID_BYTES: usize = 128;
 // safety margin and serialize the entire request so clones sharing one token
 // cannot create a burst or overlap writes.
 pub(super) const MIN_WRITE_INTERVAL: Duration = Duration::from_millis(250);
+pub(super) const MIN_CREATE_INTERVAL: Duration = Duration::from_secs(12);
 
 #[derive(Debug)]
 pub(super) struct WritePacer {
@@ -98,6 +107,7 @@ pub struct WbBidWriteClient {
     authorization: HeaderValue,
     timeout: Duration,
     pacer: Arc<WritePacer>,
+    create_pacer: Arc<WritePacer>,
 }
 
 impl fmt::Debug for WbBidWriteClient {
@@ -108,6 +118,10 @@ impl fmt::Debug for WbBidWriteClient {
             .field("authorization", &"<redacted>")
             .field("timeout", &self.timeout)
             .field("minimum_write_interval", &self.pacer.minimum_interval)
+            .field(
+                "minimum_create_interval",
+                &self.create_pacer.minimum_interval,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -173,6 +187,11 @@ impl WbBidWriteClient {
             authorization,
             timeout: timeout_duration,
             pacer: Arc::new(WritePacer::new(minimum_write_interval)),
+            create_pacer: Arc::new(WritePacer::new(if minimum_write_interval.is_zero() {
+                Duration::ZERO
+            } else {
+                MIN_CREATE_INTERVAL
+            })),
         })
     }
 
@@ -240,6 +259,34 @@ impl WbBidWriteClient {
         Fut: Future<Output = Result<(), E>>,
     {
         self.campaign_status_with_permit(advert_id, START_CAMPAIGN_PATH, permit)
+            .await
+    }
+
+    /// Creates one ready-to-start campaign with exactly one HTTP attempt.
+    /// The caller must persist an execute-once claim before granting `permit`.
+    #[allow(
+        dead_code,
+        reason = "writer primitive remains unreachable until durable prepare/approve/apply wiring"
+    )]
+    pub(in crate::control) async fn create_campaign_with_permit<E, F, Fut>(
+        &self,
+        request: &WbCreateCampaignRequest,
+        permit: F,
+    ) -> Result<u64, WbGuardedWriteError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        validate_create_campaign_request(request).map_err(WbGuardedWriteError::Write)?;
+        self.create_pacer
+            .run_guarded(
+                || async { permit().await.map_err(WbGuardedWriteError::Permit) },
+                || async {
+                    self.create_campaign_once(request)
+                        .await
+                        .map_err(WbGuardedWriteError::Write)
+                },
+            )
             .await
     }
 
@@ -324,6 +371,74 @@ impl WbBidWriteClient {
         Err(WbWriteError::HttpStatus { status, request_id })
     }
 
+    #[allow(
+        dead_code,
+        reason = "called only by the guarded campaign-create primitive"
+    )]
+    async fn create_campaign_once(
+        &self,
+        request: &WbCreateCampaignRequest,
+    ) -> Result<u64, WbWriteError> {
+        let mut payload = serde_json::json!({
+            "name": request.name,
+            "nms": request.nm_ids,
+            "bid_type": request.bid_type.as_api_str(),
+            "payment_type": request.payment_type.as_api_str(),
+        });
+        if request.bid_type == WbCampaignBidType::Manual {
+            payload["placement_types"] = Value::Array(
+                request
+                    .placement_types
+                    .iter()
+                    .map(|placement| Value::String(placement.as_api_str().to_owned()))
+                    .collect(),
+            );
+        }
+        let send = self
+            .http
+            .post(format!("{}{}", self.base_url, CREATE_CAMPAIGN_PATH))
+            .header(AUTHORIZATION, self.authorization.clone())
+            .json(&payload)
+            .send();
+        let response = timeout(self.timeout, send)
+            .await
+            .map_err(|_| WbWriteError::Ambiguous {
+                reason: "timeout",
+                request_id: None,
+            })?
+            .map_err(|_| WbWriteError::Ambiguous {
+                reason: "network_error",
+                request_id: None,
+            })?;
+        let status = response.status();
+        let request_id = response_request_id(&response);
+        let limit = if status.is_success() {
+            MAX_WRITE_RESPONSE_BYTES
+        } else {
+            MAX_ERROR_RESPONSE_BYTES
+        };
+        let bytes =
+            read_bounded(response, limit)
+                .await
+                .map_err(|reason| WbWriteError::Ambiguous {
+                    reason,
+                    request_id: request_id.clone(),
+                })?;
+        if status == StatusCode::OK {
+            let advert_id =
+                serde_json::from_slice::<u64>(&bytes).map_err(|_| WbWriteError::Ambiguous {
+                    reason: "invalid_success_advert_id",
+                    request_id: request_id.clone(),
+                })?;
+            validate_advert_id(advert_id).map_err(|_| WbWriteError::Ambiguous {
+                reason: "invalid_success_advert_id",
+                request_id,
+            })?;
+            return Ok(advert_id);
+        }
+        Err(WbWriteError::HttpStatus { status, request_id })
+    }
+
     async fn change_campaign_status_once(
         &self,
         advert_id: u64,
@@ -401,6 +516,52 @@ pub(super) fn validate_write_request(
         })
     {
         return Err(WbWriteError::InvalidRequest("changes"));
+    }
+    Ok(())
+}
+
+#[allow(
+    dead_code,
+    reason = "called only by the guarded campaign-create primitive"
+)]
+pub(super) fn validate_create_campaign_request(
+    request: &WbCreateCampaignRequest,
+) -> Result<(), WbWriteError> {
+    if request.name.is_empty()
+        || request.name.trim() != request.name
+        || request.name.len() > 100
+        || request.name.chars().any(char::is_control)
+    {
+        return Err(WbWriteError::InvalidRequest("name"));
+    }
+    if request.nm_ids.is_empty() || request.nm_ids.len() > MAX_CHANGES {
+        return Err(WbWriteError::InvalidRequest("nm_ids"));
+    }
+    let unique_nm_ids = request.nm_ids.iter().copied().collect::<BTreeSet<_>>();
+    if unique_nm_ids.len() != request.nm_ids.len()
+        || request
+            .nm_ids
+            .iter()
+            .any(|nm_id| *nm_id == 0 || *nm_id > i64::MAX as u64)
+    {
+        return Err(WbWriteError::InvalidRequest("nm_ids"));
+    }
+    let unique_placements = request
+        .placement_types
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let placements_valid = match request.bid_type {
+        WbCampaignBidType::Manual => {
+            !request.placement_types.is_empty()
+                && request.placement_types.len() <= 2
+                && unique_placements.len() == request.placement_types.len()
+                && !unique_placements.contains(&super::WbBidPlacement::Combined)
+        }
+        WbCampaignBidType::Unified => request.placement_types.is_empty(),
+    };
+    if !placements_valid {
+        return Err(WbWriteError::InvalidRequest("placement_types"));
     }
     Ok(())
 }

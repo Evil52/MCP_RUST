@@ -38,4 +38,7 @@ pub use config::{
 pub use plan::{PlanStoreError, WbActionQuota, WbPlanRepository, WbPlanStatus};
 pub use policy::{ControlMode, ControlPolicy, WbActionLimits, WbBidPlacement};
 pub use server::{ControlMcp, WbControlServices};
-pub use wb::{WbBidChange, WbBidWriteClient, WbPreparedBidChange};
+pub use wb::{
+    WbBidChange, WbBidWriteClient, WbCampaignBidType, WbCampaignPaymentType,
+    WbCreateCampaignRequest, WbPreparedBidChange,
+};
