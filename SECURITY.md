@@ -220,6 +220,19 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   environment-variable names, never secret values. Do not place Sonar, SSH, or other unrelated
   secrets in this file. A production orchestrator should use managed secrets instead of plain
   container environment variables.
+- Every protective state in this system is fail-closed and silent by design: an incident-locked WB
+  robot stops issuing writes but leaves the campaign running at its last applied bid, an ambiguous
+  Gmail send stays in `sending` until an operator reconciles it, and a stack that did not come up
+  after a reboot is indistinguishable from a quiet morning. `scripts/check-runtime-health.sh` is the
+  detection channel those designs assume; scheduled via `scripts/install-operations-agents.sh` it
+  reports incident classes, unresolved marketplace actions, stalled report work, an unhealthy or
+  absent data plane, and a stale backup. Without it installed, none of those states reach anyone.
+- Backups are operator-scheduled rather than intrinsic. `scripts/backup-position-stack.sh` captures
+  the database and the artifact volume as one recovery point and
+  `scripts/verify-position-backup.sh` proves the result by restoring it, but both depend on the
+  passphrase from `scripts/bootstrap-backup-passphrase.sh` being held somewhere other than the host
+  being protected. AES-256-CBC is not authenticated: the recorded SHA-256 detects corruption, not an
+  attacker who can rewrite an archive and its manifest together.
 - Application logs provide safe transport/error telemetry but are not an append-only corporate audit
   ledger. A production rollout that requires non-repudiation must add an external protected audit sink
   for actor/tool/account/outcome without payloads or credentials.

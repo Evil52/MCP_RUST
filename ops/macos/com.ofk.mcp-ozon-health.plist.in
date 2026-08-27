@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ofk.mcp-ozon-health</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__RUNNER__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>MCP_RUNTIME_DIR</key>
+    <string>__RUNTIME_DIR__</string>
+    <key>MCP_OPS_PROJECT_DIR</key>
+    <string>__PROJECT_DIR__</string>
+    <key>MCP_HEALTH_POSITION_ENV</key>
+    <string>__POSITION_ENV__</string>
+    <key>MCP_BACKUP_DIR</key>
+    <string>__BACKUP_DIR__</string>
+    <key>MCP_HEALTH_NOTIFY_COMMAND</key>
+    <string>__NOTIFY_COMMAND__</string>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <!-- Every 15 minutes. StartCalendarInterval rather than StartInterval so the
+       first check after a wake happens immediately: the states this probe
+       exists to surface are exactly the ones that accumulate while nobody is
+       looking at the machine. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Minute</key><integer>45</integer></dict>
+  </array>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/health.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/health.error.log</string>
+</dict>
+</plist>

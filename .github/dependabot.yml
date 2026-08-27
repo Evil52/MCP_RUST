@@ -30,6 +30,12 @@ updates:
       timezone: Asia/Yekaterinburg
     open-pull-requests-limit: 10
 
+  # A PostgreSQL major upgrade cannot be applied by replacing the image: the
+  # existing PGDATA is unreadable to the new major and the container fails to
+  # start, taking the whole data plane with it. Majors therefore go through the
+  # documented pg_upgrade procedure in position-monitor/README.md, never
+  # through an automatic pull request. Patch and minor digests still arrive
+  # here weekly.
   - package-ecosystem: docker
     directory: /position-monitor
     schedule:
@@ -38,3 +44,7 @@ updates:
       time: "05:15"
       timezone: Asia/Yekaterinburg
     open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: postgres
+        update-types:
+          - version-update:semver-major

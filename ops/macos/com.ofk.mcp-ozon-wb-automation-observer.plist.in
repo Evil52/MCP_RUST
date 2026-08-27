@@ -21,8 +21,27 @@
   </dict>
   <key>RunAtLoad</key>
   <true/>
-  <key>StartInterval</key>
-  <integer>300</integer>
+  <!-- StartInterval drops any firing whose moment lands while the Mac is
+       asleep (launchd.plist: "that interval will be missed"), and also
+       drops one if the previous cycle is still running. StartCalendarInterval
+       instead starts the job on the next wake, coalescing everything missed
+       into a single cycle, so a closed lid no longer silently suspends the
+       process that enforces the daily spend cap. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>5</integer></dict>
+    <dict><key>Minute</key><integer>10</integer></dict>
+    <dict><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Minute</key><integer>20</integer></dict>
+    <dict><key>Minute</key><integer>25</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Minute</key><integer>40</integer></dict>
+    <dict><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Minute</key><integer>50</integer></dict>
+    <dict><key>Minute</key><integer>55</integer></dict>
+  </array>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>

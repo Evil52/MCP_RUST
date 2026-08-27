@@ -17,6 +17,12 @@ lock_directory="${TMPDIR:-/tmp}/mcp-ozon-wb-automation-live.lock"
 lock_pid_file="$lock_directory/pid"
 
 umask 077
+# This lock only avoids the cost of starting a redundant container. It is not
+# the mutual-exclusion guarantee: reclaiming a stale lock is not atomic, so two
+# racing runs can both believe they hold it. Correctness comes from the
+# session-scoped `pg_try_advisory_lock` in automation_postgres.rs, where the
+# loser gets `Ok(None)` and does nothing, and which PostgreSQL releases by
+# itself when a crashed run's connection drops.
 if ! mkdir "$lock_directory" 2>/dev/null; then
   if [[ -f "$lock_pid_file" && ! -L "$lock_pid_file" ]]; then
     lock_pid="$(head -n 1 "$lock_pid_file" 2>/dev/null || true)"
