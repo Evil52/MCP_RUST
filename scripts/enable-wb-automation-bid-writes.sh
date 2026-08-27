@@ -91,13 +91,13 @@ if ! jq -e '
   and .nm_ids == [449627598, 449627015, 497424314]
   and .target_impressions_per_day == 5000
   and .autonomous_pacing == "traffic_frontier_v2"
-  and .traffic_frontier_bid_kopecks == 540
+  and .traffic_frontier_bid_kopecks == 1000
   and .traffic_frontier_feedback_timeout_seconds == 1800
   and .min_bid_kopecks == 102
   and .max_bid_kopecks == 3000
   and .bid_step_percent == 5
-  and .daily_pause_threshold_minor == 25000
-  and .daily_spend_cap_minor == 30000
+  and .daily_pause_threshold_minor == 45000
+  and .daily_spend_cap_minor == 50000
   and .max_actions_per_day == 50
   and .cooldown_seconds == 300
   and .allow_budget_top_up == false
@@ -165,20 +165,25 @@ if [[ -e "$bid_policy_target" ]]; then
       | .traffic_frontier_feedback_timeout_seconds = $target[0].traffic_frontier_feedback_timeout_seconds
       | .max_bid_kopecks = $target[0].max_bid_kopecks
       | .bid_step_percent = $target[0].bid_step_percent
+      | .daily_pause_threshold_minor = $target[0].daily_pause_threshold_minor
+      | .daily_spend_cap_minor = $target[0].daily_spend_cap_minor
       | .max_actions_per_day = $target[0].max_actions_per_day
       | .cooldown_seconds = $target[0].cooldown_seconds
     ' "$bid_policy_target")"
     if ! jq -e '
       .write_enabled == true
       and .bid_writes_enabled == true
-      and .authorization_reference == "chat/2026-08-24/safe-auto-robot"
-      and .autonomous_pacing == "enabled"
-      and (.traffic_frontier_bid_kopecks // null) == null
-      and (.traffic_frontier_feedback_timeout_seconds // null) == null
-      and .max_bid_kopecks == 500
-      and .bid_step_percent == 15
-      and .max_actions_per_day == 2
-      and .cooldown_seconds == 21600
+      and .authorization_reference == "chat/2026-08-27/traffic-frontier-v2"
+      and .autonomous_pacing == "traffic_frontier_v2"
+      and .traffic_frontier_bid_kopecks == 540
+      and .traffic_frontier_feedback_timeout_seconds == 1800
+      and .max_bid_kopecks == 3000
+      and .bid_step_percent == 5
+      and .daily_pause_threshold_minor == 25000
+      and .daily_spend_cap_minor == 30000
+      and .max_actions_per_day == 50
+      and .cooldown_seconds == 300
+      and .allow_budget_top_up == false
     ' "$bid_policy_target" >/dev/null \
       || [[ "$migrated_policy" != "$target_policy" ]]; then
       echo "installed WB automation policy is not an approved migration source" >&2
@@ -297,7 +302,7 @@ fi
 
 if [[ "$migration_required" == "true" ]]; then
   activation_output="$("${compose[@]}" run --rm --no-deps wb-automation-live \
-    activate-traffic-frontier-v2-pg \
+    raise-traffic-frontier-limits-pg \
     /etc/mcp-ozon/wb-automation-shadow-policy.json \
     /etc/mcp-ozon/wb-automation-live-policy.json \
     /etc/mcp-ozon/access.json \
@@ -320,6 +325,8 @@ if ! jq -e '
   or .outcome == "bid_writes_already_active"
   or .outcome == "traffic_frontier_v2_activated"
   or .outcome == "traffic_frontier_v2_already_active"
+  or .outcome == "traffic_frontier_limits_raised"
+  or .outcome == "traffic_frontier_limits_already_active"
 ' <<<"$activation_output" >/dev/null; then
   echo "WB automation bid-live activation did not complete" >&2
   exit 1

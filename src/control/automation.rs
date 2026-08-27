@@ -1449,7 +1449,7 @@ mod tests {
             "../../config/wb-automation-robot.json"
         ))
         .unwrap();
-        let observed_at = Utc.with_ymd_and_hms(2026, 8, 24, 7, 3, 27).unwrap();
+        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 7, 30, 0).unwrap();
         let live_skus = [(449_627_598, 10), (449_627_015, 12), (497_424_314, 10)]
             .into_iter()
             .map(|(nm_id, sellable_stock)| WbAutomationSkuObservation {

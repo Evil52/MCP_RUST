@@ -1527,12 +1527,18 @@ mod tests {
             .unwrap();
             test_policy.write_enabled = true;
             test_policy.bid_writes_enabled = true;
+            test_policy.authorized_at = Utc.with_ymd_and_hms(2026, 8, 24, 7, 0, 0).unwrap();
+            test_policy.observe_until = Utc.with_ymd_and_hms(2026, 8, 24, 7, 0, 1).unwrap();
+            test_policy.authorization_expires_at =
+                Utc.with_ymd_and_hms(2026, 9, 23, 7, 0, 0).unwrap();
             test_policy.autonomous_pacing =
                 crate::control::automation::WbAutomationPacingMode::Enabled;
             test_policy.traffic_frontier_bid_kopecks = None;
             test_policy.traffic_frontier_feedback_timeout_seconds = None;
             test_policy.max_bid_kopecks = 500;
             test_policy.bid_step_percent = 15;
+            test_policy.daily_pause_threshold_minor = 25_000;
+            test_policy.daily_spend_cap_minor = 30_000;
             test_policy.max_actions_per_day = 2;
             test_policy.cooldown_seconds = 21_600;
             test_policy.campaign_id = campaign_id;
@@ -2200,6 +2206,8 @@ mod tests {
         policy.traffic_frontier_feedback_timeout_seconds = Some(1_800);
         policy.max_bid_kopecks = 3_000;
         policy.bid_step_percent = 5;
+        policy.daily_pause_threshold_minor = 25_000;
+        policy.daily_spend_cap_minor = 30_000;
         policy.max_actions_per_day = 50;
         policy.cooldown_seconds = 300;
         snapshot.observation.observed_at = Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
@@ -2234,6 +2242,40 @@ mod tests {
                     reason: WbAutomationBidReason::TrafficFrontierBootstrap,
                 }]
         ));
+    }
+
+    #[test]
+    fn traffic_frontier_ten_uses_the_reviewed_budget_and_entry() {
+        let (mut policy, snapshot) = traffic_frontier_snapshot();
+        policy.traffic_frontier_bid_kopecks = Some(1_000);
+        policy.daily_pause_threshold_minor = 45_000;
+        policy.daily_spend_cap_minor = 50_000;
+        let decision = traffic_frontier_pacing_decision(&policy, &snapshot, None)
+            .unwrap()
+            .expect("under-paced traffic enters the reviewed ten-ruble frontier");
+        assert!(matches!(
+            decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes == &[WbAutomationBidChange {
+                    nm_id: 497_424_314,
+                    from_bid_kopecks: 117,
+                    to_bid_kopecks: 1_000,
+                    reason: WbAutomationBidReason::TrafficFrontierBootstrap,
+                }]
+        ));
+        assert_eq!(
+            traffic_frontier_dynamic_cap(
+                &policy,
+                &snapshot,
+                snapshot
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap(),
+            1_666
+        );
     }
 
     #[test]

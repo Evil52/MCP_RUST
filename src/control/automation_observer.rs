@@ -724,6 +724,9 @@ mod tests {
         .unwrap();
         policy.write_enabled = true;
         policy.bid_writes_enabled = true;
+        policy.authorized_at = Utc.with_ymd_and_hms(2026, 8, 24, 7, 0, 0).unwrap();
+        policy.observe_until = Utc.with_ymd_and_hms(2026, 8, 24, 7, 0, 1).unwrap();
+        policy.authorization_expires_at = Utc.with_ymd_and_hms(2026, 9, 23, 7, 0, 0).unwrap();
         policy
     }
 

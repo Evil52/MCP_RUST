@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
         Command::ActivateTrafficFrontierV2Postgres(options) => {
             activate_traffic_frontier_v2_postgres(options).await
         }
+        Command::RaiseTrafficFrontierLimitsPostgres(options) => {
+            raise_traffic_frontier_limits_postgres(options).await
+        }
         Command::ExecutePostgres(options) => execute_postgres_once(options).await,
         Command::ExplicitExposureIncreasePostgres(options) => {
             explicit_exposure_increase_postgres_once(options).await
@@ -392,6 +395,127 @@ fn validate_traffic_frontier_v2_activation(
     Ok(())
 }
 
+async fn raise_traffic_frontier_limits_postgres(options: ActivatePolicyOptions) -> Result<()> {
+    let source = build_observer(&options.source)?;
+    let target = build_observer(&ObserveOptions {
+        policy: options.target_policy,
+        registry: options.source.registry.clone(),
+        reader_token: options.source.reader_token.clone(),
+        state_directory: PathBuf::new(),
+        allow_broad_reader: options.source.allow_broad_reader,
+        reader_proxy_url: options.source.reader_proxy_url.clone(),
+    })?;
+    validate_traffic_frontier_limits_raise(source.policy(), target.policy())?;
+    let now = Utc::now();
+    ensure!(
+        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
+        "WB traffic-frontier limits authorization is not active"
+    );
+    target
+        .observe(now, WbAutomationStateView::default())
+        .await
+        .context("WB traffic-frontier limits read-only preflight failed")?;
+    let database_url =
+        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
+    let database_config =
+        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
+    let store = WbAutomationPostgresStore::connect(&database_config).await?;
+    store.verify_runtime_contract().await?;
+    let Some(mut lease) = store
+        .try_acquire_campaign(
+            target.policy().account_id.as_str(),
+            target.policy().campaign_id,
+        )
+        .await?
+    else {
+        bail!("WB traffic-frontier limits campaign lock is contended");
+    };
+    let receipt = lease
+        .activate_traffic_frontier_limits_policy(
+            source.policy_sha256(),
+            target.policy_sha256(),
+            source
+                .policy()
+                .traffic_frontier_bid_kopecks
+                .context("source WB traffic-frontier entry bid is unavailable")?,
+            target
+                .policy()
+                .traffic_frontier_bid_kopecks
+                .context("target WB traffic-frontier entry bid is unavailable")?,
+            source.policy().daily_pause_threshold_minor,
+            target.policy().daily_pause_threshold_minor,
+            source.policy().daily_spend_cap_minor,
+            target.policy().daily_spend_cap_minor,
+        )
+        .await?;
+    lease.release().await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "account_id": target.policy().account_id,
+            "campaign_id": target.policy().campaign_id,
+            "outcome": if receipt.changed {
+                "traffic_frontier_limits_raised"
+            } else {
+                "traffic_frontier_limits_already_active"
+            },
+            "state_revision": receipt.state_revision,
+            "traffic_frontier_bid_kopecks": target.policy().traffic_frontier_bid_kopecks,
+            "daily_pause_threshold_minor": target.policy().daily_pause_threshold_minor,
+            "daily_spend_cap_minor": target.policy().daily_spend_cap_minor,
+            "max_bid_kopecks": target.policy().max_bid_kopecks,
+            "bid_writes_enabled": true,
+        })
+    );
+    Ok(())
+}
+
+fn validate_traffic_frontier_limits_raise(
+    source: &WbAutomationPolicy,
+    target: &WbAutomationPolicy,
+) -> Result<()> {
+    use mcp_ozon::control::WbAutomationPacingMode;
+
+    ensure!(
+        source.write_enabled
+            && source.bid_writes_enabled
+            && target.write_enabled
+            && target.bid_writes_enabled
+            && source.autonomous_pacing == WbAutomationPacingMode::TrafficFrontierV2
+            && target.autonomous_pacing == WbAutomationPacingMode::TrafficFrontierV2
+            && source.authorization_reference == "chat/2026-08-27/traffic-frontier-v2"
+            && target.authorization_reference == "chat/2026-08-27/traffic-frontier-10-daily-500"
+            && source.traffic_frontier_bid_kopecks == Some(540)
+            && target.traffic_frontier_bid_kopecks == Some(1_000)
+            && source.daily_pause_threshold_minor == 25_000
+            && target.daily_pause_threshold_minor == 45_000
+            && source.daily_spend_cap_minor == 30_000
+            && target.daily_spend_cap_minor == 50_000
+            && source.max_bid_kopecks == 3_000
+            && target.max_bid_kopecks == 3_000
+            && target.max_bid_kopecks
+                <= target
+                    .daily_spend_cap_minor
+                    .saturating_sub(target.daily_pause_threshold_minor),
+        "WB traffic-frontier limits transition is outside the reviewed authorization"
+    );
+    let mut expected = source.clone();
+    expected
+        .authorization_reference
+        .clone_from(&target.authorization_reference);
+    expected.authorized_at = target.authorized_at;
+    expected.authorization_expires_at = target.authorization_expires_at;
+    expected.observe_until = target.observe_until;
+    expected.traffic_frontier_bid_kopecks = Some(1_000);
+    expected.daily_pause_threshold_minor = 45_000;
+    expected.daily_spend_cap_minor = 50_000;
+    ensure!(
+        target == &expected,
+        "WB traffic-frontier limits transition changes an unapproved policy field"
+    );
+    Ok(())
+}
+
 async fn shadow_postgres_once(options: ShadowPostgresOptions) -> Result<()> {
     let observer = build_observer(&options.observer)?;
     ensure!(
@@ -624,6 +748,7 @@ enum Command {
     ActivateBidWritesPostgres(ActivatePolicyOptions),
     ActivateBoundedPacingPostgres(ActivatePolicyOptions),
     ActivateTrafficFrontierV2Postgres(ActivatePolicyOptions),
+    RaiseTrafficFrontierLimitsPostgres(ActivatePolicyOptions),
     ExecutePostgres(PostgresExecuteOptions),
     ExplicitExposureIncreasePostgres(ExplicitExposureIncreaseOptions),
     Execute(ExecuteOptions),
@@ -807,6 +932,31 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         && command == "activate-traffic-frontier-v2-pg"
     {
         return Ok(Command::ActivateTrafficFrontierV2Postgres(
+            ActivatePolicyOptions {
+                source: ObserveOptions {
+                    policy: source_bid_policy.into(),
+                    registry: registry.into(),
+                    reader_token: reader_token.into(),
+                    state_directory: PathBuf::new(),
+                    allow_broad_reader: parse_bool(broad_reader)?,
+                    reader_proxy_url: optional_proxy(tail)?,
+                },
+                target_policy: target_bid_policy.into(),
+            },
+        ));
+    }
+    if let [
+        command,
+        source_bid_policy,
+        target_bid_policy,
+        registry,
+        reader_token,
+        broad_reader,
+        tail @ ..,
+    ] = arguments
+        && command == "raise-traffic-frontier-limits-pg"
+    {
+        return Ok(Command::RaiseTrafficFrontierLimitsPostgres(
             ActivatePolicyOptions {
                 source: ObserveOptions {
                     policy: source_bid_policy.into(),
@@ -1053,10 +1203,16 @@ mod tests {
     }
 
     fn traffic_frontier_v2_policies() -> (WbAutomationPolicy, WbAutomationPolicy) {
-        let target = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+        let mut target = serde_json::from_str::<WbAutomationPolicy>(include_str!(
             "../../config/wb-automation-robot.bid-live.json"
         ))
         .expect("repository traffic-frontier policy parses");
+        target.authorization_reference = "chat/2026-08-27/traffic-frontier-v2".to_owned();
+        target.authorized_at = "2026-08-24T07:00:00Z".parse().unwrap();
+        target.authorization_expires_at = "2026-09-23T07:00:00Z".parse().unwrap();
+        target.traffic_frontier_bid_kopecks = Some(540);
+        target.daily_pause_threshold_minor = 25_000;
+        target.daily_spend_cap_minor = 30_000;
         let mut source = target.clone();
         source.authorization_reference = "chat/2026-08-24/safe-auto-robot".to_owned();
         source.authorized_at = "2026-08-24T07:00:00Z".parse().unwrap();
@@ -1069,6 +1225,22 @@ mod tests {
         source.bid_step_percent = 15;
         source.max_actions_per_day = 2;
         source.cooldown_seconds = 21_600;
+        (source, target)
+    }
+
+    fn traffic_frontier_limits_policies() -> (WbAutomationPolicy, WbAutomationPolicy) {
+        let target = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+            "../../config/wb-automation-robot.bid-live.json"
+        ))
+        .expect("repository traffic-frontier limits policy parses");
+        let mut source = target.clone();
+        source.authorization_reference = "chat/2026-08-27/traffic-frontier-v2".to_owned();
+        source.authorized_at = "2026-08-24T07:00:00Z".parse().unwrap();
+        source.authorization_expires_at = "2026-09-23T07:00:00Z".parse().unwrap();
+        source.observe_until = "2026-08-25T04:37:03Z".parse().unwrap();
+        source.traffic_frontier_bid_kopecks = Some(540);
+        source.daily_pause_threshold_minor = 25_000;
+        source.daily_spend_cap_minor = 30_000;
         (source, target)
     }
 
@@ -1100,5 +1272,20 @@ mod tests {
         let mut unbounded = target;
         unbounded.max_bid_kopecks = 5_001;
         assert!(validate_traffic_frontier_v2_activation(&source, &unbounded).is_err());
+    }
+
+    #[test]
+    fn traffic_frontier_limits_raise_accepts_only_reviewed_changes() {
+        let (source, target) = traffic_frontier_limits_policies();
+        validate_traffic_frontier_limits_raise(&source, &target)
+            .expect("reviewed traffic-frontier limits transition is accepted");
+
+        let mut excessive_budget = target.clone();
+        excessive_budget.daily_spend_cap_minor += 1;
+        assert!(validate_traffic_frontier_limits_raise(&source, &excessive_budget).is_err());
+
+        let mut expanded_bid_cap = target;
+        expanded_bid_cap.max_bid_kopecks += 1;
+        assert!(validate_traffic_frontier_limits_raise(&source, &expanded_bid_cap).is_err());
     }
 }
