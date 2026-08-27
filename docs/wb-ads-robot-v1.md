@@ -14,9 +14,12 @@ represented in typed policy, enforced in code, and covered by tests.
 - Allowed products: `449627598`, `449627015`, `497424314`
 - Advertising timezone: `Europe/Moscow`
 - Target DRR / hard DRR: 15% / 25%
-- Maximum bid: 5 RUB
-- Maximum ordinary bid step: 15%
-- Cooldown: 6 hours
+- Traffic-frontier entry bid: 5.40 RUB
+- Emergency absolute bid ceiling: 30 RUB; the ordinary economic ceiling is
+  calculated from current spend, clicks, orders and target DRR
+- Maximum ordinary bid step: 5%
+- Evaluation/cooldown: 5 minutes; unchanged WB counters block another write
+  for 30 minutes
 - Protective threshold / daily ceiling: 250 RUB / 300 RUB
 - Daily impression target: 5,000, subordinate to financial guards
 - Automatic budget top-up: forbidden
@@ -127,26 +130,39 @@ network and allows only the exact WB write paths. If a write is sent, the runner
 immediately performs a second cycle for read-back; any ambiguity remains a
 durable unresolved action and blocks later writes.
 
-## P3 bounded bid-live runtime
+## P3 Traffic Frontier v2 bid-live runtime
 
 `config/wb-automation-robot.bid-live.json` differs from the protective policy
-only by `bid_writes_enabled=true`. The account, campaign, three SKUs, 5 RUB bid
-ceiling, 15% step, two actions per Moscow day, six-hour cooldown, 250 RUB pause,
+by `bid_writes_enabled=true`. The account, campaign, three SKUs, 250 RUB pause,
 300 RUB hard ceiling and prohibition on budget top-up remain unchanged.
+`autonomous_pacing="traffic_frontier_v2"` adds a reviewed 5.40 RUB traffic
+entry, five-minute feedback cycle, 5% step and at most 50 actions per Moscow
+day.
 
 Every cycle reads the official minimum CPC bid for all three SKUs before a
 decision. Every returned bid must declare `RUB` and contain exactly the approved
 SKU/search scope and the reviewed 102-kopeck floor; currency, shape, value drift
 or incomplete data fails closed before a write. Campaign details, current
 spend, budget and stock are also refreshed.
-Incomplete per-SKU attribution still blocks SKU-performance claims and
-reductions. With `autonomous_pacing="enabled"`, reviewed campaign totals may
-authorize one exposure step when impressions remain below 5,000, aggregate DRR
-is at or below target (or clicks without orders remain below the reduction
-threshold), and all stronger campaign guards are clear. The least-bid safe
-in-stock SKU is selected deterministically; aggregate totals are never copied
-into SKU rows. A genuinely low-stock SKU is still lowered to the verified floor
-before any pacing step can be considered.
+Incomplete per-SKU attribution still blocks SKU-performance claims. Traffic
+Frontier v2 may use only complete current-day campaign totals for symmetric
+exposure control; aggregate totals are never copied into SKU rows. It raises
+the least-bid safe in-stock SKU directly to 5.40 RUB when delivery is below
+pace, then uses bounded 5% probes. After every applied action, a later cycle
+must observe a change in cumulative impressions, clicks, spend, orders or
+revenue. Unchanged or regressed counters fail closed. A 30-minute feedback
+timeout permits another bounded probe when WB reporting is delayed, limiting
+no-feedback probes to 48 per day even though the policy quota is 50.
+
+The working ceiling is dynamic. Before the first order, exploration is capped
+at 10 RUB because 30 no-order clicks at that CPC consume the 300 RUB daily
+ceiling. After orders arrive, the ceiling is the target-DRR allowable average
+CPC derived from attributed revenue and current clicks. Both are further
+bounded by remaining spend before the 250 RUB pause. The 30 RUB field is only
+an emergency schema ceiling: one click cannot consume the 50 RUB reserve
+between the pause and hard daily cap. DRR above 15%, 30 clicks without an order,
+or spend above pace causes a reduction; DRR above 25% and the existing hard
+guards remain protective stops.
 
 An operator may request one explicit low-exposure step toward the policy's
 5,000-impression target with `explicit-exposure-increase-once-pg`. This is not a
@@ -193,15 +209,11 @@ exact protective-policy digest under the PostgreSQL campaign lock, appends a
 reinstalls the five-minute LaunchAgent. A failure after timer shutdown leaves
 automation stopped rather than mixing policy owners.
 
-Re-running the installer for the reviewed autonomous pacing policy uses
-`activate-bounded-pacing-pg`. It accepts two bid-live policies only when the
-target enables `autonomous_pacing="enabled"` and lowers `max_bid_kopecks`, proves
-the current WB bids fit under that cap through the read-only observer, preserves
-the durable action counter and cooldown, and appends
-`bounded_pacing_activated`. The robot then applies at most one 15% step per
-cycle while campaign exposure is below 5,000 and the campaign-level efficiency,
-stock, daily action, cooldown and spend guards remain clear. The 5 RUB cap is
-not a target and is never applied as a one-shot bid.
+Re-running the installer for the reviewed Traffic Frontier v2 policy uses
+`activate-traffic-frontier-v2-pg`. It accepts only the exact reviewed transition,
+performs a read-only preflight, preserves durable counters, cooldown, pause and
+incident state, and appends `traffic_frontier_v2_activated`. A repeated rollout
+is idempotent.
 
 ## CPC compatibility corrections
 
@@ -215,6 +227,16 @@ CPC campaign and must never be fabricated:
 
 The current minimum CPC bid endpoint does support CPC and is the mandatory
 read-before-write guard used by the bounded P3 runtime.
+
+The feedback controller follows established budget-pacing practice: adjust
+against fresh delivery feedback, pace spend smoothly through the day, constrain
+ROI/DRR and stop quickly when the constraint is violated. CPC frontier discovery
+remains empirical because WB's current recommended competitive-bid endpoint is
+documented for CPM, not CPC:
+
+- <https://arxiv.org/abs/1506.05851>
+- <https://arxiv.org/abs/2003.01452>
+- <https://arxiv.org/abs/2301.13306>
 
 ## Signals outside the bounded bid-live rollout
 

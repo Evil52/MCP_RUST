@@ -36,6 +36,9 @@ async fn main() -> Result<()> {
         Command::ActivateBoundedPacingPostgres(options) => {
             activate_bounded_pacing_postgres(options).await
         }
+        Command::ActivateTrafficFrontierV2Postgres(options) => {
+            activate_traffic_frontier_v2_postgres(options).await
+        }
         Command::ExecutePostgres(options) => execute_postgres_once(options).await,
         Command::ExplicitExposureIncreasePostgres(options) => {
             explicit_exposure_increase_postgres_once(options).await
@@ -256,6 +259,135 @@ fn validate_bounded_pacing_activation(
     ensure!(
         target == &expected,
         "WB automation bounded pacing transition changes an unapproved policy field"
+    );
+    Ok(())
+}
+
+async fn activate_traffic_frontier_v2_postgres(options: ActivatePolicyOptions) -> Result<()> {
+    let source = build_observer(&options.source)?;
+    let target = build_observer(&ObserveOptions {
+        policy: options.target_policy,
+        registry: options.source.registry.clone(),
+        reader_token: options.source.reader_token.clone(),
+        state_directory: PathBuf::new(),
+        allow_broad_reader: options.source.allow_broad_reader,
+        reader_proxy_url: options.source.reader_proxy_url.clone(),
+    })?;
+    validate_traffic_frontier_v2_activation(source.policy(), target.policy())?;
+    let now = Utc::now();
+    ensure!(
+        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
+        "WB traffic-frontier v2 authorization is not active"
+    );
+    target
+        .observe(now, WbAutomationStateView::default())
+        .await
+        .context("WB traffic-frontier v2 read-only preflight failed")?;
+    let database_url =
+        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
+    let database_config =
+        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
+    let store = WbAutomationPostgresStore::connect(&database_config).await?;
+    store.verify_runtime_contract().await?;
+    let Some(mut lease) = store
+        .try_acquire_campaign(
+            target.policy().account_id.as_str(),
+            target.policy().campaign_id,
+        )
+        .await?
+    else {
+        bail!("WB traffic-frontier v2 campaign lock is contended");
+    };
+    let receipt = lease
+        .activate_traffic_frontier_v2_policy(
+            source.policy_sha256(),
+            target.policy_sha256(),
+            source.policy().max_bid_kopecks,
+            target.policy().max_bid_kopecks,
+            target
+                .policy()
+                .traffic_frontier_bid_kopecks
+                .context("WB traffic-frontier v2 entry bid is unavailable")?,
+            target.policy().max_actions_per_day,
+            target.policy().cooldown_seconds,
+            target
+                .policy()
+                .traffic_frontier_feedback_timeout_seconds
+                .context("WB traffic-frontier v2 feedback timeout is unavailable")?,
+        )
+        .await?;
+    lease.release().await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "account_id": target.policy().account_id,
+            "campaign_id": target.policy().campaign_id,
+            "outcome": if receipt.changed {
+                "traffic_frontier_v2_activated"
+            } else {
+                "traffic_frontier_v2_already_active"
+            },
+            "state_revision": receipt.state_revision,
+            "traffic_frontier_bid_kopecks": target.policy().traffic_frontier_bid_kopecks,
+            "max_bid_kopecks": target.policy().max_bid_kopecks,
+            "max_actions_per_day": target.policy().max_actions_per_day,
+            "cooldown_seconds": target.policy().cooldown_seconds,
+            "daily_spend_cap_minor": target.policy().daily_spend_cap_minor,
+            "bid_writes_enabled": true,
+        })
+    );
+    Ok(())
+}
+
+fn validate_traffic_frontier_v2_activation(
+    source: &WbAutomationPolicy,
+    target: &WbAutomationPolicy,
+) -> Result<()> {
+    use mcp_ozon::control::WbAutomationPacingMode;
+
+    ensure!(
+        source.write_enabled
+            && source.bid_writes_enabled
+            && target.write_enabled
+            && target.bid_writes_enabled
+            && source.autonomous_pacing == WbAutomationPacingMode::Enabled
+            && target.autonomous_pacing == WbAutomationPacingMode::TrafficFrontierV2
+            && source.traffic_frontier_bid_kopecks.is_none()
+            && source.traffic_frontier_feedback_timeout_seconds.is_none()
+            && target.traffic_frontier_bid_kopecks == Some(540)
+            && target.traffic_frontier_feedback_timeout_seconds == Some(1_800)
+            && source.max_bid_kopecks == 500
+            && target.max_bid_kopecks == 3_000
+            && source.bid_step_percent == 15
+            && target.bid_step_percent == 5
+            && source.max_actions_per_day == 2
+            && target.max_actions_per_day == 50
+            && source.cooldown_seconds == 21_600
+            && target.cooldown_seconds == 300
+            && target.max_bid_kopecks
+                <= target
+                    .daily_spend_cap_minor
+                    .saturating_sub(target.daily_pause_threshold_minor)
+            && target.authorization_reference == "chat/2026-08-27/traffic-frontier-v2",
+        "WB traffic-frontier v2 transition is outside the reviewed authorization"
+    );
+    let mut expected = source.clone();
+    expected
+        .authorization_reference
+        .clone_from(&target.authorization_reference);
+    expected.authorized_at = target.authorized_at;
+    expected.authorization_expires_at = target.authorization_expires_at;
+    expected.observe_until = target.observe_until;
+    expected.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV2;
+    expected.traffic_frontier_bid_kopecks = Some(540);
+    expected.traffic_frontier_feedback_timeout_seconds = Some(1_800);
+    expected.max_bid_kopecks = 3_000;
+    expected.bid_step_percent = 5;
+    expected.max_actions_per_day = 50;
+    expected.cooldown_seconds = 300;
+    ensure!(
+        target == &expected,
+        "WB traffic-frontier v2 transition changes an unapproved policy field"
     );
     Ok(())
 }
@@ -491,6 +623,7 @@ enum Command {
     ActivateProtectiveLivePostgres(ActivatePolicyOptions),
     ActivateBidWritesPostgres(ActivatePolicyOptions),
     ActivateBoundedPacingPostgres(ActivatePolicyOptions),
+    ActivateTrafficFrontierV2Postgres(ActivatePolicyOptions),
     ExecutePostgres(PostgresExecuteOptions),
     ExplicitExposureIncreasePostgres(ExplicitExposureIncreaseOptions),
     Execute(ExecuteOptions),
@@ -664,6 +797,31 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
     }
     if let [
         command,
+        source_bid_policy,
+        target_bid_policy,
+        registry,
+        reader_token,
+        broad_reader,
+        tail @ ..,
+    ] = arguments
+        && command == "activate-traffic-frontier-v2-pg"
+    {
+        return Ok(Command::ActivateTrafficFrontierV2Postgres(
+            ActivatePolicyOptions {
+                source: ObserveOptions {
+                    policy: source_bid_policy.into(),
+                    registry: registry.into(),
+                    reader_token: reader_token.into(),
+                    state_directory: PathBuf::new(),
+                    allow_broad_reader: parse_bool(broad_reader)?,
+                    reader_proxy_url: optional_proxy(tail)?,
+                },
+                target_policy: target_bid_policy.into(),
+            },
+        ));
+    }
+    if let [
+        command,
         policy,
         registry,
         reader_token,
@@ -792,7 +950,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bounded-pacing-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
+        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bounded-pacing-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v2-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
     )
 }
 
@@ -877,13 +1035,40 @@ mod tests {
     use super::*;
 
     fn bounded_pacing_policies() -> (WbAutomationPolicy, WbAutomationPolicy) {
-        let target = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+        let mut target = serde_json::from_str::<WbAutomationPolicy>(include_str!(
             "../../config/wb-automation-robot.bid-live.json"
         ))
         .expect("repository bid-live policy parses");
+        target.autonomous_pacing = mcp_ozon::control::WbAutomationPacingMode::Enabled;
+        target.traffic_frontier_bid_kopecks = None;
+        target.traffic_frontier_feedback_timeout_seconds = None;
+        target.max_bid_kopecks = 500;
+        target.bid_step_percent = 15;
+        target.max_actions_per_day = 2;
+        target.cooldown_seconds = 21_600;
         let mut source = target.clone();
         source.max_bid_kopecks = 600;
         source.autonomous_pacing = mcp_ozon::control::WbAutomationPacingMode::Disabled;
+        (source, target)
+    }
+
+    fn traffic_frontier_v2_policies() -> (WbAutomationPolicy, WbAutomationPolicy) {
+        let target = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+            "../../config/wb-automation-robot.bid-live.json"
+        ))
+        .expect("repository traffic-frontier policy parses");
+        let mut source = target.clone();
+        source.authorization_reference = "chat/2026-08-24/safe-auto-robot".to_owned();
+        source.authorized_at = "2026-08-24T07:00:00Z".parse().unwrap();
+        source.authorization_expires_at = "2026-09-23T07:00:00Z".parse().unwrap();
+        source.observe_until = "2026-08-25T04:37:03Z".parse().unwrap();
+        source.autonomous_pacing = mcp_ozon::control::WbAutomationPacingMode::Enabled;
+        source.traffic_frontier_bid_kopecks = None;
+        source.traffic_frontier_feedback_timeout_seconds = None;
+        source.max_bid_kopecks = 500;
+        source.bid_step_percent = 15;
+        source.max_actions_per_day = 2;
+        source.cooldown_seconds = 21_600;
         (source, target)
     }
 
@@ -900,5 +1085,20 @@ mod tests {
         let mut not_tighter = target;
         not_tighter.max_bid_kopecks = source.max_bid_kopecks;
         assert!(validate_bounded_pacing_activation(&source, &not_tighter).is_err());
+    }
+
+    #[test]
+    fn traffic_frontier_v2_activation_accepts_only_reviewed_changes() {
+        let (source, target) = traffic_frontier_v2_policies();
+        validate_traffic_frontier_v2_activation(&source, &target)
+            .expect("reviewed traffic-frontier transition is accepted");
+
+        let mut overspend = target.clone();
+        overspend.daily_spend_cap_minor += 1;
+        assert!(validate_traffic_frontier_v2_activation(&source, &overspend).is_err());
+
+        let mut unbounded = target;
+        unbounded.max_bid_kopecks = 5_001;
+        assert!(validate_traffic_frontier_v2_activation(&source, &unbounded).is_err());
     }
 }

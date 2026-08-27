@@ -90,14 +90,16 @@ if ! jq -e '
   and .campaign_id == 39682633
   and .nm_ids == [449627598, 449627015, 497424314]
   and .target_impressions_per_day == 5000
-  and .autonomous_pacing == "enabled"
+  and .autonomous_pacing == "traffic_frontier_v2"
+  and .traffic_frontier_bid_kopecks == 540
+  and .traffic_frontier_feedback_timeout_seconds == 1800
   and .min_bid_kopecks == 102
-  and .max_bid_kopecks == 500
-  and .bid_step_percent == 15
+  and .max_bid_kopecks == 3000
+  and .bid_step_percent == 5
   and .daily_pause_threshold_minor == 25000
   and .daily_spend_cap_minor == 30000
-  and .max_actions_per_day == 2
-  and .cooldown_seconds == 21600
+  and .max_actions_per_day == 50
+  and .cooldown_seconds == 300
   and .allow_budget_top_up == false
 ' "$bid_policy_source" >/dev/null; then
   echo "repository WB bid-live policy exceeds the approved limits" >&2
@@ -153,14 +155,30 @@ if [[ -e "$bid_policy_target" ]]; then
   installed_policy="$(jq -cS '.' "$bid_policy_target")"
   target_policy="$(jq -cS '.' "$bid_policy_source")"
   if [[ "$installed_policy" != "$target_policy" ]]; then
-    migrated_policy="$(jq -cS \
-      '.max_bid_kopecks = 500 | .autonomous_pacing = "enabled"' \
-      "$bid_policy_target")"
+    migrated_policy="$(jq -cS --slurpfile target "$bid_policy_source" '
+      .authorization_reference = $target[0].authorization_reference
+      | .authorized_at = $target[0].authorized_at
+      | .authorization_expires_at = $target[0].authorization_expires_at
+      | .observe_until = $target[0].observe_until
+      | .autonomous_pacing = $target[0].autonomous_pacing
+      | .traffic_frontier_bid_kopecks = $target[0].traffic_frontier_bid_kopecks
+      | .traffic_frontier_feedback_timeout_seconds = $target[0].traffic_frontier_feedback_timeout_seconds
+      | .max_bid_kopecks = $target[0].max_bid_kopecks
+      | .bid_step_percent = $target[0].bid_step_percent
+      | .max_actions_per_day = $target[0].max_actions_per_day
+      | .cooldown_seconds = $target[0].cooldown_seconds
+    ' "$bid_policy_target")"
     if ! jq -e '
       .write_enabled == true
       and .bid_writes_enabled == true
-      and (.autonomous_pacing // "disabled") == "disabled"
-      and .max_bid_kopecks == 600
+      and .authorization_reference == "chat/2026-08-24/safe-auto-robot"
+      and .autonomous_pacing == "enabled"
+      and (.traffic_frontier_bid_kopecks // null) == null
+      and (.traffic_frontier_feedback_timeout_seconds // null) == null
+      and .max_bid_kopecks == 500
+      and .bid_step_percent == 15
+      and .max_actions_per_day == 2
+      and .cooldown_seconds == 21600
     ' "$bid_policy_target" >/dev/null \
       || [[ "$migrated_policy" != "$target_policy" ]]; then
       echo "installed WB automation policy is not an approved migration source" >&2
@@ -178,7 +196,7 @@ install -m 600 "$position_env" "$position_env_target"
 
 # Mount the target policy in the source slot for the credentialless preflight.
 # `observe-once` cannot write, and proves every current bid is already at or
-# below the new 500-kopeck hard cap before the durable digest is changed.
+# below the emergency 3000-kopeck hard cap before the durable digest changes.
 export WB_AUTOMATION_SHADOW_POLICY_HOST="$bid_policy_target"
 export WB_AUTOMATION_LIVE_POLICY_HOST="$bid_policy_target"
 export WB_AUTOMATION_ACCESS_CONFIG_HOST="$registry"
@@ -279,7 +297,7 @@ fi
 
 if [[ "$migration_required" == "true" ]]; then
   activation_output="$("${compose[@]}" run --rm --no-deps wb-automation-live \
-    activate-bounded-pacing-pg \
+    activate-traffic-frontier-v2-pg \
     /etc/mcp-ozon/wb-automation-shadow-policy.json \
     /etc/mcp-ozon/wb-automation-live-policy.json \
     /etc/mcp-ozon/access.json \
@@ -300,8 +318,8 @@ printf '%s\n' "$activation_output"
 if ! jq -e '
   .outcome == "bid_writes_activated"
   or .outcome == "bid_writes_already_active"
-  or .outcome == "bounded_pacing_activated"
-  or .outcome == "bounded_pacing_already_active"
+  or .outcome == "traffic_frontier_v2_activated"
+  or .outcome == "traffic_frontier_v2_already_active"
 ' <<<"$activation_output" >/dev/null; then
   echo "WB automation bid-live activation did not complete" >&2
   exit 1

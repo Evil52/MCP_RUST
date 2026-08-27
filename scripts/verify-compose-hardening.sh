@@ -1767,25 +1767,25 @@ check_contains \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   "activate-bid-writes-pg"
 check_contains \
-  "WB automation bid-live installer uses audited bounded pacing migration" \
+  "WB automation bid-live installer uses audited traffic-frontier migration" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  "activate-bounded-pacing-pg"
+  "activate-traffic-frontier-v2-pg"
 check_contains \
   "WB automation bid-live installer validates activation outcome" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   '.outcome == "bid_writes_activated"'
 check_contains \
-  "WB automation bid-live installer validates bounded pacing outcome" \
+  "WB automation bid-live installer validates traffic-frontier outcome" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  '.outcome == "bounded_pacing_activated"'
+  '.outcome == "traffic_frontier_v2_activated"'
 check_contains \
-  "WB automation bid-live installer pins five-ruble hard cap" \
+  "WB automation bid-live installer pins emergency bid cap" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  '.max_bid_kopecks == 500'
+  '.max_bid_kopecks == 3000'
 check_contains \
-  "WB automation bid-live installer pins autonomous pacing" \
+  "WB automation bid-live installer pins traffic-frontier pacing" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  '.autonomous_pacing == "enabled"'
+  '.autonomous_pacing == "traffic_frontier_v2"'
 check_contains \
   "WB automation bid-live installer enables the runner mode explicitly" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
