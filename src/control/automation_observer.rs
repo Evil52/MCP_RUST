@@ -32,10 +32,9 @@ use super::{
     config::{read_control_token, validate_wb_reader_token},
 };
 
-// Version 4 adds explicit current-day spend completeness and the versioned
-// WB ADS ROBOT v1 policy contract. Missing current-day delivery is no longer
-// serialized as a trusted zero that could authorize a write.
-const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
+// Version 6 records the current vendor minimum for every SKU so a dynamic WB
+// floor can never be confused with the policy's reviewed lower bound.
+const SNAPSHOT_SCHEMA_VERSION: u32 = 6;
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
@@ -175,7 +174,7 @@ impl WbAutomationObserver {
             )
             .await
             .context("WB automation minimum CPC bids недоступны")?;
-        validate_minimum_bids(&minimum_bids, &self.policy)?;
+        let minimum_bids = parse_minimum_bids(&minimum_bids, &self.policy)?;
         let budget = self
             .client
             .promotion_campaign_budget(&self.policy.account_id, self.policy.campaign_id)
@@ -219,6 +218,7 @@ impl WbAutomationObserver {
             current_date,
             previous_date,
             &campaign,
+            &minimum_bids,
             budget_remaining_minor,
             &advertising,
             &stocks,
@@ -320,7 +320,7 @@ fn parse_budget_minor(response: &Value) -> Result<u64> {
         .context("WB automation budget overflow")
 }
 
-fn validate_minimum_bids(response: &Value, policy: &WbAutomationPolicy) -> Result<()> {
+fn parse_minimum_bids(response: &Value, policy: &WbAutomationPolicy) -> Result<BTreeMap<u64, u64>> {
     let envelope = response
         .as_object()
         .context("WB automation minimum CPC bids имеют неверную форму")?;
@@ -374,13 +374,16 @@ fn validate_minimum_bids(response: &Value, policy: &WbAutomationPolicy) -> Resul
     }
     let expected = policy.nm_ids.iter().copied().collect::<BTreeSet<_>>();
     ensure!(
-        minimums.keys().copied().collect::<BTreeSet<_>>() == expected
-            && minimums
-                .values()
-                .all(|minimum| *minimum == policy.min_bid_kopecks),
-        "WB automation minimum CPC bid contract изменился"
+        minimums.keys().copied().collect::<BTreeSet<_>>() == expected,
+        "WB automation minimum CPC bid SKU scope изменился"
     );
-    Ok(())
+    ensure!(
+        minimums
+            .values()
+            .all(|minimum| *minimum > 0 && *minimum <= policy.max_bid_kopecks),
+        "WB automation minimum CPC bid вышел за разрешённые границы"
+    );
+    Ok(minimums)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -390,6 +393,7 @@ fn build_observation(
     current_date: NaiveDate,
     previous_date: NaiveDate,
     campaign: &CampaignObservation,
+    minimum_bids: &BTreeMap<u64, u64>,
     budget_remaining_minor: u64,
     advertising: &[CollectedAdvertisingFact],
     stocks: &[crate::reporting::postgres_collector::CollectedStockFact],
@@ -461,6 +465,9 @@ fn build_observation(
             let fact = previous.get(nm_id).copied();
             Ok(WbAutomationSkuObservation {
                 nm_id: *nm_id,
+                minimum_bid_kopecks: *minimum_bids
+                    .get(nm_id)
+                    .context("WB automation minimum CPC bid исчез")?,
                 current_bid_kopecks: *campaign
                     .bids
                     .get(nm_id)
@@ -994,7 +1001,14 @@ mod tests {
             700
         );
         assert!(parse_budget_minor(&serde_json::json!({"total": u64::MAX})).is_err());
-        assert!(validate_minimum_bids(&minimum_bids_response(), &policy).is_ok());
+        assert_eq!(
+            parse_minimum_bids(&minimum_bids_response(), &policy)
+                .unwrap()
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![102, 102, 102]
+        );
         for invalid in [
             serde_json::json!({}),
             serde_json::json!({"bids": [], "unexpected": true}),
@@ -1004,7 +1018,7 @@ mod tests {
             serde_json::json!({"bids": [{"nm_id": 449_627_598_u64, "bids": [{"currency": "RUB", "type": "search"}]}]}),
             serde_json::json!({"bids": [{"nm_id": 449_627_598_u64, "bids": [{"currency": "RUB", "type": "recommendation", "value": 102}]}]}),
         ] {
-            assert!(validate_minimum_bids(&invalid, &policy).is_err());
+            assert!(parse_minimum_bids(&invalid, &policy).is_err());
         }
         for invalid_bid in [
             serde_json::json!({"type": "search", "value": 102}),
@@ -1013,18 +1027,27 @@ mod tests {
         ] {
             let mut invalid = minimum_bids_response();
             invalid["bids"][0]["bids"][0] = invalid_bid;
-            assert!(validate_minimum_bids(&invalid, &policy).is_err());
+            assert!(parse_minimum_bids(&invalid, &policy).is_err());
         }
         let mut changed_minimum = minimum_bids_response();
         changed_minimum["bids"][0]["bids"][0]["value"] = serde_json::json!(103);
-        assert!(validate_minimum_bids(&changed_minimum, &policy).is_err());
+        assert_eq!(
+            parse_minimum_bids(&changed_minimum, &policy).unwrap()[&449_627_598],
+            103
+        );
+        let mut invalid_minimum = minimum_bids_response();
+        invalid_minimum["bids"][0]["bids"][0]["value"] = serde_json::json!(0);
+        assert!(parse_minimum_bids(&invalid_minimum, &policy).is_err());
+        invalid_minimum["bids"][0]["bids"][0]["value"] =
+            serde_json::json!(policy.max_bid_kopecks + 1);
+        assert!(parse_minimum_bids(&invalid_minimum, &policy).is_err());
         let mut duplicate_minimum = minimum_bids_response();
         let duplicate_row = duplicate_minimum["bids"][0].clone();
         duplicate_minimum["bids"]
             .as_array_mut()
             .unwrap()
             .push(duplicate_row);
-        assert!(validate_minimum_bids(&duplicate_minimum, &policy).is_err());
+        assert!(parse_minimum_bids(&duplicate_minimum, &policy).is_err());
         assert_eq!(sha256_hex(b"test").len(), 64);
         assert!(read_regular_file(&fixture.policy, MAX_POLICY_BYTES, "policy").is_ok());
         assert!(
@@ -1056,6 +1079,7 @@ mod tests {
         }]))
         .unwrap();
         let (stocks, _) = parse_stock_page(&stocks_response()).unwrap();
+        let minimum_bids = parse_minimum_bids(&minimum_bids_response(), &policy).unwrap();
         let observed_at = Utc.with_ymd_and_hms(2026, 8, 25, 12, 0, 0).unwrap();
         assert!(
             !build_observation(
@@ -1064,6 +1088,7 @@ mod tests {
                 observed_at.date_naive(),
                 observed_at.date_naive().pred_opt().unwrap(),
                 &campaign,
+                &minimum_bids,
                 100_000,
                 &advertising,
                 &stocks,

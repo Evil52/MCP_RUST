@@ -653,8 +653,12 @@ fn explicit_exposure_increase_decision(
         })
         .min_by_key(|sku| sku.current_bid_kopecks)
         .context("WB explicit exposure increase has no safe SKU candidate")?;
-    let to_bid_kopecks = super::automation::increase_bid(policy, sku.current_bid_kopecks)
-        .context("WB explicit exposure bid increase is invalid")?;
+    let to_bid_kopecks = super::automation::increase_bid(
+        policy,
+        sku.current_bid_kopecks,
+        super::automation::effective_minimum_bid(policy, sku),
+    )
+    .context("WB explicit exposure bid increase is invalid")?;
     ensure!(
         to_bid_kopecks > sku.current_bid_kopecks,
         "WB explicit exposure bid cannot increase"
@@ -775,20 +779,24 @@ fn traffic_frontier_pacing_decision(
         .skus
         .iter()
         .filter(|sku| {
-            sku.sellable_stock > policy.min_sellable_stock && sku.current_bid_kopecks < dynamic_cap
+            sku.sellable_stock > policy.min_sellable_stock
+                && sku.current_bid_kopecks < dynamic_cap
+                && super::automation::effective_minimum_bid(policy, sku) <= dynamic_cap
         })
         .min_by_key(|sku| (sku.current_bid_kopecks, sku.nm_id))
     else {
         return Ok(None);
     };
+    let minimum = super::automation::effective_minimum_bid(policy, sku);
     let (to_bid_kopecks, reason) = if sku.current_bid_kopecks < frontier {
         (
-            frontier.min(dynamic_cap),
+            frontier.max(minimum).min(dynamic_cap),
             WbAutomationBidReason::TrafficFrontierBootstrap,
         )
     } else {
         (
-            super::automation::increase_bid(policy, sku.current_bid_kopecks)?.min(dynamic_cap),
+            super::automation::increase_bid(policy, sku.current_bid_kopecks, minimum)?
+                .min(dynamic_cap),
             WbAutomationBidReason::TrafficFrontierIncrease,
         )
     };
@@ -902,9 +910,15 @@ fn traffic_frontier_decrease(
         .observation
         .skus
         .iter()
-        .filter(|sku| sku.current_bid_kopecks > policy.min_bid_kopecks)
+        .filter(|sku| {
+            sku.current_bid_kopecks > super::automation::effective_minimum_bid(policy, sku)
+        })
         .max_by_key(|sku| (sku.current_bid_kopecks, std::cmp::Reverse(sku.nm_id)))?;
-    let to_bid_kopecks = decrease_frontier_bid(policy, sku.current_bid_kopecks);
+    let to_bid_kopecks = decrease_frontier_bid(
+        policy,
+        sku.current_bid_kopecks,
+        super::automation::effective_minimum_bid(policy, sku),
+    );
     (to_bid_kopecks < sku.current_bid_kopecks).then(|| {
         traffic_frontier_change(
             policy,
@@ -917,11 +931,13 @@ fn traffic_frontier_decrease(
     })
 }
 
-fn decrease_frontier_bid(policy: &super::automation::WbAutomationPolicy, current: u64) -> u64 {
+fn decrease_frontier_bid(
+    policy: &super::automation::WbAutomationPolicy,
+    current: u64,
+    minimum: u64,
+) -> u64 {
     let delta = current.saturating_mul(u64::from(policy.bid_step_percent)) / 100;
-    current
-        .saturating_sub(delta.max(1))
-        .max(policy.min_bid_kopecks)
+    current.saturating_sub(delta.max(1)).max(minimum)
 }
 
 fn traffic_frontier_change(
@@ -1011,8 +1027,12 @@ fn autonomous_exposure_pacing_decision(
     else {
         return Ok(None);
     };
-    let to_bid_kopecks = super::automation::increase_bid(policy, sku.current_bid_kopecks)
-        .context("WB autonomous exposure pacing bid increase is invalid")?;
+    let to_bid_kopecks = super::automation::increase_bid(
+        policy,
+        sku.current_bid_kopecks,
+        super::automation::effective_minimum_bid(policy, sku),
+    )
+    .context("WB autonomous exposure pacing bid increase is invalid")?;
     ensure!(
         to_bid_kopecks > sku.current_bid_kopecks,
         "WB autonomous exposure pacing bid cannot increase"
@@ -1245,7 +1265,7 @@ enum PendingActionKind {
 fn pending_from_decision(
     action: &WbAutomationAction,
     observation: &super::automation::WbAutomationObservation,
-    min_bid_kopecks: u64,
+    policy_min_bid_kopecks: u64,
     reserved_at: DateTime<Utc>,
 ) -> Option<PendingAction> {
     let kind = match action {
@@ -1259,19 +1279,17 @@ fn pending_from_decision(
             }
         }
         WbAutomationAction::DisableSku { nm_id, reason } => {
-            let current = observation
-                .skus
-                .iter()
-                .find(|sku| sku.nm_id == *nm_id)?
-                .current_bid_kopecks;
-            if current == min_bid_kopecks {
+            let sku = observation.skus.iter().find(|sku| sku.nm_id == *nm_id)?;
+            let current = sku.current_bid_kopecks;
+            let effective_minimum = policy_min_bid_kopecks.max(sku.minimum_bid_kopecks);
+            if current <= effective_minimum {
                 return None;
             }
             PendingActionKind::ChangeBids {
                 changes: vec![WbAutomationBidChange {
                     nm_id: *nm_id,
                     from_bid_kopecks: current,
-                    to_bid_kopecks: min_bid_kopecks,
+                    to_bid_kopecks: effective_minimum,
                     reason: match reason {
                         super::automation::WbAutomationDisableReason::LowStock => {
                             super::automation::WbAutomationBidReason::LowStockGuard
@@ -1864,6 +1882,7 @@ mod tests {
                 .copied()
                 .map(|nm_id| WbAutomationSkuObservation {
                     nm_id,
+                    minimum_bid_kopecks: 102,
                     current_bid_kopecks: 117,
                     sellable_stock: 10,
                     impressions: 0,
@@ -1886,7 +1905,7 @@ mod tests {
         (
             policy,
             WbAutomationSnapshot {
-                schema_version: 5,
+                schema_version: 6,
                 policy_sha256: "a".repeat(64),
                 previous_business_date: now().date_naive().pred_opt().unwrap(),
                 observation,
@@ -1929,6 +1948,7 @@ mod tests {
             current_campaign_metrics: None,
             skus: vec![WbAutomationSkuObservation {
                 nm_id: 1,
+                minimum_bid_kopecks: 102,
                 current_bid_kopecks: bid,
                 sellable_stock: 10,
                 impressions: 0,
@@ -3649,6 +3669,36 @@ mod tests {
                     if changes[0].reason == expected && changes[0].to_bid_kopecks == 102
             ));
         }
+        let mut dynamic_floor = observation(9, 200);
+        dynamic_floor.skus[0].minimum_bid_kopecks = 180;
+        let pending = pending_from_decision(
+            &WbAutomationAction::DisableSku {
+                nm_id: 1,
+                reason: WbAutomationDisableReason::LowStock,
+            },
+            &dynamic_floor,
+            102,
+            at,
+        )
+        .unwrap();
+        assert!(matches!(
+            pending.kind,
+            PendingActionKind::ChangeBids { ref changes }
+                if changes[0].to_bid_kopecks == 180
+        ));
+        dynamic_floor.skus[0].current_bid_kopecks = 180;
+        assert!(
+            pending_from_decision(
+                &WbAutomationAction::DisableSku {
+                    nm_id: 1,
+                    reason: WbAutomationDisableReason::LowStock,
+                },
+                &dynamic_floor,
+                102,
+                at,
+            )
+            .is_none()
+        );
         assert!(
             pending_from_decision(
                 &WbAutomationAction::DisableSku {

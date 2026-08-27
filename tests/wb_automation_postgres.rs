@@ -49,10 +49,12 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     let paced_policy_digest = "7".repeat(64);
     let frontier_policy_digest = "8".repeat(64);
     let frontier_limits_policy_digest = "9".repeat(64);
+    let frontier_corridor_policy_digest = "a".repeat(64);
     let live_cycle_id = format!("{campaign_id:064x}");
     let bid_cycle_id = format!("{:064x}", campaign_id + 1);
     let paced_cycle_id = format!("{:064x}", campaign_id + 2);
     let frontier_cycle_id = format!("{:064x}", campaign_id + 3);
+    let frontier_limits_cycle_id = format!("{:064x}", campaign_id + 4);
     let business_date = NaiveDate::from_ymd_opt(2026, 8, 26).expect("valid date");
     let observed_at = Utc
         .with_ymd_and_hms(2026, 8, 26, 12, 0, 0)
@@ -443,6 +445,85 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     assert_eq!(limits_payload["to_daily_spend_cap_minor"], 50_000);
     assert_eq!(limits_payload["autonomous_pacing"], "traffic_frontier_v2");
     assert_eq!(limits_payload["state_revision"], 6);
+
+    lease
+        .persist_shadow_cycle(
+            &frontier_limits_cycle_id,
+            &frontier_limits_policy_digest,
+            observed_at + Duration::seconds(5),
+            business_date,
+            6,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("latest traffic-frontier limits evidence is persisted");
+    assert_eq!(
+        lease
+            .activate_traffic_frontier_corridor_policy(
+                &frontier_limits_policy_digest,
+                &frontier_corridor_policy_digest,
+                1_000,
+                700,
+                3_000,
+                3_000,
+            )
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    let corridor = lease
+        .activate_traffic_frontier_corridor_policy(
+            &frontier_limits_policy_digest,
+            &frontier_corridor_policy_digest,
+            1_000,
+            700,
+            3_000,
+            1_200,
+        )
+        .await
+        .expect("traffic-frontier corridor is tightened atomically");
+    assert!(corridor.changed);
+    assert_eq!(corridor.state_revision, 7);
+    let corridor_replay = lease
+        .activate_traffic_frontier_corridor_policy(
+            &frontier_limits_policy_digest,
+            &frontier_corridor_policy_digest,
+            1_000,
+            700,
+            3_000,
+            1_200,
+        )
+        .await
+        .expect("traffic-frontier corridor replay is idempotent");
+    assert!(!corridor_replay.changed);
+    assert_eq!(corridor_replay.state_revision, 7);
+    let corridor_audit = admin
+        .query_one(
+            "SELECT cycle_id, payload_json FROM wb_automation.audit_events \
+             WHERE account_id=$1 AND advert_id=$2 \
+               AND event_type='traffic_frontier_corridor_tightened'",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("traffic-frontier corridor audit evidence is readable");
+    assert_eq!(corridor_audit.get::<_, String>(0), frontier_limits_cycle_id);
+    let corridor_payload =
+        serde_json::from_str::<serde_json::Value>(&corridor_audit.get::<_, String>(1))
+            .expect("traffic-frontier corridor audit payload is valid JSON");
+    assert_eq!(
+        corridor_payload["from_policy_sha256"],
+        frontier_limits_policy_digest
+    );
+    assert_eq!(
+        corridor_payload["to_policy_sha256"],
+        frontier_corridor_policy_digest
+    );
+    assert_eq!(corridor_payload["from_traffic_frontier_bid_kopecks"], 1_000);
+    assert_eq!(corridor_payload["to_traffic_frontier_bid_kopecks"], 700);
+    assert_eq!(corridor_payload["from_max_bid_kopecks"], 3_000);
+    assert_eq!(corridor_payload["to_max_bid_kopecks"], 1_200);
+    assert_eq!(corridor_payload["autonomous_pacing"], "traffic_frontier_v2");
+    assert_eq!(corridor_payload["state_revision"], 7);
 
     lease.release().await.expect("campaign lock is released");
     drop(admin);

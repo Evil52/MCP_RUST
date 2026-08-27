@@ -144,6 +144,12 @@ enum PolicyTransition {
         from_daily_spend_cap_minor: u64,
         to_daily_spend_cap_minor: u64,
     },
+    TrafficFrontierCorridorTightened {
+        from_frontier_bid_kopecks: u64,
+        to_frontier_bid_kopecks: u64,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+    },
 }
 
 impl PolicyTransition {
@@ -154,6 +160,7 @@ impl PolicyTransition {
             Self::BoundedPacingActivated { .. } => "bounded_pacing_activated",
             Self::TrafficFrontierV2Activated { .. } => "traffic_frontier_v2_activated",
             Self::TrafficFrontierLimitsRaised { .. } => "traffic_frontier_limits_raised",
+            Self::TrafficFrontierCorridorTightened { .. } => "traffic_frontier_corridor_tightened",
         }
     }
 
@@ -163,7 +170,8 @@ impl PolicyTransition {
             Self::BidWrites
             | Self::BoundedPacingActivated { .. }
             | Self::TrafficFrontierV2Activated { .. }
-            | Self::TrafficFrontierLimitsRaised { .. } => "bid_live",
+            | Self::TrafficFrontierLimitsRaised { .. }
+            | Self::TrafficFrontierCorridorTightened { .. } => "bid_live",
         }
     }
 
@@ -174,6 +182,7 @@ impl PolicyTransition {
                 | Self::BoundedPacingActivated { .. }
                 | Self::TrafficFrontierV2Activated { .. }
                 | Self::TrafficFrontierLimitsRaised { .. }
+                | Self::TrafficFrontierCorridorTightened { .. }
         )
     }
 
@@ -185,6 +194,11 @@ impl PolicyTransition {
                 ..
             }
             | Self::TrafficFrontierV2Activated {
+                from_max_bid_kopecks,
+                to_max_bid_kopecks,
+                ..
+            }
+            | Self::TrafficFrontierCorridorTightened {
                 from_max_bid_kopecks,
                 to_max_bid_kopecks,
                 ..
@@ -204,7 +218,8 @@ impl PolicyTransition {
             Self::ProtectiveLive
             | Self::BidWrites
             | Self::TrafficFrontierV2Activated { .. }
-            | Self::TrafficFrontierLimitsRaised { .. } => None,
+            | Self::TrafficFrontierLimitsRaised { .. }
+            | Self::TrafficFrontierCorridorTightened { .. } => None,
         }
     }
 }
@@ -595,6 +610,38 @@ impl WbAutomationCampaignLease<'_> {
         .await
     }
 
+    /// Tightens an already-active traffic-frontier policy without resetting
+    /// counters, pending-action guards, incidents or feedback history.
+    pub async fn activate_traffic_frontier_corridor_policy(
+        &mut self,
+        source_policy_digest: &str,
+        target_policy_digest: &str,
+        from_frontier_bid_kopecks: u64,
+        to_frontier_bid_kopecks: u64,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        if to_frontier_bid_kopecks == 0
+            || to_frontier_bid_kopecks >= from_frontier_bid_kopecks
+            || to_max_bid_kopecks == 0
+            || to_max_bid_kopecks >= from_max_bid_kopecks
+            || to_frontier_bid_kopecks > to_max_bid_kopecks
+        {
+            return Err(WbAutomationPostgresError::InvalidInput);
+        }
+        self.activate_policy_transition(
+            source_policy_digest,
+            target_policy_digest,
+            PolicyTransition::TrafficFrontierCorridorTightened {
+                from_frontier_bid_kopecks,
+                to_frontier_bid_kopecks,
+                from_max_bid_kopecks,
+                to_max_bid_kopecks,
+            },
+        )
+        .await
+    }
+
     async fn activate_policy_transition(
         &mut self,
         source_policy_digest: &str,
@@ -740,6 +787,16 @@ impl WbAutomationCampaignLease<'_> {
             payload["to_daily_pause_threshold_minor"] = to_daily_pause_threshold_minor.into();
             payload["from_daily_spend_cap_minor"] = from_daily_spend_cap_minor.into();
             payload["to_daily_spend_cap_minor"] = to_daily_spend_cap_minor.into();
+        }
+        if let PolicyTransition::TrafficFrontierCorridorTightened {
+            from_frontier_bid_kopecks,
+            to_frontier_bid_kopecks,
+            ..
+        } = transition
+        {
+            payload["autonomous_pacing"] = "traffic_frontier_v2".into();
+            payload["from_traffic_frontier_bid_kopecks"] = from_frontier_bid_kopecks.into();
+            payload["to_traffic_frontier_bid_kopecks"] = to_frontier_bid_kopecks.into();
         }
         let payload_json = payload.to_string();
         insert_audit_event(

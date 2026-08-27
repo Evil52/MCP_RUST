@@ -1767,29 +1767,29 @@ check_contains \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   "activate-bid-writes-pg"
 check_contains \
-  "WB automation bid-live installer uses audited traffic-frontier limits migration" \
+  "WB automation bid-live installer uses audited traffic-frontier corridor migration" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  "raise-traffic-frontier-limits-pg"
+  "tighten-traffic-frontier-corridor-pg"
 check_contains \
   "WB automation bid-live installer validates activation outcome" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   '.outcome == "bid_writes_activated"'
 check_contains \
-  "WB automation bid-live installer validates traffic-frontier limits outcome" \
+  "WB automation bid-live installer validates traffic-frontier corridor outcome" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  '.outcome == "traffic_frontier_limits_raised"'
+  '.outcome == "traffic_frontier_corridor_tightened"'
 check_contains \
   "WB automation bid-live installer pins emergency bid cap" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  '.max_bid_kopecks == 3000'
+  '.max_bid_kopecks == 1200'
 check_contains \
   "WB automation bid-live installer pins traffic-frontier pacing" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   '.autonomous_pacing == "traffic_frontier_v2"'
 check_contains \
-  "WB automation bid-live installer pins 10 RUB traffic frontier" \
+  "WB automation bid-live installer pins 7 RUB traffic frontier" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  '.traffic_frontier_bid_kopecks == 1000'
+  '.traffic_frontier_bid_kopecks == 700'
 check_contains \
   "WB automation bid-live installer pins 500 RUB daily cap" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
