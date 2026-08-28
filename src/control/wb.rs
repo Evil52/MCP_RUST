@@ -10,8 +10,8 @@ use super::policy::{BidLimits, WbPromotionBidTargetPolicy};
 pub use client::WbBidWriteClient;
 #[cfg(test)]
 use client::{
-    MAX_ERROR_RESPONSE_BYTES, MAX_REQUEST_ID_BYTES, MIN_WRITE_INTERVAL, WritePacer,
-    validate_write_request,
+    MAX_ERROR_RESPONSE_BYTES, MAX_REQUEST_ID_BYTES, MIN_CREATE_INTERVAL, MIN_WRITE_INTERVAL,
+    WritePacer, validate_create_campaign_request, validate_write_request,
 };
 pub(super) use snapshot::{campaign_snapshot, prepare_changes, snapshot_matches_plan_state};
 #[cfg(test)]
@@ -21,6 +21,52 @@ mod client;
 mod snapshot;
 
 const MAX_CHANGES: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WbCampaignBidType {
+    Manual,
+    Unified,
+}
+
+impl WbCampaignBidType {
+    #[must_use]
+    pub const fn as_api_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Unified => "unified",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WbCampaignPaymentType {
+    Cpm,
+    Cpc,
+}
+
+impl WbCampaignPaymentType {
+    #[must_use]
+    pub const fn as_api_str(self) -> &'static str {
+        match self {
+            Self::Cpm => "cpm",
+            Self::Cpc => "cpc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbCreateCampaignRequest {
+    pub name: String,
+    pub nm_ids: Vec<u64>,
+    pub bid_type: WbCampaignBidType,
+    pub payment_type: WbCampaignPaymentType,
+    /// Manual campaigns require one or both concrete placements. Unified
+    /// campaigns require an empty list because WB fixes both placements.
+    pub placement_types: Vec<WbBidPlacement>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

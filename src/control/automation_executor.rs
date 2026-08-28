@@ -275,6 +275,25 @@ impl WbAutomationExecutor {
         .await
     }
 
+    /// Executes one explicitly authorized resume after a protective daily-cap
+    /// pause. The action uses the same durable reservation, one-shot write and
+    /// read-back reconciliation protocol as every other PostgreSQL-backed
+    /// mutation; scheduled cycles still never resume a campaign automatically.
+    pub async fn run_explicit_resume_after_daily_cap_once_postgres(
+        &self,
+        store: &WbAutomationPostgresStore,
+        legacy: &WbAutomationLegacyStateSeed,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<WbAutomationPostgresExecutionReceipt>> {
+        self.run_once_postgres_with_intent(
+            store,
+            legacy,
+            observed_at,
+            PostgresExecutionIntent::ExplicitResumeAfterDailyCap,
+        )
+        .await
+    }
+
     async fn run_once_postgres_with_intent(
         &self,
         store: &WbAutomationPostgresStore,
@@ -313,10 +332,18 @@ impl WbAutomationExecutor {
                 .context("WB automation PostgreSQL state is unavailable")?,
         };
         let business_date = wb_automation_business_date(observed_at);
-        if matches!(intent, PostgresExecutionIntent::ExplicitExposureTarget(_)) {
+        if !matches!(intent, PostgresExecutionIntent::Automatic) {
             ensure!(
                 state.pending_idempotency_key.is_none() && state.incident_class.is_none(),
-                "WB explicit exposure increase requires clean durable state"
+                "WB explicit action requires clean durable state"
+            );
+        }
+        if matches!(intent, PostgresExecutionIntent::ExplicitResumeAfterDailyCap) {
+            ensure!(
+                state
+                    .paused_for_daily_cap_on
+                    .is_some_and(|paused_on| paused_on < business_date),
+                "WB explicit resume requires a durable prior-day automation pause"
             );
         }
         let state_view = WbAutomationStateView {
@@ -433,8 +460,7 @@ impl WbAutomationExecutor {
             cycle_id: cycle_id.clone(),
             policy_digest: self.observer.policy_sha256().to_owned(),
             request_digest,
-            action_kind: durable_action_kind(&pending.kind)
-                .context("WB automation PostgreSQL action kind is unsupported")?,
+            action_kind: durable_action_kind(&pending.kind),
             request_json,
             business_date,
             expected_state_revision: state.revision,
@@ -554,9 +580,11 @@ impl WbAutomationExecutor {
                 .pause_campaign_with_permit(self.observer.policy().campaign_id, permit)
                 .await
                 .map(|_| ()),
-            PendingActionKind::ResumeCampaignAfterDailyCap => Err(WbGuardedWriteError::Permit(
-                super::automation_postgres::WbAutomationPostgresError::InvalidInput,
-            )),
+            PendingActionKind::ResumeCampaignAfterDailyCap => self
+                .writer
+                .start_campaign_with_permit(self.observer.policy().campaign_id, permit)
+                .await
+                .map(|_| ()),
         }
     }
 }
@@ -565,6 +593,7 @@ impl WbAutomationExecutor {
 enum PostgresExecutionIntent {
     Automatic,
     ExplicitExposureTarget(u64),
+    ExplicitResumeAfterDailyCap,
 }
 
 async fn load_traffic_feedback_baseline(
@@ -594,6 +623,9 @@ fn apply_postgres_execution_intent(
         PostgresExecutionIntent::ExplicitExposureTarget(target_impressions) => Some(
             explicit_exposure_increase_decision(policy, snapshot, target_impressions)?,
         ),
+        PostgresExecutionIntent::ExplicitResumeAfterDailyCap => {
+            Some(explicit_resume_after_daily_cap_decision(policy, snapshot)?)
+        }
         PostgresExecutionIntent::Automatic if policy.autonomous_pacing.uses_traffic_frontier() => {
             traffic_frontier_pacing_decision(policy, snapshot, last_applied_snapshot)?
         }
@@ -606,6 +638,63 @@ fn apply_postgres_execution_intent(
         snapshot.decision = decision;
     }
     Ok(())
+}
+
+fn explicit_resume_after_daily_cap_decision(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+) -> Result<WbAutomationDecision> {
+    use super::automation::WbAutomationHoldReason;
+
+    ensure!(
+        policy.write_enabled && policy.bid_writes_enabled,
+        "WB explicit resume requires active write and bid-write policy"
+    );
+    ensure!(
+        matches!(
+            snapshot.decision.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::ProtectivePauseRequiresApproval
+                    | WbAutomationHoldReason::SpendDataIncomplete
+            }
+        ),
+        "WB explicit resume is blocked by a stronger decision guard"
+    );
+    ensure!(
+        snapshot.observation.campaign_status == 11 && snapshot.observation.paused_by_automation,
+        "WB explicit resume requires the automation-owned protective pause"
+    );
+    ensure!(
+        snapshot.observation.budget_remaining_minor > 0,
+        "WB explicit resume requires a positive campaign budget"
+    );
+    ensure!(
+        snapshot.observation.daily_spend_minor < policy.daily_pause_threshold_minor
+            && snapshot.observation.daily_spend_minor < policy.daily_spend_cap_minor,
+        "WB explicit resume is blocked by the current daily spend guard"
+    );
+    ensure!(
+        snapshot
+            .observation
+            .skus
+            .iter()
+            .any(|sku| sku.sellable_stock > policy.min_sellable_stock),
+        "WB explicit resume requires at least one sellable SKU"
+    );
+    ensure!(
+        snapshot.observation.skus.iter().all(|sku| {
+            sku.current_bid_kopecks >= super::automation::effective_minimum_bid(policy, sku)
+                && sku.current_bid_kopecks <= policy.max_bid_kopecks
+        }),
+        "WB explicit resume requires every current bid inside the reviewed corridor"
+    );
+    Ok(WbAutomationDecision {
+        account_id: policy.account_id.clone(),
+        campaign_id: policy.campaign_id,
+        observed_at: snapshot.observation.observed_at,
+        action: WbAutomationAction::ResumeCampaignAfterDailyCap,
+        unresolved_stops: Vec::new(),
+    })
 }
 
 fn explicit_exposure_increase_decision(
@@ -687,8 +776,9 @@ const MOSCOW_OFFSET_SECONDS: i64 = 3 * 60 * 60;
 
 /// Maintains a CPC campaign around a measured traffic frontier without
 /// repeatedly acting on the same delayed WB statistics. The initial jump is
-/// explicit policy, while later movement follows cumulative spend/delivery
-/// feedback and the target-DRR economic ceiling.
+/// explicit policy. V2 retains cumulative feedback semantics, while V3 waits
+/// for a statistically useful post-action delta and judges the marginal
+/// orders and DRR produced by that last bid change.
 fn traffic_frontier_pacing_decision(
     policy: &super::automation::WbAutomationPolicy,
     snapshot: &WbAutomationSnapshot,
@@ -718,15 +808,44 @@ fn traffic_frontier_pacing_decision(
         "WB traffic-frontier current campaign metrics are inconsistent"
     );
 
-    if !traffic_feedback_is_actionable(policy, snapshot, metrics, last_applied_snapshot)? {
-        return Ok(Some(traffic_frontier_hold(
+    let feedback_metrics = if policy.autonomous_pacing.uses_marginal_feedback() {
+        let Some(delta) = traffic_feedback_delta(snapshot, metrics, last_applied_snapshot) else {
+            return Ok(Some(traffic_frontier_hold(
+                policy,
+                snapshot,
+                WbAutomationHoldReason::TrafficFeedbackPending,
+            )));
+        };
+        let min_impressions = policy
+            .traffic_frontier_min_feedback_impressions
+            .context("WB traffic-frontier v3 minimum feedback impressions are unavailable")?;
+        let min_clicks = policy
+            .traffic_frontier_min_feedback_clicks
+            .context("WB traffic-frontier v3 minimum feedback clicks are unavailable")?;
+        if delta.impressions < min_impressions && delta.clicks < min_clicks {
+            return Ok(Some(traffic_frontier_hold(
+                policy,
+                snapshot,
+                WbAutomationHoldReason::TrafficFeedbackPending,
+            )));
+        }
+        delta
+    } else {
+        if !traffic_frontier_v2_feedback_is_actionable(
             policy,
             snapshot,
-            WbAutomationHoldReason::TrafficFeedbackPending,
-        )));
-    }
-
-    let drr = campaign_drr_basis_points(metrics)?;
+            metrics,
+            last_applied_snapshot,
+        )? {
+            return Ok(Some(traffic_frontier_hold(
+                policy,
+                snapshot,
+                WbAutomationHoldReason::TrafficFeedbackPending,
+            )));
+        }
+        metrics.clone()
+    };
+    let drr = campaign_drr_basis_points(&feedback_metrics)?;
     let expected_spend = paced_value(
         policy.daily_pause_threshold_minor,
         snapshot.observation.observed_at,
@@ -741,7 +860,15 @@ fn traffic_frontier_pacing_decision(
         < u128::from(expected_spend) * PACING_LOWER_BASIS_POINTS;
     let delivery_under_pace = metrics.impressions < expected_impressions;
 
-    if metrics.attributed_orders == 0 && metrics.clicks >= policy.no_order_reduce_clicks {
+    let no_order_reduce_clicks = if policy.autonomous_pacing.uses_marginal_feedback() {
+        policy
+            .traffic_frontier_min_feedback_clicks
+            .context("WB traffic-frontier v3 minimum feedback clicks are unavailable")?
+    } else {
+        policy.no_order_reduce_clicks
+    };
+    if feedback_metrics.attributed_orders == 0 && feedback_metrics.clicks >= no_order_reduce_clicks
+    {
         return Ok(traffic_frontier_decrease(
             policy,
             snapshot,
@@ -763,14 +890,33 @@ fn traffic_frontier_pacing_decision(
             WbAutomationBidReason::TrafficFrontierRetentionDecrease,
         ));
     }
+    if policy.autonomous_pacing.uses_marginal_feedback()
+        && metrics.attributed_orders >= policy.target_orders_per_day
+    {
+        return Ok(None);
+    }
     if !spend_under_pace || !delivery_under_pace {
         return Ok(None);
+    }
+    // V3 never buys more traffic merely because delivery is behind its time
+    // curve. A bid increase requires at least one incremental attributed order
+    // and revenue at or below the target marginal DRR.
+    if policy.autonomous_pacing.uses_marginal_feedback()
+        && (feedback_metrics.attributed_orders == 0
+            || feedback_metrics.attributed_revenue_minor == 0
+            || drr.is_none_or(|value| value > policy.target_drr_basis_points))
+    {
+        return Ok(Some(traffic_frontier_hold(
+            policy,
+            snapshot,
+            WbAutomationHoldReason::TrafficFeedbackPending,
+        )));
     }
 
     let frontier = policy
         .traffic_frontier_bid_kopecks
         .context("WB traffic-frontier entry bid is unavailable")?;
-    let dynamic_cap = traffic_frontier_dynamic_cap(policy, snapshot, metrics)?;
+    let dynamic_cap = traffic_frontier_dynamic_cap(policy, snapshot, &feedback_metrics)?;
     if dynamic_cap < frontier {
         return Ok(None);
     }
@@ -810,7 +956,7 @@ fn traffic_frontier_pacing_decision(
     )))
 }
 
-fn traffic_feedback_is_actionable(
+fn traffic_frontier_v2_feedback_is_actionable(
     policy: &super::automation::WbAutomationPolicy,
     snapshot: &WbAutomationSnapshot,
     current: &super::automation::WbAutomationCampaignMetrics,
@@ -847,6 +993,38 @@ fn traffic_feedback_is_actionable(
         return Ok(false);
     }
     Ok(current != baseline)
+}
+
+fn traffic_feedback_delta(
+    snapshot: &WbAutomationSnapshot,
+    current: &super::automation::WbAutomationCampaignMetrics,
+    last_applied_snapshot: Option<&WbAutomationSnapshot>,
+) -> Option<super::automation::WbAutomationCampaignMetrics> {
+    let Some(previous) = last_applied_snapshot else {
+        return Some(current.clone());
+    };
+    if wb_automation_business_date(previous.observation.observed_at)
+        != wb_automation_business_date(snapshot.observation.observed_at)
+    {
+        return Some(current.clone());
+    }
+    let baseline = previous.observation.current_campaign_metrics.as_ref()?;
+    if current.impressions < baseline.impressions
+        || current.clicks < baseline.clicks
+        || current.spend_minor < baseline.spend_minor
+        || current.attributed_orders < baseline.attributed_orders
+        || current.attributed_revenue_minor < baseline.attributed_revenue_minor
+    {
+        return None;
+    }
+    Some(super::automation::WbAutomationCampaignMetrics {
+        impressions: current.impressions - baseline.impressions,
+        clicks: current.clicks - baseline.clicks,
+        spend_minor: current.spend_minor - baseline.spend_minor,
+        attributed_orders: current.attributed_orders - baseline.attributed_orders,
+        attributed_revenue_minor: current.attributed_revenue_minor
+            - baseline.attributed_revenue_minor,
+    })
 }
 
 fn traffic_frontier_dynamic_cap(
@@ -1127,7 +1305,7 @@ async fn reconcile_postgres_pending(
         "WB automation PostgreSQL pending action is already resolved"
     );
     if pending_is_visible(observation, &pending) {
-        let paused_on = durable_pause_date(&pending)?;
+        let paused_on = durable_pause_date(&pending);
         let transition = lease
             .mark_applied(
                 &action.idempotency_key,
@@ -1175,7 +1353,7 @@ fn pending_from_durable_action(action: &WbAutomationDurableAction) -> Result<Pen
     let kind = serde_json::from_str::<PendingActionKind>(&action.request_json)
         .context("WB automation PostgreSQL action payload is invalid")?;
     ensure!(
-        durable_action_kind(&kind) == Some(action.action_kind),
+        durable_action_kind(&kind) == action.action_kind,
         "WB automation PostgreSQL action payload does not match its kind"
     );
     Ok(PendingAction {
@@ -1197,25 +1375,26 @@ fn pending_is_visible(
     }
 }
 
-fn durable_pause_date(pending: &PendingAction) -> Result<Option<NaiveDate>> {
+fn durable_pause_date(pending: &PendingAction) -> Option<NaiveDate> {
     match pending.kind {
         PendingActionKind::PauseCampaignForDailyCap => {
-            Ok(Some(wb_automation_business_date(pending.reserved_at)))
+            Some(wb_automation_business_date(pending.reserved_at))
         }
-        PendingActionKind::ChangeBids { .. } => Ok(None),
-        PendingActionKind::ResumeCampaignAfterDailyCap => {
-            anyhow::bail!("PostgreSQL durable actions never contain automatic resume")
+        PendingActionKind::ChangeBids { .. } | PendingActionKind::ResumeCampaignAfterDailyCap => {
+            None
         }
     }
 }
 
-const fn durable_action_kind(kind: &PendingActionKind) -> Option<WbAutomationDurableActionKind> {
+const fn durable_action_kind(kind: &PendingActionKind) -> WbAutomationDurableActionKind {
     match kind {
-        PendingActionKind::ChangeBids { .. } => Some(WbAutomationDurableActionKind::ChangeBids),
+        PendingActionKind::ChangeBids { .. } => WbAutomationDurableActionKind::ChangeBids,
         PendingActionKind::PauseCampaignForDailyCap => {
-            Some(WbAutomationDurableActionKind::PauseCampaignForDailyCap)
+            WbAutomationDurableActionKind::PauseCampaignForDailyCap
         }
-        PendingActionKind::ResumeCampaignAfterDailyCap => None,
+        PendingActionKind::ResumeCampaignAfterDailyCap => {
+            WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap
+        }
     }
 }
 
@@ -1551,8 +1730,12 @@ mod tests {
                 Utc.with_ymd_and_hms(2026, 9, 23, 7, 0, 0).unwrap();
             test_policy.autonomous_pacing =
                 crate::control::automation::WbAutomationPacingMode::Enabled;
+            test_policy.target_impressions_per_day = 5_000;
+            test_policy.target_orders_per_day = 0;
             test_policy.traffic_frontier_bid_kopecks = None;
             test_policy.traffic_frontier_feedback_timeout_seconds = None;
+            test_policy.traffic_frontier_min_feedback_impressions = None;
+            test_policy.traffic_frontier_min_feedback_clicks = None;
             test_policy.max_bid_kopecks = 500;
             test_policy.bid_step_percent = 15;
             test_policy.daily_pause_threshold_minor = 25_000;
@@ -2006,7 +2189,7 @@ mod tests {
         assert!(!pending_is_visible(&observation(9, 114), &pending));
         assert_eq!(
             durable_action_kind(&pending.kind),
-            Some(WbAutomationDurableActionKind::ChangeBids)
+            WbAutomationDurableActionKind::ChangeBids
         );
 
         let pause = PendingAction {
@@ -2017,10 +2200,10 @@ mod tests {
         assert!(!pending_is_visible(&observation(9, 100), &pause));
         assert_eq!(
             durable_action_kind(&pause.kind),
-            Some(WbAutomationDurableActionKind::PauseCampaignForDailyCap)
+            WbAutomationDurableActionKind::PauseCampaignForDailyCap
         );
         assert_eq!(
-            durable_pause_date(&pause).unwrap(),
+            durable_pause_date(&pause),
             Some(wb_automation_business_date(now()))
         );
         let resume = PendingAction {
@@ -2028,9 +2211,12 @@ mod tests {
             kind: PendingActionKind::ResumeCampaignAfterDailyCap,
         };
         assert!(pending_is_visible(&observation(9, 100), &resume));
-        assert_eq!(durable_action_kind(&resume.kind), None);
-        assert!(durable_pause_date(&resume).is_err());
-        assert_eq!(durable_pause_date(&pending).unwrap(), None);
+        assert_eq!(
+            durable_action_kind(&resume.kind),
+            WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap
+        );
+        assert_eq!(durable_pause_date(&resume), None);
+        assert_eq!(durable_pause_date(&pending), None);
         assert_eq!(
             classify_postgres_write(&Ok(())).unwrap(),
             PostgresWriteResult::Sent
@@ -2136,6 +2322,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn explicit_resume_requires_owned_pause_stock_budget_and_bid_corridor() {
+        let (policy, mut snapshot) = explicit_exposure_snapshot();
+        snapshot.observation.campaign_status = 11;
+        snapshot.observation.paused_by_automation = true;
+        snapshot.observation.daily_spend_complete = false;
+        snapshot.decision.action = WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::SpendDataIncomplete,
+        };
+        assert_eq!(
+            explicit_resume_after_daily_cap_decision(&policy, &snapshot)
+                .unwrap()
+                .action,
+            WbAutomationAction::ResumeCampaignAfterDailyCap
+        );
+
+        let mut no_stock = snapshot.clone();
+        for sku in &mut no_stock.observation.skus {
+            sku.sellable_stock = policy.min_sellable_stock;
+        }
+        assert!(explicit_resume_after_daily_cap_decision(&policy, &no_stock).is_err());
+
+        let mut exhausted = snapshot.clone();
+        exhausted.observation.budget_remaining_minor = 0;
+        exhausted.decision.action = WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::BudgetExhausted,
+        };
+        assert!(explicit_resume_after_daily_cap_decision(&policy, &exhausted).is_err());
+
+        let mut outside_corridor = snapshot;
+        outside_corridor.observation.skus[0].current_bid_kopecks = policy.max_bid_kopecks + 1;
+        assert!(explicit_resume_after_daily_cap_decision(&policy, &outside_corridor).is_err());
     }
 
     #[test]
@@ -2246,6 +2466,40 @@ mod tests {
         (policy, snapshot)
     }
 
+    fn traffic_frontier_v3_snapshot() -> (WbAutomationPolicy, WbAutomationSnapshot) {
+        let (mut policy, mut snapshot) = traffic_frontier_snapshot();
+        policy.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV3;
+        policy.target_impressions_per_day = 1_500;
+        policy.target_orders_per_day = 3;
+        policy.traffic_frontier_feedback_timeout_seconds = Some(3_600);
+        policy.traffic_frontier_min_feedback_impressions = Some(200);
+        policy.traffic_frontier_min_feedback_clicks = Some(10);
+        policy.max_actions_per_day = 12;
+        policy.cooldown_seconds = 1_800;
+        snapshot.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 320,
+            clicks: 12,
+            spend_minor: 1_000,
+            attributed_orders: 1,
+            attributed_revenue_minor: 100_000,
+        });
+        (policy, snapshot)
+    }
+
+    fn traffic_frontier_v3_baseline(snapshot: &WbAutomationSnapshot) -> WbAutomationSnapshot {
+        let mut baseline = snapshot.clone();
+        baseline.observation.observed_at -= ChronoDuration::hours(2);
+        baseline.decision.observed_at = baseline.observation.observed_at;
+        baseline.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 100,
+            clicks: 2,
+            spend_minor: 0,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        });
+        baseline
+    }
+
     #[test]
     fn traffic_frontier_bootstraps_to_the_reviewed_entry_bid() {
         let (policy, snapshot) = traffic_frontier_snapshot();
@@ -2338,6 +2592,237 @@ mod tests {
                 .expect("probe timeout permits another observation-driven step")
                 .action,
             WbAutomationAction::ChangeBids { .. }
+        ));
+    }
+
+    #[test]
+    fn traffic_frontier_v3_never_lets_timeout_replace_the_minimum_sample() {
+        let (policy, mut snapshot) = traffic_frontier_v3_snapshot();
+        snapshot.observation.last_action_at =
+            Some(snapshot.observation.observed_at - ChronoDuration::hours(2));
+        let mut baseline = traffic_frontier_v3_baseline(&snapshot);
+        snapshot.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 299,
+            clicks: 11,
+            spend_minor: 900,
+            attributed_orders: 1,
+            attributed_revenue_minor: 100_000,
+        });
+        baseline.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 100,
+            clicks: 2,
+            spend_minor: 0,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        });
+
+        let decision = traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+            .unwrap()
+            .expect("v3 records an explicit sample hold");
+        assert_eq!(
+            decision.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::TrafficFeedbackPending,
+            }
+        );
+    }
+
+    #[test]
+    fn traffic_frontier_v3_increases_only_after_efficient_incremental_orders() {
+        let (policy, snapshot) = traffic_frontier_v3_snapshot();
+        let baseline = traffic_frontier_v3_baseline(&snapshot);
+        let delta = traffic_feedback_delta(
+            &snapshot,
+            snapshot
+                .observation
+                .current_campaign_metrics
+                .as_ref()
+                .unwrap(),
+            Some(&baseline),
+        )
+        .unwrap();
+        assert_eq!(
+            delta,
+            WbAutomationCampaignMetrics {
+                impressions: 220,
+                clicks: 10,
+                spend_minor: 1_000,
+                attributed_orders: 1,
+                attributed_revenue_minor: 100_000,
+            }
+        );
+
+        assert!(matches!(
+            traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+                .unwrap()
+                .expect("efficient marginal order permits one bounded increase")
+                .action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes.len() == 1
+                    && changes[0].reason == WbAutomationBidReason::TrafficFrontierBootstrap
+        ));
+
+        let mut target_reached = snapshot;
+        target_reached.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 320,
+            clicks: 12,
+            spend_minor: 3_000,
+            attributed_orders: 3,
+            attributed_revenue_minor: 300_000,
+        });
+        let mut target_baseline = baseline;
+        target_baseline.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 100,
+            clicks: 2,
+            spend_minor: 2_000,
+            attributed_orders: 2,
+            attributed_revenue_minor: 200_000,
+        });
+        assert_eq!(
+            traffic_frontier_pacing_decision(&policy, &target_reached, Some(&target_baseline),)
+                .unwrap(),
+            None
+        );
+
+        assert_eq!(
+            traffic_feedback_delta(
+                &target_reached,
+                target_reached
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+                None,
+            )
+            .unwrap(),
+            target_reached
+                .observation
+                .current_campaign_metrics
+                .clone()
+                .unwrap()
+        );
+
+        let mut previous_day = target_baseline;
+        previous_day.observation.observed_at -= ChronoDuration::days(1);
+        assert_eq!(
+            traffic_feedback_delta(
+                &target_reached,
+                target_reached
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+                Some(&previous_day),
+            )
+            .unwrap(),
+            target_reached
+                .observation
+                .current_campaign_metrics
+                .clone()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn traffic_frontier_v3_holds_an_impression_sample_without_orders() {
+        let (policy, mut snapshot) = traffic_frontier_v3_snapshot();
+        let baseline = traffic_frontier_v3_baseline(&snapshot);
+        snapshot.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 300,
+            clicks: 8,
+            spend_minor: 1_000,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        });
+
+        assert_eq!(
+            traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+                .unwrap()
+                .unwrap()
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::TrafficFeedbackPending,
+            }
+        );
+    }
+
+    #[test]
+    fn traffic_frontier_v3_reduces_on_marginal_clicks_without_orders() {
+        let (policy, mut snapshot) = traffic_frontier_v3_snapshot();
+        for sku in &mut snapshot.observation.skus {
+            sku.current_bid_kopecks = 1_000;
+        }
+        let mut baseline = traffic_frontier_v3_baseline(&snapshot);
+        baseline.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 100,
+            clicks: 2,
+            spend_minor: 1_000,
+            attributed_orders: 1,
+            attributed_revenue_minor: 100_000,
+        });
+        snapshot.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 220,
+            clicks: 12,
+            spend_minor: 3_000,
+            attributed_orders: 1,
+            attributed_revenue_minor: 100_000,
+        });
+
+        assert!(matches!(
+            traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+                .unwrap()
+                .expect("ten marginal clicks without an order reduce one bid")
+                .action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes.len() == 1
+                    && changes[0].reason == WbAutomationBidReason::NoOrdersAfterClicks
+        ));
+    }
+
+    #[test]
+    fn traffic_frontier_v3_uses_marginal_drr_and_fails_closed_on_regression() {
+        let (policy, mut snapshot) = traffic_frontier_v3_snapshot();
+        for sku in &mut snapshot.observation.skus {
+            sku.current_bid_kopecks = 1_000;
+        }
+        let mut baseline = traffic_frontier_v3_baseline(&snapshot);
+        baseline.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 1_000,
+            clicks: 40,
+            spend_minor: 10_000,
+            attributed_orders: 4,
+            attributed_revenue_minor: 200_000,
+        });
+        snapshot.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 1_200,
+            clicks: 50,
+            spend_minor: 30_000,
+            attributed_orders: 5,
+            attributed_revenue_minor: 250_000,
+        });
+        assert!(matches!(
+            traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+                .unwrap()
+                .expect("forty-percent marginal DRR reduces one bid")
+                .action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes[0].reason == WbAutomationBidReason::HardDrrExceeded
+        ));
+
+        snapshot
+            .observation
+            .current_campaign_metrics
+            .as_mut()
+            .unwrap()
+            .impressions = 999;
+        assert!(matches!(
+            traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+                .unwrap()
+                .expect("regressed counters hold fail closed")
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::TrafficFeedbackPending
+            }
         ));
     }
 
@@ -2509,7 +2994,7 @@ mod tests {
         feedback.observation.last_action_at =
             Some(feedback.observation.observed_at - ChronoDuration::minutes(10));
         assert!(
-            !traffic_feedback_is_actionable(
+            !traffic_frontier_v2_feedback_is_actionable(
                 &policy,
                 &feedback,
                 feedback
@@ -2525,7 +3010,7 @@ mod tests {
         let mut previous_day = feedback.clone();
         previous_day.observation.observed_at -= ChronoDuration::days(1);
         assert!(
-            traffic_feedback_is_actionable(
+            traffic_frontier_v2_feedback_is_actionable(
                 &policy,
                 &feedback,
                 feedback
@@ -2541,7 +3026,7 @@ mod tests {
         let mut missing_baseline = feedback.clone();
         missing_baseline.observation.current_campaign_metrics = None;
         assert!(
-            !traffic_feedback_is_actionable(
+            !traffic_frontier_v2_feedback_is_actionable(
                 &policy,
                 &feedback,
                 feedback
@@ -2562,7 +3047,7 @@ mod tests {
             .unwrap()
             .impressions += 1;
         assert!(
-            !traffic_feedback_is_actionable(
+            !traffic_frontier_v2_feedback_is_actionable(
                 &policy,
                 &feedback,
                 feedback
@@ -2578,7 +3063,7 @@ mod tests {
         let mut missing_timeout = policy.clone();
         missing_timeout.traffic_frontier_feedback_timeout_seconds = None;
         assert!(
-            traffic_feedback_is_actionable(
+            traffic_frontier_v2_feedback_is_actionable(
                 &missing_timeout,
                 &feedback,
                 feedback
@@ -2590,6 +3075,7 @@ mod tests {
             )
             .is_err()
         );
+        assert!(traffic_frontier_pacing_decision(&missing_timeout, &feedback, None).is_err());
 
         let mut missing_frontier = policy.clone();
         missing_frontier.traffic_frontier_bid_kopecks = None;
@@ -3025,6 +3511,89 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the PostgreSQL campaign lease is consumed by explicit async release"
+    )]
+    async fn explicit_resume_after_daily_cap_is_durable_and_clears_the_pause() {
+        #[cfg(coverage)]
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
+        #[cfg(not(coverage))]
+        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
+        let campaign_id = 39_682_725;
+        let fixture = Fixture::new_for_campaign(campaign_id);
+        let observed_at = Utc::now();
+        let business_date = wb_automation_business_date(observed_at);
+        let current_date = business_date.format("%Y-%m-%d").to_string();
+        let paused_on = business_date.pred_opt().unwrap();
+        // A paused campaign often has no current-day statistics row. Explicit
+        // authorization may break that otherwise permanent evidence deadlock,
+        // but only when the durable prior-day pause proves robot ownership.
+        let (reader_url, _) = reader_server_for(campaign_id, 11, 200, &current_date, None, 10);
+        let (writer_url, writer_requests) = mock_http(vec![(200, "{}".to_owned())]);
+        let mut executor = fixture.executor(&reader_url, &writer_url);
+        let config = Config::from_str(&database_url).unwrap();
+        let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        store.verify_runtime_contract().await.unwrap();
+        let legacy = WbAutomationLegacyStateSeed {
+            policy_digest: executor.policy_sha256().to_owned(),
+            business_date: paused_on,
+            actions_today: 2,
+            last_action_at: Some(observed_at - ChronoDuration::hours(12)),
+            paused_for_daily_cap_on: Some(paused_on),
+            incident_class: None,
+            legacy_digest: "f".repeat(64),
+        };
+
+        let first = executor
+            .run_explicit_resume_after_daily_cap_once_postgres(&store, &legacy, observed_at)
+            .await
+            .unwrap()
+            .expect("campaign lock is available");
+        assert_eq!(
+            first.outcome,
+            WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+        );
+        assert_eq!(
+            first.decision.action,
+            WbAutomationAction::ResumeCampaignAfterDailyCap
+        );
+        assert!(
+            writer_requests
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .starts_with("GET /adv/v0/start")
+        );
+
+        let (readback_url, _) = reader_server_for(campaign_id, 9, 200, &current_date, Some(0), 10);
+        executor
+            .observer
+            .replace_client_for_test(test_reader(&readback_url));
+        let reconciled = executor
+            .run_once_postgres(&store, &legacy, observed_at + ChronoDuration::minutes(1))
+            .await
+            .unwrap()
+            .expect("campaign lock is available");
+        assert_eq!(reconciled.outcome, WbAutomationExecutionOutcome::Reconciled);
+
+        let lease = store
+            .try_acquire_campaign("ip_domnyshev_wb", campaign_id)
+            .await
+            .unwrap()
+            .expect("executor released its campaign lock");
+        let state = lease.load_state().await.unwrap().unwrap();
+        assert_eq!(state.business_date, business_date);
+        assert_eq!(state.actions_today, 1);
+        assert!(state.pending_idempotency_key.is_none());
+        assert!(state.paused_for_daily_cap_on.is_none());
+        assert_eq!(state.revision, 3);
+        lease.release().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn postgres_executor_covers_holds_caps_pauses_and_ambiguous_readback() {
         #[cfg(coverage)]
         let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
@@ -3196,28 +3765,6 @@ mod tests {
                 .is_none()
         );
         held.release().await.unwrap();
-        let mut resume_lease = lock_owner
-            .try_acquire_campaign("ip_domnyshev_wb", locked_campaign)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            locked_executor
-                .send_pending_postgres(
-                    &PendingAction {
-                        reserved_at: observed_at,
-                        kind: PendingActionKind::ResumeCampaignAfterDailyCap,
-                    },
-                    &mut resume_lease,
-                    &"0".repeat(64),
-                    1,
-                )
-                .await,
-            Err(WbGuardedWriteError::Permit(
-                crate::control::automation_postgres::WbAutomationPostgresError::InvalidInput
-            ))
-        ));
-        resume_lease.release().await.unwrap();
 
         let rollover_campaign = 39_682_711;
         let rollover_fixture = Fixture::new_for_campaign(rollover_campaign);

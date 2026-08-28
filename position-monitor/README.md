@@ -151,13 +151,119 @@ payment type or placement, so both remain null; recommendation snapshots have
 the endpoint's fixed `cpm` contract and a null placement; minimum-bid snapshots
 retain the payment type and placement supplied to and returned for that method.
 History is append-only for the collector; no automatic retention or deletion
-job is installed yet. Define encrypted backups and a reviewed retention period
-before enabling scheduled collection.
+job is installed yet. Encrypted backups are covered below; a reviewed retention
+period for the history itself still has to be defined before scheduled
+collection is enabled.
 
 The database is not published on a host port. Future collector and MCP services
 must join the internal Docker network `mcp-ozon-position-internal` explicitly.
 The init files are copied into a small derived PostgreSQL image at build time;
 there is no runtime bind mount from the macOS `Documents` directory.
+
+## Backups and recovery
+
+Two stores hold everything that cannot be recreated from the marketplaces: this
+database and the `mcp-ozon-report-artifacts` volume. They are backed up
+together, by one command, in one order.
+
+### Taking backups
+
+Create the passphrase once and put a copy somewhere other than this Mac:
+
+```bash
+./scripts/bootstrap-backup-passphrase.sh
+```
+
+A passphrase that exists only on the machine the backup protects cannot be used
+after that machine is lost, which is the case the backup exists for.
+
+Then schedule both operations agents:
+
+```bash
+MCP_HEALTH_NOTIFY_COMMAND="$HOME/.local/libexec/mcp-ozon/notify" \
+  ./scripts/install-operations-agents.sh
+```
+
+The installer takes one real backup, restores it into a disposable PostgreSQL
+container and runs one health check before scheduling anything. It refuses to
+install an agent whose first run did not work.
+
+This creates `com.ofk.mcp-ozon-backup` (daily at 03:30) and
+`com.ofk.mcp-ozon-health` (every 15 minutes). Both use
+`StartCalendarInterval`: `StartInterval` drops any firing whose moment lands
+while the Mac is asleep, while `StartCalendarInterval` runs the job on the next
+wake.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MCP_BACKUP_DIR` | `~/MCP_OZON-backups` | Where backups are written. Put this on separate storage. |
+| `MCP_BACKUP_RETAIN` | `14` | Backups kept before the oldest are pruned. |
+| `MCP_BACKUP_PASSPHRASE_FILE` | `$MCP_RUNTIME_DIR/backup-passphrase` | Encryption passphrase, mode `600`. |
+| `MCP_BACKUP_OFFSITE_COMMAND` | unset | One executable, called with the new backup directory. |
+| `MCP_HEALTH_NOTIFY_COMMAND` | unset | One executable; receives the findings report on stdin. |
+| `MCP_HEALTH_CYCLE_STALE_SECONDS` | `1800` | Age at which a silent WB robot becomes a finding. |
+| `MCP_HEALTH_BACKUP_STALE_SECONDS` | `129600` | Age at which the newest backup becomes a finding. |
+
+Both hooks are executed directly rather than through a shell, so each must be a
+single executable file. Wrap `mail`, `curl` or `osascript` in a small script
+instead of passing a command line.
+
+### Why the capture order matters
+
+`persist_and_mark_ready` writes artifact bytes before the database row that
+references them becomes ready. A database snapshot taken at T1 can therefore
+only reference artifacts that already existed before T1, so capturing the
+database first and the artifacts second yields an artifact set that is a
+superset of what the dump references. The reverse order would produce dangling
+`artifact_object_key` values for anything published between the two captures.
+
+### Verifying a backup
+
+```bash
+./scripts/verify-position-backup.sh            # newest backup
+./scripts/verify-position-backup.sh BACKUP_DIR # a specific one
+```
+
+This restores into a disposable container built from the exact pinned
+PostgreSQL digest recorded in the manifest, with the restricted application
+roles created first so ownership and grants apply as they do in production. It
+then checks that every `artifact_object_key` the restored database references is
+present in the artifact archive captured alongside it — the cross-store
+consistency that two independently restored volumes silently lose.
+
+The container has no network and its volume is removed on exit. Nothing touches
+the live stack.
+
+### Restoring for real
+
+1. Stop every writer: the collectors, the report worker and both WB automation
+   agents. Leave the database running.
+2. Verify the backup first, with the command above. Never restore an archive
+   that has not been restored successfully somewhere else.
+3. Restore the database into a **new** volume rather than over the live one, so
+   the damaged state remains available as evidence.
+4. Restore the artifact volume from the same backup directory. Restoring the
+   two stores from different backups is the one mistake this layout is designed
+   to prevent.
+5. Re-run the health check before re-enabling any writer.
+
+Encryption is AES-256-CBC, which is not authenticated. The manifest records the
+SHA-256 of each ciphertext and the restore path verifies it before decrypting,
+which detects corruption and truncation. It is not a defence against an attacker
+who can rewrite both the archive and its manifest — which is why the backup
+directory belongs on separate, protected storage.
+
+### PostgreSQL major upgrades
+
+The image is pinned by digest and Dependabot is configured to propose patch and
+minor updates only. A major upgrade is deliberately excluded, because replacing
+the image does not migrate `PGDATA`: the new major cannot read the old data
+directory and the container fails to start, taking the whole data plane with it.
+
+To move majors: take and verify a backup, start the new major against an empty
+volume, restore the dump into it, run the health check, and only then repoint
+the stack. Keep the previous volume until the new one has served a full daily
+reporting cycle.
 
 ## Bootstrap
 
@@ -166,7 +272,7 @@ positions until a separately reviewed live-source phase is shipped. When ready:
 
 1. Generate the ignored local secret file with
    `./scripts/bootstrap-position-env.sh .position.env`, or copy
-   `.position.env.example` to `.position.env` and generate five different random passwords of at
+   `.position.env.example` to `.position.env` and generate seven different random passwords of at
    least 24 characters. Keep the file mode `0600`. Bootstrap rejects example placeholders, short
    values, reused passwords, and an admin username that collides with any restricted application
    role. The helper never prints generated passwords and refuses to overwrite an existing file.

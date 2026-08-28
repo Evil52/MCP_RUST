@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ofk.mcp-ozon-backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__RUNNER__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>MCP_RUNTIME_DIR</key>
+    <string>__RUNTIME_DIR__</string>
+    <key>MCP_OPS_PROJECT_DIR</key>
+    <string>__PROJECT_DIR__</string>
+    <key>MCP_BACKUP_POSITION_ENV</key>
+    <string>__POSITION_ENV__</string>
+    <key>MCP_BACKUP_DIR</key>
+    <string>__BACKUP_DIR__</string>
+    <key>MCP_BACKUP_OFFSITE_COMMAND</key>
+    <string>__OFFSITE_COMMAND__</string>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <!-- Daily, and deliberately StartCalendarInterval: a backup missed because
+       the Mac was asleep at 03:30 is started on the next wake instead of being
+       dropped, which is the behaviour StartInterval would give. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key><integer>3</integer>
+      <key>Minute</key><integer>30</integer>
+    </dict>
+  </array>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/backup.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/backup.error.log</string>
+</dict>
+</plist>

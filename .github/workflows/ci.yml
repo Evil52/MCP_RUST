@@ -137,7 +137,7 @@ jobs:
           --all-features
           --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector|report-collector|report-worker|wb-automation))\.rs$'
           --show-missing-lines
-          --fail-under-lines 100
+          --fail-uncovered-lines 0
 
   dependency-security:
     name: Dependency security
@@ -162,6 +162,51 @@ jobs:
 
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny check
+
+      # `[patch.crates-io]` points rmcp at vendor/rmcp, so its Cargo.lock entry
+      # carries no source and no checksum. Dependabot cannot propose an update
+      # for a path patch, which leaves the vendored transport as the one
+      # dependency nothing watches. The version agreement below is enforced on
+      # every run; the upstream comparison needs the network and would block
+      # unrelated pull requests, so it is fatal only on the weekly schedule.
+      - name: Check the vendored rmcp fork against upstream
+        env:
+          ENFORCE_UPSTREAM: >-
+            ${{ github.event_name == 'schedule'
+            || github.event_name == 'workflow_dispatch' }}
+        run: |
+          pinned="$(sed -n 's/^rmcp = { version = "=\([0-9][0-9.]*\)".*/\1/p' Cargo.toml)"
+          vendored="$(sed -n 's/^version = "\([0-9][0-9.]*\)".*/\1/p' vendor/rmcp/Cargo.toml | head -n 1)"
+          documented="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' vendor/rmcp/UPSTREAM.md | head -n 1)"
+          if [ -z "$pinned" ] || [ -z "$vendored" ] || [ -z "$documented" ]; then
+            echo "could not resolve the vendored rmcp version" >&2
+            exit 1
+          fi
+          if [ "$pinned" != "$vendored" ] || [ "$pinned" != "$documented" ]; then
+            echo "vendored rmcp version disagrees:" >&2
+            echo "  Cargo.toml pin:            $pinned" >&2
+            echo "  vendor/rmcp/Cargo.toml:    $vendored" >&2
+            echo "  vendor/rmcp/UPSTREAM.md:   $documented" >&2
+            exit 1
+          fi
+          latest="$(
+            curl --fail --silent --show-error --location \
+              --header 'User-Agent: mcp-ozon-ci' \
+              https://crates.io/api/v1/crates/rmcp \
+              | jq -r '.crate.max_stable_version'
+          )"
+          if [ "$latest" = "$pinned" ]; then
+            echo "vendored rmcp $pinned matches the latest published release"
+            exit 0
+          fi
+          echo "upstream rmcp is $latest; vendor/rmcp is pinned at $pinned." >&2
+          echo "Re-vendor it, reapply the local modifications listed in" >&2
+          echo "vendor/rmcp/UPSTREAM.md, and update the recorded version," >&2
+          echo "checksum and upstream commit." >&2
+          if [ "$ENFORCE_UPSTREAM" = "true" ]; then
+            exit 1
+          fi
+          echo "::warning::vendored rmcp $pinned is behind upstream $latest"
 
   container:
     name: Hardened container

@@ -301,6 +301,7 @@ AS $$
 DECLARE
     expected_actions integer;
     pending_status text;
+    pending_action_kind text;
     pending_reserved_at timestamptz;
 BEGIN
     IF TG_OP = 'INSERT' THEN
@@ -326,6 +327,25 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    IF OLD.paused_for_daily_cap_on IS NOT NULL
+       AND NEW.paused_for_daily_cap_on IS NULL THEN
+        SELECT status, action_kind
+        INTO pending_status, pending_action_kind
+        FROM wb_automation.action_attempts
+        WHERE idempotency_key = OLD.pending_idempotency_key
+          AND account_id = OLD.account_id
+          AND advert_id = OLD.advert_id;
+        IF (
+            OLD.pending_idempotency_key IS NOT NULL
+            AND NEW.pending_idempotency_key IS NULL
+            AND pending_status = 'applied'
+            AND pending_action_kind = 'resume_campaign_after_daily_cap'
+        ) IS NOT TRUE THEN
+            RAISE EXCEPTION
+                'WB automation daily-cap pause requires an applied explicit resume';
+        END IF;
+    END IF;
+
     IF NEW.account_id <> OLD.account_id
        OR NEW.advert_id <> OLD.advert_id
        OR NEW.schema_version <> OLD.schema_version
@@ -345,10 +365,7 @@ BEGIN
            OLD.incident_class IS NOT NULL
            AND NEW.incident_class IS DISTINCT FROM OLD.incident_class
        )
-       OR (
-           OLD.paused_for_daily_cap_on IS NOT NULL
-           AND NEW.paused_for_daily_cap_on IS NULL
-       ) THEN
+       THEN
         RAISE EXCEPTION 'invalid WB automation state transition';
     END IF;
 
