@@ -251,6 +251,7 @@ impl WbAutomationExecutor {
             legacy,
             observed_at,
             PostgresExecutionIntent::Automatic,
+            None,
         )
         .await
     }
@@ -271,6 +272,28 @@ impl WbAutomationExecutor {
             legacy,
             observed_at,
             PostgresExecutionIntent::ExplicitExposureTarget(target_impressions),
+            None,
+        )
+        .await
+    }
+
+    /// Executes at most one explicitly authorized action after the reviewed
+    /// daily quota has already been exhausted. The counter is incremented,
+    /// never reset, and the authorization reference is consumed by the
+    /// PostgreSQL audit transaction so it cannot authorize a second action.
+    pub async fn run_explicit_quota_override_once_postgres(
+        &self,
+        store: &WbAutomationPostgresStore,
+        legacy: &WbAutomationLegacyStateSeed,
+        observed_at: DateTime<Utc>,
+        authorization_reference: &str,
+    ) -> Result<Option<WbAutomationPostgresExecutionReceipt>> {
+        self.run_once_postgres_with_intent(
+            store,
+            legacy,
+            observed_at,
+            PostgresExecutionIntent::ExplicitQuotaOverride,
+            Some(authorization_reference),
         )
         .await
     }
@@ -290,6 +313,7 @@ impl WbAutomationExecutor {
             legacy,
             observed_at,
             PostgresExecutionIntent::ExplicitResumeAfterDailyCap,
+            None,
         )
         .await
     }
@@ -300,6 +324,7 @@ impl WbAutomationExecutor {
         legacy: &WbAutomationLegacyStateSeed,
         observed_at: DateTime<Utc>,
         intent: PostgresExecutionIntent,
+        quota_override_authorization: Option<&str>,
     ) -> Result<Option<WbAutomationPostgresExecutionReceipt>> {
         let policy = self.observer.policy();
         ensure!(
@@ -452,7 +477,10 @@ impl WbAutomationExecutor {
         };
         let request_json = serde_json::to_string(&pending.kind)?;
         let request_digest = sha256_domain("wb-automation-request-v1", request_json.as_bytes());
-        let idempotency_material = format!("{cycle_id}:{request_digest}");
+        let idempotency_material = quota_override_authorization.map_or_else(
+            || format!("{cycle_id}:{request_digest}"),
+            |authorization| format!("{cycle_id}:{request_digest}:{authorization}"),
+        );
         let idempotency_key =
             sha256_domain("wb-automation-action-v1", idempotency_material.as_bytes());
         let reservation = WbAutomationActionReservation {
@@ -466,7 +494,13 @@ impl WbAutomationExecutor {
             expected_state_revision: state.revision,
             max_actions_per_day: policy.max_actions_per_day,
         };
-        let reservation = lease.reserve_action(&reservation).await?;
+        let reservation = if let Some(authorization) = quota_override_authorization {
+            lease
+                .reserve_explicit_quota_override_action(&reservation, authorization)
+                .await?
+        } else {
+            lease.reserve_action(&reservation).await?
+        };
         let write_result = self
             .send_pending_postgres(
                 &pending,
@@ -593,6 +627,7 @@ impl WbAutomationExecutor {
 enum PostgresExecutionIntent {
     Automatic,
     ExplicitExposureTarget(u64),
+    ExplicitQuotaOverride,
     ExplicitResumeAfterDailyCap,
 }
 
@@ -623,6 +658,9 @@ fn apply_postgres_execution_intent(
         PostgresExecutionIntent::ExplicitExposureTarget(target_impressions) => Some(
             explicit_exposure_increase_decision(policy, snapshot, target_impressions)?,
         ),
+        PostgresExecutionIntent::ExplicitQuotaOverride => {
+            explicit_quota_override_decision(policy, snapshot, last_applied_snapshot)?
+        }
         PostgresExecutionIntent::ExplicitResumeAfterDailyCap => {
             Some(explicit_resume_after_daily_cap_decision(policy, snapshot)?)
         }
@@ -638,6 +676,44 @@ fn apply_postgres_execution_intent(
         snapshot.decision = decision;
     }
     Ok(())
+}
+
+fn explicit_quota_override_decision(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    last_applied_snapshot: Option<&WbAutomationSnapshot>,
+) -> Result<Option<WbAutomationDecision>> {
+    use super::automation::WbAutomationHoldReason;
+
+    ensure!(
+        policy.autonomous_pacing.uses_marginal_feedback(),
+        "WB explicit quota override requires traffic frontier v3"
+    );
+    ensure!(
+        matches!(
+            snapshot.decision.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::ActionQuotaExhausted
+            }
+        ) && snapshot.observation.actions_today >= policy.max_actions_per_day,
+        "WB explicit quota override requires an exhausted daily action quota"
+    );
+    ensure!(
+        snapshot
+            .observation
+            .last_action_at
+            .is_none_or(|last_action| {
+                snapshot.observation.observed_at
+                    >= last_action + chrono::Duration::seconds(i64::from(policy.cooldown_seconds))
+            }),
+        "WB explicit quota override preserves the cooldown guard"
+    );
+
+    let mut eligible = snapshot.clone();
+    eligible.decision.action = WbAutomationAction::Hold {
+        reason: WbAutomationHoldReason::AttributionIncomplete,
+    };
+    traffic_frontier_pacing_decision(policy, &eligible, last_applied_snapshot)
 }
 
 fn explicit_resume_after_daily_cap_decision(
@@ -2019,6 +2095,42 @@ mod tests {
         ])
     }
 
+    fn traffic_frontier_v3_reader_server_for(
+        campaign_id: u64,
+        bids: [u64; 3],
+        current_date: &str,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let advertising_payload = serde_json::json!([{
+            "advertId": campaign_id,
+            "stats": [{
+                "date": current_date,
+                "views": 320,
+                "clicks": 12,
+                "sum": 10,
+                "orders": 1,
+                "sumPrice": 1_000
+            }]
+        }]);
+        mock_http(vec![
+            (
+                200,
+                campaign_response_with_bids(campaign_id, 9, bids).to_string(),
+            ),
+            (200, minimum_bids_response().to_string()),
+            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, advertising_payload.to_string()),
+            (
+                200,
+                serde_json::json!({"data": {"items": [
+                    {"nmId": 449_627_598_u64, "warehouseId": 1, "quantity": 10},
+                    {"nmId": 449_627_015_u64, "warehouseId": 1, "quantity": 10},
+                    {"nmId": 497_424_314_u64, "warehouseId": 1, "quantity": 10}
+                ]}})
+                .to_string(),
+            ),
+        ])
+    }
+
     fn explicit_exposure_snapshot() -> (WbAutomationPolicy, WbAutomationSnapshot) {
         let mut policy = serde_json::from_slice::<WbAutomationPolicy>(include_bytes!(
             "../../config/wb-automation-robot.json"
@@ -2720,6 +2832,62 @@ mod tests {
                 .current_campaign_metrics
                 .clone()
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn explicit_quota_override_preserves_v3_feedback_and_cooldown_guards() {
+        let (policy, mut snapshot) = traffic_frontier_v3_snapshot();
+        let baseline = traffic_frontier_v3_baseline(&snapshot);
+        snapshot.observation.actions_today = policy.max_actions_per_day;
+        snapshot.observation.last_action_at =
+            Some(snapshot.observation.observed_at - ChronoDuration::minutes(31));
+        snapshot.decision.action = WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::ActionQuotaExhausted,
+        };
+
+        assert!(matches!(
+            explicit_quota_override_decision(&policy, &snapshot, Some(&baseline))
+                .unwrap()
+                .expect("one audited override reuses the v3 marginal decision")
+                .action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes.len() == 1
+                    && changes[0].reason == WbAutomationBidReason::TrafficFrontierBootstrap
+        ));
+
+        let mut cooling_down = snapshot.clone();
+        cooling_down.observation.last_action_at =
+            Some(cooling_down.observation.observed_at - ChronoDuration::minutes(1));
+        assert!(explicit_quota_override_decision(&policy, &cooling_down, Some(&baseline)).is_err());
+
+        let mut not_exhausted = snapshot.clone();
+        not_exhausted.observation.actions_today = policy.max_actions_per_day - 1;
+        assert!(
+            explicit_quota_override_decision(&policy, &not_exhausted, Some(&baseline)).is_err()
+        );
+
+        let mut wrong_hold = snapshot.clone();
+        wrong_hold.decision.action = WbAutomationAction::Hold {
+            reason: WbAutomationHoldReason::AttributionIncomplete,
+        };
+        assert!(explicit_quota_override_decision(&policy, &wrong_hold, Some(&baseline)).is_err());
+
+        let mut not_v3 = policy.clone();
+        not_v3.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV2;
+        assert!(explicit_quota_override_decision(&not_v3, &snapshot, Some(&baseline)).is_err());
+
+        let mut target_reached = snapshot;
+        target_reached.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 1_500,
+            clicks: 20,
+            spend_minor: 2_000,
+            attributed_orders: policy.target_orders_per_day,
+            attributed_revenue_minor: 200_000,
+        });
+        assert_eq!(
+            explicit_quota_override_decision(&policy, &target_reached, Some(&baseline)).unwrap(),
+            None
         );
     }
 
@@ -3505,6 +3673,113 @@ mod tests {
             .expect("executor released its campaign lock");
         let state = lease.load_state().await.unwrap().unwrap();
         assert_eq!(state.actions_today, 1);
+        assert!(state.pending_idempotency_key.is_none());
+        assert_eq!(state.revision, 3);
+        lease.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the PostgreSQL campaign lease is consumed by explicit async release"
+    )]
+    async fn explicit_quota_override_uses_v3_guards_durable_write_and_exact_readback() {
+        #[cfg(coverage)]
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
+        #[cfg(not(coverage))]
+        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+            return;
+        };
+        let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
+        let campaign_id = 39_682_726;
+        let fixture = Fixture::new_for_campaign(campaign_id);
+        let mut policy =
+            serde_json::from_slice::<WbAutomationPolicy>(&fs::read(&fixture.policy).unwrap())
+                .unwrap();
+        policy.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV3;
+        policy.target_impressions_per_day = 1_500;
+        policy.target_orders_per_day = 3;
+        policy.traffic_frontier_bid_kopecks = Some(540);
+        policy.traffic_frontier_feedback_timeout_seconds = Some(3_600);
+        policy.traffic_frontier_min_feedback_impressions = Some(200);
+        policy.traffic_frontier_min_feedback_clicks = Some(10);
+        policy.max_bid_kopecks = 3_000;
+        policy.bid_step_percent = 5;
+        policy.max_actions_per_day = 12;
+        policy.cooldown_seconds = 1_800;
+        fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+
+        let observed_at = Utc::now();
+        let business_date = wb_automation_business_date(observed_at);
+        let current_date = business_date.format("%Y-%m-%d").to_string();
+        let (reader_url, _) =
+            traffic_frontier_v3_reader_server_for(campaign_id, [117, 134, 117], &current_date);
+        let (writer_url, writer_requests) = mock_http(vec![(200, "{}".to_owned())]);
+        let mut executor = fixture.executor(&reader_url, &writer_url);
+        let config = Config::from_str(&database_url).unwrap();
+        let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        store.verify_runtime_contract().await.unwrap();
+        let legacy = WbAutomationLegacyStateSeed {
+            policy_digest: executor.policy_sha256().to_owned(),
+            business_date,
+            actions_today: policy.max_actions_per_day,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: "a".repeat(64),
+        };
+        let authorization_reference = "chat/2026-08-28/one-extra-audited-action";
+
+        let first = executor
+            .run_explicit_quota_override_once_postgres(
+                &store,
+                &legacy,
+                observed_at,
+                authorization_reference,
+            )
+            .await
+            .unwrap()
+            .expect("campaign lock is available");
+        assert_eq!(
+            first.outcome,
+            WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+        );
+        assert!(matches!(
+            first.decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes == &[WbAutomationBidChange {
+                    nm_id: 449_627_598,
+                    from_bid_kopecks: 117,
+                    to_bid_kopecks: 540,
+                    reason: WbAutomationBidReason::TrafficFrontierBootstrap,
+                }]
+        ));
+        let write_request = writer_requests
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(write_request.starts_with("PATCH /api/advert/v1/bids"));
+        assert!(write_request.contains("\"nm_id\":449627598"));
+        assert!(write_request.contains("\"bid_kopecks\":540"));
+
+        let (readback_url, _) =
+            traffic_frontier_v3_reader_server_for(campaign_id, [540, 134, 117], &current_date);
+        executor
+            .observer
+            .replace_client_for_test(test_reader(&readback_url));
+        let reconciled = executor
+            .run_once_postgres(&store, &legacy, observed_at + ChronoDuration::minutes(1))
+            .await
+            .unwrap()
+            .expect("campaign lock is available");
+        assert_eq!(reconciled.outcome, WbAutomationExecutionOutcome::Reconciled);
+
+        let lease = store
+            .try_acquire_campaign("ip_domnyshev_wb", campaign_id)
+            .await
+            .unwrap()
+            .expect("executor released its campaign lock");
+        let state = lease.load_state().await.unwrap().unwrap();
+        assert_eq!(state.actions_today, policy.max_actions_per_day + 1);
         assert!(state.pending_idempotency_key.is_none());
         assert_eq!(state.revision, 3);
         lease.release().await.unwrap();

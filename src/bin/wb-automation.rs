@@ -52,6 +52,9 @@ async fn main() -> Result<()> {
         Command::ExplicitExposureIncreasePostgres(options) => {
             explicit_exposure_increase_postgres_once(options).await
         }
+        Command::ExplicitQuotaOverridePostgres(options) => {
+            explicit_quota_override_postgres_once(options).await
+        }
         Command::ExplicitResumeAfterDailyCapPostgres(options) => {
             explicit_resume_after_daily_cap_postgres_once(options).await
         }
@@ -866,7 +869,7 @@ async fn execute_once(options: ExecuteOptions) -> Result<()> {
 }
 
 async fn execute_postgres_once(options: PostgresExecuteOptions) -> Result<()> {
-    execute_postgres_with_intent(options, PostgresCommandIntent::Automatic).await
+    execute_postgres_with_intent(options, PostgresCommandIntent::Automatic, None).await
 }
 
 async fn explicit_exposure_increase_postgres_once(
@@ -879,6 +882,22 @@ async fn explicit_exposure_increase_postgres_once(
     execute_postgres_with_intent(
         options.execute,
         PostgresCommandIntent::ExplicitExposureTarget(options.target_impressions),
+        None,
+    )
+    .await
+}
+
+async fn explicit_quota_override_postgres_once(
+    options: ExplicitQuotaOverrideOptions,
+) -> Result<()> {
+    ensure!(
+        options.confirmation == "--confirm-one-extra-audited-action",
+        "WB explicit quota override confirmation is invalid"
+    );
+    execute_postgres_with_intent(
+        options.execute,
+        PostgresCommandIntent::ExplicitQuotaOverride,
+        Some(&options.authorization_reference),
     )
     .await
 }
@@ -893,6 +912,7 @@ async fn explicit_resume_after_daily_cap_postgres_once(
     execute_postgres_with_intent(
         options.execute,
         PostgresCommandIntent::ExplicitResumeAfterDailyCap,
+        None,
     )
     .await
 }
@@ -901,12 +921,14 @@ async fn explicit_resume_after_daily_cap_postgres_once(
 enum PostgresCommandIntent {
     Automatic,
     ExplicitExposureTarget(u64),
+    ExplicitQuotaOverride,
     ExplicitResumeAfterDailyCap,
 }
 
 async fn execute_postgres_with_intent(
     options: PostgresExecuteOptions,
     intent: PostgresCommandIntent,
+    quota_override_authorization: Option<&str>,
 ) -> Result<()> {
     let state_directory = options
         .legacy_state
@@ -939,6 +961,17 @@ async fn execute_postgres_with_intent(
         PostgresCommandIntent::ExplicitExposureTarget(target) => {
             executor
                 .run_explicit_exposure_increase_once_postgres(&store, &legacy, Utc::now(), target)
+                .await?
+        }
+        PostgresCommandIntent::ExplicitQuotaOverride => {
+            executor
+                .run_explicit_quota_override_once_postgres(
+                    &store,
+                    &legacy,
+                    Utc::now(),
+                    quota_override_authorization
+                        .context("WB explicit quota override authorization is unavailable")?,
+                )
                 .await?
         }
         PostgresCommandIntent::ExplicitResumeAfterDailyCap => {
@@ -1028,6 +1061,7 @@ enum Command {
     TightenTrafficFrontierCorridorPostgres(ActivatePolicyOptions),
     ExecutePostgres(PostgresExecuteOptions),
     ExplicitExposureIncreasePostgres(ExplicitExposureIncreaseOptions),
+    ExplicitQuotaOverridePostgres(ExplicitQuotaOverrideOptions),
     ExplicitResumeAfterDailyCapPostgres(ExplicitResumeAfterDailyCapOptions),
     Execute(ExecuteOptions),
     Auto(ExecuteOptions),
@@ -1051,6 +1085,12 @@ struct PostgresExecuteOptions {
 struct ExplicitExposureIncreaseOptions {
     execute: PostgresExecuteOptions,
     target_impressions: u64,
+    confirmation: String,
+}
+
+struct ExplicitQuotaOverrideOptions {
+    execute: PostgresExecuteOptions,
+    authorization_reference: String,
     confirmation: String,
 }
 
@@ -1093,6 +1133,41 @@ impl ExecuteOptions {
 }
 
 fn parse_command(arguments: &[String]) -> Result<Command> {
+    if let [
+        command,
+        policy,
+        registry,
+        reader_token,
+        writer_token,
+        legacy_state,
+        broad_reader,
+        writer_proxy_url,
+        authorization_reference,
+        confirmation,
+        tail @ ..,
+    ] = arguments
+        && command == "explicit-quota-override-once-pg"
+    {
+        return Ok(Command::ExplicitQuotaOverridePostgres(
+            ExplicitQuotaOverrideOptions {
+                execute: PostgresExecuteOptions {
+                    execute: ExecuteOptions {
+                        policy: policy.into(),
+                        registry: registry.into(),
+                        reader_token: reader_token.into(),
+                        writer_token: writer_token.into(),
+                        state_directory: PathBuf::new(),
+                        allow_broad_reader: parse_bool(broad_reader)?,
+                        writer_proxy_url: nonempty(writer_proxy_url)?,
+                        reader_proxy_url: optional_proxy(tail)?,
+                    },
+                    legacy_state: legacy_state.into(),
+                },
+                authorization_reference: authorization_reference.clone(),
+                confirmation: confirmation.clone(),
+            },
+        ));
+    }
     if let [
         command,
         policy,
@@ -1466,7 +1541,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bounded-pacing-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v2-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v3-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation raise-traffic-frontier-limits-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation tighten-traffic-frontier-corridor-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation explicit-resume-after-daily-cap-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> --confirm-explicit-resume-after-daily-cap [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
+        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bounded-pacing-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v2-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v3-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation raise-traffic-frontier-limits-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation tighten-traffic-frontier-corridor-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation explicit-quota-override-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <authorization-reference> --confirm-one-extra-audited-action [reader-proxy-url] | wb-automation explicit-resume-after-daily-cap-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> --confirm-explicit-resume-after-daily-cap [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
     )
 }
 
@@ -1716,6 +1791,39 @@ mod tests {
         let mut expanded_budget = target;
         expanded_budget.daily_spend_cap_minor += 1;
         assert!(validate_traffic_frontier_v3_activation(&source, &expanded_budget).is_err());
+    }
+
+    #[test]
+    fn explicit_quota_override_command_keeps_authorization_and_confirmation_separate() {
+        let arguments = [
+            "explicit-quota-override-once-pg",
+            "policy.json",
+            "access.json",
+            "reader.token",
+            "writer.token",
+            "legacy.json",
+            "true",
+            "http://writer:3130",
+            "chat/2026-08-28/one-extra-audited-action",
+            "--confirm-one-extra-audited-action",
+            "http://reader:3128",
+        ]
+        .map(str::to_owned);
+        let Command::ExplicitQuotaOverridePostgres(options) =
+            parse_command(&arguments).expect("explicit override command parses")
+        else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(
+            options.authorization_reference,
+            "chat/2026-08-28/one-extra-audited-action"
+        );
+        assert_eq!(options.confirmation, "--confirm-one-extra-audited-action");
+        assert!(options.execute.execute.allow_broad_reader);
+        assert_eq!(
+            options.execute.execute.reader_proxy_url.as_deref(),
+            Some("http://reader:3128")
+        );
     }
 
     #[test]
