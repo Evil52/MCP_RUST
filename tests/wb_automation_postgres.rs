@@ -51,12 +51,14 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     let frontier_limits_policy_digest = "9".repeat(64);
     let frontier_corridor_policy_digest = "a".repeat(64);
     let frontier_v3_policy_digest = "b".repeat(64);
+    let frontier_v4_policy_digest = "c".repeat(64);
     let live_cycle_id = format!("{campaign_id:064x}");
     let bid_cycle_id = format!("{:064x}", campaign_id + 1);
     let paced_cycle_id = format!("{:064x}", campaign_id + 2);
     let frontier_cycle_id = format!("{:064x}", campaign_id + 3);
     let frontier_limits_cycle_id = format!("{:064x}", campaign_id + 4);
     let frontier_corridor_cycle_id = format!("{:064x}", campaign_id + 5);
+    let frontier_v3_cycle_id = format!("{:064x}", campaign_id + 6);
     let business_date = NaiveDate::from_ymd_opt(2026, 8, 26).expect("valid date");
     let observed_at = Utc
         .with_ymd_and_hms(2026, 8, 26, 12, 0, 0)
@@ -638,6 +640,107 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     assert_eq!(v3_payload["min_feedback_impressions"], 200);
     assert_eq!(v3_payload["min_feedback_clicks"], 10);
     assert_eq!(v3_payload["state_revision"], 8);
+
+    lease
+        .persist_shadow_cycle(
+            &frontier_v3_cycle_id,
+            &frontier_v3_policy_digest,
+            observed_at + Duration::seconds(7),
+            business_date,
+            8,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("latest traffic-frontier v3 evidence is persisted");
+    assert_eq!(
+        lease
+            .activate_traffic_frontier_v4_policy(
+                &frontier_v3_policy_digest,
+                &frontier_v4_policy_digest,
+                1_500,
+                2_500,
+                700,
+                10,
+                1_500,
+                3,
+                48,
+                1_800,
+                1_800,
+                200,
+                10,
+            )
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    let v4 = lease
+        .activate_traffic_frontier_v4_policy(
+            &frontier_v3_policy_digest,
+            &frontier_v4_policy_digest,
+            1_500,
+            1_500,
+            700,
+            10,
+            1_500,
+            3,
+            48,
+            1_800,
+            1_800,
+            200,
+            10,
+        )
+        .await
+        .expect("traffic-frontier v4 policy is activated atomically");
+    assert!(v4.changed);
+    assert_eq!(v4.state_revision, 9);
+    let v4_state = lease
+        .load_state()
+        .await
+        .expect("traffic-frontier v4 state query succeeds")
+        .expect("traffic-frontier v4 state exists");
+    assert_eq!(v4_state.policy_digest, frontier_v4_policy_digest);
+    assert_eq!(v4_state.actions_today, 1);
+    let v4_replay = lease
+        .activate_traffic_frontier_v4_policy(
+            &frontier_v3_policy_digest,
+            &frontier_v4_policy_digest,
+            1_500,
+            1_500,
+            700,
+            10,
+            1_500,
+            3,
+            48,
+            1_800,
+            1_800,
+            200,
+            10,
+        )
+        .await
+        .expect("traffic-frontier v4 activation replay is idempotent");
+    assert!(!v4_replay.changed);
+    assert_eq!(v4_replay.state_revision, 9);
+    let v4_audit = admin
+        .query_one(
+            "SELECT cycle_id, payload_json FROM wb_automation.audit_events \
+             WHERE account_id=$1 AND advert_id=$2 \
+               AND event_type='traffic_frontier_v4_activated'",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("traffic-frontier v4 audit evidence is readable");
+    assert_eq!(v4_audit.get::<_, String>(0), frontier_v3_cycle_id);
+    let v4_payload = serde_json::from_str::<serde_json::Value>(&v4_audit.get::<_, String>(1))
+        .expect("traffic-frontier v4 audit payload is valid JSON");
+    assert_eq!(v4_payload["autonomous_pacing"], "traffic_frontier_v4");
+    assert_eq!(v4_payload["target_drr_basis_points"], 1_500);
+    assert_eq!(v4_payload["hard_drr_basis_points"], 1_500);
+    assert_eq!(v4_payload["traffic_frontier_bid_kopecks"], 700);
+    assert_eq!(v4_payload["bid_step_percent"], 10);
+    assert_eq!(v4_payload["max_actions_per_day"], 48);
+    assert_eq!(v4_payload["feedback_timeout_seconds"], 1_800);
+    assert_eq!(v4_payload["zero_cost_probe_enabled"], true);
+    assert_eq!(v4_payload["state_revision"], 9);
 
     lease.release().await.expect("campaign lock is released");
     drop(admin);

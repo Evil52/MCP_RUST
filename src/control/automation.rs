@@ -83,6 +83,7 @@ pub enum WbAutomationPacingMode {
     Enabled,
     TrafficFrontierV2,
     TrafficFrontierV3,
+    TrafficFrontierV4,
 }
 
 impl WbAutomationPacingMode {
@@ -90,18 +91,29 @@ impl WbAutomationPacingMode {
     pub const fn is_enabled(self) -> bool {
         matches!(
             self,
-            Self::Enabled | Self::TrafficFrontierV2 | Self::TrafficFrontierV3
+            Self::Enabled
+                | Self::TrafficFrontierV2
+                | Self::TrafficFrontierV3
+                | Self::TrafficFrontierV4
         )
     }
 
     #[must_use]
     pub const fn uses_traffic_frontier(self) -> bool {
-        matches!(self, Self::TrafficFrontierV2 | Self::TrafficFrontierV3)
+        matches!(
+            self,
+            Self::TrafficFrontierV2 | Self::TrafficFrontierV3 | Self::TrafficFrontierV4
+        )
     }
 
     #[must_use]
     pub const fn uses_marginal_feedback(self) -> bool {
-        matches!(self, Self::TrafficFrontierV3)
+        matches!(self, Self::TrafficFrontierV3 | Self::TrafficFrontierV4)
+    }
+
+    #[must_use]
+    pub const fn allows_zero_cost_probe(self) -> bool {
+        matches!(self, Self::TrafficFrontierV4)
     }
 }
 
@@ -595,7 +607,9 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
         || nm_ids.len() != policy.nm_ids.len()
         || nm_ids.contains(&0)
         || policy.target_drr_basis_points == 0
-        || policy.hard_drr_basis_points <= policy.target_drr_basis_points
+        || policy.hard_drr_basis_points < policy.target_drr_basis_points
+        || (policy.hard_drr_basis_points == policy.target_drr_basis_points
+            && !policy.autonomous_pacing.allows_zero_cost_probe())
         || policy.hard_drr_basis_points > 10_000
         || policy.target_impressions_per_day == 0
         || (!policy.autonomous_pacing.uses_marginal_feedback() && policy.target_orders_per_day != 0)
@@ -1700,6 +1714,33 @@ mod tests {
         too_many_actions.max_actions_per_day = 49;
         assert_eq!(
             validate_wb_automation_policy(&too_many_actions),
+            Err(WbAutomationDecisionError::InvalidPolicy)
+        );
+    }
+
+    #[test]
+    fn only_traffic_frontier_v4_accepts_a_single_fifteen_percent_drr_limit() {
+        let mut v4 = policy();
+        v4.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV4;
+        v4.target_drr_basis_points = 1_500;
+        v4.hard_drr_basis_points = 1_500;
+        v4.target_impressions_per_day = 1_500;
+        v4.target_orders_per_day = 3;
+        v4.traffic_frontier_bid_kopecks = Some(700);
+        v4.traffic_frontier_feedback_timeout_seconds = Some(1_800);
+        v4.traffic_frontier_min_feedback_impressions = Some(200);
+        v4.traffic_frontier_min_feedback_clicks = Some(10);
+        v4.min_bid_kopecks = 500;
+        v4.max_bid_kopecks = 1_050;
+        v4.daily_spend_cap_minor = 50_000;
+        v4.daily_pause_threshold_minor = 45_000;
+        v4.max_actions_per_day = 48;
+        v4.cooldown_seconds = 1_800;
+        assert!(validate_wb_automation_policy(&v4).is_ok());
+
+        v4.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV3;
+        assert_eq!(
+            validate_wb_automation_policy(&v4),
             Err(WbAutomationDecisionError::InvalidPolicy)
         );
     }

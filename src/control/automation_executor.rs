@@ -854,7 +854,10 @@ const MOSCOW_OFFSET_SECONDS: i64 = 3 * 60 * 60;
 /// repeatedly acting on the same delayed WB statistics. The initial jump is
 /// explicit policy. V2 retains cumulative feedback semantics, while V3 waits
 /// for a statistically useful post-action delta and judges the marginal
-/// orders and DRR produced by that last bid change.
+/// orders and DRR produced by that last bid change. V4 additionally permits a
+/// zero-cost probe after the cooldown when CPC delivery produced no clicks,
+/// spend, orders or revenue. Any paid feedback immediately restores the full
+/// marginal-sample and economic guards.
 fn traffic_frontier_pacing_decision(
     policy: &super::automation::WbAutomationPolicy,
     snapshot: &WbAutomationSnapshot,
@@ -884,6 +887,7 @@ fn traffic_frontier_pacing_decision(
         "WB traffic-frontier current campaign metrics are inconsistent"
     );
 
+    let mut zero_cost_probe = false;
     let feedback_metrics = if policy.autonomous_pacing.uses_marginal_feedback() {
         let Some(delta) = traffic_feedback_delta(snapshot, metrics, last_applied_snapshot) else {
             return Ok(Some(traffic_frontier_hold(
@@ -898,7 +902,9 @@ fn traffic_frontier_pacing_decision(
         let min_clicks = policy
             .traffic_frontier_min_feedback_clicks
             .context("WB traffic-frontier v3 minimum feedback clicks are unavailable")?;
-        if delta.impressions < min_impressions && delta.clicks < min_clicks {
+        zero_cost_probe = policy.autonomous_pacing.allows_zero_cost_probe()
+            && traffic_frontier_zero_cost_probe_is_actionable(policy, snapshot, &delta)?;
+        if delta.impressions < min_impressions && delta.clicks < min_clicks && !zero_cost_probe {
             return Ok(Some(traffic_frontier_hold(
                 policy,
                 snapshot,
@@ -974,10 +980,13 @@ fn traffic_frontier_pacing_decision(
     if !spend_under_pace || !delivery_under_pace {
         return Ok(None);
     }
-    // V3 never buys more traffic merely because delivery is behind its time
-    // curve. A bid increase requires at least one incremental attributed order
-    // and revenue at or below the target marginal DRR.
+    // V3, and V4 after any paid feedback, never buy more traffic merely
+    // because delivery is behind its time curve. A regular bid increase
+    // requires at least one incremental attributed order and revenue at or
+    // below the target marginal DRR. The only exception is V4's bounded
+    // zero-cost probe established above.
     if policy.autonomous_pacing.uses_marginal_feedback()
+        && !zero_cost_probe
         && (feedback_metrics.attributed_orders == 0
             || feedback_metrics.attributed_revenue_minor == 0
             || drr.is_none_or(|value| value > policy.target_drr_basis_points))
@@ -1030,6 +1039,28 @@ fn traffic_frontier_pacing_decision(
         to_bid_kopecks,
         reason,
     )))
+}
+
+fn traffic_frontier_zero_cost_probe_is_actionable(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    delta: &super::automation::WbAutomationCampaignMetrics,
+) -> Result<bool> {
+    if delta.clicks != 0
+        || delta.spend_minor != 0
+        || delta.attributed_orders != 0
+        || delta.attributed_revenue_minor != 0
+    {
+        return Ok(false);
+    }
+    let Some(last_action_at) = snapshot.observation.last_action_at else {
+        return Ok(true);
+    };
+    let timeout = policy
+        .traffic_frontier_feedback_timeout_seconds
+        .context("WB traffic-frontier v4 probe timeout is unavailable")?;
+    Ok(snapshot.observation.observed_at
+        >= last_action_at + ChronoDuration::seconds(i64::from(timeout)))
 }
 
 fn traffic_frontier_v2_feedback_is_actionable(
@@ -2598,6 +2629,28 @@ mod tests {
         (policy, snapshot)
     }
 
+    fn traffic_frontier_v4_snapshot() -> (WbAutomationPolicy, WbAutomationSnapshot) {
+        let (mut policy, mut snapshot) = traffic_frontier_v3_snapshot();
+        policy.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV4;
+        policy.target_drr_basis_points = 1_500;
+        policy.hard_drr_basis_points = 1_500;
+        policy.traffic_frontier_bid_kopecks = Some(700);
+        policy.traffic_frontier_feedback_timeout_seconds = Some(1_800);
+        policy.bid_step_percent = 10;
+        policy.max_actions_per_day = 48;
+        snapshot.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 14,
+            clicks: 0,
+            spend_minor: 0,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        });
+        for sku in &mut snapshot.observation.skus {
+            sku.current_bid_kopecks = 500;
+        }
+        (policy, snapshot)
+    }
+
     fn traffic_frontier_v3_baseline(snapshot: &WbAutomationSnapshot) -> WbAutomationSnapshot {
         let mut baseline = snapshot.clone();
         baseline.observation.observed_at -= ChronoDuration::hours(2);
@@ -2733,6 +2786,65 @@ mod tests {
             .expect("v3 records an explicit sample hold");
         assert_eq!(
             decision.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::TrafficFeedbackPending,
+            }
+        );
+    }
+
+    #[test]
+    fn traffic_frontier_v4_bootstraps_zero_cost_traffic_before_the_full_sample() {
+        let (policy, snapshot) = traffic_frontier_v4_snapshot();
+        let decision = traffic_frontier_pacing_decision(&policy, &snapshot, None)
+            .unwrap()
+            .expect("zero-cost CPC delivery permits one bounded frontier probe");
+        assert!(matches!(
+            decision.action,
+            WbAutomationAction::ChangeBids { ref changes }
+                if changes == &[WbAutomationBidChange {
+                    nm_id: 449_627_015,
+                    from_bid_kopecks: 500,
+                    to_bid_kopecks: 700,
+                    reason: WbAutomationBidReason::TrafficFrontierBootstrap,
+                }]
+        ));
+    }
+
+    #[test]
+    fn traffic_frontier_v4_waits_for_cooldown_and_never_probes_paid_feedback() {
+        let (policy, mut snapshot) = traffic_frontier_v4_snapshot();
+        snapshot.observation.last_action_at =
+            Some(snapshot.observation.observed_at - ChronoDuration::minutes(10));
+        let baseline = snapshot.clone();
+        let held = traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+            .unwrap()
+            .expect("an early zero-cost probe remains held by feedback timeout");
+        assert_eq!(
+            held.action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::TrafficFeedbackPending,
+            }
+        );
+
+        snapshot.observation.last_action_at =
+            Some(snapshot.observation.observed_at - ChronoDuration::minutes(31));
+        snapshot
+            .observation
+            .current_campaign_metrics
+            .as_mut()
+            .unwrap()
+            .clicks = 1;
+        snapshot
+            .observation
+            .current_campaign_metrics
+            .as_mut()
+            .unwrap()
+            .spend_minor = 500;
+        let paid = traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+            .unwrap()
+            .expect("paid feedback below the sample fails closed");
+        assert_eq!(
+            paid.action,
             WbAutomationAction::Hold {
                 reason: WbAutomationHoldReason::TrafficFeedbackPending,
             }

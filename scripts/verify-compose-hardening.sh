@@ -1875,6 +1875,10 @@ check_contains \
   "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
   'activate-protective-live-pg'
 check_contains \
+  "WB Oduvanchik installer persists protective evidence before bid activation" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '.decision.action.hold.reason == "bid_writes_disabled"'
+check_contains \
   "WB Oduvanchik installer uses audited bid-write activation" \
   "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
   'activate-bid-writes-pg'
@@ -1887,13 +1891,41 @@ check_contains \
   "$project_dir/ops/macos/com.ofk.mcp-ozon-wb-automation-oduvanchik-live.plist.in" \
   'com.ofk.mcp-ozon-wb-automation-oduvanchik-live'
 check_contains \
-  "WB Oduvanchik LaunchAgent runs at each half hour" \
+  "WB Oduvanchik LaunchAgent observes every five minutes" \
+  "$project_dir/ops/macos/com.ofk.mcp-ozon-wb-automation-oduvanchik-live.plist.in" \
+  '<dict><key>Minute</key><integer>5</integer></dict>'
+check_contains \
+  "WB Oduvanchik LaunchAgent retains each half-hour write boundary" \
   "$project_dir/ops/macos/com.ofk.mcp-ozon-wb-automation-oduvanchik-live.plist.in" \
   '<dict><key>Minute</key><integer>30</integer></dict>'
 check_contains \
   "WB Oduvanchik LaunchAgent keeps the Robot runtime separate" \
   "$project_dir/ops/macos/com.ofk.mcp-ozon-wb-automation-oduvanchik-live.plist.in" \
   '<string>oduvanchik</string>'
+check_contains \
+  "WB Oduvanchik v4 rollout requires exact explicit confirmation" \
+  "$project_dir/scripts/enable-wb-automation-oduvanchik-v4.sh" \
+  '--confirm-enable-oduvanchik-traffic-frontier-v4-drr-15'
+check_contains \
+  "WB Oduvanchik v4 rollout pins one 15 percent DRR boundary" \
+  "$project_dir/scripts/enable-wb-automation-oduvanchik-v4.sh" \
+  '.hard_drr_basis_points == 1500'
+check_contains \
+  "WB Oduvanchik v4 rollout pins the 10.5 RUB ceiling" \
+  "$project_dir/scripts/enable-wb-automation-oduvanchik-v4.sh" \
+  '.max_bid_kopecks == 1050'
+check_contains \
+  "WB Oduvanchik v4 rollout preserves the 500 RUB daily cap" \
+  "$project_dir/scripts/enable-wb-automation-oduvanchik-v4.sh" \
+  '.daily_spend_cap_minor == 50000'
+check_contains \
+  "WB Oduvanchik v4 rollout uses the audited durable transition" \
+  "$project_dir/scripts/enable-wb-automation-oduvanchik-v4.sh" \
+  'activate-traffic-frontier-v4-pg'
+check_contains \
+  "WB Oduvanchik v4 rollout restores the old agent before cutover failure" \
+  "$project_dir/scripts/enable-wb-automation-oduvanchik-v4.sh" \
+  'policy_installed" != true'
 check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \

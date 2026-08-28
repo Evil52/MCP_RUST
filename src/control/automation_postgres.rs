@@ -147,6 +147,19 @@ enum PolicyTransition {
         min_feedback_impressions: u64,
         min_feedback_clicks: u64,
     },
+    TrafficFrontierV4Activated {
+        target_drr_basis_points: u32,
+        hard_drr_basis_points: u32,
+        frontier_bid_kopecks: u64,
+        bid_step_percent: u8,
+        target_impressions_per_day: u64,
+        target_orders_per_day: u64,
+        max_actions_per_day: u32,
+        cooldown_seconds: u32,
+        feedback_timeout_seconds: u32,
+        min_feedback_impressions: u64,
+        min_feedback_clicks: u64,
+    },
     TrafficFrontierLimitsRaised {
         from_frontier_bid_kopecks: u64,
         to_frontier_bid_kopecks: u64,
@@ -171,6 +184,7 @@ impl PolicyTransition {
             Self::BoundedPacingActivated { .. } => "bounded_pacing_activated",
             Self::TrafficFrontierV2Activated { .. } => "traffic_frontier_v2_activated",
             Self::TrafficFrontierV3Activated { .. } => "traffic_frontier_v3_activated",
+            Self::TrafficFrontierV4Activated { .. } => "traffic_frontier_v4_activated",
             Self::TrafficFrontierLimitsRaised { .. } => "traffic_frontier_limits_raised",
             Self::TrafficFrontierCorridorTightened { .. } => "traffic_frontier_corridor_tightened",
         }
@@ -183,6 +197,7 @@ impl PolicyTransition {
             | Self::BoundedPacingActivated { .. }
             | Self::TrafficFrontierV2Activated { .. }
             | Self::TrafficFrontierV3Activated { .. }
+            | Self::TrafficFrontierV4Activated { .. }
             | Self::TrafficFrontierLimitsRaised { .. }
             | Self::TrafficFrontierCorridorTightened { .. } => "bid_live",
         }
@@ -195,6 +210,7 @@ impl PolicyTransition {
                 | Self::BoundedPacingActivated { .. }
                 | Self::TrafficFrontierV2Activated { .. }
                 | Self::TrafficFrontierV3Activated { .. }
+                | Self::TrafficFrontierV4Activated { .. }
                 | Self::TrafficFrontierLimitsRaised { .. }
                 | Self::TrafficFrontierCorridorTightened { .. }
         )
@@ -220,6 +236,7 @@ impl PolicyTransition {
             Self::ProtectiveLive
             | Self::BidWrites
             | Self::TrafficFrontierV3Activated { .. }
+            | Self::TrafficFrontierV4Activated { .. }
             | Self::TrafficFrontierLimitsRaised { .. } => None,
         }
     }
@@ -231,6 +248,10 @@ impl PolicyTransition {
                 ..
             }
             | Self::TrafficFrontierV3Activated {
+                target_impressions_per_day,
+                ..
+            }
+            | Self::TrafficFrontierV4Activated {
                 target_impressions_per_day,
                 ..
             } => Some(target_impressions_per_day),
@@ -632,6 +653,61 @@ impl WbAutomationCampaignLease<'_> {
         .await
     }
 
+    /// Activates the reviewed Traffic Frontier v4 zero-cost probe policy while
+    /// preserving counters, cooldown history, action attempts and incidents.
+    /// V4 uses one 15% DRR boundary for both optimization and hard-stop logic.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn activate_traffic_frontier_v4_policy(
+        &mut self,
+        source_policy_digest: &str,
+        target_policy_digest: &str,
+        target_drr_basis_points: u32,
+        hard_drr_basis_points: u32,
+        frontier_bid_kopecks: u64,
+        bid_step_percent: u8,
+        target_impressions_per_day: u64,
+        target_orders_per_day: u64,
+        max_actions_per_day: u32,
+        cooldown_seconds: u32,
+        feedback_timeout_seconds: u32,
+        min_feedback_impressions: u64,
+        min_feedback_clicks: u64,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        if target_drr_basis_points != 1_500
+            || hard_drr_basis_points != target_drr_basis_points
+            || !(500..=1_050).contains(&frontier_bid_kopecks)
+            || !(5..=10).contains(&bid_step_percent)
+            || !(1_300..=1_600).contains(&target_impressions_per_day)
+            || !(3..=4).contains(&target_orders_per_day)
+            || !(9..=48).contains(&max_actions_per_day)
+            || !(1_800..=3_600).contains(&cooldown_seconds)
+            || feedback_timeout_seconds < cooldown_seconds
+            || !(100..=10_000).contains(&min_feedback_impressions)
+            || !(5..=100).contains(&min_feedback_clicks)
+            || min_feedback_clicks > min_feedback_impressions
+        {
+            return Err(WbAutomationPostgresError::InvalidInput);
+        }
+        self.activate_policy_transition(
+            source_policy_digest,
+            target_policy_digest,
+            PolicyTransition::TrafficFrontierV4Activated {
+                target_drr_basis_points,
+                hard_drr_basis_points,
+                frontier_bid_kopecks,
+                bid_step_percent,
+                target_impressions_per_day,
+                target_orders_per_day,
+                max_actions_per_day,
+                cooldown_seconds,
+                feedback_timeout_seconds,
+                min_feedback_impressions,
+                min_feedback_clicks,
+            },
+        )
+        .await
+    }
+
     /// Raises the reviewed Traffic Frontier entry and daily budget limits
     /// without resetting action counters, feedback baselines, incidents or
     /// pause state. The exact authorized values are checked by the CLI before
@@ -851,6 +927,34 @@ impl WbAutomationCampaignLease<'_> {
             payload["feedback_timeout_seconds"] = feedback_timeout_seconds.into();
             payload["min_feedback_impressions"] = min_feedback_impressions.into();
             payload["min_feedback_clicks"] = min_feedback_clicks.into();
+        }
+        if let PolicyTransition::TrafficFrontierV4Activated {
+            target_drr_basis_points,
+            hard_drr_basis_points,
+            frontier_bid_kopecks,
+            bid_step_percent,
+            target_impressions_per_day,
+            target_orders_per_day,
+            max_actions_per_day,
+            cooldown_seconds,
+            feedback_timeout_seconds,
+            min_feedback_impressions,
+            min_feedback_clicks,
+        } = transition
+        {
+            payload["autonomous_pacing"] = "traffic_frontier_v4".into();
+            payload["target_drr_basis_points"] = target_drr_basis_points.into();
+            payload["hard_drr_basis_points"] = hard_drr_basis_points.into();
+            payload["traffic_frontier_bid_kopecks"] = frontier_bid_kopecks.into();
+            payload["bid_step_percent"] = bid_step_percent.into();
+            payload["target_impressions_per_day"] = target_impressions_per_day.into();
+            payload["target_orders_per_day"] = target_orders_per_day.into();
+            payload["max_actions_per_day"] = max_actions_per_day.into();
+            payload["cooldown_seconds"] = cooldown_seconds.into();
+            payload["feedback_timeout_seconds"] = feedback_timeout_seconds.into();
+            payload["min_feedback_impressions"] = min_feedback_impressions.into();
+            payload["min_feedback_clicks"] = min_feedback_clicks.into();
+            payload["zero_cost_probe_enabled"] = true.into();
         }
         if let PolicyTransition::TrafficFrontierLimitsRaised {
             from_frontier_bid_kopecks,
