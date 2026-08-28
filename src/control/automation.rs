@@ -651,7 +651,7 @@ const fn valid_marginal_feedback_policy(policy: &WbAutomationPolicy) -> bool {
         && policy.target_orders_per_day >= 3
         && policy.target_orders_per_day <= 4
         && policy.max_actions_per_day >= 9
-        && policy.max_actions_per_day <= 12
+        && policy.max_actions_per_day <= 48
         && policy.cooldown_seconds >= 1_800
         && policy.cooldown_seconds <= 3_600
 }
@@ -1697,10 +1697,25 @@ mod tests {
         );
 
         let mut too_many_actions = traffic;
-        too_many_actions.max_actions_per_day = 51;
+        too_many_actions.max_actions_per_day = 49;
         assert_eq!(
             validate_wb_automation_policy(&too_many_actions),
             Err(WbAutomationDecisionError::InvalidPolicy)
         );
+    }
+
+    #[test]
+    fn oduvanchik_policy_accepts_the_reviewed_half_hour_action_ceiling() {
+        let policy = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+            "../../config/wb-automation-oduvanchik.bid-live.json"
+        ))
+        .unwrap();
+
+        validate_wb_automation_policy(&policy).unwrap();
+        assert_eq!(policy.max_actions_per_day, 48);
+        assert_eq!(policy.cooldown_seconds, 1_800);
+        assert_eq!(policy.min_bid_kopecks, 500);
+        assert_eq!(policy.max_bid_kopecks, 1_050);
+        assert!(!policy.allow_budget_top_up);
     }
 }

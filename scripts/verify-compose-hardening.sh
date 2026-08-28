@@ -1815,6 +1815,86 @@ check_contains \
   "$project_dir/scripts/run-wb-automation-live.sh" \
   'write_sent_reconciliation_required'
 check_contains \
+  "WB automation live runner isolates each campaign lock" \
+  "$project_dir/scripts/run-wb-automation-live.sh" \
+  'mcp-ozon-wb-automation-live-$runtime_id.lock'
+check_contains \
+  "WB automation live runner pins the expected account" \
+  "$project_dir/scripts/run-wb-automation-live.sh" \
+  'WB_AUTOMATION_EXPECTED_ACCOUNT_ID'
+check_contains \
+  "WB automation live runner pins the expected campaign" \
+  "$project_dir/scripts/run-wb-automation-live.sh" \
+  'WB_AUTOMATION_EXPECTED_CAMPAIGN_ID'
+check_contains \
+  "WB automation live runner isolates compose projects" \
+  "$project_dir/scripts/run-wb-automation-live.sh" \
+  '--project-name "$compose_project"'
+check_contains \
+  "WB automation live compose isolates writer-egress container names" \
+  "$project_dir/compose.wb-automation-live.yaml" \
+  '${WB_AUTOMATION_WRITE_EGRESS_CONTAINER_NAME:-mcp-ozon-wb-automation-live-write-egress}'
+check_contains \
+  "WB Oduvanchik installer requires explicit safe-auto authorization" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '--confirm-enable-oduvanchik-safe-auto'
+check_contains \
+  "WB Oduvanchik installer pins the reviewed account" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '.account_id == "ofk_region_wb"'
+check_contains \
+  "WB Oduvanchik installer pins the reviewed campaign" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '.campaign_id == 39807762'
+check_contains \
+  "WB Oduvanchik installer pins the 5 RUB floor" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '.min_bid_kopecks == 500'
+check_contains \
+  "WB Oduvanchik installer pins the 10.5 RUB ceiling" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '.max_bid_kopecks == 1050'
+check_contains \
+  "WB Oduvanchik installer pins the 500 RUB hard daily cap" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '.daily_spend_cap_minor == 50000'
+check_contains \
+  "WB Oduvanchik installer pins the 48-action ceiling" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '.max_actions_per_day == 48'
+check_contains \
+  "WB Oduvanchik installer forbids automatic top-ups" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '.allow_budget_top_up == false'
+check_contains \
+  "WB Oduvanchik installer bootstraps durable shadow state" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  '.outcome == "shadow_persisted"'
+check_contains \
+  "WB Oduvanchik installer uses audited protective activation" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  'activate-protective-live-pg'
+check_contains \
+  "WB Oduvanchik installer uses audited bid-write activation" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  'activate-bid-writes-pg'
+check_contains \
+  "WB Oduvanchik installer isolates its writer egress" \
+  "$project_dir/scripts/install-wb-automation-oduvanchik-live-agent.sh" \
+  'mcp-ozon-wb-automation-oduvanchik-write-egress'
+check_contains \
+  "WB Oduvanchik LaunchAgent has an independent label" \
+  "$project_dir/ops/macos/com.ofk.mcp-ozon-wb-automation-oduvanchik-live.plist.in" \
+  'com.ofk.mcp-ozon-wb-automation-oduvanchik-live'
+check_contains \
+  "WB Oduvanchik LaunchAgent runs at each half hour" \
+  "$project_dir/ops/macos/com.ofk.mcp-ozon-wb-automation-oduvanchik-live.plist.in" \
+  '<dict><key>Minute</key><integer>30</integer></dict>'
+check_contains \
+  "WB Oduvanchik LaunchAgent keeps the Robot runtime separate" \
+  "$project_dir/ops/macos/com.ofk.mcp-ozon-wb-automation-oduvanchik-live.plist.in" \
+  '<string>oduvanchik</string>'
+check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
   "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"

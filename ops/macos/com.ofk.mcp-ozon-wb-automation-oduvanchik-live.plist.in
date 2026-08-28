@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ofk.mcp-ozon-wb-automation-oduvanchik-live</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__RUNNER__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>MCP_RUNTIME_DIR</key>
+    <string>__RUNTIME_DIR__</string>
+    <key>WB_AUTOMATION_PROJECT_DIR</key>
+    <string>__PROJECT_DIR__</string>
+    <key>WB_AUTOMATION_POSITION_ENV</key>
+    <string>__RUNTIME_DIR__/position.env</string>
+    <key>WB_AUTOMATION_SHADOW_POLICY</key>
+    <string>__RUNTIME_DIR__/wb-automation-oduvanchik/shadow-policy.json</string>
+    <key>WB_AUTOMATION_LIVE_POLICY</key>
+    <string>__RUNTIME_DIR__/wb-automation-oduvanchik/live-policy.json</string>
+    <key>WB_AUTOMATION_READ_TOKEN_FILE</key>
+    <string>__RUNTIME_DIR__/ofk-region-wb-promotion-read.token</string>
+    <key>WB_AUTOMATION_WRITE_TOKEN_FILE</key>
+    <string>__RUNTIME_DIR__/ofk-region-wb-promotion-write.token</string>
+    <key>WB_AUTOMATION_LEGACY_STATE</key>
+    <string>__RUNTIME_DIR__/wb-automation-oduvanchik/execution-state.json</string>
+    <key>WB_AUTOMATION_EXPECTED_ACCOUNT_ID</key>
+    <string>ofk_region_wb</string>
+    <key>WB_AUTOMATION_EXPECTED_CAMPAIGN_ID</key>
+    <string>39807762</string>
+    <key>WB_AUTOMATION_RUNTIME_ID</key>
+    <string>oduvanchik</string>
+    <key>WB_AUTOMATION_COMPOSE_PROJECT_NAME</key>
+    <string>mcp-ozon-wb-automation-oduvanchik-live</string>
+    <key>WB_AUTOMATION_WRITE_EGRESS_CONTAINER_NAME</key>
+    <string>mcp-ozon-wb-automation-oduvanchik-write-egress</string>
+    <key>WB_AUTOMATION_BID_WRITES_ENABLED</key>
+    <string>true</string>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+  </array>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/wb-automation-oduvanchik-live.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/wb-automation-oduvanchik-live.error.log</string>
+</dict>
+</plist>

@@ -81,7 +81,7 @@ services:
       - /tmp:size=8m,mode=1777
 
   write-egress:
-    container_name: mcp-ozon-wb-automation-live-write-egress
+    container_name: ${WB_AUTOMATION_WRITE_EGRESS_CONTAINER_NAME:-mcp-ozon-wb-automation-live-write-egress}
     image: mcp-ozon-wb-automation-live-write-egress:local
     build:
       context: .

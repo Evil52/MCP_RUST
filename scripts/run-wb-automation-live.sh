@@ -13,7 +13,12 @@ writer_token="${WB_AUTOMATION_WRITE_TOKEN_FILE:-$runtime_dir/ip-domnyshev-wb-pro
 legacy_state="${WB_AUTOMATION_LEGACY_STATE:-$runtime_dir/wb-automation-robot/execution-state.json}"
 bid_writes_enabled="${WB_AUTOMATION_BID_WRITES_ENABLED:-false}"
 compose_file="$project_root/compose.wb-automation-live.yaml"
-lock_directory="${TMPDIR:-/tmp}/mcp-ozon-wb-automation-live.lock"
+expected_account_id="${WB_AUTOMATION_EXPECTED_ACCOUNT_ID:-ip_domnyshev_wb}"
+expected_campaign_id="${WB_AUTOMATION_EXPECTED_CAMPAIGN_ID:-39682633}"
+runtime_id="${WB_AUTOMATION_RUNTIME_ID:-robot}"
+compose_project="${WB_AUTOMATION_COMPOSE_PROJECT_NAME:-mcp-ozon-wb-automation-live}"
+write_egress_container_name="${WB_AUTOMATION_WRITE_EGRESS_CONTAINER_NAME:-mcp-ozon-wb-automation-live-write-egress}"
+lock_directory="${TMPDIR:-/tmp}/mcp-ozon-wb-automation-live-$runtime_id.lock"
 lock_pid_file="$lock_directory/pid"
 
 umask 077
@@ -60,6 +65,14 @@ if [[ "$bid_writes_enabled" != "false" && "$bid_writes_enabled" != "true" ]]; th
   echo "WB automation bid-writes mode must be true or false" >&2
   exit 1
 fi
+if [[ ! "$expected_account_id" =~ ^[A-Za-z0-9_-]{1,128}$ \
+   || ! "$expected_campaign_id" =~ ^[1-9][0-9]*$ \
+   || ! "$runtime_id" =~ ^[A-Za-z0-9_-]{1,64}$ \
+   || ! "$compose_project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ \
+   || ! "$write_egress_container_name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+  echo "WB automation runtime identity is invalid" >&2
+  exit 1
+fi
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   env_mode="$(/usr/bin/stat -f '%Lp' "$position_env")"
@@ -81,22 +94,25 @@ if ! grep -Eq '^WB_AUTOMATION_DB_PASSWORD=.{24,}$' "$position_env"; then
   echo "WB automation database password is unavailable" >&2
   exit 1
 fi
-if ! jq -e '
+if ! jq -e --arg account_id "$expected_account_id" \
+  --argjson campaign_id "$expected_campaign_id" '
   .policy_version == "wb_ads_robot.v1"
   and .write_enabled == false
   and (.bid_writes_enabled // false) == false
-  and .account_id == "ip_domnyshev_wb"
-  and .campaign_id == 39682633
+  and .account_id == $account_id
+  and .campaign_id == $campaign_id
 ' "$shadow_policy" >/dev/null; then
   echo "WB automation shadow policy does not match the guarded cutover source" >&2
   exit 1
 fi
-if ! jq -e --argjson bid_writes_enabled "$bid_writes_enabled" '
+if ! jq -e --arg account_id "$expected_account_id" \
+  --argjson campaign_id "$expected_campaign_id" \
+  --argjson bid_writes_enabled "$bid_writes_enabled" '
   .policy_version == "wb_ads_robot.v1"
   and .write_enabled == true
   and .bid_writes_enabled == $bid_writes_enabled
-  and .account_id == "ip_domnyshev_wb"
-  and .campaign_id == 39682633
+  and .account_id == $account_id
+  and .campaign_id == $campaign_id
   and .allow_budget_top_up == false
 ' "$live_policy" >/dev/null; then
   echo "WB automation live policy does not match the approved bid-writes mode" >&2
@@ -109,9 +125,11 @@ export WB_AUTOMATION_ACCESS_CONFIG_HOST="$registry"
 export WB_AUTOMATION_READ_TOKEN_FILE_HOST="$reader_token"
 export WB_AUTOMATION_WRITE_TOKEN_FILE_HOST="$writer_token"
 export WB_AUTOMATION_LEGACY_STATE_HOST="$legacy_state"
+export WB_AUTOMATION_WRITE_EGRESS_CONTAINER_NAME="$write_egress_container_name"
 
 compose=(
   docker compose
+  --project-name "$compose_project"
   --project-directory "$project_root"
   --env-file "$position_env"
   -f "$compose_file"
