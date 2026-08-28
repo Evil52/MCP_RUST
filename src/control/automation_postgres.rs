@@ -1080,6 +1080,28 @@ impl WbAutomationCampaignLease<'_> {
         &mut self,
         reservation: &WbAutomationActionReservation,
     ) -> Result<WbAutomationReservationReceipt, WbAutomationPostgresError> {
+        self.reserve_action_with_quota_override(reservation, None)
+            .await
+    }
+
+    /// Reserves one action beyond an already exhausted policy quota without
+    /// changing or resetting the durable counter. The authorization reference
+    /// is consumed by a unique append-only audit event in the same transaction.
+    pub async fn reserve_explicit_quota_override_action(
+        &mut self,
+        reservation: &WbAutomationActionReservation,
+        authorization_reference: &str,
+    ) -> Result<WbAutomationReservationReceipt, WbAutomationPostgresError> {
+        validate_authorization_reference(authorization_reference)?;
+        self.reserve_action_with_quota_override(reservation, Some(authorization_reference))
+            .await
+    }
+
+    async fn reserve_action_with_quota_override(
+        &mut self,
+        reservation: &WbAutomationActionReservation,
+        quota_override_authorization: Option<&str>,
+    ) -> Result<WbAutomationReservationReceipt, WbAutomationPostgresError> {
         validate_reservation(reservation)?;
         let expected_revision = to_i64(reservation.expected_state_revision)?;
         let max_actions = i32::try_from(reservation.max_actions_per_day)
@@ -1147,8 +1169,13 @@ impl WbAutomationCampaignLease<'_> {
         } else {
             state_row.get::<_, i32>(2)
         };
-        if actions_before < 0 || actions_before >= max_actions {
-            return Err(WbAutomationPostgresError::StateChanged);
+        let quota_exhausted = actions_before >= max_actions;
+        match quota_override_authorization {
+            None if quota_exhausted => return Err(WbAutomationPostgresError::StateChanged),
+            Some(_) if !quota_exhausted || actions_before >= 500 => {
+                return Err(WbAutomationPostgresError::StateChanged);
+            }
+            None | Some(_) => {}
         }
         let cycle_matches = transaction
             .query_opt(
@@ -1229,6 +1256,31 @@ impl WbAutomationCampaignLease<'_> {
             },
         )
         .await?;
+        if let Some(authorization_reference) = quota_override_authorization {
+            let payload = serde_json::to_string(&serde_json::json!({
+                "authorization_reference": authorization_reference,
+                "actions_before": actions_before,
+                "policy_max_actions_per_day": max_actions,
+            }))
+            .map_err(|_| WbAutomationPostgresError::InvalidInput)?;
+            insert_one_time_quota_override_audit_event(
+                &transaction,
+                &AuditEvent {
+                    event_key: &audit_event_key(
+                        authorization_reference,
+                        "explicit_quota_override_authorized",
+                        &format!("{}:{}", self.account_id, self.campaign_id),
+                    ),
+                    cycle_id: &reservation.cycle_id,
+                    account_id: &self.account_id,
+                    campaign_id: self.campaign_id,
+                    event_type: "explicit_quota_override_authorized",
+                    idempotency_key: Some(&reservation.idempotency_key),
+                    payload_json: &payload,
+                },
+            )
+            .await?;
+        }
         transaction
             .commit()
             .await
@@ -2010,6 +2062,35 @@ async fn insert_audit_event(
     Ok(())
 }
 
+async fn insert_one_time_quota_override_audit_event(
+    transaction: &tokio_postgres::Transaction<'_>,
+    event: &AuditEvent<'_>,
+) -> Result<(), WbAutomationPostgresError> {
+    validate_digest(event.event_key)?;
+    validate_digest(event.cycle_id)?;
+    validate_json(event.payload_json, 256 * 1024)?;
+    let inserted = transaction
+        .execute(
+            "INSERT INTO wb_automation.audit_events (\
+                event_key, cycle_id, account_id, advert_id, event_type, \
+                idempotency_key, payload_json\
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7) \
+             ON CONFLICT (event_key) DO NOTHING",
+            &[
+                &event.event_key,
+                &event.cycle_id,
+                &event.account_id,
+                &event.campaign_id,
+                &event.event_type,
+                &event.idempotency_key,
+                &event.payload_json,
+            ],
+        )
+        .await
+        .map_err(|_| WbAutomationPostgresError::Unavailable)?;
+    ensure_one_row(inserted)
+}
+
 fn audit_event_key(idempotency_key: &str, event_type: &str, detail: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"wb-automation-audit-v1");
@@ -2172,6 +2253,19 @@ fn validate_error_class(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validate_authorization_reference(value: &str) -> Result<(), WbAutomationPostgresError> {
+    if !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'/' | b'.'))
+    {
+        Ok(())
+    } else {
+        Err(WbAutomationPostgresError::InvalidInput)
+    }
 }
 
 fn to_i64(value: u64) -> Result<i64, WbAutomationPostgresError> {

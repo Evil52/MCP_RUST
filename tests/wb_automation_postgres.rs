@@ -888,6 +888,18 @@ async fn automation_state_is_isolated_locked_and_idempotent() {
     }
     assert_eq!(
         lease
+            .reserve_explicit_quota_override_action(&reservation, "")
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    assert_eq!(
+        lease
+            .reserve_explicit_quota_override_action(&reservation, "chat/2026-08-28/not-exhausted",)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    assert_eq!(
+        lease
             .cancel_reserved(&reservation.idempotency_key, 1, "Bad")
             .await,
         Err(WbAutomationPostgresError::InvalidInput)
@@ -1666,6 +1678,148 @@ async fn incident_without_action_is_sticky_audited_and_resets_daily_quota() {
             .await,
         Err(WbAutomationPostgresError::StateChanged)
     );
+    lease.release().await.expect("campaign lock is released");
+    drop(admin);
+    admin_connection
+        .await
+        .expect("admin connection task shuts down");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the campaign lease is consumed by the explicit async release under test"
+)]
+async fn explicit_quota_override_is_counted_audited_and_single_use() {
+    let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+        return;
+    };
+    let _database_guard = POSTGRES_TEST_LOCK.lock().await;
+    let config = Config::from_str(&database_url).expect("test database URL parses");
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
+        .expect("test wrapper provides the admin URL");
+    let admin_config = Config::from_str(&admin_url).expect("admin URL parses");
+    let (admin, admin_connection) = raw_client(&admin_config).await;
+    let store = WbAutomationPostgresStore::connect(&config)
+        .await
+        .expect("store connects");
+    let campaign_id = 7_300_000_u64 + CAMPAIGN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let campaign_id_i64 = i64::try_from(campaign_id).expect("campaign fits i64");
+    let account_id = format!("wb_quota_override_{}", std::process::id());
+    let policy_digest = "c".repeat(64);
+    let cycle_id = format!("{campaign_id:064x}");
+    let replay_cycle_id = format!("{:064x}", campaign_id + 1);
+    let business_date = NaiveDate::from_ymd_opt(2026, 8, 28).expect("valid date");
+    let observed_at = Utc
+        .with_ymd_and_hms(2026, 8, 28, 9, 0, 0)
+        .single()
+        .expect("valid timestamp");
+    let authorization_reference = "chat/2026-08-28/one-extra-audited-action";
+    let mut lease = store
+        .try_acquire_campaign(&account_id, campaign_id)
+        .await
+        .expect("lock query succeeds")
+        .expect("campaign lock is acquired");
+    lease
+        .initialize_from_legacy(&WbAutomationLegacyStateSeed {
+            policy_digest: policy_digest.clone(),
+            business_date,
+            actions_today: 12,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: "d".repeat(64),
+        })
+        .await
+        .expect("quota-exhausted state is initialized");
+    lease
+        .persist_shadow_cycle(
+            &cycle_id,
+            &policy_digest,
+            observed_at,
+            business_date,
+            1,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("override decision cycle is persisted");
+    let reservation = WbAutomationActionReservation {
+        idempotency_key: "e".repeat(64),
+        cycle_id: cycle_id.clone(),
+        policy_digest: policy_digest.clone(),
+        request_digest: "f".repeat(64),
+        action_kind: WbAutomationDurableActionKind::ChangeBids,
+        request_json:
+            "{\"kind\":\"change_bids\",\"changes\":[{\"nm_id\":449627598,\"bid_kopecks\":700}]}"
+                .to_owned(),
+        business_date,
+        expected_state_revision: 1,
+        max_actions_per_day: 12,
+    };
+    assert_eq!(
+        lease.reserve_action(&reservation).await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let reserved = lease
+        .reserve_explicit_quota_override_action(&reservation, authorization_reference)
+        .await
+        .expect("one extra action is reserved without resetting the counter");
+    assert_eq!(reserved.state_revision, 2);
+    assert!(reserved.inserted);
+    let cancelled = lease
+        .cancel_reserved(&reservation.idempotency_key, 2, "operator_cancelled")
+        .await
+        .expect("test reservation is resolved without a marketplace write");
+    assert_eq!(cancelled.state_revision, 3);
+
+    let audit = admin
+        .query_one(
+            "SELECT payload_json FROM wb_automation.audit_events \
+             WHERE account_id=$1 AND advert_id=$2 \
+               AND event_type='explicit_quota_override_authorized'",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("one-time authorization audit exists");
+    let payload = serde_json::from_str::<serde_json::Value>(audit.get(0))
+        .expect("authorization audit payload parses");
+    assert_eq!(payload["authorization_reference"], authorization_reference);
+    assert_eq!(payload["actions_before"], 12);
+    assert_eq!(payload["policy_max_actions_per_day"], 12);
+
+    lease
+        .persist_shadow_cycle(
+            &replay_cycle_id,
+            &policy_digest,
+            observed_at + Duration::hours(1),
+            business_date,
+            3,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("second decision cycle is persisted");
+    let mut replay = reservation;
+    replay.idempotency_key = "a".repeat(64);
+    replay.cycle_id = replay_cycle_id;
+    replay.request_digest = "b".repeat(64);
+    replay.expected_state_revision = 3;
+    assert_eq!(
+        lease
+            .reserve_explicit_quota_override_action(&replay, authorization_reference)
+            .await,
+        Err(WbAutomationPostgresError::StateChanged)
+    );
+    let state = lease
+        .load_state()
+        .await
+        .expect("state query succeeds")
+        .expect("state exists");
+    assert_eq!(state.actions_today, 13);
+    assert!(state.pending_idempotency_key.is_none());
+    assert_eq!(state.revision, 3);
+
     lease.release().await.expect("campaign lock is released");
     drop(admin);
     admin_connection
