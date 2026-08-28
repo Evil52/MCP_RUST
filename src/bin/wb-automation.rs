@@ -42,6 +42,9 @@ async fn main() -> Result<()> {
         Command::ActivateTrafficFrontierV3Postgres(options) => {
             activate_traffic_frontier_v3_postgres(options).await
         }
+        Command::ActivateTrafficFrontierV4Postgres(options) => {
+            activate_traffic_frontier_v4_postgres(options).await
+        }
         Command::RaiseTrafficFrontierLimitsPostgres(options) => {
             raise_traffic_frontier_limits_postgres(options).await
         }
@@ -531,6 +534,147 @@ fn validate_traffic_frontier_v3_activation(
     ensure!(
         target == &expected,
         "WB traffic-frontier v3 transition changes an unapproved policy field"
+    );
+    Ok(())
+}
+
+async fn activate_traffic_frontier_v4_postgres(options: ActivatePolicyOptions) -> Result<()> {
+    let source = build_observer(&options.source)?;
+    let target = build_observer(&ObserveOptions {
+        policy: options.target_policy,
+        registry: options.source.registry.clone(),
+        reader_token: options.source.reader_token.clone(),
+        state_directory: PathBuf::new(),
+        allow_broad_reader: options.source.allow_broad_reader,
+        reader_proxy_url: options.source.reader_proxy_url.clone(),
+    })?;
+    validate_traffic_frontier_v4_activation(source.policy(), target.policy())?;
+    let now = Utc::now();
+    ensure!(
+        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
+        "WB traffic-frontier v4 authorization is not active"
+    );
+    target
+        .observe(now, WbAutomationStateView::default())
+        .await
+        .context("WB traffic-frontier v4 read-only preflight failed")?;
+    let database_url =
+        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
+    let database_config =
+        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
+    let store = WbAutomationPostgresStore::connect(&database_config).await?;
+    store.verify_runtime_contract().await?;
+    let Some(mut lease) = store
+        .try_acquire_campaign(
+            target.policy().account_id.as_str(),
+            target.policy().campaign_id,
+        )
+        .await?
+    else {
+        bail!("WB traffic-frontier v4 campaign lock is contended");
+    };
+    let receipt = lease
+        .activate_traffic_frontier_v4_policy(
+            source.policy_sha256(),
+            target.policy_sha256(),
+            target.policy().target_drr_basis_points,
+            target.policy().hard_drr_basis_points,
+            target
+                .policy()
+                .traffic_frontier_bid_kopecks
+                .context("WB traffic-frontier v4 entry bid is unavailable")?,
+            target.policy().bid_step_percent,
+            target.policy().target_impressions_per_day,
+            target.policy().target_orders_per_day,
+            target.policy().max_actions_per_day,
+            target.policy().cooldown_seconds,
+            target
+                .policy()
+                .traffic_frontier_feedback_timeout_seconds
+                .context("WB traffic-frontier v4 feedback timeout is unavailable")?,
+            target
+                .policy()
+                .traffic_frontier_min_feedback_impressions
+                .context("WB traffic-frontier v4 minimum feedback impressions are unavailable")?,
+            target
+                .policy()
+                .traffic_frontier_min_feedback_clicks
+                .context("WB traffic-frontier v4 minimum feedback clicks are unavailable")?,
+        )
+        .await?;
+    lease.release().await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "account_id": target.policy().account_id,
+            "campaign_id": target.policy().campaign_id,
+            "outcome": if receipt.changed {
+                "traffic_frontier_v4_activated"
+            } else {
+                "traffic_frontier_v4_already_active"
+            },
+            "state_revision": receipt.state_revision,
+            "target_drr_basis_points": target.policy().target_drr_basis_points,
+            "hard_drr_basis_points": target.policy().hard_drr_basis_points,
+            "traffic_frontier_bid_kopecks": target.policy().traffic_frontier_bid_kopecks,
+            "bid_step_percent": target.policy().bid_step_percent,
+            "max_actions_per_day": target.policy().max_actions_per_day,
+            "cooldown_seconds": target.policy().cooldown_seconds,
+            "daily_spend_cap_minor": target.policy().daily_spend_cap_minor,
+            "zero_cost_probe_enabled": true,
+            "bid_writes_enabled": true,
+        })
+    );
+    Ok(())
+}
+
+fn validate_traffic_frontier_v4_activation(
+    source: &WbAutomationPolicy,
+    target: &WbAutomationPolicy,
+) -> Result<()> {
+    use mcp_ozon::control::WbAutomationPacingMode;
+
+    ensure!(
+        source.account_id == "ofk_region_wb"
+            && source.campaign_id == 39_807_762
+            && source.campaign_name == "Одуванчик"
+            && source.write_enabled
+            && source.bid_writes_enabled
+            && target.write_enabled
+            && target.bid_writes_enabled
+            && source.autonomous_pacing == WbAutomationPacingMode::TrafficFrontierV3
+            && target.autonomous_pacing == WbAutomationPacingMode::TrafficFrontierV4
+            && target.target_drr_basis_points == 1_500
+            && target.hard_drr_basis_points == 1_500
+            && target.traffic_frontier_bid_kopecks == Some(700)
+            && target.traffic_frontier_feedback_timeout_seconds == Some(1_800)
+            && target.traffic_frontier_min_feedback_impressions == Some(200)
+            && target.traffic_frontier_min_feedback_clicks == Some(10)
+            && target.bid_step_percent == 10
+            && target.max_bid_kopecks == 1_050
+            && target.daily_spend_cap_minor == 50_000
+            && target.daily_pause_threshold_minor == 45_000
+            && target.max_actions_per_day == 48
+            && target.cooldown_seconds == 1_800
+            && target.authorization_reference
+                == "chat/2026-08-28/oduvanchik-traffic-frontier-v4-drr-15",
+        "WB traffic-frontier v4 transition is outside the reviewed authorization"
+    );
+    let mut expected = source.clone();
+    expected
+        .authorization_reference
+        .clone_from(&target.authorization_reference);
+    expected.authorized_at = target.authorized_at;
+    expected.observe_until = target.observe_until;
+    expected.target_drr_basis_points = 1_500;
+    expected.hard_drr_basis_points = 1_500;
+    expected.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV4;
+    expected.traffic_frontier_bid_kopecks = Some(700);
+    expected.traffic_frontier_feedback_timeout_seconds = Some(1_800);
+    expected.bid_step_percent = 10;
+    ensure!(
+        target == &expected,
+        "WB traffic-frontier v4 transition changes an unapproved policy field"
     );
     Ok(())
 }
@@ -1057,6 +1201,7 @@ enum Command {
     ActivateBoundedPacingPostgres(ActivatePolicyOptions),
     ActivateTrafficFrontierV2Postgres(ActivatePolicyOptions),
     ActivateTrafficFrontierV3Postgres(ActivatePolicyOptions),
+    ActivateTrafficFrontierV4Postgres(ActivatePolicyOptions),
     RaiseTrafficFrontierLimitsPostgres(ActivatePolicyOptions),
     TightenTrafficFrontierCorridorPostgres(ActivatePolicyOptions),
     ExecutePostgres(PostgresExecuteOptions),
@@ -1345,6 +1490,31 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         broad_reader,
         tail @ ..,
     ] = arguments
+        && command == "activate-traffic-frontier-v4-pg"
+    {
+        return Ok(Command::ActivateTrafficFrontierV4Postgres(
+            ActivatePolicyOptions {
+                source: ObserveOptions {
+                    policy: source_bid_policy.into(),
+                    registry: registry.into(),
+                    reader_token: reader_token.into(),
+                    state_directory: PathBuf::new(),
+                    allow_broad_reader: parse_bool(broad_reader)?,
+                    reader_proxy_url: optional_proxy(tail)?,
+                },
+                target_policy: target_bid_policy.into(),
+            },
+        ));
+    }
+    if let [
+        command,
+        source_bid_policy,
+        target_bid_policy,
+        registry,
+        reader_token,
+        broad_reader,
+        tail @ ..,
+    ] = arguments
         && command == "activate-traffic-frontier-v2-pg"
     {
         return Ok(Command::ActivateTrafficFrontierV2Postgres(
@@ -1541,7 +1711,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bounded-pacing-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v2-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v3-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation raise-traffic-frontier-limits-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation tighten-traffic-frontier-corridor-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation explicit-quota-override-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <authorization-reference> --confirm-one-extra-audited-action [reader-proxy-url] | wb-automation explicit-resume-after-daily-cap-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> --confirm-explicit-resume-after-daily-cap [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
+        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bounded-pacing-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v2-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v3-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v4-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation raise-traffic-frontier-limits-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation tighten-traffic-frontier-corridor-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation explicit-quota-override-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <authorization-reference> --confirm-one-extra-audited-action [reader-proxy-url] | wb-automation explicit-resume-after-daily-cap-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> --confirm-explicit-resume-after-daily-cap [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
     )
 }
 
@@ -1748,6 +1918,18 @@ mod tests {
         (source, target)
     }
 
+    fn traffic_frontier_v4_policies() -> (WbAutomationPolicy, WbAutomationPolicy) {
+        let source = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+            "../../config/wb-automation-oduvanchik.bid-live.json"
+        ))
+        .expect("repository Oduvanchik v3 policy parses");
+        let target = serde_json::from_str::<WbAutomationPolicy>(include_str!(
+            "../../config/wb-automation-oduvanchik.v4.json"
+        ))
+        .expect("repository Oduvanchik v4 policy parses");
+        (source, target)
+    }
+
     #[test]
     fn bounded_pacing_activation_accepts_only_reviewed_changes() {
         let (source, target) = bounded_pacing_policies();
@@ -1791,6 +1973,47 @@ mod tests {
         let mut expanded_budget = target;
         expanded_budget.daily_spend_cap_minor += 1;
         assert!(validate_traffic_frontier_v3_activation(&source, &expanded_budget).is_err());
+    }
+
+    #[test]
+    fn traffic_frontier_v4_activation_accepts_only_the_fifteen_percent_policy() {
+        let (source, target) = traffic_frontier_v4_policies();
+        validate_traffic_frontier_v4_activation(&source, &target)
+            .expect("reviewed Oduvanchik v4 transition is accepted");
+
+        let mut relaxed_drr = target.clone();
+        relaxed_drr.hard_drr_basis_points = 2_500;
+        assert!(validate_traffic_frontier_v4_activation(&source, &relaxed_drr).is_err());
+
+        let mut expanded_budget = target;
+        expanded_budget.daily_spend_cap_minor += 1;
+        assert!(validate_traffic_frontier_v4_activation(&source, &expanded_budget).is_err());
+    }
+
+    #[test]
+    fn traffic_frontier_v4_command_parses_the_read_only_activation_inputs() {
+        let arguments = [
+            "activate-traffic-frontier-v4-pg",
+            "source.json",
+            "target.json",
+            "access.json",
+            "reader.token",
+            "true",
+            "http://reader:3128",
+        ]
+        .map(str::to_owned);
+        let Command::ActivateTrafficFrontierV4Postgres(options) =
+            parse_command(&arguments).expect("v4 activation command parses")
+        else {
+            panic!("unexpected command variant");
+        };
+        assert_eq!(options.source.policy, PathBuf::from("source.json"));
+        assert_eq!(options.target_policy, PathBuf::from("target.json"));
+        assert!(options.source.allow_broad_reader);
+        assert_eq!(
+            options.source.reader_proxy_url.as_deref(),
+            Some("http://reader:3128")
+        );
     }
 
     #[test]

@@ -247,6 +247,33 @@ if ! jq -e '
   exit 1
 fi
 
+# The durable bid-live transition requires append-only evidence produced by
+# the exact protective policy digest. This cycle cannot write bids because the
+# mounted policy keeps bid_writes_enabled=false; it closes the audited handoff
+# between the two activation stages instead of relying on shadow evidence from
+# the previous digest.
+protective_cycle_output="$("${live[@]}" run --rm --no-deps wb-automation-live \
+  execute-once-pg \
+  /etc/mcp-ozon/wb-automation-live-policy.json \
+  /etc/mcp-ozon/access.json \
+  /run/secrets/wb-promotion-read.token \
+  /run/secrets/wb-promotion-write.token \
+  /var/lib/mcp-ozon-legacy/execution-state.json \
+  true \
+  http://write-egress:3130 \
+  http://ozon-egress:3128)"
+printf '%s\n' "$protective_cycle_output"
+if ! jq -e '
+  .outcome == "observed"
+  and .decision.account_id == "ofk_region_wb"
+  and .decision.campaign_id == 39807762
+  and .decision.action.hold.reason == "bid_writes_disabled"
+  and .cycle_inserted == true
+' <<<"$protective_cycle_output" >/dev/null; then
+  echo "WB Oduvanchik protective evidence cycle did not complete" >&2
+  exit 1
+fi
+
 export WB_AUTOMATION_SHADOW_POLICY_HOST="$protective_policy_target"
 export WB_AUTOMATION_LIVE_POLICY_HOST="$bid_policy_target"
 bid_output="$("${live[@]}" run --rm --no-deps wb-automation-live \
