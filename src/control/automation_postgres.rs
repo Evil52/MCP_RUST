@@ -1612,11 +1612,11 @@ impl WbAutomationCampaignLease<'_> {
             if action.readback_cycle_id.as_deref() != Some(readback_cycle_id)
                 || state.revision != replay_revision
                 || state.pending_idempotency_key.is_some()
-                || (action.action_kind == WbAutomationDurableActionKind::PauseCampaignForDailyCap
-                    && state.paused_for_daily_cap_on != paused_for_daily_cap_on)
-                || (action.action_kind
-                    == WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap
-                    && state.paused_for_daily_cap_on.is_some())
+                || !applied_replay_pause_state_matches(
+                    action.action_kind,
+                    paused_for_daily_cap_on,
+                    state.paused_for_daily_cap_on,
+                )
             {
                 return Err(WbAutomationPostgresError::StateChanged);
             }
@@ -2203,6 +2203,22 @@ fn map_insert_error(error: tokio_postgres::Error) -> WbAutomationPostgresError {
     }
 }
 
+fn applied_replay_pause_state_matches(
+    action_kind: WbAutomationDurableActionKind,
+    requested_pause_date: Option<NaiveDate>,
+    persisted_pause_date: Option<NaiveDate>,
+) -> bool {
+    match action_kind {
+        WbAutomationDurableActionKind::ChangeBids => true,
+        WbAutomationDurableActionKind::PauseCampaignForDailyCap => {
+            persisted_pause_date == requested_pause_date
+        }
+        WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap => {
+            persisted_pause_date.is_none()
+        }
+    }
+}
+
 #[cfg(coverage)]
 #[doc(hidden)]
 pub fn exercise_coverage_only_database_mappings() {
@@ -2340,6 +2356,32 @@ mod tests {
             status_database(WbAutomationDurableActionStatus::Applied),
             "applied"
         );
+        let pause_date = NaiveDate::from_ymd_opt(2026, 8, 28).unwrap();
+        assert!(applied_replay_pause_state_matches(
+            WbAutomationDurableActionKind::ChangeBids,
+            Some(pause_date),
+            None,
+        ));
+        assert!(applied_replay_pause_state_matches(
+            WbAutomationDurableActionKind::PauseCampaignForDailyCap,
+            Some(pause_date),
+            Some(pause_date),
+        ));
+        assert!(!applied_replay_pause_state_matches(
+            WbAutomationDurableActionKind::PauseCampaignForDailyCap,
+            Some(pause_date),
+            None,
+        ));
+        assert!(applied_replay_pause_state_matches(
+            WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap,
+            None,
+            None,
+        ));
+        assert!(!applied_replay_pause_state_matches(
+            WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap,
+            None,
+            Some(pause_date),
+        ));
     }
 
     #[test]

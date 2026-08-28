@@ -808,19 +808,41 @@ fn traffic_frontier_pacing_decision(
         "WB traffic-frontier current campaign metrics are inconsistent"
     );
 
-    if !traffic_feedback_is_actionable(policy, snapshot, metrics, last_applied_snapshot)? {
-        return Ok(Some(traffic_frontier_hold(
+    let feedback_metrics = if policy.autonomous_pacing.uses_marginal_feedback() {
+        let Some(delta) = traffic_feedback_delta(snapshot, metrics, last_applied_snapshot) else {
+            return Ok(Some(traffic_frontier_hold(
+                policy,
+                snapshot,
+                WbAutomationHoldReason::TrafficFeedbackPending,
+            )));
+        };
+        let min_impressions = policy
+            .traffic_frontier_min_feedback_impressions
+            .context("WB traffic-frontier v3 minimum feedback impressions are unavailable")?;
+        let min_clicks = policy
+            .traffic_frontier_min_feedback_clicks
+            .context("WB traffic-frontier v3 minimum feedback clicks are unavailable")?;
+        if delta.impressions < min_impressions && delta.clicks < min_clicks {
+            return Ok(Some(traffic_frontier_hold(
+                policy,
+                snapshot,
+                WbAutomationHoldReason::TrafficFeedbackPending,
+            )));
+        }
+        delta
+    } else {
+        if !traffic_frontier_v2_feedback_is_actionable(
             policy,
             snapshot,
-            WbAutomationHoldReason::TrafficFeedbackPending,
-        )));
-    }
-
-    let feedback_metrics = if policy.autonomous_pacing.uses_marginal_feedback() {
-        traffic_feedback_delta(snapshot, metrics, last_applied_snapshot).context(
-            "WB traffic-frontier v3 feedback delta is unavailable after it became actionable",
-        )?
-    } else {
+            metrics,
+            last_applied_snapshot,
+        )? {
+            return Ok(Some(traffic_frontier_hold(
+                policy,
+                snapshot,
+                WbAutomationHoldReason::TrafficFeedbackPending,
+            )));
+        }
         metrics.clone()
     };
     let drr = campaign_drr_basis_points(&feedback_metrics)?;
@@ -934,24 +956,12 @@ fn traffic_frontier_pacing_decision(
     )))
 }
 
-fn traffic_feedback_is_actionable(
+fn traffic_frontier_v2_feedback_is_actionable(
     policy: &super::automation::WbAutomationPolicy,
     snapshot: &WbAutomationSnapshot,
     current: &super::automation::WbAutomationCampaignMetrics,
     last_applied_snapshot: Option<&WbAutomationSnapshot>,
 ) -> Result<bool> {
-    if policy.autonomous_pacing.uses_marginal_feedback() {
-        let Some(delta) = traffic_feedback_delta(snapshot, current, last_applied_snapshot) else {
-            return Ok(false);
-        };
-        let min_impressions = policy
-            .traffic_frontier_min_feedback_impressions
-            .context("WB traffic-frontier v3 minimum feedback impressions are unavailable")?;
-        let min_clicks = policy
-            .traffic_frontier_min_feedback_clicks
-            .context("WB traffic-frontier v3 minimum feedback clicks are unavailable")?;
-        return Ok(delta.impressions >= min_impressions || delta.clicks >= min_clicks);
-    }
     let Some(last_action_at) = snapshot.observation.last_action_at else {
         return Ok(true);
     };
@@ -1720,6 +1730,7 @@ mod tests {
                 Utc.with_ymd_and_hms(2026, 9, 23, 7, 0, 0).unwrap();
             test_policy.autonomous_pacing =
                 crate::control::automation::WbAutomationPacingMode::Enabled;
+            test_policy.target_impressions_per_day = 5_000;
             test_policy.target_orders_per_day = 0;
             test_policy.traffic_frontier_bid_kopecks = None;
             test_policy.traffic_frontier_feedback_timeout_seconds = None;
@@ -2648,11 +2659,7 @@ mod tests {
                 .action,
             WbAutomationAction::ChangeBids { ref changes }
                 if changes.len() == 1
-                    && matches!(
-                        changes[0].reason,
-                        WbAutomationBidReason::TrafficFrontierBootstrap
-                            | WbAutomationBidReason::TrafficFrontierIncrease
-                    )
+                    && changes[0].reason == WbAutomationBidReason::TrafficFrontierBootstrap
         ));
 
         let mut target_reached = snapshot;
@@ -2675,6 +2682,67 @@ mod tests {
             traffic_frontier_pacing_decision(&policy, &target_reached, Some(&target_baseline),)
                 .unwrap(),
             None
+        );
+
+        assert_eq!(
+            traffic_feedback_delta(
+                &target_reached,
+                target_reached
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+                None,
+            )
+            .unwrap(),
+            target_reached
+                .observation
+                .current_campaign_metrics
+                .clone()
+                .unwrap()
+        );
+
+        let mut previous_day = target_baseline;
+        previous_day.observation.observed_at -= ChronoDuration::days(1);
+        assert_eq!(
+            traffic_feedback_delta(
+                &target_reached,
+                target_reached
+                    .observation
+                    .current_campaign_metrics
+                    .as_ref()
+                    .unwrap(),
+                Some(&previous_day),
+            )
+            .unwrap(),
+            target_reached
+                .observation
+                .current_campaign_metrics
+                .clone()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn traffic_frontier_v3_holds_an_impression_sample_without_orders() {
+        let (policy, mut snapshot) = traffic_frontier_v3_snapshot();
+        let baseline = traffic_frontier_v3_baseline(&snapshot);
+        snapshot.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
+            impressions: 300,
+            clicks: 8,
+            spend_minor: 1_000,
+            attributed_orders: 0,
+            attributed_revenue_minor: 0,
+        });
+
+        assert_eq!(
+            traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
+                .unwrap()
+                .unwrap()
+                .action,
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::TrafficFeedbackPending,
+            }
         );
     }
 
@@ -2926,7 +2994,7 @@ mod tests {
         feedback.observation.last_action_at =
             Some(feedback.observation.observed_at - ChronoDuration::minutes(10));
         assert!(
-            !traffic_feedback_is_actionable(
+            !traffic_frontier_v2_feedback_is_actionable(
                 &policy,
                 &feedback,
                 feedback
@@ -2942,7 +3010,7 @@ mod tests {
         let mut previous_day = feedback.clone();
         previous_day.observation.observed_at -= ChronoDuration::days(1);
         assert!(
-            traffic_feedback_is_actionable(
+            traffic_frontier_v2_feedback_is_actionable(
                 &policy,
                 &feedback,
                 feedback
@@ -2958,7 +3026,7 @@ mod tests {
         let mut missing_baseline = feedback.clone();
         missing_baseline.observation.current_campaign_metrics = None;
         assert!(
-            !traffic_feedback_is_actionable(
+            !traffic_frontier_v2_feedback_is_actionable(
                 &policy,
                 &feedback,
                 feedback
@@ -2979,7 +3047,7 @@ mod tests {
             .unwrap()
             .impressions += 1;
         assert!(
-            !traffic_feedback_is_actionable(
+            !traffic_frontier_v2_feedback_is_actionable(
                 &policy,
                 &feedback,
                 feedback
@@ -2995,7 +3063,7 @@ mod tests {
         let mut missing_timeout = policy.clone();
         missing_timeout.traffic_frontier_feedback_timeout_seconds = None;
         assert!(
-            traffic_feedback_is_actionable(
+            traffic_frontier_v2_feedback_is_actionable(
                 &missing_timeout,
                 &feedback,
                 feedback
@@ -3007,6 +3075,7 @@ mod tests {
             )
             .is_err()
         );
+        assert!(traffic_frontier_pacing_decision(&missing_timeout, &feedback, None).is_err());
 
         let mut missing_frontier = policy.clone();
         missing_frontier.traffic_frontier_bid_kopecks = None;

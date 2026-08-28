@@ -522,6 +522,10 @@ fn write_request_is_bounded_and_unique() {
 #[test]
 fn campaign_creation_request_is_exact_and_bounded() {
     assert_eq!(MIN_CREATE_INTERVAL, Duration::from_secs(12));
+    assert_eq!(WbCampaignBidType::Manual.as_api_str(), "manual");
+    assert_eq!(WbCampaignBidType::Unified.as_api_str(), "unified");
+    assert_eq!(WbCampaignPaymentType::Cpm.as_api_str(), "cpm");
+    assert_eq!(WbCampaignPaymentType::Cpc.as_api_str(), "cpc");
     let request = create_campaign_request();
     assert!(validate_create_campaign_request(&request).is_ok());
 
@@ -614,6 +618,150 @@ async fn campaign_creation_refuses_invalid_receipt_as_ambiguous() {
         }) if request_id == "create-bad"
     ));
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn campaign_creation_covers_unified_and_failure_outcomes() {
+    let unified = WbCreateCampaignRequest {
+        bid_type: WbCampaignBidType::Unified,
+        payment_type: WbCampaignPaymentType::Cpm,
+        placement_types: Vec::new(),
+        ..create_campaign_request()
+    };
+    let (base_url, server) = response_server(
+        http_response("200 OK", "x-request-id: create-unified\r\n", b"39690002"),
+        Duration::ZERO,
+    )
+    .await;
+    let client = WbBidWriteClient::new_for_test(&base_url, "test-token", Duration::from_secs(1));
+    assert_eq!(
+        client
+            .create_campaign_with_permit(&unified, || async { Ok::<_, ()>(()) })
+            .await
+            .unwrap(),
+        39_690_002
+    );
+    let request = server.await.unwrap();
+    let payload: Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(payload["bid_type"], "unified");
+    assert_eq!(payload["payment_type"], "cpm");
+    assert!(payload.get("placement_types").is_none());
+
+    let (base_url, server) = response_server(
+        http_response(
+            "400 Bad Request",
+            "x-request-id: create-rejected\r\n",
+            b"{}",
+        ),
+        Duration::ZERO,
+    )
+    .await;
+    let client = WbBidWriteClient::new_for_test(&base_url, "test-token", Duration::from_secs(1));
+    assert!(matches!(
+        client
+            .create_campaign_with_permit(&create_campaign_request(), || async { Ok::<_, ()>(()) })
+            .await,
+        Err(WbGuardedWriteError::Write(WbWriteError::HttpStatus {
+            status: StatusCode::BAD_REQUEST,
+            request_id: Some(ref request_id),
+        })) if request_id == "create-rejected"
+    ));
+    server.await.unwrap();
+
+    let (base_url, server) = response_server(
+        http_response("200 OK", "x-request-id: create-zero\r\n", b"0"),
+        Duration::ZERO,
+    )
+    .await;
+    let client = WbBidWriteClient::new_for_test(&base_url, "test-token", Duration::from_secs(1));
+    assert!(matches!(
+        client
+            .create_campaign_with_permit(&create_campaign_request(), || async { Ok::<_, ()>(()) })
+            .await,
+        Err(WbGuardedWriteError::Write(WbWriteError::Ambiguous {
+            reason: "invalid_success_advert_id",
+            request_id: Some(ref request_id),
+        })) if request_id == "create-zero"
+    ));
+    server.await.unwrap();
+
+    let oversized_body = vec![b'x'; MAX_ERROR_RESPONSE_BYTES + 1];
+    let (base_url, server) = response_server(
+        http_response(
+            "400 Bad Request",
+            "x-request-id: create-oversized\r\n",
+            &oversized_body,
+        ),
+        Duration::ZERO,
+    )
+    .await;
+    let client = WbBidWriteClient::new_for_test(&base_url, "test-token", Duration::from_secs(1));
+    assert!(matches!(
+        client
+            .create_campaign_with_permit(&create_campaign_request(), || async { Ok::<_, ()>(()) })
+            .await,
+        Err(WbGuardedWriteError::Write(WbWriteError::Ambiguous {
+            reason: "response_too_large",
+            request_id: Some(ref request_id),
+        })) if request_id == "create-oversized"
+    ));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn campaign_creation_preserves_timeout_and_network_ambiguity() {
+    let (base_url, server) = response_server(
+        http_response("200 OK", "", b"39690003"),
+        Duration::from_millis(30),
+    )
+    .await;
+    let http = Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let client = WbBidWriteClient::from_parts(
+        http,
+        &base_url,
+        "test-token",
+        Duration::from_millis(5),
+        Duration::ZERO,
+    )
+    .unwrap();
+    let timeout_error = client
+        .create_campaign_with_permit(&create_campaign_request(), || async { Ok::<_, ()>(()) })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            timeout_error,
+            WbGuardedWriteError::Write(WbWriteError::Ambiguous {
+                reason: "timeout",
+                request_id: None,
+            })
+        ),
+        "{timeout_error:?}"
+    );
+    server.await.unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_address = listener.local_addr().unwrap();
+    drop(listener);
+    let offline = WbBidWriteClient::new_for_test(
+        &format!("http://{closed_address}"),
+        "test-token",
+        Duration::from_secs(1),
+    );
+    assert!(matches!(
+        offline
+            .create_campaign_with_permit(&create_campaign_request(), || async { Ok::<_, ()>(()) })
+            .await,
+        Err(WbGuardedWriteError::Write(WbWriteError::Ambiguous {
+            reason: "network_error",
+            request_id: None,
+        }))
+    ));
 }
 
 #[test]

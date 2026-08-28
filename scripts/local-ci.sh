@@ -41,6 +41,6 @@ fi
     --all-features \
     --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector|report-collector|report-worker|wb-automation))\.rs$' \
     --show-missing-lines \
-    --fail-under-lines 100
+    --fail-uncovered-lines 0
 
 echo "Local CI passed."

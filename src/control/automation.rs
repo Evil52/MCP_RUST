@@ -1668,6 +1668,20 @@ mod tests {
             Err(WbAutomationDecisionError::InvalidPolicy)
         );
 
+        let mut missing_min_impressions = traffic.clone();
+        missing_min_impressions.traffic_frontier_min_feedback_impressions = None;
+        assert_eq!(
+            validate_wb_automation_policy(&missing_min_impressions),
+            Err(WbAutomationDecisionError::InvalidPolicy)
+        );
+
+        let mut missing_min_clicks = traffic.clone();
+        missing_min_clicks.traffic_frontier_min_feedback_clicks = None;
+        assert_eq!(
+            validate_wb_automation_policy(&missing_min_clicks),
+            Err(WbAutomationDecisionError::InvalidPolicy)
+        );
+
         let mut no_click_headroom = traffic.clone();
         no_click_headroom.max_bid_kopecks = 5_001;
         assert_eq!(

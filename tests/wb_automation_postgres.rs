@@ -104,6 +104,20 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
             .await,
         Err(WbAutomationPostgresError::StateChanged)
     );
+    admin
+        .batch_execute("REVOKE INSERT ON wb_automation.audit_events FROM wb_automation_writer")
+        .await
+        .expect("audit insert permission fault is installed");
+    assert_eq!(
+        lease
+            .activate_protective_live_policy(&shadow_policy_digest, &live_policy_digest)
+            .await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT INSERT ON wb_automation.audit_events TO wb_automation_writer")
+        .await
+        .expect("audit insert permission is restored");
     let activation = lease
         .activate_protective_live_policy(&shadow_policy_digest, &live_policy_digest)
         .await
@@ -1545,6 +1559,10 @@ async fn incident_without_action_is_sticky_audited_and_resets_daily_quota() {
     };
     let _database_guard = POSTGRES_TEST_LOCK.lock().await;
     let config = Config::from_str(&database_url).expect("test database URL parses");
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
+        .expect("test wrapper provides the admin URL");
+    let admin_config = Config::from_str(&admin_url).expect("admin URL parses");
+    let (admin, admin_connection) = raw_client(&admin_config).await;
     let store = WbAutomationPostgresStore::connect(&config)
         .await
         .expect("store connects");
@@ -1611,6 +1629,20 @@ async fn incident_without_action_is_sticky_audited_and_resets_daily_quota() {
             .await,
         Err(WbAutomationPostgresError::StateChanged)
     );
+    admin
+        .batch_execute("REVOKE INSERT ON wb_automation.audit_events FROM wb_automation_writer")
+        .await
+        .expect("incident audit permission fault is installed");
+    assert_eq!(
+        lease
+            .mark_incident_without_action(&cycle_id, 1, business_date, "manual_resume_required")
+            .await,
+        Err(WbAutomationPostgresError::Unavailable)
+    );
+    admin
+        .batch_execute("GRANT INSERT ON wb_automation.audit_events TO wb_automation_writer")
+        .await
+        .expect("incident audit permission is restored");
     let transition = lease
         .mark_incident_without_action(&cycle_id, 1, business_date, "manual_resume_required")
         .await
@@ -1635,4 +1667,8 @@ async fn incident_without_action_is_sticky_audited_and_resets_daily_quota() {
         Err(WbAutomationPostgresError::StateChanged)
     );
     lease.release().await.expect("campaign lock is released");
+    drop(admin);
+    admin_connection
+        .await
+        .expect("admin connection task shuts down");
 }
