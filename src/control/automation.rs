@@ -44,12 +44,18 @@ pub struct WbAutomationPolicy {
     pub target_drr_basis_points: u32,
     pub hard_drr_basis_points: u32,
     pub target_impressions_per_day: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub target_orders_per_day: u64,
     #[serde(default, skip_serializing_if = "is_pacing_disabled")]
     pub autonomous_pacing: WbAutomationPacingMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_frontier_bid_kopecks: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_frontier_feedback_timeout_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_frontier_min_feedback_impressions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_frontier_min_feedback_clicks: Option<u64>,
     pub min_bid_kopecks: u64,
     pub max_bid_kopecks: u64,
     pub bid_step_percent: u8,
@@ -76,17 +82,26 @@ pub enum WbAutomationPacingMode {
     Disabled,
     Enabled,
     TrafficFrontierV2,
+    TrafficFrontierV3,
 }
 
 impl WbAutomationPacingMode {
     #[must_use]
     pub const fn is_enabled(self) -> bool {
-        matches!(self, Self::Enabled | Self::TrafficFrontierV2)
+        matches!(
+            self,
+            Self::Enabled | Self::TrafficFrontierV2 | Self::TrafficFrontierV3
+        )
     }
 
     #[must_use]
     pub const fn uses_traffic_frontier(self) -> bool {
-        matches!(self, Self::TrafficFrontierV2)
+        matches!(self, Self::TrafficFrontierV2 | Self::TrafficFrontierV3)
+    }
+
+    #[must_use]
+    pub const fn uses_marginal_feedback(self) -> bool {
+        matches!(self, Self::TrafficFrontierV3)
     }
 }
 
@@ -438,6 +453,14 @@ const fn is_false(value: &bool) -> bool {
     clippy::trivially_copy_pass_by_ref,
     reason = "serde skip_serializing_if requires a predicate that borrows the field"
 )]
+const fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires a predicate that borrows the field"
+)]
 const fn is_pacing_disabled(value: &WbAutomationPacingMode) -> bool {
     matches!(value, WbAutomationPacingMode::Disabled)
 }
@@ -575,11 +598,19 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
         || policy.hard_drr_basis_points <= policy.target_drr_basis_points
         || policy.hard_drr_basis_points > 10_000
         || policy.target_impressions_per_day == 0
-        || policy.autonomous_pacing.uses_traffic_frontier()
-            && !valid_traffic_frontier_policy(policy)
-        || !policy.autonomous_pacing.uses_traffic_frontier()
+        || (!policy.autonomous_pacing.uses_marginal_feedback() && policy.target_orders_per_day != 0)
+        || (policy.autonomous_pacing.uses_traffic_frontier()
+            && !valid_traffic_frontier_policy(policy))
+        || (!policy.autonomous_pacing.uses_traffic_frontier()
             && (policy.traffic_frontier_bid_kopecks.is_some()
-                || policy.traffic_frontier_feedback_timeout_seconds.is_some())
+                || policy.traffic_frontier_feedback_timeout_seconds.is_some()
+                || policy.traffic_frontier_min_feedback_impressions.is_some()
+                || policy.traffic_frontier_min_feedback_clicks.is_some()))
+        || (policy.autonomous_pacing == WbAutomationPacingMode::TrafficFrontierV2
+            && (policy.traffic_frontier_min_feedback_impressions.is_some()
+                || policy.traffic_frontier_min_feedback_clicks.is_some()))
+        || (policy.autonomous_pacing.uses_marginal_feedback()
+            && !valid_marginal_feedback_policy(policy))
         || policy.min_bid_kopecks == 0
         || policy.max_bid_kopecks < policy.min_bid_kopecks
         || !(1..=25).contains(&policy.bid_step_percent)
@@ -601,6 +632,28 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
         return Err(WbAutomationDecisionError::InvalidPolicy);
     }
     Ok(())
+}
+
+const fn valid_marginal_feedback_policy(policy: &WbAutomationPolicy) -> bool {
+    let Some(min_impressions) = policy.traffic_frontier_min_feedback_impressions else {
+        return false;
+    };
+    let Some(min_clicks) = policy.traffic_frontier_min_feedback_clicks else {
+        return false;
+    };
+    min_impressions >= 100
+        && min_impressions <= 10_000
+        && min_clicks >= 5
+        && min_clicks <= 100
+        && min_clicks <= min_impressions
+        && policy.target_impressions_per_day >= 1_300
+        && policy.target_impressions_per_day <= 1_600
+        && policy.target_orders_per_day >= 3
+        && policy.target_orders_per_day <= 4
+        && policy.max_actions_per_day >= 9
+        && policy.max_actions_per_day <= 12
+        && policy.cooldown_seconds >= 1_800
+        && policy.cooldown_seconds <= 3_600
 }
 
 const fn valid_traffic_frontier_policy(policy: &WbAutomationPolicy) -> bool {
@@ -803,9 +856,12 @@ mod tests {
             target_drr_basis_points: 1_500,
             hard_drr_basis_points: 2_500,
             target_impressions_per_day: 5_000,
+            target_orders_per_day: 0,
             autonomous_pacing: WbAutomationPacingMode::Enabled,
             traffic_frontier_bid_kopecks: None,
             traffic_frontier_feedback_timeout_seconds: None,
+            traffic_frontier_min_feedback_impressions: None,
+            traffic_frontier_min_feedback_clicks: None,
             min_bid_kopecks: 102,
             max_bid_kopecks: 600,
             bid_step_percent: 15,
@@ -1548,7 +1604,7 @@ mod tests {
             "../../config/wb-automation-robot.json"
         ))
         .unwrap();
-        let observed_at = Utc.with_ymd_and_hms(2026, 8, 27, 10, 10, 0).unwrap();
+        let observed_at = robot_policy.observe_until + Duration::minutes(5);
         let live_skus = [(449_627_598, 10), (449_627_015, 12), (497_424_314, 10)]
             .into_iter()
             .map(|(nm_id, sellable_stock)| WbAutomationSkuObservation {

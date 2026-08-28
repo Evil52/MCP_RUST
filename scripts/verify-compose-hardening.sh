@@ -1767,17 +1767,17 @@ check_contains \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   "activate-bid-writes-pg"
 check_contains \
-  "WB automation bid-live installer uses audited traffic-frontier corridor migration" \
+  "WB automation bid-live installer uses audited traffic-frontier v3 migration" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  "tighten-traffic-frontier-corridor-pg"
+  "activate-traffic-frontier-v3-pg"
 check_contains \
   "WB automation bid-live installer validates activation outcome" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
   '.outcome == "bid_writes_activated"'
 check_contains \
-  "WB automation bid-live installer validates traffic-frontier corridor outcome" \
+  "WB automation bid-live installer validates traffic-frontier v3 outcome" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  '.outcome == "traffic_frontier_corridor_tightened"'
+  '.outcome == "traffic_frontier_v3_activated"'
 check_contains \
   "WB automation bid-live installer pins emergency bid cap" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
@@ -1785,7 +1785,11 @@ check_contains \
 check_contains \
   "WB automation bid-live installer pins traffic-frontier pacing" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
-  '.autonomous_pacing == "traffic_frontier_v2"'
+  '.autonomous_pacing == "traffic_frontier_v3"'
+check_contains \
+  "WB automation bid-live installer pins marginal feedback sample" \
+  "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \
+  '.traffic_frontier_min_feedback_impressions == 200'
 check_contains \
   "WB automation bid-live installer pins 7 RUB traffic frontier" \
   "$project_dir/scripts/enable-wb-automation-bid-writes.sh" \

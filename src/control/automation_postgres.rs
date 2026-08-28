@@ -56,6 +56,7 @@ pub struct WbAutomationLegacyStateSeed {
 pub enum WbAutomationDurableActionKind {
     ChangeBids,
     PauseCampaignForDailyCap,
+    ResumeCampaignAfterDailyCap,
 }
 
 impl WbAutomationDurableActionKind {
@@ -63,6 +64,7 @@ impl WbAutomationDurableActionKind {
         match self {
             Self::ChangeBids => "change_bids",
             Self::PauseCampaignForDailyCap => "pause_campaign_for_daily_cap",
+            Self::ResumeCampaignAfterDailyCap => "resume_campaign_after_daily_cap",
         }
     }
 }
@@ -136,6 +138,15 @@ enum PolicyTransition {
         cooldown_seconds: u32,
         feedback_timeout_seconds: u32,
     },
+    TrafficFrontierV3Activated {
+        target_impressions_per_day: u64,
+        target_orders_per_day: u64,
+        max_actions_per_day: u32,
+        cooldown_seconds: u32,
+        feedback_timeout_seconds: u32,
+        min_feedback_impressions: u64,
+        min_feedback_clicks: u64,
+    },
     TrafficFrontierLimitsRaised {
         from_frontier_bid_kopecks: u64,
         to_frontier_bid_kopecks: u64,
@@ -159,6 +170,7 @@ impl PolicyTransition {
             Self::BidWrites => "bid_writes_activated",
             Self::BoundedPacingActivated { .. } => "bounded_pacing_activated",
             Self::TrafficFrontierV2Activated { .. } => "traffic_frontier_v2_activated",
+            Self::TrafficFrontierV3Activated { .. } => "traffic_frontier_v3_activated",
             Self::TrafficFrontierLimitsRaised { .. } => "traffic_frontier_limits_raised",
             Self::TrafficFrontierCorridorTightened { .. } => "traffic_frontier_corridor_tightened",
         }
@@ -170,6 +182,7 @@ impl PolicyTransition {
             Self::BidWrites
             | Self::BoundedPacingActivated { .. }
             | Self::TrafficFrontierV2Activated { .. }
+            | Self::TrafficFrontierV3Activated { .. }
             | Self::TrafficFrontierLimitsRaised { .. }
             | Self::TrafficFrontierCorridorTightened { .. } => "bid_live",
         }
@@ -181,6 +194,7 @@ impl PolicyTransition {
             Self::BidWrites
                 | Self::BoundedPacingActivated { .. }
                 | Self::TrafficFrontierV2Activated { .. }
+                | Self::TrafficFrontierV3Activated { .. }
                 | Self::TrafficFrontierLimitsRaised { .. }
                 | Self::TrafficFrontierCorridorTightened { .. }
         )
@@ -203,15 +217,20 @@ impl PolicyTransition {
                 to_max_bid_kopecks,
                 ..
             } => Some((from_max_bid_kopecks, to_max_bid_kopecks)),
-            Self::ProtectiveLive | Self::BidWrites | Self::TrafficFrontierLimitsRaised { .. } => {
-                None
-            }
+            Self::ProtectiveLive
+            | Self::BidWrites
+            | Self::TrafficFrontierV3Activated { .. }
+            | Self::TrafficFrontierLimitsRaised { .. } => None,
         }
     }
 
     const fn target_impressions_per_day(self) -> Option<u64> {
         match self {
             Self::BoundedPacingActivated {
+                target_impressions_per_day,
+                ..
+            }
+            | Self::TrafficFrontierV3Activated {
                 target_impressions_per_day,
                 ..
             } => Some(target_impressions_per_day),
@@ -570,6 +589,49 @@ impl WbAutomationCampaignLease<'_> {
         .await
     }
 
+    /// Activates the reviewed Traffic Frontier v3 marginal-feedback policy
+    /// without resetting durable counters, cooldown history, pending-action
+    /// guards, incidents or the last applied feedback baseline.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn activate_traffic_frontier_v3_policy(
+        &mut self,
+        source_policy_digest: &str,
+        target_policy_digest: &str,
+        target_impressions_per_day: u64,
+        target_orders_per_day: u64,
+        max_actions_per_day: u32,
+        cooldown_seconds: u32,
+        feedback_timeout_seconds: u32,
+        min_feedback_impressions: u64,
+        min_feedback_clicks: u64,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        if !(1_300..=1_600).contains(&target_impressions_per_day)
+            || !(3..=4).contains(&target_orders_per_day)
+            || !(9..=12).contains(&max_actions_per_day)
+            || !(1_800..=3_600).contains(&cooldown_seconds)
+            || feedback_timeout_seconds < cooldown_seconds
+            || !(100..=10_000).contains(&min_feedback_impressions)
+            || !(5..=100).contains(&min_feedback_clicks)
+            || min_feedback_clicks > min_feedback_impressions
+        {
+            return Err(WbAutomationPostgresError::InvalidInput);
+        }
+        self.activate_policy_transition(
+            source_policy_digest,
+            target_policy_digest,
+            PolicyTransition::TrafficFrontierV3Activated {
+                target_impressions_per_day,
+                target_orders_per_day,
+                max_actions_per_day,
+                cooldown_seconds,
+                feedback_timeout_seconds,
+                min_feedback_impressions,
+                min_feedback_clicks,
+            },
+        )
+        .await
+    }
+
     /// Raises the reviewed Traffic Frontier entry and daily budget limits
     /// without resetting action counters, feedback baselines, incidents or
     /// pause state. The exact authorized values are checked by the CLI before
@@ -770,6 +832,25 @@ impl WbAutomationCampaignLease<'_> {
             payload["max_actions_per_day"] = max_actions_per_day.into();
             payload["cooldown_seconds"] = cooldown_seconds.into();
             payload["feedback_timeout_seconds"] = feedback_timeout_seconds.into();
+        }
+        if let PolicyTransition::TrafficFrontierV3Activated {
+            target_impressions_per_day,
+            target_orders_per_day,
+            max_actions_per_day,
+            cooldown_seconds,
+            feedback_timeout_seconds,
+            min_feedback_impressions,
+            min_feedback_clicks,
+        } = transition
+        {
+            payload["autonomous_pacing"] = "traffic_frontier_v3".into();
+            payload["target_impressions_per_day"] = target_impressions_per_day.into();
+            payload["target_orders_per_day"] = target_orders_per_day.into();
+            payload["max_actions_per_day"] = max_actions_per_day.into();
+            payload["cooldown_seconds"] = cooldown_seconds.into();
+            payload["feedback_timeout_seconds"] = feedback_timeout_seconds.into();
+            payload["min_feedback_impressions"] = min_feedback_impressions.into();
+            payload["min_feedback_clicks"] = min_feedback_clicks.into();
         }
         if let PolicyTransition::TrafficFrontierLimitsRaised {
             from_frontier_bid_kopecks,
@@ -1513,7 +1594,10 @@ impl WbAutomationCampaignLease<'_> {
             Err(error) => return Err(error),
         };
         let pause_shape_matches = match action.action_kind {
-            WbAutomationDurableActionKind::ChangeBids => paused_for_daily_cap_on.is_none(),
+            WbAutomationDurableActionKind::ChangeBids
+            | WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap => {
+                paused_for_daily_cap_on.is_none()
+            }
             WbAutomationDurableActionKind::PauseCampaignForDailyCap => {
                 matches!(paused_for_daily_cap_on, Some(date) if date <= state.business_date)
             }
@@ -1530,6 +1614,9 @@ impl WbAutomationCampaignLease<'_> {
                 || state.pending_idempotency_key.is_some()
                 || (action.action_kind == WbAutomationDurableActionKind::PauseCampaignForDailyCap
                     && state.paused_for_daily_cap_on != paused_for_daily_cap_on)
+                || (action.action_kind
+                    == WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap
+                    && state.paused_for_daily_cap_on.is_some())
             {
                 return Err(WbAutomationPostgresError::StateChanged);
             }
@@ -1619,6 +1706,21 @@ impl WbAutomationCampaignLease<'_> {
                             &self.account_id,
                             &self.campaign_id,
                             &paused_for_daily_cap_on,
+                            &new_revision,
+                            &expected_revision,
+                        ],
+                    )
+                    .await
+            }
+            WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap => {
+                transaction
+                    .execute(
+                        "UPDATE wb_automation.execution_state \
+                         SET pending_idempotency_key=NULL, paused_for_daily_cap_on=NULL, revision=$3 \
+                         WHERE account_id=$1 AND advert_id=$2 AND revision=$4",
+                        &[
+                            &self.account_id,
+                            &self.campaign_id,
                             &new_revision,
                             &expected_revision,
                         ],
@@ -1798,7 +1900,8 @@ fn validate_reservation(
                 return Err(WbAutomationPostgresError::InvalidInput);
             }
         }
-        WbAutomationDurableActionKind::PauseCampaignForDailyCap => {
+        WbAutomationDurableActionKind::PauseCampaignForDailyCap
+        | WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap => {
             if object.contains_key("changes") {
                 return Err(WbAutomationPostgresError::InvalidInput);
             }
@@ -1969,6 +2072,9 @@ fn parse_action_kind(
         "pause_campaign_for_daily_cap" => {
             Ok(WbAutomationDurableActionKind::PauseCampaignForDailyCap)
         }
+        "resume_campaign_after_daily_cap" => {
+            Ok(WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap)
+        }
         _ => Err(WbAutomationPostgresError::Unavailable),
     }
 }
@@ -2107,6 +2213,10 @@ pub fn exercise_coverage_only_database_mappings() {
     assert_eq!(
         parse_action_kind("pause_campaign_for_daily_cap"),
         Ok(WbAutomationDurableActionKind::PauseCampaignForDailyCap)
+    );
+    assert_eq!(
+        parse_action_kind("resume_campaign_after_daily_cap"),
+        Ok(WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap)
     );
     assert_eq!(
         parse_action_kind("unknown"),

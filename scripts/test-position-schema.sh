@@ -617,6 +617,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/021_wb_automation_state.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/022_wb_automation_explicit_resume.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \
@@ -625,6 +627,8 @@ migration_admin_psql=(
   --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /docker-entrypoint-initdb.d/021_wb_automation_state.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /docker-entrypoint-initdb.d/022_wb_automation_explicit_resume.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)

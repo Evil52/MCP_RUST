@@ -89,17 +89,20 @@ if ! jq -e '
   and .account_id == "ip_domnyshev_wb"
   and .campaign_id == 39682633
   and .nm_ids == [449627598, 449627015, 497424314]
-  and .target_impressions_per_day == 5000
-  and .autonomous_pacing == "traffic_frontier_v2"
+  and .target_impressions_per_day == 1500
+  and .target_orders_per_day == 3
+  and .autonomous_pacing == "traffic_frontier_v3"
   and .traffic_frontier_bid_kopecks == 700
-  and .traffic_frontier_feedback_timeout_seconds == 1800
+  and .traffic_frontier_feedback_timeout_seconds == 3600
+  and .traffic_frontier_min_feedback_impressions == 200
+  and .traffic_frontier_min_feedback_clicks == 10
   and .min_bid_kopecks == 102
   and .max_bid_kopecks == 1200
   and .bid_step_percent == 5
   and .daily_pause_threshold_minor == 45000
   and .daily_spend_cap_minor == 50000
-  and .max_actions_per_day == 50
-  and .cooldown_seconds == 300
+  and .max_actions_per_day == 12
+  and .cooldown_seconds == 1800
   and .allow_budget_top_up == false
 ' "$bid_policy_source" >/dev/null; then
   echo "repository WB bid-live policy exceeds the approved limits" >&2
@@ -160,9 +163,13 @@ if [[ -e "$bid_policy_target" ]]; then
       | .authorized_at = $target[0].authorized_at
       | .authorization_expires_at = $target[0].authorization_expires_at
       | .observe_until = $target[0].observe_until
+      | .target_impressions_per_day = $target[0].target_impressions_per_day
+      | .target_orders_per_day = $target[0].target_orders_per_day
       | .autonomous_pacing = $target[0].autonomous_pacing
       | .traffic_frontier_bid_kopecks = $target[0].traffic_frontier_bid_kopecks
       | .traffic_frontier_feedback_timeout_seconds = $target[0].traffic_frontier_feedback_timeout_seconds
+      | .traffic_frontier_min_feedback_impressions = $target[0].traffic_frontier_min_feedback_impressions
+      | .traffic_frontier_min_feedback_clicks = $target[0].traffic_frontier_min_feedback_clicks
       | .max_bid_kopecks = $target[0].max_bid_kopecks
       | .bid_step_percent = $target[0].bid_step_percent
       | .daily_pause_threshold_minor = $target[0].daily_pause_threshold_minor
@@ -173,11 +180,15 @@ if [[ -e "$bid_policy_target" ]]; then
     if ! jq -e '
       .write_enabled == true
       and .bid_writes_enabled == true
-      and .authorization_reference == "chat/2026-08-27/traffic-frontier-10-daily-500"
+      and .authorization_reference == "chat/2026-08-27/traffic-frontier-7-12"
+      and .target_impressions_per_day == 5000
+      and (.target_orders_per_day // 0) == 0
       and .autonomous_pacing == "traffic_frontier_v2"
-      and .traffic_frontier_bid_kopecks == 1000
+      and .traffic_frontier_bid_kopecks == 700
       and .traffic_frontier_feedback_timeout_seconds == 1800
-      and .max_bid_kopecks == 3000
+      and (.traffic_frontier_min_feedback_impressions // null) == null
+      and (.traffic_frontier_min_feedback_clicks // null) == null
+      and .max_bid_kopecks == 1200
       and .bid_step_percent == 5
       and .daily_pause_threshold_minor == 45000
       and .daily_spend_cap_minor == 50000
@@ -302,7 +313,7 @@ fi
 
 if [[ "$migration_required" == "true" ]]; then
   activation_output="$("${compose[@]}" run --rm --no-deps wb-automation-live \
-    tighten-traffic-frontier-corridor-pg \
+    activate-traffic-frontier-v3-pg \
     /etc/mcp-ozon/wb-automation-shadow-policy.json \
     /etc/mcp-ozon/wb-automation-live-policy.json \
     /etc/mcp-ozon/access.json \
@@ -329,6 +340,8 @@ if ! jq -e '
   or .outcome == "traffic_frontier_limits_already_active"
   or .outcome == "traffic_frontier_corridor_tightened"
   or .outcome == "traffic_frontier_corridor_already_active"
+  or .outcome == "traffic_frontier_v3_activated"
+  or .outcome == "traffic_frontier_v3_already_active"
 ' <<<"$activation_output" >/dev/null; then
   echo "WB automation bid-live activation did not complete" >&2
   exit 1

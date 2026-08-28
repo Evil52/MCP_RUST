@@ -17,6 +17,7 @@ position_compose="$project_root/compose.position.yaml"
 legacy_egress_compose="$project_root/compose.wb-automation-egress.yaml"
 roles_script="$project_root/position-monitor/initdb/003_roles.sh"
 migration="$project_root/position-monitor/initdb/021_wb_automation_state.sql"
+explicit_resume_migration="$project_root/position-monitor/initdb/022_wb_automation_explicit_resume.sql"
 position_env="$project_root/.position.env"
 runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
 position_env_target="$runtime_dir/position.env"
@@ -47,7 +48,8 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 for path in \
   "$policy_source" "$runner_source" "$plist_template" "$shadow_compose" \
-  "$position_compose" "$legacy_egress_compose" "$roles_script" "$migration" "$position_env" \
+  "$position_compose" "$legacy_egress_compose" "$roles_script" "$migration" \
+  "$explicit_resume_migration" "$position_env" \
   "$registry" "$reader_token" "$legacy_state"; do
   if [[ ! -f "$path" || -L "$path" ]]; then
     echo "required WB automation shadow file is unavailable or unsafe: $path" >&2
@@ -160,6 +162,13 @@ fi
     --username "${POSITION_DB_ADMIN_USER:-position_admin}" \
     --dbname "${POSITION_DB_NAME:-ozon_positions}" \
     <"$migration" >/dev/null
+"$docker_bin" exec -i \
+  --env PGPASSWORD="$POSITION_DB_ADMIN_PASSWORD" \
+  "$position_container" psql \
+    --no-psqlrc --set ON_ERROR_STOP=1 \
+    --username "${POSITION_DB_ADMIN_USER:-position_admin}" \
+    --dbname "${POSITION_DB_NAME:-ozon_positions}" \
+    <"$explicit_resume_migration" >/dev/null
 
 mkdir -p "$runtime_dir" "$libexec_dir" "$agent_dir" "$log_dir"
 chmod 700 "$runtime_dir" "$libexec_dir"
