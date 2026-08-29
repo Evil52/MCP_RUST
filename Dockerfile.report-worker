@@ -17,7 +17,8 @@ FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec4
 ARG MCP_RELEASE_GIT_SHA=unverified
 LABEL org.opencontainers.image.revision="${MCP_RELEASE_GIT_SHA}"
 
-RUN addgroup -S -g 10001 reporting \
+RUN apk upgrade --no-cache \
+    && addgroup -S -g 10001 reporting \
     && adduser -S -D -H -u 10001 -G reporting reporting \
     && install -d -o reporting -g reporting -m 0700 /var/lib/mcp-ozon/report-artifacts
 
