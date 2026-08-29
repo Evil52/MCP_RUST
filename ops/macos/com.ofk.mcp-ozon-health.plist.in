@@ -22,6 +22,8 @@
     <string>__BACKUP_DIR__</string>
     <key>MCP_HEALTH_NOTIFY_COMMAND</key>
     <string>__NOTIFY_COMMAND__</string>
+    <key>MCP_BACKUP_ALLOW_LOCAL_ONLY</key>
+    <string>__ALLOW_LOCAL_ONLY__</string>
     <key>PATH</key>
     <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>

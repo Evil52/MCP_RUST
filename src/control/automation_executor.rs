@@ -850,6 +850,11 @@ const BASIS_POINTS: u128 = 10_000;
 const SECONDS_PER_DAY: u64 = 86_400;
 const MOSCOW_OFFSET_SECONDS: i64 = 3 * 60 * 60;
 
+struct TrafficFrontierFeedback {
+    metrics: super::automation::WbAutomationCampaignMetrics,
+    zero_cost_probe: bool,
+}
+
 /// Maintains a CPC campaign around a measured traffic frontier without
 /// repeatedly acting on the same delayed WB statistics. The initial jump is
 /// explicit policy. V2 retains cumulative feedback semantics, while V3 waits
@@ -863,7 +868,7 @@ fn traffic_frontier_pacing_decision(
     snapshot: &WbAutomationSnapshot,
     last_applied_snapshot: Option<&WbAutomationSnapshot>,
 ) -> Result<Option<WbAutomationDecision>> {
-    use super::automation::{WbAutomationBidReason, WbAutomationHoldReason};
+    use super::automation::WbAutomationHoldReason;
 
     if !matches!(
         snapshot.decision.action,
@@ -887,47 +892,16 @@ fn traffic_frontier_pacing_decision(
         "WB traffic-frontier current campaign metrics are inconsistent"
     );
 
-    let mut zero_cost_probe = false;
-    let feedback_metrics = if policy.autonomous_pacing.uses_marginal_feedback() {
-        let Some(delta) = traffic_feedback_delta(snapshot, metrics, last_applied_snapshot) else {
-            return Ok(Some(traffic_frontier_hold(
-                policy,
-                snapshot,
-                WbAutomationHoldReason::TrafficFeedbackPending,
-            )));
-        };
-        let min_impressions = policy
-            .traffic_frontier_min_feedback_impressions
-            .context("WB traffic-frontier v3 minimum feedback impressions are unavailable")?;
-        let min_clicks = policy
-            .traffic_frontier_min_feedback_clicks
-            .context("WB traffic-frontier v3 minimum feedback clicks are unavailable")?;
-        zero_cost_probe = policy.autonomous_pacing.allows_zero_cost_probe()
-            && traffic_frontier_zero_cost_probe_is_actionable(policy, snapshot, &delta)?;
-        if delta.impressions < min_impressions && delta.clicks < min_clicks && !zero_cost_probe {
-            return Ok(Some(traffic_frontier_hold(
-                policy,
-                snapshot,
-                WbAutomationHoldReason::TrafficFeedbackPending,
-            )));
-        }
-        delta
-    } else {
-        if !traffic_frontier_v2_feedback_is_actionable(
+    let Some(feedback) =
+        traffic_frontier_feedback(policy, snapshot, metrics, last_applied_snapshot)?
+    else {
+        return Ok(Some(traffic_frontier_hold(
             policy,
             snapshot,
-            metrics,
-            last_applied_snapshot,
-        )? {
-            return Ok(Some(traffic_frontier_hold(
-                policy,
-                snapshot,
-                WbAutomationHoldReason::TrafficFeedbackPending,
-            )));
-        }
-        metrics.clone()
+            WbAutomationHoldReason::TrafficFeedbackPending,
+        )));
     };
-    let drr = campaign_drr_basis_points(&feedback_metrics)?;
+    let drr = campaign_drr_basis_points(&feedback.metrics)?;
     let expected_spend = paced_value(
         policy.daily_pause_threshold_minor,
         snapshot.observation.observed_at,
@@ -942,35 +916,10 @@ fn traffic_frontier_pacing_decision(
         < u128::from(expected_spend) * PACING_LOWER_BASIS_POINTS;
     let delivery_under_pace = metrics.impressions < expected_impressions;
 
-    let no_order_reduce_clicks = if policy.autonomous_pacing.uses_marginal_feedback() {
-        policy
-            .traffic_frontier_min_feedback_clicks
-            .context("WB traffic-frontier v3 minimum feedback clicks are unavailable")?
-    } else {
-        policy.no_order_reduce_clicks
-    };
-    if feedback_metrics.attributed_orders == 0 && feedback_metrics.clicks >= no_order_reduce_clicks
+    if let Some(reason) =
+        traffic_frontier_decrease_reason(policy, &feedback.metrics, drr, spend_over_pace)?
     {
-        return Ok(traffic_frontier_decrease(
-            policy,
-            snapshot,
-            WbAutomationBidReason::NoOrdersAfterClicks,
-        ));
-    }
-    if drr.is_some_and(|value| value > policy.target_drr_basis_points) {
-        let reason = if drr.is_some_and(|value| value > policy.hard_drr_basis_points) {
-            WbAutomationBidReason::HardDrrExceeded
-        } else {
-            WbAutomationBidReason::TargetDrrExceeded
-        };
         return Ok(traffic_frontier_decrease(policy, snapshot, reason));
-    }
-    if spend_over_pace {
-        return Ok(traffic_frontier_decrease(
-            policy,
-            snapshot,
-            WbAutomationBidReason::TrafficFrontierRetentionDecrease,
-        ));
     }
     if policy.autonomous_pacing.uses_marginal_feedback()
         && metrics.attributed_orders >= policy.target_orders_per_day
@@ -986,9 +935,9 @@ fn traffic_frontier_pacing_decision(
     // below the target marginal DRR. The only exception is V4's bounded
     // zero-cost probe established above.
     if policy.autonomous_pacing.uses_marginal_feedback()
-        && !zero_cost_probe
-        && (feedback_metrics.attributed_orders == 0
-            || feedback_metrics.attributed_revenue_minor == 0
+        && !feedback.zero_cost_probe
+        && (feedback.metrics.attributed_orders == 0
+            || feedback.metrics.attributed_revenue_minor == 0
             || drr.is_none_or(|value| value > policy.target_drr_basis_points))
     {
         return Ok(Some(traffic_frontier_hold(
@@ -998,10 +947,87 @@ fn traffic_frontier_pacing_decision(
         )));
     }
 
+    traffic_frontier_increase_decision(policy, snapshot, &feedback.metrics)
+}
+
+fn traffic_frontier_feedback(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    metrics: &super::automation::WbAutomationCampaignMetrics,
+    last_applied_snapshot: Option<&WbAutomationSnapshot>,
+) -> Result<Option<TrafficFrontierFeedback>> {
+    if !policy.autonomous_pacing.uses_marginal_feedback() {
+        let actionable = traffic_frontier_v2_feedback_is_actionable(
+            policy,
+            snapshot,
+            metrics,
+            last_applied_snapshot,
+        )?;
+        return Ok(actionable.then(|| TrafficFrontierFeedback {
+            metrics: metrics.clone(),
+            zero_cost_probe: false,
+        }));
+    }
+
+    let Some(delta) = traffic_feedback_delta(snapshot, metrics, last_applied_snapshot) else {
+        return Ok(None);
+    };
+    let min_impressions = policy
+        .traffic_frontier_min_feedback_impressions
+        .context("WB traffic-frontier v3 minimum feedback impressions are unavailable")?;
+    let min_clicks = policy
+        .traffic_frontier_min_feedback_clicks
+        .context("WB traffic-frontier v3 minimum feedback clicks are unavailable")?;
+    let zero_cost_probe = policy.autonomous_pacing.allows_zero_cost_probe()
+        && traffic_frontier_zero_cost_probe_is_actionable(policy, snapshot, &delta)?;
+    if delta.impressions < min_impressions && delta.clicks < min_clicks && !zero_cost_probe {
+        return Ok(None);
+    }
+    Ok(Some(TrafficFrontierFeedback {
+        metrics: delta,
+        zero_cost_probe,
+    }))
+}
+
+fn traffic_frontier_decrease_reason(
+    policy: &super::automation::WbAutomationPolicy,
+    feedback: &super::automation::WbAutomationCampaignMetrics,
+    drr: Option<u32>,
+    spend_over_pace: bool,
+) -> Result<Option<super::automation::WbAutomationBidReason>> {
+    use super::automation::WbAutomationBidReason;
+
+    let no_order_reduce_clicks = if policy.autonomous_pacing.uses_marginal_feedback() {
+        policy
+            .traffic_frontier_min_feedback_clicks
+            .context("WB traffic-frontier v3 minimum feedback clicks are unavailable")?
+    } else {
+        policy.no_order_reduce_clicks
+    };
+    if feedback.attributed_orders == 0 && feedback.clicks >= no_order_reduce_clicks {
+        return Ok(Some(WbAutomationBidReason::NoOrdersAfterClicks));
+    }
+    if let Some(value) = drr.filter(|value| *value > policy.target_drr_basis_points) {
+        return Ok(Some(if value > policy.hard_drr_basis_points {
+            WbAutomationBidReason::HardDrrExceeded
+        } else {
+            WbAutomationBidReason::TargetDrrExceeded
+        }));
+    }
+    Ok(spend_over_pace.then_some(WbAutomationBidReason::TrafficFrontierRetentionDecrease))
+}
+
+fn traffic_frontier_increase_decision(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+    feedback: &super::automation::WbAutomationCampaignMetrics,
+) -> Result<Option<WbAutomationDecision>> {
+    use super::automation::WbAutomationBidReason;
+
     let frontier = policy
         .traffic_frontier_bid_kopecks
         .context("WB traffic-frontier entry bid is unavailable")?;
-    let dynamic_cap = traffic_frontier_dynamic_cap(policy, snapshot, &feedback_metrics)?;
+    let dynamic_cap = traffic_frontier_dynamic_cap(policy, snapshot, feedback)?;
     if dynamic_cap < frontier {
         return Ok(None);
     }

@@ -9,6 +9,17 @@ if [[ $# -ne 1 || "$1" != "$confirmation" ]]; then
 fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+release_record="$(
+  "$project_root/scripts/verify-release-images.sh" \
+    wb-automation control-write-egress ozon-egress
+)"
+export MCP_WB_AUTOMATION_IMAGE
+MCP_WB_AUTOMATION_IMAGE="$(jq -r '.images["wb-automation"]' <<<"$release_record")"
+export MCP_CONTROL_WRITE_EGRESS_IMAGE
+MCP_CONTROL_WRITE_EGRESS_IMAGE="$(
+  jq -r '.images["control-write-egress"]' <<<"$release_record"
+)"
+ozon_egress_image="$(jq -r '.images["ozon-egress"]' <<<"$release_record")"
 shadow_policy_source="$project_root/config/wb-automation-robot.json"
 protective_policy_source="$project_root/config/wb-automation-robot.live.json"
 bid_policy_source="$project_root/config/wb-automation-robot.bid-live.json"
@@ -227,7 +238,6 @@ compose=(
   -f "$live_compose"
 )
 "${compose[@]}" config --quiet
-"${compose[@]}" build wb-automation-live write-egress
 
 sed \
   -e "s|__RUNNER__|$runner_target|g" \
@@ -235,13 +245,15 @@ sed \
   -e "s|__LOG_DIR__|$log_dir|g" \
   -e "s|__RUNTIME_DIR__|$runtime_dir|g" \
   -e "s|__PROJECT_DIR__|$project_root|g" \
+  -e "s|__WB_AUTOMATION_IMAGE__|$MCP_WB_AUTOMATION_IMAGE|g" \
+  -e "s|__CONTROL_WRITE_EGRESS_IMAGE__|$MCP_CONTROL_WRITE_EGRESS_IMAGE|g" \
   -e "s|__BID_WRITES_ENABLED__|true|g" \
   "$plist_template" >"$temporary_plist"
 plutil -lint "$temporary_plist" >/dev/null
 
 # Build and prove both credentialless egresses before stopping the currently
 # healthy protective timer.
-"$docker_bin" compose \
+MCP_OZON_EGRESS_IMAGE="$ozon_egress_image" "$docker_bin" compose \
   --project-directory "$project_root" \
   --env-file "$position_env" \
   -f "$position_compose" \

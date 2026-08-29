@@ -1008,22 +1008,16 @@ fn load_jwt_config(lookup: &mut dyn FnMut(&str) -> Option<String>) -> Result<Jwt
         .context("MCP_JWT_ISSUER обязателен при MCP_AUTH_MODE=jwt")?
         .trim_end_matches('/')
         .to_owned();
+    validate_jwt_https_url("MCP_JWT_ISSUER", &issuer)?;
     let audience =
         lookup("MCP_JWT_AUDIENCE").context("MCP_JWT_AUDIENCE обязателен при MCP_AUTH_MODE=jwt")?;
     let jwks_url = lookup("MCP_JWT_JWKS_URL")
         .unwrap_or_else(|| format!("{issuer}/protocol/openid-connect/certs"));
+    validate_jwt_https_url("MCP_JWT_JWKS_URL", &jwks_url)?;
     let resource_url =
         lookup("MCP_PUBLIC_URL").context("MCP_PUBLIC_URL обязателен при MCP_AUTH_MODE=jwt")?;
-    let mut parsed_resource =
-        reqwest::Url::parse(&resource_url).context("MCP_PUBLIC_URL должен быть абсолютным URL")?;
-    if !matches!(parsed_resource.scheme(), "http" | "https") {
-        bail!("MCP_PUBLIC_URL должен использовать http или https");
-    }
-    let parsed_audience = reqwest::Url::parse(&audience)
-        .context("MCP_JWT_AUDIENCE должен быть абсолютным URL ресурса MCP_PUBLIC_URL")?;
-    if !matches!(parsed_audience.scheme(), "http" | "https") {
-        bail!("MCP_JWT_AUDIENCE должен использовать http или https");
-    }
+    let mut parsed_resource = validate_jwt_https_url("MCP_PUBLIC_URL", &resource_url)?;
+    let parsed_audience = validate_jwt_https_url("MCP_JWT_AUDIENCE", &audience)?;
     let resource_url = parsed_resource.to_string();
     let audience = parsed_audience.to_string();
     if audience != resource_url {
@@ -1055,6 +1049,20 @@ fn load_jwt_config(lookup: &mut dyn FnMut(&str) -> Option<String>) -> Result<Jwt
         required_scopes,
         jwks_cache_ttl: Duration::from_secs(ttl),
     })
+}
+
+fn validate_jwt_https_url(name: &str, value: &str) -> Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(value).with_context(|| format!("{name} должен быть URL"))?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("{name} должен быть абсолютным HTTPS URL без credentials/query/fragment");
+    }
+    Ok(parsed)
 }
 
 fn load_auth_config(
@@ -2477,8 +2485,8 @@ mod tests {
             let jwt = BTreeMap::from([
                 ("MCP_AUTH_MODE", "jwt"),
                 ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-                ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
-                ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
+                ("MCP_JWT_ISSUER", "https://issuer.test/realms/ofk"),
+                ("MCP_JWT_AUDIENCE", "https://localhost:8788/mcp"),
                 ("MCP_PUBLIC_URL", value),
             ]);
             assert!(
@@ -2491,9 +2499,9 @@ mod tests {
             let jwt = BTreeMap::from([
                 ("MCP_AUTH_MODE", "jwt"),
                 ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-                ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
-                ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
-                ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
+                ("MCP_JWT_ISSUER", "https://issuer.test/realms/ofk"),
+                ("MCP_JWT_AUDIENCE", "https://localhost:8788/mcp"),
+                ("MCP_PUBLIC_URL", "https://localhost:8788/mcp"),
                 ("MCP_JWKS_CACHE_TTL_SECONDS", value),
             ]);
             assert!(
@@ -2512,9 +2520,9 @@ mod tests {
             let jwt = BTreeMap::from([
                 ("MCP_AUTH_MODE", "jwt"),
                 ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-                ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
-                ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
-                ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
+                ("MCP_JWT_ISSUER", "https://issuer.test/realms/ofk"),
+                ("MCP_JWT_AUDIENCE", "https://localhost:8788/mcp"),
+                ("MCP_PUBLIC_URL", "https://localhost:8788/mcp"),
                 ("MCP_JWT_REQUIRED_SCOPES", value),
             ]);
             assert!(
@@ -2537,9 +2545,9 @@ mod tests {
         let required_jwt_values = [
             ("MCP_AUTH_MODE", "jwt"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-            ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
-            ("MCP_JWT_AUDIENCE", "http://localhost:8788/mcp"),
-            ("MCP_PUBLIC_URL", "http://localhost:8788/mcp"),
+            ("MCP_JWT_ISSUER", "https://issuer.test/realms/ofk"),
+            ("MCP_JWT_AUDIENCE", "https://localhost:8788/mcp"),
+            ("MCP_PUBLIC_URL", "https://localhost:8788/mcp"),
         ];
         for omitted in ["MCP_JWT_ISSUER", "MCP_JWT_AUDIENCE", "MCP_PUBLIC_URL"] {
             assert!(
@@ -2609,7 +2617,7 @@ mod tests {
         let jwt_typo = BTreeMap::from([
             ("MCP_AUTH_MODE", "jwt"),
             ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-            ("MCP_JWT_ISSUER", "http://issuer.test/realms/ofk"),
+            ("MCP_JWT_ISSUER", "https://issuer.test/realms/ofk"),
             ("MCP_JWT_AUDIENCE", "https://mcp.example/mcp"),
             ("MCP_PUBLIC_URL", "https://mcp.example/mcp"),
             ("MCP_DEV_ALLOW_NON_LOOPBACK", "yes"),
@@ -2680,33 +2688,68 @@ mod tests {
             let values = BTreeMap::from([
                 ("MCP_AUTH_MODE", "jwt"),
                 ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
-                ("MCP_JWT_ISSUER", "http://localhost:8180/realms/ofk"),
+                ("MCP_JWT_ISSUER", "https://issuer.example/realms/ofk"),
                 ("MCP_JWT_AUDIENCE", audience),
                 ("MCP_PUBLIC_URL", public_url),
             ]);
             AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
         };
 
-        let config = config_from("http://localhost/mcp", "HTTP://LOCALHOST:80/mcp").unwrap();
+        let config = config_from("https://localhost/mcp", "HTTPS://LOCALHOST:443/mcp").unwrap();
         assert!(matches!(
             config.auth,
             AuthConfig::Jwt(JwtConfig {
                 ref audience,
                 ref resource_url,
                 ..
-            }) if audience == "http://localhost/mcp" && resource_url == audience
+            }) if audience == "https://localhost/mcp" && resource_url == audience
         ));
 
         for audience in [
             "ozonofk-mcp",
             "ftp://localhost:8788/mcp",
-            "http://localhost:8788/mcp/",
-            "http://localhost:8788/other",
+            "https://localhost:8788/mcp/",
+            "https://localhost:8788/other",
         ] {
-            let error = config_from(audience, "http://localhost:8788/mcp")
+            let error = config_from(audience, "https://localhost:8788/mcp")
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("MCP_JWT_AUDIENCE"), "{error}");
+        }
+    }
+
+    #[test]
+    fn jwt_metadata_urls_require_https_without_ambiguous_components() {
+        let path = write_registry(&sample_registry());
+        let valid = BTreeMap::from([
+            ("MCP_AUTH_MODE", "jwt"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("MCP_JWT_ISSUER", "https://issuer.example/realms/ofk"),
+            ("MCP_JWT_AUDIENCE", "https://mcp.example/mcp"),
+            ("MCP_JWT_JWKS_URL", "https://issuer.example/realms/ofk/jwks"),
+            ("MCP_PUBLIC_URL", "https://mcp.example/mcp"),
+        ]);
+
+        for (name, value) in [
+            ("MCP_JWT_ISSUER", "http://issuer.example/realms/ofk"),
+            ("MCP_JWT_ISSUER", "https://user:secret@issuer.example"),
+            ("MCP_JWT_ISSUER", "https://issuer.example/realm?tenant=ofk"),
+            ("MCP_JWT_JWKS_URL", "http://issuer.example/jwks"),
+            ("MCP_JWT_JWKS_URL", "https://issuer.example/jwks#old"),
+            ("MCP_JWT_AUDIENCE", "http://mcp.example/mcp"),
+            ("MCP_PUBLIC_URL", "https://mcp.example/mcp?transport=http"),
+        ] {
+            let error = AppConfig::from_lookup(|key| {
+                if key == name {
+                    Some(value.to_owned())
+                } else {
+                    valid.get(key).map(|value| (*value).to_owned())
+                }
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(name), "{name}={value:?}: {error}");
+            assert!(!error.contains("secret"), "{error}");
         }
     }
 

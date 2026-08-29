@@ -18,6 +18,10 @@ if [[ -e "$state_file" ]]; then
   exit 1
 fi
 
+release_record="$("$project_root/scripts/verify-release-images.sh" server)"
+release_sha="$(jq -r '.git_sha' <<<"$release_record")"
+server_image="$(jq -r '.images.server' <<<"$release_record")"
+
 "$project_root/scripts/canary-init.sh"
 
 runtime_dir="$(mktemp -d "$temporary_root/mcp-ozon-canary.XXXXXX")"
@@ -42,8 +46,21 @@ printf '%s\n' "$runtime_registry" >"$state_file.tmp"
 chmod 600 "$state_file.tmp"
 mv -f "$state_file.tmp" "$state_file"
 
+MCP_RELEASE_GIT_SHA="$release_sha" \
+MCP_SERVER_IMAGE="$server_image" \
 MCP_CANARY_ACCESS_CONFIG="$runtime_registry" \
-  docker compose -f "$compose_file" up -d --build
+  docker compose -f "$compose_file" up -d --no-build
+
+actual_release_sha="$(
+  docker container inspect \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+    mcp-ozon-canary
+)"
+if [[ "$actual_release_sha" != "$release_sha" ]]; then
+  docker compose -f "$compose_file" down >/dev/null 2>&1 || true
+  echo "canary image revision does not match CI release evidence" >&2
+  exit 1
+fi
 
 cleanup_on_error=false
-echo "MCP_OZON canary started: http://127.0.0.1:8789/mcp"
+echo "MCP_OZON canary started at verified revision $release_sha: http://127.0.0.1:8789/mcp"

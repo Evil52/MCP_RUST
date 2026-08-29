@@ -129,6 +129,22 @@ impl ControlMcp {
         self.authenticator.as_ref()
     }
 
+    /// Verifies the hot-reloaded registry and, when enabled, the durable plan
+    /// store. The WB read/write APIs are deliberately outside readiness.
+    pub(crate) async fn readiness(&self) -> Result<(), ()> {
+        if let Err(error) = self.registry.load_async().await {
+            tracing::warn!(%error, "Control readiness failed: access registry is invalid");
+            return Err(());
+        }
+        if let Some(services) = &self.wb
+            && let Err(error) = services.plans.probe().await
+        {
+            tracing::warn!(%error, "Control readiness failed: plan store is unavailable");
+            return Err(());
+        }
+        Ok(())
+    }
+
     fn wb_services(&self, account_id: &str) -> Result<&WbControlServices, String> {
         let services = self
             .wb
@@ -165,6 +181,10 @@ impl HttpMcpServer for ControlMcp {
 
     fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
         self.transport_authenticator()
+    }
+
+    fn readiness(&self) -> crate::http::ReadinessFuture<'_> {
+        Box::pin(self.readiness())
     }
 }
 

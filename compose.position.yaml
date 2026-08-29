@@ -2,10 +2,12 @@ name: mcp-ozon-position
 
 services:
   position-db:
-    image: mcp-ozon-position-db:local
+    image: ${MCP_POSITION_DB_IMAGE:-mcp-ozon-position-db:local}
     build:
       context: ./position-monitor
       dockerfile: Dockerfile
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     environment:
       POSTGRES_DB: ${POSITION_DB_NAME:-ozon_positions}
       POSTGRES_USER: ${POSITION_DB_ADMIN_USER:-position_admin}
@@ -47,10 +49,12 @@ services:
       start_period: 10s
 
   position-collector:
-    image: mcp-ozon-position-collector:local
+    image: ${MCP_POSITION_COLLECTOR_IMAGE:-mcp-ozon-position-collector:local}
     build:
       context: .
       dockerfile: Dockerfile.position-collector
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     environment:
       POSITION_COLLECTOR_MODE: disabled
       POSITION_COLLECTOR_DATABASE_URL: postgresql://position_collector:${POSITION_COLLECTOR_DB_PASSWORD:?POSITION_COLLECTOR_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
@@ -88,10 +92,12 @@ services:
   # report-collector and WB write credentials remain in Control; the proxy
   # receives neither and cannot select any additional destination.
   ozon-egress:
-    image: mcp-ozon-egress:local
+    image: ${MCP_OZON_EGRESS_IMAGE:-mcp-ozon-egress:local}
     build:
       context: .
       dockerfile: Dockerfile.ozon-egress
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     depends_on:
       position-db:
         condition: service_healthy
@@ -132,10 +138,12 @@ services:
       start_period: 10s
 
   report-collector:
-    image: mcp-ozon-report-collector:local
+    image: ${MCP_REPORT_COLLECTOR_IMAGE:-mcp-ozon-report-collector:local}
     build:
       context: .
       dockerfile: Dockerfile.report-collector
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     environment:
       REPORT_COLLECTOR_MODE: disabled
       REPORT_COLLECTOR_DATABASE_URL: postgresql://report_collector:${REPORT_COLLECTOR_DB_PASSWORD:?REPORT_COLLECTOR_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
@@ -186,10 +194,12 @@ services:
       start_period: 10s
 
   report-worker:
-    image: mcp-ozon-report-worker:local
+    image: ${MCP_REPORT_WORKER_IMAGE:-mcp-ozon-report-worker:local}
     build:
       context: .
       dockerfile: Dockerfile.report-worker
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     environment:
       REPORT_WORKER_MODE: disabled
       REPORT_WORKER_DATABASE_URL: postgresql://report_worker:${REPORT_WORKER_DB_PASSWORD:?REPORT_WORKER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}

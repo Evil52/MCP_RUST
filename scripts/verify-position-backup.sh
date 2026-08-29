@@ -6,7 +6,8 @@
 # Three things are checked, in increasing order of what they would have cost
 # to discover during a real incident:
 #
-#   1. The ciphertext still matches the SHA-256 recorded when it was written.
+#   1. The ciphertext still matches the SHA-256 recorded when it was written,
+#      and authenticated age archives reject any modified ciphertext.
 #   2. `pg_restore` completes into the exact pinned PostgreSQL build, with the
 #      application roles present, so ownership and grants apply cleanly.
 #   3. Every `artifact_object_key` the restored database references is present
@@ -20,6 +21,7 @@ set -euo pipefail
 
 runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
 passphrase_file="${MCP_BACKUP_PASSPHRASE_FILE:-$runtime_dir/backup-passphrase}"
+identity_file="${MCP_BACKUP_AGE_IDENTITY_FILE:-$runtime_dir/backup-age-identity.txt}"
 backup_root="${MCP_BACKUP_DIR:-$HOME/MCP_OZON-backups}"
 readiness_attempts=60
 
@@ -57,16 +59,37 @@ if [[ ! -d "$backup_dir" || -L "$backup_dir" ]]; then
 fi
 
 manifest="$backup_dir/manifest.json"
-database_archive="$backup_dir/position-db.dump.enc"
-artifact_archive="$backup_dir/report-artifacts.tar.enc"
-for path in "$manifest" "$database_archive" "$artifact_archive" "$passphrase_file"; do
+if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+  echo "required restore input is unavailable or unsafe: $manifest" >&2
+  exit 1
+fi
+
+manifest_version="$(jq -r '.manifest_version' "$manifest")"
+case "$manifest_version" in
+  1)
+    database_archive="$backup_dir/position-db.dump.enc"
+    artifact_archive="$backup_dir/report-artifacts.tar.enc"
+    key_file="$passphrase_file"
+    ;;
+  2)
+    database_archive="$backup_dir/position-db.dump.age"
+    artifact_archive="$backup_dir/report-artifacts.tar.age"
+    key_file="$identity_file"
+    ;;
+  *)
+    echo "backup manifest version is unsupported: $manifest_version" >&2
+    exit 1
+    ;;
+esac
+
+for path in "$database_archive" "$artifact_archive" "$key_file"; do
   if [[ ! -f "$path" || -L "$path" ]]; then
     echo "required restore input is unavailable or unsafe: $path" >&2
     exit 1
   fi
 done
-if [[ "$("${stat_mode[@]}" "$passphrase_file")" != "600" ]]; then
-  echo "backup passphrase must have mode 600: $passphrase_file" >&2
+if [[ "$("${stat_mode[@]}" "$key_file")" != "600" ]]; then
+  echo "backup decryption key must have mode 600: $key_file" >&2
   exit 1
 fi
 
@@ -80,21 +103,55 @@ if ! "$docker_bin" info >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! jq -e '.manifest_version == 1' "$manifest" >/dev/null; then
-  echo "backup manifest version is unsupported" >&2
-  exit 1
-fi
 db_image="$(jq -r '.postgres_image' "$manifest")"
 db_name="$(jq -r '.database_name' "$manifest")"
 db_owner="$(jq -r '.database_owner' "$manifest")"
-iterations="$(jq -r '.key_derivation.iterations' "$manifest")"
-expected_db_sha="$(jq -r '.archives["position-db.dump.enc"].sha256' "$manifest")"
-expected_artifact_sha="$(jq -r '.archives["report-artifacts.tar.enc"].sha256' "$manifest")"
+
+case "$manifest_version" in
+  1)
+    if ! command -v openssl >/dev/null 2>&1; then
+      echo "openssl is required to restore legacy backup format v1" >&2
+      exit 1
+    fi
+    if ! jq -e '
+      .cipher == "aes-256-cbc"
+      and .key_derivation.function == "pbkdf2"
+      and (.key_derivation.iterations | type == "number")
+      and .key_derivation.iterations > 0
+    ' "$manifest" >/dev/null; then
+      echo "legacy backup manifest has unsupported encryption settings" >&2
+      exit 1
+    fi
+    iterations="$(jq -r '.key_derivation.iterations' "$manifest")"
+    expected_db_sha="$(jq -r '.archives["position-db.dump.enc"].sha256' "$manifest")"
+    expected_artifact_sha="$(jq -r '.archives["report-artifacts.tar.enc"].sha256' "$manifest")"
+    ;;
+  2)
+    for command in age age-keygen; do
+      if ! command -v "$command" >/dev/null 2>&1; then
+        echo "$command is required to restore backup format v2" >&2
+        exit 1
+      fi
+    done
+    if ! jq -e '
+      .encryption.format == "age"
+      and .encryption.specification == "v1"
+      and (.encryption.recipients_sha256 | test("^[0-9a-f]{64}$"))
+    ' "$manifest" >/dev/null; then
+      echo "backup manifest has unsupported age encryption settings" >&2
+      exit 1
+    fi
+    expected_db_sha="$(jq -r '.archives["position-db.dump.age"].sha256' "$manifest")"
+    expected_artifact_sha="$(jq -r '.archives["report-artifacts.tar.age"].sha256' "$manifest")"
+    expected_recipients_sha="$(jq -r '.encryption.recipients_sha256' "$manifest")"
+    ;;
+esac
 
 if [[ ! "$db_image" =~ ^postgres:[0-9]+-alpine@sha256:[0-9a-f]{64}$ ]] \
   || [[ ! "$db_name" =~ ^[A-Za-z0-9_]+$ ]] \
   || [[ ! "$db_owner" =~ ^[A-Za-z0-9_]+$ ]] \
-  || [[ ! "$iterations" =~ ^[1-9][0-9]*$ ]]; then
+  || [[ ! "$expected_db_sha" =~ ^[0-9a-f]{64}$ ]] \
+  || [[ ! "$expected_artifact_sha" =~ ^[0-9a-f]{64}$ ]]; then
   echo "backup manifest does not describe a restorable archive" >&2
   exit 1
 fi
@@ -108,6 +165,20 @@ if [[ "$actual_db_sha" != "$expected_db_sha" ]]; then
 fi
 if [[ "$actual_artifact_sha" != "$expected_artifact_sha" ]]; then
   echo "artifact archive does not match its recorded SHA-256" >&2
+  exit 1
+fi
+if [[ "$manifest_version" == 2 ]]; then
+  actual_recipients_sha="$(
+    age-keygen -y "$identity_file" | "${sha256[@]}" | awk '{ print $1 }'
+  )"
+  if [[ "$actual_recipients_sha" != "$expected_recipients_sha" ]]; then
+    echo "backup age identity does not match the manifest recipient" >&2
+    exit 1
+  fi
+fi
+
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "openssl is required to generate the disposable database password" >&2
   exit 1
 fi
 
@@ -128,8 +199,12 @@ cleanup() {
 trap cleanup EXIT
 
 decrypt() {
-  openssl enc -d -aes-256-cbc -pbkdf2 -iter "$iterations" \
-    -pass "file:$passphrase_file" -in "$1"
+  if [[ "$manifest_version" == 1 ]]; then
+    openssl enc -d -aes-256-cbc -pbkdf2 -iter "$iterations" \
+      -pass "file:$passphrase_file" -in "$1"
+  else
+    age --decrypt --identity "$identity_file" "$1"
+  fi
 }
 
 echo "==> starting disposable PostgreSQL ($db_image)"
@@ -282,5 +357,15 @@ else
   fi
   echo "    $referenced_count referenced artifact keys all present"
 fi
+
+verification_marker="$backup_dir/restore-verified.json"
+temporary_marker="$backup_dir/.restore-verified.$$.tmp"
+jq -n \
+  --arg verified_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+  --arg manifest_sha256 "$actual_db_sha:$actual_artifact_sha" \
+  '{schema_version: 1, verified_at: $verified_at, archive_identity: $manifest_sha256}' \
+  >"$temporary_marker"
+chmod 600 "$temporary_marker"
+mv -f "$temporary_marker" "$verification_marker"
 
 printf '\nbackup verified: %s\n' "$backup_dir"

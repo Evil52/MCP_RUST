@@ -3,9 +3,12 @@ name: mcp-ozon-control
 services:
   control:
     container_name: mcp-ozon-control
+    image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:local}
     build:
       context: .
       dockerfile: Dockerfile.control
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     environment:
       CONTROL_MCP_TRANSPORT: http
       CONTROL_MCP_BIND: 0.0.0.0:8790
@@ -51,16 +54,19 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8790/health"]
+      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8790/readyz"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 10s
 
   control-ingress:
+    image: ${MCP_CONTROL_INGRESS_IMAGE:-mcp-ozon-control-ingress:local}
     build:
       context: .
       dockerfile: Dockerfile.control-ingress
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     ports:
       - "127.0.0.1:8790:8790"
     networks:

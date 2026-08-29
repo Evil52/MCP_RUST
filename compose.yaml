@@ -3,9 +3,12 @@ name: mcp-ozon
 services:
   server:
     container_name: mcp-ozon-server
+    image: ${MCP_SERVER_IMAGE:-mcp-ozon:local}
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     env_file:
       - ${MCP_ENV_FILE:-.env}
     environment:
@@ -44,7 +47,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8787/health"]
+      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8787/readyz"]
       interval: 10s
       timeout: 3s
       retries: 5

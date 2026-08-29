@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ofk.mcp-ozon-restore-verify</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__RUNNER__</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>MCP_RUNTIME_DIR</key>
+    <string>__RUNTIME_DIR__</string>
+    <key>MCP_BACKUP_DIR</key>
+    <string>__BACKUP_DIR__</string>
+    <key>MCP_BACKUP_AGE_IDENTITY_FILE</key>
+    <string>__AGE_IDENTITY_FILE__</string>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>1</integer>
+    <key>Hour</key><integer>4</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/restore-verify.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/restore-verify.error.log</string>
+</dict>
+</plist>

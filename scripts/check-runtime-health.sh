@@ -28,19 +28,39 @@ backup_root="${MCP_BACKUP_DIR:-$HOME/MCP_OZON-backups}"
 db_network="${MCP_HEALTH_DB_NETWORK:-mcp-ozon-position-internal}"
 db_host="${MCP_HEALTH_DB_HOST:-position-db}"
 compose_project="${MCP_HEALTH_COMPOSE_PROJECT:-mcp-ozon-position}"
-required_services="${MCP_HEALTH_REQUIRED_SERVICES:-position-db,ozon-egress}"
+required_services="${MCP_HEALTH_REQUIRED_SERVICES:-position-db,position-collector,ozon-egress,report-collector,report-worker}"
+mcp_container_name="${MCP_HEALTH_MCP_CONTAINER_NAME:-mcp-ozon-server}"
+mcp_ready_url="${MCP_HEALTH_MCP_READY_URL:-http://127.0.0.1:8787/readyz}"
+required_launch_agents="${MCP_HEALTH_REQUIRED_LAUNCH_AGENTS:-com.ofk.mcp-ozon-runtime,com.ofk.mcp-ozon-backup,com.ofk.mcp-ozon-health,com.ofk.mcp-ozon-restore-verify}"
+skip_launch_agent_check="${MCP_HEALTH_SKIP_LAUNCH_AGENT_CHECK:-false}"
 cycle_stale_seconds="${MCP_HEALTH_CYCLE_STALE_SECONDS:-1800}"
 backup_stale_seconds="${MCP_HEALTH_BACKUP_STALE_SECONDS:-129600}"
+restore_stale_seconds="${MCP_HEALTH_RESTORE_STALE_SECONDS:-691200}"
+allow_local_only="${MCP_BACKUP_ALLOW_LOCAL_ONLY:-false}"
 notify_command="${MCP_HEALTH_NOTIFY_COMMAND:-}"
 
 umask 077
 
-for value in "$cycle_stale_seconds" "$backup_stale_seconds"; do
+for value in "$cycle_stale_seconds" "$backup_stale_seconds" "$restore_stale_seconds"; do
   if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
     echo "health thresholds must be positive integers" >&2
     exit 2
   fi
 done
+case "$allow_local_only" in
+  true | false) ;;
+  *)
+    echo "MCP_BACKUP_ALLOW_LOCAL_ONLY must be true or false" >&2
+    exit 2
+    ;;
+esac
+case "$skip_launch_agent_check" in
+  true | false) ;;
+  *)
+    echo "MCP_HEALTH_SKIP_LAUNCH_AGENT_CHECK must be true or false" >&2
+    exit 2
+    ;;
+esac
 
 findings=()
 add_finding() {
@@ -123,6 +143,34 @@ for service in "${service_list[@]}"; do
   esac
 done
 
+mcp_state="$(
+  "$docker_bin" container inspect --format '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}' \
+    "$mcp_container_name" 2>/dev/null || true
+)"
+case "$mcp_state" in
+  running\|healthy) ;;
+  "") add_finding "main MCP container does not exist: $mcp_container_name" ;;
+  *) add_finding "main MCP container is not ready: $mcp_container_name ($mcp_state)" ;;
+esac
+if ! /usr/bin/curl --noproxy '*' --connect-timeout 2 --max-time 4 \
+  --fail --silent --show-error "$mcp_ready_url" >/dev/null 2>&1; then
+  add_finding "main MCP readiness endpoint is unavailable: $mcp_ready_url"
+fi
+
+if [[ "$(uname -s)" == "Darwin" && "$skip_launch_agent_check" != true ]]; then
+  old_ifs="$IFS"
+  IFS=','
+  read -r -a launch_agent_list <<<"$required_launch_agents"
+  IFS="$old_ifs"
+  launch_domain="gui/$(id -u)"
+  for launch_label in "${launch_agent_list[@]}"; do
+    [[ -z "$launch_label" ]] && continue
+    if ! launchctl print "$launch_domain/$launch_label" >/dev/null 2>&1; then
+      add_finding "required LaunchAgent is not loaded: $launch_label"
+    fi
+  done
+fi
+
 # ------------------------------------------------------------------- backups
 
 # A missing backup root must become a finding, not a silent exit: under
@@ -145,6 +193,37 @@ else
   backup_age=$(($(date '+%s') - backup_epoch))
   if ((backup_age > backup_stale_seconds)); then
     add_finding "newest backup is $((backup_age / 3600))h old: $(basename "$newest_backup")"
+  fi
+  offsite_marker="$newest_backup/offsite-complete.json"
+  local_only_marker="$newest_backup/local-only-risk-accepted.json"
+  if [[ -f "$offsite_marker" && ! -L "$offsite_marker" ]]; then
+    :
+  elif [[ "$allow_local_only" == true \
+    && -f "$local_only_marker" && ! -L "$local_only_marker" ]]; then
+    :
+  else
+    add_finding "newest backup has no confirmed offsite copy: $(basename "$newest_backup")"
+  fi
+fi
+
+newest_restore_marker="$(
+  find "$backup_root" -mindepth 2 -maxdepth 2 -type f \
+    -name restore-verified.json 2>/dev/null \
+    | sort -r \
+    | head -n 1 \
+    || true
+)"
+if [[ -z "$newest_restore_marker" ]]; then
+  add_finding "no successful scheduled restore verification was recorded"
+else
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    restore_epoch="$(/usr/bin/stat -f '%m' "$newest_restore_marker")"
+  else
+    restore_epoch="$(stat -c '%Y' "$newest_restore_marker")"
+  fi
+  restore_age=$(($(date '+%s') - restore_epoch))
+  if ((restore_age > restore_stale_seconds)); then
+    add_finding "last successful restore verification is $((restore_age / 3600))h old"
   fi
 fi
 

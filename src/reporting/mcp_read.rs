@@ -75,6 +75,10 @@ pub enum ReportingReadError {
 pub trait ReportingReadRepository: Send + Sync {
     fn enabled(&self) -> bool;
 
+    fn probe(&self) -> ReportingReadFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn collection_status<'a>(
         &'a self,
         account: &'a AccountScope,
@@ -153,6 +157,13 @@ impl ReportingReader {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.repository.enabled()
+    }
+
+    /// Probes the configured repository without exposing connection details.
+    /// The intentional no-database mode is ready; a configured PostgreSQL
+    /// reader must complete a round trip through its supervised session.
+    pub async fn probe(&self) -> Result<(), ReportingReadError> {
+        self.repository.probe().await
     }
 
     pub async fn collection_status(
@@ -1915,6 +1926,15 @@ impl ReportingReadRepository for PostgresReportingRepository {
         true
     }
 
+    fn probe(&self) -> ReportingReadFuture<'_, ()> {
+        Box::pin(async move {
+            self.client
+                .probe()
+                .await
+                .map_err(|_| ReportingReadError::Unavailable)
+        })
+    }
+
     fn collection_status<'a>(
         &'a self,
         account: &'a AccountScope,
@@ -2320,6 +2340,7 @@ mod tests {
         let account = account();
         let date = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
         assert!(!reader.is_enabled());
+        assert_eq!(reader.probe().await, Ok(()));
         assert_eq!(
             reader.collection_status(&account, 1).await,
             Err(ReportingReadError::Disabled)
@@ -2438,6 +2459,7 @@ mod tests {
         // Prove the repository is genuinely healthy first, so the assertions
         // below cannot pass because the fixture was broken all along.
         repository.verify_runtime_contract().await.unwrap();
+        assert_eq!(repository.probe().await, Ok(()));
 
         connection_task.abort();
         let _ = connection_task.await;
@@ -2445,6 +2467,10 @@ mod tests {
         let account = account();
         assert_eq!(
             repository.verify_runtime_contract().await,
+            Err(ReportingReadError::Unavailable)
+        );
+        assert_eq!(
+            repository.probe().await,
             Err(ReportingReadError::Unavailable)
         );
         assert_eq!(

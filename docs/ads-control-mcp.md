@@ -268,19 +268,17 @@ permissions to group/other because startup deliberately rejects those modes.
 
 Add a new random `CONTROL_WRITER_DB_PASSWORD` to the ignored `.position.env`.
 For a new database volume, migration `020_wb_control_plans.sql` runs during
-normal initialization. Existing volumes do not rerun init scripts; after the
-database container has the new environment variable, apply the additive role
-and schema steps once:
+normal initialization. Existing volumes do not rerun init scripts. After a
+verified backup, rebuild the database image and use the ledger-backed
+migrator. The one-time baseline is accepted only when the complete structural
+healthcheck of the existing schema succeeds:
 
 ```bash
 docker compose --env-file .position.env -f compose.position.yaml up -d position-db
 docker compose --env-file .position.env -f compose.position.yaml \
-  exec -T position-db /docker-entrypoint-initdb.d/003_roles.sh
+  exec -T position-db migrate-position-db --baseline-current
 docker compose --env-file .position.env -f compose.position.yaml \
-  exec -T position-db sh -c \
-  'PGPASSWORD="$POSTGRES_PASSWORD" psql --no-psqlrc --set=ON_ERROR_STOP=1 \
-   --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
-   --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql'
+  exec -T position-db migrate-position-db
 ```
 
 Use the repository bootstrap script when creating a fresh position environment:
@@ -358,9 +356,19 @@ export CONTROL_MCP_JWT_JWKS_HOST=auth.example
 export CONTROL_MCP_JWT_JWKS_PATH=/realms/ofk/protocol/openid-connect/certs
 export CONTROL_MCP_PUBLIC_URL=https://control.example/mcp
 
+release_record="$(
+  ./scripts/verify-release-images.sh \
+    control control-ingress control-auth-egress control-write-egress
+)"
+export MCP_RELEASE_GIT_SHA="$(jq -r '.git_sha' <<<"$release_record")"
+export MCP_CONTROL_IMAGE="$(jq -r '.images.control' <<<"$release_record")"
+export MCP_CONTROL_INGRESS_IMAGE="$(jq -r '.images["control-ingress"]' <<<"$release_record")"
+export MCP_CONTROL_AUTH_EGRESS_IMAGE="$(jq -r '.images["control-auth-egress"]' <<<"$release_record")"
+export MCP_CONTROL_WRITE_EGRESS_IMAGE="$(jq -r '.images["control-write-egress"]' <<<"$release_record")"
+
 docker compose --env-file .position.env \
   -f compose.control.yaml -f compose.control-wb-plan.yaml \
-  up -d --build
+  up -d --no-build --wait --wait-timeout 300
 ```
 
 Only after the policy, approval flow, action limits and database-gate procedure
@@ -373,7 +381,7 @@ export CONTROL_MCP_MARKETPLACE_WRITES_ENABLED=true
 
 docker compose --env-file .position.env \
   -f compose.control.yaml -f compose.control-wb-plan.yaml \
-  -f compose.control-wb-live.yaml up -d --build
+  -f compose.control-wb-live.yaml up -d --no-build --wait --wait-timeout 300
 ```
 
 Never use the live overlay without the plan layer, never mount the writer token

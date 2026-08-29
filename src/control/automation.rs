@@ -573,7 +573,24 @@ pub fn validate_wb_automation_policy(
 }
 
 fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisionError> {
-    let identifiers_valid = !policy.account_id.is_empty()
+    let nm_ids = policy.nm_ids.iter().copied().collect::<BTreeSet<_>>();
+    if ![
+        valid_policy_identity(policy),
+        valid_policy_authorization(policy),
+        valid_policy_targets(policy, &nm_ids),
+        valid_policy_pacing(policy),
+        valid_policy_action_limits(policy),
+    ]
+    .into_iter()
+    .all(|valid| valid)
+    {
+        return Err(WbAutomationDecisionError::InvalidPolicy);
+    }
+    Ok(())
+}
+
+fn valid_policy_identity(policy: &WbAutomationPolicy) -> bool {
+    let account_id_valid = !policy.account_id.is_empty()
         && policy.account_id.len() <= 128
         && policy
             .account_id
@@ -583,7 +600,17 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
         && policy.campaign_name.len() <= 128
         && policy.campaign_name.trim() == policy.campaign_name
         && !policy.campaign_name.chars().any(char::is_control);
-    let authorization_valid = valid_identifier(&policy.authorized_by_actor_id)
+    policy.policy_version == "wb_ads_robot.v1"
+        && policy.payment_type == "cpc"
+        && policy.placement == "search"
+        && policy.timezone == "Europe/Moscow"
+        && account_id_valid
+        && campaign_name_valid
+        && policy.campaign_id != 0
+}
+
+fn valid_policy_authorization(policy: &WbAutomationPolicy) -> bool {
+    valid_identifier(&policy.authorized_by_actor_id)
         && !policy.authorization_reference.is_empty()
         && policy.authorization_reference.len() <= 128
         && policy
@@ -591,61 +618,64 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'/' | b'.'))
         && policy.authorized_at < policy.observe_until
-        && policy.observe_until < policy.authorization_expires_at;
-    let nm_ids = policy.nm_ids.iter().copied().collect::<BTreeSet<_>>();
-    if policy.policy_version != "wb_ads_robot.v1"
-        || policy.bid_writes_enabled && !policy.write_enabled
-        || policy.payment_type != "cpc"
-        || policy.placement != "search"
-        || policy.timezone != "Europe/Moscow"
-        || !identifiers_valid
-        || !campaign_name_valid
-        || !authorization_valid
-        || policy.campaign_id == 0
-        || policy.nm_ids.is_empty()
-        || policy.nm_ids.len() > 50
-        || nm_ids.len() != policy.nm_ids.len()
-        || nm_ids.contains(&0)
-        || policy.target_drr_basis_points == 0
-        || policy.hard_drr_basis_points < policy.target_drr_basis_points
-        || (policy.hard_drr_basis_points == policy.target_drr_basis_points
-            && !policy.autonomous_pacing.allows_zero_cost_probe())
-        || policy.hard_drr_basis_points > 10_000
-        || policy.target_impressions_per_day == 0
-        || (!policy.autonomous_pacing.uses_marginal_feedback() && policy.target_orders_per_day != 0)
-        || (policy.autonomous_pacing.uses_traffic_frontier()
-            && !valid_traffic_frontier_policy(policy))
-        || (!policy.autonomous_pacing.uses_traffic_frontier()
-            && (policy.traffic_frontier_bid_kopecks.is_some()
-                || policy.traffic_frontier_feedback_timeout_seconds.is_some()
-                || policy.traffic_frontier_min_feedback_impressions.is_some()
-                || policy.traffic_frontier_min_feedback_clicks.is_some()))
-        || (policy.autonomous_pacing == WbAutomationPacingMode::TrafficFrontierV2
-            && (policy.traffic_frontier_min_feedback_impressions.is_some()
-                || policy.traffic_frontier_min_feedback_clicks.is_some()))
-        || (policy.autonomous_pacing.uses_marginal_feedback()
-            && !valid_marginal_feedback_policy(policy))
-        || policy.min_bid_kopecks == 0
-        || policy.max_bid_kopecks < policy.min_bid_kopecks
-        || !(1..=25).contains(&policy.bid_step_percent)
-        || policy.daily_spend_cap_minor == 0
-        || policy.daily_pause_threshold_minor == 0
-        || policy.daily_pause_threshold_minor > policy.daily_spend_cap_minor
-        || !(1..=50).contains(&policy.max_actions_per_day)
-        || !(300..=86_400).contains(&policy.cooldown_seconds)
-        || policy.no_order_reduce_clicks == 0
-        || policy.no_order_disable_clicks <= policy.no_order_reduce_clicks
-        || policy.no_order_disable_spend_minor == 0
-        || policy.efficient_min_orders == 0
-        || policy.efficient_min_conversion_basis_points == 0
-        || policy.efficient_min_conversion_basis_points > 10_000
-        || policy.low_exposure_max_impressions == 0
-        || policy.low_exposure_max_clicks == 0
-        || policy.allow_budget_top_up
-    {
-        return Err(WbAutomationDecisionError::InvalidPolicy);
-    }
-    Ok(())
+        && policy.observe_until < policy.authorization_expires_at
+}
+
+fn valid_policy_targets(policy: &WbAutomationPolicy, nm_ids: &BTreeSet<u64>) -> bool {
+    !policy.nm_ids.is_empty()
+        && policy.nm_ids.len() <= 50
+        && nm_ids.len() == policy.nm_ids.len()
+        && !nm_ids.contains(&0)
+}
+
+fn valid_policy_pacing(policy: &WbAutomationPolicy) -> bool {
+    let drr_valid = policy.target_drr_basis_points > 0
+        && policy.hard_drr_basis_points >= policy.target_drr_basis_points
+        && (policy.hard_drr_basis_points != policy.target_drr_basis_points
+            || policy.autonomous_pacing.allows_zero_cost_probe())
+        && policy.hard_drr_basis_points <= 10_000;
+    let frontier_fields_absent = policy.traffic_frontier_bid_kopecks.is_none()
+        && policy.traffic_frontier_feedback_timeout_seconds.is_none()
+        && policy.traffic_frontier_min_feedback_impressions.is_none()
+        && policy.traffic_frontier_min_feedback_clicks.is_none();
+    let frontier_valid = if policy.autonomous_pacing.uses_traffic_frontier() {
+        valid_traffic_frontier_policy(policy)
+    } else {
+        frontier_fields_absent
+    };
+    let marginal_valid = if policy.autonomous_pacing.uses_marginal_feedback() {
+        valid_marginal_feedback_policy(policy)
+    } else {
+        policy.target_orders_per_day == 0
+    };
+    let v2_valid = policy.autonomous_pacing != WbAutomationPacingMode::TrafficFrontierV2
+        || (policy.traffic_frontier_min_feedback_impressions.is_none()
+            && policy.traffic_frontier_min_feedback_clicks.is_none());
+    drr_valid
+        && policy.target_impressions_per_day > 0
+        && frontier_valid
+        && marginal_valid
+        && v2_valid
+}
+
+fn valid_policy_action_limits(policy: &WbAutomationPolicy) -> bool {
+    policy.min_bid_kopecks > 0
+        && policy.max_bid_kopecks >= policy.min_bid_kopecks
+        && (1..=25).contains(&policy.bid_step_percent)
+        && policy.daily_spend_cap_minor > 0
+        && policy.daily_pause_threshold_minor > 0
+        && policy.daily_pause_threshold_minor <= policy.daily_spend_cap_minor
+        && (1..=50).contains(&policy.max_actions_per_day)
+        && (300..=86_400).contains(&policy.cooldown_seconds)
+        && policy.no_order_reduce_clicks > 0
+        && policy.no_order_disable_clicks > policy.no_order_reduce_clicks
+        && policy.no_order_disable_spend_minor > 0
+        && policy.efficient_min_orders > 0
+        && (1..=10_000).contains(&policy.efficient_min_conversion_basis_points)
+        && policy.low_exposure_max_impressions > 0
+        && policy.low_exposure_max_clicks > 0
+        && !policy.allow_budget_top_up
+        && (!policy.bid_writes_enabled || policy.write_enabled)
 }
 
 const fn valid_marginal_feedback_policy(policy: &WbAutomationPolicy) -> bool {

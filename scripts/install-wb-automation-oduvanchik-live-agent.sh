@@ -10,6 +10,18 @@ if [[ $# -ne 1 || "$1" != "$confirmation" ]]; then
 fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+release_record="$(
+  "$project_root/scripts/verify-release-images.sh" \
+    wb-automation control-write-egress ozon-egress
+)"
+release_sha="$(jq -r '.git_sha' <<<"$release_record")"
+export MCP_WB_AUTOMATION_IMAGE
+MCP_WB_AUTOMATION_IMAGE="$(jq -r '.images["wb-automation"]' <<<"$release_record")"
+export MCP_CONTROL_WRITE_EGRESS_IMAGE
+MCP_CONTROL_WRITE_EGRESS_IMAGE="$(
+  jq -r '.images["control-write-egress"]' <<<"$release_record"
+)"
+ozon_egress_image="$(jq -r '.images["ozon-egress"]' <<<"$release_record")"
 shadow_policy_source="$project_root/config/wb-automation-oduvanchik.json"
 protective_policy_source="$project_root/config/wb-automation-oduvanchik.live.json"
 bid_policy_source="$project_root/config/wb-automation-oduvanchik.bid-live.json"
@@ -179,6 +191,8 @@ sed \
   -e "s|__LOG_DIR__|$log_dir|g" \
   -e "s|__RUNTIME_DIR__|$runtime_dir|g" \
   -e "s|__PROJECT_DIR__|$project_root|g" \
+  -e "s|__WB_AUTOMATION_IMAGE__|$MCP_WB_AUTOMATION_IMAGE|g" \
+  -e "s|__CONTROL_WRITE_EGRESS_IMAGE__|$MCP_CONTROL_WRITE_EGRESS_IMAGE|g" \
   "$plist_template" >"$temporary_plist"
 plutil -lint "$temporary_plist" >/dev/null
 
@@ -205,17 +219,17 @@ live=(
   --env-file "$position_env"
   -f "$live_compose"
 )
-"${shadow[@]}" config --quiet
-"${live[@]}" config --quiet
-"${shadow[@]}" build wb-automation-shadow
-"${live[@]}" build wb-automation-live write-egress
+MCP_RELEASE_GIT_SHA="$release_sha" "${shadow[@]}" config --quiet
+MCP_RELEASE_GIT_SHA="$release_sha" "${live[@]}" config --quiet
 
+MCP_RELEASE_GIT_SHA="$release_sha" \
+MCP_OZON_EGRESS_IMAGE="$ozon_egress_image" \
 "$docker_bin" compose \
   --project-directory "$project_root" \
   --env-file "$position_env" \
   -f "$position_compose" \
   up -d --no-deps --wait --wait-timeout 60 ozon-egress
-"${live[@]}" up -d --no-deps --wait --wait-timeout 60 write-egress
+MCP_RELEASE_GIT_SHA="$release_sha" "${live[@]}" up -d --no-deps --wait --wait-timeout 60 write-egress
 
 launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
 

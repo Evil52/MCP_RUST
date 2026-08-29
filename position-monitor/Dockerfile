@@ -1,28 +1,13 @@
 FROM postgres:17-alpine@sha256:d4bb0a8c1b7bb2e29f976d099e7bfb9a5d8858cffe9e46b35cd302cd1f1f8168
 
-COPY --chmod=0644 initdb/001_schema.sql /docker-entrypoint-initdb.d/001_schema.sql
-COPY --chmod=0644 initdb/002_ozon_collector_contract.sql /docker-entrypoint-initdb.d/002_ozon_collector_contract.sql
-COPY --chmod=0644 initdb/002_wb_official_history.sql /docker-entrypoint-initdb.d/002_wb_official_history.sql
-COPY --chmod=0755 initdb/003_roles.sh /docker-entrypoint-initdb.d/003_roles.sh
-COPY --chmod=0644 initdb/004_ozon_postgres_adapter.sql /docker-entrypoint-initdb.d/004_ozon_postgres_adapter.sql
-COPY --chmod=0644 initdb/005_daily_reporting_outbox.sql /docker-entrypoint-initdb.d/005_daily_reporting_outbox.sql
-COPY --chmod=0644 initdb/006_daily_report_snapshots.sql /docker-entrypoint-initdb.d/006_daily_report_snapshots.sql
-COPY --chmod=0644 initdb/007_daily_reporting_optional_metrics.sql /docker-entrypoint-initdb.d/007_daily_reporting_optional_metrics.sql
-COPY --chmod=0644 initdb/008_daily_reporting_artifact_identity.sql /docker-entrypoint-initdb.d/008_daily_reporting_artifact_identity.sql
-COPY --chmod=0644 initdb/009_daily_reporting_generation_backoff.sql /docker-entrypoint-initdb.d/009_daily_reporting_generation_backoff.sql
-COPY --chmod=0644 initdb/010_daily_reporting_observation_window.sql /docker-entrypoint-initdb.d/010_daily_reporting_observation_window.sql
-COPY --chmod=0644 initdb/011_daily_reporting_collection_claims.sql /docker-entrypoint-initdb.d/011_daily_reporting_collection_claims.sql
-COPY --chmod=0644 initdb/012_daily_reporting_delivery_error_classes.sql /docker-entrypoint-initdb.d/012_daily_reporting_delivery_error_classes.sql
-COPY --chmod=0644 initdb/013_daily_reporting_delivery_reconciliation.sql /docker-entrypoint-initdb.d/013_daily_reporting_delivery_reconciliation.sql
-COPY --chmod=0644 initdb/014_daily_reporting_period_preserving_catchup.sql /docker-entrypoint-initdb.d/014_daily_reporting_period_preserving_catchup.sql
-COPY --chmod=0644 initdb/015_daily_reporting_ozon_finance.sql /docker-entrypoint-initdb.d/015_daily_reporting_ozon_finance.sql
-COPY --chmod=0644 initdb/016_daily_reporting_unit_economics.sql /docker-entrypoint-initdb.d/016_daily_reporting_unit_economics.sql
-COPY --chmod=0644 initdb/017_daily_reporting_advertising_extensions.sql /docker-entrypoint-initdb.d/017_daily_reporting_advertising_extensions.sql
-COPY --chmod=0644 initdb/018_daily_reporting_recovery_observation_window.sql /docker-entrypoint-initdb.d/018_daily_reporting_recovery_observation_window.sql
-COPY --chmod=0644 initdb/019_daily_reporting_mcp_read_views.sql /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql
-COPY --chmod=0644 initdb/020_wb_control_plans.sql /docker-entrypoint-initdb.d/020_wb_control_plans.sql
-COPY --chmod=0644 initdb/021_wb_automation_state.sql /docker-entrypoint-initdb.d/021_wb_automation_state.sql
-COPY --chmod=0644 initdb/022_wb_automation_explicit_resume.sql /docker-entrypoint-initdb.d/022_wb_automation_explicit_resume.sql
+ARG MCP_RELEASE_GIT_SHA=unverified
+LABEL org.opencontainers.image.revision="${MCP_RELEASE_GIT_SHA}"
+
+RUN install -d -m 0755 /opt/mcp-ozon/migrations
+COPY --chmod=0644 initdb/*.sql /opt/mcp-ozon/migrations/
+COPY --chmod=0755 initdb/003_roles.sh /opt/mcp-ozon/migrations/003_roles.sh
+COPY --chmod=0755 migrate.sh /usr/local/bin/migrate-position-db
+COPY --chmod=0755 migrate.sh /docker-entrypoint-initdb.d/001_migrate.sh
 COPY --chmod=0755 healthcheck.sh /usr/local/bin/position-db-healthcheck
 
 # This image always runs as postgres, so the root-only privilege-drop helper is

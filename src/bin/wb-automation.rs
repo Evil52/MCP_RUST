@@ -1278,8 +1278,81 @@ impl ExecuteOptions {
 }
 
 fn parse_command(arguments: &[String]) -> Result<Command> {
-    if let [
-        command,
+    let Some(command) = arguments.first().map(String::as_str) else {
+        return usage();
+    };
+    match command {
+        "explicit-quota-override-once-pg" => parse_explicit_quota_override(arguments),
+        "explicit-resume-after-daily-cap-once-pg" => parse_explicit_resume(arguments),
+        "explicit-exposure-increase-once-pg" => parse_explicit_exposure(arguments),
+        "activate-protective-live-pg"
+        | "activate-bid-writes-pg"
+        | "activate-bounded-pacing-pg"
+        | "activate-traffic-frontier-v2-pg"
+        | "activate-traffic-frontier-v3-pg"
+        | "activate-traffic-frontier-v4-pg"
+        | "raise-traffic-frontier-limits-pg"
+        | "tighten-traffic-frontier-corridor-pg" => {
+            let options = parse_activation_options(arguments)?;
+            Ok(match command {
+                "activate-protective-live-pg" => Command::ActivateProtectiveLivePostgres(options),
+                "activate-bid-writes-pg" => Command::ActivateBidWritesPostgres(options),
+                "activate-bounded-pacing-pg" => Command::ActivateBoundedPacingPostgres(options),
+                "activate-traffic-frontier-v2-pg" => {
+                    Command::ActivateTrafficFrontierV2Postgres(options)
+                }
+                "activate-traffic-frontier-v3-pg" => {
+                    Command::ActivateTrafficFrontierV3Postgres(options)
+                }
+                "activate-traffic-frontier-v4-pg" => {
+                    Command::ActivateTrafficFrontierV4Postgres(options)
+                }
+                "raise-traffic-frontier-limits-pg" => {
+                    Command::RaiseTrafficFrontierLimitsPostgres(options)
+                }
+                "tighten-traffic-frontier-corridor-pg" => {
+                    Command::TightenTrafficFrontierCorridorPostgres(options)
+                }
+                _ => unreachable!("activation commands are exhaustively matched"),
+            })
+        }
+        "shadow-once-pg" => parse_shadow_postgres(arguments),
+        "execute-once-pg" => parse_execute_postgres(arguments),
+        "execute-once" | "auto-once" => parse_execute(arguments),
+        "observe-once" => parse_observe(arguments),
+        _ => usage(),
+    }
+}
+
+fn parse_activation_options(arguments: &[String]) -> Result<ActivatePolicyOptions> {
+    let [
+        _,
+        source_policy,
+        target_policy,
+        registry,
+        reader_token,
+        broad_reader,
+        tail @ ..,
+    ] = arguments
+    else {
+        return usage();
+    };
+    Ok(ActivatePolicyOptions {
+        source: observe_options(
+            source_policy,
+            registry,
+            reader_token,
+            None,
+            broad_reader,
+            tail,
+        )?,
+        target_policy: target_policy.into(),
+    })
+}
+
+fn parse_explicit_quota_override(arguments: &[String]) -> Result<Command> {
+    let [
+        _,
         policy,
         registry,
         reader_token,
@@ -1291,30 +1364,32 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         confirmation,
         tail @ ..,
     ] = arguments
-        && command == "explicit-quota-override-once-pg"
-    {
-        return Ok(Command::ExplicitQuotaOverridePostgres(
-            ExplicitQuotaOverrideOptions {
-                execute: PostgresExecuteOptions {
-                    execute: ExecuteOptions {
-                        policy: policy.into(),
-                        registry: registry.into(),
-                        reader_token: reader_token.into(),
-                        writer_token: writer_token.into(),
-                        state_directory: PathBuf::new(),
-                        allow_broad_reader: parse_bool(broad_reader)?,
-                        writer_proxy_url: nonempty(writer_proxy_url)?,
-                        reader_proxy_url: optional_proxy(tail)?,
-                    },
-                    legacy_state: legacy_state.into(),
-                },
-                authorization_reference: authorization_reference.clone(),
-                confirmation: confirmation.clone(),
-            },
-        ));
-    }
-    if let [
-        command,
+    else {
+        return usage();
+    };
+    Ok(Command::ExplicitQuotaOverridePostgres(
+        ExplicitQuotaOverrideOptions {
+            execute: postgres_execute_options(
+                execute_option_inputs(
+                    policy,
+                    registry,
+                    reader_token,
+                    writer_token,
+                    broad_reader,
+                    writer_proxy_url,
+                ),
+                legacy_state,
+                tail,
+            )?,
+            authorization_reference: authorization_reference.clone(),
+            confirmation: confirmation.clone(),
+        },
+    ))
+}
+
+fn parse_explicit_resume(arguments: &[String]) -> Result<Command> {
+    let [
+        _,
         policy,
         registry,
         reader_token,
@@ -1325,29 +1400,31 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         confirmation,
         tail @ ..,
     ] = arguments
-        && command == "explicit-resume-after-daily-cap-once-pg"
-    {
-        return Ok(Command::ExplicitResumeAfterDailyCapPostgres(
-            ExplicitResumeAfterDailyCapOptions {
-                execute: PostgresExecuteOptions {
-                    execute: ExecuteOptions {
-                        policy: policy.into(),
-                        registry: registry.into(),
-                        reader_token: reader_token.into(),
-                        writer_token: writer_token.into(),
-                        state_directory: PathBuf::new(),
-                        allow_broad_reader: parse_bool(broad_reader)?,
-                        writer_proxy_url: nonempty(writer_proxy_url)?,
-                        reader_proxy_url: optional_proxy(tail)?,
-                    },
-                    legacy_state: legacy_state.into(),
-                },
-                confirmation: confirmation.clone(),
-            },
-        ));
-    }
-    if let [
-        command,
+    else {
+        return usage();
+    };
+    Ok(Command::ExplicitResumeAfterDailyCapPostgres(
+        ExplicitResumeAfterDailyCapOptions {
+            execute: postgres_execute_options(
+                execute_option_inputs(
+                    policy,
+                    registry,
+                    reader_token,
+                    writer_token,
+                    broad_reader,
+                    writer_proxy_url,
+                ),
+                legacy_state,
+                tail,
+            )?,
+            confirmation: confirmation.clone(),
+        },
+    ))
+}
+
+fn parse_explicit_exposure(arguments: &[String]) -> Result<Command> {
+    let [
+        _,
         policy,
         registry,
         reader_token,
@@ -1359,230 +1436,34 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         confirmation,
         tail @ ..,
     ] = arguments
-        && command == "explicit-exposure-increase-once-pg"
-    {
-        return Ok(Command::ExplicitExposureIncreasePostgres(
-            ExplicitExposureIncreaseOptions {
-                execute: PostgresExecuteOptions {
-                    execute: ExecuteOptions {
-                        policy: policy.into(),
-                        registry: registry.into(),
-                        reader_token: reader_token.into(),
-                        writer_token: writer_token.into(),
-                        state_directory: PathBuf::new(),
-                        allow_broad_reader: parse_bool(broad_reader)?,
-                        writer_proxy_url: nonempty(writer_proxy_url)?,
-                        reader_proxy_url: optional_proxy(tail)?,
-                    },
-                    legacy_state: legacy_state.into(),
-                },
-                target_impressions: target_impressions
-                    .parse()
-                    .context("WB explicit exposure target is invalid")?,
-                confirmation: confirmation.clone(),
-            },
-        ));
-    }
-    if let [
-        command,
-        shadow_policy,
-        live_policy,
-        registry,
-        reader_token,
-        broad_reader,
-        tail @ ..,
-    ] = arguments
-        && command == "activate-protective-live-pg"
-    {
-        return Ok(Command::ActivateProtectiveLivePostgres(
-            ActivatePolicyOptions {
-                source: ObserveOptions {
-                    policy: shadow_policy.into(),
-                    registry: registry.into(),
-                    reader_token: reader_token.into(),
-                    state_directory: PathBuf::new(),
-                    allow_broad_reader: parse_bool(broad_reader)?,
-                    reader_proxy_url: optional_proxy(tail)?,
-                },
-                target_policy: live_policy.into(),
-            },
-        ));
-    }
-    if let [
-        command,
-        protective_policy,
-        bid_policy,
-        registry,
-        reader_token,
-        broad_reader,
-        tail @ ..,
-    ] = arguments
-        && command == "activate-bid-writes-pg"
-    {
-        return Ok(Command::ActivateBidWritesPostgres(ActivatePolicyOptions {
-            source: ObserveOptions {
-                policy: protective_policy.into(),
-                registry: registry.into(),
-                reader_token: reader_token.into(),
-                state_directory: PathBuf::new(),
-                allow_broad_reader: parse_bool(broad_reader)?,
-                reader_proxy_url: optional_proxy(tail)?,
-            },
-            target_policy: bid_policy.into(),
-        }));
-    }
-    if let [
-        command,
-        source_bid_policy,
-        target_bid_policy,
-        registry,
-        reader_token,
-        broad_reader,
-        tail @ ..,
-    ] = arguments
-        && command == "activate-bounded-pacing-pg"
-    {
-        return Ok(Command::ActivateBoundedPacingPostgres(
-            ActivatePolicyOptions {
-                source: ObserveOptions {
-                    policy: source_bid_policy.into(),
-                    registry: registry.into(),
-                    reader_token: reader_token.into(),
-                    state_directory: PathBuf::new(),
-                    allow_broad_reader: parse_bool(broad_reader)?,
-                    reader_proxy_url: optional_proxy(tail)?,
-                },
-                target_policy: target_bid_policy.into(),
-            },
-        ));
-    }
-    if let [
-        command,
-        source_bid_policy,
-        target_bid_policy,
-        registry,
-        reader_token,
-        broad_reader,
-        tail @ ..,
-    ] = arguments
-        && command == "activate-traffic-frontier-v3-pg"
-    {
-        return Ok(Command::ActivateTrafficFrontierV3Postgres(
-            ActivatePolicyOptions {
-                source: ObserveOptions {
-                    policy: source_bid_policy.into(),
-                    registry: registry.into(),
-                    reader_token: reader_token.into(),
-                    state_directory: PathBuf::new(),
-                    allow_broad_reader: parse_bool(broad_reader)?,
-                    reader_proxy_url: optional_proxy(tail)?,
-                },
-                target_policy: target_bid_policy.into(),
-            },
-        ));
-    }
-    if let [
-        command,
-        source_bid_policy,
-        target_bid_policy,
-        registry,
-        reader_token,
-        broad_reader,
-        tail @ ..,
-    ] = arguments
-        && command == "activate-traffic-frontier-v4-pg"
-    {
-        return Ok(Command::ActivateTrafficFrontierV4Postgres(
-            ActivatePolicyOptions {
-                source: ObserveOptions {
-                    policy: source_bid_policy.into(),
-                    registry: registry.into(),
-                    reader_token: reader_token.into(),
-                    state_directory: PathBuf::new(),
-                    allow_broad_reader: parse_bool(broad_reader)?,
-                    reader_proxy_url: optional_proxy(tail)?,
-                },
-                target_policy: target_bid_policy.into(),
-            },
-        ));
-    }
-    if let [
-        command,
-        source_bid_policy,
-        target_bid_policy,
-        registry,
-        reader_token,
-        broad_reader,
-        tail @ ..,
-    ] = arguments
-        && command == "activate-traffic-frontier-v2-pg"
-    {
-        return Ok(Command::ActivateTrafficFrontierV2Postgres(
-            ActivatePolicyOptions {
-                source: ObserveOptions {
-                    policy: source_bid_policy.into(),
-                    registry: registry.into(),
-                    reader_token: reader_token.into(),
-                    state_directory: PathBuf::new(),
-                    allow_broad_reader: parse_bool(broad_reader)?,
-                    reader_proxy_url: optional_proxy(tail)?,
-                },
-                target_policy: target_bid_policy.into(),
-            },
-        ));
-    }
-    if let [
-        command,
-        source_bid_policy,
-        target_bid_policy,
-        registry,
-        reader_token,
-        broad_reader,
-        tail @ ..,
-    ] = arguments
-        && command == "raise-traffic-frontier-limits-pg"
-    {
-        return Ok(Command::RaiseTrafficFrontierLimitsPostgres(
-            ActivatePolicyOptions {
-                source: ObserveOptions {
-                    policy: source_bid_policy.into(),
-                    registry: registry.into(),
-                    reader_token: reader_token.into(),
-                    state_directory: PathBuf::new(),
-                    allow_broad_reader: parse_bool(broad_reader)?,
-                    reader_proxy_url: optional_proxy(tail)?,
-                },
-                target_policy: target_bid_policy.into(),
-            },
-        ));
-    }
-    if let [
-        command,
-        source_bid_policy,
-        target_bid_policy,
-        registry,
-        reader_token,
-        broad_reader,
-        tail @ ..,
-    ] = arguments
-        && command == "tighten-traffic-frontier-corridor-pg"
-    {
-        return Ok(Command::TightenTrafficFrontierCorridorPostgres(
-            ActivatePolicyOptions {
-                source: ObserveOptions {
-                    policy: source_bid_policy.into(),
-                    registry: registry.into(),
-                    reader_token: reader_token.into(),
-                    state_directory: PathBuf::new(),
-                    allow_broad_reader: parse_bool(broad_reader)?,
-                    reader_proxy_url: optional_proxy(tail)?,
-                },
-                target_policy: target_bid_policy.into(),
-            },
-        ));
-    }
-    if let [
-        command,
+    else {
+        return usage();
+    };
+    Ok(Command::ExplicitExposureIncreasePostgres(
+        ExplicitExposureIncreaseOptions {
+            execute: postgres_execute_options(
+                execute_option_inputs(
+                    policy,
+                    registry,
+                    reader_token,
+                    writer_token,
+                    broad_reader,
+                    writer_proxy_url,
+                ),
+                legacy_state,
+                tail,
+            )?,
+            target_impressions: target_impressions
+                .parse()
+                .context("WB explicit exposure target is invalid")?,
+            confirmation: confirmation.clone(),
+        },
+    ))
+}
+
+fn parse_shadow_postgres(arguments: &[String]) -> Result<Command> {
+    let [
+        _,
         policy,
         registry,
         reader_token,
@@ -1590,22 +1471,18 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         broad_reader,
         tail @ ..,
     ] = arguments
-        && command == "shadow-once-pg"
-    {
-        return Ok(Command::ShadowPostgres(ShadowPostgresOptions {
-            observer: ObserveOptions {
-                policy: policy.into(),
-                registry: registry.into(),
-                reader_token: reader_token.into(),
-                state_directory: PathBuf::new(),
-                allow_broad_reader: parse_bool(broad_reader)?,
-                reader_proxy_url: optional_proxy(tail)?,
-            },
-            legacy_state: legacy_state.into(),
-        }));
-    }
-    if let [
-        command,
+    else {
+        return usage();
+    };
+    Ok(Command::ShadowPostgres(ShadowPostgresOptions {
+        observer: observe_options(policy, registry, reader_token, None, broad_reader, tail)?,
+        legacy_state: legacy_state.into(),
+    }))
+}
+
+fn parse_execute_postgres(arguments: &[String]) -> Result<Command> {
+    let [
+        _,
         policy,
         registry,
         reader_token,
@@ -1615,23 +1492,25 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         writer_proxy_url,
         tail @ ..,
     ] = arguments
-        && command == "execute-once-pg"
-    {
-        return Ok(Command::ExecutePostgres(PostgresExecuteOptions {
-            execute: ExecuteOptions {
-                policy: policy.into(),
-                registry: registry.into(),
-                reader_token: reader_token.into(),
-                writer_token: writer_token.into(),
-                state_directory: PathBuf::new(),
-                allow_broad_reader: parse_bool(broad_reader)?,
-                writer_proxy_url: nonempty(writer_proxy_url)?,
-                reader_proxy_url: optional_proxy(tail)?,
-            },
-            legacy_state: legacy_state.into(),
-        }));
-    }
-    if let [
+    else {
+        return usage();
+    };
+    Ok(Command::ExecutePostgres(postgres_execute_options(
+        execute_option_inputs(
+            policy,
+            registry,
+            reader_token,
+            writer_token,
+            broad_reader,
+            writer_proxy_url,
+        ),
+        legacy_state,
+        tail,
+    )?))
+}
+
+fn parse_execute(arguments: &[String]) -> Result<Command> {
+    let [
         command,
         policy,
         registry,
@@ -1642,26 +1521,31 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         writer_proxy_url,
         tail @ ..,
     ] = arguments
-        && matches!(command.as_str(), "execute-once" | "auto-once")
-    {
-        let options = ExecuteOptions {
-            policy: policy.into(),
-            registry: registry.into(),
-            reader_token: reader_token.into(),
-            writer_token: writer_token.into(),
-            state_directory: state_directory.into(),
-            allow_broad_reader: parse_bool(broad_reader)?,
-            writer_proxy_url: nonempty(writer_proxy_url)?,
-            reader_proxy_url: optional_proxy(tail)?,
-        };
-        return Ok(if command == "execute-once" {
-            Command::Execute(options)
-        } else {
-            Command::Auto(options)
-        });
-    }
+    else {
+        return usage();
+    };
+    let options = execute_options(
+        execute_option_inputs(
+            policy,
+            registry,
+            reader_token,
+            writer_token,
+            broad_reader,
+            writer_proxy_url,
+        ),
+        Some(state_directory),
+        tail,
+    )?;
+    Ok(if command == "execute-once" {
+        Command::Execute(options)
+    } else {
+        Command::Auto(options)
+    })
+}
+
+fn parse_observe(arguments: &[String]) -> Result<Command> {
     let [
-        command,
+        _,
         policy,
         registry,
         reader_token,
@@ -1672,17 +1556,88 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
     else {
         return usage();
     };
-    if command != "observe-once" {
-        return usage();
+    Ok(Command::Observe(observe_options(
+        policy,
+        registry,
+        reader_token,
+        Some(state_directory),
+        broad_reader,
+        tail,
+    )?))
+}
+
+#[derive(Clone, Copy)]
+struct ExecuteOptionInputs<'a> {
+    policy: &'a str,
+    registry: &'a str,
+    reader_token: &'a str,
+    writer_token: &'a str,
+    broad_reader: &'a str,
+    writer_proxy_url: &'a str,
+}
+
+const fn execute_option_inputs<'a>(
+    policy: &'a str,
+    registry: &'a str,
+    reader_token: &'a str,
+    writer_token: &'a str,
+    broad_reader: &'a str,
+    writer_proxy_url: &'a str,
+) -> ExecuteOptionInputs<'a> {
+    ExecuteOptionInputs {
+        policy,
+        registry,
+        reader_token,
+        writer_token,
+        broad_reader,
+        writer_proxy_url,
     }
-    Ok(Command::Observe(ObserveOptions {
+}
+
+fn postgres_execute_options(
+    inputs: ExecuteOptionInputs<'_>,
+    legacy_state: &str,
+    tail: &[String],
+) -> Result<PostgresExecuteOptions> {
+    Ok(PostgresExecuteOptions {
+        execute: execute_options(inputs, None, tail)?,
+        legacy_state: legacy_state.into(),
+    })
+}
+
+fn execute_options(
+    inputs: ExecuteOptionInputs<'_>,
+    state_directory: Option<&str>,
+    tail: &[String],
+) -> Result<ExecuteOptions> {
+    Ok(ExecuteOptions {
+        policy: inputs.policy.into(),
+        registry: inputs.registry.into(),
+        reader_token: inputs.reader_token.into(),
+        writer_token: inputs.writer_token.into(),
+        state_directory: state_directory.map_or_else(PathBuf::new, PathBuf::from),
+        allow_broad_reader: parse_bool(inputs.broad_reader)?,
+        writer_proxy_url: nonempty(inputs.writer_proxy_url)?,
+        reader_proxy_url: optional_proxy(tail)?,
+    })
+}
+
+fn observe_options(
+    policy: &str,
+    registry: &str,
+    reader_token: &str,
+    state_directory: Option<&str>,
+    broad_reader: &str,
+    tail: &[String],
+) -> Result<ObserveOptions> {
+    Ok(ObserveOptions {
         policy: policy.into(),
         registry: registry.into(),
         reader_token: reader_token.into(),
-        state_directory: state_directory.into(),
+        state_directory: state_directory.map_or_else(PathBuf::new, PathBuf::from),
         allow_broad_reader: parse_bool(broad_reader)?,
         reader_proxy_url: optional_proxy(tail)?,
-    }))
+    })
 }
 
 fn optional_proxy(values: &[String]) -> Result<Option<String>> {

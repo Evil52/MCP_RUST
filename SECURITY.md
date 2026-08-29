@@ -230,8 +230,9 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
 - Backups are operator-scheduled rather than intrinsic. `scripts/backup-position-stack.sh` captures
   the database and the artifact volume as one recovery point and
   `scripts/verify-position-backup.sh` proves the result by restoring it, but both depend on the
-  passphrase from `scripts/bootstrap-backup-passphrase.sh` being held somewhere other than the host
-  being protected. AES-256-CBC is not authenticated: the recorded SHA-256 detects corruption, not an
+  age identity from `scripts/bootstrap-backup-age-key.sh` being held somewhere other than the host
+  being protected. New age v1 archives are authenticated. Legacy manifest-version-1 AES-256-CBC
+  backups remain readable, but their recorded SHA-256 only detects accidental corruption, not an
   attacker who can rewrite an archive and its manifest together.
 - Application logs provide safe transport/error telemetry but are not an append-only corporate audit
   ledger. A production rollout that requires non-repudiation must add an external protected audit sink

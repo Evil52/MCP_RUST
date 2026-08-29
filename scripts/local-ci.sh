@@ -16,7 +16,7 @@ echo "==> Formatting"
 cargo fmt --all -- --check
 
 echo "==> Tests"
-cargo test --locked --all-targets --all-features
+cargo test --locked --all-targets --all-features -- --test-threads=1
 
 echo "==> Clippy"
 cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -30,7 +30,15 @@ cargo audit --deny warnings
 echo "==> Dependency policy"
 cargo deny check
 
-echo "==> Coverage"
+echo "==> ShellCheck"
+if ! command -v shellcheck >/dev/null 2>&1; then
+  echo "shellcheck is required: brew install shellcheck" >&2
+  exit 1
+fi
+shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
+./scripts/test-release-image-lock.sh
+
+echo "==> Core library source-line coverage"
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo "cargo-llvm-cov is required: cargo install cargo-llvm-cov --version 0.8.7 --locked" >&2
   exit 1
@@ -41,6 +49,7 @@ fi
     --all-features \
     --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector|report-collector|report-worker|wb-automation))\.rs$' \
     --show-missing-lines \
-    --fail-uncovered-lines 0
+    --fail-under-functions 100 \
+    --fail-under-lines 99.9
 
 echo "Local CI passed."

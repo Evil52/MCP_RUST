@@ -2,10 +2,12 @@ name: mcp-ozon-wb-automation-live
 
 services:
   wb-automation-live:
-    image: mcp-ozon-wb-automation-live:local
+    image: ${MCP_WB_AUTOMATION_IMAGE:-mcp-ozon-wb-automation-live:local}
     build:
       context: .
       dockerfile: Dockerfile.wb-automation-shadow
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     environment:
       WB_AUTOMATION_DATABASE_URL: postgresql://wb_automation_writer:${WB_AUTOMATION_DB_PASSWORD:?WB_AUTOMATION_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
       RUST_LOG: mcp_ozon::control=info
@@ -82,10 +84,12 @@ services:
 
   write-egress:
     container_name: ${WB_AUTOMATION_WRITE_EGRESS_CONTAINER_NAME:-mcp-ozon-wb-automation-live-write-egress}
-    image: mcp-ozon-wb-automation-live-write-egress:local
+    image: ${MCP_CONTROL_WRITE_EGRESS_IMAGE:-mcp-ozon-wb-automation-live-write-egress:local}
     build:
       context: .
       dockerfile: Dockerfile.control-write-egress
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     networks:
       - write-egress-internal
       - outbound

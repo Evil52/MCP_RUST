@@ -40,6 +40,10 @@ if [[ ! -f "$source_registry" || -L "$source_registry" ]]; then
   exit 1
 fi
 
+release_record="$("$project_root/scripts/verify-release-images.sh" server)"
+release_sha="$(jq -r '.git_sha' <<<"$release_record")"
+server_image="$(jq -r '.images.server' <<<"$release_record")"
+
 if [[ "$(uname -s)" == "Darwin" ]]; then
   environment_mode="$(/usr/bin/stat -f '%Lp' "$environment_file")"
   source_mode="$(/usr/bin/stat -f '%Lp' "$source_registry")"
@@ -87,11 +91,27 @@ if ! "$docker_bin" info >/dev/null 2>&1; then
   exit 1
 fi
 
+MCP_RELEASE_GIT_SHA="$release_sha" \
+MCP_SERVER_IMAGE="$server_image" \
 MCP_ACCESS_CONFIG_HOST="$runtime_registry" \
   "$docker_bin" compose \
     --project-directory "$project_root" \
     -f "$compose_file" \
-    up -d --build --force-recreate --wait --wait-timeout 300 server
+    up -d --no-build --force-recreate --wait --wait-timeout 300 server
+
+actual_release_sha="$(
+  "$docker_bin" container inspect \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+    mcp-ozon-server
+)"
+if [[ "$actual_release_sha" != "$release_sha" ]]; then
+  "$docker_bin" compose \
+    --project-directory "$project_root" \
+    -f "$compose_file" \
+    stop server >/dev/null 2>&1 || true
+  echo "production image revision does not match CI release evidence" >&2
+  exit 1
+fi
 
 mkdir -p "$agent_dir" "$log_dir" "$watchdog_dir"
 install -m 700 "$project_root/scripts/ensure-local-runtime.sh" "$watchdog"
@@ -108,4 +128,4 @@ install -m 600 "$temporary_plist" "$plist"
 launchctl bootstrap "$domain" "$plist"
 launchctl kickstart -k "$domain/$label"
 
-echo "Installed and started $label"
+echo "Installed and started $label at verified revision $release_sha"

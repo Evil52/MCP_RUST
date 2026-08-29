@@ -16,6 +16,10 @@
     <string>__RUNTIME_DIR__</string>
     <key>WB_AUTOMATION_PROJECT_DIR</key>
     <string>__PROJECT_DIR__</string>
+    <key>MCP_WB_AUTOMATION_IMAGE</key>
+    <string>__WB_AUTOMATION_IMAGE__</string>
+    <key>MCP_CONTROL_WRITE_EGRESS_IMAGE</key>
+    <string>__CONTROL_WRITE_EGRESS_IMAGE__</string>
     <key>WB_AUTOMATION_BID_WRITES_ENABLED</key>
     <string>__BID_WRITES_ENABLED__</string>
     <key>PATH</key>

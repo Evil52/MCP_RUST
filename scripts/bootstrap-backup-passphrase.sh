@@ -1,5 +1,5 @@
 #!/bin/sh
-# Generate the local, ignored passphrase that encrypts stack backups.
+# Generate the passphrase needed only to restore legacy backup format v1.
 # The value is never printed: only the backup and restore scripts read it,
 # and they take it from this file by path.
 set -eu
@@ -29,6 +29,8 @@ chmod 600 "$output_path"
 
 echo "created protected backup passphrase file: $output_path"
 echo
+echo "This passphrase is for legacy manifest_version 1 backups only."
+echo "New backups use age; run ./scripts/bootstrap-backup-age-key.sh."
 echo "Store a copy outside this host now. A backup whose passphrase exists"
 echo "only on the machine the backup protects cannot be restored after that"
 echo "machine is lost, which is the case the backup exists for."

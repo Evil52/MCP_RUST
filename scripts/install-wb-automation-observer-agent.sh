@@ -3,6 +3,11 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+release_record="$(
+  "$project_root/scripts/verify-release-images.sh" control-write-egress
+)"
+release_sha="$(jq -r '.git_sha' <<<"$release_record")"
+write_egress_image="$(jq -r '.images["control-write-egress"]' <<<"$release_record")"
 policy_source="$project_root/config/wb-automation-robot.json"
 runner_source="$project_root/scripts/run-wb-automation-observer.sh"
 plist_template="$project_root/ops/macos/com.ofk.mcp-ozon-wb-automation-observer.plist.in"
@@ -53,10 +58,12 @@ install -m 700 "$project_root/target/release/wb-automation" "$binary_target"
 install -m 700 "$runner_source" "$runner_target"
 install -m 600 "$policy_source" "$policy_target"
 
+MCP_RELEASE_GIT_SHA="$release_sha" \
+MCP_CONTROL_WRITE_EGRESS_IMAGE="$write_egress_image" \
 docker compose \
   --project-directory "$project_root" \
   -f "$egress_compose" \
-  up --detach --build --wait --wait-timeout 120 write-egress
+  up --detach --no-build --wait --wait-timeout 120 write-egress
 
 sed \
   -e "s|__RUNNER__|$runner_target|g" \
@@ -71,4 +78,4 @@ install -m 600 "$temporary_plist" "$plist"
 launchctl bootstrap "$domain" "$plist"
 launchctl kickstart -k "$domain/$label"
 
-echo "Installed and started $label in safe-auto mode; policy controls observe-only cutoff"
+echo "Installed and started $label at verified revision $release_sha in safe-auto mode; policy controls observe-only cutoff"

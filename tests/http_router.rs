@@ -69,7 +69,7 @@ const RESOURCE_URL: &str = "http://localhost:8788/mcp";
 const RESOURCE_METADATA_URL: &str = "http://localhost:8788/.well-known/oauth-protected-resource";
 const ISSUER: &str = "http://issuer.test/realms/ofk";
 
-fn registry() -> RegistrySource {
+fn registry_with_path() -> (RegistrySource, std::path::PathBuf) {
     let id = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path =
         std::env::temp_dir().join(format!("mcp-ozon-router-{}-{id}.json", std::process::id()));
@@ -88,7 +88,12 @@ fn registry() -> RegistrySource {
         .expect("registry fixture serializes"),
     )
     .expect("registry fixture is written");
-    RegistrySource::new(path).expect("registry fixture is valid")
+    let registry = RegistrySource::new(&path).expect("registry fixture is valid");
+    (registry, path)
+}
+
+fn registry() -> RegistrySource {
+    registry_with_path().0
 }
 
 fn ozon_client() -> OzonClient {
@@ -269,8 +274,53 @@ async fn health_probe_is_served_without_authentication_in_both_modes() {
     for router in [dev_router(), jwt_router()] {
         let (status, _, body) = get(router, "/health").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "ok");
+        assert_eq!(body, "ready");
     }
+}
+
+#[tokio::test]
+async fn capacity_metrics_are_bounded_unlabelled_and_available_without_authentication() {
+    for router in [dev_router(), jwt_router()] {
+        let (status, content_type, body) = get(router, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            content_type.as_deref(),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+        assert!(body.contains("mcp_http_in_flight_requests 0\n"));
+        assert!(body.contains("mcp_http_retained_post_responses 0\n"));
+        assert!(body.contains("mcp_http_active_streams 0\n"));
+        assert!(body.contains("mcp_http_auth_requests 0\n"));
+        assert!(body.contains("mcp_http_auth_streams 0\n"));
+        assert!(
+            !body.contains('{'),
+            "metrics must not carry identity labels"
+        );
+    }
+}
+
+#[tokio::test]
+async fn liveness_stays_up_while_invalid_hot_reload_fails_readiness_closed() {
+    let (registry, path) = registry_with_path();
+    let server = OzonMcp::new(ozon_client(), "admin".to_owned(), registry);
+    let router = build_router(server, NonZeroUsize::new(4).expect("non-zero"));
+
+    let (status, _, body) = get(router.clone(), "/livez").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "live");
+    let (status, _, body) = get(router.clone(), "/readyz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "ready");
+
+    std::fs::write(path, b"{").expect("registry fixture becomes invalid");
+    for endpoint in ["/health", "/readyz"] {
+        let (status, _, body) = get(router.clone(), endpoint).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "not ready");
+    }
+    let (status, _, body) = get(router, "/livez").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "live");
 }
 
 #[tokio::test]
@@ -297,12 +347,11 @@ async fn oauth_resource_metadata_is_published_only_when_the_server_authenticates
 }
 
 #[tokio::test]
-async fn the_router_exposes_mcp_and_nothing_else() {
+async fn the_router_exposes_only_the_explicit_operational_and_mcp_surface() {
     // Pins the served surface. A new public route has to be added here
     // deliberately instead of appearing unnoticed.
     for uri in [
         "/",
-        "/metrics",
         "/config",
         "/.env",
         "/.well-known/oauth-authorization-server",
@@ -431,11 +480,11 @@ async fn the_production_router_enforces_its_session_cap_end_to_end() {
     );
 
     // Refusing the extra session must not take the process down with it: the
-    // liveness probe has to keep answering so orchestration sees a healthy
-    // container that is merely at capacity.
+    // Readiness remains available because saturation does not invalidate
+    // deployment-owned dependencies.
     let (status, _, body) = get(router, "/health").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "ok");
+    assert_eq!(body, "ready");
 }
 
 #[tokio::test(start_paused = true)]
@@ -576,7 +625,7 @@ async fn cancelling_the_router_root_terminates_an_active_legacy_session() {
 
     let (health_status, _, body) = get(router, "/health").await;
     assert_eq!(health_status, StatusCode::OK);
-    assert_eq!(body, "ok");
+    assert_eq!(body, "ready");
 }
 
 #[tokio::test]

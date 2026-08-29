@@ -511,6 +511,7 @@ async fn run_repository_scenarios_with_optional_test_database(
     let config = validate_control_database_url(&database_url).unwrap();
     let repository = WbPlanRepository::connect(&config).await.unwrap();
     repository.verify_runtime_contract().await.unwrap();
+    repository.probe().await.unwrap();
     let (mut admin, admin_connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
         .await
         .unwrap();
@@ -2834,6 +2835,7 @@ async fn verify_every_repository_entry_point_fails_closed_when_the_database_is_g
         repository.verify_runtime_contract().await,
         Err(PlanStoreError::Unavailable)
     );
+    assert_eq!(repository.probe().await, Err(PlanStoreError::Unavailable));
     assert_eq!(
         repository.register_policy(1, 7, POLICY_DIGEST, now).await,
         Err(PlanStoreError::Unavailable)

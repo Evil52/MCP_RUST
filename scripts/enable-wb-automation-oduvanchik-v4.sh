@@ -10,6 +10,17 @@ if [[ $# -ne 1 || "$1" != "$confirmation" ]]; then
 fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+release_record="$(
+  "$project_root/scripts/verify-release-images.sh" \
+    wb-automation control-write-egress ozon-egress
+)"
+export MCP_WB_AUTOMATION_IMAGE
+MCP_WB_AUTOMATION_IMAGE="$(jq -r '.images["wb-automation"]' <<<"$release_record")"
+export MCP_CONTROL_WRITE_EGRESS_IMAGE
+MCP_CONTROL_WRITE_EGRESS_IMAGE="$(
+  jq -r '.images["control-write-egress"]' <<<"$release_record"
+)"
+ozon_egress_image="$(jq -r '.images["ozon-egress"]' <<<"$release_record")"
 source_policy="$project_root/config/wb-automation-oduvanchik.bid-live.json"
 target_policy="$project_root/config/wb-automation-oduvanchik.v4.json"
 live_compose="$project_root/compose.wb-automation-live.yaml"
@@ -142,6 +153,8 @@ sed \
   -e "s|__LOG_DIR__|$log_dir|g" \
   -e "s|__RUNTIME_DIR__|$runtime_dir|g" \
   -e "s|__PROJECT_DIR__|$project_root|g" \
+  -e "s|__WB_AUTOMATION_IMAGE__|$MCP_WB_AUTOMATION_IMAGE|g" \
+  -e "s|__CONTROL_WRITE_EGRESS_IMAGE__|$MCP_CONTROL_WRITE_EGRESS_IMAGE|g" \
   "$plist_template" >"$temporary_plist"
 plutil -lint "$temporary_plist" >/dev/null
 
@@ -160,8 +173,7 @@ live=(
   -f "$live_compose"
 )
 "${live[@]}" config --quiet
-"${live[@]}" build wb-automation-live write-egress
-"$docker_bin" compose \
+MCP_OZON_EGRESS_IMAGE="$ozon_egress_image" "$docker_bin" compose \
   --project-directory "$project_root" \
   --env-file "$position_env" \
   -f "$position_compose" \

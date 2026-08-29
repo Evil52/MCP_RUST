@@ -9,6 +9,18 @@ if [[ $# -ne 1 || "$1" != "$confirmation" ]]; then
 fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+release_record="$(
+  "$project_root/scripts/verify-release-images.sh" \
+    wb-automation control-write-egress ozon-egress
+)"
+release_sha="$(jq -r '.git_sha' <<<"$release_record")"
+export MCP_WB_AUTOMATION_IMAGE
+MCP_WB_AUTOMATION_IMAGE="$(jq -r '.images["wb-automation"]' <<<"$release_record")"
+export MCP_CONTROL_WRITE_EGRESS_IMAGE
+MCP_CONTROL_WRITE_EGRESS_IMAGE="$(
+  jq -r '.images["control-write-egress"]' <<<"$release_record"
+)"
+ozon_egress_image="$(jq -r '.images["ozon-egress"]' <<<"$release_record")"
 shadow_policy_source="$project_root/config/wb-automation-robot.json"
 live_policy_source="$project_root/config/wb-automation-robot.live.json"
 runner_source="$project_root/scripts/run-wb-automation-live.sh"
@@ -139,8 +151,7 @@ compose=(
   --env-file "$position_env"
   -f "$live_compose"
 )
-"${compose[@]}" config --quiet
-"${compose[@]}" build wb-automation-live write-egress
+MCP_RELEASE_GIT_SHA="$release_sha" "${compose[@]}" config --quiet
 
 sed \
   -e "s|__RUNNER__|$runner_target|g" \
@@ -148,18 +159,22 @@ sed \
   -e "s|__LOG_DIR__|$log_dir|g" \
   -e "s|__RUNTIME_DIR__|$runtime_dir|g" \
   -e "s|__PROJECT_DIR__|$project_root|g" \
+  -e "s|__WB_AUTOMATION_IMAGE__|$MCP_WB_AUTOMATION_IMAGE|g" \
+  -e "s|__CONTROL_WRITE_EGRESS_IMAGE__|$MCP_CONTROL_WRITE_EGRESS_IMAGE|g" \
   -e "s|__BID_WRITES_ENABLED__|false|g" \
   "$plist_template" >"$temporary_plist"
 plutil -lint "$temporary_plist" >/dev/null
 
 # Prove both credentialless egresses before stopping the shadow timer. The
 # live worker itself has no direct outbound network route.
+MCP_RELEASE_GIT_SHA="$release_sha" \
+MCP_OZON_EGRESS_IMAGE="$ozon_egress_image" \
 "$docker_bin" compose \
   --project-directory "$project_root" \
   --env-file "$position_env" \
   -f "$position_compose" \
   up -d --no-deps --wait --wait-timeout 60 ozon-egress
-"${compose[@]}" up -d --no-deps --wait --wait-timeout 60 write-egress
+MCP_RELEASE_GIT_SHA="$release_sha" "${compose[@]}" up -d --no-deps --wait --wait-timeout 60 write-egress
 
 # Only one runtime may own the campaign. From this point on, any failure leaves
 # both autonomous writers stopped until the installer is rerun.

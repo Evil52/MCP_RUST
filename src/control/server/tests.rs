@@ -1921,6 +1921,31 @@ async fn run_wb_runtime_happy_path(
         .is_err()
     );
 
+    let (readiness_services, _, _) = test_wb_services(Arc::clone(&plans), Vec::new(), None);
+    let readiness_server = base_server
+        .clone()
+        .with_wb_control_services(readiness_services);
+    assert!(readiness_server.readiness().await.is_ok());
+
+    admin
+        .batch_execute("ALTER ROLE control_writer NOLOGIN")
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE usename = 'control_writer' AND pid <> pg_backend_pid()",
+            &[],
+        )
+        .await
+        .unwrap();
+    let unavailable = readiness_server.readiness().await;
+    admin
+        .batch_execute("ALTER ROLE control_writer LOGIN")
+        .await
+        .unwrap();
+    assert!(unavailable.is_err());
+
     clean_control_tables(&admin).await;
     drop(admin);
     admin_connection_task.await.unwrap().unwrap();
@@ -2004,6 +2029,24 @@ fn authenticated_constructor_advertises_exact_control_oauth_policy() {
             Some(&expected)
         );
     }
+}
+
+#[tokio::test]
+async fn control_readiness_tracks_the_hot_reloaded_registry() {
+    let fixtures = Fixtures::new(false);
+    let server = fixtures.authenticated_server();
+    assert!(
+        <ControlMcp as HttpMcpServer>::readiness(&server)
+            .await
+            .is_ok()
+    );
+
+    fs::write(&fixtures.registry_path, b"{").unwrap();
+    assert!(
+        <ControlMcp as HttpMcpServer>::readiness(&server)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

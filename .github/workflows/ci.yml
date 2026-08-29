@@ -63,6 +63,7 @@ jobs:
           command -v shellcheck >/dev/null
           shellcheck --version
           shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
+          ./scripts/test-release-image-lock.sh
           if git grep -n -I -E -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|sqp_[[:alnum:]_-]{20,}'; then
             echo "A likely private key or Sonar token is committed." >&2
             exit 1
@@ -72,7 +73,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run tests
-        run: cargo test --locked --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features -- --test-threads=1
 
       - name: Verify PostgreSQL repository transaction contract
         run: ./scripts/with-position-test-db.sh ./scripts/test-position-runtime.sh
@@ -104,10 +105,10 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Test project Rust version
-        run: cargo +1.98.0 test --locked --all-targets --all-features
+        run: cargo +1.98.0 test --locked --all-targets --all-features -- --test-threads=1
 
   coverage:
-    name: Coverage 100%
+    name: Core library source lines
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -128,7 +129,7 @@ jobs:
         with:
           tool: cargo-llvm-cov@0.8.7
 
-      - name: Enforce complete line coverage
+      - name: Enforce core-library coverage baseline
         run: >-
           ./scripts/with-position-test-db.sh
           cargo llvm-cov
@@ -137,7 +138,8 @@ jobs:
           --all-features
           --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector|report-collector|report-worker|wb-automation))\.rs$'
           --show-missing-lines
-          --fail-uncovered-lines 0
+          --fail-under-functions 100
+          --fail-under-lines 99.9
 
   dependency-security:
     name: Dependency security
@@ -211,7 +213,7 @@ jobs:
   container:
     name: Hardened container
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -225,13 +227,56 @@ jobs:
         env:
           POSITION_SCHEMA_TEST_IMAGE: mcp-ozon-position-db:ci
           POSITION_SCHEMA_TEST_KEEP_IMAGE: "true"
+          MCP_RELEASE_GIT_SHA: ${{ github.sha }}
         run: ./scripts/test-position-schema.sh
 
-      - name: Build image
+      - name: Build every shipped runtime image at the tested revision
+        env:
+          RELEASE_SHA: ${{ github.sha }}
         run: |
-          docker build --pull --tag mcp-ozon:ci .
-          docker build --pull --tag mcp-ozon-position-collector:ci \
-            --file Dockerfile.position-collector .
+          build() {
+            local tag="$1"
+            local dockerfile="$2"
+            local context="${3:-.}"
+            docker build --pull \
+              --build-arg "MCP_RELEASE_GIT_SHA=$RELEASE_SHA" \
+              --tag "$tag" --file "$dockerfile" "$context"
+          }
+          build mcp-ozon:ci Dockerfile
+          build mcp-ozon-control:ci Dockerfile.control
+          build mcp-ozon-position-collector:ci Dockerfile.position-collector
+          build mcp-ozon-report-collector:ci Dockerfile.report-collector
+          build mcp-ozon-report-worker:ci Dockerfile.report-worker
+          build mcp-ozon-wb-automation:ci Dockerfile.wb-automation-shadow
+          build mcp-ozon-egress:ci Dockerfile.ozon-egress
+          build mcp-ozon-control-ingress:ci Dockerfile.control-ingress
+          build mcp-ozon-control-auth-egress:ci Dockerfile.control-auth-egress
+          build mcp-ozon-control-write-egress:ci Dockerfile.control-write-egress
+          build mcp-ozon-mail-egress:ci Dockerfile.mail-egress
+
+      - name: Verify every image carries the tested revision
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          images=(
+            mcp-ozon:ci
+            mcp-ozon-control:ci
+            mcp-ozon-position-db:ci
+            mcp-ozon-position-collector:ci
+            mcp-ozon-report-collector:ci
+            mcp-ozon-report-worker:ci
+            mcp-ozon-wb-automation:ci
+            mcp-ozon-egress:ci
+            mcp-ozon-control-ingress:ci
+            mcp-ozon-control-auth-egress:ci
+            mcp-ozon-control-write-egress:ci
+            mcp-ozon-mail-egress:ci
+          )
+          for image in "${images[@]}"; do
+            test "$(docker image inspect \
+              --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+              "$image")" = "$RELEASE_SHA"
+          done
 
       - name: Verify minimal static musl runtime
         run: |
@@ -280,32 +325,30 @@ jobs:
           --skip-dirs target
           .
 
-      - name: Scan image for fixable high and critical vulnerabilities
-        run: >-
-          trivy image
-          --scanners vuln,secret
-          --severity HIGH,CRITICAL
-          --ignore-unfixed
-          --exit-code 1
-          mcp-ozon:ci
-
-      - name: Scan position database image for fixable high and critical vulnerabilities
-        run: >-
-          trivy image
-          --scanners vuln,secret
-          --severity HIGH,CRITICAL
-          --ignore-unfixed
-          --exit-code 1
-          mcp-ozon-position-db:ci
-
-      - name: Scan position collector image for fixable high and critical vulnerabilities
-        run: >-
-          trivy image
-          --scanners vuln,secret
-          --severity HIGH,CRITICAL
-          --ignore-unfixed
-          --exit-code 1
-          mcp-ozon-position-collector:ci
+      - name: Scan every shipped image for fixable high and critical vulnerabilities
+        run: |
+          images=(
+            mcp-ozon:ci
+            mcp-ozon-control:ci
+            mcp-ozon-position-db:ci
+            mcp-ozon-position-collector:ci
+            mcp-ozon-report-collector:ci
+            mcp-ozon-report-worker:ci
+            mcp-ozon-wb-automation:ci
+            mcp-ozon-egress:ci
+            mcp-ozon-control-ingress:ci
+            mcp-ozon-control-auth-egress:ci
+            mcp-ozon-control-write-egress:ci
+            mcp-ozon-mail-egress:ci
+          )
+          for image in "${images[@]}"; do
+            trivy image \
+              --scanners vuln,secret \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              "$image"
+          done
 
       - name: Start hardened container and verify health
         run: |
@@ -329,7 +372,7 @@ jobs:
           trap cleanup EXIT
 
           for attempt in $(seq 1 30); do
-            if curl --fail --silent --show-error http://127.0.0.1:8787/health; then
+            if curl --fail --silent --show-error http://127.0.0.1:8787/readyz; then
               break
             fi
             if [[ "$attempt" == "30" ]]; then
@@ -361,3 +404,255 @@ jobs:
             --calls 3 \
             --timeout-seconds 10 \
             --expect-overload
+
+  publish-images:
+    name: Publish ${{ matrix.id }}
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    needs: [quality, rust-version, coverage, dependency-security, container]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - id: server
+            context: .
+            dockerfile: Dockerfile
+          - id: control
+            context: .
+            dockerfile: Dockerfile.control
+          - id: position-db
+            context: position-monitor
+            dockerfile: position-monitor/Dockerfile
+          - id: position-collector
+            context: .
+            dockerfile: Dockerfile.position-collector
+          - id: report-collector
+            context: .
+            dockerfile: Dockerfile.report-collector
+          - id: report-worker
+            context: .
+            dockerfile: Dockerfile.report-worker
+          - id: wb-automation
+            context: .
+            dockerfile: Dockerfile.wb-automation-shadow
+          - id: ozon-egress
+            context: .
+            dockerfile: Dockerfile.ozon-egress
+          - id: control-ingress
+            context: .
+            dockerfile: Dockerfile.control-ingress
+          - id: control-auth-egress
+            context: .
+            dockerfile: Dockerfile.control-auth-egress
+          - id: control-write-egress
+            context: .
+            dockerfile: Dockerfile.control-write-egress
+          - id: mail-egress
+            context: .
+            dockerfile: Dockerfile.mail-egress
+    env:
+      GHCR_PACKAGE: ghcr.io/evil52/mcp-rust-runtime
+    steps:
+      - name: Checkout the exact tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require a private GHCR package
+        env:
+          GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+        run: |
+          if [[ -z "$GHCR_PUBLISH_TOKEN" ]]; then
+            echo "GHCR_PUBLISH_TOKEN with only write:packages is required." >&2
+            exit 1
+          fi
+          response="$RUNNER_TEMP/ghcr-package.json"
+          status="$(curl --silent --show-error \
+            --header "Authorization: Bearer $GHCR_PUBLISH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --output "$response" --write-out '%{http_code}' \
+            https://api.github.com/users/Evil52/packages/container/mcp-rust-runtime)"
+          case "$status" in
+            200)
+              jq -e '.visibility == "private"' "$response" >/dev/null \
+                || { echo "existing GHCR package is not private" >&2; exit 1; }
+              ;;
+            404)
+              echo "package does not exist yet; GHCR creates it private by default"
+              ;;
+            *)
+              echo "could not verify GHCR package visibility (HTTP $status)" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Log in to private GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: Evil52
+          password: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: amd64,arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build and publish the multi-platform candidate
+        id: publish
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.GHCR_PACKAGE }}:candidate-${{ github.sha }}-${{ matrix.id }}
+          build-args: MCP_RELEASE_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=release-${{ matrix.id }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.id }}
+          provenance: false
+          sbom: false
+
+      - name: Confirm package remained private
+        env:
+          GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+        run: |
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GHCR_PUBLISH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            https://api.github.com/users/Evil52/packages/container/mcp-rust-runtime \
+            | jq -e '.visibility == "private"' >/dev/null
+
+      - name: Attest the immutable image digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.GHCR_PACKAGE }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install verified Trivy
+        run: |
+          trivy_dir="$(mktemp -d)"
+          curl --fail --silent --show-error --location \
+            https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-64bit.tar.gz \
+            --output "$trivy_dir/trivy.tar.gz"
+          echo '2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b  trivy.tar.gz' \
+            | (cd "$trivy_dir" && sha256sum --check)
+          tar --extract --gzip --file "$trivy_dir/trivy.tar.gz" --directory "$trivy_dir"
+          sudo install --mode 0755 "$trivy_dir/trivy" /usr/local/bin/trivy
+
+      - name: Scan and inspect both published platforms
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Buildx returned an invalid image digest." >&2
+            exit 1
+          fi
+          reference="$GHCR_PACKAGE@$IMAGE_DIGEST"
+          for platform in linux/amd64 linux/arm64; do
+            trivy image \
+              --platform "$platform" \
+              --scanners vuln,secret \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              "$reference"
+            docker pull --platform "$platform" "$reference"
+            actual_revision="$(docker image inspect \
+              --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+              "$reference")"
+            test "$actual_revision" = "$RELEASE_SHA"
+            docker image rm "$reference" >/dev/null
+          done
+
+      - name: Write immutable image fragment
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          mkdir -p target/release-image-fragment
+          jq -n \
+            --arg id "${{ matrix.id }}" \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg reference "$GHCR_PACKAGE@$IMAGE_DIGEST" '
+            {
+              schema_version: 1,
+              id: $id,
+              git_sha: $git_sha,
+              repository: $repository,
+              platforms: ["linux/amd64", "linux/arm64"],
+              reference: $reference
+            }
+          ' >"target/release-image-fragment/${{ matrix.id }}.json"
+
+      - name: Publish verified image fragment
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mcp-ozon-image-${{ matrix.id }}-${{ github.sha }}
+          path: target/release-image-fragment/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release-evidence:
+    name: Release evidence
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    needs: [publish-images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout the exact tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download every verified image fragment
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mcp-ozon-image-*-${{ github.sha }}
+          path: target/release-image-fragments
+          merge-multiple: true
+
+      - name: Write immutable release image lock
+        run: >-
+          ./scripts/create-release-image-lock.sh
+          target/release-image-fragments
+          "$GITHUB_SHA"
+          "$GITHUB_REPOSITORY"
+          target/release-evidence/release-images.json
+
+      - name: Write immutable release identity
+        run: >-
+          ./scripts/write-release-evidence.sh
+          "$GITHUB_SHA"
+          "$GITHUB_REPOSITORY"
+          "$GITHUB_RUN_ID"
+          target/release-evidence/release-images.json
+          target/release-evidence/release.json
+
+      - name: Publish release identity after every required gate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mcp-ozon-release-${{ github.sha }}
+          path: |
+            target/release-evidence/release.json
+            target/release-evidence/release-images.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

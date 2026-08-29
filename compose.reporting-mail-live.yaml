@@ -7,10 +7,12 @@ services:
   mail-egress:
     profiles:
       - reporting-mail-live
-    image: mcp-ozon-mail-egress:local
+    image: ${MCP_MAIL_EGRESS_IMAGE:-mcp-ozon-mail-egress:local}
     build:
       context: .
       dockerfile: Dockerfile.mail-egress
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     networks:
       - mail-egress-internal
       - outbound

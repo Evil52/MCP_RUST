@@ -11,11 +11,10 @@
 # references. The reverse order would produce dangling `artifact_object_key`
 # values for anything published between the two captures.
 #
-# The archive is encrypted with AES-256-CBC. CBC is not authenticated, so the
-# manifest records the SHA-256 of each ciphertext and the restore path verifies
-# it before decrypting. That detects corruption and truncation; it is not a
-# defence against an attacker who can rewrite both the archive and its manifest,
-# which is why the backup directory belongs on separate, protected storage.
+# The archive is encrypted to an age recipient. The age v1 file format is
+# authenticated, so a modified ciphertext is rejected even if an attacker can
+# also rewrite the adjacent manifest. The manifest still records SHA-256 for
+# early corruption detection and stable archive identity.
 
 set -euo pipefail
 
@@ -30,14 +29,14 @@ if [[ ! -d "$project_root" || -L "$project_root" ]]; then
 fi
 position_env="${MCP_BACKUP_POSITION_ENV:-$project_root/.position.env}"
 runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
-passphrase_file="${MCP_BACKUP_PASSPHRASE_FILE:-$runtime_dir/backup-passphrase}"
+recipients_file="${MCP_BACKUP_AGE_RECIPIENTS_FILE:-$runtime_dir/backup-age-recipients.txt}"
 backup_root="${MCP_BACKUP_DIR:-$HOME/MCP_OZON-backups}"
 retain="${MCP_BACKUP_RETAIN:-14}"
 artifact_volume="${MCP_BACKUP_ARTIFACT_VOLUME:-mcp-ozon-report-artifacts}"
 db_network="${MCP_BACKUP_DB_NETWORK:-mcp-ozon-position-internal}"
 db_host="${MCP_BACKUP_DB_HOST:-position-db}"
 offsite_command="${MCP_BACKUP_OFFSITE_COMMAND:-}"
-pbkdf2_iterations=600000
+allow_local_only="${MCP_BACKUP_ALLOW_LOCAL_ONLY:-false}"
 
 umask 077
 
@@ -53,8 +52,15 @@ if [[ ! "$retain" =~ ^[1-9][0-9]*$ ]] || ((retain < 3 || retain > 365)); then
   echo "MCP_BACKUP_RETAIN must be an integer from 3 to 365" >&2
   exit 1
 fi
+case "$allow_local_only" in
+  true | false) ;;
+  *)
+    echo "MCP_BACKUP_ALLOW_LOCAL_ONLY must be true or false" >&2
+    exit 1
+    ;;
+esac
 
-for path in "$position_env" "$passphrase_file"; do
+for path in "$position_env" "$recipients_file"; do
   if [[ ! -f "$path" || -L "$path" ]]; then
     echo "required backup input is unavailable or unsafe: $path" >&2
     exit 1
@@ -64,13 +70,6 @@ for path in "$position_env" "$passphrase_file"; do
     exit 1
   fi
 done
-
-passphrase_length="$(head -c 4096 "$passphrase_file" | head -n 1 | tr -d '\n' | wc -c | tr -d ' ')"
-if ((passphrase_length < 32)); then
-  echo "backup passphrase must be at least 32 characters" >&2
-  echo "generate one with: ./scripts/bootstrap-backup-passphrase.sh $passphrase_file" >&2
-  exit 1
-fi
 
 if ! grep -Eq '^POSITION_DB_ADMIN_PASSWORD=.{24,}$' "$position_env"; then
   echo "position database admin password is unavailable" >&2
@@ -83,6 +82,11 @@ if [[ -n "$offsite_command" && ! -x "$offsite_command" ]]; then
   echo "MCP_BACKUP_OFFSITE_COMMAND must be one executable file: $offsite_command" >&2
   exit 1
 fi
+if [[ -z "$offsite_command" && "$allow_local_only" != true ]]; then
+  echo "an executable MCP_BACKUP_OFFSITE_COMMAND is required" >&2
+  echo "set MCP_BACKUP_ALLOW_LOCAL_ONLY=true only as an explicit accepted-risk exception" >&2
+  exit 1
+fi
 
 docker_bin="${DOCKER_BIN:-$(command -v docker || true)}"
 if [[ -z "$docker_bin" || ! -x "$docker_bin" ]]; then
@@ -93,8 +97,9 @@ if ! "$docker_bin" info >/dev/null 2>&1; then
   echo "Docker Engine is unavailable" >&2
   exit 1
 fi
-if ! command -v openssl >/dev/null 2>&1; then
-  echo "openssl is required to encrypt the backup" >&2
+if ! command -v age >/dev/null 2>&1; then
+  echo "age is required to encrypt the backup" >&2
+  echo "install age and run: ./scripts/bootstrap-backup-age-key.sh" >&2
   exit 1
 fi
 
@@ -153,12 +158,11 @@ cleanup() {
 trap cleanup EXIT
 
 encrypt_to() {
-  openssl enc -aes-256-cbc -salt -pbkdf2 -iter "$pbkdf2_iterations" \
-    -pass "file:$passphrase_file" -out "$1"
+  age --encrypt --recipients-file "$recipients_file" --output "$1"
 }
 
-database_archive="$staging_dir/position-db.dump.enc"
-artifact_archive="$staging_dir/report-artifacts.tar.enc"
+database_archive="$staging_dir/position-db.dump.age"
+artifact_archive="$staging_dir/report-artifacts.tar.age"
 
 # `pg_dump --format=custom` is what `pg_restore` consumes selectively, and it
 # takes one consistent snapshot without blocking the collectors.
@@ -194,6 +198,7 @@ finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 database_sha256="$("${sha256[@]}" "$database_archive" | awk '{ print $1 }')"
 artifact_sha256="$("${sha256[@]}" "$artifact_archive" | awk '{ print $1 }')"
+recipients_sha256="$("${sha256[@]}" "$recipients_file" | awk '{ print $1 }')"
 database_bytes="$(wc -c <"$database_archive" | tr -d ' ')"
 artifact_bytes="$(wc -c <"$artifact_archive" | tr -d ' ')"
 
@@ -210,26 +215,29 @@ jq -n \
   --arg db_owner "$db_owner" \
   --arg database_sha256 "$database_sha256" \
   --arg artifact_sha256 "$artifact_sha256" \
+  --arg recipients_sha256 "$recipients_sha256" \
   --argjson database_bytes "$database_bytes" \
   --argjson artifact_bytes "$artifact_bytes" \
-  --argjson pbkdf2_iterations "$pbkdf2_iterations" \
   '{
-     manifest_version: 1,
+     manifest_version: 2,
      started_at: $started_at,
      finished_at: $finished_at,
      capture_order: ["position-db", "report-artifacts"],
      postgres_image: $db_image,
      database_name: $db_name,
      database_owner: $db_owner,
-     cipher: "aes-256-cbc",
-     key_derivation: { function: "pbkdf2", iterations: $pbkdf2_iterations },
+     encryption: {
+       format: "age",
+       specification: "v1",
+       recipients_sha256: $recipients_sha256
+     },
      archives: {
-       "position-db.dump.enc": {
+       "position-db.dump.age": {
          format: "pg_dump --format=custom",
          sha256: $database_sha256,
          bytes: $database_bytes
        },
-       "report-artifacts.tar.enc": {
+       "report-artifacts.tar.age": {
          format: "tar",
          sha256: $artifact_sha256,
          bytes: $artifact_bytes
@@ -259,6 +267,19 @@ fi
 
 if [[ -n "$offsite_command" ]]; then
   "$offsite_command" "$target_dir"
+  marker="$target_dir/offsite-complete.json"
+  jq -n \
+    --arg completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    --arg backup "$(basename "$target_dir")" \
+    '{schema_version: 1, completed_at: $completed_at, backup: $backup}' \
+    >"$marker"
+  chmod 600 "$marker"
+else
+  marker="$target_dir/local-only-risk-accepted.json"
+  jq -n \
+    --arg accepted_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{schema_version: 1, accepted_at: $accepted_at}' >"$marker"
+  chmod 600 "$marker"
 fi
 
 printf 'backup complete: %s (db %s bytes, artifacts %s bytes)\n' \

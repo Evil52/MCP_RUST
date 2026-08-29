@@ -14,6 +14,7 @@ report_worker_password="report-worker-schema-test"
 report_collector_password="report-collector-schema-test"
 control_writer_password="control-writer-schema-test"
 wb_automation_password="wb-automation-schema-test"
+release_sha="${MCP_RELEASE_GIT_SHA:-unverified}"
 
 case "$keep_image" in
   true | false) ;;
@@ -387,7 +388,8 @@ expect_exact_validation_failure \
   WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
 
-docker build --pull --tag "$image" --file "$project_root/position-monitor/Dockerfile" \
+docker build --pull --build-arg "MCP_RELEASE_GIT_SHA=$release_sha" \
+  --tag "$image" --file "$project_root/position-monitor/Dockerfile" \
   "$project_root/position-monitor"
 image_user="$(docker image inspect --format '{{.Config.User}}' "$image")"
 if [[ "$image_user" != postgres ]]; then
@@ -395,7 +397,7 @@ if [[ "$image_user" != postgres ]]; then
   printf 'actual image user: %s\n' "$image_user" >&2
   exit 1
 fi
-docker run --detach --rm --name "$container" \
+docker run --detach --name "$container" \
   --env POSTGRES_DB=ozon_positions \
   --env POSTGRES_USER=position_admin \
   --env POSTGRES_PASSWORD="$admin_password" \
@@ -452,6 +454,61 @@ control_writer_psql=(
   psql --host 127.0.0.1 --username control_writer --dbname ozon_positions
   --no-psqlrc --set ON_ERROR_STOP=1
 )
+docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
+ledger_contract="$({ "${admin_psql[@]}" --tuples-only --no-align --command "
+  SELECT count(*) = 22
+     AND bool_and(state = 'applied')
+     AND bool_and(applied_at IS NOT NULL)
+  FROM mcp_runtime.schema_migrations
+"; } | tr -d '[:space:]')"
+if [[ "$ledger_contract" != t ]]; then
+  echo "fresh database migration ledger is incomplete" >&2
+  exit 1
+fi
+"${admin_psql[@]}" --command "
+  INSERT INTO mcp_runtime.schema_migrations (
+    migration_id, sha256, state, started_at, applied_at
+  ) VALUES (
+    '999_future.sql', repeat('f', 64), 'applied', clock_timestamp(), clock_timestamp()
+  );
+  DELETE FROM mcp_runtime.schema_migrations
+  WHERE migration_id = '022_wb_automation_explicit_resume.sql';
+" >/dev/null
+expect_failure_containing \
+  "unknown migration rollback" \
+  "database contains migrations unknown to this binary" \
+  docker exec "$container" /usr/local/bin/migrate-position-db
+known_migration_was_not_reapplied="$({ "${admin_psql[@]}" --tuples-only --no-align \
+  --command "SELECT NOT EXISTS (
+    SELECT 1 FROM mcp_runtime.schema_migrations
+    WHERE migration_id = '022_wb_automation_explicit_resume.sql'
+  )"; } | tr -d '[:space:]')"
+if [[ "$known_migration_was_not_reapplied" != t ]]; then
+  echo "rollback refusal applied an older migration before failing" >&2
+  exit 1
+fi
+"${admin_psql[@]}" --command "
+  DELETE FROM mcp_runtime.schema_migrations
+  WHERE migration_id = '999_future.sql'
+" >/dev/null
+docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
+original_migration_checksum="$({ "${admin_psql[@]}" --tuples-only --no-align \
+  --command "SELECT sha256 FROM mcp_runtime.schema_migrations
+             WHERE migration_id = '001_schema.sql'"; } | tr -d '[:space:]')"
+"${admin_psql[@]}" --command "
+  UPDATE mcp_runtime.schema_migrations
+  SET sha256 = repeat('0', 64)
+  WHERE migration_id = '001_schema.sql'
+" >/dev/null
+expect_failure_containing \
+  "migration checksum drift" \
+  "migration ledger mismatch" \
+  docker exec "$container" /usr/local/bin/migrate-position-db
+"${admin_psql[@]}" --command "
+  UPDATE mcp_runtime.schema_migrations
+  SET sha256 = '$original_migration_checksum'
+  WHERE migration_id = '001_schema.sql'
+" >/dev/null
 assert_control_schema_contract \
   "fresh database" \
   "${admin_psql[@]}"
@@ -489,7 +546,7 @@ docker exec \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$container" \
-  /docker-entrypoint-initdb.d/003_roles.sh >/dev/null
+  /opt/mcp-ozon/migrations/003_roles.sh >/dev/null
 assert_control_schema_contract \
   "role-bootstrap membership convergence" \
   "${admin_psql[@]}"
@@ -535,7 +592,7 @@ migration_admin_psql=(
   --no-psqlrc --set ON_ERROR_STOP=1
 )
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/001_schema.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/001_schema.sql >/dev/null
 "${migration_admin_psql[@]}" --command "
   INSERT INTO search_position.monitors
       (
@@ -572,39 +629,39 @@ migration_admin_psql=(
       GRANT SELECT ON TABLES TO position_reader;
 ' >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/002_ozon_collector_contract.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/002_ozon_collector_contract.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/002_wb_official_history.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/002_wb_official_history.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/004_ozon_postgres_adapter.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/004_ozon_postgres_adapter.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/005_daily_reporting_outbox.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/005_daily_reporting_outbox.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/006_daily_report_snapshots.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/006_daily_report_snapshots.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/007_daily_reporting_optional_metrics.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/007_daily_reporting_optional_metrics.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/008_daily_reporting_artifact_identity.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/008_daily_reporting_artifact_identity.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/009_daily_reporting_generation_backoff.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/009_daily_reporting_generation_backoff.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/010_daily_reporting_observation_window.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/010_daily_reporting_observation_window.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/011_daily_reporting_collection_claims.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/011_daily_reporting_collection_claims.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/012_daily_reporting_delivery_error_classes.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/012_daily_reporting_delivery_error_classes.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/013_daily_reporting_delivery_reconciliation.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/013_daily_reporting_delivery_reconciliation.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/014_daily_reporting_period_preserving_catchup.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/014_daily_reporting_period_preserving_catchup.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/015_daily_reporting_ozon_finance.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/015_daily_reporting_ozon_finance.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/016_daily_reporting_unit_economics.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/016_daily_reporting_unit_economics.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/017_daily_reporting_advertising_extensions.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/017_daily_reporting_advertising_extensions.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/018_daily_reporting_recovery_observation_window.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/018_daily_reporting_recovery_observation_window.sql >/dev/null
 "${migration_admin_psql[@]}" --command '
   GRANT USAGE ON SCHEMA daily_reporting TO position_reader;
   GRANT SELECT ON ALL TABLES IN SCHEMA daily_reporting TO position_reader;
@@ -612,23 +669,23 @@ migration_admin_psql=(
       GRANT SELECT ON TABLES TO position_reader;
 ' >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/019_daily_reporting_mcp_read_views.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/020_wb_control_plans.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/021_wb_automation_state.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/021_wb_automation_state.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/022_wb_automation_explicit_resume.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/022_wb_automation_explicit_resume.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/019_daily_reporting_mcp_read_views.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/019_daily_reporting_mcp_read_views.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/020_wb_control_plans.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/020_wb_control_plans.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/021_wb_automation_state.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/021_wb_automation_state.sql >/dev/null
 "${migration_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/022_wb_automation_explicit_resume.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/022_wb_automation_explicit_resume.sql >/dev/null
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -892,7 +949,7 @@ reject_admin_psql=(
   --dbname ozon_migration_reject_probe --no-psqlrc --set ON_ERROR_STOP=1
 )
 "${reject_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/001_schema.sql >/dev/null
+  --file /opt/mcp-ozon/migrations/001_schema.sql >/dev/null
 "${reject_admin_psql[@]}" --command "
   INSERT INTO search_position.monitors
       (store_id, product_id, search_phrase, region_code, region_name)
@@ -902,7 +959,7 @@ expect_failure_containing \
   "incompatible existing Ozon monitor migration" \
   "monitors_interval_minutes_check" \
   "${reject_admin_psql[@]}" \
-  --file /docker-entrypoint-initdb.d/002_ozon_collector_contract.sql
+  --file /opt/mcp-ozon/migrations/002_ozon_collector_contract.sql
 reject_rollback="$({ "${reject_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT
@@ -943,7 +1000,7 @@ expect_failure_containing \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$container" \
-  /docker-entrypoint-initdb.d/003_roles.sh
+  /opt/mcp-ozon/migrations/003_roles.sh
 "${admin_psql[@]}" \
   --command 'ALTER TABLE search_position.alerts_rollback_probe RENAME TO alerts' \
   >/dev/null

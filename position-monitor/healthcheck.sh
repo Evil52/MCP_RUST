@@ -5,6 +5,12 @@ set -eu
 : "${POSTGRES_USER:?POSTGRES_USER is required}"
 : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
 
+require_migration_ledger="${POSITION_DB_REQUIRE_MIGRATION_LEDGER:-true}"
+case "$require_migration_ledger" in
+  true | false) ;;
+  *) exit 1 ;;
+esac
+
 healthy="$({
   PGPASSWORD="$POSTGRES_PASSWORD" psql \
     --host=127.0.0.1 \
@@ -13,7 +19,8 @@ healthy="$({
     --no-psqlrc \
     --no-align \
     --tuples-only \
-    --set=ON_ERROR_STOP=1 <<'SQL'
+    --set=ON_ERROR_STOP=1 \
+    --set=require_migration_ledger="$require_migration_ledger" <<'SQL'
 SELECT
     to_regclass('search_position.monitors') IS NOT NULL
     AND to_regclass('search_position.collection_runs') IS NOT NULL
@@ -1195,6 +1202,18 @@ SELECT
         SELECT rolconfig @> ARRAY['default_transaction_read_only=on']
         FROM pg_roles
         WHERE rolname = 'position_reader'
+    )
+    AND (
+        :'require_migration_ledger' = 'false'
+        OR (
+            to_regclass('mcp_runtime.schema_migrations') IS NOT NULL
+            AND (
+                SELECT count(*) = 22
+                    AND bool_and(state = 'applied')
+                    AND bool_and(applied_at IS NOT NULL)
+                FROM mcp_runtime.schema_migrations
+            )
+        )
     );
 SQL
 } 2>/dev/null)"

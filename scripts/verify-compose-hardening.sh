@@ -343,7 +343,7 @@ verify_server() {
   check "$label: healthcheck matches the local HTTP readiness contract" "$server" \
     '.healthcheck == {
        "test": ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null",
-                "http://127.0.0.1:8787/health"],
+                "http://127.0.0.1:8787/readyz"],
        "timeout": "3s", "interval": "10s", "retries": 5,
        "start_period": "10s"
      }'
@@ -1321,7 +1321,7 @@ verify_control() {
   check "control: healthcheck is local, bounded, and exact" "$service" \
     '.healthcheck == {
        "test": ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null",
-                "http://127.0.0.1:8790/health"],
+                "http://127.0.0.1:8790/readyz"],
        "timeout": "3s", "interval": "10s", "retries": 5,
        "start_period": "10s"
      }'

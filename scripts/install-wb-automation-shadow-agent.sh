@@ -9,15 +9,19 @@ if [[ $# -ne 1 || "$1" != "$confirmation" ]]; then
 fi
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+release_record="$(
+  "$project_root/scripts/verify-release-images.sh" wb-automation ozon-egress
+)"
+release_sha="$(jq -r '.git_sha' <<<"$release_record")"
+wb_automation_image="$(jq -r '.images["wb-automation"]' <<<"$release_record")"
+ozon_egress_image="$(jq -r '.images["ozon-egress"]' <<<"$release_record")"
+export MCP_WB_AUTOMATION_IMAGE="$wb_automation_image"
 policy_source="$project_root/config/wb-automation-robot.json"
 runner_source="$project_root/scripts/run-wb-automation-shadow.sh"
 plist_template="$project_root/ops/macos/com.ofk.mcp-ozon-wb-automation-shadow.plist.in"
 shadow_compose="$project_root/compose.wb-automation-shadow.yaml"
 position_compose="$project_root/compose.position.yaml"
 legacy_egress_compose="$project_root/compose.wb-automation-egress.yaml"
-roles_script="$project_root/position-monitor/initdb/003_roles.sh"
-migration="$project_root/position-monitor/initdb/021_wb_automation_state.sql"
-explicit_resume_migration="$project_root/position-monitor/initdb/022_wb_automation_explicit_resume.sql"
 position_env="$project_root/.position.env"
 runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
 position_env_target="$runtime_dir/position.env"
@@ -48,8 +52,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 for path in \
   "$policy_source" "$runner_source" "$plist_template" "$shadow_compose" \
-  "$position_compose" "$legacy_egress_compose" "$roles_script" "$migration" \
-  "$explicit_resume_migration" "$position_env" \
+  "$position_compose" "$legacy_egress_compose" "$position_env" \
   "$registry" "$reader_token" "$legacy_state"; do
   if [[ ! -f "$path" || -L "$path" ]]; then
     echo "required WB automation shadow file is unavailable or unsafe: $path" >&2
@@ -141,9 +144,9 @@ if [[ -z "$position_container" ]]; then
   exit 1
 fi
 
-# Additive database preparation and image construction cannot touch WB. Finish
-# them while the working legacy timer is still available, minimizing the
-# guarded no-writer window that begins below.
+# Ledger-backed database preparation and image construction cannot touch WB.
+# Finish them while the working legacy timer is still available, minimizing
+# the guarded no-writer window that begins below.
 "$docker_bin" exec -i \
   --env POSTGRES_PASSWORD="$POSITION_DB_ADMIN_PASSWORD" \
   --env POSTGRES_USER="${POSITION_DB_ADMIN_USER:-position_admin}" \
@@ -154,21 +157,7 @@ fi
   --env REPORT_COLLECTOR_DB_PASSWORD="$REPORT_COLLECTOR_DB_PASSWORD" \
   --env CONTROL_WRITER_DB_PASSWORD="$CONTROL_WRITER_DB_PASSWORD" \
   --env WB_AUTOMATION_DB_PASSWORD="$WB_AUTOMATION_DB_PASSWORD" \
-  "$position_container" /bin/sh -s <"$roles_script" >/dev/null
-"$docker_bin" exec -i \
-  --env PGPASSWORD="$POSITION_DB_ADMIN_PASSWORD" \
-  "$position_container" psql \
-    --no-psqlrc --set ON_ERROR_STOP=1 \
-    --username "${POSITION_DB_ADMIN_USER:-position_admin}" \
-    --dbname "${POSITION_DB_NAME:-ozon_positions}" \
-    <"$migration" >/dev/null
-"$docker_bin" exec -i \
-  --env PGPASSWORD="$POSITION_DB_ADMIN_PASSWORD" \
-  "$position_container" psql \
-    --no-psqlrc --set ON_ERROR_STOP=1 \
-    --username "${POSITION_DB_ADMIN_USER:-position_admin}" \
-    --dbname "${POSITION_DB_NAME:-ozon_positions}" \
-    <"$explicit_resume_migration" >/dev/null
+  "$position_container" /usr/local/bin/migrate-position-db >/dev/null
 
 mkdir -p "$runtime_dir" "$libexec_dir" "$agent_dir" "$log_dir"
 chmod 700 "$runtime_dir" "$libexec_dir"
@@ -176,6 +165,7 @@ install -m 700 "$runner_source" "$runner_target"
 install -m 644 "$policy_source" "$policy_target"
 install -m 600 "$position_env" "$position_env_target"
 
+MCP_RELEASE_GIT_SHA="$release_sha" \
 WB_AUTOMATION_POLICY_HOST="$policy_target" \
 WB_AUTOMATION_ACCESS_CONFIG_HOST="$registry" \
 WB_AUTOMATION_READ_TOKEN_FILE_HOST="$reader_token" \
@@ -184,7 +174,7 @@ WB_AUTOMATION_LEGACY_STATE_HOST="$legacy_state" \
     --project-directory "$project_root" \
     --env-file "$position_env" \
     -f "$shadow_compose" \
-    build wb-automation-shadow
+    config --quiet
 
 sed \
   -e "s|__RUNNER__|$runner_target|g" \
@@ -192,11 +182,14 @@ sed \
   -e "s|__LOG_DIR__|$log_dir|g" \
   -e "s|__RUNTIME_DIR__|$runtime_dir|g" \
   -e "s|__PROJECT_DIR__|$project_root|g" \
+  -e "s|__WB_AUTOMATION_IMAGE__|$wb_automation_image|g" \
   "$plist_template" >"$temporary_plist"
 plutil -lint "$temporary_plist" >/dev/null
 
 # The shadow has no direct network route. Prove its credentialless read proxy
 # is healthy before disabling the working legacy timer.
+MCP_RELEASE_GIT_SHA="$release_sha" \
+MCP_OZON_EGRESS_IMAGE="$ozon_egress_image" \
 "$docker_bin" compose \
   --project-directory "$project_root" \
   --env-file "$position_env" \

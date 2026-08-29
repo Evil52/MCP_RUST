@@ -362,6 +362,20 @@ impl OzonMcp {
         self.authenticator.as_ref()
     }
 
+    /// Verifies only deployment-owned dependencies used by the request path.
+    /// Marketplace APIs are intentionally excluded from readiness.
+    pub(crate) async fn readiness(&self) -> Result<(), ()> {
+        if let Err(error) = self.registry.load_async().await {
+            tracing::warn!(%error, "MCP readiness failed: access registry is invalid");
+            return Err(());
+        }
+        if let Err(error) = self.reporting_reader.probe().await {
+            tracing::warn!(%error, "MCP readiness failed: reporting reader is unavailable");
+            return Err(());
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn with_preview_features(
         mut self,
@@ -6690,6 +6704,13 @@ mod tests {
             self.calls.load(Ordering::SeqCst)
         }
 
+        fn unavailable() -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+                error: Some(ReportingReadError::Unavailable),
+            }
+        }
+
         fn complete<'a, T: Send + 'a>(&'a self, value: T) -> ReportingReadFuture<'a, T> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let error = self.error;
@@ -6707,6 +6728,10 @@ mod tests {
     impl ReportingReadRepository for FakeReportingRepository {
         fn enabled(&self) -> bool {
             true
+        }
+
+        fn probe(&self) -> ReportingReadFuture<'_, ()> {
+            self.complete(())
         }
 
         fn collection_status<'a>(
@@ -6854,6 +6879,15 @@ mod tests {
             performance_registry_source(),
         )
         .with_reporting_reader(ReportingReader::from_repository(repository))
+    }
+
+    #[tokio::test]
+    async fn readiness_fails_when_the_configured_reporting_reader_is_unavailable() {
+        let repository = Arc::new(FakeReportingRepository::unavailable());
+        let server = reporting_test_server("admin", repository.clone());
+
+        assert!(server.readiness().await.is_err());
+        assert_eq!(repository.calls(), 1);
     }
 
     fn reporting_edge_registry_source() -> RegistrySource {

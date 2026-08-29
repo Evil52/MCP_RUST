@@ -35,10 +35,12 @@ services:
         condition: service_healthy
 
   control-write-egress:
-    image: mcp-ozon-control-write-egress:local
+    image: ${MCP_CONTROL_WRITE_EGRESS_IMAGE:-mcp-ozon-control-write-egress:local}
     build:
       context: .
       dockerfile: Dockerfile.control-write-egress
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     networks:
       - control-write-egress-internal
       - outbound
@@ -71,10 +73,12 @@ services:
       start_period: 10s
 
   control-auth-egress:
-    image: mcp-ozon-control-auth-egress:local
+    image: ${MCP_CONTROL_AUTH_EGRESS_IMAGE:-mcp-ozon-control-auth-egress:local}
     build:
       context: .
       dockerfile: Dockerfile.control-auth-egress
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     environment:
       CONTROL_AUTH_JWKS_HOST: ${CONTROL_MCP_JWT_JWKS_HOST:?CONTROL_MCP_JWT_JWKS_HOST is required}
       CONTROL_AUTH_JWKS_PATH: ${CONTROL_MCP_JWT_JWKS_PATH:?CONTROL_MCP_JWT_JWKS_PATH is required}

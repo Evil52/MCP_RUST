@@ -20,8 +20,12 @@
     <string>__POSITION_ENV__</string>
     <key>MCP_BACKUP_DIR</key>
     <string>__BACKUP_DIR__</string>
+    <key>MCP_BACKUP_AGE_RECIPIENTS_FILE</key>
+    <string>__AGE_RECIPIENTS_FILE__</string>
     <key>MCP_BACKUP_OFFSITE_COMMAND</key>
     <string>__OFFSITE_COMMAND__</string>
+    <key>MCP_BACKUP_ALLOW_LOCAL_ONLY</key>
+    <string>__ALLOW_LOCAL_ONLY__</string>
     <key>PATH</key>
     <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>

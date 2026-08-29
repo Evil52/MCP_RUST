@@ -18,6 +18,8 @@
     <string>__RUNTIME_DIR__</string>
     <key>WB_AUTOMATION_PROJECT_DIR</key>
     <string>__PROJECT_DIR__</string>
+    <key>MCP_WB_AUTOMATION_IMAGE</key>
+    <string>__WB_AUTOMATION_IMAGE__</string>
     <key>PATH</key>
     <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>

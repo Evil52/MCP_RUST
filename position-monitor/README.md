@@ -168,19 +168,26 @@ together, by one command, in one order.
 
 ### Taking backups
 
-Create the passphrase once and put a copy somewhere other than this Mac:
+Install `age`, create a dedicated identity once, and put a protected copy of
+the identity somewhere other than this Mac:
 
 ```bash
-./scripts/bootstrap-backup-passphrase.sh
+brew install age
+./scripts/bootstrap-backup-age-key.sh
 ```
 
-A passphrase that exists only on the machine the backup protects cannot be used
-after that machine is lost, which is the case the backup exists for.
+The script writes a secret identity and a public recipients file. The backup
+writer receives only the public file; the restore verifier receives the secret
+identity. An identity that exists only on the machine the backup protects
+cannot be used after that machine is lost, which is the case the backup exists
+for.
 
-Then schedule both operations agents:
+Then configure an executable offsite-copy hook and schedule all three
+operations agents:
 
 ```bash
 MCP_HEALTH_NOTIFY_COMMAND="$HOME/.local/libexec/mcp-ozon/notify" \
+MCP_BACKUP_OFFSITE_COMMAND="$HOME/.local/libexec/mcp-ozon/offsite-copy" \
   ./scripts/install-operations-agents.sh
 ```
 
@@ -188,8 +195,9 @@ The installer takes one real backup, restores it into a disposable PostgreSQL
 container and runs one health check before scheduling anything. It refuses to
 install an agent whose first run did not work.
 
-This creates `com.ofk.mcp-ozon-backup` (daily at 03:30) and
-`com.ofk.mcp-ozon-health` (every 15 minutes). Both use
+This creates `com.ofk.mcp-ozon-backup` (daily at 03:30),
+`com.ofk.mcp-ozon-restore-verify` (Sunday at 04:30), and
+`com.ofk.mcp-ozon-health` (every 15 minutes). They use
 `StartCalendarInterval`: `StartInterval` drops any firing whose moment lands
 while the Mac is asleep, while `StartCalendarInterval` runs the job on the next
 wake.
@@ -198,11 +206,15 @@ wake.
 | --- | --- | --- |
 | `MCP_BACKUP_DIR` | `~/MCP_OZON-backups` | Where backups are written. Put this on separate storage. |
 | `MCP_BACKUP_RETAIN` | `14` | Backups kept before the oldest are pruned. |
-| `MCP_BACKUP_PASSPHRASE_FILE` | `$MCP_RUNTIME_DIR/backup-passphrase` | Encryption passphrase, mode `600`. |
-| `MCP_BACKUP_OFFSITE_COMMAND` | unset | One executable, called with the new backup directory. |
+| `MCP_BACKUP_AGE_RECIPIENTS_FILE` | `$MCP_RUNTIME_DIR/backup-age-recipients.txt` | Public age recipients used by the backup writer, mode `600`. |
+| `MCP_BACKUP_AGE_IDENTITY_FILE` | `$MCP_RUNTIME_DIR/backup-age-identity.txt` | Secret age identity used only by restore verification, mode `600`. |
+| `MCP_BACKUP_PASSPHRASE_FILE` | `$MCP_RUNTIME_DIR/backup-passphrase` | Legacy v1 restore only; not used for new backups. |
+| `MCP_BACKUP_OFFSITE_COMMAND` | required | One executable that must confirm copying the new backup off-host. |
+| `MCP_BACKUP_ALLOW_LOCAL_ONLY` | `false` | Explicit accepted-risk exception when offsite storage is temporarily unavailable. |
 | `MCP_HEALTH_NOTIFY_COMMAND` | unset | One executable; receives the findings report on stdin. |
 | `MCP_HEALTH_CYCLE_STALE_SECONDS` | `1800` | Age at which a silent WB robot becomes a finding. |
 | `MCP_HEALTH_BACKUP_STALE_SECONDS` | `129600` | Age at which the newest backup becomes a finding. |
+| `MCP_HEALTH_RESTORE_STALE_SECONDS` | `691200` | Age at which the last successful disposable restore becomes a finding. |
 
 Both hooks are executed directly rather than through a shell, so each must be a
 single executable file. Wrap `mail`, `curl` or `osascript` in a small script
@@ -247,11 +259,12 @@ the live stack.
    to prevent.
 5. Re-run the health check before re-enabling any writer.
 
-Encryption is AES-256-CBC, which is not authenticated. The manifest records the
-SHA-256 of each ciphertext and the restore path verifies it before decrypting,
-which detects corruption and truncation. It is not a defence against an attacker
-who can rewrite both the archive and its manifest — which is why the backup
-directory belongs on separate, protected storage.
+New backups use authenticated age v1 files (`manifest_version: 2`). The
+manifest also records each ciphertext SHA-256 for early corruption detection
+and stable archive identity. Restore keeps read compatibility with legacy
+`manifest_version: 1` AES-256-CBC backups; those require the old passphrase and
+do not gain authentication retroactively. Keep the backup directory and the
+recovery identity on separate protected storage.
 
 ### PostgreSQL major upgrades
 
@@ -309,71 +322,23 @@ disabled and leave `MCP_REPORTING_DATABASE_URL` unset until every database
 migration and the authenticated database healthcheck below have succeeded. Do
 not run `down -v`, remove `mcp-ozon-position-data`, or recreate the named volume.
 
-Create or rotate the restricted
-`report_worker` and `report_collector` roles by running the current
-`003_roles.sh` with all five
-password environment variables, then apply only the migrations that are
-missing from the inspected schema, in the order shown, as the database owner.
-These SQL files are not a migration ledger. In particular, migration `018` is
-intentionally one-shot: if
-`source_snapshots_recovery_start_window_check` already exists, skip `018` and
-continue with `019`; never run `018` a second time.
+The database image now owns a checksum-protected migration ledger in
+`mcp_runtime.schema_migrations`. It refuses changed checksums, interrupted
+`applying` rows, unknown newer migrations, and an existing schema without a
+reviewed baseline. On the first upgrade from the pre-ledger image, rebuild
+`position-db`, confirm the verified backup, and baseline exactly once. Later
+upgrades run only the normal migrator:
 
 ```bash
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" REPORT_WORKER_DB_PASSWORD="$REPORT_WORKER_DB_PASSWORD" exec /docker-entrypoint-initdb.d/003_roles.sh'
+  migrate-position-db --baseline-current
 docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/005_daily_reporting_outbox.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/006_daily_report_snapshots.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/007_daily_reporting_optional_metrics.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/008_daily_reporting_artifact_identity.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/009_daily_reporting_generation_backoff.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/010_daily_reporting_observation_window.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/011_daily_reporting_collection_claims.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/012_daily_reporting_delivery_error_classes.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/013_daily_reporting_delivery_reconciliation.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/014_daily_reporting_period_preserving_catchup.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/015_daily_reporting_ozon_finance.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/016_daily_reporting_unit_economics.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/017_daily_reporting_advertising_extensions.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/018_daily_reporting_recovery_observation_window.sql
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/019_daily_reporting_mcp_read_views.sql
+  migrate-position-db
 ```
 
-Migration `018_daily_reporting_recovery_observation_window.sql` must commit
-before `019_daily_reporting_mcp_read_views.sql`. Migration `019` creates the
-curated MCP projections and converges `position_reader` from any legacy broad
-grants to the explicit read-only view allowlist; do not skip or reverse these
-two migrations.
+The migrator preserves the required order between migration `018` and `019`
+and never retries a migration left in `applying`: restore or reconcile that
+state explicitly instead of guessing whether a one-shot transaction committed.
 
 The migrations are transactional. The collection-claim migration gives each
 exact account/marketplace/cutoff a fifteen-minute lease with a monotonically
@@ -470,14 +435,9 @@ monitor uses an interval other than 30 minutes, searches beyond top 100, has a
 non-numeric Ozon product ID, or if multiple existing runs map to one half-hour
 slot.
 
-After reviewing those preconditions, apply the migration without deleting or
-recreating the named volume:
-
-```bash
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/002_ozon_collector_contract.sql
-```
+After reviewing those preconditions, use only the ledger-backed migrator from
+the preceding section. Direct execution of this SQL file is unsupported because
+it would bypass checksum and ordering evidence.
 
 The migration adds exact slot idempotency, the one-way Ozon run state machine,
 non-lossy placement, published reader views, a durable circuit and request
@@ -485,32 +445,21 @@ budget tables/functions. It revokes reader access to raw Ozon runs,
 measurements and alerts. Applying the migration does not start a collector or
 make a marketplace request.
 
-After the collector contract is present, apply the adapter digest migration in
-the same reviewed maintenance window:
-
-```bash
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/004_ozon_postgres_adapter.sql
-```
+The migrator applies the adapter digest migration after the collector contract
+in the same reviewed maintenance window.
 
 It adds an immutable SHA-256 payload digest. Existing historical rows receive a
 non-replayable zero marker; no measurement or terminal run is mutated.
 
 ### Existing-volume WB migration
 
-Back up the initialized database first. Then apply the additive migration to
-the running database without deleting or recreating its named volume:
-
-```bash
-docker compose --env-file .position.env -f compose.position.yaml exec -T position-db \
-  sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" exec psql --no-psqlrc --set ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB"' \
-  < position-monitor/initdb/002_wb_official_history.sql
-```
+Back up the initialized database first. Then use only the ledger-backed
+migrator from the preceding section; direct execution of the additive SQL is
+unsupported.
 
 The migration is transactional and, on an existing installation, grants only
-the new WB tables/sequences to the already-created restricted roles. Apply it
-exactly once. After it commits, rebuild and recreate only the database
+the new WB tables/sequences to the already-created restricted roles. The ledger
+applies it exactly once. After it commits, rebuild and recreate only the database
 container so that the new authenticated healthcheck is installed; the named
 data volume is retained:
 

@@ -94,6 +94,15 @@ impl WbPlanRepository {
         }
     }
 
+    /// Confirms that the process-owned supervised database session can still
+    /// complete a round trip. It performs no marketplace request or write.
+    pub async fn probe(&self) -> Result<(), PlanStoreError> {
+        self.client
+            .probe()
+            .await
+            .map_err(|_| PlanStoreError::Unavailable)
+    }
+
     /// Registers the next immutable policy identity. Re-registering the exact
     /// current identity is idempotent; rollback and revision reuse fail closed.
     pub async fn register_policy(

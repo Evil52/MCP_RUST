@@ -3,9 +3,10 @@
 //! The router lives here rather than in `main.rs` so tests exercise the exact
 //! wiring production runs. Assembling an equivalent router inside a test is not
 //! the same guarantee: the copy drifts, and the routes that only exist in the
-//! binary — `/health` and the OAuth resource metadata — go unverified.
+//! binary — liveness/readiness and the OAuth resource metadata — go unverified.
 
 use std::{
+    future::Future,
     num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
@@ -50,7 +51,15 @@ use crate::{
 pub trait HttpMcpServer: ServerHandler + Clone {
     fn protected_resource_metadata(&self) -> Option<ProtectedResourceMetadata>;
     fn transport_authenticator(&self) -> Option<&JwtAuthenticator>;
+    fn readiness(&self) -> ReadinessFuture<'_>;
 }
+
+/// A dependency-local readiness check.
+///
+/// Implementations must not call marketplace APIs: readiness is allowed to
+/// validate only resources owned by this deployment, such as the hot-reloaded
+/// registry and an already-configured PostgreSQL session.
+pub type ReadinessFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ()>> + Send + 'a>>;
 
 impl HttpMcpServer for OzonMcp {
     fn protected_resource_metadata(&self) -> Option<ProtectedResourceMetadata> {
@@ -59,6 +68,10 @@ impl HttpMcpServer for OzonMcp {
 
     fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
         self.transport_authenticator()
+    }
+
+    fn readiness(&self) -> ReadinessFuture<'_> {
+        Box::pin(self.readiness())
     }
 }
 
@@ -227,6 +240,34 @@ impl McpHttpLimits {
         Arc::clone(&self.post_response_permits)
             .try_acquire_owned()
             .ok()
+    }
+
+    fn prometheus_metrics(&self) -> String {
+        let in_flight = |capacity: usize, semaphore: &Semaphore| {
+            capacity.saturating_sub(semaphore.available_permits())
+        };
+        format!(
+            concat!(
+                "# TYPE mcp_http_in_flight_requests gauge\n",
+                "mcp_http_in_flight_requests {}\n",
+                "# TYPE mcp_http_retained_post_responses gauge\n",
+                "mcp_http_retained_post_responses {}\n",
+                "# TYPE mcp_http_active_streams gauge\n",
+                "mcp_http_active_streams {}\n",
+                "# TYPE mcp_http_auth_requests gauge\n",
+                "mcp_http_auth_requests {}\n",
+                "# TYPE mcp_http_auth_streams gauge\n",
+                "mcp_http_auth_streams {}\n",
+            ),
+            in_flight(MCP_MAX_IN_FLIGHT_REQUESTS, &self.request_permits),
+            in_flight(
+                MCP_MAX_IN_FLIGHT_POST_RESPONSES,
+                &self.post_response_permits,
+            ),
+            in_flight(MCP_MAX_IN_FLIGHT_STREAMS, &self.stream_permits),
+            in_flight(MCP_MAX_IN_FLIGHT_REQUESTS, &self.auth_request_permits),
+            in_flight(MCP_MAX_IN_FLIGHT_STREAMS, &self.auth_stream_permits),
+        )
     }
 }
 
@@ -963,9 +1004,9 @@ async fn limit_mcp_request_concurrency(
     }
 }
 
-/// Builds the complete HTTP router: the MCP endpoint, a liveness probe, and —
-/// only when the server authenticates requests — the OAuth protected-resource
-/// metadata document.
+/// Builds the complete HTTP router: the MCP endpoint, process liveness,
+/// dependency-local readiness, and — only when the server authenticates
+/// requests — the OAuth protected-resource metadata document.
 ///
 /// `max_sessions` bounds concurrently retained MCP sessions, so an
 /// unauthenticated client cannot exhaust memory by opening sessions.
@@ -1051,7 +1092,10 @@ where
         transport_config.clone(),
         server.transport_authenticator().cloned(),
     );
+    let metrics_limits = http_limits.clone();
     let server = Arc::new(server);
+    let health_server = Arc::clone(&server);
+    let readiness_server = Arc::clone(&server);
     let session_manager = Arc::new(
         LocalSessionManager::default()
             .with_max_sessions(max_sessions)
@@ -1069,7 +1113,22 @@ where
             limit_mcp_request_concurrency,
         ));
     let mut router = Router::new()
-        .route("/health", get(|| async { "ok" }))
+        .route("/livez", get(|| async { "live" }))
+        .route(
+            "/health",
+            get(move || readiness_response(Arc::clone(&health_server))),
+        )
+        .route(
+            "/readyz",
+            get(move || readiness_response(Arc::clone(&readiness_server))),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let limits = metrics_limits.clone();
+                async move { metrics_response(&limits) }
+            }),
+        )
         .nest("/mcp", mcp_router);
     if let Some(metadata) = protected_resource_metadata {
         router = router.route(
@@ -1081,6 +1140,24 @@ where
         );
     }
     router
+}
+
+fn metrics_response(limits: &McpHttpLimits) -> Response {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        limits.prometheus_metrics(),
+    )
+        .into_response()
+}
+
+async fn readiness_response<S>(server: Arc<S>) -> Response
+where
+    S: HttpMcpServer,
+{
+    match server.readiness().await {
+        Ok(()) => (StatusCode::OK, "ready").into_response(),
+        Err(()) => (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response(),
+    }
 }
 
 #[cfg(test)]
