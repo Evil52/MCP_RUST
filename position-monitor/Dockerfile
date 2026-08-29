@@ -1,4 +1,4 @@
-FROM postgres:17-alpine@sha256:d4bb0a8c1b7bb2e29f976d099e7bfb9a5d8858cffe9e46b35cd302cd1f1f8168
+FROM postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
 
 ARG MCP_RELEASE_GIT_SHA=unverified
 LABEL org.opencontainers.image.revision="${MCP_RELEASE_GIT_SHA}"
