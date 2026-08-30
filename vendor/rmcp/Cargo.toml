@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.88"
 name = "rmcp"
-version = "3.1.1"
+version = "3.1.4"
 autolib = false
 autobins = false
 autoexamples = false
@@ -94,6 +94,7 @@ macros = [
 request-state = [
     "dep:hmac",
     "dep:sha2",
+    "dep:zeroize",
     "base64",
 ]
 reqwest = [
@@ -528,6 +529,10 @@ required-features = [
 ]
 
 [[test]]
+name = "test_streamable_http_get_stream_auth_challenge"
+path = "tests/test_streamable_http_get_stream_auth_challenge.rs"
+
+[[test]]
 name = "test_streamable_http_idle_timeout_log"
 path = "tests/test_streamable_http_idle_timeout_log.rs"
 
@@ -736,6 +741,10 @@ version = "0.1"
 features = ["tokio"]
 optional = true
 
+[dependencies.indexmap]
+version = "2"
+features = ["serde"]
+
 [dependencies.jsonwebtoken]
 version = "11"
 features = ["aws_lc_rs"]
@@ -772,7 +781,7 @@ optional = true
 default-features = false
 
 [dependencies.rmcp-macros]
-version = "3.1.1"
+version = "3.1.4"
 optional = true
 
 [dependencies.schemars]
@@ -835,6 +844,10 @@ optional = true
 
 [dependencies.which]
 version = "8"
+optional = true
+
+[dependencies.zeroize]
+version = "1"
 optional = true
 
 [dev-dependencies.anyhow]

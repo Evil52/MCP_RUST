@@ -28,10 +28,15 @@ backup_root="${MCP_BACKUP_DIR:-$HOME/MCP_OZON-backups}"
 db_network="${MCP_HEALTH_DB_NETWORK:-mcp-ozon-position-internal}"
 db_host="${MCP_HEALTH_DB_HOST:-position-db}"
 compose_project="${MCP_HEALTH_COMPOSE_PROJECT:-mcp-ozon-position}"
-required_services="${MCP_HEALTH_REQUIRED_SERVICES:-position-db,position-collector,ozon-egress,report-collector,report-worker}"
+# Only the always-on base data plane is required by default. The collectors and
+# report worker are deliberately disabled until their guarded operator
+# cutovers complete, so treating them as baseline services makes a healthy
+# fail-closed deployment permanently noisy. Operators that enable optional
+# runtimes must list them explicitly in MCP_HEALTH_REQUIRED_SERVICES.
+required_services="${MCP_HEALTH_REQUIRED_SERVICES-position-db,ozon-egress}"
 mcp_container_name="${MCP_HEALTH_MCP_CONTAINER_NAME:-mcp-ozon-server}"
 mcp_ready_url="${MCP_HEALTH_MCP_READY_URL:-http://127.0.0.1:8787/readyz}"
-required_launch_agents="${MCP_HEALTH_REQUIRED_LAUNCH_AGENTS:-com.ofk.mcp-ozon-runtime,com.ofk.mcp-ozon-backup,com.ofk.mcp-ozon-health,com.ofk.mcp-ozon-restore-verify}"
+required_launch_agents="${MCP_HEALTH_REQUIRED_LAUNCH_AGENTS-com.ofk.mcp-ozon-runtime,com.ofk.mcp-ozon-backup,com.ofk.mcp-ozon-health,com.ofk.mcp-ozon-restore-verify}"
 skip_launch_agent_check="${MCP_HEALTH_SKIP_LAUNCH_AGENT_CHECK:-false}"
 cycle_stale_seconds="${MCP_HEALTH_CYCLE_STALE_SECONDS:-1800}"
 backup_stale_seconds="${MCP_HEALTH_BACKUP_STALE_SECONDS:-129600}"
@@ -61,6 +66,12 @@ case "$skip_launch_agent_check" in
     exit 2
     ;;
 esac
+for csv_contract in "$required_services" "$required_launch_agents"; do
+  if [[ ! "$csv_contract" =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]]; then
+    echo "health required-service and LaunchAgent lists must be non-empty comma-separated identifiers" >&2
+    exit 2
+  fi
+done
 
 findings=()
 add_finding() {

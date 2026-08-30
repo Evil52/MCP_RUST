@@ -36,6 +36,7 @@ if ! command -v shellcheck >/dev/null 2>&1; then
   exit 1
 fi
 shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
+./scripts/test-runtime-health-contract.sh
 ./scripts/test-release-image-lock.sh
 
 echo "==> Core library source-line coverage"

@@ -22,6 +22,10 @@
     <string>__BACKUP_DIR__</string>
     <key>MCP_HEALTH_NOTIFY_COMMAND</key>
     <string>__NOTIFY_COMMAND__</string>
+    <key>MCP_HEALTH_REQUIRED_SERVICES</key>
+    <string>__HEALTH_REQUIRED_SERVICES__</string>
+    <key>MCP_HEALTH_REQUIRED_LAUNCH_AGENTS</key>
+    <string>__HEALTH_REQUIRED_LAUNCH_AGENTS__</string>
     <key>MCP_BACKUP_ALLOW_LOCAL_ONLY</key>
     <string>__ALLOW_LOCAL_ONLY__</string>
     <key>PATH</key>
