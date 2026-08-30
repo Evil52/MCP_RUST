@@ -48,7 +48,7 @@ for image_id in "$@"; do
 
   echo "==> pulling immutable $image_id image" >&2
   if ! "$docker_bin" pull "$reference" >&2; then
-    echo "private GHCR pull failed; authenticate Docker with a read:packages token" >&2
+    echo "public GHCR pull failed; verify package visibility and registry availability" >&2
     exit 1
   fi
   actual_release_sha="$(
