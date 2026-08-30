@@ -65,6 +65,7 @@ jobs:
           shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
           ./scripts/test-runtime-health-contract.sh
           ./scripts/test-release-image-lock.sh
+          ./scripts/test-shared-rust-image-builder.sh
           if git grep -n -I -E -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|sqp_[[:alnum:]_-]{20,}'; then
             echo "A likely private key or Sonar token is committed." >&2
             exit 1
@@ -424,12 +425,52 @@ jobs:
             --timeout-seconds 10 \
             --expect-overload
 
+  prime-rust-release-cache:
+    name: Prime Rust release cache
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    needs: [quality, rust-version, coverage, dependency-security, container]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the exact tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: amd64,arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # All six Rust Dockerfiles have the same builder stage. Build it once per
+      # platform and export the completed binary layer under a read-only scope;
+      # the parallel image jobs below keep their own writable cache scopes.
+      - name: Compile every Rust runtime binary once per platform
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          target: builder
+          platforms: linux/amd64,linux/arm64
+          outputs: type=cacheonly
+          cache-from: type=gha,scope=release-rust-binaries
+          cache-to: type=gha,mode=max,scope=release-rust-binaries,timeout=20m
+          provenance: false
+          sbom: false
+
   publish-images:
     name: Publish ${{ matrix.id }}
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
-    needs: [quality, rust-version, coverage, dependency-security, container]
+    needs: [prime-rust-release-cache]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -445,39 +486,63 @@ jobs:
           - id: server
             context: .
             dockerfile: Dockerfile
+            cache_from: |-
+              type=gha,scope=release-server
+              type=gha,scope=release-rust-binaries
           - id: control
             context: .
             dockerfile: Dockerfile.control
+            cache_from: |-
+              type=gha,scope=release-control
+              type=gha,scope=release-rust-binaries
           - id: position-db
             context: position-monitor
             dockerfile: position-monitor/Dockerfile
+            cache_from: type=gha,scope=release-position-db
           - id: position-collector
             context: .
             dockerfile: Dockerfile.position-collector
+            cache_from: |-
+              type=gha,scope=release-position-collector
+              type=gha,scope=release-rust-binaries
           - id: report-collector
             context: .
             dockerfile: Dockerfile.report-collector
+            cache_from: |-
+              type=gha,scope=release-report-collector
+              type=gha,scope=release-rust-binaries
           - id: report-worker
             context: .
             dockerfile: Dockerfile.report-worker
+            cache_from: |-
+              type=gha,scope=release-report-worker
+              type=gha,scope=release-rust-binaries
           - id: wb-automation
             context: .
             dockerfile: Dockerfile.wb-automation-shadow
+            cache_from: |-
+              type=gha,scope=release-wb-automation
+              type=gha,scope=release-rust-binaries
           - id: ozon-egress
             context: .
             dockerfile: Dockerfile.ozon-egress
+            cache_from: type=gha,scope=release-ozon-egress
           - id: control-ingress
             context: .
             dockerfile: Dockerfile.control-ingress
+            cache_from: type=gha,scope=release-control-ingress
           - id: control-auth-egress
             context: .
             dockerfile: Dockerfile.control-auth-egress
+            cache_from: type=gha,scope=release-control-auth-egress
           - id: control-write-egress
             context: .
             dockerfile: Dockerfile.control-write-egress
+            cache_from: type=gha,scope=release-control-write-egress
           - id: mail-egress
             context: .
             dockerfile: Dockerfile.mail-egress
+            cache_from: type=gha,scope=release-mail-egress
     env:
       GHCR_PACKAGE: ghcr.io/evil52/mcp-rust-runtime
     steps:
@@ -539,7 +604,7 @@ jobs:
           push: true
           tags: ${{ env.GHCR_PACKAGE }}:candidate-${{ github.sha }}-${{ matrix.id }}
           build-args: MCP_RELEASE_GIT_SHA=${{ github.sha }}
-          cache-from: type=gha,scope=release-${{ matrix.id }}
+          cache-from: ${{ matrix.cache_from }}
           cache-to: type=gha,mode=max,scope=release-${{ matrix.id }}
           provenance: false
           sbom: false

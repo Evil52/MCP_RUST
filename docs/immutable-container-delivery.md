@@ -57,6 +57,23 @@ The lock contains the exact twelve deployable image identities: `server`,
 `mail-egress`, `ozon-egress`, `position-db`, `position-collector`,
 `report-collector`, `report-worker`, and `wb-automation`.
 
+## Rust build cache topology
+
+The six Rust runtime Dockerfiles intentionally have an identical `builder`
+stage. After the required gates pass, `prime-rust-release-cache` compiles every
+Rust binary once for each target platform and exports that completed layer to
+the `release-rust-binaries` GitHub Actions cache scope with a cache-only output.
+The parallel image jobs import that scope, assemble their separate minimal
+runtime images, and continue to publish, scan and attest each immutable digest
+independently.
+
+The shared scope is written only by the prime job. Each parallel publisher
+writes only its image-specific cache scope, so concurrent jobs cannot overwrite
+the common cache. No credentials or runtime configuration enter the builder;
+its inputs are the tested `Cargo.toml`, `Cargo.lock`, `vendor/`, and `src/`
+tree. `scripts/test-shared-rust-image-builder.sh` fails CI if a Dockerfile's
+builder stage or expected runtime artifact drifts from this contract.
+
 ## One-time GitHub setup
 
 1. Create a classic personal access token for the CI publisher with only

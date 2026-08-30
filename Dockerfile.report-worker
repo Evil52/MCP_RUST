@@ -9,8 +9,16 @@ COPY src ./src
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
-    cargo build --locked --release --bin report-worker \
-    && cp /build/target/release/report-worker /build/report-worker
+    cargo build --locked --release --bins \
+    && mkdir -p /build/runtime-bin \
+    && cp \
+        /build/target/release/mcp-ozon \
+        /build/target/release/mcp-ozon-control \
+        /build/target/release/position-collector \
+        /build/target/release/report-collector \
+        /build/target/release/report-worker \
+        /build/target/release/wb-automation \
+        /build/runtime-bin/
 
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS runtime
 
@@ -22,7 +30,7 @@ RUN apk upgrade --no-cache \
     && adduser -S -D -H -u 10001 -G reporting reporting \
     && install -d -o reporting -g reporting -m 0700 /var/lib/mcp-ozon/report-artifacts
 
-COPY --from=builder /build/report-worker /usr/local/bin/report-worker
+COPY --from=builder /build/runtime-bin/report-worker /usr/local/bin/report-worker
 
 USER reporting
 ENTRYPOINT ["/usr/local/bin/report-worker"]
