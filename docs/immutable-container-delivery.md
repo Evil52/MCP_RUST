@@ -3,19 +3,23 @@
 ## Status and fixed decisions
 
 The repository implements the complete source-to-runtime identity chain. The
-selected registry is the private GitHub Container Registry package
+selected registry is the public GitHub Container Registry package
 `ghcr.io/evil52/mcp-rust-runtime`. CI publishes only after all required quality,
 security, coverage and container jobs pass. Production never builds release
 images locally.
 
 The fixed policy is:
 
-- the package must remain `private`; CI checks visibility before and after every
+- the package must remain `public`; CI checks visibility before and after every
   publish and fails closed if it cannot prove that state;
 - CI uses a dedicated classic PAT stored as the repository Actions secret
   `GHCR_PUBLISH_TOKEN`, scoped only to `write:packages`;
-- the production Mac uses a separate pull-only classic PAT with
-  `read:packages`; it is never stored in the repository or a workflow secret;
+- production pulls immutable image digests anonymously and stores no GHCR
+  credential;
+- public visibility is irreversible in GitHub Packages: image layers,
+  configuration and metadata are visible to anyone. Secrets must only enter at
+  runtime through protected environment files or bind mounts and must never be
+  baked into an image;
 - every release image is built for `linux/amd64` and `linux/arm64`, scanned on
   both platforms and receives a GitHub build-provenance attestation;
 - discovery tags are mutable and cannot be deployment input; installers accept
@@ -24,9 +28,9 @@ The fixed policy is:
   90 days. Rollback inputs that must outlive that window must be copied to the
   protected operator archive before expiry.
 
-The package is deliberately not associated with the public source repository by
-an OCI source label. Package access and repository visibility therefore remain
-separate controls.
+The package is deliberately not associated with the source repository by an
+OCI source label. Its public visibility is an explicit delivery decision rather
+than an inherited repository permission.
 
 ## Required release contract
 
@@ -45,8 +49,8 @@ The implementation preserves these invariants:
    `org.opencontainers.image.revision`, and invoke Compose with `--no-build`.
 6. Canary and production consume the same digest lock. Rollback selects a
    previously retained lock; it never rebuilds an old checkout.
-7. Registry credentials grant pull-only access on the production Mac. CI's
-   publish identity is separate and unavailable to the runtime.
+7. Production has anonymous, read-only registry access. CI's publish identity
+   is separate and unavailable to the runtime.
 
 The lock contains the exact twelve deployable image identities: `server`,
 `control`, `control-ingress`, `control-auth-egress`, `control-write-egress`,
@@ -58,21 +62,18 @@ The lock contains the exact twelve deployable image identities: `server`,
 1. Create a classic personal access token for the CI publisher with only
    `write:packages`. Do not grant repository scopes.
 2. Store it as the repository Actions secret `GHCR_PUBLISH_TOKEN`.
-3. After the first publish, confirm the package visibility is `private`. The
-   workflow repeats this check, so a later visibility drift blocks releases.
-4. Create a different classic PAT for the production operator with only
-   `read:packages`. Authenticate Docker without placing the token on the command
-   line or in shell history:
+3. After the first publish, open the package page, choose **Package settings**,
+   then under **Danger Zone** choose **Change visibility** and `Public`. GitHub
+   requires the package name as confirmation and does not allow a public package
+   to be made private again.
+4. Re-run the release workflow. It checks `public` visibility before and after
+   every publish, so a missing transition or later policy drift blocks releases.
+5. Do not configure a production GHCR token. Public container packages support
+   anonymous pulls.
 
-   ```bash
-   docker login ghcr.io --username Evil52 --password-stdin < /protected/path/ghcr-read-token
-   ```
-
-   The token file must be a non-symlink regular file with mode `600` in a
-   protected directory and must not be placed inside this repository.
-
-GitHub CLI also needs an authenticated user able to read this repository and
-the private package metadata because installers execute `gh attestation verify`.
+GitHub CLI still needs an authenticated user able to read this repository
+because installers execute `gh attestation verify`. That identity does not need
+package read permission for the public registry object.
 
 ## Deployment and rollback
 

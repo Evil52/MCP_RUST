@@ -467,7 +467,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Require a private GHCR package
+      - name: Require a public GHCR package
         env:
           GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
         run: |
@@ -483,11 +483,11 @@ jobs:
             https://api.github.com/users/Evil52/packages/container/mcp-rust-runtime)"
           case "$status" in
             200)
-              jq -e '.visibility == "private"' "$response" >/dev/null \
-                || { echo "existing GHCR package is not private" >&2; exit 1; }
+              jq -e '.visibility == "public"' "$response" >/dev/null \
+                || { echo "existing GHCR package is not public" >&2; exit 1; }
               ;;
             404)
-              echo "package does not exist yet; GHCR creates it private by default"
+              echo "package does not exist yet; the first publish requires an administrator to make it public before rerunning this workflow"
               ;;
             *)
               echo "could not verify GHCR package visibility (HTTP $status)" >&2
@@ -495,7 +495,7 @@ jobs:
               ;;
           esac
 
-      - name: Log in to private GHCR
+      - name: Log in to GHCR publisher
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -525,7 +525,7 @@ jobs:
           provenance: false
           sbom: false
 
-      - name: Confirm package remained private
+      - name: Confirm package remained public
         env:
           GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
         run: |
@@ -533,7 +533,7 @@ jobs:
             --header "Authorization: Bearer $GHCR_PUBLISH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
             https://api.github.com/users/Evil52/packages/container/mcp-rust-runtime \
-            | jq -e '.visibility == "private"' >/dev/null
+            | jq -e '.visibility == "public"' >/dev/null
 
       - name: Attest the immutable image digest
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
