@@ -1,6 +1,6 @@
 #!/bin/bash
-# Install the two LaunchAgents this deployment was missing: a scheduled
-# encrypted backup and a scheduled health probe.
+# Install the three protective LaunchAgents this deployment needs: a scheduled
+# encrypted backup, a scheduled restore verification and a health probe.
 #
 # Both are proven before they are scheduled. The installer takes one real
 # backup, restores it into a disposable PostgreSQL container, and runs one
@@ -18,6 +18,8 @@ backup_dir="${MCP_BACKUP_DIR:-$HOME/MCP_OZON-backups}"
 notify_command="${MCP_HEALTH_NOTIFY_COMMAND:-}"
 offsite_command="${MCP_BACKUP_OFFSITE_COMMAND:-}"
 allow_local_only="${MCP_BACKUP_ALLOW_LOCAL_ONLY:-false}"
+health_required_services="${MCP_HEALTH_REQUIRED_SERVICES-position-db,ozon-egress}"
+health_required_launch_agents="${MCP_HEALTH_REQUIRED_LAUNCH_AGENTS-com.ofk.mcp-ozon-runtime,com.ofk.mcp-ozon-backup,com.ofk.mcp-ozon-health,com.ofk.mcp-ozon-restore-verify}"
 position_env_source="$project_root/.position.env"
 position_env_target="$runtime_dir/position.env"
 libexec_dir="$HOME/.local/libexec/mcp-ozon"
@@ -55,6 +57,12 @@ case "$allow_local_only" in
     exit 1
     ;;
 esac
+for csv_contract in "$health_required_services" "$health_required_launch_agents"; do
+  if [[ ! "$csv_contract" =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]]; then
+    echo "MCP_HEALTH_REQUIRED_SERVICES and MCP_HEALTH_REQUIRED_LAUNCH_AGENTS must be non-empty comma-separated identifiers" >&2
+    exit 1
+  fi
+done
 if [[ -z "$offsite_command" && "$allow_local_only" != true ]]; then
   echo "MCP_BACKUP_OFFSITE_COMMAND is required for scheduled production backups" >&2
   echo "set MCP_BACKUP_ALLOW_LOCAL_ONLY=true only to record an explicit accepted risk" >&2
@@ -128,6 +136,8 @@ render() {
     -e "s|__NOTIFY_COMMAND__|$notify_command|g" \
     -e "s|__OFFSITE_COMMAND__|$offsite_command|g" \
     -e "s|__ALLOW_LOCAL_ONLY__|$allow_local_only|g" \
+    -e "s|__HEALTH_REQUIRED_SERVICES__|$health_required_services|g" \
+    -e "s|__HEALTH_REQUIRED_LAUNCH_AGENTS__|$health_required_launch_agents|g" \
     "$2"
 }
 
@@ -171,6 +181,8 @@ MCP_OPS_PROJECT_DIR="$project_root" \
 MCP_HEALTH_POSITION_ENV="$position_env_target" \
 MCP_BACKUP_DIR="$backup_dir" \
 MCP_BACKUP_ALLOW_LOCAL_ONLY="$allow_local_only" \
+MCP_HEALTH_REQUIRED_SERVICES="$health_required_services" \
+MCP_HEALTH_REQUIRED_LAUNCH_AGENTS="$health_required_launch_agents" \
 MCP_HEALTH_SKIP_LAUNCH_AGENT_CHECK=true \
   "$libexec_dir/check-runtime-health.sh" || health_status=$?
 if ((health_status > 1)); then

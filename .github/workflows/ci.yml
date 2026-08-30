@@ -63,6 +63,7 @@ jobs:
           command -v shellcheck >/dev/null
           shellcheck --version
           shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
+          ./scripts/test-runtime-health-contract.sh
           ./scripts/test-release-image-lock.sh
           if git grep -n -I -E -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|sqp_[[:alnum:]_-]{20,}'; then
             echo "A likely private key or Sonar token is committed." >&2
@@ -180,7 +181,13 @@ jobs:
           pinned="$(sed -n 's/^rmcp = { version = "=\([0-9][0-9.]*\)".*/\1/p' Cargo.toml)"
           vendored="$(sed -n 's/^version = "\([0-9][0-9.]*\)".*/\1/p' vendor/rmcp/Cargo.toml | head -n 1)"
           documented="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' vendor/rmcp/UPSTREAM.md | head -n 1)"
-          if [ -z "$pinned" ] || [ -z "$vendored" ] || [ -z "$documented" ]; then
+          documented_checksum="$(
+            # shellcheck disable=SC2016 # Literal Markdown backticks delimit the checksum.
+            sed -n 's/^- crate checksum: `\([0-9a-f]\{64\}\)`.*/\1/p' \
+              vendor/rmcp/UPSTREAM.md
+          )"
+          if [ -z "$pinned" ] || [ -z "$vendored" ] \
+            || [ -z "$documented" ] || [ -z "$documented_checksum" ]; then
             echo "could not resolve the vendored rmcp version" >&2
             exit 1
           fi
@@ -189,6 +196,18 @@ jobs:
             echo "  Cargo.toml pin:            $pinned" >&2
             echo "  vendor/rmcp/Cargo.toml:    $vendored" >&2
             echo "  vendor/rmcp/UPSTREAM.md:   $documented" >&2
+            exit 1
+          fi
+          published_checksum="$(
+            curl --fail --silent --show-error --location \
+              --header 'User-Agent: mcp-ozon-ci' \
+              "https://crates.io/api/v1/crates/rmcp/$pinned" \
+              | jq -r '.version.checksum // empty'
+          )"
+          if [ "$published_checksum" != "$documented_checksum" ]; then
+            echo "vendored rmcp checksum disagrees with crates.io:" >&2
+            echo "  crates.io:                 $published_checksum" >&2
+            echo "  vendor/rmcp/UPSTREAM.md:   $documented_checksum" >&2
             exit 1
           fi
           latest="$(
@@ -600,7 +619,7 @@ jobs:
           ' >"target/release-image-fragment/${{ matrix.id }}.json"
 
       - name: Publish verified image fragment
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mcp-ozon-image-${{ matrix.id }}-${{ github.sha }}
           path: target/release-image-fragment/${{ matrix.id }}.json
@@ -647,7 +666,7 @@ jobs:
           target/release-evidence/release.json
 
       - name: Publish release identity after every required gate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mcp-ozon-release-${{ github.sha }}
           path: |

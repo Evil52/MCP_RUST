@@ -1,12 +1,12 @@
 # Vendored rmcp
 
-This directory contains the source of `rmcp` 3.1.1 from the official
+This directory contains the source of `rmcp` 3.1.4 from the official
 Model Context Protocol Rust SDK:
 
 - upstream: https://github.com/modelcontextprotocol/rust-sdk
-- crate: https://crates.io/crates/rmcp/3.1.1
-- crate checksum: `094c075f6698deef5a657cf4df6b684dff65157d255978b92b552ec22503f17a`
-- upstream commit: `baac607e52b9788ec20902e2c7143ba4f4786f4b`
+- crate: https://crates.io/crates/rmcp/3.1.4
+- crate checksum: `1a15bc53261a9dc37e105df006e4656c598379a8f9581f8950debb130f27a7cf`
+- upstream commit: `4a738b9dd99eaca418b614afa433a0cbdaf8d056`
 - license: Apache-2.0 (see `LICENSE`)
 
 Local modification: `Tool` exposes the OpenAI plugin authentication extension
