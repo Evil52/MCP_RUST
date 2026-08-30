@@ -38,6 +38,7 @@ fi
 shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
 ./scripts/test-runtime-health-contract.sh
 ./scripts/test-release-image-lock.sh
+./scripts/test-shared-rust-image-builder.sh
 
 echo "==> Core library source-line coverage"
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
