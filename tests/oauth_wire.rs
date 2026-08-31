@@ -538,6 +538,7 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         "ozon_fbs_cancel_reasons",
         "ozon_fbs_posting",
         "ozon_fbs_postings",
+        "ozon_posting_sales_fallback",
         "ozon_fbs_stocks_by_warehouse",
         "ozon_fbs_unfulfilled",
         "ozon_finance_accrual_by_day",

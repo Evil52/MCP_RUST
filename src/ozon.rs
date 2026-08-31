@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -27,7 +27,18 @@ const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT_REQUESTS_PER_CLIENT: usize = 16;
 const MAX_GLOBAL_IN_FLIGHT_REQUESTS: usize = 32;
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(20);
-const ANALYTICS_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
+// Ozon documents one Analytics request per minute. A five-second guard keeps
+// rolling-window and clock-boundary implementations from seeing two departures
+// inside the same vendor minute.
+const ANALYTICS_REQUEST_INTERVAL: Duration = Duration::from_secs(65);
+const ANALYTICS_RATE_LIMIT_BASE_COOLDOWN: Duration = Duration::from_secs(120);
+const ANALYTICS_RATE_LIMIT_MAX_COOLDOWN: Duration = Duration::from_secs(3_600);
+// A bounded report call may retry missing-header 429s after 2m and 4m. Longer
+// vendor delays remain installed in the shared gate but are returned to the
+// caller instead of holding one collection attempt for an hour.
+const ANALYTICS_QUEUED_RETRY_BUDGET: Duration = Duration::from_secs(600);
+const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(300);
+const MAX_ANALYTICS_CACHE_ENTRIES: usize = 256;
 // Ozon can return a one-minute Retry-After for the read-only accrual ledger.
 // Reserve that bounded wait in the request deadline so the existing retry
 // policy can honor the upstream cooldown instead of failing a complete daily
@@ -157,6 +168,8 @@ pub enum OzonError {
         request_id: Option<String>,
         retry_after: Option<Duration>,
     },
+    #[error("локальный cooldown Ozon API ещё активен (retry-after: {retry_after:?})")]
+    LocalRateLimited { retry_after: Duration },
     #[error("временная ошибка Ozon API (HTTP {status}, request-id: {request_id:?})")]
     Server {
         status: StatusCode,
@@ -220,7 +233,7 @@ impl OzonError {
             Self::Unauthorized { .. } => OzonErrorKind::Unauthorized,
             Self::Forbidden { .. } => OzonErrorKind::Forbidden,
             Self::NotFound { .. } => OzonErrorKind::NotFound,
-            Self::RateLimited { .. } => OzonErrorKind::RateLimited,
+            Self::RateLimited { .. } | Self::LocalRateLimited { .. } => OzonErrorKind::RateLimited,
             Self::Server { .. } => OzonErrorKind::Server,
             Self::Api { .. } => OzonErrorKind::Http,
             Self::Timeout { .. } | Self::DeadlineExceeded => OzonErrorKind::Timeout,
@@ -237,7 +250,8 @@ impl OzonError {
             Self::EndpointNotAllowed(_)
             | Self::MissingCredentials(_)
             | Self::DeadlineExceeded
-            | Self::Overloaded => None,
+            | Self::Overloaded
+            | Self::LocalRateLimited { .. } => None,
             Self::Unauthorized { request_id }
             | Self::Forbidden { request_id }
             | Self::NotFound { request_id }
@@ -256,6 +270,7 @@ impl OzonError {
 struct RateLimiter {
     next_allowed: Mutex<Instant>,
     analytics_next_allowed: Mutex<Instant>,
+    analytics_rate_limit_strikes: Mutex<u8>,
     in_flight: Semaphore,
     #[cfg(test)]
     before_claim: Mutex<
@@ -271,6 +286,7 @@ impl RateLimiter {
         Self {
             next_allowed: Mutex::new(Instant::now()),
             analytics_next_allowed: Mutex::new(Instant::now()),
+            analytics_rate_limit_strikes: Mutex::new(0),
             in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CLIENT),
             #[cfg(test)]
             before_claim: Mutex::new(None),
@@ -281,28 +297,33 @@ impl RateLimiter {
     ///
     /// Network permits are acquired only after this returns, so a paced caller
     /// cannot reserve scarce HTTP capacity while it sleeps.
+    #[cfg(test)]
     async fn wait_until_ready_for(&self, path: &str) {
         loop {
-            let now = Instant::now();
-            let general_wait = self
-                .next_allowed
-                .lock()
-                .await
-                .saturating_duration_since(now);
-            let analytics_wait = if path == ANALYTICS_DATA_PATH {
-                self.analytics_next_allowed
-                    .lock()
-                    .await
-                    .saturating_duration_since(now)
-            } else {
-                Duration::ZERO
-            };
-            let wait = general_wait.max(analytics_wait);
+            let wait = self.ready_in_for(path).await;
             if wait.is_zero() {
                 return;
             }
             sleep(wait).await;
         }
+    }
+
+    async fn ready_in_for(&self, path: &str) -> Duration {
+        let now = Instant::now();
+        let general_wait = self
+            .next_allowed
+            .lock()
+            .await
+            .saturating_duration_since(now);
+        let analytics_wait = if path == ANALYTICS_DATA_PATH {
+            self.analytics_next_allowed
+                .lock()
+                .await
+                .saturating_duration_since(now)
+        } else {
+            Duration::ZERO
+        };
+        general_wait.max(analytics_wait)
     }
 
     #[cfg(test)]
@@ -352,11 +373,108 @@ impl RateLimiter {
             *next_allowed = cooldown_until;
         }
     }
+
+    /// Installs an endpoint-specific exponential cooldown when Analytics omits
+    /// `Retry-After`. The state is shared by every store alias with the same
+    /// Client-Id and is reset only after a complete successful response.
+    async fn record_analytics_rate_limit(&self, retry_after: Option<Duration>) -> Duration {
+        let mut strikes = self.analytics_rate_limit_strikes.lock().await;
+        let exponent = u32::from((*strikes).min(5));
+        let fallback = ANALYTICS_RATE_LIMIT_BASE_COOLDOWN
+            .saturating_mul(1_u32 << exponent)
+            .min(ANALYTICS_RATE_LIMIT_MAX_COOLDOWN);
+        let delay = retry_after
+            .unwrap_or(fallback)
+            .max(ANALYTICS_REQUEST_INTERVAL)
+            .min(ANALYTICS_RATE_LIMIT_MAX_COOLDOWN);
+        *strikes = strikes.saturating_add(1).min(6);
+        drop(strikes);
+
+        let cooldown_until = Instant::now() + delay;
+        let mut next_allowed = self.analytics_next_allowed.lock().await;
+        if *next_allowed < cooldown_until {
+            *next_allowed = cooldown_until;
+        }
+        delay
+    }
+
+    async fn clear_analytics_rate_limit(&self) {
+        *self.analytics_rate_limit_strikes.lock().await = 0;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AnalyticsCacheEntry {
+    value: Value,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct AnalyticsCache {
+    entries: Mutex<BTreeMap<String, AnalyticsCacheEntry>>,
+    in_flight: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+}
+
+impl AnalyticsCache {
+    async fn get(&self, key: &str) -> Option<Value> {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().await;
+        entries.retain(|_, entry| entry.expires_at > now);
+        entries.get(key).map(|entry| entry.value.clone())
+    }
+
+    async fn coalescing_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        let mut in_flight = self.in_flight.lock().await;
+        in_flight.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = in_flight.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        in_flight.insert(key.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn insert(&self, key: String, value: Value) {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().await;
+        entries.retain(|_, entry| entry.expires_at > now);
+        if entries.len() >= MAX_ANALYTICS_CACHE_ENTRIES
+            && let Some(oldest_key) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| key.clone())
+        {
+            entries.remove(&oldest_key);
+        }
+        entries.insert(
+            key,
+            AnalyticsCacheEntry {
+                value,
+                expires_at: now + ANALYTICS_CACHE_TTL,
+            },
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyticsPacingMode {
+    FailFast,
+    Queue,
 }
 
 enum RequestAttempt {
     Complete(Value),
     Retry { delay: Duration, error: OzonError },
+}
+
+struct AttemptInput<'a> {
+    limiter: &'a RateLimiter,
+    credentials: &'a StoreCredentials,
+    store: &'a StoreId,
+    path: &'static str,
+    payload: &'a Value,
+    attempt: usize,
+    pacing_mode: AnalyticsPacingMode,
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +485,7 @@ pub struct OzonClient {
     stores: Arc<BTreeMap<StoreId, StoreCredentials>>,
     rate_limiters: Arc<BTreeMap<StoreId, Arc<RateLimiter>>>,
     global_in_flight: Arc<Semaphore>,
+    analytics_cache: Arc<AnalyticsCache>,
 }
 
 impl OzonClient {
@@ -463,6 +582,7 @@ impl OzonClient {
             stores: Arc::new(stores),
             rate_limiters: Arc::new(rate_limiters),
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT_REQUESTS)),
+            analytics_cache: Arc::new(AnalyticsCache::default()),
         })
     }
 
@@ -489,20 +609,73 @@ impl OzonClient {
         path: &'static str,
         payload: Value,
     ) -> Result<Value, OzonError> {
+        self.post_with_analytics_pacing(store, path, payload, AnalyticsPacingMode::FailFast)
+            .await
+    }
+
+    /// Queues an Analytics page behind the per-account departure gate.
+    ///
+    /// This is reserved for bounded background/report pagination. Interactive
+    /// MCP calls use [`Self::post`] and receive the remaining local cooldown
+    /// immediately instead of holding a tool slot for a minute-scale wait.
+    pub async fn post_queued(
+        &self,
+        store: &StoreId,
+        path: &'static str,
+        payload: Value,
+    ) -> Result<Value, OzonError> {
+        self.post_with_analytics_pacing(store, path, payload, AnalyticsPacingMode::Queue)
+            .await
+    }
+
+    async fn post_with_analytics_pacing(
+        &self,
+        store: &StoreId,
+        path: &'static str,
+        payload: Value,
+        pacing_mode: AnalyticsPacingMode,
+    ) -> Result<Value, OzonError> {
         // Enforced here, at the only point where a request can leave the
         // process, so the read-only guarantee does not depend on callers.
         if !self.is_endpoint_allowed(path) {
             return Err(OzonError::EndpointNotAllowed(path.to_owned()));
         }
-        let pacing_allowance = match path {
-            ANALYTICS_DATA_PATH => ANALYTICS_REQUEST_INTERVAL,
-            "/v1/finance/accrual/types" | "/v1/finance/accrual/by-day" => {
+        if path == ANALYTICS_DATA_PATH {
+            let key = analytics_cache_key(store, &payload);
+            if let Some(value) = self.analytics_cache.get(&key).await {
+                return Ok(value);
+            }
+            let lock = self.analytics_cache.coalescing_lock(&key).await;
+            let _guard = lock.lock().await;
+            if let Some(value) = self.analytics_cache.get(&key).await {
+                return Ok(value);
+            }
+            let value = self
+                .post_uncached(store, path, payload, pacing_mode)
+                .await?;
+            self.analytics_cache.insert(key, value.clone()).await;
+            return Ok(value);
+        }
+        self.post_uncached(store, path, payload, pacing_mode).await
+    }
+
+    async fn post_uncached(
+        &self,
+        store: &StoreId,
+        path: &'static str,
+        payload: Value,
+        pacing_mode: AnalyticsPacingMode,
+    ) -> Result<Value, OzonError> {
+        let pacing_allowance = match (path, pacing_mode) {
+            (ANALYTICS_DATA_PATH, AnalyticsPacingMode::FailFast) => ANALYTICS_REQUEST_INTERVAL,
+            (ANALYTICS_DATA_PATH, AnalyticsPacingMode::Queue) => ANALYTICS_QUEUED_RETRY_BUDGET,
+            ("/v1/finance/accrual/types" | "/v1/finance/accrual/by-day", _) => {
                 FINANCE_ACCRUAL_RETRY_ALLOWANCE
             }
             _ => Duration::ZERO,
         };
         let deadline = TokioInstant::now() + self.request_deadline.saturating_add(pacing_allowance);
-        self.post_within_deadline(store, path, payload, deadline)
+        self.post_within_deadline(store, path, payload, deadline, pacing_mode)
             .await
     }
 
@@ -512,6 +685,7 @@ impl OzonClient {
         path: &'static str,
         payload: Value,
         deadline: TokioInstant,
+        pacing_mode: AnalyticsPacingMode,
     ) -> Result<Value, OzonError> {
         let credentials = self
             .stores
@@ -530,7 +704,15 @@ impl OzonClient {
             // network permits before the outer loop sleeps.
             let outcome = timeout_at(
                 deadline,
-                self.send_attempt(limiter, credentials, store, path, &payload, attempt),
+                self.send_attempt(AttemptInput {
+                    limiter,
+                    credentials,
+                    store,
+                    path,
+                    payload: &payload,
+                    attempt,
+                    pacing_mode,
+                }),
             )
             .await;
 
@@ -580,16 +762,20 @@ impl OzonClient {
         }
     }
 
-    async fn send_attempt(
-        &self,
-        limiter: &RateLimiter,
-        credentials: &StoreCredentials,
-        store: &StoreId,
-        path: &'static str,
-        payload: &Value,
-        attempt: usize,
-    ) -> Result<RequestAttempt, OzonError> {
-        let _permits = self.acquire_request_permits(limiter, path).await?;
+    async fn send_attempt(&self, input: AttemptInput<'_>) -> Result<RequestAttempt, OzonError> {
+        let AttemptInput {
+            limiter,
+            credentials,
+            store,
+            path,
+            payload,
+            attempt,
+            pacing_mode,
+        } = input;
+        let queue_analytics = pacing_mode == AnalyticsPacingMode::Queue || attempt > 1;
+        let _permits = self
+            .acquire_request_permits(limiter, path, queue_analytics)
+            .await?;
         let request_trace = RequestTrace {
             store,
             endpoint: path,
@@ -624,9 +810,23 @@ impl OzonClient {
         let status = response.status();
         let request_id = safe_request_id(response.headers());
         let retry_after = parse_retry_after(response.headers(), Utc::now());
-        let planned_retry = retry_plan(status, attempt, retry_after);
+        let enforced_retry_after =
+            if path == ANALYTICS_DATA_PATH && status == StatusCode::TOO_MANY_REQUESTS {
+                Some(
+                    limiter
+                        .record_analytics_rate_limit(retry_after.duration())
+                        .await,
+                )
+            } else {
+                retry_after.duration()
+            };
+        let planned_retry =
+            analytics_queued_retry_plan(path, status, pacing_mode, attempt, enforced_retry_after)
+                .or_else(|| retry_plan(path, status, attempt, retry_after));
 
-        if let Some(delay) = shared_retry_cooldown(status, retry_after) {
+        if path != ANALYTICS_DATA_PATH
+            && let Some(delay) = shared_retry_cooldown(status, retry_after)
+        {
             // Install a vendor-directed cooldown before `_permits` is
             // released, closing the window in which a same-Client-Id sibling
             // could leave during Retry-After.
@@ -636,7 +836,7 @@ impl OzonClient {
         if let Some((delay, kind)) = planned_retry {
             trace_response(&request_trace, status, request_id.as_deref(), true, kind);
             let diagnostic = read_bounded_diagnostic_body(&mut response).await;
-            let error = classify_http_error(status, request_id, retry_after.duration(), diagnostic);
+            let error = classify_http_error(status, request_id, enforced_retry_after, diagnostic);
             return Ok(RequestAttempt::Retry { delay, error });
         }
 
@@ -644,9 +844,12 @@ impl OzonClient {
             &mut response,
             status,
             request_id.clone(),
-            retry_after.duration(),
+            enforced_retry_after,
         )
         .await;
+        if path == ANALYTICS_DATA_PATH && result.is_ok() {
+            limiter.clear_analytics_rate_limit().await;
+        }
         let kind = result
             .as_ref()
             .err()
@@ -679,9 +882,17 @@ impl OzonClient {
         &'a self,
         limiter: &'a RateLimiter,
         path: &str,
+        queue_analytics: bool,
     ) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>), OzonError> {
         loop {
-            limiter.wait_until_ready_for(path).await;
+            let wait = limiter.ready_in_for(path).await;
+            if !wait.is_zero() {
+                if path == ANALYTICS_DATA_PATH && !queue_analytics {
+                    return Err(OzonError::LocalRateLimited { retry_after: wait });
+                }
+                sleep(wait).await;
+                continue;
+            }
             let global_permit = self
                 .global_in_flight
                 .try_acquire()
@@ -708,10 +919,18 @@ impl OzonClient {
 }
 
 fn retry_plan(
+    path: &str,
     status: StatusCode,
     attempt: usize,
     retry_after: ParsedRetryAfter,
 ) -> Option<(Duration, OzonErrorKind)> {
+    // A missing Retry-After is common on this endpoint. Retrying an
+    // interactive call inside its deadline used to produce a second 429 at
+    // +60s and then expire before attempt three. The shared adaptive gate now
+    // owns the cooldown; callers retry as a new operation at the reported time.
+    if path == ANALYTICS_DATA_PATH && status == StatusCode::TOO_MANY_REQUESTS {
+        return None;
+    }
     if !is_retriable(status) || attempt >= MAX_ATTEMPTS {
         return None;
     }
@@ -727,6 +946,29 @@ fn retry_plan(
         OzonErrorKind::Server
     };
     Some((retry_delay(attempt, retry_after), kind))
+}
+
+fn analytics_queued_retry_plan(
+    path: &str,
+    status: StatusCode,
+    pacing_mode: AnalyticsPacingMode,
+    attempt: usize,
+    retry_after: Option<Duration>,
+) -> Option<(Duration, OzonErrorKind)> {
+    if path != ANALYTICS_DATA_PATH
+        || status != StatusCode::TOO_MANY_REQUESTS
+        || pacing_mode != AnalyticsPacingMode::Queue
+        || attempt >= MAX_ATTEMPTS
+    {
+        return None;
+    }
+    retry_after
+        .filter(|delay| *delay <= ANALYTICS_QUEUED_RETRY_BUDGET)
+        .map(|delay| (delay, OzonErrorKind::RateLimited))
+}
+
+fn analytics_cache_key(store: &StoreId, payload: &Value) -> String {
+    format!("{store}\n{payload}")
 }
 
 /// A valid bounded Retry-After is a shared Client-Id quota signal even when
@@ -2058,6 +2300,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn analytics_429_without_header_fails_fast_and_installs_exponential_cooldown() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(429, r#"{"error":"slow down"}"#)
+                .header("X-Request-Id", "analytics-limited"),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+        let payload = serde_json::json!({"limit": 10, "offset": 0});
+
+        let started_at = Instant::now();
+        let error = client
+            .post(&StoreId::from("ofk"), ANALYTICS_DATA_PATH, payload.clone())
+            .await
+            .unwrap_err();
+
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            &error,
+            OzonError::RateLimited {
+                request_id: Some(request_id),
+                retry_after: Some(delay),
+            } if request_id == "analytics-limited"
+                && *delay == ANALYTICS_RATE_LIMIT_BASE_COOLDOWN
+        ));
+
+        let local = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.post(&StoreId::from("ofk"), ANALYTICS_DATA_PATH, payload),
+        )
+        .await
+        .expect("an active Analytics cooldown must be reported immediately")
+        .unwrap_err();
+        assert!(matches!(
+            local,
+            OzonError::LocalRateLimited { retry_after }
+                if retry_after > Duration::from_secs(119)
+        ));
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_analytics_429s_double_the_fallback_cooldown_until_success() {
+        let limiter = RateLimiter::new();
+
+        assert_eq!(
+            limiter.record_analytics_rate_limit(None).await,
+            ANALYTICS_RATE_LIMIT_BASE_COOLDOWN
+        );
+        assert_eq!(
+            limiter.record_analytics_rate_limit(None).await,
+            ANALYTICS_RATE_LIMIT_BASE_COOLDOWN.saturating_mul(2)
+        );
+        limiter.clear_analytics_rate_limit().await;
+        assert_eq!(
+            limiter.record_analytics_rate_limit(None).await,
+            ANALYTICS_RATE_LIMIT_BASE_COOLDOWN
+        );
+    }
+
+    #[tokio::test]
+    async fn identical_successful_analytics_requests_are_served_from_the_bounded_cache() {
+        let (base_url, requests) =
+            mock_server(vec![MockResponse::new(200, r#"{"result":{"data":[]}}"#)]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+        let payload = serde_json::json!({"limit": 10, "offset": 0});
+
+        let first = client
+            .post(&StoreId::from("ofk"), ANALYTICS_DATA_PATH, payload.clone())
+            .await
+            .unwrap();
+        let second = client
+            .post(&StoreId::from("ofk"), ANALYTICS_DATA_PATH, payload)
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_analytics_requests_are_coalesced_behind_one_departure() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(200, r#"{"result":{"data":[]}}"#).delay(Duration::from_millis(100)),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+        let payload = serde_json::json!({"limit": 10, "offset": 0});
+        let store = StoreId::from("ofk");
+
+        let first = client.post_queued(&store, ANALYTICS_DATA_PATH, payload.clone());
+        let second = client.post_queued(&store, ANALYTICS_DATA_PATH, payload.clone());
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_request_count(&requests, 1);
+        assert_eq!(
+            analytics_cache_key(&store, &payload),
+            format!("ofk\n{payload}")
+        );
+    }
+
+    #[tokio::test]
+    async fn analytics_cache_evicts_the_oldest_entry_at_its_hard_capacity() {
+        let cache = AnalyticsCache::default();
+        for index in 0..=MAX_ANALYTICS_CACHE_ENTRIES {
+            cache
+                .insert(format!("key-{index:03}"), serde_json::json!(index))
+                .await;
+        }
+
+        assert!(cache.get("key-000").await.is_none());
+        assert_eq!(
+            cache
+                .get(&format!("key-{MAX_ANALYTICS_CACHE_ENTRIES:03}"))
+                .await,
+            Some(serde_json::json!(MAX_ANALYTICS_CACHE_ENTRIES))
+        );
+    }
+
+    #[tokio::test]
     async fn claim_reports_the_remaining_delay_after_another_caller_wins() {
         let limiter = RateLimiter::new();
         *limiter.next_allowed.lock().await = Instant::now() + Duration::from_secs(1);
@@ -2099,7 +2459,7 @@ mod tests {
             let limiter = Arc::clone(&limiter);
             async move {
                 let permits = client
-                    .acquire_request_permits(&limiter, "/v1/rating/summary")
+                    .acquire_request_permits(&limiter, "/v1/rating/summary", true)
                     .await
                     .unwrap();
                 drop(permits);
@@ -2180,7 +2540,7 @@ mod tests {
             .unwrap();
 
         let mut paced_acquisition =
-            Box::pin(client.acquire_request_permits(&paced, "/v1/rating/summary"));
+            Box::pin(client.acquire_request_permits(&paced, "/v1/rating/summary", true));
         std::future::poll_fn(|context| {
             assert!(matches!(
                 paced_acquisition.as_mut().poll(context),
@@ -2997,11 +3357,17 @@ mod tests {
     #[test]
     fn retry_plan_allows_only_bounded_transient_retries() {
         assert_eq!(
-            retry_plan(StatusCode::SERVICE_UNAVAILABLE, 1, ParsedRetryAfter::Absent),
+            retry_plan(
+                "",
+                StatusCode::SERVICE_UNAVAILABLE,
+                1,
+                ParsedRetryAfter::Absent,
+            ),
             Some((BASE_RETRY_DELAY, OzonErrorKind::Server))
         );
         assert_eq!(
             retry_plan(
+                "",
                 StatusCode::TOO_MANY_REQUESTS,
                 1,
                 ParsedRetryAfter::Valid(Duration::from_secs(2)),
@@ -3010,6 +3376,7 @@ mod tests {
         );
         assert_eq!(
             retry_plan(
+                "",
                 StatusCode::SERVICE_UNAVAILABLE,
                 1,
                 ParsedRetryAfter::Valid(MAX_RETRY_DELAY + Duration::from_secs(1)),
@@ -3018,6 +3385,7 @@ mod tests {
         );
         assert_eq!(
             retry_plan(
+                "",
                 StatusCode::SERVICE_UNAVAILABLE,
                 1,
                 ParsedRetryAfter::Invalid,
@@ -3026,6 +3394,7 @@ mod tests {
         );
         assert_eq!(
             retry_plan(
+                "",
                 StatusCode::INTERNAL_SERVER_ERROR,
                 1,
                 ParsedRetryAfter::Absent,
@@ -3034,9 +3403,66 @@ mod tests {
         );
         assert_eq!(
             retry_plan(
+                "",
                 StatusCode::SERVICE_UNAVAILABLE,
                 MAX_ATTEMPTS,
                 ParsedRetryAfter::Absent,
+            ),
+            None
+        );
+        assert_eq!(
+            retry_plan(
+                ANALYTICS_DATA_PATH,
+                StatusCode::TOO_MANY_REQUESTS,
+                1,
+                ParsedRetryAfter::Absent,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn queued_analytics_429_retry_is_bounded_and_interactive_calls_fail_fast() {
+        assert_eq!(
+            analytics_queued_retry_plan(
+                ANALYTICS_DATA_PATH,
+                StatusCode::TOO_MANY_REQUESTS,
+                AnalyticsPacingMode::Queue,
+                1,
+                Some(ANALYTICS_RATE_LIMIT_BASE_COOLDOWN),
+            ),
+            Some((
+                ANALYTICS_RATE_LIMIT_BASE_COOLDOWN,
+                OzonErrorKind::RateLimited
+            ))
+        );
+        assert_eq!(
+            analytics_queued_retry_plan(
+                ANALYTICS_DATA_PATH,
+                StatusCode::TOO_MANY_REQUESTS,
+                AnalyticsPacingMode::FailFast,
+                1,
+                Some(ANALYTICS_RATE_LIMIT_BASE_COOLDOWN),
+            ),
+            None
+        );
+        assert_eq!(
+            analytics_queued_retry_plan(
+                ANALYTICS_DATA_PATH,
+                StatusCode::TOO_MANY_REQUESTS,
+                AnalyticsPacingMode::Queue,
+                MAX_ATTEMPTS,
+                Some(ANALYTICS_RATE_LIMIT_BASE_COOLDOWN),
+            ),
+            None
+        );
+        assert_eq!(
+            analytics_queued_retry_plan(
+                ANALYTICS_DATA_PATH,
+                StatusCode::TOO_MANY_REQUESTS,
+                AnalyticsPacingMode::Queue,
+                1,
+                Some(ANALYTICS_QUEUED_RETRY_BUDGET + Duration::from_secs(1)),
             ),
             None
         );
