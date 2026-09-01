@@ -28,7 +28,7 @@ Available tools:
 - `wb_promotion_reconcile_bid_plan` — read-back only; it never repeats a write.
 
 This is a separate seven-tool Control registry. It is not part of the Analytics
-MCP release contract, which remains exactly 76 read-only tools. In Control,
+MCP release contract, which remains exactly 77 read-only tools. In Control,
 `prepare`, `approve`, `apply`, and `reconcile` intentionally advertise
 non-read-only annotations because they change durable Control state; only
 `apply` sends a marketplace mutation. `approve` is also marked destructive

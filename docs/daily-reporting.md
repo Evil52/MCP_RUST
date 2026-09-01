@@ -138,6 +138,23 @@ locally and set mode `0600`; never put real addresses in the example or Git.
 Keep the three Gmail OAuth files in the ignored `report-gmail-oauth/` directory
 with directory mode `0700` and file mode `0600`.
 
+## Manager analytics read path
+
+`ofk_ozon_sales_analytics` is the default interactive sales tool for managers.
+It reads only successful published `sales` snapshots through the restricted
+`position_reader` PostgreSQL projection and never contacts Ozon. Queries are
+bounded to 31 local business days, 1,000 result rows and a 100,000-row offset;
+they can group by day, SKU, or day+SKU and sort by a dimension, ordered units,
+or operational GMV. Every requested date carries explicit `complete`,
+`preliminary`, `partial`, or `unavailable` coverage. Rows from partial snapshots
+are never served, and a missing day is never fabricated as zero sales.
+
+The direct `ozon_analytics` tool remains available only to administrators for
+rare live diagnostics. It does not publish or refresh a PostgreSQL snapshot.
+Normal freshness comes exclusively from the guarded `report-collector`
+scheduler, so marketplace request volume scales with scheduled account
+collection rather than the number of managers or ChatGPT prompts.
+
 ## Remaining rollout gates
 
 The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot

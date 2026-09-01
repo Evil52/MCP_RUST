@@ -23,7 +23,7 @@ use std::{
 use anyhow::{Result as AnyResult, anyhow};
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio_postgres::{Client, Config, Row, config::Host, types::FromSql};
 
 use crate::postgres::SupervisedClient;
@@ -49,6 +49,11 @@ const MAX_STATUS_ROWS: u16 = 50;
 const MAX_HISTORY_POINTS: u16 = 100;
 const MAX_READY_REPORTS: u16 = 100;
 const MAX_HISTORY_DAYS: i64 = 366;
+pub const MAX_SALES_ANALYTICS_DAYS: i64 = 31;
+pub const MAX_SALES_ANALYTICS_ROWS: u16 = 1_000;
+pub const MAX_SALES_ANALYTICS_OFFSET: u32 = 100_000;
+const MAX_SALES_ANALYTICS_FACT_ROWS: u64 = 250_000;
+const MAX_SALES_SNAPSHOT_CANDIDATES: usize = 63;
 const MAX_FACT_ROWS: usize = 25_000;
 const UTC_03_00: NaiveTime = NaiveTime::from_hms_opt(3, 0, 0).unwrap();
 const UTC_09_00: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
@@ -98,6 +103,12 @@ pub trait ReportingReadRepository: Send + Sync {
         to: Option<NaiveDate>,
         limit: u16,
     ) -> ReportingReadFuture<'a, MetricsHistoryResult>;
+
+    fn sales_analytics<'a>(
+        &'a self,
+        account: &'a AccountScope,
+        query: SalesAnalyticsQuery,
+    ) -> ReportingReadFuture<'a, SalesAnalyticsResult>;
 
     fn manager_actions<'a>(
         &'a self,
@@ -194,6 +205,15 @@ impl ReportingReader {
         self.repository
             .metrics_history(account, from, to, limit)
             .await
+    }
+
+    pub async fn sales_analytics(
+        &self,
+        account: &AccountScope,
+        query: SalesAnalyticsQuery,
+    ) -> Result<SalesAnalyticsResult, ReportingReadError> {
+        validate_sales_analytics_query(query)?;
+        self.repository.sales_analytics(account, query).await
     }
 
     pub async fn manager_actions(
@@ -347,6 +367,86 @@ pub struct MetricsHistoryResult {
     pub points: Vec<MetricsHistoryPoint>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SalesAnalyticsGroup {
+    Day,
+    Sku,
+    DaySku,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SalesAnalyticsSort {
+    Dimension,
+    OrderedUnits,
+    OperationalGmv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SalesAnalyticsDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SalesAnalyticsQuery {
+    pub date_from: NaiveDate,
+    pub date_to: NaiveDate,
+    pub group_by: SalesAnalyticsGroup,
+    pub sort_by: SalesAnalyticsSort,
+    pub direction: SalesAnalyticsDirection,
+    pub limit: u16,
+    pub offset: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SalesDateCoverageState {
+    Complete,
+    Preliminary,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SalesDateCoverage {
+    pub business_date: String,
+    pub state: SalesDateCoverageState,
+    pub served: bool,
+    pub cutoff_at: Option<String>,
+    pub source_as_of: Option<String>,
+    pub period_end: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SalesAnalyticsRow {
+    pub business_date: Option<String>,
+    pub sku: Option<String>,
+    pub ordered_units: u64,
+    pub operational_gmv_minor: u64,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SalesAnalyticsResult {
+    pub account_id: String,
+    pub marketplace: ReportingMarketplace,
+    pub date_from: String,
+    pub date_to: String,
+    pub state: DataState,
+    pub source: String,
+    pub group_by: SalesAnalyticsGroup,
+    pub sort_by: SalesAnalyticsSort,
+    pub direction: SalesAnalyticsDirection,
+    pub limit: u16,
+    pub offset: u32,
+    pub total_rows: u64,
+    pub rows: Vec<SalesAnalyticsRow>,
+    pub coverage: Vec<SalesDateCoverage>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionSeverity {
@@ -453,6 +553,14 @@ impl ReportingReadRepository for DisabledReportingRepository {
         disabled()
     }
 
+    fn sales_analytics<'a>(
+        &'a self,
+        _account: &'a AccountScope,
+        _query: SalesAnalyticsQuery,
+    ) -> ReportingReadFuture<'a, SalesAnalyticsResult> {
+        disabled()
+    }
+
     fn manager_actions<'a>(
         &'a self,
         _account: &'a AccountScope,
@@ -474,6 +582,22 @@ fn validate_limit(limit: u16, maximum: u16) -> Result<(), ReportingReadError> {
     (limit > 0 && limit <= maximum)
         .then_some(())
         .ok_or(ReportingReadError::InvalidRequest)
+}
+
+fn validate_sales_analytics_query(query: SalesAnalyticsQuery) -> Result<(), ReportingReadError> {
+    let inclusive_days = query
+        .date_to
+        .signed_duration_since(query.date_from)
+        .num_days()
+        + 1;
+    if !(1..=MAX_SALES_ANALYTICS_DAYS).contains(&inclusive_days)
+        || !(1..=MAX_SALES_ANALYTICS_ROWS).contains(&query.limit)
+        || query.offset > MAX_SALES_ANALYTICS_OFFSET
+    {
+        Err(ReportingReadError::InvalidRequest)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_runtime_contract(valid: bool) -> Result<(), ReportingReadError> {
@@ -647,6 +771,390 @@ impl PostgresReportingRepository {
             .map(|row| published_descriptor(row, account, cutoff))
             .collect()
     }
+
+    async fn sales_analytics_impl(
+        &self,
+        account: &AccountScope,
+        query: SalesAnalyticsQuery,
+    ) -> Result<SalesAnalyticsResult, ReportingReadError> {
+        validate_sales_analytics_query(query)?;
+        if account.marketplace() != Marketplace::Ozon {
+            return Err(ReportingReadError::InvalidRequest);
+        }
+        let range = history_range(Some(query.date_from), Some(query.date_to))?;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| ReportingReadError::Unavailable)?;
+        let marketplace = marketplace_str(account.marketplace());
+        let rows = client
+            .query(
+                SALES_SNAPSHOT_CANDIDATES_QUERY,
+                &[
+                    &account.account_id(),
+                    &marketplace,
+                    &range.utc_start,
+                    &range.utc_end,
+                ],
+            )
+            .await
+            .map_err(|_| ReportingReadError::Unavailable)?;
+        if rows.len() > MAX_SALES_SNAPSHOT_CANDIDATES {
+            return Err(ReportingReadError::InvalidPublishedData);
+        }
+        let descriptors = rows
+            .iter()
+            .map(|row| {
+                let cutoff = column(row, 4)?;
+                published_descriptor(row, account, cutoff)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let selection = select_sales_snapshots(query, descriptors)?;
+        validate_selected_sales_fact_count(&selection.expected)?;
+        let snapshot_ids = selection.expected.keys().copied().collect::<Vec<_>>();
+        let (total_rows, rows) = if snapshot_ids.is_empty() {
+            (0, Vec::new())
+        } else {
+            validate_sales_fact_rows(&client, account, &selection.expected).await?;
+            aggregate_sales_rows(&client, &snapshot_ids, query).await?
+        };
+        Ok(SalesAnalyticsResult {
+            account_id: account.account_id().to_owned(),
+            marketplace: account.marketplace().into(),
+            date_from: query.date_from.to_string(),
+            date_to: query.date_to.to_string(),
+            state: selection.state,
+            source: "published_postgresql_snapshots".to_owned(),
+            group_by: query.group_by,
+            sort_by: query.sort_by,
+            direction: query.direction,
+            limit: query.limit,
+            offset: query.offset,
+            total_rows,
+            rows,
+            coverage: selection.coverage,
+        })
+    }
+}
+
+struct SalesSnapshotSelection {
+    state: DataState,
+    coverage: Vec<SalesDateCoverage>,
+    expected: BTreeMap<i64, (NaiveDate, SnapshotDescriptor)>,
+}
+
+fn select_sales_snapshots(
+    query: SalesAnalyticsQuery,
+    descriptors: Vec<SnapshotDescriptor>,
+) -> Result<SalesSnapshotSelection, ReportingReadError> {
+    let offset = super::yekaterinburg_offset();
+    let mut latest = BTreeMap::<NaiveDate, SnapshotDescriptor>::new();
+    for descriptor in descriptors {
+        if descriptor.source() != SnapshotSource::Sales {
+            return Err(ReportingReadError::InvalidPublishedData);
+        }
+        let (period_start, period_end) = descriptor.period();
+        let local_start = period_start.with_timezone(&offset);
+        let business_date = local_start.date_naive();
+        let next_date = business_date
+            .succ_opt()
+            .ok_or(ReportingReadError::InvalidPublishedData)?;
+        let complete_end = offset
+            .from_local_datetime(
+                &next_date
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or(ReportingReadError::InvalidPublishedData)?,
+            )
+            .single()
+            .ok_or(ReportingReadError::InvalidPublishedData)?
+            .with_timezone(&Utc);
+        if local_start.time() != NaiveTime::MIN
+            || business_date < query.date_from
+            || business_date > query.date_to
+            || period_end <= period_start
+            || period_end > complete_end
+        {
+            return Err(ReportingReadError::InvalidPublishedData);
+        }
+        match latest.entry(business_date) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(descriptor);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().cutoff_at() == descriptor.cutoff_at() {
+                    return Err(ReportingReadError::InvalidPublishedData);
+                }
+                if entry.get().cutoff_at() < descriptor.cutoff_at() {
+                    entry.insert(descriptor);
+                }
+            }
+        }
+    }
+
+    let mut coverage = Vec::new();
+    let mut expected = BTreeMap::new();
+    let mut date = query.date_from;
+    loop {
+        let item = match latest.remove(&date) {
+            None => SalesDateCoverage {
+                business_date: date.to_string(),
+                state: SalesDateCoverageState::Unavailable,
+                served: false,
+                cutoff_at: None,
+                source_as_of: None,
+                period_end: None,
+            },
+            Some(descriptor) => {
+                let (_, period_end) = descriptor.period();
+                let next_date = date
+                    .succ_opt()
+                    .ok_or(ReportingReadError::InvalidPublishedData)?;
+                let complete = period_end.with_timezone(&offset).naive_local()
+                    == next_date
+                        .and_hms_opt(0, 0, 0)
+                        .ok_or(ReportingReadError::InvalidPublishedData)?;
+                let served = descriptor.status() == SnapshotStatus::Succeeded
+                    && descriptor.pagination_complete();
+                let state = if !served {
+                    SalesDateCoverageState::Partial
+                } else if complete {
+                    SalesDateCoverageState::Complete
+                } else {
+                    SalesDateCoverageState::Preliminary
+                };
+                let item = SalesDateCoverage {
+                    business_date: date.to_string(),
+                    state,
+                    served,
+                    cutoff_at: Some(timestamp_string(descriptor.cutoff_at())),
+                    source_as_of: Some(timestamp_string(descriptor.source_as_of())),
+                    period_end: Some(timestamp_string(period_end)),
+                };
+                if served
+                    && expected
+                        .insert(descriptor.snapshot_id(), (date, descriptor))
+                        .is_some()
+                {
+                    return Err(ReportingReadError::InvalidPublishedData);
+                }
+                item
+            }
+        };
+        coverage.push(item);
+        if date == query.date_to {
+            break;
+        }
+        date = date.succ_opt().ok_or(ReportingReadError::InvalidRequest)?;
+    }
+    let served = coverage.iter().filter(|item| item.served).count();
+    let state = if served == 0 {
+        DataState::Unavailable
+    } else if coverage
+        .iter()
+        .all(|item| item.state == SalesDateCoverageState::Complete)
+    {
+        DataState::Complete
+    } else {
+        DataState::Partial
+    };
+    Ok(SalesSnapshotSelection {
+        state,
+        coverage,
+        expected,
+    })
+}
+
+fn validate_selected_sales_fact_count(
+    expected: &BTreeMap<i64, (NaiveDate, SnapshotDescriptor)>,
+) -> Result<(), ReportingReadError> {
+    let count = expected.values().try_fold(0_u64, |total, (_, descriptor)| {
+        total.checked_add(u64::from(descriptor.row_count()))
+    });
+    match count {
+        Some(count) if count <= MAX_SALES_ANALYTICS_FACT_ROWS => Ok(()),
+        Some(_) => Err(ReportingReadError::InvalidRequest),
+        None => Err(ReportingReadError::InvalidPublishedData),
+    }
+}
+
+async fn validate_sales_fact_rows(
+    client: &Client,
+    account: &AccountScope,
+    expected: &BTreeMap<i64, (NaiveDate, SnapshotDescriptor)>,
+) -> Result<(), ReportingReadError> {
+    let snapshot_ids = expected.keys().copied().collect::<Vec<_>>();
+    let marketplace = marketplace_str(account.marketplace());
+    let rows = client
+        .query(
+            "SELECT snapshot_id, count(*)::bigint, min(business_date), max(business_date), \
+                    bool_and(account_id = $2 AND marketplace = $3 AND source = 'sales' \
+                        AND snapshot_status = 'succeeded' AND pagination_complete) \
+             FROM daily_reporting.mcp_sales_facts \
+             WHERE snapshot_id = ANY($1::bigint[]) \
+             GROUP BY snapshot_id",
+            &[&snapshot_ids, &account.account_id(), &marketplace],
+        )
+        .await
+        .map_err(|_| ReportingReadError::Unavailable)?;
+    let mut actual = BTreeMap::<i64, u64>::new();
+    for row in rows {
+        let snapshot_id: i64 = column(&row, 0)?;
+        let count = nonnegative_i64(column(&row, 1)?)?;
+        let minimum: Option<NaiveDate> = column(&row, 2)?;
+        let maximum: Option<NaiveDate> = column(&row, 3)?;
+        let valid: bool = column(&row, 4)?;
+        let Some((business_date, _)) = expected.get(&snapshot_id) else {
+            return Err(ReportingReadError::InvalidPublishedData);
+        };
+        if !valid || minimum != Some(*business_date) || maximum != Some(*business_date) {
+            return Err(ReportingReadError::InvalidPublishedData);
+        }
+        if actual.insert(snapshot_id, count).is_some() {
+            return Err(ReportingReadError::InvalidPublishedData);
+        }
+    }
+    for (snapshot_id, (_, descriptor)) in expected {
+        let actual = actual.get(snapshot_id).copied().unwrap_or(0);
+        let actual =
+            usize::try_from(actual).map_err(|_| ReportingReadError::InvalidPublishedData)?;
+        validate_snapshot_fact_count(actual, descriptor.row_count())?;
+    }
+    Ok(())
+}
+
+async fn aggregate_sales_rows(
+    client: &Client,
+    snapshot_ids: &[i64],
+    query: SalesAnalyticsQuery,
+) -> Result<(u64, Vec<SalesAnalyticsRow>), ReportingReadError> {
+    let (_, group_by, _) = sales_group_sql(query.group_by, SalesAnalyticsDirection::Asc);
+    let count_query = format!(
+        "SELECT count(*)::bigint FROM (\
+             SELECT 1 FROM daily_reporting.mcp_sales_facts \
+             WHERE snapshot_id = ANY($1::bigint[]) GROUP BY {group_by}\
+         ) AS grouped_sales"
+    );
+    let total_rows = client
+        .query_one(&count_query, &[&snapshot_ids])
+        .await
+        .map_err(|_| ReportingReadError::Unavailable)?;
+    let total_rows = nonnegative_i64(column(&total_rows, 0)?)?;
+    if total_rows == 0 || u64::from(query.offset) >= total_rows {
+        return Ok((total_rows, Vec::new()));
+    }
+    let (dimensions, group_by, dimension_order) = sales_group_sql(query.group_by, query.direction);
+    let direction = sales_direction_sql(query.direction);
+    let order_by = match query.sort_by {
+        SalesAnalyticsSort::Dimension => dimension_order.to_owned(),
+        SalesAnalyticsSort::OrderedUnits => {
+            format!("sum(ordered_units) {direction}, {dimension_order}")
+        }
+        SalesAnalyticsSort::OperationalGmv => {
+            format!("sum(operational_gmv_minor) {direction}, {dimension_order}")
+        }
+    };
+    let page_query = format!(
+        "SELECT {dimensions}, sum(ordered_units)::text, \
+                sum(operational_gmv_minor)::text \
+         FROM daily_reporting.mcp_sales_facts \
+         WHERE snapshot_id = ANY($1::bigint[]) \
+         GROUP BY {group_by} \
+         ORDER BY {order_by} \
+         LIMIT $2 OFFSET $3"
+    );
+    let rows = client
+        .query(
+            &page_query,
+            &[
+                &snapshot_ids,
+                &i64::from(query.limit),
+                &i64::from(query.offset),
+            ],
+        )
+        .await
+        .map_err(|_| ReportingReadError::Unavailable)?;
+    let rows = rows
+        .iter()
+        .map(|row| sales_analytics_row(row, query.group_by))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((total_rows, rows))
+}
+
+const fn sales_group_sql(
+    group: SalesAnalyticsGroup,
+    direction: SalesAnalyticsDirection,
+) -> (&'static str, &'static str, &'static str) {
+    match (group, direction) {
+        (SalesAnalyticsGroup::Day, SalesAnalyticsDirection::Asc) => (
+            "business_date, NULL::bigint AS sku",
+            "business_date",
+            "business_date ASC",
+        ),
+        (SalesAnalyticsGroup::Day, SalesAnalyticsDirection::Desc) => (
+            "business_date, NULL::bigint AS sku",
+            "business_date",
+            "business_date DESC",
+        ),
+        (SalesAnalyticsGroup::Sku, SalesAnalyticsDirection::Asc) => {
+            ("NULL::date AS business_date, sku", "sku", "sku ASC")
+        }
+        (SalesAnalyticsGroup::Sku, SalesAnalyticsDirection::Desc) => {
+            ("NULL::date AS business_date, sku", "sku", "sku DESC")
+        }
+        (SalesAnalyticsGroup::DaySku, SalesAnalyticsDirection::Asc) => (
+            "business_date, sku",
+            "business_date, sku",
+            "business_date ASC, sku ASC",
+        ),
+        (SalesAnalyticsGroup::DaySku, SalesAnalyticsDirection::Desc) => (
+            "business_date, sku",
+            "business_date, sku",
+            "business_date DESC, sku DESC",
+        ),
+    }
+}
+
+const fn sales_direction_sql(direction: SalesAnalyticsDirection) -> &'static str {
+    match direction {
+        SalesAnalyticsDirection::Asc => "ASC",
+        SalesAnalyticsDirection::Desc => "DESC",
+    }
+}
+
+fn sales_analytics_row(
+    row: &Row,
+    group: SalesAnalyticsGroup,
+) -> Result<SalesAnalyticsRow, ReportingReadError> {
+    let business_date: Option<NaiveDate> = column(row, 0)?;
+    let sku: Option<i64> = column(row, 1)?;
+    let dimensions_valid = match group {
+        SalesAnalyticsGroup::Day => business_date.is_some() && sku.is_none(),
+        SalesAnalyticsGroup::Sku => business_date.is_none() && sku.is_some(),
+        SalesAnalyticsGroup::DaySku => business_date.is_some() && sku.is_some(),
+    };
+    if !dimensions_valid {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+    let sku = sku
+        .map(positive_i64)
+        .transpose()?
+        .map(|value| value.to_string());
+    let ordered_units: String = column(row, 2)?;
+    let operational_gmv_minor: String = column(row, 3)?;
+    Ok(SalesAnalyticsRow {
+        business_date: business_date.map(|value| value.to_string()),
+        sku,
+        ordered_units: decimal_u64(&ordered_units)?,
+        operational_gmv_minor: decimal_u64(&operational_gmv_minor)?,
+        currency: "RUB".to_owned(),
+    })
+}
+
+fn decimal_u64(value: &str) -> Result<u64, ReportingReadError> {
+    value
+        .parse()
+        .map_err(|_| ReportingReadError::InvalidPublishedData)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1961,6 +2469,14 @@ impl ReportingReadRepository for PostgresReportingRepository {
         Box::pin(async move { self.metrics_history_impl(account, from, to, limit).await })
     }
 
+    fn sales_analytics<'a>(
+        &'a self,
+        account: &'a AccountScope,
+        query: SalesAnalyticsQuery,
+    ) -> ReportingReadFuture<'a, SalesAnalyticsResult> {
+        Box::pin(async move { self.sales_analytics_impl(account, query).await })
+    }
+
     fn manager_actions<'a>(
         &'a self,
         account: &'a AccountScope,
@@ -1988,6 +2504,14 @@ const PUBLISHED_SNAPSHOTS_QUERY: &str = "SELECT snapshot_id, account_id, marketp
      FROM daily_reporting.mcp_published_source_snapshots \
      WHERE account_id = $1 AND marketplace = $2 AND cutoff_at = $3 \
      ORDER BY source";
+
+const SALES_SNAPSHOT_CANDIDATES_QUERY: &str = "SELECT snapshot_id, account_id, marketplace, source, cutoff_at, source_as_of, \
+            period_start, period_end, status, pagination_complete, row_count \
+     FROM daily_reporting.mcp_published_source_snapshots \
+     WHERE account_id = $1 AND marketplace = $2 AND source = 'sales' \
+       AND period_start >= $3 AND period_start < $4 \
+     ORDER BY cutoff_at, snapshot_id \
+     LIMIT 64";
 
 const CONTRACT_PROBES: &[&str] = &[
     "SELECT snapshot_id, account_id, marketplace, source, cutoff_at, source_as_of, \
@@ -2317,6 +2841,31 @@ mod tests {
             })
         }
 
+        fn sales_analytics<'a>(
+            &'a self,
+            account: &'a AccountScope,
+            query: SalesAnalyticsQuery,
+        ) -> ReportingReadFuture<'a, SalesAnalyticsResult> {
+            Box::pin(async move {
+                Ok(SalesAnalyticsResult {
+                    account_id: account.account_id().to_owned(),
+                    marketplace: account.marketplace().into(),
+                    date_from: query.date_from.to_string(),
+                    date_to: query.date_to.to_string(),
+                    state: DataState::Unavailable,
+                    source: "published_postgresql_snapshots".to_owned(),
+                    group_by: query.group_by,
+                    sort_by: query.sort_by,
+                    direction: query.direction,
+                    limit: query.limit,
+                    offset: query.offset,
+                    total_rows: 0,
+                    rows: Vec::new(),
+                    coverage: Vec::new(),
+                })
+            })
+        }
+
         fn manager_actions<'a>(
             &'a self,
             account: &'a AccountScope,
@@ -2356,6 +2905,23 @@ mod tests {
             Err(ReportingReadError::Disabled)
         );
         assert_eq!(
+            reader
+                .sales_analytics(
+                    &account,
+                    SalesAnalyticsQuery {
+                        date_from: date,
+                        date_to: date,
+                        group_by: SalesAnalyticsGroup::Day,
+                        sort_by: SalesAnalyticsSort::Dimension,
+                        direction: SalesAnalyticsDirection::Asc,
+                        limit: 1,
+                        offset: 0,
+                    },
+                )
+                .await,
+            Err(ReportingReadError::Disabled)
+        );
+        assert_eq!(
             reader.manager_actions(&account, None).await,
             Err(ReportingReadError::Disabled)
         );
@@ -2388,6 +2954,52 @@ mod tests {
             reader.metrics_history(&account, None, None, 0).await,
             Err(ReportingReadError::InvalidRequest)
         );
+        let date = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        let sales_query = SalesAnalyticsQuery {
+            date_from: date,
+            date_to: date,
+            group_by: SalesAnalyticsGroup::Day,
+            sort_by: SalesAnalyticsSort::Dimension,
+            direction: SalesAnalyticsDirection::Asc,
+            limit: 1,
+            offset: 0,
+        };
+        assert_eq!(
+            reader
+                .sales_analytics(
+                    &account,
+                    SalesAnalyticsQuery {
+                        limit: 0,
+                        ..sales_query
+                    },
+                )
+                .await,
+            Err(ReportingReadError::InvalidRequest)
+        );
+        assert_eq!(
+            reader
+                .sales_analytics(
+                    &account,
+                    SalesAnalyticsQuery {
+                        date_to: date + Duration::days(MAX_SALES_ANALYTICS_DAYS),
+                        ..sales_query
+                    },
+                )
+                .await,
+            Err(ReportingReadError::InvalidRequest)
+        );
+        assert_eq!(
+            reader
+                .sales_analytics(
+                    &account,
+                    SalesAnalyticsQuery {
+                        offset: MAX_SALES_ANALYTICS_OFFSET + 1,
+                        ..sales_query
+                    },
+                )
+                .await,
+            Err(ReportingReadError::InvalidRequest)
+        );
         assert_eq!(
             reader.ready_reports(MAX_READY_REPORTS + 1).await,
             Err(ReportingReadError::InvalidRequest)
@@ -2417,6 +3029,95 @@ mod tests {
             DataState::Unavailable
         );
         assert!(reader.ready_reports(1).await.unwrap().reports.is_empty());
+    }
+
+    fn sales_descriptor(
+        id: i64,
+        business_date: NaiveDate,
+        cutoff: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+        status: SnapshotStatus,
+    ) -> SnapshotDescriptor {
+        let offset = super::super::yekaterinburg_offset();
+        let period_start = offset
+            .from_local_datetime(&business_date.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        SnapshotDescriptor::new(
+            id,
+            "store_1".to_owned(),
+            Marketplace::Ozon,
+            SnapshotSource::Sales,
+            cutoff,
+            cutoff,
+            period_start,
+            period_end,
+            1,
+            status == SnapshotStatus::Succeeded,
+            status,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sales_snapshot_selection_prefers_latest_complete_day_and_never_serves_partial_rows() {
+        let first = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        let second = first.succ_opt().unwrap();
+        let third = second.succ_opt().unwrap();
+        let full_first_end = Utc.with_ymd_and_hms(2026, 8, 20, 19, 0, 0).unwrap();
+        let full_second_end = Utc.with_ymd_and_hms(2026, 8, 21, 19, 0, 0).unwrap();
+        let query = SalesAnalyticsQuery {
+            date_from: first,
+            date_to: third,
+            group_by: SalesAnalyticsGroup::DaySku,
+            sort_by: SalesAnalyticsSort::OperationalGmv,
+            direction: SalesAnalyticsDirection::Desc,
+            limit: 100,
+            offset: 0,
+        };
+        let selection = select_sales_snapshots(
+            query,
+            vec![
+                sales_descriptor(
+                    1,
+                    first,
+                    Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap(),
+                    Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap(),
+                    SnapshotStatus::Succeeded,
+                ),
+                sales_descriptor(
+                    2,
+                    first,
+                    Utc.with_ymd_and_hms(2026, 8, 21, 3, 0, 0).unwrap(),
+                    full_first_end,
+                    SnapshotStatus::Succeeded,
+                ),
+                sales_descriptor(
+                    3,
+                    second,
+                    Utc.with_ymd_and_hms(2026, 8, 22, 3, 0, 0).unwrap(),
+                    full_second_end,
+                    SnapshotStatus::Partial,
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(selection.state, DataState::Partial);
+        assert_eq!(selection.expected.len(), 1);
+        assert!(selection.expected.contains_key(&2));
+        assert_eq!(
+            selection
+                .coverage
+                .iter()
+                .map(|item| (item.state, item.served))
+                .collect::<Vec<_>>(),
+            vec![
+                (SalesDateCoverageState::Complete, true),
+                (SalesDateCoverageState::Partial, false),
+                (SalesDateCoverageState::Unavailable, false),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -2484,6 +3185,25 @@ mod tests {
         assert_eq!(
             repository
                 .metrics_history(&account, None, None, 10)
+                .await
+                .err(),
+            Some(ReportingReadError::Unavailable)
+        );
+        let date = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        assert_eq!(
+            repository
+                .sales_analytics_impl(
+                    &account,
+                    SalesAnalyticsQuery {
+                        date_from: date,
+                        date_to: date,
+                        group_by: SalesAnalyticsGroup::Day,
+                        sort_by: SalesAnalyticsSort::Dimension,
+                        direction: SalesAnalyticsDirection::Asc,
+                        limit: 10,
+                        offset: 0,
+                    },
+                )
                 .await
                 .err(),
             Some(ReportingReadError::Unavailable)

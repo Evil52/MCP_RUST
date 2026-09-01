@@ -529,6 +529,7 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         "ofk_data_completeness",
         "ofk_manager_actions",
         "ofk_metrics_history",
+        "ofk_ozon_sales_analytics",
         "ofk_reports",
         "ozon_analytics",
         "ozon_fbo_cancel_reasons",
