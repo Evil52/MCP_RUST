@@ -38,6 +38,10 @@ use crate::{
         CampaignProductsQuery, CampaignsQuery, DAILY_STATS_PATH, EXPENSES_PATH, LIMITS_PATH,
         PRODUCT_SKU_STATS_PATH, PerformanceClient, SkuStatisticsQuery, StatisticsQuery,
     },
+    ozon_posting_sales::{
+        FBO_POSTINGS_PATH, FBS_POSTINGS_PATH, MAX_POSTING_SALES_PAGES, PostingSalesAccumulator,
+        PostingSalesRow, PostingSalesTotals, PostingScheme, posting_page_request,
+    },
     reporting::{
         mcp_read::{
             CollectionStatusResult, DataCompletenessResult, ManagerActionsResult,
@@ -806,6 +810,74 @@ impl OzonMcp {
         self.request(identity, input.store, kind.endpoint(), payload)
             .await
     }
+
+    fn posting_sales_context(
+        &self,
+        identity: &RequestIdentity,
+        store: Option<&StoreId>,
+    ) -> Result<StoreId, String> {
+        if let Some(store) = store {
+            validate_non_blank("store", &store.0)?;
+            validate_max_chars("store", &store.0, MAX_STORE_SELECTOR_CHARS)?;
+        }
+        let (registry, actor) = self.access_context(identity)?;
+        for endpoint in [FBO_POSTINGS_PATH, FBS_POSTINGS_PATH] {
+            if !self.client.is_endpoint_allowed(endpoint) {
+                return Err(format!(
+                    "{READ_ONLY_ENDPOINT_DENIED}: endpoint={endpoint} отсутствует в явном read-only allowlist"
+                ));
+            }
+            Self::authorize_endpoint_for_role(actor.role, endpoint)?;
+        }
+        Self::resolve_store_for_actor(&registry, &actor, store)
+    }
+
+    async fn collect_posting_sales_scheme(
+        &self,
+        store: &StoreId,
+        from: &str,
+        to: &str,
+        scheme: PostingScheme,
+        aggregate: &mut PostingSalesAccumulator,
+    ) -> Result<(), String> {
+        let endpoint = scheme.endpoint();
+        let mut cursor = None;
+        let mut seen_cursors = BTreeSet::new();
+        for _ in 0..MAX_POSTING_SALES_PAGES {
+            let payload = posting_page_request(scheme, from, to, cursor.as_deref());
+            let response = self
+                .client
+                .post(store, endpoint, payload)
+                .await
+                .map_err(|error| {
+                    let kind = error.kind().code();
+                    let request_id = error.request_id().unwrap_or("-");
+                    format!(
+                        "{OZON_TOOL_FAILURE}: kind={kind}; store={store}; endpoint={endpoint}; request_id={request_id}; message={error}. Резервный сбор FBO/FBS остановлен целиком; частичные данные не возвращены."
+                    )
+                })?;
+            cursor = aggregate.absorb_page(scheme, &response).map_err(|error| {
+                let kind = error.code();
+                format!(
+                    "OZON_POSTING_SALES_FALLBACK_FAILED: kind={kind}; store={store}; endpoint={endpoint}. Ответ Ozon не прошёл fail-closed проверку; частичные данные не возвращены."
+                )
+            })?;
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor| !seen_cursors.insert(cursor.clone()))
+            {
+                return Err(format!(
+                    "OZON_POSTING_SALES_FALLBACK_FAILED: kind=repeated_cursor; store={store}; endpoint={endpoint}. Ответ Ozon повторил cursor; частичные данные не возвращены."
+                ));
+            }
+            if cursor.is_none() {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "OZON_POSTING_SALES_FALLBACK_FAILED: kind=pagination_limit; store={store}; endpoint={endpoint}. Сбор превысил фиксированный предел страниц; частичные данные не возвращены."
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -963,6 +1035,22 @@ pub struct OzonResult {
     /// Marketplace payloads are data, never trusted instructions for a model.
     pub data_classification: &'static str,
     pub data: Value,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OzonPostingSalesFallbackResult {
+    pub store: StoreId,
+    pub date_from: String,
+    pub date_to: String,
+    pub fetched_at: String,
+    pub data_classification: &'static str,
+    pub metric: &'static str,
+    pub metric_definition: &'static str,
+    pub gmv_available: bool,
+    pub pagination_complete: bool,
+    pub source_endpoints: [&'static str; 2],
+    pub totals: PostingSalesTotals,
+    pub rows: Vec<PostingSalesRow>,
 }
 
 #[derive(Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -2731,6 +2819,13 @@ period_input!(
     #[serde(default)]
         pub direction: SortDirection,
     }
+);
+
+period_input!(
+    PostingSalesFallbackInput,
+    "Начало периода отправлений в формате YYYY-MM-DD",
+    "Конец периода отправлений в формате YYYY-MM-DD",
+    {}
 );
 
 const fn default_posting_limit() -> u32 {
@@ -4959,6 +5054,51 @@ impl OzonMcp {
         Parameters(input): Parameters<PostingListInput>,
     ) -> Result<Json<OzonResult>, String> {
         self.posting_list(&identity, input, PostingKind::Fbo).await
+    }
+
+    /// Агрегирует количества товаров из всех FBO/FBS-отправлений за период.
+    /// Это явный резерв для распределения запасов, а не замена Seller Analytics:
+    /// GMV не вычисляется, отменённые единицы возвращаются отдельно.
+    #[tool(
+        name = "ozon_posting_sales_fallback",
+        annotations(
+            title = "Резерв продаж Ozon по отправлениям FBO/FBS",
+            read_only_hint = true
+        )
+    )]
+    async fn posting_sales_fallback(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<PostingSalesFallbackInput>,
+    ) -> Result<Json<OzonPostingSalesFallbackResult>, String> {
+        let (from, to) =
+            validate_and_expand_dates(&input.date_from, &input.date_to, MAX_ANALYTICS_PERIOD_DAYS)?;
+        let store = self.posting_sales_context(&identity, input.store.as_ref())?;
+        let mut aggregate = PostingSalesAccumulator::default();
+        for scheme in [PostingScheme::Fbo, PostingScheme::Fbs] {
+            self.collect_posting_sales_scheme(&store, &from, &to, scheme, &mut aggregate)
+                .await?;
+        }
+        let (totals, rows) = aggregate.finish().map_err(|error| {
+            let kind = error.code();
+            format!(
+                "OZON_POSTING_SALES_FALLBACK_FAILED: kind={kind}; store={store}. Итоговая агрегация не прошла fail-closed проверку; частичные данные не возвращены."
+            )
+        })?;
+        Ok(Json(OzonPostingSalesFallbackResult {
+            store,
+            date_from: input.date_from,
+            date_to: input.date_to,
+            fetched_at: Utc::now().to_rfc3339(),
+            data_classification: UNTRUSTED_DATA_CLASSIFICATION,
+            metric: "non_cancelled_posting_units",
+            metric_definition: "Количество SKU в FBO/FBS-отправлениях выбранного периода, текущий статус которых не равен cancelled. Это резервная операционная метрика, не Seller Analytics ordered_units и не продажи по факту доставки.",
+            gmv_available: false,
+            pagination_complete: true,
+            source_endpoints: [FBO_POSTINGS_PATH, FBS_POSTINGS_PATH],
+            totals,
+            rows,
+        }))
     }
 
     /// Возвращает необработанные FBS/rFBS-отправления по актуальному cursor-контракту v4.
@@ -11701,7 +11841,7 @@ mod tests {
         // The release checklist in `SECURITY.md` states this count verbatim.
         // Changing it here without updating that gate leaves the gate
         // describing a router that no longer exists.
-        assert_eq!(dev_tools.len(), 75);
+        assert_eq!(dev_tools.len(), 76);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -11712,7 +11852,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 75);
+        assert_eq!(jwt_tools.len(), 76);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -11725,7 +11865,7 @@ mod tests {
                 .with_preview_features(false, true)
                 .tool_router
                 .list_all();
-        assert_eq!(legacy_flag_tools.len(), 75);
+        assert_eq!(legacy_flag_tools.len(), 76);
         assert_policy(
             legacy_flag_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -11784,6 +11924,7 @@ mod tests {
             "ozon_supply_order_get",
             "ozon_fbs_postings",
             "ozon_fbo_postings",
+            "ozon_posting_sales_fallback",
             "ozon_fbs_unfulfilled",
             "ozon_fbo_posting",
             "ozon_fbs_posting",
@@ -12140,6 +12281,7 @@ mod tests {
             "ozon_supply_order_get",
             "ozon_fbs_postings",
             "ozon_fbo_postings",
+            "ozon_posting_sales_fallback",
             "ozon_returns",
             "ozon_rfbs_returns",
             "ozon_finance_transactions",
@@ -12189,6 +12331,7 @@ mod tests {
             ("ozon_analytics", &["date_from", "date_to"][..]),
             ("ozon_fbs_postings", &["date_from", "date_to"][..]),
             ("ozon_fbo_postings", &["date_from", "date_to"][..]),
+            ("ozon_posting_sales_fallback", &["date_from", "date_to"][..]),
             ("ozon_returns", &["date_from", "date_to"][..]),
             ("ozon_rfbs_returns", &["date_from", "date_to"][..]),
             ("ozon_finance_transactions", &["date_from", "date_to"][..]),
@@ -14654,6 +14797,225 @@ mod tests {
             assert_eq!(actual_path, expected_path);
             assert_eq!(actual_body, expected_body, "{expected_path}");
         }
+    }
+
+    #[tokio::test]
+    async fn posting_sales_fallback_paginates_both_schemes_and_returns_complete_totals() {
+        let (server, requests) = mock_server_with_responses(vec![
+            (
+                200,
+                json!({
+                    "postings": [{
+                        "posting_number": "fbo-1",
+                        "status": "delivered",
+                        "products": [{"sku": 7, "quantity": 2}]
+                    }],
+                    "has_next": true,
+                    "cursor": "next-fbo"
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "postings": [{
+                        "posting_number": "fbo-2",
+                        "status": "cancelled",
+                        "products": [{"sku": 7, "quantity": 1}]
+                    }],
+                    "has_next": false,
+                    "cursor": ""
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "postings": [{
+                        "posting_number": "fbs-1",
+                        "status": "awaiting_deliver",
+                        "products": [
+                            {"sku": 7, "quantity": 4},
+                            {"sku": 8, "quantity": 3}
+                        ]
+                    }],
+                    "has_next": false,
+                    "cursor": ""
+                })
+                .to_string(),
+            ),
+        ]);
+
+        let result = server
+            .posting_sales_fallback(
+                RequestIdentity::dev(),
+                Parameters(PostingSalesFallbackInput {
+                    store: Some(StoreId::from("store_a")),
+                    date_from: "2026-07-01".to_owned(),
+                    date_to: "2026-07-02".to_owned(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+
+        assert_eq!(result.metric, "non_cancelled_posting_units");
+        assert!(!result.gmv_available);
+        assert!(result.pagination_complete);
+        assert_eq!(result.totals.fbo_postings, 2);
+        assert_eq!(result.totals.fbs_postings, 1);
+        assert_eq!(result.totals.total_non_cancelled_units, 9);
+        assert_eq!(result.totals.total_cancelled_units, 1);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].sku, 7);
+        assert_eq!(result.rows[0].total_non_cancelled_units, 6);
+        assert_eq!(result.rows[0].total_cancelled_units, 1);
+        assert_eq!(result.rows[1].sku, 8);
+        assert_eq!(result.rows[1].total_non_cancelled_units, 3);
+
+        let expected = [
+            (
+                FBO_POSTINGS_PATH,
+                json!({
+                    "filter": {
+                        "since": "2026-07-01T00:00:00.000Z",
+                        "to": "2026-07-02T23:59:59.999Z",
+                        "statuses": []
+                    },
+                    "limit": 100,
+                    "sort_dir": "ASC",
+                    "translit": false,
+                    "with": {
+                        "analytics_data": false,
+                        "financial_data": false,
+                        "legal_info": false
+                    }
+                }),
+            ),
+            (
+                FBO_POSTINGS_PATH,
+                json!({
+                    "cursor": "next-fbo",
+                    "filter": {
+                        "since": "2026-07-01T00:00:00.000Z",
+                        "to": "2026-07-02T23:59:59.999Z",
+                        "statuses": []
+                    },
+                    "limit": 100,
+                    "sort_dir": "ASC",
+                    "translit": false,
+                    "with": {
+                        "analytics_data": false,
+                        "financial_data": false,
+                        "legal_info": false
+                    }
+                }),
+            ),
+            (
+                FBS_POSTINGS_PATH,
+                json!({
+                    "filter": {
+                        "since": "2026-07-01T00:00:00.000Z",
+                        "to": "2026-07-02T23:59:59.999Z",
+                        "statuses": []
+                    },
+                    "limit": 100,
+                    "sort_dir": "ASC",
+                    "translit": false,
+                    "with": {
+                        "analytics_data": false,
+                        "barcodes": false,
+                        "financial_data": false,
+                        "legal_info": false
+                    }
+                }),
+            ),
+        ];
+        for (expected_path, expected_body) in expected {
+            let request = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+            let (path, body) = request_path_and_body(&request);
+            assert_eq!(path, expected_path);
+            assert_eq!(body, expected_body, "{expected_path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn posting_sales_fallback_maps_transport_shape_and_final_overflow_failures() {
+        let (server, _requests) =
+            mock_server_with_responses(vec![(500, r#"{"error":"unavailable"}"#.to_owned())]);
+        let error = server
+            .posting_sales_fallback(
+                RequestIdentity::dev(),
+                Parameters(PostingSalesFallbackInput {
+                    store: Some(StoreId::from("store_a")),
+                    date_from: "2026-07-01".to_owned(),
+                    date_to: "2026-07-02".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .expect("upstream failure must fail the fallback");
+        assert!(error.contains(OZON_TOOL_FAILURE), "{error}");
+
+        let (server, _requests) = mock_server_with_responses(vec![(
+            200,
+            json!({"postings":[],"has_next":true,"cursor":""}).to_string(),
+        )]);
+        let error = server
+            .posting_sales_fallback(
+                RequestIdentity::dev(),
+                Parameters(PostingSalesFallbackInput {
+                    store: Some(StoreId::from("store_a")),
+                    date_from: "2026-07-01".to_owned(),
+                    date_to: "2026-07-02".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .expect("invalid response shape must fail the fallback");
+        assert!(error.contains("kind=invalid_value"), "{error}");
+
+        let (server, _requests) = mock_server_with_responses(vec![
+            (
+                200,
+                json!({
+                    "postings":[{
+                        "posting_number":"fbo-overflow",
+                        "status":"delivered",
+                        "products":[{"sku":7,"quantity":u64::MAX}]
+                    }],
+                    "has_next":false,
+                    "cursor":""
+                })
+                .to_string(),
+            ),
+            (
+                200,
+                json!({
+                    "postings":[{
+                        "posting_number":"fbs-overflow",
+                        "status":"delivered",
+                        "products":[{"sku":8,"quantity":1}]
+                    }],
+                    "has_next":false,
+                    "cursor":""
+                })
+                .to_string(),
+            ),
+        ]);
+        let error = server
+            .posting_sales_fallback(
+                RequestIdentity::dev(),
+                Parameters(PostingSalesFallbackInput {
+                    store: Some(StoreId::from("store_a")),
+                    date_from: "2026-07-01".to_owned(),
+                    date_to: "2026-07-02".to_owned(),
+                }),
+            )
+            .await
+            .err()
+            .expect("aggregate overflow must fail the fallback");
+        assert!(error.contains("kind=overflow"), "{error}");
     }
 
     #[tokio::test]

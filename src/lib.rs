@@ -6,6 +6,7 @@ pub mod control;
 pub mod http;
 pub mod ozon;
 pub mod ozon_performance;
+pub mod ozon_posting_sales;
 pub mod position_collector;
 pub mod postgres;
 pub mod reporting;

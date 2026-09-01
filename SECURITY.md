@@ -25,7 +25,7 @@ The following properties are treated as release gates:
    are selected and before any socket is opened. Chat input cannot supply a host, HTTP method, or
    path. Redirects and ambient HTTP proxies are disabled. The separately inventoried Control MCP
    has its own narrower write invariant below; its one reviewed PATCH must never be added to an
-   Analytics client or to the 75-tool Analytics registry.
+   Analytics client or to the 76-tool Analytics registry.
 2. Production Ozon Seller egress uses 35 stable reporting/list/info paths, including the three
    finance-accrual reads promoted after canary validation. Posting lists use only
    `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list`; the superseded
@@ -66,9 +66,14 @@ The following properties are treated as release gates:
 5. Marketplace responses are bounded after decompression, obvious PII fields are redacted, and the
    result is labelled `untrusted_external_marketplace_data`. Marketplace text must never be treated
    as model instructions or forwarded to another tool without a new explicit user request.
-6. Ozon Seller Analytics departures are paced at one request per 60 seconds per shared Client-Id.
-   The wait happens before global and per-client network permits are acquired; report pagination is
-   capped at ten pages so the quota cannot turn a daily run into an unbounded backfill.
+6. Ozon Seller Analytics departures are paced through one guarded 65-second gate per shared
+   Client-Id. Exact successful requests are coalesced and cached for five minutes. An Analytics 429
+   installs an adaptive two-minute cooldown that doubles up to one hour (and honours a bounded
+   `Retry-After` when present): interactive calls fail fast during the cooldown, while the atomic
+   report collector may perform at most two queued retries inside a ten-minute retry budget. Longer
+   cooldowns remain installed for the next run. All waits happen before global and per-client
+   network permits are acquired; report pagination is capped at ten pages so the quota cannot turn
+   a daily run into an unbounded backfill.
 7. Credentials, request bodies, response diagnostics, JWTs, and marketplace payloads are not written
    to application logs. Structured upstream errors contain only safe kind/status/account/endpoint and
    a strictly sanitized request ID.
@@ -255,7 +260,7 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
 
 - Run `./scripts/local-ci.sh`, require 100% line coverage, Clippy/rustdoc warnings as errors,
   RustSec/cargo-deny, CodeQL, dependency review, secret scanning, and the hardened-container job.
-- Verify the Analytics MCP production tool list contains exactly 75 stable tools, no preview tools,
+- Verify the Analytics MCP production tool list contains exactly 76 stable tools, no preview tools,
   and every tool advertises `readOnlyHint=true`, `destructiveHint=false`, and the expected
   OAuth/noauth policy. This count never includes Control MCP tools.
 - Verify the separate Control MCP registry contains exactly seven tools:

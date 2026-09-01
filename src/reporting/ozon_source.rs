@@ -44,10 +44,12 @@ use super::{
 const OVERLOAD_RETRY_ATTEMPTS: usize = 4;
 const OVERLOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-// `/v1/analytics/data` is limited by Ozon to one request per minute. Ten
-// bounded pages cover up to 9,999 rows and keep a complete collection inside
-// the operator dry-run deadline; a tenth full page fails closed instead of
-// starting an unbounded multi-hour backfill.
+// `/v1/analytics/data` uses the shared guarded 65-second queue. Ten bounded
+// pages cover up to 9,999 rows and keep a complete collection inside the
+// operator dry-run deadline; a tenth full page fails closed instead of
+// starting an unbounded multi-hour backfill. On 429 the client installs an
+// adaptive cooldown and allows this collector at most two queued retries
+// inside a ten-minute retry budget.
 const MAX_SALES_PAGES: usize = 10;
 // At 100 products/page this still accommodates 10,000 products, while the
 // manual dry-run's absolute deadline bounds the total request time.
@@ -180,7 +182,7 @@ impl OzonReportTransport for OzonClientReportTransport {
         Box::pin(async move {
             retry_local_overload(path, || async {
                 self.client
-                    .post(&self.store, path, request.payload.clone())
+                    .post_queued(&self.store, path, request.payload.clone())
                     .await
                     // Keep only the stable, non-sensitive classification. In
                     // particular, never retain Ozon's error body in report

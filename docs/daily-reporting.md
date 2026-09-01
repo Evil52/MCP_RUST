@@ -48,8 +48,10 @@ The first disabled-only phase provides:
 - Ozon sales normalization that requests the two supported metrics, revenue
   and ordered units; unavailable cancellation/return metrics remain explicit
   `N/D` values rather than fabricated zeroes;
-  Analytics pagination is paced at one request per minute per Client-Id and is
-  capped at ten pages (9,999 complete rows) inside the 12-minute dry-run deadline; and
+  Analytics pagination uses the shared guarded 65-second Client-Id queue and is
+  capped at ten pages (9,999 complete rows) inside the 12-minute dry-run deadline;
+  an Analytics 429 installs an adaptive two-minute-to-one-hour cooldown and the
+  bounded collector may make at most two queued retries inside ten minutes; and
 - warehouse-specific Ozon FBO and FBS stock collection that retains each real
   warehouse ID with an `fbo:` or `fbs:` namespace instead of substituting a
   synthetic channel-wide warehouse; and
