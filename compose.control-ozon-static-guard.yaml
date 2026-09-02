@@ -16,7 +16,7 @@ services:
     security_opt: [no-new-privileges:true]
 
   ozon-campaign-guard:
-    image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:furnitura-cpc7}
+    image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:furnitura-cpc7-v2}
     build:
       context: .
       dockerfile: Dockerfile.control
@@ -126,7 +126,7 @@ networks:
 
 volumes:
   guard-state:
-    name: mcp-ozon-furnitura-cpc7-guard-state
+    name: ${CONTROL_MCP_OZON_GUARD_STATE_VOLUME:-mcp-ozon-furnitura-cpc7-guard-state}
 
 secrets:
   ozon-performance-client-id:

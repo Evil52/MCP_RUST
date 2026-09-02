@@ -1,3 +1,4 @@
+use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,60 @@ impl OzonGuardStopReason {
 pub enum OzonGuardEvaluationError {
     #[error("Ozon guard limits use invalid units or values")]
     InvalidLimit,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum OzonProductGuardError {
+    #[error("Ozon product guard bid limits are invalid")]
+    InvalidLimit,
+    #[error("Ozon campaign product snapshot is invalid")]
+    InvalidSnapshot,
+    #[error("Ozon campaign product SKU differs from the guarded SKU")]
+    SkuMismatch,
+    #[error("Ozon campaign product bid is outside the guarded corridor")]
+    BidOutOfRange,
+}
+
+pub fn validate_ozon_campaign_product_guard(
+    snapshot: &Value,
+    expected_sku: u64,
+    min_bid_microrubles: u64,
+    max_bid_microrubles: u64,
+) -> Result<u64, OzonProductGuardError> {
+    if expected_sku == 0
+        || min_bid_microrubles == 0
+        || min_bid_microrubles > max_bid_microrubles
+        || !min_bid_microrubles.is_multiple_of(1_000_000)
+        || !max_bid_microrubles.is_multiple_of(1_000_000)
+    {
+        return Err(OzonProductGuardError::InvalidLimit);
+    }
+    let products = snapshot
+        .get("products")
+        .and_then(Value::as_array)
+        .filter(|products| products.len() == 1)
+        .ok_or(OzonProductGuardError::InvalidSnapshot)?;
+    let product = &products[0];
+    let sku = canonical_u64(product.get("sku")).ok_or(OzonProductGuardError::InvalidSnapshot)?;
+    if sku != expected_sku {
+        return Err(OzonProductGuardError::SkuMismatch);
+    }
+    let bid = canonical_u64(product.get("bid")).ok_or(OzonProductGuardError::InvalidSnapshot)?;
+    if !(min_bid_microrubles..=max_bid_microrubles).contains(&bid) {
+        return Err(OzonProductGuardError::BidOutOfRange);
+    }
+    Ok(bid)
+}
+
+fn canonical_u64(value: Option<&Value>) -> Option<u64> {
+    match value? {
+        Value::Number(value) => value.as_u64(),
+        Value::String(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|parsed| parsed.to_string() == *value),
+        _ => None,
+    }
 }
 
 pub fn evaluate_ozon_campaign_guard(
@@ -89,6 +144,61 @@ mod tests {
         assert_eq!(
             evaluate_ozon_campaign_guard(0, 0, 2_000_000_000, 9),
             Err(OzonGuardEvaluationError::InvalidLimit)
+        );
+    }
+
+    #[test]
+    fn product_guard_requires_one_exact_sku_inside_the_bid_corridor() {
+        let snapshot = serde_json::json!({
+            "products": [{"sku": "3588576015", "bid": "7000000"}]
+        });
+        assert_eq!(
+            validate_ozon_campaign_product_guard(&snapshot, 3_588_576_015, 7_000_000, 12_000_000),
+            Ok(7_000_000)
+        );
+
+        for (snapshot, expected) in [
+            (
+                serde_json::json!({"products": []}),
+                OzonProductGuardError::InvalidSnapshot,
+            ),
+            (
+                serde_json::json!({"products": [
+                    {"sku": "3588576015", "bid": "7000000"},
+                    {"sku": "1", "bid": "7000000"}
+                ]}),
+                OzonProductGuardError::InvalidSnapshot,
+            ),
+            (
+                serde_json::json!({"products": [{"sku": "03588576015", "bid": "7000000"}]}),
+                OzonProductGuardError::InvalidSnapshot,
+            ),
+            (
+                serde_json::json!({"products": [{"sku": "1", "bid": "7000000"}]}),
+                OzonProductGuardError::SkuMismatch,
+            ),
+            (
+                serde_json::json!({"products": [{"sku": "3588576015", "bid": "6000000"}]}),
+                OzonProductGuardError::BidOutOfRange,
+            ),
+            (
+                serde_json::json!({"products": [{"sku": "3588576015", "bid": 13000000}]}),
+                OzonProductGuardError::BidOutOfRange,
+            ),
+        ] {
+            assert_eq!(
+                validate_ozon_campaign_product_guard(
+                    &snapshot,
+                    3_588_576_015,
+                    7_000_000,
+                    12_000_000
+                ),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            validate_ozon_campaign_product_guard(&snapshot, 3_588_576_015, 12_000_000, 7_000_000),
+            Err(OzonProductGuardError::InvalidLimit)
         );
     }
 }

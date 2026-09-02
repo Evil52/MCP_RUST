@@ -161,6 +161,32 @@ async fn guarded_deactivate_uses_exact_campaign_endpoint() {
 }
 
 #[tokio::test]
+async fn guarded_product_update_uses_put_and_exact_campaign_endpoint() {
+    let (base_url, requests) = mock_http(vec![
+        (
+            200,
+            r#"{"access_token":"token","token_type":"Bearer","expires_in":1800}"#,
+        ),
+        (200, "{}"),
+    ]);
+    let client = OzonAdsWriteClient::new_for_test(&base_url, credentials(), Duration::from_secs(3));
+    client
+        .update_products_with_permit(
+            12_345,
+            OzonCampaignStrategy::TargetBids,
+            &target_bid_products(),
+            || async { Ok::<_, ()>(()) },
+        )
+        .await
+        .unwrap();
+    let captured = requests.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert!(captured[1].starts_with("PUT /api/client/campaign/12345/products "));
+    assert!(captured[1].ends_with("\r\n\r\n{\"bids\":[{\"sku\":3457585933,\"bid\":7000000}]}"));
+    drop(captured);
+}
+
+#[tokio::test]
 #[allow(clippy::significant_drop_tightening)]
 async fn postgres_plan_requires_separate_approval_gates_and_exact_readback() {
     let Ok(database_url) = std::env::var("OZON_CONTROL_TEST_DATABASE_URL") else {

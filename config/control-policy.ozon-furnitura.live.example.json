@@ -20,7 +20,7 @@
         },
         {
           "account_id": "furnitura_dlya_doma",
-          "skus": [3624640796],
+          "skus": [5442149776],
           "weekly_budget_microrubles": 2000000000,
           "per_sku_spend_cap_microrubles": 2000000000,
           "initial_cpc_bid_microrubles": 7000000,
@@ -31,7 +31,7 @@
         },
         {
           "account_id": "furnitura_dlya_doma",
-          "skus": [3625930192],
+          "skus": [3588576015],
           "weekly_budget_microrubles": 2000000000,
           "per_sku_spend_cap_microrubles": 2000000000,
           "initial_cpc_bid_microrubles": 7000000,
@@ -53,7 +53,7 @@
         },
         {
           "account_id": "furnitura_dlya_doma",
-          "skus": [3026611133],
+          "skus": [2717700073],
           "weekly_budget_microrubles": 2000000000,
           "per_sku_spend_cap_microrubles": 2000000000,
           "initial_cpc_bid_microrubles": 7000000,

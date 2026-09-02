@@ -9,7 +9,10 @@ pub use client::{
     OzonCampaignProductsRequest, OzonCampaignStrategy, OzonGuardedWriteError, OzonPlacement,
     OzonWriteError, OzonWriteErrorKind,
 };
-pub use guard::{OzonGuardEvaluationError, OzonGuardStopReason, evaluate_ozon_campaign_guard};
+pub use guard::{
+    OzonGuardEvaluationError, OzonGuardStopReason, OzonProductGuardError,
+    evaluate_ozon_campaign_guard, validate_ozon_campaign_product_guard,
+};
 pub use model::{OzonCampaignGuard, OzonLaunchStatus, OzonPlanStoreError};
 pub use plan::{
     OzonCampaignLaunchManifest, OzonCampaignLaunchSpec, OzonLaunchPlanError,

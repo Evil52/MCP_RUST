@@ -41,8 +41,9 @@ pub use ozon::{
     OzonAdsWriteClient, OzonCampaignCreateRequest, OzonCampaignGuard, OzonCampaignLaunchManifest,
     OzonCampaignLaunchSpec, OzonCampaignProduct, OzonCampaignProductsRequest, OzonCampaignStrategy,
     OzonGuardEvaluationError, OzonGuardStopReason, OzonGuardedWriteError, OzonLaunchPlanError,
-    OzonLaunchStatus, OzonPlacement, OzonPlanRepository, OzonPlanStoreError, OzonWriteError,
-    OzonWriteErrorKind, evaluate_ozon_campaign_guard, prepare_campaign_launch_manifest,
+    OzonLaunchStatus, OzonPlacement, OzonPlanRepository, OzonPlanStoreError, OzonProductGuardError,
+    OzonWriteError, OzonWriteErrorKind, evaluate_ozon_campaign_guard,
+    prepare_campaign_launch_manifest, validate_ozon_campaign_product_guard,
 };
 pub use plan::{PlanStoreError, WbActionQuota, WbPlanRepository, WbPlanStatus};
 pub use policy::{ControlMode, ControlPolicy, WbActionLimits, WbBidPlacement};

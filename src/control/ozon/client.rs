@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, fmt, future::Future, sync::Arc, time::Duration}
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use reqwest::{
-    Client, Proxy, Response, StatusCode,
+    Client, Method, Proxy, Response, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
     redirect::Policy,
 };
@@ -258,6 +258,25 @@ impl OzonAdsWriteClient {
         Ok(())
     }
 
+    pub async fn update_products_with_permit<E, P, PermitFuture>(
+        &self,
+        campaign_id: u64,
+        strategy: OzonCampaignStrategy,
+        request: &OzonCampaignProductsRequest,
+        permit: P,
+    ) -> Result<(), OzonGuardedWriteError<E>>
+    where
+        P: FnOnce() -> PermitFuture,
+        PermitFuture: Future<Output = Result<(), E>>,
+    {
+        validate_campaign_id(campaign_id).map_err(OzonGuardedWriteError::Write)?;
+        validate_products_request(strategy, request).map_err(OzonGuardedWriteError::Write)?;
+        let path = format!("/api/client/campaign/{campaign_id}/products");
+        let body = serde_json::to_vec(request).map_err(|_| OzonWriteError::InvalidRequest)?;
+        self.put_guarded(&path, &body, permit).await?;
+        Ok(())
+    }
+
     pub async fn activate_campaign_with_permit<E, P, PermitFuture>(
         &self,
         campaign_id: u64,
@@ -288,12 +307,39 @@ impl OzonAdsWriteClient {
         Ok(())
     }
 
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "write lock deliberately serializes permit validation and the complete POST response"
-    )]
     async fn post_guarded<E, P, PermitFuture>(
         &self,
+        path: &str,
+        body: &[u8],
+        permit: P,
+    ) -> Result<Vec<u8>, OzonGuardedWriteError<E>>
+    where
+        P: FnOnce() -> PermitFuture,
+        PermitFuture: Future<Output = Result<(), E>>,
+    {
+        self.write_guarded(Method::POST, path, body, permit).await
+    }
+
+    async fn put_guarded<E, P, PermitFuture>(
+        &self,
+        path: &str,
+        body: &[u8],
+        permit: P,
+    ) -> Result<Vec<u8>, OzonGuardedWriteError<E>>
+    where
+        P: FnOnce() -> PermitFuture,
+        PermitFuture: Future<Output = Result<(), E>>,
+    {
+        self.write_guarded(Method::PUT, path, body, permit).await
+    }
+
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "write lock deliberately serializes permit validation and the complete write response"
+    )]
+    async fn write_guarded<E, P, PermitFuture>(
+        &self,
+        method: Method,
         path: &str,
         body: &[u8],
         permit: P,
@@ -315,7 +361,7 @@ impl OzonAdsWriteClient {
         authorization.set_sensitive(true);
         let response = self
             .http
-            .post(format!("{}{path}", self.base_url))
+            .request(method, format!("{}{path}", self.base_url))
             .header(AUTHORIZATION, authorization)
             .header("content-type", "application/json")
             .body(body.to_vec())
