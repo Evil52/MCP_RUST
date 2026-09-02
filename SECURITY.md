@@ -265,14 +265,17 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   Exactly `ofk_request_ozon_sales_refresh` has `readOnlyHint=false`: it inserts or reuses one
   internal PostgreSQL queue row but has no marketplace egress. Every other Analytics tool has
   `readOnlyHint=true`. This count never includes Control MCP tools.
-- Verify the separate Control MCP registry contains exactly seven tools:
-  `ozon_ads_control_status`, `ozon_ads_control_scope`, `wb_promotion_prepare_bid_update`,
+- Verify the separate Control MCP registry contains exactly twelve tools:
+  `ozon_ads_control_status`, `ozon_ads_control_scope`,
+  `ozon_performance_preview_campaign_launch`, `ozon_performance_prepare_campaign_launch`,
+  `ozon_performance_approve_campaign_launch`, `ozon_performance_apply_campaign_launch`,
+  `ozon_performance_reconcile_campaign_launch`, `wb_promotion_prepare_bid_update`,
   `wb_promotion_approve_bid_plan`, `wb_promotion_apply_bid_plan`,
   `wb_promotion_bid_plan_status`, and `wb_promotion_reconcile_bid_plan`. Status, scope and plan status
   must be read-only; prepare and reconcile must be non-read-only but non-destructive; approval must
   be non-read-only, destructive, idempotent and closed-world because it grants execution authority;
   apply must be non-read-only, destructive and idempotent in the sense that a plan can be claimed
-  only once. The combined implementation inventory is 86, but no release check may treat it as one
+  only once. The combined implementation inventory is 91, but no release check may treat it as one
   security boundary.
 - Verify `ofk_collection_status`, `ofk_data_completeness`, `ofk_metrics_history`,
   `ofk_manager_actions`, `ofk_ozon_sales_analytics`, `ofk_ozon_sales_refresh_status`, and

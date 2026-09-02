@@ -182,7 +182,7 @@ mod tests {
                 OzonProductGuardError::BidOutOfRange,
             ),
             (
-                serde_json::json!({"products": [{"sku": "3588576015", "bid": 13000000}]}),
+                serde_json::json!({"products": [{"sku": "3588576015", "bid": 13_000_000}]}),
                 OzonProductGuardError::BidOutOfRange,
             ),
         ] {
