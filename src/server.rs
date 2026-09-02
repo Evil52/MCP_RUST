@@ -32,7 +32,7 @@ use crate::{
         AuthenticatedActor, JwtAuthenticationFailure, JwtAuthenticator, ProtectedResourceMetadata,
     },
     config::{AccessRegistry, Actor, Marketplace, RegistrySource, Role, StoreId},
-    ozon::OzonClient,
+    ozon::{OzonClient, OzonError, OzonErrorKind},
     ozon_performance::{
         CAMPAIGN_OBJECTS_PATH_TEMPLATE, CAMPAIGN_PRODUCTS_PATH_TEMPLATE, CAMPAIGNS_PATH,
         CampaignProductsQuery, CampaignsQuery, DAILY_STATS_PATH, EXPENSES_PATH, LIMITS_PATH,
@@ -625,6 +625,22 @@ impl OzonMcp {
         )
     }
 
+    #[allow(clippy::unused_self)]
+    fn ozon_error(&self, store: &StoreId, endpoint: &str, error: &OzonError) -> String {
+        let kind = error.kind().code();
+        let request_id = error.request_id().unwrap_or("-");
+        let recovery = if endpoint == "/v1/analytics/data"
+            && error.kind() == OzonErrorKind::RateLimited
+        {
+            "Не повторяйте тот же Analytics-запрос до окончания local-cooldown и не переключайте магазин. Если пользователь уже явно разрешил резервное распределение по отправлениям, используйте ozon_posting_sales_fallback: он возвращает non_cancelled_posting_units без GMV и не является Seller Analytics ordered_units."
+        } else {
+            "Остановите текущую операцию: не вызывайте автоматически другие инструменты или магазины Ozon и не заявляйте о прямом доступе к Ozon. Сообщите пользователю об ошибке и дождитесь нового явного запроса с подключённым OzonOFK."
+        };
+        format!(
+            "{OZON_TOOL_FAILURE}: kind={kind}; store={store}; endpoint={endpoint}; request_id={request_id}; message={error}. {recovery}"
+        )
+    }
+
     fn wb_result(account_id: String, endpoint: &'static str, mut data: Value) -> Json<WbResult> {
         redact_marketplace_pii(&mut data);
         Json(WbResult {
@@ -667,13 +683,7 @@ impl OzonMcp {
             .client
             .post(&store, endpoint, payload)
             .await
-            .map_err(|error| {
-                let kind = error.kind().code();
-                let request_id = error.request_id().unwrap_or("-");
-                format!(
-                    "{OZON_TOOL_FAILURE}: kind={kind}; store={store}; endpoint={endpoint}; request_id={request_id}; message={error}. Остановите текущую операцию: не вызывайте автоматически другие инструменты или магазины Ozon и не заявляйте о прямом доступе к Ozon. Сообщите пользователю об ошибке и дождитесь нового явного запроса с подключённым OzonOFK."
-                )
-            })?;
+            .map_err(|error| self.ozon_error(&store, endpoint, &error))?;
         redact_marketplace_pii(&mut data);
         Ok(Json(OzonResult {
             store,
@@ -4480,6 +4490,10 @@ impl OzonMcp {
     }
 
     /// Получает продажи и воронку Ozon по периоду, SKU, бренду, категории или времени.
+    /// После 429 не повторяйте этот инструмент до окончания `local-cooldown`.
+    /// Если пользователь явно разрешил резервное распределение по отправлениям,
+    /// используйте `ozon_posting_sales_fallback`; его операционная метрика не
+    /// эквивалентна Seller Analytics `ordered_units` и не содержит GMV.
     #[tool(
         name = "ozon_analytics",
         annotations(title = "Аналитика продаж Ozon", read_only_hint = true)
@@ -16336,6 +16350,31 @@ mod tests {
         assert!(error.contains("не настроены Client-Id и Api-Key"));
         assert!(error.contains("не вызывайте автоматически другие инструменты"));
         assert!(error.contains("не заявляйте о прямом доступе к Ozon"));
+    }
+
+    #[test]
+    fn analytics_rate_limit_error_keeps_vendor_and_local_delays_distinct() {
+        let error = server().ozon_error(
+            &StoreId::from("store_a"),
+            "/v1/analytics/data",
+            &OzonError::RateLimited {
+                request_id: Some("analytics-rate-id".to_owned()),
+                retry_after: None,
+                local_cooldown: Some(Duration::from_secs(120)),
+            },
+        );
+
+        assert!(error.contains("kind=rate_limited"), "{error}");
+        assert!(error.contains("request_id=analytics-rate-id"), "{error}");
+        assert!(error.contains("vendor-retry-after: None"), "{error}");
+        assert!(error.contains("local-cooldown: Some(120s)"), "{error}");
+        assert!(
+            error.contains("Не повторяйте тот же Analytics-запрос"),
+            "{error}"
+        );
+        assert!(error.contains("ozon_posting_sales_fallback"), "{error}");
+        assert!(error.contains("non_cancelled_posting_units"), "{error}");
+        assert!(error.contains("без GMV"), "{error}");
     }
 
     #[tokio::test]

@@ -162,13 +162,18 @@ pub enum OzonError {
     #[error("ресурс Ozon API не найден (HTTP 404, request-id: {request_id:?})")]
     NotFound { request_id: Option<String> },
     #[error(
-        "Ozon API ограничил частоту запросов (HTTP 429, request-id: {request_id:?}, retry-after: {retry_after:?})"
+        "Ozon API ограничил частоту запросов (HTTP 429, request-id: {request_id:?}, vendor-retry-after: {retry_after:?}, local-cooldown: {local_cooldown:?})"
     )]
     RateLimited {
         request_id: Option<String>,
+        /// Delay explicitly supplied by Ozon in `Retry-After`.
         retry_after: Option<Duration>,
+        /// Adaptive delay enforced locally. This is intentionally separate
+        /// from the vendor header so callers never attribute a synthesized
+        /// Analytics cooldown to Ozon.
+        local_cooldown: Option<Duration>,
     },
-    #[error("локальный cooldown Ozon API ещё активен (retry-after: {retry_after:?})")]
+    #[error("локальный cooldown Ozon API ещё активен (local-cooldown: {retry_after:?})")]
     LocalRateLimited { retry_after: Duration },
     #[error("временная ошибка Ozon API (HTTP {status}, request-id: {request_id:?})")]
     Server {
@@ -810,16 +815,18 @@ impl OzonClient {
         let status = response.status();
         let request_id = safe_request_id(response.headers());
         let retry_after = parse_retry_after(response.headers(), Utc::now());
-        let enforced_retry_after =
+        let vendor_retry_after = retry_after.duration();
+        let local_cooldown =
             if path == ANALYTICS_DATA_PATH && status == StatusCode::TOO_MANY_REQUESTS {
                 Some(
                     limiter
-                        .record_analytics_rate_limit(retry_after.duration())
+                        .record_analytics_rate_limit(vendor_retry_after)
                         .await,
                 )
             } else {
-                retry_after.duration()
+                None
             };
+        let enforced_retry_after = local_cooldown.or(vendor_retry_after);
         let planned_retry =
             analytics_queued_retry_plan(path, status, pacing_mode, attempt, enforced_retry_after)
                 .or_else(|| retry_plan(path, status, attempt, retry_after));
@@ -836,7 +843,13 @@ impl OzonClient {
         if let Some((delay, kind)) = planned_retry {
             trace_response(&request_trace, status, request_id.as_deref(), true, kind);
             let diagnostic = read_bounded_diagnostic_body(&mut response).await;
-            let error = classify_http_error(status, request_id, enforced_retry_after, diagnostic);
+            let error = classify_http_error(
+                status,
+                request_id,
+                vendor_retry_after,
+                local_cooldown,
+                diagnostic,
+            );
             return Ok(RequestAttempt::Retry { delay, error });
         }
 
@@ -844,7 +857,8 @@ impl OzonClient {
             &mut response,
             status,
             request_id.clone(),
-            enforced_retry_after,
+            vendor_retry_after,
+            local_cooldown,
         )
         .await;
         if path == ANALYTICS_DATA_PATH && result.is_ok() {
@@ -988,6 +1002,7 @@ async fn decode_response(
     status: StatusCode,
     request_id: Option<String>,
     retry_after: Option<Duration>,
+    local_cooldown: Option<Duration>,
 ) -> Result<Value, OzonError> {
     if !status.is_success() {
         let diagnostic = read_bounded_diagnostic_body(response).await;
@@ -995,6 +1010,7 @@ async fn decode_response(
             status,
             request_id,
             retry_after,
+            local_cooldown,
             diagnostic,
         ));
     }
@@ -1091,6 +1107,7 @@ fn classify_http_error(
     status: StatusCode,
     request_id: Option<String>,
     retry_after: Option<Duration>,
+    local_cooldown: Option<Duration>,
     body: String,
 ) -> OzonError {
     match status {
@@ -1100,6 +1117,7 @@ fn classify_http_error(
         StatusCode::TOO_MANY_REQUESTS => OzonError::RateLimited {
             request_id,
             retry_after,
+            local_cooldown,
         },
         status if status.is_server_error() => OzonError::Server {
             status,
@@ -1894,8 +1912,13 @@ mod tests {
             assert_eq!(error.kind(), expected_kind, "HTTP {status}: {error:?}");
             assert_eq!(error.request_id(), Some("oversized-error"));
             match error {
-                OzonError::RateLimited { retry_after, .. } => {
+                OzonError::RateLimited {
+                    retry_after,
+                    local_cooldown,
+                    ..
+                } => {
                     assert_eq!(retry_after, Some(Duration::from_secs(60)));
+                    assert_eq!(local_cooldown, None);
                 }
                 OzonError::Server { status, body, .. } => {
                     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -2319,10 +2342,19 @@ mod tests {
             &error,
             OzonError::RateLimited {
                 request_id: Some(request_id),
-                retry_after: Some(delay),
+                retry_after: None,
+                local_cooldown: Some(delay),
             } if request_id == "analytics-limited"
                 && *delay == ANALYTICS_RATE_LIMIT_BASE_COOLDOWN
         ));
+        assert!(
+            error.to_string().contains("vendor-retry-after: None"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("local-cooldown: Some(120s)"),
+            "{error}"
+        );
 
         let local = tokio::time::timeout(
             Duration::from_secs(1),
@@ -2335,6 +2367,37 @@ mod tests {
             local,
             OzonError::LocalRateLimited { retry_after }
                 if retry_after > Duration::from_secs(119)
+        ));
+        assert_request_count(&requests, 1);
+    }
+
+    #[tokio::test]
+    async fn analytics_vendor_retry_after_is_not_relabelled_as_the_local_cooldown() {
+        let (base_url, requests) = mock_server(vec![
+            MockResponse::new(429, r#"{"error":"slow down"}"#)
+                .header("Retry-After", "1")
+                .header("X-Request-Id", "analytics-vendor-delay"),
+        ]);
+        let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+
+        let error = client
+            .post(
+                &StoreId::from("ofk"),
+                ANALYTICS_DATA_PATH,
+                serde_json::json!({"limit": 10, "offset": 0}),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            OzonError::RateLimited {
+                request_id: Some(request_id),
+                retry_after: Some(vendor_delay),
+                local_cooldown: Some(local_delay),
+            } if request_id == "analytics-vendor-delay"
+                && *vendor_delay == Duration::from_secs(1)
+                && *local_delay == ANALYTICS_REQUEST_INTERVAL
         ));
         assert_request_count(&requests, 1);
     }
@@ -2840,6 +2903,7 @@ mod tests {
             OzonError::RateLimited {
                 request_id: Some(request_id),
                 retry_after: Some(delay),
+                local_cooldown: None,
             } if request_id == "final-cooldown" && *delay == Duration::from_secs(1)
         ));
         let shared_limiter = Arc::clone(&client.rate_limiters[&StoreId::from("primary")]);
