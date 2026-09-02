@@ -3,7 +3,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, time::Duration};
 use tokio_postgres::Config as PostgresConfig;
 
 use crate::{
-    config::{JwtConfig, RegistrySource, TransportMode},
+    config::{JwtConfig, PerformanceCredentials, RegistrySource, StoreId, TransportMode},
     control::policy::ControlPolicy,
 };
 
@@ -25,7 +25,34 @@ pub struct ControlAppConfig {
     /// Optional restricted store used to persist even a disabled policy
     /// revision as a rollback-prevention tombstone. It contains no WB secret.
     pub policy_database: Option<ControlPolicyDatabaseConfig>,
+    pub ozon_runtime: Option<ControlOzonRuntimeConfig>,
     pub wb_runtime: Option<ControlWbRuntimeConfig>,
+}
+
+#[derive(Clone)]
+pub struct ControlOzonRuntimeConfig {
+    pub account_id: String,
+    pub store_id: StoreId,
+    pub credentials: PerformanceCredentials,
+    /// Credentials may be loaded for plan/read-back while the write executor
+    /// remains absent. This is true only when every write gate is enabled.
+    pub writer_enabled: bool,
+    pub proxy_url: String,
+    pub request_timeout: Duration,
+}
+
+impl std::fmt::Debug for ControlOzonRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlOzonRuntimeConfig")
+            .field("account_id", &self.account_id)
+            .field("store_id", &self.store_id)
+            .field("credentials", &"<redacted>")
+            .field("writer_enabled", &self.writer_enabled)
+            .field("proxy_url", &self.proxy_url)
+            .field("request_timeout", &self.request_timeout)
+            .finish()
+    }
 }
 
 #[derive(Clone)]

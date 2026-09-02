@@ -1,0 +1,73 @@
+services:
+  control:
+    environment:
+      # This overlay only arms construction of the executor. Durable plan,
+      # separate approval and database runtime leases are still mandatory.
+      CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: ${CONTROL_MCP_MARKETPLACE_WRITES_ENABLED:-false}
+
+  ozon-campaign-guard:
+    image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:local}
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
+    entrypoint: ["/usr/local/bin/ozon-campaign-guard"]
+    environment:
+      CONTROL_MCP_TRANSPORT: http
+      CONTROL_MCP_BIND: 127.0.0.1:8790
+      CONTROL_MCP_AUTH_MODE: jwt
+      CONTROL_MCP_JWT_ISSUER: ${CONTROL_MCP_JWT_ISSUER:?CONTROL_MCP_JWT_ISSUER is required}
+      CONTROL_MCP_JWT_JWKS_URL: http://control-auth-egress:8080/jwks
+      CONTROL_MCP_PUBLIC_URL: ${CONTROL_MCP_PUBLIC_URL:?CONTROL_MCP_PUBLIC_URL is required}
+      CONTROL_MCP_JWT_AUDIENCE: ${CONTROL_MCP_PUBLIC_URL:?CONTROL_MCP_PUBLIC_URL is required}
+      CONTROL_MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
+      CONTROL_MCP_POLICY: /etc/mcp-ozon/control-policy.json
+      CONTROL_MCP_DATABASE_URL: postgresql://control_writer:${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: ${CONTROL_MCP_MARKETPLACE_WRITES_ENABLED:-false}
+      CONTROL_MCP_OZON_ACCOUNT_ID: furnitura_dlya_doma
+      CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE: /run/mcp-ozon/control-credentials/ozon-performance-client-id
+      CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE: /run/mcp-ozon/control-credentials/ozon-performance-client-secret
+      CONTROL_MCP_OZON_PROXY: http://control-ozon-write-egress:3130
+      CONTROL_MCP_OZON_TIMEOUT_SECONDS: "20"
+      RUST_LOG: ozon_campaign_guard=info
+    volumes:
+      - type: bind
+        source: ${CONTROL_MCP_ACCESS_CONFIG_HOST:?CONTROL_MCP_ACCESS_CONFIG_HOST is required}
+        target: /etc/mcp-ozon/access.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CONTROL_MCP_POLICY_HOST:?CONTROL_MCP_POLICY_HOST is required}
+        target: /etc/mcp-ozon/control-policy.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE_HOST:?CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE_HOST is required}
+        target: /run/mcp-ozon/control-credentials/ozon-performance-client-id
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE_HOST:?CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE_HOST is required}
+        target: /run/mcp-ozon/control-credentials/ozon-performance-client-secret
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - position-internal
+      - control-ozon-write-egress-internal
+    depends_on:
+      control-ozon-write-egress:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=8m,mode=1777

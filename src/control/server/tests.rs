@@ -1969,7 +1969,7 @@ async fn wb_runtime_happy_path_is_durable_and_uses_exact_http_calls() {
 fn inventory_exposes_local_inspection_and_guarded_wb_workflow() {
     let fixtures = Fixtures::new(false);
     let server = fixtures.server();
-    assert_eq!(server.tool_router.map.len(), 7);
+    assert_eq!(server.tool_router.map.len(), 12);
     let status = server
         .tool_router
         .map
@@ -2145,6 +2145,11 @@ async fn control_http_wire_lists_exact_inventory_and_propagates_request_identity
         [
             "ozon_ads_control_scope",
             "ozon_ads_control_status",
+            "ozon_performance_apply_campaign_launch",
+            "ozon_performance_approve_campaign_launch",
+            "ozon_performance_prepare_campaign_launch",
+            "ozon_performance_preview_campaign_launch",
+            "ozon_performance_reconcile_campaign_launch",
             "wb_promotion_apply_bid_plan",
             "wb_promotion_approve_bid_plan",
             "wb_promotion_bid_plan_status",

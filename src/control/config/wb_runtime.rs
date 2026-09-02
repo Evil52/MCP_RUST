@@ -55,10 +55,23 @@ pub(super) fn load_wb_runtime(
     if policy.mode == ControlMode::Disabled {
         return Ok(None);
     }
+    let configured_account_id = lookup("CONTROL_MCP_WB_ACCOUNT_ID");
+    if !policy
+        .actors
+        .iter()
+        .any(|actor| !actor.wb_promotion_bid_targets.is_empty())
+    {
+        if configured_account_id.is_some() {
+            bail!("CONTROL_MCP_WB_ACCOUNT_ID не имеет явных targets в control policy");
+        }
+        return Ok(None);
+    }
     if !matches!(auth, ControlAuthConfig::Jwt(_)) {
         bail!("WB Control runtime разрешён только в JWT-режиме Control MCP");
     }
-    let account_id = required_nonempty(lookup, "CONTROL_MCP_WB_ACCOUNT_ID")?;
+    let account_id = configured_account_id
+        .filter(|value| !value.is_empty() && value.trim() == value)
+        .context("CONTROL_MCP_WB_ACCOUNT_ID обязателен для WB Control runtime")?;
     let account = registry
         .accounts
         .iter()

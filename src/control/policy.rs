@@ -22,11 +22,13 @@ const MAX_ACTORS: usize = 256;
 const MAX_TARGETS_PER_ACTOR: usize = 1_000;
 const MAX_SKUS_PER_TARGET: usize = 1_000;
 const MAX_WB_NM_IDS_PER_TARGET: usize = 50;
+const MAX_OZON_LAUNCH_SKUS_PER_TARGET: usize = 50;
 const MAX_APPROVERS_PER_TARGET: usize = 16;
 const MAX_WB_SIGNED_ID: u64 = i64::MAX as u64;
 const MAX_ACTIONS_PER_HOUR: u32 = 60;
 const MAX_ACTIONS_PER_DAY: u32 = 500;
 const MAX_CUMULATIVE_ABS_DELTA_KOPECKS_PER_DAY: u64 = i64::MAX as u64;
+const MAX_OZON_WEEKLY_BUDGET_MICRORUBLES: u64 = 1_000_000 * 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -61,7 +63,28 @@ pub(super) struct ActorControlPolicy {
     #[serde(default)]
     pub(super) targets: Vec<ControlTargetPolicy>,
     #[serde(default)]
+    pub(super) ozon_campaign_launch_targets: Vec<OzonCampaignLaunchTargetPolicy>,
+    #[serde(default)]
     pub(super) wb_promotion_bid_targets: Vec<WbPromotionBidTargetPolicy>,
+}
+
+/// Exact, immutable scope for creating one Ozon CPC campaign.
+///
+/// Ozon exposes a campaign-level weekly budget, not a per-SKU budget. The
+/// per-SKU value is therefore an independent local spend cap that the
+/// controller must enforce from attributed SKU statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct OzonCampaignLaunchTargetPolicy {
+    pub(super) account_id: String,
+    pub(super) skus: Vec<u64>,
+    pub(super) weekly_budget_microrubles: u64,
+    pub(super) per_sku_spend_cap_microrubles: u64,
+    pub(super) initial_cpc_bid_microrubles: u64,
+    pub(super) max_cpc_bid_microrubles: u64,
+    pub(super) target_drr_percent: u8,
+    pub(super) target_position: u8,
+    pub(super) approver_actor_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

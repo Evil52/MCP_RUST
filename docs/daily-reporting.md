@@ -155,6 +155,26 @@ Normal freshness comes exclusively from the guarded `report-collector`
 scheduler, so marketplace request volume scales with scheduled account
 collection rather than the number of managers or ChatGPT prompts.
 
+For an on-demand current-day update, ChatGPT calls
+`ofk_request_ozon_sales_refresh`. The tool only inserts or reuses a PostgreSQL
+queue request; it never calls Ozon synchronously. Concurrent requests from all
+managers for one account share one request ID, and a successful result is reused
+for ten minutes. A queued current-day request may wait for up to four hours, so
+fourteen distinct accounts fit the globally sequential worst case.
+`ofk_ozon_sales_refresh_status` reports `queued`, `running`, `succeeded`, or
+`failed`. The single `report-collector` loop claims at most one
+job at a time. It will not start during the 12 minutes before either scheduled
+cutoff, throughout the 08:00-08:30 and 17:00-17:30 EKB report windows, or
+during the following 65-second Seller API pacing tail. It collects all five
+Ozon sources and publishes the snapshot and queue completion in one
+transaction.
+
+This prevents a manager burst from becoming a marketplace burst. It cannot
+promise that Ozon will never return HTTP 429: the same Client-Id may be used by
+an external process, and Ozon controls its limits. Seller analytics requests
+still use the guarded 65-second queue and bounded adaptive 429 cooldown; a
+failed refresh remains explicit and never replaces the last published snapshot.
+
 ## Remaining rollout gates
 
 The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot

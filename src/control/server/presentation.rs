@@ -1,11 +1,80 @@
 use chrono::{DateTime, Utc};
 
 use crate::control::{
+    ozon::{OzonCampaignPlan, OzonLaunchStatus, OzonPlanStoreError},
     plan::{PlanStoreError, WbControlPlan, WbPlanStatus},
     wb::{WbCampaignBidSnapshot, WbWriteError, WbWriteOutcomeKind},
 };
 
-use super::contract::{WbPlanApprovalResult, WbPlanResult};
+use super::contract::{
+    OzonCampaignPlanApprovalResult, OzonCampaignPlanResult, WbPlanApprovalResult, WbPlanResult,
+};
+
+pub(super) fn ozon_plan_result(plan: &OzonCampaignPlan) -> OzonCampaignPlanResult {
+    OzonCampaignPlanResult {
+        plan_id: plan.plan_id.clone(),
+        plan_digest: plan.plan_digest.clone(),
+        manifest_digest: plan.manifest.manifest_digest.clone(),
+        actor_id: plan.actor_id.clone(),
+        account_id: plan.account_id.clone(),
+        sku: plan.sku,
+        policy_schema_version: plan.schema_version,
+        policy_revision: plan.policy_revision,
+        policy_digest: plan.policy_digest.clone(),
+        status: plan.status,
+        campaign_id: plan.campaign_id,
+        approval: plan
+            .approval
+            .as_ref()
+            .map(|approval| OzonCampaignPlanApprovalResult {
+                approval_id: approval.approval_id.clone(),
+                approver_id: approval.approver_id.clone(),
+                approved_at: format_timestamp(approval.approved_at),
+                expires_at: format_timestamp(approval.expires_at),
+            }),
+        spec: plan.manifest.spec.clone(),
+        created_at: format_timestamp(plan.created_at),
+        expires_at: format_timestamp(plan.expires_at),
+        last_error_class: plan.last_error_class.clone(),
+        requires_reconciliation: plan.status.requires_reconciliation(),
+    }
+}
+
+pub(super) fn ozon_plan_store_error(error: OzonPlanStoreError) -> String {
+    match error {
+        OzonPlanStoreError::NotFound => "CONTROL_PLAN_NOT_FOUND",
+        OzonPlanStoreError::InvalidState => "CONTROL_PLAN_ALREADY_USED",
+        OzonPlanStoreError::Expired => "CONTROL_PLAN_EXPIRED",
+        OzonPlanStoreError::ApprovalExpired => "CONTROL_PLAN_APPROVAL_EXPIRED",
+        OzonPlanStoreError::PlanChanged => "CONTROL_PLAN_CHANGED",
+        OzonPlanStoreError::PolicyChanged => "CONTROL_POLICY_CHANGED",
+        OzonPlanStoreError::RuntimeDisabled => "CONTROL_RUNTIME_DISABLED",
+        OzonPlanStoreError::SkuLocked => "CONTROL_SKU_INCIDENT_LOCKED",
+        OzonPlanStoreError::InvalidPlan => "CONTROL_PLAN_INVALID",
+        OzonPlanStoreError::Unavailable => "CONTROL_PERSISTENCE_UNAVAILABLE",
+    }
+    .to_owned()
+}
+
+pub(super) fn ozon_write_failure(
+    kind: crate::control::ozon::OzonWriteErrorKind,
+    operation: &'static str,
+) -> (OzonLaunchStatus, &'static str) {
+    match (kind, operation) {
+        (crate::control::ozon::OzonWriteErrorKind::Definite, "create") => {
+            (OzonLaunchStatus::Failed, "ozon_create_rejected")
+        }
+        (crate::control::ozon::OzonWriteErrorKind::Definite, "products") => {
+            (OzonLaunchStatus::Failed, "ozon_products_rejected")
+        }
+        (crate::control::ozon::OzonWriteErrorKind::Definite, "activate") => {
+            (OzonLaunchStatus::Failed, "ozon_activate_rejected")
+        }
+        (_, "create") => (OzonLaunchStatus::Ambiguous, "ozon_create_ambiguous"),
+        (_, "products") => (OzonLaunchStatus::Ambiguous, "ozon_products_ambiguous"),
+        _ => (OzonLaunchStatus::Ambiguous, "ozon_activate_ambiguous"),
+    }
+}
 
 #[derive(Debug)]
 pub(super) enum WritePermitFailure {

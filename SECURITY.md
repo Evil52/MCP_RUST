@@ -25,7 +25,7 @@ The following properties are treated as release gates:
    are selected and before any socket is opened. Chat input cannot supply a host, HTTP method, or
    path. Redirects and ambient HTTP proxies are disabled. The separately inventoried Control MCP
    has its own narrower write invariant below; its one reviewed PATCH must never be added to an
-   Analytics client or to the 77-tool Analytics registry.
+   Analytics client or to the 79-tool Analytics registry.
 2. Production Ozon Seller egress uses 35 stable reporting/list/info paths, including the three
    finance-accrual reads promoted after canary validation. Posting lists use only
    `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list`; the superseded
@@ -260,9 +260,11 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
 
 - Run `./scripts/local-ci.sh`, require 100% line coverage, Clippy/rustdoc warnings as errors,
   RustSec/cargo-deny, CodeQL, dependency review, secret scanning, and the hardened-container job.
-- Verify the Analytics MCP production tool list contains exactly 77 stable tools, no preview tools,
-  and every tool advertises `readOnlyHint=true`, `destructiveHint=false`, and the expected
-  OAuth/noauth policy. This count never includes Control MCP tools.
+- Verify the Analytics MCP production tool list contains exactly 79 stable tools, no preview tools,
+  and every tool advertises `destructiveHint=false` and the expected OAuth/noauth policy.
+  Exactly `ofk_request_ozon_sales_refresh` has `readOnlyHint=false`: it inserts or reuses one
+  internal PostgreSQL queue row but has no marketplace egress. Every other Analytics tool has
+  `readOnlyHint=true`. This count never includes Control MCP tools.
 - Verify the separate Control MCP registry contains exactly seven tools:
   `ozon_ads_control_status`, `ozon_ads_control_scope`, `wb_promotion_prepare_bid_update`,
   `wb_promotion_approve_bid_plan`, `wb_promotion_apply_bid_plan`,
@@ -270,14 +272,24 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   must be read-only; prepare and reconcile must be non-read-only but non-destructive; approval must
   be non-read-only, destructive, idempotent and closed-world because it grants execution authority;
   apply must be non-read-only, destructive and idempotent in the sense that a plan can be claimed
-  only once. The combined implementation inventory is 83, but no release check may treat it as one
+  only once. The combined implementation inventory is 86, but no release check may treat it as one
   security boundary.
 - Verify `ofk_collection_status`, `ofk_data_completeness`, `ofk_metrics_history`,
-  `ofk_manager_actions`, `ofk_ozon_sales_analytics`, and `ofk_reports` are internal read-only reporting tools with
+  `ofk_manager_actions`, `ofk_ozon_sales_analytics`, `ofk_ozon_sales_refresh_status`, and
+  `ofk_reports` are internal read-only reporting tools with
   `openWorldHint=false`. They must read only curated PostgreSQL views through the restricted
   reporting reader, enforce actor/account RBAC before database access, and return a stable
-  unavailable result when the reporting database is not configured; they must never start a sync,
-  mutate marketplace or internal data, generate a report, or send mail.
+  unavailable result when the reporting database is not configured; they must never mutate a
+  marketplace, generate a report, or send mail.
+- Verify `ofk_request_ozon_sales_refresh` enforces actor/account RBAC before its separately
+  restricted `report_refresh_requester` database boundary. Fourteen concurrent calls for one
+  account must resolve to one active request ID with one creator. The role may execute only the
+  request/status functions and must have no queue-table, snapshot-table, claim, completion, or
+  marketplace credential access. Only the sequential `report-collector` may claim the job and
+  atomically complete it with a full five-source Ozon snapshot. Database fencing must allow only
+  one globally running refresh even with multiple collector replicas. The collector must reserve
+  the complete 12-minute refresh deadline before scheduled report cutoffs and the 65-second Seller
+  pacing tail after their completion windows.
 - Verify `ofk_ozon_sales_analytics` is available to an account-scoped manager and reads only
   successful published sales snapshots. Missing, preliminary and partial dates must remain explicit.
   Verify direct `ozon_analytics` egress is denied before credential lookup for every non-admin role.

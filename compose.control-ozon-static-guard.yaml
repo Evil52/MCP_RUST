@@ -1,0 +1,135 @@
+name: mcp-ozon-furnitura-cpc7
+
+services:
+  guard-state-init:
+    image: alpine:3.24
+    command: ["sh", "-c", "chown 10001:10001 /state && chmod 700 /state"]
+    user: "0:0"
+    volumes:
+      - type: volume
+        source: guard-state
+        target: /state
+    network_mode: none
+    restart: "no"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER]
+    security_opt: [no-new-privileges:true]
+
+  ozon-campaign-guard:
+    image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:furnitura-cpc7}
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-local-furnitura-cpc7}
+    entrypoint: ["/usr/local/bin/ozon-campaign-guard"]
+    environment:
+      CONTROL_MCP_TRANSPORT: http
+      CONTROL_MCP_BIND: 127.0.0.1:8790
+      CONTROL_MCP_AUTH_MODE: jwt
+      CONTROL_MCP_JWT_ISSUER: https://static-guard.invalid
+      CONTROL_MCP_JWT_JWKS_URL: http://control-auth-egress:8080/jwks
+      CONTROL_MCP_PUBLIC_URL: https://static-guard.invalid/mcp
+      CONTROL_MCP_JWT_AUDIENCE: https://static-guard.invalid/mcp
+      CONTROL_MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
+      CONTROL_MCP_POLICY: /etc/mcp-ozon/control-policy.json
+      # Parsed by the shared fail-closed loader; static guard mode does not
+      # connect to this address or use the plan database.
+      CONTROL_MCP_DATABASE_URL: postgresql://control_writer:unused@127.0.0.1:5432/unused
+      CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: "true"
+      CONTROL_MCP_OZON_ACCOUNT_ID: furnitura_dlya_doma
+      CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE: /run/secrets/ozon-performance-client-id
+      CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE: /run/secrets/ozon-performance-client-secret
+      CONTROL_MCP_OZON_PROXY: http://control-ozon-write-egress:3130
+      CONTROL_MCP_OZON_TIMEOUT_SECONDS: "20"
+      CONTROL_MCP_OZON_STATIC_GUARDS_FILE: /etc/mcp-ozon/static-guards.json
+      CONTROL_MCP_OZON_STATIC_GUARD_STATE_FILE: /var/lib/mcp-ozon-guard/state.json
+      RUST_LOG: ozon_campaign_guard=info
+    volumes:
+      - type: bind
+        source: ./config/access.json
+        target: /etc/mcp-ozon/access.json
+        read_only: true
+      - type: bind
+        source: ./config/control-policy.ozon-furnitura.live.example.json
+        target: /etc/mcp-ozon/control-policy.json
+        read_only: true
+      - type: bind
+        source: ./config/ozon-furnitura-cpc7-live.json
+        target: /etc/mcp-ozon/static-guards.json
+        read_only: true
+      - type: volume
+        source: guard-state
+        target: /var/lib/mcp-ozon-guard
+    secrets:
+      - ozon-performance-client-id
+      - ozon-performance-client-secret
+    networks:
+      - control-ozon-write-egress-internal
+    depends_on:
+      guard-state-init:
+        condition: service_completed_successfully
+      control-ozon-write-egress:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "pidof ozon-campaign-guard >/dev/null"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  control-ozon-write-egress:
+    image: ${MCP_CONTROL_OZON_WRITE_EGRESS_IMAGE:-mcp-ozon-control-ozon-write-egress:local}
+    build:
+      context: .
+      dockerfile: Dockerfile.control-ozon-write-egress
+      args:
+        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-local-furnitura-cpc7}
+    networks:
+      - control-ozon-write-egress-internal
+      - outbound
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 32
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /var/cache/squid:size=4m,mode=1777
+      - /var/log/squid:size=2m,mode=1777
+      - /var/run/squid:size=1m,mode=1777
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "printf 'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 3130 | head -1 | grep -q '403 Forbidden'"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  control-ozon-write-egress-internal:
+    internal: true
+  outbound:
+    name: mcp-ozon-outbound
+    external: true
+
+volumes:
+  guard-state:
+    name: mcp-ozon-furnitura-cpc7-guard-state
+
+secrets:
+  ozon-performance-client-id:
+    file: ${CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE_HOST:-/Users/user/.local/share/mcp-ozon-runtime/report-credentials-ozon7-20260824/OZON_PERFORMANCE_CLIENT_ID}
+  ozon-performance-client-secret:
+    file: ${CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE_HOST:-/Users/user/.local/share/mcp-ozon-runtime/report-credentials-ozon7-20260824/OZON_PERFORMANCE_CLIENT_SECRET}

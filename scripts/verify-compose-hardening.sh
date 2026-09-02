@@ -51,6 +51,7 @@ printf '%s\n' \
   'POSITION_READER_DB_PASSWORD=verify-only-reader-not-a-secret' \
   'REPORT_WORKER_DB_PASSWORD=verify-only-report-worker-not-a-secret' \
   'REPORT_COLLECTOR_DB_PASSWORD=verify-only-report-collector-not-a-secret' \
+  'REPORT_REFRESH_REQUESTER_DB_PASSWORD=verify-only-refresh-requester-not-a-secret' \
   'CONTROL_WRITER_DB_PASSWORD=verify-only-control-writer-not-a-secret' \
   'WB_AUTOMATION_DB_PASSWORD=verify-only-wb-automation-not-a-secret' \
   >"$interpolation_env"
@@ -399,32 +400,38 @@ verify_server() {
     --arg restart "$expected_restart" '.restart == $restart'
 }
 
-# The reporting-reader overlay may change exactly two things on the verified
-# main MCP service: add its restricted database URL and attach the existing
+# The reporting-reader overlay may add exactly two restricted database URLs
+# and attach the existing
 # internal database network. Everything else, including the outbound bridge,
 # mounts, published port, filesystem and resource hardening, must remain byte-
 # for-byte equivalent after Compose has merged the files.
 # shellcheck disable=SC2016
 verify_reporting_reader() {
   local rendered="$1" base_rendered="$2" service base_service
-  local expected_database_url
+  local expected_database_url expected_refresh_database_url
   service="$(jq -c '.services.server' <<<"$rendered")"
   base_service="$(jq -c '.services.server' <<<"$base_rendered")"
   expected_database_url='postgresql://position_reader:verify-only-reader-not-a-secret@position-db:5432/ozon_positions'
+  expected_refresh_database_url='postgresql://report_refresh_requester:verify-only-refresh-requester-not-a-secret@position-db:5432/ozon_positions'
 
   check "reporting reader: server service exists" "$service" 'type == "object"'
-  check "reporting reader: only the URL and network attachment differ from main" "$service" \
+  check "reporting reader: only the URLs and network attachment differ from main" "$service" \
     --argjson base "$base_service" \
-    'del(.environment.MCP_REPORTING_DATABASE_URL, .networks)
-     == ($base | del(.environment.MCP_REPORTING_DATABASE_URL, .networks))'
-  check "reporting reader: only the restricted reader URL is added" "$service" \
+    'del(.environment.MCP_REPORTING_DATABASE_URL,
+         .environment.MCP_REPORT_REFRESH_DATABASE_URL, .networks)
+     == ($base | del(.environment.MCP_REPORTING_DATABASE_URL,
+                     .environment.MCP_REPORT_REFRESH_DATABASE_URL, .networks))'
+  check "reporting reader: only the restricted reader and requester URLs are added" "$service" \
     --arg database_url "$expected_database_url" \
+    --arg refresh_database_url "$expected_refresh_database_url" \
     '.environment.MCP_REPORTING_DATABASE_URL == $database_url
+     and .environment.MCP_REPORT_REFRESH_DATABASE_URL == $refresh_database_url
      and (.environment | has("POSITION_DB_ADMIN_PASSWORD") | not)
      and (.environment | has("POSITION_COLLECTOR_DB_PASSWORD") | not)
      and (.environment | has("POSITION_READER_DB_PASSWORD") | not)
      and (.environment | has("REPORT_WORKER_DB_PASSWORD") | not)
-     and (.environment | has("REPORT_COLLECTOR_DB_PASSWORD") | not)'
+     and (.environment | has("REPORT_COLLECTOR_DB_PASSWORD") | not)
+     and (.environment | has("REPORT_REFRESH_REQUESTER_DB_PASSWORD") | not)'
   check "reporting reader: exact outbound and fixed database networks are attached" "$rendered" \
     '(.services.server.networks | keys | sort) == ["outbound", "position-internal"]
      and (.networks | keys | sort) == ["outbound", "position-internal"]
@@ -1587,6 +1594,10 @@ check_contains \
   "reporting reader: reader password has no fallback value" \
   "$project_dir/compose.reporting-reader.yaml" \
   "\${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}"
+check_contains \
+  "reporting reader: refresh requester password has no fallback value" \
+  "$project_dir/compose.reporting-reader.yaml" \
+  "\${REPORT_REFRESH_REQUESTER_DB_PASSWORD:?REPORT_REFRESH_REQUESTER_DB_PASSWORD is required}"
 check_contains \
   "reporting reader: fixed database network is external" \
   "$project_dir/compose.reporting-reader.yaml" \

@@ -31,3 +31,15 @@ skill или OzonOFK недоступен, не восстанавливай ц�
 
 The scheduled companion is not proof of server-side email delivery. Only the
 report outbox and provider audit establish that a manager email was sent.
+
+## Explicit current-day refresh
+
+```text
+Используй $ozon-daily-manager-report и запроси одно актуальное обновление Ozon
+для доступного мне кабинета. Не вызывай прямую live-аналитику и не опрашивай
+статус циклом. Если обновление уже завершилось, прочитай опубликованный снимок
+через ofk_ozon_sales_analytics и укажи точный snapshot_cutoff_at. Если оно в
+очереди или выполняется, верни request ID и состояние; не выдавай предыдущий
+снимок за текущий. При ошибке сохрани последний успешный снимок и явно укажи,
+что новое обновление не опубликовано.
+```

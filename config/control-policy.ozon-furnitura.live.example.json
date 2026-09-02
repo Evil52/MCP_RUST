@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "revision": 2,
+  "mode": "enabled",
+  "actors": [
+    {
+      "actor_id": "rustam_magasumov",
+      "targets": [],
+      "ozon_campaign_launch_targets": [
+        {
+          "account_id": "furnitura_dlya_doma",
+          "skus": [3457585933],
+          "weekly_budget_microrubles": 2000000000,
+          "per_sku_spend_cap_microrubles": 2000000000,
+          "initial_cpc_bid_microrubles": 7000000,
+          "max_cpc_bid_microrubles": 12000000,
+          "target_drr_percent": 15,
+          "target_position": 30,
+          "approver_actor_ids": ["diana_serafimovich"]
+        },
+        {
+          "account_id": "furnitura_dlya_doma",
+          "skus": [3624640796],
+          "weekly_budget_microrubles": 2000000000,
+          "per_sku_spend_cap_microrubles": 2000000000,
+          "initial_cpc_bid_microrubles": 7000000,
+          "max_cpc_bid_microrubles": 12000000,
+          "target_drr_percent": 15,
+          "target_position": 30,
+          "approver_actor_ids": ["diana_serafimovich"]
+        },
+        {
+          "account_id": "furnitura_dlya_doma",
+          "skus": [3625930192],
+          "weekly_budget_microrubles": 2000000000,
+          "per_sku_spend_cap_microrubles": 2000000000,
+          "initial_cpc_bid_microrubles": 7000000,
+          "max_cpc_bid_microrubles": 12000000,
+          "target_drr_percent": 15,
+          "target_position": 30,
+          "approver_actor_ids": ["diana_serafimovich"]
+        },
+        {
+          "account_id": "furnitura_dlya_doma",
+          "skus": [2978114773],
+          "weekly_budget_microrubles": 2000000000,
+          "per_sku_spend_cap_microrubles": 2000000000,
+          "initial_cpc_bid_microrubles": 7000000,
+          "max_cpc_bid_microrubles": 12000000,
+          "target_drr_percent": 15,
+          "target_position": 30,
+          "approver_actor_ids": ["diana_serafimovich"]
+        },
+        {
+          "account_id": "furnitura_dlya_doma",
+          "skus": [3026611133],
+          "weekly_budget_microrubles": 2000000000,
+          "per_sku_spend_cap_microrubles": 2000000000,
+          "initial_cpc_bid_microrubles": 7000000,
+          "max_cpc_bid_microrubles": 12000000,
+          "target_drr_percent": 15,
+          "target_position": 30,
+          "approver_actor_ids": ["diana_serafimovich"]
+        }
+      ],
+      "wb_promotion_bid_targets": []
+    }
+  ]
+}

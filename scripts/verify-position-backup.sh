@@ -257,7 +257,8 @@ DECLARE
 BEGIN
     FOREACH role_name IN ARRAY ARRAY[
         'position_collector', 'position_reader', 'report_worker',
-        'report_collector', 'control_writer', 'wb_automation_writer'
+        'report_collector', 'report_refresh_requester', 'control_writer',
+        'wb_automation_writer'
     ] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
             EXECUTE format('CREATE ROLE %I NOLOGIN', role_name);

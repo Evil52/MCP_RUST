@@ -19,6 +19,7 @@
 | Canonical KPI history | no | yes | yes |
 | Server manager actions | no | yes | yes |
 | Ready/sent report catalog | no | no | yes |
+| Request/status for a deduplicated current-day Ozon refresh | yes | yes | yes |
 
 An RBAC denial is a result, not a reason to switch identity. A manager/analyst
 report without canonical history must be explicitly limited; permitted raw
@@ -95,7 +96,9 @@ its unit:
 Use a raw Ozon call only after a published KPI establishes a material anomaly
 or the user explicitly asks for that detail. Keep the same account and period.
 
-- Sales and funnel: `ozon_analytics`.
+- Published sales and funnel: `ofk_ozon_sales_analytics`.
+- Direct live sales and funnel: `ozon_analytics`, administrators only and only
+  for a rare diagnostic. It never becomes a published reporting cutoff.
 - Stock and turnover: `ozon_product_stocks`, `ozon_warehouse_stocks`,
   `ozon_stock_turnover`.
 - Advertising: `ozon_performance_daily`,
@@ -109,6 +112,22 @@ or the user explicitly asks for that detail. Keep the same account and period.
 
 Do not use web search to replace an unavailable OzonOFK source. Do not treat a
 raw live response as an immutable published reporting cutoff.
+
+## Explicit current-data refresh
+
+Do not request freshness automatically for an ordinary report. If the user
+explicitly asks to refresh or obtain current Ozon data, call
+`ofk_request_ozon_sales_refresh` exactly once for each selected account and
+then call `ofk_ozon_sales_refresh_status`. Requests from multiple managers are
+deduplicated by the server. Never loop on either tool, and never fall back to
+direct `ozon_analytics` after `queued`, `running`, or `failed`.
+
+On `succeeded`, read `ofk_ozon_sales_analytics` and cite its exact
+`snapshot_cutoff_at` as the freshness boundary. On `queued` or `running`, give
+the request ID and state that the fresh snapshot is not published yet. On
+`failed`, retain and clearly date the last successful snapshot; do not present
+it as current. The refresh is near-real-time asynchronous collection, not a
+synchronous Ozon response.
 
 ## Final report structure
 

@@ -4,6 +4,7 @@ services:
   server:
     environment:
       MCP_REPORTING_DATABASE_URL: postgresql://position_reader:${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      MCP_REPORT_REFRESH_DATABASE_URL: postgresql://report_refresh_requester:${REPORT_REFRESH_REQUESTER_DB_PASSWORD:?REPORT_REFRESH_REQUESTER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
     networks:
       - outbound
       - position-internal

@@ -55,6 +55,9 @@ SELECT
     AND to_regclass('daily_reporting.price_facts') IS NOT NULL
     AND to_regclass('daily_reporting.unit_economics_inputs') IS NOT NULL
     AND to_regclass('daily_reporting.collection_claims') IS NOT NULL
+    AND to_regclass('daily_reporting.ozon_sales_refresh_requests') IS NOT NULL
+    AND to_regclass('daily_reporting.ozon_sales_refresh_one_active_account_idx') IS NOT NULL
+    AND to_regclass('daily_reporting.ozon_sales_refresh_one_running_global_idx') IS NOT NULL
     AND to_regclass('daily_reporting.published_source_snapshots') IS NOT NULL
     AND to_regclass('daily_reporting.published_sales_facts') IS NOT NULL
     AND to_regclass('daily_reporting.published_advertising_facts') IS NOT NULL
@@ -78,6 +81,13 @@ SELECT
     AND to_regclass('control.wb_runtime_gates') IS NOT NULL
     AND to_regclass('control.wb_action_reservations') IS NOT NULL
     AND to_regclass('control.wb_audit_events') IS NOT NULL
+    AND to_regclass('control.ozon_policy_revisions') IS NOT NULL
+    AND to_regclass('control.ozon_campaign_plans') IS NOT NULL
+    AND to_regclass('control.ozon_campaign_plan_approvals') IS NOT NULL
+    AND to_regclass('control.ozon_runtime_gates') IS NOT NULL
+    AND to_regclass('control.ozon_campaign_action_reservations') IS NOT NULL
+    AND to_regclass('control.ozon_campaign_audit_events') IS NOT NULL
+    AND to_regclass('control.ozon_campaign_guards') IS NOT NULL
     AND to_regclass('wb_automation.cycles') IS NOT NULL
     AND to_regclass('wb_automation.action_attempts') IS NOT NULL
     AND to_regclass('wb_automation.execution_state') IS NOT NULL
@@ -123,9 +133,20 @@ SELECT
         'control.validate_wb_reservation_insert()'
     ) IS NOT NULL
     AND to_regprocedure('control.enforce_wb_plan_transition()') IS NOT NULL
+    AND to_regprocedure('control.enforce_ozon_plan_transition()') IS NOT NULL
+    AND to_regprocedure('control.enforce_ozon_guard_transition()') IS NOT NULL
+    AND to_regprocedure('control.reject_ozon_append_only_mutation()') IS NOT NULL
+    AND to_regprocedure('control.validate_ozon_policy_revision_insert()') IS NOT NULL
+    AND to_regprocedure('control.validate_ozon_plan_insert()') IS NOT NULL
+    AND to_regprocedure('control.validate_ozon_approval_insert()') IS NOT NULL
+    AND to_regprocedure('control.validate_ozon_reservation_insert()') IS NOT NULL
+    AND to_regprocedure('control.validate_ozon_guard_insert()') IS NOT NULL
     AND (
         SELECT string_agg(relation.relname::text, ',' ORDER BY relation.relname)
-               = 'wb_action_reservations,wb_audit_events,wb_plan_approvals,' ||
+               = 'ozon_campaign_action_reservations,ozon_campaign_audit_events,' ||
+                 'ozon_campaign_guards,ozon_campaign_plan_approvals,' ||
+                 'ozon_campaign_plans,ozon_policy_revisions,ozon_runtime_gates,' ||
+                 'wb_action_reservations,wb_audit_events,wb_plan_approvals,' ||
                  'wb_plans,wb_policy_revisions,wb_prepare_reservations,' ||
                  'wb_runtime_gates'
         FROM pg_class AS relation
@@ -136,7 +157,12 @@ SELECT
     )
     AND (
         SELECT string_agg(routine.proname::text, ',' ORDER BY routine.proname)
-               = 'enforce_wb_plan_transition,reject_wb_append_only_mutation,' ||
+               = 'enforce_ozon_guard_transition,enforce_ozon_plan_transition,' ||
+                 'enforce_wb_plan_transition,reject_ozon_append_only_mutation,' ||
+                 'reject_wb_append_only_mutation,validate_ozon_approval_insert,' ||
+                 'validate_ozon_guard_insert,validate_ozon_plan_insert,' ||
+                 'validate_ozon_policy_revision_insert,' ||
+                 'validate_ozon_reservation_insert,' ||
                  'validate_wb_approval_insert,validate_wb_plan_insert,' ||
                  'validate_wb_policy_revision_insert,' ||
                  'validate_wb_prepare_reservation_insert,' ||
@@ -148,7 +174,7 @@ SELECT
           AND routine.prorettype = 'trigger'::regtype
     )
     AND (
-        SELECT count(*) = 12
+        SELECT count(*) = 23
         FROM pg_trigger AS trigger
         JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
         JOIN pg_namespace AS namespace
@@ -157,7 +183,7 @@ SELECT
           AND NOT trigger.tgisinternal
     )
     AND (
-        SELECT count(*) = 12
+        SELECT count(*) = 23
         FROM pg_trigger AS trigger
         JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
         JOIN pg_namespace AS namespace
@@ -249,6 +275,83 @@ SELECT
                   AND trigger.tgtype = 27
                   AND trigger.tgfoid =
                       'control.reject_wb_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_plans'
+                  AND trigger.tgname = 'ozon_plans_transition_guard'
+                  AND trigger.tgtype = 19
+                  AND trigger.tgfoid =
+                      'control.enforce_ozon_plan_transition()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_plans'
+                  AND trigger.tgname = 'ozon_plans_validate_insert'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_ozon_plan_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_policy_revisions'
+                  AND trigger.tgname = 'ozon_policy_revisions_validate'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_ozon_policy_revision_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_policy_revisions'
+                  AND trigger.tgname = 'ozon_policy_revisions_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_ozon_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_plan_approvals'
+                  AND trigger.tgname = 'ozon_approvals_validate'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_ozon_approval_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_plan_approvals'
+                  AND trigger.tgname = 'ozon_approvals_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_ozon_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_action_reservations'
+                  AND trigger.tgname = 'ozon_reservations_validate'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_ozon_reservation_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_action_reservations'
+                  AND trigger.tgname = 'ozon_reservations_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_ozon_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_audit_events'
+                  AND trigger.tgname = 'ozon_audit_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_ozon_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_guards'
+                  AND trigger.tgname = 'ozon_guards_validate_insert'
+                  AND trigger.tgtype = 7
+                  AND trigger.tgfoid =
+                      'control.validate_ozon_guard_insert()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_guards'
+                  AND trigger.tgname = 'ozon_guards_transition_guard'
+                  AND trigger.tgtype = 19
+                  AND trigger.tgfoid =
+                      'control.enforce_ozon_guard_transition()'::regprocedure
               )
           )
     )
@@ -391,6 +494,21 @@ SELECT
     ) IS NOT NULL
     AND to_regprocedure(
         'daily_reporting.require_active_collection_claim()'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.request_ozon_sales_refresh(text,text,date)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.ozon_sales_refresh_status(text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.claim_ozon_sales_refresh(text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.complete_ozon_sales_refresh(bigint,integer,text,timestamp with time zone)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.fail_ozon_sales_refresh(bigint,integer,text,text)'
     ) IS NOT NULL
     AND EXISTS (
         SELECT 1
@@ -563,8 +681,53 @@ SELECT
     )
     AND has_database_privilege('position_collector', current_database(), 'CONNECT')
     AND has_database_privilege('position_reader', current_database(), 'CONNECT')
+    AND has_database_privilege('report_refresh_requester', current_database(), 'CONNECT')
     AND NOT has_database_privilege('position_collector', current_database(), 'TEMP')
     AND NOT has_database_privilege('position_reader', current_database(), 'TEMP')
+    AND NOT has_database_privilege('report_refresh_requester', current_database(), 'TEMP')
+    AND EXISTS (
+        SELECT 1
+        FROM pg_roles
+        WHERE rolname = 'report_refresh_requester'
+          AND rolcanlogin
+          AND NOT rolsuper
+          AND NOT rolcreatedb
+          AND NOT rolcreaterole
+          AND NOT rolinherit
+          AND NOT rolreplication
+          AND NOT rolbypassrls
+          AND rolconnlimit = 4
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_auth_members AS membership
+        WHERE membership.roleid = 'report_refresh_requester'::regrole
+           OR membership.member = 'report_refresh_requester'::regrole
+    )
+    AND has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.request_ozon_sales_refresh(text,text,date)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.ozon_sales_refresh_status(text)',
+        'EXECUTE'
+    )
+    AND NOT has_table_privilege(
+        'report_refresh_requester',
+        'daily_reporting.ozon_sales_refresh_requests',
+        'SELECT,INSERT,UPDATE,DELETE'
+    )
+    AND NOT has_table_privilege(
+        'report_refresh_requester', 'daily_reporting.source_snapshots',
+        'SELECT,INSERT,UPDATE,DELETE'
+    )
+    AND NOT has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.claim_ozon_sales_refresh(text)',
+        'EXECUTE'
+    )
     AND has_table_privilege(
         'position_collector', 'search_position.monitors', 'SELECT'
     )
@@ -937,6 +1100,25 @@ SELECT
         'daily_reporting.complete_report_collection_claim(bigint,bigint,text)',
         'EXECUTE'
     )
+    AND has_function_privilege(
+        'report_collector',
+        'daily_reporting.claim_ozon_sales_refresh(text)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_collector',
+        'daily_reporting.complete_ozon_sales_refresh(bigint,integer,text,timestamp with time zone)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_collector',
+        'daily_reporting.fail_ozon_sales_refresh(bigint,integer,text,text)',
+        'EXECUTE'
+    )
+    AND NOT has_table_privilege(
+        'report_collector', 'daily_reporting.ozon_sales_refresh_requests',
+        'SELECT,INSERT,UPDATE,DELETE'
+    )
     AND NOT has_function_privilege(
         'report_worker',
         'daily_reporting.claim_report_collection(text,text,timestamp with time zone,text)',
@@ -984,7 +1166,7 @@ SELECT
         FROM pg_namespace AS namespace
         CROSS JOIN unnest(ARRAY[
             'position_collector', 'position_reader', 'report_worker',
-            'report_collector', 'control_writer'
+            'report_collector', 'report_refresh_requester', 'control_writer'
         ]::name[]) AS application_role(role_name)
         WHERE namespace.nspname <> 'information_schema'
           AND namespace.nspname !~ '^pg_'
@@ -996,7 +1178,7 @@ SELECT
     AND NOT has_database_privilege('control_writer', current_database(), 'CREATE')
     AND NOT has_database_privilege('control_writer', current_database(), 'TEMP')
     AND (
-        SELECT count(*) = 5 AND bool_and(
+        SELECT count(*) = 6 AND bool_and(
             has_database_privilege(role_name, current_database(), 'CONNECT')
             AND NOT has_database_privilege(
                 role_name, current_database(), 'CREATE'
@@ -1007,7 +1189,7 @@ SELECT
         )
         FROM unnest(ARRAY[
             'position_collector', 'position_reader', 'report_worker',
-            'report_collector', 'control_writer'
+            'report_collector', 'report_refresh_requester', 'control_writer'
         ]::name[]) AS application_role(role_name)
     )
     AND NOT EXISTS (
@@ -1015,7 +1197,7 @@ SELECT
         FROM pg_database AS database_row
         CROSS JOIN unnest(ARRAY[
             'position_collector', 'position_reader', 'report_worker',
-            'report_collector', 'control_writer'
+            'report_collector', 'report_refresh_requester', 'control_writer'
         ]::name[]) AS application_role(role_name)
         WHERE database_row.datname <> current_database()
           AND (
@@ -1039,6 +1221,16 @@ SELECT
                    relation.relname::text || ':' || acl.privilege_type,
                    ',' ORDER BY relation.relname, acl.privilege_type
                ) =
+               'ozon_campaign_action_reservations:INSERT,' ||
+               'ozon_campaign_action_reservations:SELECT,' ||
+               'ozon_campaign_audit_events:INSERT,' ||
+               'ozon_campaign_audit_events:SELECT,' ||
+               'ozon_campaign_guards:INSERT,ozon_campaign_guards:SELECT,' ||
+               'ozon_campaign_plan_approvals:INSERT,' ||
+               'ozon_campaign_plan_approvals:SELECT,' ||
+               'ozon_campaign_plans:INSERT,ozon_campaign_plans:SELECT,' ||
+               'ozon_policy_revisions:INSERT,ozon_policy_revisions:SELECT,' ||
+               'ozon_runtime_gates:SELECT,' ||
                'wb_action_reservations:INSERT,wb_action_reservations:SELECT,' ||
                'wb_audit_events:INSERT,wb_audit_events:SELECT,' ||
                'wb_plan_approvals:INSERT,wb_plan_approvals:SELECT,' ||
@@ -1063,6 +1255,18 @@ SELECT
                    ',' ORDER BY relation.relname, attribute.attname,
                                 acl.privilege_type
                ) =
+               'ozon_campaign_guards.last_checked_at:UPDATE,' ||
+               'ozon_campaign_guards.last_revenue_minor:UPDATE,' ||
+               'ozon_campaign_guards.last_spend_minor:UPDATE,' ||
+               'ozon_campaign_guards.status:UPDATE,' ||
+               'ozon_campaign_guards.stop_reason:UPDATE,' ||
+               'ozon_campaign_guards.stopped_at:UPDATE,' ||
+               'ozon_campaign_plans.campaign_id:UPDATE,' ||
+               'ozon_campaign_plans.finished_at:UPDATE,' ||
+               'ozon_campaign_plans.last_error_class:UPDATE,' ||
+               'ozon_campaign_plans.operation_started_at:UPDATE,' ||
+               'ozon_campaign_plans.readback_json:UPDATE,' ||
+               'ozon_campaign_plans.status:UPDATE,' ||
                'wb_plans.apply_started_at:UPDATE,' ||
                'wb_plans.finished_at:UPDATE,' ||
                'wb_plans.last_error_class:UPDATE,' ||
@@ -1107,7 +1311,7 @@ SELECT
         SELECT 1
         FROM unnest(ARRAY[
             'position_collector', 'position_reader',
-            'report_collector', 'report_worker'
+            'report_collector', 'report_refresh_requester', 'report_worker'
         ]::text[]) AS application_role(role_name)
         WHERE has_schema_privilege(role_name::name, 'control', 'USAGE')
            OR has_schema_privilege(role_name::name, 'control', 'CREATE')
@@ -1126,7 +1330,7 @@ SELECT
                   FROM pg_roles
                   WHERE rolname IN (
                       'position_collector', 'position_reader',
-                      'report_collector', 'report_worker'
+                      'report_collector', 'report_refresh_requester', 'report_worker'
                   )
               )
           )
@@ -1153,7 +1357,7 @@ SELECT
                   FROM pg_roles
                   WHERE rolname IN (
                       'position_collector', 'position_reader',
-                      'report_collector', 'report_worker'
+                      'report_collector', 'report_refresh_requester', 'report_worker'
                   )
               )
           )
@@ -1175,7 +1379,7 @@ SELECT
                   FROM pg_roles
                   WHERE rolname IN (
                       'position_collector', 'position_reader',
-                      'report_collector', 'report_worker'
+                      'report_collector', 'report_refresh_requester', 'report_worker'
                   )
               )
           )
@@ -1193,7 +1397,7 @@ SELECT
                   FROM pg_roles
                   WHERE rolname IN (
                       'position_collector', 'position_reader',
-                      'report_collector', 'report_worker'
+                      'report_collector', 'report_refresh_requester', 'report_worker'
                   )
               )
           )
@@ -1208,7 +1412,7 @@ SELECT
         OR (
             to_regclass('mcp_runtime.schema_migrations') IS NOT NULL
             AND (
-                SELECT count(*) = 22
+                SELECT count(*) = 24
                     AND bool_and(state = 'applied')
                     AND bool_and(applied_at IS NOT NULL)
                 FROM mcp_runtime.schema_migrations

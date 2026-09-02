@@ -3,6 +3,7 @@ mod automation_executor;
 mod automation_observer;
 mod automation_postgres;
 mod config;
+mod ozon;
 mod plan;
 mod policy;
 mod server;
@@ -33,11 +34,19 @@ pub use automation_postgres::{
     WbAutomationReservationReceipt, WbAutomationStateTransitionReceipt,
 };
 pub use config::{
-    ControlAppConfig, ControlAuthConfig, ControlPolicyDatabaseConfig, ControlWbRuntimeConfig,
+    ControlAppConfig, ControlAuthConfig, ControlOzonRuntimeConfig, ControlPolicyDatabaseConfig,
+    ControlWbRuntimeConfig,
+};
+pub use ozon::{
+    OzonAdsWriteClient, OzonCampaignCreateRequest, OzonCampaignGuard, OzonCampaignLaunchManifest,
+    OzonCampaignLaunchSpec, OzonCampaignProduct, OzonCampaignProductsRequest, OzonCampaignStrategy,
+    OzonGuardEvaluationError, OzonGuardStopReason, OzonGuardedWriteError, OzonLaunchPlanError,
+    OzonLaunchStatus, OzonPlacement, OzonPlanRepository, OzonPlanStoreError, OzonWriteError,
+    OzonWriteErrorKind, evaluate_ozon_campaign_guard, prepare_campaign_launch_manifest,
 };
 pub use plan::{PlanStoreError, WbActionQuota, WbPlanRepository, WbPlanStatus};
 pub use policy::{ControlMode, ControlPolicy, WbActionLimits, WbBidPlacement};
-pub use server::{ControlMcp, WbControlServices};
+pub use server::{ControlMcp, OzonControlServices, WbControlServices};
 pub use wb::{
     WbBidChange, WbBidWriteClient, WbCampaignBidType, WbCampaignPaymentType,
     WbCreateCampaignRequest, WbPreparedBidChange,

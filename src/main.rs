@@ -9,7 +9,7 @@ use mcp_ozon::{
     http::build_router_with_cancellation_and_session_idle_timeout,
     ozon::OzonClient,
     ozon_performance::PerformanceClient,
-    reporting::mcp_read::ReportingReader,
+    reporting::{mcp_read::ReportingReader, refresh_queue::RefreshRequestService},
     runtime::{
         HTTP_CANCELLED_DRAIN_TIMEOUT, HTTP_HEADER_READ_TIMEOUT, HTTP_MAX_CONNECTIONS,
         HTTP_NATURAL_DRAIN_TIMEOUT, run_http_until_bounded_shutdown, serve_hardened_http,
@@ -42,6 +42,15 @@ async fn main() -> Result<()> {
     };
     let reporting_reader =
         ReportingReader::connect_optional(reporting_database_url.as_deref()).await?;
+    let refresh_database_url = match std::env::var("MCP_REPORT_REFRESH_DATABASE_URL") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("MCP_REPORT_REFRESH_DATABASE_URL содержит недопустимую кодировку")
+        }
+    };
+    let refresh_requests =
+        RefreshRequestService::connect_optional(refresh_database_url.as_deref()).await?;
     let client = OzonClient::new(
         config.ozon_api_base_url.clone(),
         config.request_timeout,
@@ -61,6 +70,7 @@ async fn main() -> Result<()> {
     .with_wildberries_client(wb_client)
     .with_performance_client(performance_client)
     .with_reporting_reader(reporting_reader)
+    .with_refresh_requests(refresh_requests)
     .with_preview_features(
         config.ozon_postings_vnext,
         config.ozon_finance_accruals_preview,

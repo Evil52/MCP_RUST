@@ -12,6 +12,7 @@ collector_password="position-collector-schema-test"
 reader_password="position-reader-schema-test"
 report_worker_password="report-worker-schema-test"
 report_collector_password="report-collector-schema-test"
+report_refresh_requester_password="report-refresh-requester-schema-test"
 control_writer_password="control-writer-schema-test"
 wb_automation_password="wb-automation-schema-test"
 release_sha="${MCP_RELEASE_GIT_SHA:-unverified}"
@@ -91,13 +92,36 @@ assert_control_schema_contract() {
           ('wb_action_reservations', 'wb_action_reservations_append_only',
            'reject_wb_append_only_mutation', 27),
           ('wb_audit_events', 'wb_audit_events_append_only',
-           'reject_wb_append_only_mutation', 27)
+           'reject_wb_append_only_mutation', 27),
+          ('ozon_campaign_plans', 'ozon_plans_transition_guard',
+           'enforce_ozon_plan_transition', 19),
+          ('ozon_campaign_plans', 'ozon_plans_validate_insert',
+           'validate_ozon_plan_insert', 7),
+          ('ozon_policy_revisions', 'ozon_policy_revisions_validate',
+           'validate_ozon_policy_revision_insert', 7),
+          ('ozon_policy_revisions', 'ozon_policy_revisions_append_only',
+           'reject_ozon_append_only_mutation', 27),
+          ('ozon_campaign_plan_approvals', 'ozon_approvals_validate',
+           'validate_ozon_approval_insert', 7),
+          ('ozon_campaign_plan_approvals', 'ozon_approvals_append_only',
+           'reject_ozon_append_only_mutation', 27),
+          ('ozon_campaign_action_reservations', 'ozon_reservations_validate',
+           'validate_ozon_reservation_insert', 7),
+          ('ozon_campaign_action_reservations', 'ozon_reservations_append_only',
+           'reject_ozon_append_only_mutation', 27),
+          ('ozon_campaign_audit_events', 'ozon_audit_append_only',
+           'reject_ozon_append_only_mutation', 27),
+          ('ozon_campaign_guards', 'ozon_guards_validate_insert',
+           'validate_ozon_guard_insert', 7),
+          ('ozon_campaign_guards', 'ozon_guards_transition_guard',
+           'enforce_ozon_guard_transition', 19)
     ),
     other_app_roles(role_name) AS (
         VALUES
           ('position_collector'),
           ('position_reader'),
           ('report_collector'),
+          ('report_refresh_requester'),
           ('report_worker'),
           ('wb_automation_writer')
     ),
@@ -118,7 +142,10 @@ assert_control_schema_contract() {
     SELECT
       (
           SELECT string_agg(relation.relname::text, ',' ORDER BY relation.relname)
-                 = 'wb_action_reservations,wb_audit_events,wb_plan_approvals,' ||
+                 = 'ozon_campaign_action_reservations,ozon_campaign_audit_events,' ||
+                   'ozon_campaign_guards,ozon_campaign_plan_approvals,' ||
+                   'ozon_campaign_plans,ozon_policy_revisions,ozon_runtime_gates,' ||
+                   'wb_action_reservations,wb_audit_events,wb_plan_approvals,' ||
                    'wb_plans,wb_policy_revisions,wb_prepare_reservations,' ||
                    'wb_runtime_gates'
           FROM pg_class AS relation
@@ -132,6 +159,16 @@ assert_control_schema_contract() {
                      relation.relname::text || ':' || acl.privilege_type,
                      ',' ORDER BY relation.relname, acl.privilege_type
                  ) =
+                 'ozon_campaign_action_reservations:INSERT,' ||
+                 'ozon_campaign_action_reservations:SELECT,' ||
+                 'ozon_campaign_audit_events:INSERT,' ||
+                 'ozon_campaign_audit_events:SELECT,' ||
+                 'ozon_campaign_guards:INSERT,ozon_campaign_guards:SELECT,' ||
+                 'ozon_campaign_plan_approvals:INSERT,' ||
+                 'ozon_campaign_plan_approvals:SELECT,' ||
+                 'ozon_campaign_plans:INSERT,ozon_campaign_plans:SELECT,' ||
+                 'ozon_policy_revisions:INSERT,ozon_policy_revisions:SELECT,' ||
+                 'ozon_runtime_gates:SELECT,' ||
                  'wb_action_reservations:INSERT,wb_action_reservations:SELECT,' ||
                  'wb_audit_events:INSERT,wb_audit_events:SELECT,' ||
                  'wb_plan_approvals:INSERT,wb_plan_approvals:SELECT,' ||
@@ -156,6 +193,18 @@ assert_control_schema_contract() {
                      ',' ORDER BY relation.relname, attribute.attname,
                                   acl.privilege_type
                  ) =
+                 'ozon_campaign_guards.last_checked_at:UPDATE,' ||
+                 'ozon_campaign_guards.last_revenue_minor:UPDATE,' ||
+                 'ozon_campaign_guards.last_spend_minor:UPDATE,' ||
+                 'ozon_campaign_guards.status:UPDATE,' ||
+                 'ozon_campaign_guards.stop_reason:UPDATE,' ||
+                 'ozon_campaign_guards.stopped_at:UPDATE,' ||
+                 'ozon_campaign_plans.campaign_id:UPDATE,' ||
+                 'ozon_campaign_plans.finished_at:UPDATE,' ||
+                 'ozon_campaign_plans.last_error_class:UPDATE,' ||
+                 'ozon_campaign_plans.operation_started_at:UPDATE,' ||
+                 'ozon_campaign_plans.readback_json:UPDATE,' ||
+                 'ozon_campaign_plans.status:UPDATE,' ||
                  'wb_plans.apply_started_at:UPDATE,' ||
                  'wb_plans.finished_at:UPDATE,' ||
                  'wb_plans.last_error_class:UPDATE,' ||
@@ -227,7 +276,8 @@ assert_control_schema_contract() {
           FROM pg_namespace AS namespace
           CROSS JOIN unnest(ARRAY[
               'position_collector', 'position_reader', 'report_worker',
-              'report_collector', 'control_writer', 'wb_automation_writer'
+              'report_collector', 'report_refresh_requester', 'control_writer',
+              'wb_automation_writer'
           ]::name[]) AS application_role(role_name)
           WHERE namespace.nspname <> 'information_schema'
             AND namespace.nspname !~ '^pg_'
@@ -289,7 +339,12 @@ assert_control_schema_contract() {
       )
       AND (
           SELECT string_agg(routine.proname::text, ',' ORDER BY routine.proname)
-                 = 'enforce_wb_plan_transition,reject_wb_append_only_mutation,' ||
+                 = 'enforce_ozon_guard_transition,enforce_ozon_plan_transition,' ||
+                   'enforce_wb_plan_transition,reject_ozon_append_only_mutation,' ||
+                   'reject_wb_append_only_mutation,validate_ozon_approval_insert,' ||
+                   'validate_ozon_guard_insert,validate_ozon_plan_insert,' ||
+                   'validate_ozon_policy_revision_insert,' ||
+                   'validate_ozon_reservation_insert,' ||
                    'validate_wb_approval_insert,validate_wb_plan_insert,' ||
                    'validate_wb_policy_revision_insert,' ||
                    'validate_wb_prepare_reservation_insert,' ||
@@ -336,7 +391,7 @@ assert_control_schema_contract() {
             )
       )
       AND (
-          SELECT count(*) = 12
+          SELECT count(*) = 23
           FROM actual_triggers
       )
       AND NOT EXISTS (
@@ -369,6 +424,7 @@ expect_exact_validation_failure \
   POSITION_READER_DB_PASSWORD="$reader_password" \
   REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
@@ -384,6 +440,7 @@ expect_exact_validation_failure \
   POSITION_READER_DB_PASSWORD="$reader_password" \
   REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
@@ -406,6 +463,7 @@ docker run --detach --name "$container" \
   --env POSITION_READER_DB_PASSWORD="$reader_password" \
   --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  --env REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$image" >/dev/null
@@ -449,6 +507,11 @@ report_collector_psql=(
   psql --host 127.0.0.1 --username report_collector --dbname ozon_positions
   --no-psqlrc --set ON_ERROR_STOP=1
 )
+report_refresh_requester_psql=(
+  docker exec --env PGPASSWORD="$report_refresh_requester_password" "$container"
+  psql --host 127.0.0.1 --username report_refresh_requester --dbname ozon_positions
+  --no-psqlrc --set ON_ERROR_STOP=1
+)
 control_writer_psql=(
   docker exec --env PGPASSWORD="$control_writer_password" "$container"
   psql --host 127.0.0.1 --username control_writer --dbname ozon_positions
@@ -456,13 +519,95 @@ control_writer_psql=(
 )
 docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
 ledger_contract="$({ "${admin_psql[@]}" --tuples-only --no-align --command "
-  SELECT count(*) = 22
+  SELECT count(*) = 24
      AND bool_and(state = 'applied')
      AND bool_and(applied_at IS NOT NULL)
   FROM mcp_runtime.schema_migrations
 "; } | tr -d '[:space:]')"
 if [[ "$ledger_contract" != t ]]; then
   echo "fresh database migration ledger is incomplete" >&2
+  exit 1
+fi
+refresh_dedup_contract="$({ "${report_refresh_requester_psql[@]}" \
+  --tuples-only --no-align --field-separator=: --command "
+    SELECT count(*), count(DISTINCT request.request_id),
+           count(*) FILTER (WHERE request.created)
+    FROM generate_series(1, 14) AS manager(sequence)
+    CROSS JOIN LATERAL daily_reporting.request_ozon_sales_refresh(
+        'refresh_test',
+        'manager_' || manager.sequence::text,
+        (clock_timestamp() AT TIME ZONE 'Asia/Yekaterinburg')::date
+    ) AS request
+  "; } | tr -d '[:space:]')"
+if [[ "$refresh_dedup_contract" != "14:1:1" ]]; then
+  echo "fourteen manager refresh requests were not deduplicated to one job" >&2
+  printf '%s\n' "$refresh_dedup_contract" >&2
+  exit 1
+fi
+expect_failure_containing \
+  "refresh requester direct queue read" \
+  "permission denied for table ozon_sales_refresh_requests" \
+  "${report_refresh_requester_psql[@]}" \
+  --command 'SELECT count(*) FROM daily_reporting.ozon_sales_refresh_requests'
+expect_failure_containing \
+  "refresh requester collector claim" \
+  "permission denied for function claim_ozon_sales_refresh" \
+  "${report_refresh_requester_psql[@]}" \
+  --command "SELECT * FROM daily_reporting.claim_ozon_sales_refresh('denied')"
+expect_failure_containing \
+  "report collector manager request" \
+  "permission denied for function request_ozon_sales_refresh" \
+  "${report_collector_psql[@]}" \
+  --command "SELECT * FROM daily_reporting.request_ozon_sales_refresh(
+      'refresh_test', 'collector',
+      (clock_timestamp() AT TIME ZONE 'Asia/Yekaterinburg')::date
+  )"
+"${report_refresh_requester_psql[@]}" --command "
+  SELECT * FROM daily_reporting.request_ozon_sales_refresh(
+      'refresh_second', 'manager_second',
+      (clock_timestamp() AT TIME ZONE 'Asia/Yekaterinburg')::date
+  )
+" >/dev/null
+refresh_claim_identity="$({ "${report_collector_psql[@]}" \
+  --tuples-only --no-align --field-separator=: --command "
+    SELECT request_id, request_generation, account_id
+    FROM daily_reporting.claim_ozon_sales_refresh('schema-test')
+  "; } | tr -d '[:space:]')"
+if [[ ! "$refresh_claim_identity" =~ ^[0-9]+:[0-9]+:refresh_test$ ]]; then
+  echo "report collector could not exclusively claim the first refresh job" >&2
+  printf '%s\n' "$refresh_claim_identity" >&2
+  exit 1
+fi
+blocked_refresh_claims="$({ "${report_collector_psql[@]}" \
+  --tuples-only --no-align --command "
+    SELECT count(*)
+    FROM daily_reporting.claim_ozon_sales_refresh('schema-test-2')
+  "; } | tr -d '[:space:]')"
+if [[ "$blocked_refresh_claims" != 0 ]]; then
+  echo "a second collector claimed a refresh while another account was running" >&2
+  exit 1
+fi
+IFS=: read -r refresh_claim_id refresh_claim_generation _ <<<"$refresh_claim_identity"
+refresh_failed="$({ "${report_collector_psql[@]}" \
+  --tuples-only --no-align --command "
+    SELECT daily_reporting.fail_ozon_sales_refresh(
+        $refresh_claim_id, $refresh_claim_generation,
+        'schema-test', 'schema_test_failure'
+    )
+  "; } | tr -d '[:space:]')"
+if [[ "$refresh_failed" != t ]]; then
+  echo "report collector could not terminally fail the refresh job" >&2
+  exit 1
+fi
+refresh_status_contract="$({ "${report_refresh_requester_psql[@]}" \
+  --tuples-only --no-align --field-separator=: --command "
+    SELECT request_status, business_date =
+        (clock_timestamp() AT TIME ZONE 'Asia/Yekaterinburg')::date
+    FROM daily_reporting.ozon_sales_refresh_status('refresh_test')
+  "; } | tr -d '[:space:]')"
+if [[ "$refresh_status_contract" != "failed:t" ]]; then
+  echo "refresh requester status projection is invalid" >&2
+  printf '%s\n' "$refresh_status_contract" >&2
   exit 1
 fi
 "${admin_psql[@]}" --command "
@@ -518,10 +663,10 @@ assert_control_schema_contract \
   GRANT control_writer TO report_worker;
   GRANT CREATE, CONNECT, TEMPORARY ON DATABASE postgres TO
       position_collector, position_reader, report_worker,
-      report_collector, control_writer, wb_automation_writer;
+      report_collector, report_refresh_requester, control_writer, wb_automation_writer;
   GRANT CREATE ON SCHEMA public TO
       position_collector, position_reader, report_worker,
-      report_collector, control_writer, wb_automation_writer;
+      report_collector, report_refresh_requester, control_writer, wb_automation_writer;
 " >/dev/null
 seeded_control_memberships="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "
@@ -543,6 +688,7 @@ docker exec \
   --env POSITION_READER_DB_PASSWORD="$reader_password" \
   --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  --env REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$container" \
@@ -552,14 +698,15 @@ assert_control_schema_contract \
   "${admin_psql[@]}"
 converged_database_acl="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "
-    SELECT count(*) = 6 AND bool_and(
+    SELECT count(*) = 7 AND bool_and(
         NOT has_database_privilege(role_name, 'postgres', 'CONNECT')
         AND NOT has_database_privilege(role_name, 'postgres', 'TEMP')
         AND NOT has_database_privilege(role_name, 'postgres', 'CREATE')
     )
     FROM unnest(ARRAY[
         'position_collector', 'position_reader', 'report_worker',
-        'report_collector', 'control_writer', 'wb_automation_writer'
+        'report_collector', 'report_refresh_requester', 'control_writer',
+        'wb_automation_writer'
     ]::name[]) AS application_role(role_name)
   "; } | tr -d '[:space:]')"
 if [[ "$converged_database_acl" != t ]]; then
@@ -569,12 +716,13 @@ if [[ "$converged_database_acl" != t ]]; then
 fi
 converged_schema_acl="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "
-    SELECT count(*) = 6 AND bool_and(
+    SELECT count(*) = 7 AND bool_and(
         NOT has_schema_privilege(role_name, 'public', 'CREATE')
     )
     FROM unnest(ARRAY[
         'position_collector', 'position_reader', 'report_worker',
-        'report_collector', 'control_writer', 'wb_automation_writer'
+        'report_collector', 'report_refresh_requester', 'control_writer',
+        'wb_automation_writer'
     ]::name[]) AS application_role(role_name)
   "; } | tr -d '[:space:]')"
 if [[ "$converged_schema_acl" != t ]]; then
@@ -676,6 +824,10 @@ migration_admin_psql=(
   --file /opt/mcp-ozon/migrations/021_wb_automation_state.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /opt/mcp-ozon/migrations/022_wb_automation_explicit_resume.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/023_daily_reporting_ozon_refresh_queue.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/024_ozon_control_campaign_plans.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \
@@ -997,6 +1149,7 @@ expect_failure_containing \
   --env POSITION_READER_DB_PASSWORD="$rollback_reader_password" \
   --env REPORT_WORKER_DB_PASSWORD="$report_worker_password" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
+  --env REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
   --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$container" \
@@ -2968,12 +3121,13 @@ expect_failure_containing \
     VALUES ('denied', 'denied', 'denied', 'denied', 'denied')
   "
 
-for role in position_collector position_reader report_collector report_worker control_writer wb_automation_writer; do
+for role in position_collector position_reader report_collector report_refresh_requester report_worker control_writer wb_automation_writer; do
   case "$role" in
     position_collector) role_password="$collector_password" ;;
     position_reader) role_password="$reader_password" ;;
     report_worker) role_password="$report_worker_password" ;;
     report_collector) role_password="$report_collector_password" ;;
+    report_refresh_requester) role_password="$report_refresh_requester_password" ;;
     control_writer) role_password="$control_writer_password" ;;
     wb_automation_writer) role_password="$wb_automation_password" ;;
   esac
@@ -3030,6 +3184,18 @@ expect_failure_containing \
   "${reader_psql[@]}" \
   --command 'SELECT daily_reporting.default_acl_probe()'
 
+expect_failure_containing \
+  "refresh requester future daily-report table privilege" \
+  "permission denied for table future_table_default_acl_probe" \
+  "${report_refresh_requester_psql[@]}" \
+  --command 'SELECT count(*) FROM daily_reporting.future_table_default_acl_probe'
+
+expect_failure_containing \
+  "refresh requester future daily-report function privilege" \
+  "permission denied for function default_acl_probe" \
+  "${report_refresh_requester_psql[@]}" \
+  --command 'SELECT daily_reporting.default_acl_probe()'
+
 role_attributes="$("${admin_psql[@]}" --tuples-only --no-align --field-separator=: \
   --command "
     SELECT rolname, rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit,
@@ -3037,11 +3203,11 @@ role_attributes="$("${admin_psql[@]}" --tuples-only --no-align --field-separator
     FROM pg_roles
     WHERE rolname IN (
         'position_collector', 'position_reader', 'report_collector', 'report_worker',
-        'control_writer', 'wb_automation_writer'
+        'report_refresh_requester', 'control_writer', 'wb_automation_writer'
     )
     ORDER BY rolname
   ")"
-expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4\nwb_automation_writer:t:f:f:f:f:f:f:2'
+expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_refresh_requester:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4\nwb_automation_writer:t:f:f:f:f:f:f:2'
 if [[ "$role_attributes" != "$expected_attributes" ]]; then
   echo "restricted database role attributes differ from the expected policy" >&2
   printf '%s\n' "$role_attributes" >&2

@@ -3005,6 +3005,11 @@ mod tests {
             Err(ReportingReadError::InvalidRequest)
         );
 
+        let sales = reader.sales_analytics(&account, sales_query).await.unwrap();
+        assert_eq!(sales.account_id, account.account_id());
+        assert_eq!(sales.state, DataState::Unavailable);
+        assert!(sales.rows.is_empty());
+
         let result = reader.collection_status(&account, 1).await.unwrap();
         assert_eq!(result.account_id, account.account_id());
         assert_eq!(result.marketplace, ReportingMarketplace::Ozon);
@@ -3118,6 +3123,21 @@ mod tests {
                 (SalesDateCoverageState::Unavailable, false),
             ]
         );
+
+        for group in [
+            SalesAnalyticsGroup::Day,
+            SalesAnalyticsGroup::Sku,
+            SalesAnalyticsGroup::DaySku,
+        ] {
+            for direction in [SalesAnalyticsDirection::Asc, SalesAnalyticsDirection::Desc] {
+                let (dimensions, grouping, ordering) = sales_group_sql(group, direction);
+                assert!(!dimensions.is_empty());
+                assert!(!grouping.is_empty());
+                assert!(!ordering.is_empty());
+            }
+        }
+        assert_eq!(sales_direction_sql(SalesAnalyticsDirection::Asc), "ASC");
+        assert_eq!(sales_direction_sql(SalesAnalyticsDirection::Desc), "DESC");
     }
 
     #[tokio::test]

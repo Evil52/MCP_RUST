@@ -36,6 +36,11 @@ name = "wb-automation"
 path = "src/bin/wb-automation.rs"
 test = false
 
+[[bin]]
+name = "ozon-campaign-guard"
+path = "src/bin/ozon-campaign-guard.rs"
+test = false
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
