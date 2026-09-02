@@ -192,6 +192,7 @@ async fn postgres_plan_requires_separate_approval_gates_and_exact_readback() {
     let Ok(database_url) = std::env::var("OZON_CONTROL_TEST_DATABASE_URL") else {
         return;
     };
+    let _database_guard = crate::control::plan::CONTROL_DB_TEST_LOCK.lock().await;
     let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL").unwrap();
     let database_config = database_url.parse().unwrap();
     let repository = OzonPlanRepository::connect(&database_config).await.unwrap();

@@ -232,7 +232,7 @@ BEGIN
        OR NEW.manifest_json::jsonb#>>'{spec,account_id}' IS DISTINCT FROM NEW.account_id
        OR jsonb_array_length(NEW.manifest_json::jsonb#>'{spec,skus}') IS DISTINCT FROM 1
        OR (NEW.manifest_json::jsonb#>>'{spec,skus,0}')::bigint IS DISTINCT FROM NEW.sku
-       OR NEW.manifest_json::jsonb#>>'{create_request,productAutopilotStrategy}' IS DISTINCT FROM 'TARGET_CIR'
+       OR NEW.manifest_json::jsonb#>>'{create_request,productAutopilotStrategy}' IS DISTINCT FROM 'TARGET_BIDS'
        OR NEW.manifest_json::jsonb#>>'{create_request,placement}' IS DISTINCT FROM 'PLACEMENT_SEARCH_AND_CATEGORY'
        OR (NEW.manifest_json::jsonb#>>'{create_request,weeklyBudget}')::bigint
           IS DISTINCT FROM (NEW.manifest_json::jsonb#>>'{spec,weekly_budget_microrubles}')::bigint
@@ -243,8 +243,9 @@ BEGIN
        OR ((NEW.manifest_json::jsonb#>>'{spec,weekly_budget_microrubles}')::bigint>0)
           IS DISTINCT FROM true
        OR NEW.manifest_json::jsonb#>>'{products_request,bids,0,sku}' IS DISTINCT FROM NEW.sku::text
-       OR (NEW.manifest_json::jsonb#>>'{products_request,bids,0,targetCir}')::integer
-          IS DISTINCT FROM (NEW.manifest_json::jsonb#>>'{spec,target_drr_percent}')::integer
+       OR (NEW.manifest_json::jsonb#>>'{products_request,bids,0,bid}')::bigint
+          IS DISTINCT FROM (NEW.manifest_json::jsonb#>>'{spec,initial_cpc_bid_microrubles}')::bigint
+       OR NEW.manifest_json::jsonb#>'{products_request,bids,0}'?'targetCir'
        OR NEW.manifest_json::jsonb#>'{products_request,bids,0}'?'topPosition'
        OR NEW.manifest_json::jsonb->>'activation_required' IS DISTINCT FROM 'true' THEN
         RAISE EXCEPTION 'Ozon plan manifest does not match immutable columns';
