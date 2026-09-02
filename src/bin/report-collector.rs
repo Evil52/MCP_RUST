@@ -1,17 +1,17 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind, business_date,
     collector_orchestrator::plan_due_collection,
     collector_plan::CollectionTarget,
-    collector_schedule::DueCollection,
+    collector_schedule::{COLLECTION_COMPLETION_WINDOW, DueCollection},
     collector_service::{ReportCollectorConfig, ReportCollectorMode},
     credential_bootstrap::bootstrap_report_credentials,
     ozon_performance_source::{OzonPerformanceReportSource, PerformanceClientReportTransport},
     ozon_source::{OzonClientReportTransport, collect_complete_snapshots_extended},
-    postgres_collector::PostgresSnapshotWriter,
+    postgres_collector::{CollectionClaim, PostgresSnapshotWriter, SalesRefreshClaim},
     report_cutoff, reporting_interval,
     snapshot::Marketplace,
     wb_source::{WbClientReportTransport, WbReportSource},
@@ -27,6 +27,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 /// transactional snapshot publication, so a slow upstream cannot hold an
 /// operator invocation forever.
 const REPORT_TARGET_TOTAL_DEADLINE: Duration = Duration::from_mins(12);
+/// Keep the same-account Seller API quiet after a scheduled collection. This
+/// matches the analytics endpoint's minimum pacing interval and avoids a fresh
+/// client instance immediately following the last scheduled request.
+const REFRESH_AFTER_SCHEDULE_SAFETY: Duration = Duration::from_secs(65);
 const SCHEDULED_TICK: Duration = Duration::from_secs(60);
 const MAX_CONSECUTIVE_SCHEDULER_FAILURES: u32 = 5;
 
@@ -102,6 +106,14 @@ async fn main() -> Result<()> {
             run_collect_due_command(&config, &writer).await?;
             return Ok(());
         }
+        Command::RefreshOnce => {
+            ensure!(
+                config.mode() == ReportCollectorMode::Scheduled && config.policy().enabled,
+                "refresh-once requires scheduled mode and an enabled daily report policy"
+            );
+            run_one_sales_refresh(&config, &writer).await?;
+            return Ok(());
+        }
         Command::RunScheduler => {
             run_scheduler_command(&config, &writer).await?;
             return Ok(());
@@ -138,6 +150,7 @@ enum Command {
         kind: ReportKind,
     },
     CollectDue,
+    RefreshOnce,
     RunScheduler,
     BootstrapCredentials {
         registry: PathBuf,
@@ -153,6 +166,7 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         [argument] if argument == "healthcheck" => Ok(Command::Healthcheck),
         [argument] if argument == "collection-preflight" => Ok(Command::CollectionPreflight),
         [argument] if argument == "collect-due" => Ok(Command::CollectDue),
+        [argument] if argument == "refresh-once" => Ok(Command::RefreshOnce),
         [argument] if argument == "run-scheduler" => Ok(Command::RunScheduler),
         [command, registry, policy, dotenv, output] if command == "bootstrap-credentials" => {
             Ok(Command::BootstrapCredentials {
@@ -174,7 +188,7 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         }
         _ => {
             bail!(
-                "usage: report-collector [healthcheck | collection-preflight | collect-due | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | wb-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | bootstrap-credentials <access.json> <policy.json> <source.env> <new-output-directory>]"
+                "usage: report-collector [healthcheck | collection-preflight | collect-due | refresh-once | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | wb-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | bootstrap-credentials <access.json> <policy.json> <source.env> <new-output-directory>]"
             )
         }
     }
@@ -273,7 +287,14 @@ async fn run_collection_scheduler(
             () = cancellation.cancelled() => return Ok(()),
             _ = timer.tick() => {}
         }
-        match run_due_collection(config, writer, Utc::now(), cancellation).await {
+        let tick_at = Utc::now();
+        let result = run_due_collection(config, writer, tick_at, cancellation).await;
+        let result = if result.is_ok() && !cancellation.is_cancelled() {
+            run_one_sales_refresh(config, writer).await
+        } else {
+            result
+        };
+        match result {
             Ok(()) => consecutive_failures = 0,
             Err(error) => {
                 consecutive_failures += 1;
@@ -289,6 +310,192 @@ async fn run_collection_scheduler(
                 );
             }
         }
+    }
+}
+
+/// Claims and processes one manager refresh. The scheduler calls this only
+/// outside the fixed report windows, so scheduled report snapshots keep
+/// priority. PostgreSQL returns at most one globally fenced job.
+async fn run_one_sales_refresh(
+    config: &ReportCollectorConfig,
+    writer: &PostgresSnapshotWriter,
+) -> Result<()> {
+    if !refresh_window_is_open(Utc::now()) {
+        return Ok(());
+    }
+    let owner_id = claim_owner("refresh");
+    let Some(refresh_claim) = writer.claim_sales_refresh(&owner_id).await? else {
+        return Ok(());
+    };
+    let Some(target) = config
+        .collection_plan()
+        .iter()
+        .find(|target| {
+            target.account_id == refresh_claim.account_id()
+                && target.marketplace == Marketplace::Ozon
+        })
+        .cloned()
+    else {
+        finish_failed_refresh(writer, &refresh_claim, "account_not_in_policy").await?;
+        return Ok(());
+    };
+    let Some(collection_claim) = writer
+        .claim_target(&target, refresh_claim.cutoff_at(), &owner_id)
+        .await?
+    else {
+        finish_failed_refresh(writer, &refresh_claim, "snapshot_claim_busy").await?;
+        return Ok(());
+    };
+    let remaining = (refresh_claim.lease_until() - Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    if remaining.is_zero() {
+        let _ = writer.release_claim(&collection_claim).await;
+        finish_failed_refresh(writer, &refresh_claim, "refresh_lease_expired").await?;
+        return Ok(());
+    }
+    let outcome = timeout(
+        remaining.min(REPORT_TARGET_TOTAL_DEADLINE),
+        collect_sales_refresh_target(config, writer, &collection_claim, &refresh_claim, &target),
+    )
+    .await;
+    match outcome {
+        Ok(Ok(snapshot_ids)) => {
+            tracing::info!(
+                account_id = refresh_claim.account_id(),
+                snapshots = snapshot_ids.len(),
+                cutoff_at = %refresh_claim.cutoff_at(),
+                "manager-requested Ozon snapshot refresh completed"
+            );
+        }
+        Ok(Err(error)) => {
+            let released = writer
+                .release_claim(&collection_claim)
+                .await
+                .unwrap_or(false);
+            let error_class = refresh_error_class(&error);
+            finish_failed_refresh(writer, &refresh_claim, error_class).await?;
+            tracing::warn!(
+                account_id = refresh_claim.account_id(),
+                released,
+                error_class,
+                "manager-requested Ozon snapshot refresh failed"
+            );
+        }
+        Err(_) => {
+            let released = writer
+                .release_claim(&collection_claim)
+                .await
+                .unwrap_or(false);
+            finish_failed_refresh(writer, &refresh_claim, "collection_deadline").await?;
+            tracing::warn!(
+                account_id = refresh_claim.account_id(),
+                released,
+                "manager-requested Ozon snapshot refresh reached its deadline"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Manual refreshes cannot start close enough to a fixed report window to
+/// overlap it. The pre-window reserve is the complete refresh deadline; the
+/// post-window reserve is the Seller analytics pacing interval.
+fn refresh_window_is_open(now: DateTime<Utc>) -> bool {
+    let offset = FixedOffset::east_opt(5 * 60 * 60).expect("EKB offset must be valid");
+    let local_seconds = now
+        .with_timezone(&offset)
+        .time()
+        .num_seconds_from_midnight();
+    let pre_window = u32::try_from(REPORT_TARGET_TOTAL_DEADLINE.as_secs())
+        .expect("refresh deadline must fit in one day");
+    let collection_window = u32::try_from(COLLECTION_COMPLETION_WINDOW.num_seconds())
+        .expect("collection window must be positive and fit in one day");
+    let post_window = u32::try_from(REFRESH_AFTER_SCHEDULE_SAFETY.as_secs())
+        .expect("refresh safety interval must fit in one day");
+
+    [8 * 60 * 60, 17 * 60 * 60].into_iter().all(|cutoff| {
+        let reserved_start = cutoff - pre_window;
+        let reserved_end = cutoff + collection_window + post_window;
+        !(reserved_start..=reserved_end).contains(&local_seconds)
+    })
+}
+
+async fn collect_sales_refresh_target(
+    config: &ReportCollectorConfig,
+    writer: &PostgresSnapshotWriter,
+    collection_claim: &CollectionClaim,
+    refresh_claim: &SalesRefreshClaim,
+    target: &CollectionTarget,
+) -> Result<Vec<i64>> {
+    let period_start = refresh_period_start(refresh_claim.business_date())?;
+    ensure!(
+        refresh_claim.cutoff_at() > period_start,
+        "refresh cutoff must be after the EKB business-day start"
+    );
+    let (client, performance, store) = config.resolve_ozon_scheduled(collection_claim)?;
+    let performance_store = store.clone();
+    let transport = OzonClientReportTransport::new(client, store);
+    let performance_source = OzonPerformanceReportSource::new(
+        PerformanceClientReportTransport::new(performance, performance_store),
+    );
+    let performance_facts = performance_source
+        .collect_extended(refresh_claim.business_date())
+        .await
+        .map_err(|_| anyhow::anyhow!("performance_collection_failed"))?;
+    let snapshots = collect_complete_snapshots_extended(
+        &transport,
+        performance_facts.advertising,
+        performance_facts.expenses,
+        target.account_id.clone(),
+        refresh_claim.cutoff_at(),
+        Utc::now,
+        period_start,
+        refresh_claim.cutoff_at(),
+        env!("CARGO_PKG_VERSION").to_owned(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("seller_collection_failed"))?;
+    writer
+        .persist_refresh_claimed_batch(collection_claim, refresh_claim, &snapshots)
+        .await
+        .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
+}
+
+fn refresh_period_start(date: NaiveDate) -> Result<DateTime<Utc>> {
+    let offset = FixedOffset::east_opt(5 * 60 * 60).context("EKB offset is invalid")?;
+    let local = date
+        .and_hms_opt(0, 0, 0)
+        .context("refresh business date is invalid")?;
+    offset
+        .from_local_datetime(&local)
+        .single()
+        .map(|value| value.with_timezone(&Utc))
+        .context("refresh business-day start is out of range")
+}
+
+async fn finish_failed_refresh(
+    writer: &PostgresSnapshotWriter,
+    claim: &SalesRefreshClaim,
+    error_class: &str,
+) -> Result<()> {
+    ensure!(
+        writer.fail_sales_refresh(claim, error_class).await?,
+        "refresh queue claim was lost before failure could be recorded"
+    );
+    Ok(())
+}
+
+fn refresh_error_class(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("performance_collection_failed") {
+        "performance_collection_failed"
+    } else if message.contains("seller_collection_failed") {
+        "seller_collection_failed"
+    } else if message.contains("snapshot_persistence_failed") {
+        "snapshot_persistence_failed"
+    } else {
+        "refresh_collection_failed"
     }
 }
 
@@ -695,6 +902,10 @@ mod tests {
             parse_command(&arguments(&["collection-preflight"])).unwrap(),
             Command::CollectionPreflight
         );
+        assert_eq!(
+            parse_command(&arguments(&["refresh-once"])).unwrap(),
+            Command::RefreshOnce
+        );
         assert!(matches!(
             parse_command(&arguments(&["ozon-dry-run", "ozon", "2026-08-18"])).unwrap(),
             Command::OzonDryRun {
@@ -716,6 +927,24 @@ mod tests {
         ] {
             assert!(parse_command(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn manager_refresh_reserves_scheduled_windows_and_api_pacing_tail() {
+        // UTC 03:00 and 12:00 are 08:00 and 17:00 in Yekaterinburg.
+        assert!(refresh_window_is_open(utc(2, 47, 59)));
+        assert!(!refresh_window_is_open(utc(2, 48, 0)));
+        assert!(!refresh_window_is_open(utc(3, 31, 5)));
+        assert!(refresh_window_is_open(utc(3, 31, 6)));
+        assert!(refresh_window_is_open(utc(11, 47, 59)));
+        assert!(!refresh_window_is_open(utc(11, 48, 0)));
+        assert!(!refresh_window_is_open(utc(12, 31, 5)));
+        assert!(refresh_window_is_open(utc(12, 31, 6)));
+    }
+
+    fn utc(hour: u32, minute: u32, second: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 18, hour, minute, second)
+            .unwrap()
     }
 
     #[test]

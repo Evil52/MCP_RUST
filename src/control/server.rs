@@ -10,8 +10,14 @@ use rmcp::{
 use crate::{
     auth::{JwtAuthenticator, ProtectedResourceMetadata},
     config::{AccessRegistry, Actor, RegistrySource},
-    control::{plan::WbPlanRepository, policy::ControlPolicy, wb::WbBidWriteClient},
+    control::{
+        ozon::{OzonAdsWriteClient, OzonPlanRepository},
+        plan::WbPlanRepository,
+        policy::ControlPolicy,
+        wb::WbBidWriteClient,
+    },
     http::HttpMcpServer,
+    ozon_performance::PerformanceClient,
     wb::WbClient,
 };
 
@@ -30,6 +36,7 @@ pub struct ControlMcp {
     default_actor_id: Option<String>,
     authenticator: Option<JwtAuthenticator>,
     wb: Option<WbControlServices>,
+    ozon: Option<OzonControlServices>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -40,6 +47,28 @@ pub struct WbControlServices {
     pub reader: Arc<WbClient>,
     pub writer: Option<Arc<WbBidWriteClient>>,
     pub plans: Arc<WbPlanRepository>,
+}
+
+#[derive(Clone)]
+pub struct OzonControlServices {
+    pub account_id: String,
+    pub store_id: crate::config::StoreId,
+    pub reader: Arc<PerformanceClient>,
+    pub writer: Option<Arc<OzonAdsWriteClient>>,
+    pub plans: Arc<OzonPlanRepository>,
+}
+
+impl std::fmt::Debug for OzonControlServices {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OzonControlServices")
+            .field("account_id", &self.account_id)
+            .field("store_id", &self.store_id)
+            .field("reader", &"<configured>")
+            .field("writer_configured", &self.writer.is_some())
+            .field("plans", &"<configured>")
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for WbControlServices {
@@ -64,6 +93,7 @@ impl ControlMcp {
             default_actor_id: Some(actor_id),
             authenticator: None,
             wb: None,
+            ozon: None,
             tool_router: Self::configured_tool_router(None),
         }
     }
@@ -81,6 +111,7 @@ impl ControlMcp {
             default_actor_id: None,
             authenticator: Some(authenticator),
             wb: None,
+            ozon: None,
             tool_router,
         }
     }
@@ -91,6 +122,16 @@ impl ControlMcp {
             self.wb = Some(services);
         } else {
             tracing::error!("refusing to attach WB write services to dev/no-auth Control MCP");
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_ozon_control_services(mut self, services: OzonControlServices) -> Self {
+        if self.authenticator.is_some() {
+            self.ozon = Some(services);
+        } else {
+            tracing::error!("refusing to attach Ozon write services to dev/no-auth Control MCP");
         }
         self
     }
@@ -142,6 +183,12 @@ impl ControlMcp {
             tracing::warn!(%error, "Control readiness failed: plan store is unavailable");
             return Err(());
         }
+        if let Some(services) = &self.ozon
+            && let Err(error) = services.plans.probe().await
+        {
+            tracing::warn!(%error, "Control readiness failed: Ozon plan store is unavailable");
+            return Err(());
+        }
         Ok(())
     }
 
@@ -153,6 +200,18 @@ impl ControlMcp {
         if services.account_id != account_id {
             return Err(format!(
                 "{ACCESS_DENIED}: WB account находится вне runtime scope"
+            ));
+        }
+        Ok(services)
+    }
+
+    fn ozon_services(&self, account_id: &str) -> Result<&OzonControlServices, String> {
+        let Some(services) = self.ozon.as_ref() else {
+            return Err("CONTROL_DISABLED: Ozon runtime не настроен".to_owned());
+        };
+        if services.account_id != account_id {
+            return Err(format!(
+                "{ACCESS_DENIED}: Ozon account находится вне runtime scope"
             ));
         }
         Ok(services)

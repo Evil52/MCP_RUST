@@ -31,6 +31,8 @@ migrations="
 020_wb_control_plans.sql
 021_wb_automation_state.sql
 022_wb_automation_explicit_resume.sql
+023_daily_reporting_ozon_refresh_queue.sql
+024_ozon_control_campaign_plans.sql
 "
 
 case "$mode" in
@@ -106,7 +108,9 @@ unexpected_migration_count() {
        '019_daily_reporting_mcp_read_views.sql',
        '020_wb_control_plans.sql',
        '021_wb_automation_state.sql',
-       '022_wb_automation_explicit_resume.sql'
+       '022_wb_automation_explicit_resume.sql',
+       '023_daily_reporting_ozon_refresh_queue.sql',
+       '024_ozon_control_campaign_plans.sql'
      )"
 }
 
@@ -157,7 +161,7 @@ COMMIT;
 SQL
   done
   "$migration_dir/003_roles.sh"
-  echo "migration ledger baselined at 022_wb_automation_explicit_resume.sql"
+  echo "migration ledger baselined at 024_ozon_control_campaign_plans.sql"
   exit 0
 fi
 
@@ -242,4 +246,4 @@ if [ "$roles_refreshed" != true ]; then
   exit 1
 fi
 
-echo "database migrations verified through 022_wb_automation_explicit_resume.sql"
+echo "database migrations verified through 024_ozon_control_campaign_plans.sql"

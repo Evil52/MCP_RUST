@@ -10,6 +10,7 @@ use crate::{
 use super::{
     ControlAppConfig, ControlAuthConfig,
     jwt::load_jwt_config,
+    load_ozon_runtime,
     validation::{parse_max_sessions, parse_session_idle_timeout, parse_strict_bool, value_or},
     wb_runtime::{load_policy_database, load_wb_runtime},
 };
@@ -88,6 +89,10 @@ impl ControlAppConfig {
             &snapshot,
             policy_database.as_ref(),
         )?;
+        let ozon_runtime = load_ozon_runtime(&mut lookup, &auth, &policy, &snapshot)?;
+        if ozon_runtime.is_some() && policy_database.is_none() {
+            bail!("Ozon Control runtime требует CONTROL_MCP_DATABASE_URL");
+        }
 
         Ok(Self {
             bind,
@@ -98,6 +103,7 @@ impl ControlAppConfig {
             registry,
             policy,
             policy_database,
+            ozon_runtime,
             wb_runtime,
         })
     }

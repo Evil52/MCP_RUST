@@ -57,12 +57,18 @@ credentials or marketplace payloads. Rendered HTML/XLSX bytes live outside
 PostgreSQL in an immutable artifact store; the outbox keeps only the stable
 XLSX object key and SHA-256.
 The collector also exposes an opt-in one-shot `collect-due` command and a
-non-overlapping `run-scheduler` minute loop. They consider only the open
-08:00/17:00 EKB thirty-minute completion window, skip already published
-targets, claim each remaining account before resolving only that account's read
-credentials, and publish the four mandatory sources atomically. Missed timer
-ticks are skipped; bounded sustained failures exit for supervisor restart, and
-shutdown attempts to release the active claim. The shipped Compose mode and
+non-overlapping `run-scheduler` minute loop. Scheduled report work considers
+only the open 08:00/17:00 EKB thirty-minute completion windows, skips already
+published targets, claims each remaining account before resolving only that
+account's read credentials, and publishes every mandatory source atomically.
+Away from those windows the same single loop may claim at most one deduplicated
+manager-requested Ozon refresh and publishes its five-source snapshot together
+with queue completion. A refresh cannot start during the preceding 12-minute
+deadline reserve or the following 65-second Seller API pacing tail. Queued
+current-day work expires after four hours, which covers the fourteen-account
+sequential worst case. Missed timer ticks are skipped; bounded sustained
+failures exit for supervisor restart, and shutdown attempts to release the
+active claim. The shipped Compose mode and
 policy are still disabled and mount no credential directory, so neither path is
 active in the default deployment. Opt-in scheduled mode accepts only an
 operator-owned read-only directory named by `REPORT_COLLECTOR_CREDENTIAL_DIR`.
@@ -106,13 +112,16 @@ identity must have the same XLSX and HTML content hashes. The dedicated
 collector or database service mounts it. See
 `docs/search-position-monitoring.md` for the complete reporting contract.
 
-The initial architecture has five security principals:
+The architecture has six security principals:
 
 - `position_admin` owns the database and manages Ozon monitors and WB targets;
 - `position_collector` may read target definitions and append runs and
   snapshots. It cannot change target identity or update/delete WB snapshots;
 - `position_reader` is forced into read-only transactions and is the only role
-  that the Rust MCP server may use;
+  that the Rust MCP server may use for analytics reads;
+- `report_refresh_requester` lets the Rust MCP server execute only the bounded
+  refresh request/status functions. It cannot read the queue or snapshots,
+  claim work, or access marketplace credentials;
 - `report_worker` can use only the reporting outbox and cannot read raw Ozon or
   WB position history. It can read only published reporting snapshot views;
 - `report_collector` can append normalized report facts and finalize their
@@ -317,9 +326,10 @@ explicit migration, never volume deletion.
 
 ### Existing-volume daily reporting migration
 
-Back up the initialized database first. Keep the Rust MCP reporting reader
-disabled and leave `MCP_REPORTING_DATABASE_URL` unset until every database
-migration and the authenticated database healthcheck below have succeeded. Do
+Back up the initialized database first. Keep the Rust MCP reporting boundary
+disabled and leave `MCP_REPORTING_DATABASE_URL` and
+`MCP_REPORT_REFRESH_DATABASE_URL` unset until every database migration and the
+authenticated database healthcheck below have succeeded. Do
 not run `down -v`, remove `mcp-ozon-position-data`, or recreate the named volume.
 
 The database image now owns a checksum-protected migration ledger in
@@ -365,24 +375,31 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
   /usr/local/bin/position-db-healthcheck
 ```
 
-Only after this database-first gate succeeds may the deployment secret
-`MCP_REPORTING_DATABASE_URL` be configured for `position_reader` and the Rust
-MCP service be recreated. Do not print that URL or its password in logs or shell
-history.
+Only after this database-first gate succeeds may the deployment secrets
+`MCP_REPORTING_DATABASE_URL` for `position_reader` and
+`MCP_REPORT_REFRESH_DATABASE_URL` for `report_refresh_requester` be configured
+and the Rust MCP service be recreated. Do not print either URL or password in
+logs or shell history.
 
 ### Enable the MCP reporting reader (explicit opt-in)
 
 `compose.reporting-reader.yaml` is deliberately not part of the default MCP
 deployment. It attaches only the MCP server to the already-created
-`mcp-ozon-position-internal` network and passes one credential: the
-`position_reader` connection URL. It does not start, migrate, or depend on the
+`mcp-ozon-position-internal` network and passes two independent credentials:
+the read-only `position_reader` URL and the function-only
+`report_refresh_requester` URL. It does not start, migrate, or depend on the
 database service, and it does not expose the admin, collector, or worker
 passwords to the MCP container.
 
 Before enabling it, verify an integrity-checked protected backup (encrypt it
-when it leaves the protected host), migrations through `019`, the database
+when it leaves the protected host), migrations through `024`, the database
 healthcheck above, and a protected `.position.env` whose reader password is
-URL-safe (the documented hexadecimal bootstrap value is URL-safe).
+URL-safe (the documented hexadecimal bootstrap value is URL-safe). Existing
+installations must add a separate URL-safe
+`REPORT_REFRESH_REQUESTER_DB_PASSWORD`; never reuse the reader, collector,
+worker, administrator, or application password. The bootstrap script emits it
+only while creating a new `.position.env` and deliberately refuses to overwrite
+an existing file.
 Use `.position.env` only for Compose interpolation; never add it as the MCP
 service's `env_file`.
 

@@ -6,35 +6,51 @@ rust-version = "1.98.0"
 publish = false
 default-run = "mcp-ozon"
 
+[features]
+default = ["runtime-binaries"]
+runtime-binaries = []
+
 [[bin]]
 name = "mcp-ozon"
 path = "src/main.rs"
 test = false
+required-features = ["runtime-binaries"]
 
 [[bin]]
 name = "mcp-ozon-control"
 path = "src/bin/mcp-ozon-control.rs"
 test = false
+required-features = ["runtime-binaries"]
 
 [[bin]]
 name = "position-collector"
 path = "src/bin/position-collector.rs"
 test = false
+required-features = ["runtime-binaries"]
 
 [[bin]]
 name = "report-worker"
 path = "src/bin/report-worker.rs"
 test = false
+required-features = ["runtime-binaries"]
 
 [[bin]]
 name = "report-collector"
 path = "src/bin/report-collector.rs"
 test = false
+required-features = ["runtime-binaries"]
 
 [[bin]]
 name = "wb-automation"
 path = "src/bin/wb-automation.rs"
 test = false
+required-features = ["runtime-binaries"]
+
+[[bin]]
+name = "ozon-campaign-guard"
+path = "src/bin/ozon-campaign-guard.rs"
+test = false
+required-features = ["runtime-binaries"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }

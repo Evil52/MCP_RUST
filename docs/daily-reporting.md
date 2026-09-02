@@ -138,6 +138,43 @@ locally and set mode `0600`; never put real addresses in the example or Git.
 Keep the three Gmail OAuth files in the ignored `report-gmail-oauth/` directory
 with directory mode `0700` and file mode `0600`.
 
+## Manager analytics read path
+
+`ofk_ozon_sales_analytics` is the default interactive sales tool for managers.
+It reads only successful published `sales` snapshots through the restricted
+`position_reader` PostgreSQL projection and never contacts Ozon. Queries are
+bounded to 31 local business days, 1,000 result rows and a 100,000-row offset;
+they can group by day, SKU, or day+SKU and sort by a dimension, ordered units,
+or operational GMV. Every requested date carries explicit `complete`,
+`preliminary`, `partial`, or `unavailable` coverage. Rows from partial snapshots
+are never served, and a missing day is never fabricated as zero sales.
+
+The direct `ozon_analytics` tool remains available only to administrators for
+rare live diagnostics. It does not publish or refresh a PostgreSQL snapshot.
+Normal freshness comes exclusively from the guarded `report-collector`
+scheduler, so marketplace request volume scales with scheduled account
+collection rather than the number of managers or ChatGPT prompts.
+
+For an on-demand current-day update, ChatGPT calls
+`ofk_request_ozon_sales_refresh`. The tool only inserts or reuses a PostgreSQL
+queue request; it never calls Ozon synchronously. Concurrent requests from all
+managers for one account share one request ID, and a successful result is reused
+for ten minutes. A queued current-day request may wait for up to four hours, so
+fourteen distinct accounts fit the globally sequential worst case.
+`ofk_ozon_sales_refresh_status` reports `queued`, `running`, `succeeded`, or
+`failed`. The single `report-collector` loop claims at most one
+job at a time. It will not start during the 12 minutes before either scheduled
+cutoff, throughout the 08:00-08:30 and 17:00-17:30 EKB report windows, or
+during the following 65-second Seller API pacing tail. It collects all five
+Ozon sources and publishes the snapshot and queue completion in one
+transaction.
+
+This prevents a manager burst from becoming a marketplace burst. It cannot
+promise that Ozon will never return HTTP 429: the same Client-Id may be used by
+an external process, and Ozon controls its limits. Seller analytics requests
+still use the guarded 65-second queue and bounded adaptive 429 cooldown; a
+failed refresh remains explicit and never replaces the last published snapshot.
+
 ## Remaining rollout gates
 
 The snapshot manifest, normalized PostgreSQL storage contract, atomic snapshot

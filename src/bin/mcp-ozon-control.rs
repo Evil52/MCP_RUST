@@ -7,10 +7,11 @@ use mcp_ozon::{
     auth::JwtAuthenticator,
     config::TransportMode,
     control::{
-        ControlAppConfig, ControlAuthConfig, ControlMcp, WbBidWriteClient, WbControlServices,
-        WbPlanRepository,
+        ControlAppConfig, ControlAuthConfig, ControlMcp, OzonAdsWriteClient, OzonControlServices,
+        OzonPlanRepository, WbBidWriteClient, WbControlServices, WbPlanRepository,
     },
     http::build_router_for_server_with_cancellation_and_session_idle_timeout,
+    ozon_performance::PerformanceClient,
     runtime::{
         HTTP_CANCELLED_DRAIN_TIMEOUT, HTTP_HEADER_READ_TIMEOUT, HTTP_MAX_CONNECTIONS,
         HTTP_NATURAL_DRAIN_TIMEOUT, run_http_until_bounded_shutdown, serve_hardened_http,
@@ -35,6 +36,56 @@ async fn main() -> Result<()> {
     // ControlAppConfig never loads `.env`. A write token can only be read from
     // the explicitly mounted Control-only credential file when every gate is on.
     let config = ControlAppConfig::from_env()?;
+    let ozon_services = match &config.ozon_runtime {
+        Some(runtime) => {
+            let database = &config
+                .policy_database
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Ozon Control требует plan store"))?
+                .database;
+            let plans = OzonPlanRepository::connect(database)
+                .await
+                .map_err(|_| anyhow::anyhow!("Ozon Control plan store недоступен"))?;
+            plans
+                .verify_runtime_contract()
+                .await
+                .map_err(|_| anyhow::anyhow!("Ozon control_writer runtime contract неверен"))?;
+            plans
+                .register_policy(
+                    config.policy.version,
+                    config.policy.revision,
+                    config.policy.digest(),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Ozon policy rollback/reuse отклонён"))?;
+            let credentials =
+                BTreeMap::from([(runtime.store_id.clone(), runtime.credentials.clone())]);
+            let reader = PerformanceClient::new_with_https_proxy(
+                runtime.request_timeout,
+                credentials,
+                &runtime.proxy_url,
+            )?;
+            let writer = runtime
+                .writer_enabled
+                .then(|| {
+                    OzonAdsWriteClient::new(
+                        runtime.request_timeout,
+                        runtime.credentials.clone(),
+                        &runtime.proxy_url,
+                    )
+                    .map(Arc::new)
+                })
+                .transpose()?;
+            Some(OzonControlServices {
+                account_id: runtime.account_id.clone(),
+                store_id: runtime.store_id.clone(),
+                reader: Arc::new(reader),
+                writer,
+                plans: Arc::new(plans),
+            })
+        }
+        None => None,
+    };
     let wb_services = match &config.wb_runtime {
         Some(runtime) => {
             let accounts = BTreeMap::from([(
@@ -84,6 +135,7 @@ async fn main() -> Result<()> {
         None => None,
     };
     if config.wb_runtime.is_none()
+        && config.ozon_runtime.is_none()
         && let Some(policy_database) = &config.policy_database
     {
         let plans = WbPlanRepository::connect(&policy_database.database)
@@ -116,6 +168,9 @@ async fn main() -> Result<()> {
     };
     if let Some(services) = wb_services {
         server = server.with_wb_control_services(services);
+    }
+    if let Some(services) = ozon_services {
+        server = server.with_ozon_control_services(services);
     }
 
     if server.transport_authenticator().is_none() {

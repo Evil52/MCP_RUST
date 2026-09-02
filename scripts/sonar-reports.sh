@@ -64,8 +64,8 @@ fi
 ./scripts/with-position-test-db.sh cargo llvm-cov \
   --locked \
   --all-targets \
-  --all-features \
-  --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|position-collector|report-collector|report-worker|wb-automation))\.rs$' \
+  --no-default-features \
+  --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|ozon-campaign-guard|position-collector|report-collector|report-worker|wb-automation))\.rs$' \
   --lcov \
   --output-path "$coverage_report_tmp"
 sed -i.bak "s#SF:$project_root/#SF:#" "$coverage_report_tmp"

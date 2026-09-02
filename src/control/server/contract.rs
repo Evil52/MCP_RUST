@@ -2,10 +2,73 @@ use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::control::{
+    ozon::{OzonCampaignLaunchSpec, OzonLaunchStatus},
     plan::{WbActionQuota, WbPlanStatus},
     policy::{ControlMode, WbActionLimits, WbBidPlacement},
     wb::{WbBidChange, WbPreparedBidChange},
 };
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewOzonCampaignLaunchInput {
+    pub spec: OzonCampaignLaunchSpec,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareOzonCampaignLaunchInput {
+    pub spec: OzonCampaignLaunchSpec,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OzonCampaignPlanInput {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApproveOzonCampaignLaunchInput {
+    pub plan_id: String,
+    pub plan_digest: String,
+    pub approval_reference: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApplyOzonCampaignLaunchInput {
+    pub plan_id: String,
+    pub plan_digest: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OzonCampaignPlanApprovalResult {
+    pub approval_id: String,
+    pub approver_id: String,
+    pub approved_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OzonCampaignPlanResult {
+    pub plan_id: String,
+    pub plan_digest: String,
+    pub manifest_digest: String,
+    pub actor_id: String,
+    pub account_id: String,
+    pub sku: u64,
+    pub policy_schema_version: u32,
+    pub policy_revision: u64,
+    pub policy_digest: String,
+    pub status: OzonLaunchStatus,
+    pub campaign_id: Option<u64>,
+    pub approval: Option<OzonCampaignPlanApprovalResult>,
+    pub spec: OzonCampaignLaunchSpec,
+    pub created_at: String,
+    pub expires_at: String,
+    pub last_error_class: Option<String>,
+    pub requires_reconciliation: bool,
+}
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -37,7 +100,21 @@ pub struct ControlScopeResult {
     pub policy_digest: String,
     pub mode: ControlMode,
     pub targets: Vec<ControlTargetResult>,
+    pub ozon_campaign_launch_targets: Vec<OzonCampaignLaunchTargetResult>,
     pub wb_promotion_bid_targets: Vec<WbPromotionBidTargetResult>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct OzonCampaignLaunchTargetResult {
+    pub account_id: String,
+    pub skus: Vec<u64>,
+    pub weekly_budget_microrubles: u64,
+    pub per_sku_spend_cap_microrubles: u64,
+    pub initial_cpc_bid_microrubles: u64,
+    pub max_cpc_bid_microrubles: u64,
+    pub target_drr_percent: u8,
+    pub target_position: u8,
+    pub approver_actor_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

@@ -124,6 +124,7 @@ AND (
     WHERE relations.relkind IN ('r','p','v','m','f')
       AND schemas.nspname <> 'information_schema'
       AND schemas.nspname !~ '^pg_'
+      AND relations.relname LIKE 'wb\_%' ESCAPE '\'
       AND (
         has_table_privilege(current_user, relations.oid, 'SELECT')
         OR has_table_privilege(current_user, relations.oid, 'INSERT')
@@ -152,6 +153,7 @@ AND (
     WHERE sequences.relkind='S'
       AND schemas.nspname <> 'information_schema'
       AND schemas.nspname !~ '^pg_'
+      AND sequences.relname LIKE 'wb\_%' ESCAPE '\'
       AND (
         has_sequence_privilege(current_user, sequences.oid, 'USAGE')
         OR has_sequence_privilege(current_user, sequences.oid, 'SELECT')
@@ -190,7 +192,9 @@ AND (
     JOIN pg_catalog.pg_class tables ON tables.oid=triggers.tgrelid
     JOIN pg_catalog.pg_namespace schemas ON schemas.oid=tables.relnamespace
     JOIN pg_catalog.pg_proc functions ON functions.oid=triggers.tgfoid
-    WHERE schemas.nspname='control' AND NOT triggers.tgisinternal
+    WHERE schemas.nspname='control'
+      AND tables.relname LIKE 'wb\_%' ESCAPE '\'
+      AND NOT triggers.tgisinternal
 ) = ARRAY[
     'wb_action_reservations|wb_action_reservations_append_only|reject_wb_append_only_mutation|27|O',
     'wb_action_reservations|wb_action_reservations_validate|validate_wb_reservation_insert|7|O',
@@ -220,6 +224,7 @@ AND (
     WHERE schemas.nspname='control'
       AND functions.prorettype='pg_catalog.trigger'::regtype
       AND functions.prokind='f'
+      AND functions.proname LIKE '%wb%'
 ) = ARRAY[
     'enforce_wb_plan_transition|false|v||false',
     'reject_wb_append_only_mutation|false|v||false',

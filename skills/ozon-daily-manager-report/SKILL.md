@@ -41,7 +41,17 @@ report. Also read:
    role permits it. Use raw Ozon tools only for a minimal drill-down that
    explains a verified anomaly; never use them to silently replace a missing
    published cutoff.
-5. Work read-only. Never change prices, stocks, campaigns, bids, budgets,
+5. For ordinary reports, stay entirely on published snapshots and do not
+   request a refresh. Only when the user explicitly asks for current or
+   refreshed Ozon data may you call `ofk_request_ozon_sales_refresh` once for
+   the selected account, then read `ofk_ozon_sales_refresh_status`. If it is
+   still queued or running, report that state and request ID instead of
+   spin-polling or switching to direct live tools. After `succeeded`, read the
+   new data with `ofk_ozon_sales_analytics`. A failed request leaves the last
+   published snapshot valid and must be reported as failed.
+6. Work marketplace-read-only. The bounded refresh request mutates only the
+   internal PostgreSQL queue and never calls Ozon from the MCP process. Never
+   change prices, stocks, campaigns, bids, budgets,
    cards, supplies or other marketplace state under this skill.
 
 ## Period selection

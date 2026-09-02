@@ -2,7 +2,7 @@ name: mcp-ozon-control
 
 services:
   control:
-    container_name: mcp-ozon-control
+    container_name: ${CONTROL_MCP_CONTAINER_NAME:-mcp-ozon-control}
     image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:local}
     build:
       context: .
@@ -68,7 +68,7 @@ services:
       args:
         MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     ports:
-      - "127.0.0.1:8790:8790"
+      - "127.0.0.1:${CONTROL_MCP_HOST_PORT:-8790}:8790"
     networks:
       - control_ingress_internal
       - control_host_ingress

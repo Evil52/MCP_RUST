@@ -202,6 +202,69 @@ impl Fixtures {
         )
         .unwrap();
     }
+
+    fn configure_ozon(&self, mode: &str) {
+        fs::write(
+            &self.registry,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "actors": [{
+                    "id": "manager",
+                    "name": "Manager",
+                    "role": "manager",
+                    "oidc": { "username": "manager" }
+                }, {
+                    "id": "approver",
+                    "name": "Approver",
+                    "role": "finance",
+                    "account_ids": ["ozon_one"],
+                    "oidc": { "username": "approver" }
+                }],
+                "accounts": [{
+                    "id": "ozon_one",
+                    "organization": "Example",
+                    "marketplace": "ozon",
+                    "seller_client_id": "seller",
+                    "manager_id": "manager",
+                    "ozon": {
+                        "store_id": "store_one",
+                        "client_id_env": "UNUSED_CLIENT_ID",
+                        "api_key_env": "UNUSED_API_KEY",
+                        "performance": {
+                            "client_id_env": "UNUSED_PERF_ID",
+                            "client_secret_env": "UNUSED_PERF_SECRET"
+                        }
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &self.policy,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "revision": 1,
+                "mode": mode,
+                "actors": [{
+                    "actor_id": "manager",
+                    "ozon_campaign_launch_targets": [{
+                        "account_id": "ozon_one",
+                        "skus": [1001],
+                        "weekly_budget_microrubles": 2_000_000_000_u64,
+                        "per_sku_spend_cap_microrubles": 2_000_000_000_u64,
+                        "initial_cpc_bid_microrubles": 7_000_000_u64,
+                        "max_cpc_bid_microrubles": 12_000_000_u64,
+                        "target_drr_percent": 15,
+                        "target_position": 30,
+                        "approver_actor_ids": ["approver"]
+                    }]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
 }
 
 impl Drop for Fixtures {
@@ -420,6 +483,203 @@ fn jwt_values(fixtures: &Fixtures) -> BTreeMap<String, String> {
         ),
     ]);
     values
+}
+
+fn ozon_runtime_values(
+    fixtures: &Fixtures,
+    client_id: &TempCredential,
+    client_secret: &TempCredential,
+) -> BTreeMap<String, String> {
+    let mut values = jwt_values(fixtures);
+    values.extend([
+        (
+            "CONTROL_MCP_DATABASE_URL".to_owned(),
+            "postgresql://control_writer:secret@position-db:5432/ozon_positions".to_owned(),
+        ),
+        (
+            "CONTROL_MCP_OZON_ACCOUNT_ID".to_owned(),
+            "ozon_one".to_owned(),
+        ),
+        (
+            "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE".to_owned(),
+            client_id.display(),
+        ),
+        (
+            "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE".to_owned(),
+            client_secret.display(),
+        ),
+        (
+            "CONTROL_MCP_OZON_PROXY".to_owned(),
+            "http://ozon-control-egress:3128".to_owned(),
+        ),
+    ]);
+    values
+}
+
+#[test]
+fn ozon_runtime_loads_exact_credentials_and_arms_only_enabled_writes() {
+    let fixtures = Fixtures::new();
+    fixtures.configure_ozon("plan_only");
+    let client_id = TempCredential::new("ozon-client-id", "write-client");
+    let client_secret = TempCredential::new("ozon-client-secret", "write-secret");
+    let mut values = ozon_runtime_values(&fixtures, &client_id, &client_secret);
+
+    let config = from(&values).expect("plan-only Ozon runtime");
+    let runtime = config.ozon_runtime.expect("Ozon runtime");
+    assert_eq!(runtime.account_id, "ozon_one");
+    assert_eq!(runtime.store_id.0, "store_one");
+    assert_eq!(runtime.credentials.client_id, "write-client");
+    assert_eq!(runtime.credentials.client_secret, "write-secret");
+    assert!(!runtime.writer_enabled);
+    assert_eq!(runtime.request_timeout, Duration::from_secs(20));
+    assert!(format!("{runtime:?}").contains("<redacted>"));
+
+    fixtures.configure_ozon("enabled");
+    values.insert(
+        "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED".to_owned(),
+        "true".to_owned(),
+    );
+    values.insert(
+        "CONTROL_MCP_OZON_TIMEOUT_SECONDS".to_owned(),
+        "1".to_owned(),
+    );
+    let runtime = from(&values)
+        .expect("enabled Ozon runtime")
+        .ozon_runtime
+        .unwrap();
+    assert!(runtime.writer_enabled);
+    assert_eq!(runtime.request_timeout, Duration::from_secs(1));
+}
+
+#[test]
+fn ozon_runtime_configuration_fails_closed_on_every_external_boundary() {
+    let fixtures = Fixtures::new();
+    fixtures.configure_ozon("plan_only");
+    let client_id = TempCredential::new("ozon-client-id-errors", "write-client");
+    let client_secret = TempCredential::new("ozon-client-secret-errors", "write-secret");
+    let valid = ozon_runtime_values(&fixtures, &client_id, &client_secret);
+
+    for key in [
+        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE",
+        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE",
+        "CONTROL_MCP_OZON_PROXY",
+    ] {
+        let mut values = valid.clone();
+        values.remove(key);
+        assert!(from(&values).is_err(), "missing {key} must fail");
+
+        let mut values = valid.clone();
+        values.insert(key.to_owned(), " whitespace ".to_owned());
+        assert!(from(&values).is_err(), "invalid {key} must fail");
+    }
+
+    let mut same_file = valid.clone();
+    same_file.insert(
+        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE".to_owned(),
+        client_id.display(),
+    );
+    assert!(from(&same_file).is_err());
+
+    for timeout in ["0", "31", "not-a-number"] {
+        let mut values = valid.clone();
+        values.insert(
+            "CONTROL_MCP_OZON_TIMEOUT_SECONDS".to_owned(),
+            timeout.to_owned(),
+        );
+        assert!(from(&values).is_err(), "timeout {timeout} must fail");
+    }
+
+    let mut bad_proxy = valid.clone();
+    bad_proxy.insert(
+        "CONTROL_MCP_OZON_PROXY".to_owned(),
+        "https://user:secret@proxy.example".to_owned(),
+    );
+    assert!(from(&bad_proxy).is_err());
+
+    let mut bad_account = valid.clone();
+    bad_account.insert(
+        "CONTROL_MCP_OZON_ACCOUNT_ID".to_owned(),
+        "missing".to_owned(),
+    );
+    assert!(from(&bad_account).is_err());
+
+    let mut malformed_account = valid.clone();
+    malformed_account.insert(
+        "CONTROL_MCP_OZON_ACCOUNT_ID".to_owned(),
+        " ozon_one".to_owned(),
+    );
+    assert!(from(&malformed_account).is_err());
+
+    let mut invalid_gate = valid.clone();
+    invalid_gate.insert(
+        "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED".to_owned(),
+        "TRUE".to_owned(),
+    );
+    assert!(from(&invalid_gate).is_err());
+
+    let mut dev_auth = fixtures.values();
+    dev_auth.extend(
+        valid
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    dev_auth.remove("CONTROL_MCP_AUTH_MODE");
+    assert!(from(&dev_auth).is_err());
+
+    fixtures.configure_ozon("disabled");
+    assert!(from(&valid).is_err());
+}
+
+#[test]
+fn ozon_runtime_direct_loader_rejects_auth_scope_binding_and_unreadable_credentials() {
+    let fixtures = Fixtures::new();
+    fixtures.configure_ozon("plan_only");
+    let registry = crate::config::AccessRegistry::load(&fixtures.registry).unwrap();
+    let policy = crate::control::policy::ControlPolicy::load(&fixtures.policy, &registry).unwrap();
+    let client_id = TempCredential::new("ozon-direct-client-id", "write-client");
+    let client_secret = TempCredential::new("ozon-direct-client-secret", "write-secret");
+    let valid = ozon_runtime_values(&fixtures, &client_id, &client_secret);
+
+    let mut lookup = |key: &str| valid.get(key).cloned();
+    assert!(
+        load_ozon_runtime(
+            &mut lookup,
+            &ControlAuthConfig::Dev {
+                actor_id: "manager".to_owned(),
+            },
+            &policy,
+            &registry,
+        )
+        .is_err()
+    );
+
+    let auth = from(&valid).unwrap().auth;
+    let mut wrong_marketplace = registry.clone();
+    wrong_marketplace.accounts[0].marketplace = crate::config::Marketplace::Wildberries;
+    let mut lookup = |key: &str| valid.get(key).cloned();
+    assert!(load_ozon_runtime(&mut lookup, &auth, &policy, &wrong_marketplace,).is_err());
+
+    let mut no_target = policy.clone();
+    no_target.actors[0].ozon_campaign_launch_targets.clear();
+    let mut lookup = |key: &str| valid.get(key).cloned();
+    assert!(load_ozon_runtime(&mut lookup, &auth, &no_target, &registry,).is_err());
+
+    for key in [
+        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE",
+        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE",
+    ] {
+        let mut unreadable = valid.clone();
+        unreadable.insert(
+            key.to_owned(),
+            fixtures
+                .registry
+                .with_extension("missing")
+                .display()
+                .to_string(),
+        );
+        let mut lookup = |name: &str| unreadable.get(name).cloned();
+        assert!(load_ozon_runtime(&mut lookup, &auth, &policy, &registry).is_err());
+    }
 }
 
 #[test]

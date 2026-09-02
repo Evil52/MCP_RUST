@@ -1,0 +1,40 @@
+{
+  "account_id": "furnitura_dlya_doma",
+  "guards": [
+    {
+      "campaign_id": 37756773,
+      "sku": 3457585933,
+      "date_from": "2026-09-02",
+      "spend_cap_microrubles": 2000000000,
+      "target_drr_percent": 15
+    },
+    {
+      "campaign_id": 37756841,
+      "sku": 5442149776,
+      "date_from": "2026-09-02",
+      "spend_cap_microrubles": 2000000000,
+      "target_drr_percent": 15
+    },
+    {
+      "campaign_id": 37756847,
+      "sku": 3588576015,
+      "date_from": "2026-09-02",
+      "spend_cap_microrubles": 2000000000,
+      "target_drr_percent": 15
+    },
+    {
+      "campaign_id": 37756852,
+      "sku": 2978114773,
+      "date_from": "2026-09-02",
+      "spend_cap_microrubles": 2000000000,
+      "target_drr_percent": 15
+    },
+    {
+      "campaign_id": 37756856,
+      "sku": 2717700073,
+      "date_from": "2026-09-02",
+      "spend_cap_microrubles": 2000000000,
+      "target_drr_percent": 15
+    }
+  ]
+}

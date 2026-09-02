@@ -7,9 +7,10 @@ use crate::config::{AccessRegistry, Actor, Marketplace, MarketplaceAccount, is_c
 use super::{
     ActorControlPolicy, ControlPolicy, ControlTargetPolicy, MAX_ACTIONS_PER_DAY,
     MAX_ACTIONS_PER_HOUR, MAX_ACTORS, MAX_APPROVERS_PER_TARGET,
-    MAX_CUMULATIVE_ABS_DELTA_KOPECKS_PER_DAY, MAX_IDENTIFIER_BYTES, MAX_SKUS_PER_TARGET,
-    MAX_TARGETS_PER_ACTOR, MAX_WB_NM_IDS_PER_TARGET, MAX_WB_SIGNED_ID, WbActionLimits,
-    WbPromotionBidTargetPolicy,
+    MAX_CUMULATIVE_ABS_DELTA_KOPECKS_PER_DAY, MAX_IDENTIFIER_BYTES,
+    MAX_OZON_LAUNCH_SKUS_PER_TARGET, MAX_OZON_WEEKLY_BUDGET_MICRORUBLES, MAX_SKUS_PER_TARGET,
+    MAX_TARGETS_PER_ACTOR, MAX_WB_NM_IDS_PER_TARGET, MAX_WB_SIGNED_ID,
+    OzonCampaignLaunchTargetPolicy, WbActionLimits, WbPromotionBidTargetPolicy,
 };
 
 pub(super) fn validate_policy(policy: &ControlPolicy, registry: &AccessRegistry) -> Result<()> {
@@ -45,9 +46,126 @@ fn validate_actor_policy(
     if actor_policy.wb_promotion_bid_targets.len() > MAX_TARGETS_PER_ACTOR {
         bail!("control policy содержит слишком много WB promotion targets для actor");
     }
+    if actor_policy.ozon_campaign_launch_targets.len() > MAX_TARGETS_PER_ACTOR {
+        bail!("control policy содержит слишком много Ozon campaign launch targets для actor");
+    }
 
     validate_ozon_actor_targets(actor_policy, actor, registry)?;
+    validate_ozon_campaign_launch_targets(actor_policy, actor, registry)?;
     validate_wb_actor_targets(actor_policy, actor, registry)
+}
+
+fn validate_ozon_campaign_launch_targets(
+    actor_policy: &ActorControlPolicy,
+    actor: &Actor,
+    registry: &AccessRegistry,
+) -> Result<()> {
+    let mut targets = BTreeSet::new();
+    for target in &actor_policy.ozon_campaign_launch_targets {
+        validate_identifier("account_id", &target.account_id)?;
+        let account = registry
+            .accounts
+            .iter()
+            .find(|account| account.id == target.account_id)
+            .with_context(|| {
+                format!(
+                    "Ozon campaign launch target ссылается на неизвестный account_id {}",
+                    target.account_id
+                )
+            })?;
+        if !matches!(account.marketplace, Marketplace::Ozon)
+            || account
+                .ozon
+                .as_ref()
+                .and_then(|ozon| ozon.performance.as_ref())
+                .is_none()
+        {
+            bail!("Ozon campaign launch target требует Ozon Performance binding");
+        }
+        if !actor.can_access_account(account) {
+            bail!("actor не имеет базового доступа к Ozon campaign launch account");
+        }
+        validate_ozon_campaign_launch_target(target, &actor_policy.actor_id, account, registry)?;
+        let identity = (target.account_id.as_str(), target.skus.as_slice());
+        if !targets.insert(identity) {
+            bail!("control policy содержит повтор Ozon campaign launch target");
+        }
+    }
+    Ok(())
+}
+
+fn validate_ozon_campaign_launch_target(
+    target: &OzonCampaignLaunchTargetPolicy,
+    plan_actor_id: &str,
+    account: &MarketplaceAccount,
+    registry: &AccessRegistry,
+) -> Result<()> {
+    if target.skus.is_empty() || target.skus.len() > MAX_OZON_LAUNCH_SKUS_PER_TARGET {
+        bail!(
+            "Ozon campaign launch target должен содержать от 1 до {MAX_OZON_LAUNCH_SKUS_PER_TARGET} SKU"
+        );
+    }
+    let mut skus = BTreeSet::new();
+    if target
+        .skus
+        .iter()
+        .any(|sku| *sku == 0 || !skus.insert(*sku))
+    {
+        bail!("Ozon campaign launch SKU должны быть положительными и уникальными");
+    }
+    if target.weekly_budget_microrubles == 0
+        || target.weekly_budget_microrubles > MAX_OZON_WEEKLY_BUDGET_MICRORUBLES
+        || target.per_sku_spend_cap_microrubles == 0
+        || target
+            .per_sku_spend_cap_microrubles
+            .checked_mul(target.skus.len() as u64)
+            != Some(target.weekly_budget_microrubles)
+    {
+        bail!("Ozon campaign budget должен быть положительным и точно делиться по SKU");
+    }
+    if !(10..=100).contains(&target.target_drr_percent) {
+        bail!("Ozon target_drr_percent должен быть от 10 до 100");
+    }
+    if target.initial_cpc_bid_microrubles == 0
+        || target.initial_cpc_bid_microrubles > target.max_cpc_bid_microrubles
+        || target.max_cpc_bid_microrubles > 1_000_000_000
+    {
+        bail!("Ozon CPC bid range должен быть положительным и не выше 1 000 RUB");
+    }
+    if !(1..=30).contains(&target.target_position) {
+        bail!("Ozon target_position должен быть от 1 до 30");
+    }
+    validate_ozon_approvers(target, plan_actor_id, account, registry)
+}
+
+fn validate_ozon_approvers(
+    target: &OzonCampaignLaunchTargetPolicy,
+    plan_actor_id: &str,
+    account: &MarketplaceAccount,
+    registry: &AccessRegistry,
+) -> Result<()> {
+    if target.approver_actor_ids.is_empty()
+        || target.approver_actor_ids.len() > MAX_APPROVERS_PER_TARGET
+    {
+        bail!("Ozon approver_actor_ids должны содержать от 1 до {MAX_APPROVERS_PER_TARGET} actor");
+    }
+    let mut approvers = BTreeSet::new();
+    for approver_id in &target.approver_actor_ids {
+        validate_identifier("approver_actor_id", approver_id)?;
+        if approver_id == plan_actor_id {
+            bail!("Ozon plan actor не может approve собственный план");
+        }
+        if !approvers.insert(approver_id.as_str()) {
+            bail!("Ozon approver_actor_ids должны быть уникальными");
+        }
+        let approver = registry
+            .actor(approver_id)
+            .with_context(|| format!("неизвестный Ozon approver actor {approver_id}"))?;
+        if !approver.can_access_account(account) {
+            bail!("Ozon approver actor не имеет базового доступа к account");
+        }
+    }
+    Ok(())
 }
 
 fn validate_ozon_actor_targets(

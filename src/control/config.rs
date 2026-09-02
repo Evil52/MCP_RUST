@@ -1,8 +1,10 @@
 #[cfg(test)]
 use jwt::{CONTROL_INTERNAL_JWKS_URL, CONTROL_REQUIRED_SCOPE};
 pub use model::{
-    ControlAppConfig, ControlAuthConfig, ControlPolicyDatabaseConfig, ControlWbRuntimeConfig,
+    ControlAppConfig, ControlAuthConfig, ControlOzonRuntimeConfig, ControlPolicyDatabaseConfig,
+    ControlWbRuntimeConfig,
 };
+use ozon_runtime::load_ozon_runtime;
 #[cfg(test)]
 use wb_runtime::{
     MAX_CONTROL_CREDENTIAL_BYTES, WB_PROMOTION_BIT, WB_READ_ONLY_BIT, load_policy_database,
@@ -15,6 +17,7 @@ pub(in crate::control) use wb_runtime::{
 mod jwt;
 mod loader;
 mod model;
+mod ozon_runtime;
 mod validation;
 mod wb_runtime;
 

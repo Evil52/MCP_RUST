@@ -1,21 +1,30 @@
-# OzonOFK Control MCP: WB promotion bids
+# OzonOFK Control MCP: Ozon campaigns and WB promotion bids
 
 `mcp-ozon-control` is a separate fail-closed process for marketplace writes.
 It does not extend the analytics server or its read-only allowlists. Without an
-explicit policy, JWT auth, restricted PostgreSQL session, proxy and dedicated
-WB tokens, it starts with all marketplace writes disabled.
+explicit policy, JWT auth, restricted PostgreSQL session, fixed egress and
+dedicated marketplace credentials, it starts with all writes disabled.
 
 ## Implemented scope
 
-The first write workflow changes only product-card bids through the official
-WB Promotion endpoint `PATCH /api/advert/v1/bids` on the fixed host
-`advert-api.wildberries.ru`.
+The WB workflow changes product-card bids through `PATCH /api/advert/v1/bids`.
+The Ozon workflow creates one CPC SKU campaign, adds its one product and
+activates it through the fixed Performance API origin. Ozon write calls are
+single-attempt and cannot be sent by the Analytics MCP.
 
 Available tools:
 
 - `ozon_ads_control_status` — reports static policy/runtime prerequisites and
   states explicitly that per-target runtime gates are still required;
 - `ozon_ads_control_scope` — shows the actor's exact local Ozon/WB policy;
+- `ozon_performance_prepare_campaign_launch` — runs a live duplicate-SKU
+  preflight and persists an immutable single-SKU plan;
+- `ozon_performance_approve_campaign_launch` — records a distinct authorized
+  actor's approval of the exact plan digest;
+- `ozon_performance_apply_campaign_launch` — performs one guarded
+  create → add product → activate sequence;
+- `ozon_performance_reconcile_campaign_launch` — read-back only after an
+  ambiguous result; it never repeats a write;
 - `wb_promotion_prepare_bid_update` — first reserves a bounded preparation
   attempt, then reads current campaign bids and creates an immutable
   five-minute PostgreSQL plan;
@@ -27,15 +36,18 @@ Available tools:
 - `wb_promotion_bid_plan_status` — reads durable plan state without WB egress;
 - `wb_promotion_reconcile_bid_plan` — read-back only; it never repeats a write.
 
-This is a separate seven-tool Control registry. It is not part of the Analytics
-MCP release contract, which remains exactly 76 read-only tools. In Control,
+This is a separate twelve-tool Control registry. It is not part of the Analytics
+MCP release contract, which contains exactly 79 tools. Seventy-eight are
+read-only; `ofk_request_ozon_sales_refresh` only mutates the internal deduplicated
+snapshot-refresh queue and has no marketplace egress. In Control,
 `prepare`, `approve`, `apply`, and `reconcile` intentionally advertise
 non-read-only annotations because they change durable Control state; only
 `apply` sends a marketplace mutation. `approve` is also marked destructive
 because it grants execution authority, even though it has no WB egress.
 
-Prices, stocks, product cards, campaign creation/deletion, budgets and search
-cluster bids are not enabled.
+Prices, stocks, product cards, arbitrary campaign deletion and search-cluster
+bids are not enabled. Ozon creation is limited to exact policy-bound SKU,
+budget, DRR and approver tuples.
 
 These seven tools are a supervised execution kernel, not an autonomous store
 manager. There is no scheduled decision worker, bid optimizer, forecast model
@@ -47,6 +59,45 @@ WB currently documents campaign bid changes for statuses `4`, `9`, and `11`,
 with `combined` placement for a unified bid and `search`/`recommendations` for
 a manual bid. The request is bounded to 50 distinct `nm_id + placement` pairs.
 See the [official WB Promotion API](https://dev.wildberries.ru/docs/openapi/promotion).
+
+## Ozon launch contract for Diana's store
+
+The reviewed Furnitura policy contains five independent one-SKU targets. Each
+campaign has a weekly budget of 2,000 RUB, a local total-spend stop at 2,000
+RUB and `TARGET_BIDS` with an initial 7 RUB CPC and an immutable 12 RUB policy
+ceiling. DRR 15% is a local fail-closed stop and TOP-30 is an observation goal,
+not an API placement guarantee. Position-based bid changes remain disabled
+until a reviewed live position provider supplies region-and-phrase observations;
+competitive-bid values must not be presented as measured search positions.
+
+Confirmation is an authenticated MCP action, not a message in chat. The plan
+author calls `ozon_performance_prepare_campaign_launch` and gives Diana the
+returned `plan_id` and `plan_digest`. Diana signs in through the configured
+OIDC provider as the registry principal `diana_serafimovich` and calls:
+
+```json
+{
+  "name": "ozon_performance_approve_campaign_launch",
+  "arguments": {
+    "plan_id": "<64 hex characters>",
+    "plan_digest": "<64 hex characters>",
+    "approval_reference": "diana_2026_09_02"
+  }
+}
+```
+
+The approval lasts at most three minutes and cannot be created by the plan
+author. Apply additionally requires enabled policy, the write-capability flag,
+and active database leases for `global`, `account/furnitura_dlya_doma` and the
+exact `sku/furnitura_dlya_doma/<sku>` key. After successful activation, a
+separate guard polls Performance statistics every minute. It deactivates the
+campaign once spend reaches 2,000 RUB or attributed DRR exceeds 15%; an
+unreadable statistics response requests a fail-closed stop. A timeout or
+uncertain stop becomes an incident and is never retried blindly.
+
+Use `config/control-policy.ozon-furnitura.live.example.json` only with the
+reviewed five SKUs. The plan-only rehearsal file has a different revision, so
+plans from it are intentionally invalid after switching to live policy.
 
 ## Safety contract
 
@@ -267,8 +318,9 @@ permissions to group/other because startup deliberately rejects those modes.
 ## PostgreSQL activation
 
 Add a new random `CONTROL_WRITER_DB_PASSWORD` to the ignored `.position.env`.
-For a new database volume, migration `020_wb_control_plans.sql` runs during
-normal initialization. Existing volumes do not rerun init scripts. After a
+For a new database volume, migrations `020_wb_control_plans.sql` and
+`024_ozon_control_campaign_plans.sql` run during normal initialization.
+Existing volumes do not rerun init scripts. After a
 verified backup, rebuild the database image and use the ledger-backed
 migrator. The one-time baseline is accepted only when the complete structural
 healthcheck of the existing schema succeeds:

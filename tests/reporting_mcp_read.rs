@@ -5,7 +5,11 @@ use mcp_ozon::reporting::{
     ReportKind,
     collector_plan::CollectionTarget,
     due_deliveries,
-    mcp_read::{DataState, ManagerActionKind, ReadyReportKind, ReadyReportState, ReportingReader},
+    mcp_read::{
+        DataState, ManagerActionKind, ReadyReportKind, ReadyReportState, ReportingReader,
+        SalesAnalyticsDirection, SalesAnalyticsGroup, SalesAnalyticsQuery, SalesAnalyticsSort,
+        SalesDateCoverageState,
+    },
     outbox::{ArtifactIdentity, DeliveryErrorClass},
     postgres_collector::{
         CollectedAdvertisingExpenseFact, CollectedAdvertisingFact, CollectedFacts,
@@ -64,8 +68,8 @@ fn snapshot_with_status(
 ) -> CollectedSnapshot {
     let (period_start, period_end) = match &facts {
         CollectedFacts::Sales(_) | CollectedFacts::Advertising(_) | CollectedFacts::Finance(_) => (
-            timestamp("2098-09-15T00:00:00Z"),
-            timestamp("2098-09-16T00:00:00Z"),
+            timestamp("2098-09-14T19:00:00Z"),
+            timestamp("2098-09-15T19:00:00Z"),
         ),
         CollectedFacts::Stocks(_) | CollectedFacts::Prices(_) => (source_as_of, source_as_of),
     };
@@ -349,6 +353,32 @@ async fn restricted_reader_rebuilds_complete_history_actions_and_safe_report_met
     let kpis = history.points[0].kpis.as_ref().unwrap();
     assert_eq!(kpis.ordered_units, 3);
     assert_eq!(kpis.ad_spend_minor, 12_000);
+    let sales_analytics = reader
+        .sales_analytics(
+            &account,
+            SalesAnalyticsQuery {
+                date_from: business_date,
+                date_to: business_date,
+                group_by: SalesAnalyticsGroup::DaySku,
+                sort_by: SalesAnalyticsSort::OperationalGmv,
+                direction: SalesAnalyticsDirection::Desc,
+                limit: 100,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sales_analytics.state, DataState::Complete);
+    assert_eq!(sales_analytics.total_rows, 1);
+    assert_eq!(sales_analytics.rows.len(), 1);
+    assert_eq!(sales_analytics.rows[0].sku.as_deref(), Some("3411079879"));
+    assert_eq!(sales_analytics.rows[0].ordered_units, 3);
+    assert_eq!(sales_analytics.rows[0].operational_gmv_minor, 202_500);
+    assert_eq!(sales_analytics.coverage.len(), 1);
+    assert_eq!(
+        sales_analytics.coverage[0].state,
+        SalesDateCoverageState::Complete
+    );
     assert!(
         reader
             .metrics_history(

@@ -26,7 +26,9 @@ fn registry() -> AccessRegistry {
                 id: "approver".to_owned(),
                 name: "Approver".to_owned(),
                 role: Role::Finance,
-                account_ids: std::iter::once("wb_one".to_owned()).collect(),
+                account_ids: ["wb_one".to_owned(), "ozon_one".to_owned()]
+                    .into_iter()
+                    .collect(),
                 oidc: Some(OidcIdentity {
                     username: Some("approver".to_owned()),
                     ..OidcIdentity::default()
@@ -109,6 +111,29 @@ fn valid_wb_policy() -> serde_json::Value {
             "cooldown_seconds": 900,
             "max_cumulative_abs_delta_kopecks_per_day": 5000
         }
+    }]);
+    value
+}
+
+fn valid_ozon_launch_policy() -> serde_json::Value {
+    let mut value = valid_policy();
+    value["mode"] = serde_json::json!("plan_only");
+    value["actors"][0]["ozon_campaign_launch_targets"] = serde_json::json!([{
+        "account_id": "ozon_one",
+        "skus": [
+            3_457_585_933_u64,
+            3_624_640_796_u64,
+            3_625_930_192_u64,
+            2_978_114_773_u64,
+            3_026_611_133_u64
+        ],
+        "weekly_budget_microrubles": 10_000_000_000_u64,
+        "per_sku_spend_cap_microrubles": 2_000_000_000_u64,
+        "initial_cpc_bid_microrubles": 7_000_000_u64,
+        "max_cpc_bid_microrubles": 12_000_000_u64,
+        "target_drr_percent": 15,
+        "target_position": 10,
+        "approver_actor_ids": ["approver"]
     }]);
     value
 }
@@ -243,6 +268,114 @@ fn wb_bid_scope_requires_distinct_authorized_approver_and_bounded_actions() {
     value["actors"][0]["wb_promotion_bid_targets"][0]["action_limits"]["max_actions_per_day"] =
         serde_json::json!(2);
     assert!(parse(&value).is_err());
+}
+
+#[test]
+fn ozon_launch_scope_binds_exact_budget_skus_and_distinct_approver() {
+    let value = valid_ozon_launch_policy();
+    let policy = parse(&value).expect("valid Ozon launch policy");
+    let target = &policy
+        .actor_policy("manager")
+        .unwrap()
+        .ozon_campaign_launch_targets[0];
+    assert_eq!(target.weekly_budget_microrubles, 10_000_000_000);
+    assert_eq!(target.per_sku_spend_cap_microrubles, 2_000_000_000);
+    assert_eq!(target.initial_cpc_bid_microrubles, 7_000_000);
+    assert_eq!(target.max_cpc_bid_microrubles, 12_000_000);
+    assert_eq!(target.target_drr_percent, 15);
+    assert_eq!(target.target_position, 10);
+
+    let mut wrong_total = value.clone();
+    wrong_total["actors"][0]["ozon_campaign_launch_targets"][0]["weekly_budget_microrubles"] =
+        serde_json::json!(9_999_000_000_u64);
+    assert!(parse(&wrong_total).is_err());
+
+    let mut duplicate_sku = value.clone();
+    duplicate_sku["actors"][0]["ozon_campaign_launch_targets"][0]["skus"] =
+        serde_json::json!([3_457_585_933_u64, 3_457_585_933_u64]);
+    duplicate_sku["actors"][0]["ozon_campaign_launch_targets"][0]["weekly_budget_microrubles"] =
+        serde_json::json!(4_000_000_000_u64);
+    assert!(parse(&duplicate_sku).is_err());
+
+    let mut self_approval = value;
+    self_approval["actors"][0]["ozon_campaign_launch_targets"][0]["approver_actor_ids"] =
+        serde_json::json!(["manager"]);
+    assert!(parse(&self_approval).is_err());
+}
+
+#[test]
+fn ozon_launch_policy_rejects_every_unsafe_scope_and_limit() {
+    let valid = valid_ozon_launch_policy();
+    let path = |field: &str| format!("actors.0.ozon_campaign_launch_targets.0.{field}");
+    for (field, value) in [
+        ("account_id", serde_json::json!("missing")),
+        ("skus", serde_json::json!([])),
+        ("skus", serde_json::json!([0])),
+        ("weekly_budget_microrubles", serde_json::json!(0)),
+        ("per_sku_spend_cap_microrubles", serde_json::json!(0)),
+        ("target_drr_percent", serde_json::json!(9)),
+        ("target_drr_percent", serde_json::json!(101)),
+        ("initial_cpc_bid_microrubles", serde_json::json!(0)),
+        ("initial_cpc_bid_microrubles", serde_json::json!(13_000_000)),
+        (
+            "max_cpc_bid_microrubles",
+            serde_json::json!(1_000_000_001_u64),
+        ),
+        ("target_position", serde_json::json!(0)),
+        ("target_position", serde_json::json!(31)),
+        ("approver_actor_ids", serde_json::json!([])),
+        (
+            "approver_actor_ids",
+            serde_json::json!(["approver", "approver"]),
+        ),
+        ("approver_actor_ids", serde_json::json!(["missing"])),
+    ] {
+        let mut candidate = valid.clone();
+        let mut cursor = &mut candidate;
+        for segment in path(field).split('.') {
+            cursor = if let Ok(index) = segment.parse::<usize>() {
+                &mut cursor[index]
+            } else {
+                &mut cursor[segment]
+            };
+        }
+        *cursor = value;
+        assert!(parse(&candidate).is_err(), "{field} must fail");
+    }
+
+    let mut duplicate = valid.clone();
+    let target = duplicate["actors"][0]["ozon_campaign_launch_targets"][0].clone();
+    duplicate["actors"][0]["ozon_campaign_launch_targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(target);
+    assert!(parse(&duplicate).is_err());
+
+    let mut too_many = valid.clone();
+    let target = too_many["actors"][0]["ozon_campaign_launch_targets"][0].clone();
+    too_many["actors"][0]["ozon_campaign_launch_targets"] =
+        serde_json::json!(vec![target; MAX_TARGETS_PER_ACTOR + 1]);
+    assert!(parse(&too_many).is_err());
+
+    let mut wrong_marketplace = registry();
+    wrong_marketplace.accounts[0].marketplace = Marketplace::Wildberries;
+    assert!(parse_with_registry(&valid, &wrong_marketplace).is_err());
+
+    let mut missing_performance = registry();
+    missing_performance.accounts[0]
+        .ozon
+        .as_mut()
+        .unwrap()
+        .performance = None;
+    assert!(parse_with_registry(&valid, &missing_performance).is_err());
+
+    let mut denied_actor = registry();
+    denied_actor.accounts[0].manager_id = "approver".to_owned();
+    assert!(parse_with_registry(&valid, &denied_actor).is_err());
+
+    let mut denied_approver = registry();
+    denied_approver.actors[1].account_ids.clear();
+    assert!(parse_with_registry(&valid, &denied_approver).is_err());
 }
 
 #[test]

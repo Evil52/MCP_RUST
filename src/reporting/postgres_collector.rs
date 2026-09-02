@@ -272,6 +272,40 @@ pub struct CollectionClaim {
     lease_until: DateTime<Utc>,
 }
 
+/// Fenced queue claim for one manager-requested Ozon refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SalesRefreshClaim {
+    id: i64,
+    generation: i32,
+    account_id: String,
+    business_date: NaiveDate,
+    cutoff_at: DateTime<Utc>,
+    owner_id: String,
+    lease_until: DateTime<Utc>,
+}
+
+impl SalesRefreshClaim {
+    #[must_use]
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    #[must_use]
+    pub const fn business_date(&self) -> NaiveDate {
+        self.business_date
+    }
+
+    #[must_use]
+    pub const fn cutoff_at(&self) -> DateTime<Utc> {
+        self.cutoff_at
+    }
+
+    #[must_use]
+    pub const fn lease_until(&self) -> DateTime<Utc> {
+        self.lease_until
+    }
+}
+
 impl CollectionClaim {
     #[must_use]
     pub fn account_id(&self) -> &str {
@@ -365,8 +399,19 @@ impl PostgresSnapshotWriter {
                     AND has_function_privilege(current_user, \
                         'daily_reporting.complete_report_collection_claim(bigint,bigint,text)', \
                         'EXECUTE') \
+                    AND has_function_privilege(current_user, \
+                        'daily_reporting.claim_ozon_sales_refresh(text)', 'EXECUTE') \
+                    AND has_function_privilege(current_user, \
+                        'daily_reporting.complete_ozon_sales_refresh(bigint,integer,text,timestamptz)', \
+                        'EXECUTE') \
+                    AND has_function_privilege(current_user, \
+                        'daily_reporting.fail_ozon_sales_refresh(bigint,integer,text,text)', \
+                        'EXECUTE') \
                     AND NOT has_table_privilege(current_user, \
                         'daily_reporting.collection_claims', 'SELECT,INSERT,UPDATE,DELETE') \
+                    AND NOT has_table_privilege(current_user, \
+                        'daily_reporting.ozon_sales_refresh_requests', \
+                        'SELECT,INSERT,UPDATE,DELETE') \
                     AND NOT has_table_privilege(current_user, \
                         'daily_reporting.delivery_batches', 'SELECT')",
                 &[],
@@ -376,6 +421,61 @@ impl PostgresSnapshotWriter {
         row.get::<_, bool>(0)
             .then_some(())
             .ok_or(PostgresCollectorError::Unavailable)
+    }
+
+    /// Claims at most one queued account refresh. PostgreSQL serializes and
+    /// fences this operation, so multiple collector replicas cannot process
+    /// the same manager burst.
+    pub async fn claim_sales_refresh(
+        &self,
+        owner_id: &str,
+    ) -> Result<Option<SalesRefreshClaim>, PostgresCollectorError> {
+        validate_owner_id(owner_id)?;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let row = client
+            .query_opt(
+                "SELECT request_id, request_generation, account_id, business_date, \
+                        snapshot_cutoff_at, lease_until \
+                 FROM daily_reporting.claim_ozon_sales_refresh($1)",
+                &[&owner_id],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        Ok(row.map(|row| SalesRefreshClaim {
+            id: row.get(0),
+            generation: row.get(1),
+            account_id: row.get(2),
+            business_date: row.get(3),
+            cutoff_at: row.get(4),
+            owner_id: owner_id.to_owned(),
+            lease_until: row.get(5),
+        }))
+    }
+
+    /// Marks a claimed refresh failed with a bounded non-sensitive class.
+    pub async fn fail_sales_refresh(
+        &self,
+        claim: &SalesRefreshClaim,
+        error_class: &str,
+    ) -> Result<bool, PostgresCollectorError> {
+        validate_error_class(error_class)?;
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        client
+            .query_one(
+                "SELECT daily_reporting.fail_ozon_sales_refresh($1, $2, $3, $4)",
+                &[&claim.id, &claim.generation, &claim.owner_id, &error_class],
+            )
+            .await
+            .map(|row| row.get(0))
+            .map_err(|_| PostgresCollectorError::Unavailable)
     }
 
     /// Claims one exact account/marketplace/cutoff before credential lookup or
@@ -617,6 +717,70 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         Ok(snapshot_ids)
     }
+
+    /// Atomically publishes a complete five-source Ozon batch and completes
+    /// both the snapshot claim and the manager refresh queue claim.
+    pub async fn persist_refresh_claimed_batch(
+        &self,
+        collection_claim: &CollectionClaim,
+        refresh_claim: &SalesRefreshClaim,
+        snapshots: &[CollectedSnapshot],
+    ) -> Result<Vec<i64>, PostgresCollectorError> {
+        validate_claimed_batch(collection_claim, snapshots)?;
+        if collection_claim.marketplace != Marketplace::Ozon
+            || collection_claim.account_id != refresh_claim.account_id
+            || collection_claim.cutoff_at != refresh_claim.cutoff_at
+            || collection_claim.owner_id != refresh_claim.owner_id
+        {
+            return Err(PostgresCollectorError::InvalidInput);
+        }
+        let mut client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let mut snapshot_ids = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            snapshot_ids
+                .push(persist_in_transaction(&transaction, collection_claim, snapshot).await?);
+        }
+        let collection_completed = transaction
+            .query_one(
+                "SELECT daily_reporting.complete_report_collection_claim($1, $2, $3)",
+                &[
+                    &collection_claim.id,
+                    &collection_claim.generation,
+                    &collection_claim.owner_id,
+                ],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?
+            .get::<_, bool>(0);
+        require_claim_completed(collection_completed)?;
+        let refresh_completed = transaction
+            .query_one(
+                "SELECT daily_reporting.complete_ozon_sales_refresh($1, $2, $3, $4)",
+                &[
+                    &refresh_claim.id,
+                    &refresh_claim.generation,
+                    &refresh_claim.owner_id,
+                    &refresh_claim.cutoff_at,
+                ],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?
+            .get::<_, bool>(0);
+        require_claim_completed(refresh_completed)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        Ok(snapshot_ids)
+    }
 }
 
 fn require_claim_completed(completed: bool) -> Result<(), PostgresCollectorError> {
@@ -657,6 +821,20 @@ fn validate_owner_id(owner_id: &str) -> Result<(), PostgresCollectorError> {
         || !owner_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        Err(PostgresCollectorError::InvalidInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_error_class(error_class: &str) -> Result<(), PostgresCollectorError> {
+    if error_class.is_empty()
+        || error_class.len() > 64
+        || !error_class.as_bytes()[0].is_ascii_lowercase()
+        || !error_class
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
     {
         Err(PostgresCollectorError::InvalidInput)
     } else {
@@ -1320,6 +1498,33 @@ mod tests {
             Err(PostgresCollectorError::InvalidInput)
         );
         assert!(validate_owner_id("collector:1-2").is_ok());
+        assert!(validate_error_class("seller_collection_failed").is_ok());
+        for error_class in ["", "BadClass", "bad-class"] {
+            assert_eq!(
+                validate_error_class(error_class),
+                Err(PostgresCollectorError::InvalidInput)
+            );
+        }
+        assert_eq!(
+            validate_error_class(&"a".repeat(65)),
+            Err(PostgresCollectorError::InvalidInput)
+        );
+        let refresh_claim = SalesRefreshClaim {
+            id: 2,
+            generation: 1,
+            account_id: "pilot".to_owned(),
+            business_date: cutoff().date_naive(),
+            cutoff_at: cutoff(),
+            owner_id: "test-owner".to_owned(),
+            lease_until: cutoff() + Duration::minutes(15),
+        };
+        assert_eq!(refresh_claim.account_id(), "pilot");
+        assert_eq!(refresh_claim.business_date(), cutoff().date_naive());
+        assert_eq!(refresh_claim.cutoff_at(), cutoff());
+        assert_eq!(
+            refresh_claim.lease_until(),
+            cutoff() + Duration::minutes(15)
+        );
         assert_eq!(
             classify_snapshot_insert_code(Some(&SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE)),
             PostgresCollectorError::ClaimLost

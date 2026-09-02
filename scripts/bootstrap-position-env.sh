@@ -33,6 +33,7 @@ umask 077
     printf 'POSITION_READER_DB_PASSWORD=%s\n' "$(generate_password)"
     printf 'REPORT_WORKER_DB_PASSWORD=%s\n' "$(generate_password)"
     printf 'REPORT_COLLECTOR_DB_PASSWORD=%s\n' "$(generate_password)"
+    printf 'REPORT_REFRESH_REQUESTER_DB_PASSWORD=%s\n' "$(generate_password)"
     printf 'CONTROL_WRITER_DB_PASSWORD=%s\n' "$(generate_password)"
     printf 'WB_AUTOMATION_DB_PASSWORD=%s\n' "$(generate_password)"
 } >"$output_path"
