@@ -46,16 +46,23 @@ pub(super) fn authorize_ozon_plan_approval(
     {
         return Err("CONTROL_POLICY_CHANGED: Ozon plan больше не соответствует policy".to_owned());
     }
-    let target = ozon_plan_target(policy, plan)
-        .ok_or_else(|| "CONTROL_POLICY_CHANGED: Ozon target отсутствует".to_owned())?;
-    let account = registry
+    let Some(target) = ozon_plan_target(policy, plan) else {
+        return Err("CONTROL_POLICY_CHANGED: Ozon target отсутствует".to_owned());
+    };
+    let Some(account) = registry
         .accounts
         .iter()
         .find(|account| account.id == plan.account_id)
-        .ok_or_else(|| format!("{ACCESS_DENIED}: Ozon account отсутствует в registry"))?;
-    let plan_actor = registry
-        .actor(&plan.actor_id)
-        .map_err(|_| format!("{ACCESS_DENIED}: plan actor отсутствует в registry"))?;
+    else {
+        return Err(format!(
+            "{ACCESS_DENIED}: Ozon account отсутствует в registry"
+        ));
+    };
+    let Ok(plan_actor) = registry.actor(&plan.actor_id) else {
+        return Err(format!(
+            "{ACCESS_DENIED}: plan actor отсутствует в registry"
+        ));
+    };
     if approver.id == plan.actor_id
         || !plan_actor.can_access_account(account)
         || !approver.can_access_account(account)

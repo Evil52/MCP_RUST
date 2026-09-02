@@ -109,12 +109,15 @@ impl OzonPlanRepository {
                 };
             }
         }
-        tx.execute(
+        if let Err(error) = tx
+            .execute(
             "INSERT INTO control.ozon_policy_revisions(schema_version,policy_revision,policy_digest,registered_at) VALUES($1,$2,$3,clock_timestamp())",
             &[&schema_version, &policy_revision, &policy_digest],
         )
         .await
-        .map_err(|error| map_policy_insert(&error))?;
+        {
+            return Err(map_policy_insert(&error));
+        }
         let committed = tx
             .commit()
             .await
@@ -165,12 +168,15 @@ impl OzonPlanRepository {
             &expires_at.timestamp_micros().to_be_bytes(),
         ]);
         let plan_id = digest_fields(&[b"mcp-ozon/ozon-plan-id/v1", plan_digest.as_bytes()]);
-        tx.execute(
+        if let Err(error) = tx
+            .execute(
             "INSERT INTO control.ozon_campaign_plans(plan_id,plan_digest,actor_id,account_id,sku,schema_version,policy_revision,policy_digest,manifest_json,status,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'prepared',$10,$11)",
             &[&plan_id,&plan_digest,&manifest.actor_id,&manifest.spec.account_id,&sku_i64,&schema_version,&policy_revision,&manifest.policy_digest,&manifest_json,&now,&expires_at],
         )
         .await
-        .map_err(|error| map_plan_insert(&error))?;
+        {
+            return Err(map_plan_insert(&error));
+        }
         insert_audit(&tx, &plan_id, &manifest.actor_id, "prepared", &serde_json::json!({"plan_digest":plan_digest,"manifest_digest":manifest.manifest_digest})).await?;
         tx.commit()
             .await
@@ -376,7 +382,19 @@ impl OzonPlanRepository {
             require_gates(&tx, &plan.account_id, plan.sku).await?;
         }
         if reserve {
-            tx.execute("INSERT INTO control.ozon_campaign_action_reservations(plan_id,account_id,sku,reserved_at) VALUES($1,$2,$3,clock_timestamp())", &[&plan_id,&plan.account_id,&i64::try_from(plan.sku).map_err(|_| OzonPlanStoreError::InvalidPlan)?]).await.map_err(|error| if error.as_db_error().is_some_and(|db| db.code()==&SqlState::UNIQUE_VIOLATION) { OzonPlanStoreError::InvalidState } else { OzonPlanStoreError::Unavailable })?;
+            let result = tx.execute("INSERT INTO control.ozon_campaign_action_reservations(plan_id,account_id,sku,reserved_at) VALUES($1,$2,$3,clock_timestamp())", &[&plan_id,&plan.account_id,&i64::try_from(plan.sku).map_err(|_| OzonPlanStoreError::InvalidPlan)?]).await;
+            if let Err(error) = result {
+                let duplicate = matches!(
+                    error.as_db_error(),
+                    Some(database_error)
+                        if database_error.code() == &SqlState::UNIQUE_VIOLATION
+                );
+                return Err(if duplicate {
+                    OzonPlanStoreError::InvalidState
+                } else {
+                    OzonPlanStoreError::Unavailable
+                });
+            }
         }
         let updated = tx.execute("UPDATE control.ozon_campaign_plans SET status=$4,campaign_id=COALESCE($5,campaign_id),last_error_class=$6,readback_json=COALESCE($7,readback_json) WHERE plan_id=$1 AND actor_id=$2 AND plan_digest=$3 AND status=$8", &[&plan_id,&actor_id,&expected_digest,&to.as_db(),&campaign_id_i64,&error_class,&readback_json,&from.as_db()]).await.map_err(|_| OzonPlanStoreError::Unavailable)?;
         if updated != 1 {
@@ -634,7 +652,9 @@ fn plan_from_row(row: &Row) -> Result<OzonCampaignPlan, OzonPlanStoreError> {
     })
 }
 
-fn validate_manifest(manifest: &OzonCampaignLaunchManifest) -> Result<(), OzonPlanStoreError> {
+pub(super) fn validate_manifest(
+    manifest: &OzonCampaignLaunchManifest,
+) -> Result<(), OzonPlanStoreError> {
     validate_identity(&manifest.actor_id)?;
     validate_identity(&manifest.spec.account_id)?;
     validate_digest(&manifest.manifest_digest)?;
@@ -649,7 +669,7 @@ fn validate_manifest(manifest: &OzonCampaignLaunchManifest) -> Result<(), OzonPl
     Ok(())
 }
 
-fn validate_digest(value: &str) -> Result<(), OzonPlanStoreError> {
+pub(super) fn validate_digest(value: &str) -> Result<(), OzonPlanStoreError> {
     if value.len() == 64
         && value
             .bytes()
@@ -661,7 +681,7 @@ fn validate_digest(value: &str) -> Result<(), OzonPlanStoreError> {
     }
 }
 
-fn validate_identity(value: &str) -> Result<(), OzonPlanStoreError> {
+pub(super) fn validate_identity(value: &str) -> Result<(), OzonPlanStoreError> {
     if !value.is_empty()
         && value.len() <= 128
         && value
@@ -674,7 +694,7 @@ fn validate_identity(value: &str) -> Result<(), OzonPlanStoreError> {
     }
 }
 
-fn validate_reference(value: &str) -> Result<(), OzonPlanStoreError> {
+pub(super) fn validate_reference(value: &str) -> Result<(), OzonPlanStoreError> {
     if !value.is_empty()
         && value.len() <= 128
         && value
@@ -687,7 +707,7 @@ fn validate_reference(value: &str) -> Result<(), OzonPlanStoreError> {
     }
 }
 
-fn validate_error_class(value: &str) -> Result<(), OzonPlanStoreError> {
+pub(super) fn validate_error_class(value: &str) -> Result<(), OzonPlanStoreError> {
     if !value.is_empty()
         && value.len() <= 64
         && value
@@ -801,7 +821,7 @@ async fn insert_audit(
     tx.execute("INSERT INTO control.ozon_campaign_audit_events(plan_id,actor_id,event_type,payload_json,created_at) VALUES($1,$2,$3,$4,clock_timestamp())",&[&plan_id,&actor,&event,&payload]).await.map(|_|()).map_err(|_|OzonPlanStoreError::Unavailable)
 }
 
-fn map_policy_insert(error: &tokio_postgres::Error) -> OzonPlanStoreError {
+pub(super) fn map_policy_insert(error: &tokio_postgres::Error) -> OzonPlanStoreError {
     if error
         .as_db_error()
         .is_some_and(|db| db.code() == &SqlState::UNIQUE_VIOLATION)
@@ -811,7 +831,7 @@ fn map_policy_insert(error: &tokio_postgres::Error) -> OzonPlanStoreError {
         OzonPlanStoreError::Unavailable
     }
 }
-fn map_plan_insert(error: &tokio_postgres::Error) -> OzonPlanStoreError {
+pub(super) fn map_plan_insert(error: &tokio_postgres::Error) -> OzonPlanStoreError {
     if error
         .as_db_error()
         .is_some_and(|db| db.code() == &SqlState::UNIQUE_VIOLATION)

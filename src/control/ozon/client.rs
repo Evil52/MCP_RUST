@@ -197,6 +197,22 @@ impl OzonAdsWriteClient {
         Self::from_parts(http, base_url, credentials, Duration::ZERO)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_interval(
+        base_url: &str,
+        credentials: PerformanceCredentials,
+        timeout: Duration,
+        minimum_interval: Duration,
+    ) -> Self {
+        let http = Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .timeout(timeout)
+            .build()
+            .expect("test Ozon write client");
+        Self::from_parts(http, base_url, credentials, minimum_interval)
+    }
+
     fn from_parts(
         http: Client,
         base_url: &str,

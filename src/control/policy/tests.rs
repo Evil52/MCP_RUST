@@ -304,6 +304,81 @@ fn ozon_launch_scope_binds_exact_budget_skus_and_distinct_approver() {
 }
 
 #[test]
+fn ozon_launch_policy_rejects_every_unsafe_scope_and_limit() {
+    let valid = valid_ozon_launch_policy();
+    let path = |field: &str| format!("actors.0.ozon_campaign_launch_targets.0.{field}");
+    for (field, value) in [
+        ("account_id", serde_json::json!("missing")),
+        ("skus", serde_json::json!([])),
+        ("skus", serde_json::json!([0])),
+        ("weekly_budget_microrubles", serde_json::json!(0)),
+        ("per_sku_spend_cap_microrubles", serde_json::json!(0)),
+        ("target_drr_percent", serde_json::json!(9)),
+        ("target_drr_percent", serde_json::json!(101)),
+        ("initial_cpc_bid_microrubles", serde_json::json!(0)),
+        ("initial_cpc_bid_microrubles", serde_json::json!(13_000_000)),
+        (
+            "max_cpc_bid_microrubles",
+            serde_json::json!(1_000_000_001_u64),
+        ),
+        ("target_position", serde_json::json!(0)),
+        ("target_position", serde_json::json!(31)),
+        ("approver_actor_ids", serde_json::json!([])),
+        (
+            "approver_actor_ids",
+            serde_json::json!(["approver", "approver"]),
+        ),
+        ("approver_actor_ids", serde_json::json!(["missing"])),
+    ] {
+        let mut candidate = valid.clone();
+        let mut cursor = &mut candidate;
+        for segment in path(field).split('.') {
+            cursor = if let Ok(index) = segment.parse::<usize>() {
+                &mut cursor[index]
+            } else {
+                &mut cursor[segment]
+            };
+        }
+        *cursor = value;
+        assert!(parse(&candidate).is_err(), "{field} must fail");
+    }
+
+    let mut duplicate = valid.clone();
+    let target = duplicate["actors"][0]["ozon_campaign_launch_targets"][0].clone();
+    duplicate["actors"][0]["ozon_campaign_launch_targets"]
+        .as_array_mut()
+        .unwrap()
+        .push(target);
+    assert!(parse(&duplicate).is_err());
+
+    let mut too_many = valid.clone();
+    let target = too_many["actors"][0]["ozon_campaign_launch_targets"][0].clone();
+    too_many["actors"][0]["ozon_campaign_launch_targets"] =
+        serde_json::json!(vec![target; MAX_TARGETS_PER_ACTOR + 1]);
+    assert!(parse(&too_many).is_err());
+
+    let mut wrong_marketplace = registry();
+    wrong_marketplace.accounts[0].marketplace = Marketplace::Wildberries;
+    assert!(parse_with_registry(&valid, &wrong_marketplace).is_err());
+
+    let mut missing_performance = registry();
+    missing_performance.accounts[0]
+        .ozon
+        .as_mut()
+        .unwrap()
+        .performance = None;
+    assert!(parse_with_registry(&valid, &missing_performance).is_err());
+
+    let mut denied_actor = registry();
+    denied_actor.accounts[0].manager_id = "approver".to_owned();
+    assert!(parse_with_registry(&valid, &denied_actor).is_err());
+
+    let mut denied_approver = registry();
+    denied_approver.actors[1].account_ids.clear();
+    assert!(parse_with_registry(&valid, &denied_approver).is_err());
+}
+
+#[test]
 fn policy_rejects_credentials_and_unsafe_or_duplicate_targets() {
     let mut with_secret = valid_policy();
     with_secret["api_token"] = serde_json::json!("must-not-be-accepted");

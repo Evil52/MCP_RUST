@@ -23,8 +23,9 @@ use tower::ServiceExt;
 use super::*;
 use crate::{
     auth::AuthenticatedActor,
-    config::JwtConfig,
+    config::{JwtConfig, PerformanceCredentials, StoreId},
     control::{
+        OzonLaunchStatus, OzonPlanStoreError, OzonWriteErrorKind,
         plan::{
             CONTROL_DB_TEST_LOCK, PlanStoreError, WbActionQuota, WbApplyContext, WbControlPlan,
             WbPlanApproval, WbPlanRepository, WbPlanStatus,
@@ -41,18 +42,23 @@ use crate::{
 
 use super::{
     authorization::{
-        allowed_plan_target, authorize_plan_account_access, authorize_plan_apply,
-        authorize_plan_approval, plan_target,
+        allowed_plan_target, authorize_ozon_plan_apply, authorize_ozon_plan_approval,
+        authorize_plan_account_access, authorize_plan_apply, authorize_plan_approval,
+        ozon_plan_target, plan_target,
     },
     contract::{
-        ApplyWbBidPlanInput, ApproveWbBidPlanInput, EmptyInput, PrepareWbBidPlanInput, WbPlanInput,
-        WbPlanResult,
+        ApplyOzonCampaignLaunchInput, ApplyWbBidPlanInput, ApproveOzonCampaignLaunchInput,
+        ApproveWbBidPlanInput, EmptyInput, OzonCampaignPlanInput, PrepareOzonCampaignLaunchInput,
+        PrepareWbBidPlanInput, PreviewOzonCampaignLaunchInput, WbPlanInput, WbPlanResult,
     },
     presentation::{
-        WritePermitFailure, guarded_write_permit_error_class, plan_result, plan_store_error,
-        write_failure_finish,
+        WritePermitFailure, guarded_write_permit_error_class, ozon_plan_store_error,
+        ozon_write_failure, plan_result, plan_store_error, write_failure_finish,
     },
-    tools::read_plan_snapshot,
+    tools::{
+        ensure_ozon_sku_not_running, exact_ozon_launch_readback, find_ozon_campaign_by_title,
+        positive_json_u64, read_plan_snapshot,
+    },
 };
 
 static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -226,6 +232,89 @@ impl Fixtures {
         }
     }
 
+    fn new_ozon(mode: ControlMode) -> Self {
+        let id = FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir();
+        let registry_path = root.join(format!("control-server-ozon-registry-{id}.json"));
+        let policy_path = root.join(format!("control-server-ozon-policy-{id}.json"));
+        fs::write(
+            &registry_path,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "actors": [
+                    {
+                        "id": "launcher",
+                        "name": "Launcher",
+                        "role": "manager",
+                        "oidc": { "username": "launcher" }
+                    },
+                    {
+                        "id": "approver",
+                        "name": "Approver",
+                        "role": "finance",
+                        "account_ids": ["ozon_one"],
+                        "oidc": { "username": "approver" }
+                    },
+                    {
+                        "id": "observer",
+                        "name": "Observer",
+                        "role": "analyst",
+                        "account_ids": ["ozon_one"],
+                        "oidc": { "username": "observer" }
+                    }
+                ],
+                "accounts": [{
+                    "id": "ozon_one",
+                    "organization": "Ozon Example",
+                    "marketplace": "ozon",
+                    "seller_client_id": "seller",
+                    "manager_id": "launcher",
+                    "ozon": {
+                        "store_id": "store_one",
+                        "client_id_env": "UNUSED_CLIENT_ID",
+                        "api_key_env": "UNUSED_API_KEY",
+                        "performance": {
+                            "client_id_env": "UNUSED_PERF_ID",
+                            "client_secret_env": "UNUSED_PERF_SECRET"
+                        }
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &policy_path,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "revision": 1,
+                "mode": mode,
+                "actors": [{
+                    "actor_id": "launcher",
+                    "targets": [],
+                    "ozon_campaign_launch_targets": [{
+                        "account_id": "ozon_one",
+                        "skus": [1001],
+                        "weekly_budget_microrubles": 2_000_000_000_u64,
+                        "per_sku_spend_cap_microrubles": 2_000_000_000_u64,
+                        "initial_cpc_bid_microrubles": 7_000_000_u64,
+                        "max_cpc_bid_microrubles": 12_000_000_u64,
+                        "target_drr_percent": 15,
+                        "target_position": 30,
+                        "approver_actor_ids": ["approver"]
+                    }],
+                    "wb_promotion_bid_targets": []
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Self {
+            registry_path,
+            policy_path,
+        }
+    }
+
     fn server(&self) -> ControlMcp {
         let registry = RegistrySource::new(&self.registry_path).unwrap();
         let snapshot = registry.load().unwrap();
@@ -276,6 +365,288 @@ fn wb_requested(bid_kopecks: u64) -> Vec<WbBidChange> {
         placement: WbBidPlacement::Search,
         bid_kopecks,
     }]
+}
+
+fn ozon_launch_spec() -> crate::control::ozon::OzonCampaignLaunchSpec {
+    crate::control::ozon::OzonCampaignLaunchSpec {
+        account_id: "ozon_one".to_owned(),
+        title: "Ozon guarded launch test".to_owned(),
+        from_date: "2026-09-02".to_owned(),
+        to_date: "2026-09-08".to_owned(),
+        skus: vec![1001],
+        weekly_budget_microrubles: 2_000_000_000,
+        per_sku_spend_cap_microrubles: 2_000_000_000,
+        initial_cpc_bid_microrubles: 7_000_000,
+        max_cpc_bid_microrubles: 12_000_000,
+        target_drr_percent: 15,
+        target_position: 30,
+    }
+}
+
+fn test_performance_client(
+    responses: Vec<(u16, String)>,
+) -> (
+    crate::ozon_performance::PerformanceClient,
+    std::sync::mpsc::Receiver<String>,
+) {
+    let mut all = vec![(
+        200,
+        json!({
+            "access_token": "test-access-token",
+            "token_type": "Bearer",
+            "expires_in": 1800
+        })
+        .to_string(),
+    )];
+    all.extend(responses);
+    let (base_url, requests) = mock_http(all);
+    let store_id = StoreId::from("store_one");
+    let client = crate::ozon_performance::PerformanceClient::new_for_test(
+        base_url,
+        Duration::from_secs(2),
+        BTreeMap::from([(
+            store_id,
+            PerformanceCredentials {
+                client_id: "test-client".to_owned(),
+                client_secret: "test-secret".to_owned(),
+            },
+        )]),
+    );
+    (client, requests)
+}
+
+#[tokio::test]
+async fn ozon_read_helpers_reject_ambiguous_campaign_and_product_shapes() {
+    let store = StoreId::from("store_one");
+
+    let (client, _) = test_performance_client(vec![(400, "{}".to_owned())]);
+    assert!(
+        ensure_ozon_sku_not_running(&client, &store, 1001)
+            .await
+            .unwrap_err()
+            .starts_with("CONTROL_PREFLIGHT_FAILED:")
+    );
+
+    let (client, _) = test_performance_client(vec![
+        (200, json!({"list": [{"id": 42}]}).to_string()),
+        (400, "{}".to_owned()),
+    ]);
+    assert!(
+        ensure_ozon_sku_not_running(&client, &store, 1001)
+            .await
+            .unwrap_err()
+            .starts_with("CONTROL_PREFLIGHT_FAILED:")
+    );
+
+    let (client, _) = test_performance_client(vec![(400, "{}".to_owned())]);
+    assert!(
+        find_ozon_campaign_by_title(&client, &store, "Exact")
+            .await
+            .unwrap_err()
+            .starts_with("CONTROL_RECONCILIATION_FAILED:")
+    );
+
+    let (client, _) = test_performance_client(vec![(400, "{}".to_owned())]);
+    assert!(
+        exact_ozon_launch_readback(&client, &store, 42, 1001, "Exact", 7_000_000)
+            .await
+            .unwrap_err()
+            .starts_with("CONTROL_RECONCILIATION_FAILED:")
+    );
+
+    let (client, _) = test_performance_client(vec![
+        (
+            200,
+            json!({"list": [{
+                "id": 42,
+                "title": "Exact",
+                "state": "CAMPAIGN_STATE_RUNNING"
+            }]})
+            .to_string(),
+        ),
+        (400, "{}".to_owned()),
+    ]);
+    assert!(
+        exact_ozon_launch_readback(&client, &store, 42, 1001, "Exact", 7_000_000)
+            .await
+            .unwrap_err()
+            .starts_with("CONTROL_RECONCILIATION_FAILED:")
+    );
+
+    let (client, _) = test_performance_client(vec![(200, json!({"list": []}).to_string())]);
+    ensure_ozon_sku_not_running(&client, &store, 1001)
+        .await
+        .unwrap();
+
+    let (client, _) = test_performance_client(vec![
+        (200, json!({"list": [{"id": "42"}]}).to_string()),
+        (200, json!({"products": [{"sku": "1001"}]}).to_string()),
+    ]);
+    let error = ensure_ozon_sku_not_running(&client, &store, 1001)
+        .await
+        .unwrap_err();
+    assert!(error.contains("уже участвует"));
+
+    for campaign_body in [json!({}), json!({"list": [{"id": 0}]})] {
+        let (client, _) = test_performance_client(vec![(200, campaign_body.to_string())]);
+        assert!(
+            ensure_ozon_sku_not_running(&client, &store, 1001)
+                .await
+                .unwrap_err()
+                .starts_with("CONTROL_PREFLIGHT_FAILED:")
+        );
+    }
+
+    let (client, _) = test_performance_client(vec![
+        (200, json!({"list": [{"id": 42}]}).to_string()),
+        (200, json!({}).to_string()),
+    ]);
+    assert!(
+        ensure_ozon_sku_not_running(&client, &store, 1001)
+            .await
+            .unwrap_err()
+            .contains("invalid products list")
+    );
+
+    let products = (1..=100)
+        .map(|sku| json!({"sku": sku + 10_000}))
+        .collect::<Vec<_>>();
+    let (client, _) = test_performance_client(vec![
+        (200, json!({"list": [{"id": 42}]}).to_string()),
+        (200, json!({"products": products}).to_string()),
+    ]);
+    assert!(
+        ensure_ozon_sku_not_running(&client, &store, 1001)
+            .await
+            .unwrap_err()
+            .contains("unbounded pagination")
+    );
+
+    let mut bounded_responses = Vec::new();
+    for page in 0..10_u64 {
+        let campaigns = (1..=100_u64)
+            .map(|offset| json!({"id": page * 100 + offset}))
+            .collect::<Vec<_>>();
+        bounded_responses.push((200, json!({"list": campaigns}).to_string()));
+        bounded_responses.extend((0..100).map(|_| (200, json!({"products": []}).to_string())));
+    }
+    bounded_responses.push((200, json!({"list": [{"id": 1001}]}).to_string()));
+    let (client, _) = test_performance_client(bounded_responses);
+    assert!(
+        ensure_ozon_sku_not_running(&client, &store, 9_999)
+            .await
+            .unwrap_err()
+            .contains("campaign bound exceeded")
+    );
+
+    for (list, expected) in [
+        (json!([{"id": "42", "title": "Exact"}]), Ok(42)),
+        (json!([]), Err("campaign not found")),
+        (
+            json!([{"id": 0, "title": "Exact"}]),
+            Err("invalid campaign id"),
+        ),
+        (
+            json!([
+                {"id": "42", "title": "Exact"},
+                {"id": "43", "title": "Exact"}
+            ]),
+            Err("duplicate exact title"),
+        ),
+    ] {
+        let (client, _) = test_performance_client(vec![(200, json!({"list": list}).to_string())]);
+        let result = find_ozon_campaign_by_title(&client, &store, "Exact").await;
+        match expected {
+            Ok(id) => assert_eq!(result.unwrap(), id),
+            Err(fragment) => assert!(result.unwrap_err().contains(fragment)),
+        }
+    }
+
+    let (client, _) = test_performance_client(vec![(200, json!({}).to_string())]);
+    assert!(
+        find_ozon_campaign_by_title(&client, &store, "Exact")
+            .await
+            .unwrap_err()
+            .contains("invalid campaign list")
+    );
+    let first_page = (1..=100)
+        .map(|id| json!({"id": id, "title": "Other"}))
+        .collect::<Vec<_>>();
+    let (client, _) = test_performance_client(vec![
+        (200, json!({"list": first_page}).to_string()),
+        (
+            200,
+            json!({"list": [{"id": 101, "title": "Exact"}]}).to_string(),
+        ),
+    ]);
+    assert_eq!(
+        find_ozon_campaign_by_title(&client, &store, "Exact")
+            .await
+            .unwrap(),
+        101
+    );
+
+    let title = "Exact";
+    let campaign = json!({
+        "list": [{"id": "42", "title": title, "state": "CAMPAIGN_STATE_RUNNING"}]
+    });
+    let products = json!({"products": [{"sku": "1001", "bid": "7000000"}]});
+    let (client, _) = test_performance_client(vec![
+        (200, campaign.to_string()),
+        (200, products.to_string()),
+    ]);
+    let readback = exact_ozon_launch_readback(&client, &store, 42, 1001, title, 7_000_000)
+        .await
+        .unwrap();
+    assert_eq!(readback["bid_microrubles"], 7_000_000);
+
+    for (campaign, products, fragment) in [
+        (json!({}), None, "invalid campaign list"),
+        (json!({"list": []}), None, "campaign missing"),
+        (
+            json!({"list": [{"id": 42, "state": "CAMPAIGN_STATE_RUNNING"}]}),
+            None,
+            "title missing",
+        ),
+        (
+            json!({"list": [{"id": 42, "title": title}]}),
+            None,
+            "state missing",
+        ),
+        (
+            json!({"list": [{"id": 42, "title": title, "state": "PAUSED"}]}),
+            None,
+            "exact campaign state not proven",
+        ),
+        (
+            json!({"list": [{"id": 42, "title": title, "state": "CAMPAIGN_STATE_RUNNING"}]}),
+            Some(json!({})),
+            "invalid products list",
+        ),
+        (
+            json!({"list": [{"id": 42, "title": title, "state": "CAMPAIGN_STATE_RUNNING"}]}),
+            Some(json!({"products": [{"sku": 1001, "bid": 8_000_000}]})),
+            "exact SKU/bid not proven",
+        ),
+    ] {
+        let mut responses = vec![(200, campaign.to_string())];
+        if let Some(products) = products {
+            responses.push((200, products.to_string()));
+        }
+        let (client, _) = test_performance_client(responses);
+        assert!(
+            exact_ozon_launch_readback(&client, &store, 42, 1001, title, 7_000_000)
+                .await
+                .unwrap_err()
+                .contains(fragment)
+        );
+    }
+
+    assert_eq!(positive_json_u64(Some(&json!(42))), Some(42));
+    assert_eq!(positive_json_u64(Some(&json!("42"))), Some(42));
+    assert_eq!(positive_json_u64(Some(&json!(0))), None);
+    assert_eq!(positive_json_u64(Some(&json!(true))), None);
+    assert_eq!(positive_json_u64(None), None);
 }
 
 fn wb_snapshot(advert_id: u64, bid_kopecks: u64) -> WbCampaignBidSnapshot {
@@ -1040,6 +1411,67 @@ fn plan_projection_authorization_and_error_classes_are_exhaustive() {
     ];
     for (error, expected) in store_cases {
         assert_eq!(plan_store_error(error), expected);
+    }
+
+    for (error, expected) in [
+        (OzonPlanStoreError::NotFound, "CONTROL_PLAN_NOT_FOUND"),
+        (
+            OzonPlanStoreError::InvalidState,
+            "CONTROL_PLAN_ALREADY_USED",
+        ),
+        (OzonPlanStoreError::Expired, "CONTROL_PLAN_EXPIRED"),
+        (
+            OzonPlanStoreError::ApprovalExpired,
+            "CONTROL_PLAN_APPROVAL_EXPIRED",
+        ),
+        (OzonPlanStoreError::PlanChanged, "CONTROL_PLAN_CHANGED"),
+        (OzonPlanStoreError::PolicyChanged, "CONTROL_POLICY_CHANGED"),
+        (
+            OzonPlanStoreError::RuntimeDisabled,
+            "CONTROL_RUNTIME_DISABLED",
+        ),
+        (OzonPlanStoreError::SkuLocked, "CONTROL_SKU_INCIDENT_LOCKED"),
+        (OzonPlanStoreError::InvalidPlan, "CONTROL_PLAN_INVALID"),
+        (
+            OzonPlanStoreError::Unavailable,
+            "CONTROL_PERSISTENCE_UNAVAILABLE",
+        ),
+    ] {
+        assert_eq!(ozon_plan_store_error(error), expected);
+    }
+    for (kind, operation, expected) in [
+        (
+            OzonWriteErrorKind::Definite,
+            "create",
+            (OzonLaunchStatus::Failed, "ozon_create_rejected"),
+        ),
+        (
+            OzonWriteErrorKind::Definite,
+            "products",
+            (OzonLaunchStatus::Failed, "ozon_products_rejected"),
+        ),
+        (
+            OzonWriteErrorKind::Definite,
+            "activate",
+            (OzonLaunchStatus::Failed, "ozon_activate_rejected"),
+        ),
+        (
+            OzonWriteErrorKind::Ambiguous,
+            "create",
+            (OzonLaunchStatus::Ambiguous, "ozon_create_ambiguous"),
+        ),
+        (
+            OzonWriteErrorKind::Ambiguous,
+            "products",
+            (OzonLaunchStatus::Ambiguous, "ozon_products_ambiguous"),
+        ),
+        (
+            OzonWriteErrorKind::Ambiguous,
+            "activate",
+            (OzonLaunchStatus::Ambiguous, "ozon_activate_ambiguous"),
+        ),
+    ] {
+        assert_eq!(ozon_write_failure(kind, operation), expected);
     }
 
     assert_eq!(
@@ -1965,6 +2397,662 @@ async fn wb_runtime_happy_path_is_durable_and_uses_exact_http_calls() {
     .await;
 }
 
+#[tokio::test]
+async fn ozon_runtime_happy_path_is_durable_and_uses_exact_http_calls() {
+    let (Ok(database_url), Ok(admin_url)) = (
+        std::env::var("OZON_CONTROL_TEST_DATABASE_URL"),
+        std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),
+    ) else {
+        return;
+    };
+    let _database_guard = CONTROL_DB_TEST_LOCK.lock().await;
+    let fixtures = Fixtures::new_ozon(ControlMode::Enabled);
+    let base_server = fixtures.authenticated_server();
+    let database_config = database_url.parse().unwrap();
+    let plans = Arc::new(OzonPlanRepository::connect(&database_config).await.unwrap());
+    plans.verify_runtime_contract().await.unwrap();
+
+    let (admin, admin_connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let admin_connection_task = tokio::spawn(admin_connection);
+    admin
+        .batch_execute(
+            "TRUNCATE TABLE control.ozon_policy_revisions, control.ozon_runtime_gates RESTART IDENTITY CASCADE; \
+             INSERT INTO control.ozon_runtime_gates(gate_key,scope_kind,account_id,sku,enabled,lease_expires_at,disabled_until,revision,reason,updated_by,updated_at) \
+             VALUES('global','global',NULL,NULL,true,clock_timestamp()+interval '10 minutes',NULL,1,'integration_test','test_admin',clock_timestamp()), \
+                   ('account/ozon_one','account','ozon_one',NULL,true,clock_timestamp()+interval '10 minutes',NULL,1,'integration_test','test_admin',clock_timestamp()), \
+                   ('sku/ozon_one/1001','sku','ozon_one',1001,true,clock_timestamp()+interval '10 minutes',NULL,1,'integration_test','test_admin',clock_timestamp())",
+        )
+        .await
+        .unwrap();
+    plans
+        .register_policy(
+            base_server.policy.version,
+            base_server.policy.revision,
+            base_server.policy.digest(),
+        )
+        .await
+        .unwrap();
+
+    let token = json!({
+        "access_token": "test-access-token",
+        "token_type": "Bearer",
+        "expires_in": 1800
+    })
+    .to_string();
+    let title = ozon_launch_spec().title;
+    let (read_base_url, read_requests) = mock_http(vec![
+        (200, token.clone()),
+        (200, json!({"list": []}).to_string()),
+        (200, json!({"list": []}).to_string()),
+        (200, json!({"list": []}).to_string()),
+        (200, json!({"list": []}).to_string()),
+        (
+            200,
+            json!({
+                "list": [{
+                    "id": "91000001",
+                    "title": title,
+                    "state": "CAMPAIGN_STATE_RUNNING"
+                }]
+            })
+            .to_string(),
+        ),
+        (
+            200,
+            json!({"products": [{"sku": "1001", "bid": "7000000"}]}).to_string(),
+        ),
+    ]);
+    let store_id = StoreId::from("store_one");
+    let credentials = PerformanceCredentials {
+        client_id: "test-client".to_owned(),
+        client_secret: "test-secret".to_owned(),
+    };
+    let reader = crate::ozon_performance::PerformanceClient::new_for_test(
+        read_base_url,
+        Duration::from_secs(2),
+        BTreeMap::from([(store_id.clone(), credentials.clone())]),
+    );
+    let (write_base_url, write_requests) = mock_http(vec![
+        (200, token.clone()),
+        (200, json!({"campaignId": "91000001"}).to_string()),
+        (200, "{}".to_owned()),
+        (200, "{}".to_owned()),
+    ]);
+    let writer = OzonAdsWriteClient::new_for_test(
+        &write_base_url,
+        credentials.clone(),
+        Duration::from_secs(2),
+    );
+    let services = OzonControlServices {
+        account_id: "ozon_one".to_owned(),
+        store_id: store_id.clone(),
+        reader: Arc::new(reader),
+        writer: Some(Arc::new(writer)),
+        plans: Arc::clone(&plans),
+    };
+    let dev_server = fixtures
+        .server()
+        .with_ozon_control_services(services.clone());
+    assert!(dev_server.ozon.is_none());
+    let server = base_server.with_ozon_control_services(services);
+    let services_debug = format!("{:?}", server.ozon.as_ref().unwrap());
+    assert!(services_debug.contains("OzonControlServices"));
+    assert!(services_debug.contains("<configured>"));
+    assert!(server.ozon_services("ozon_one").is_ok());
+    assert_eq!(
+        server.ozon_services("other").unwrap_err(),
+        "CONTROL_ACCESS_DENIED: Ozon account находится вне runtime scope"
+    );
+
+    let status = server
+        .control_status(
+            fixtures.identity("launcher"),
+            Parameters(EmptyInput::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert!(status.write_executor_configured);
+    assert!(status.credentials_loaded);
+    let scope = server
+        .control_scope(
+            fixtures.identity("launcher"),
+            Parameters(EmptyInput::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(scope.ozon_campaign_launch_targets.len(), 1);
+
+    let preview = server
+        .preview_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(PreviewOzonCampaignLaunchInput {
+                spec: ozon_launch_spec(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(preview.spec.initial_cpc_bid_microrubles, 7_000_000);
+    let prepared = server
+        .prepare_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(PrepareOzonCampaignLaunchInput {
+                spec: ozon_launch_spec(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(prepared.status, OzonLaunchStatus::Prepared);
+    let prepared_plan = plans.load(&prepared.plan_id).await.unwrap();
+    let registry = server.registry.load().unwrap();
+    let launcher = registry.actor("launcher").unwrap();
+    let approver_actor = registry.actor("approver").unwrap();
+    let observer = registry.actor("observer").unwrap();
+    assert!(ozon_plan_target(&server.policy, &prepared_plan).is_some());
+    authorize_ozon_plan_approval(&server.policy, &registry, approver_actor, &prepared_plan)
+        .unwrap();
+    assert!(
+        authorize_ozon_plan_approval(&server.policy, &registry, launcher, &prepared_plan).is_err()
+    );
+    assert!(
+        authorize_ozon_plan_approval(&server.policy, &registry, observer, &prepared_plan).is_err()
+    );
+    let mut changed_plan = prepared_plan.clone();
+    changed_plan.policy_digest = "d".repeat(64);
+    assert!(
+        authorize_ozon_plan_approval(&server.policy, &registry, approver_actor, &changed_plan)
+            .is_err()
+    );
+    let mut missing_target = prepared_plan.clone();
+    missing_target.manifest.spec.target_position = 29;
+    assert!(ozon_plan_target(&server.policy, &missing_target).is_none());
+    assert!(
+        authorize_ozon_plan_approval(&server.policy, &registry, approver_actor, &missing_target)
+            .is_err()
+    );
+    let mut missing_account = (*registry).clone();
+    missing_account.accounts.clear();
+    assert!(
+        authorize_ozon_plan_approval(
+            &server.policy,
+            &missing_account,
+            approver_actor,
+            &prepared_plan
+        )
+        .is_err()
+    );
+    let mut missing_actor = (*registry).clone();
+    missing_actor.actors.retain(|actor| actor.id != "launcher");
+    assert!(
+        authorize_ozon_plan_approval(
+            &server.policy,
+            &missing_actor,
+            missing_actor.actor("approver").unwrap(),
+            &prepared_plan
+        )
+        .is_err()
+    );
+    let approved = server
+        .approve_ozon_campaign_launch(
+            fixtures.identity("approver"),
+            Parameters(ApproveOzonCampaignLaunchInput {
+                plan_id: prepared.plan_id.clone(),
+                plan_digest: prepared.plan_digest.clone(),
+                approval_reference: "integration_test".to_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(approved.status, OzonLaunchStatus::Approved);
+    let approved_plan = plans.load(&approved.plan_id).await.unwrap();
+    authorize_ozon_plan_apply(
+        &server.policy,
+        &registry,
+        launcher,
+        "ozon_one",
+        &approved_plan,
+    )
+    .unwrap();
+    assert!(
+        authorize_ozon_plan_apply(
+            &server.policy,
+            &registry,
+            observer,
+            "ozon_one",
+            &approved_plan,
+        )
+        .is_err()
+    );
+    assert!(
+        authorize_ozon_plan_apply(&server.policy, &registry, launcher, "other", &approved_plan,)
+            .is_err()
+    );
+    assert!(
+        authorize_ozon_plan_apply(
+            &server.policy,
+            &registry,
+            launcher,
+            "ozon_one",
+            &prepared_plan,
+        )
+        .is_err()
+    );
+    let mut missing_approver = (*registry).clone();
+    missing_approver
+        .actors
+        .retain(|actor| actor.id != "approver");
+    assert!(
+        authorize_ozon_plan_apply(
+            &server.policy,
+            &missing_approver,
+            missing_approver.actor("launcher").unwrap(),
+            "ozon_one",
+            &approved_plan,
+        )
+        .is_err()
+    );
+    let mut missing_apply_account = (*registry).clone();
+    missing_apply_account.accounts.clear();
+    assert!(
+        authorize_ozon_plan_apply(
+            &server.policy,
+            &missing_apply_account,
+            missing_apply_account.actor("launcher").unwrap(),
+            "ozon_one",
+            &approved_plan,
+        )
+        .is_err()
+    );
+    let mut revoked_apply_account = (*registry).clone();
+    revoked_apply_account.accounts[0].manager_id = "another_manager".to_owned();
+    assert!(
+        authorize_ozon_plan_apply(
+            &server.policy,
+            &revoked_apply_account,
+            revoked_apply_account.actor("launcher").unwrap(),
+            "ozon_one",
+            &approved_plan,
+        )
+        .is_err()
+    );
+    plans
+        .revalidate_write_permit(
+            &approved.plan_id,
+            "launcher",
+            &approved.plan_digest,
+            OzonLaunchStatus::Approved,
+        )
+        .await
+        .unwrap();
+    let claimed = plans
+        .claim_create(&approved.plan_id, "launcher", &approved.plan_digest)
+        .await
+        .unwrap();
+    plans
+        .revalidate_write_permit(
+            &claimed.plan_id,
+            "launcher",
+            &claimed.plan_digest,
+            OzonLaunchStatus::Creating,
+        )
+        .await
+        .unwrap();
+    plans
+        .transition(
+            &claimed.plan_id,
+            "launcher",
+            &claimed.plan_digest,
+            OzonLaunchStatus::Creating,
+            OzonLaunchStatus::Failed,
+            None,
+            Some("test_cancelled"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let prepared = server
+        .prepare_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(PrepareOzonCampaignLaunchInput {
+                spec: ozon_launch_spec(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    let approved = server
+        .approve_ozon_campaign_launch(
+            fixtures.identity("approver"),
+            Parameters(ApproveOzonCampaignLaunchInput {
+                plan_id: prepared.plan_id.clone(),
+                plan_digest: prepared.plan_digest.clone(),
+                approval_reference: "integration_test_retry".to_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    let applied = server
+        .apply_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(ApplyOzonCampaignLaunchInput {
+                plan_id: approved.plan_id.clone(),
+                plan_digest: approved.plan_digest.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(
+        applied.status,
+        OzonLaunchStatus::Applied,
+        "last_error_class={:?}",
+        applied.last_error_class
+    );
+    assert_eq!(applied.campaign_id, Some(91_000_001));
+    let reconciled = server
+        .reconcile_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(OzonCampaignPlanInput {
+                plan_id: applied.plan_id,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(reconciled.status, OzonLaunchStatus::Applied);
+    admin
+        .execute("DELETE FROM control.ozon_campaign_guards", &[])
+        .await
+        .unwrap();
+
+    let mut failure_reads = vec![(200, token.clone())];
+    for _ in 0..16 {
+        failure_reads.push((200, json!({"list": []}).to_string()));
+    }
+    let (failure_read_base, _) = mock_http(failure_reads);
+    let failure_reader = crate::ozon_performance::PerformanceClient::new_for_test(
+        failure_read_base,
+        Duration::from_secs(2),
+        BTreeMap::from([(store_id.clone(), credentials.clone())]),
+    );
+    let (failure_write_base, _) = mock_http(vec![
+        (200, token.clone()),
+        (400, "{}".to_owned()),
+        (200, json!({"campaignId": "91000011"}).to_string()),
+        (400, "{}".to_owned()),
+        (200, json!({"campaignId": "91000012"}).to_string()),
+        (200, "{}".to_owned()),
+        (400, "{}".to_owned()),
+        (200, json!({"campaignId": "91000013"}).to_string()),
+        (200, "{}".to_owned()),
+        (200, "{}".to_owned()),
+        (200, json!({"campaignId": "invalid"}).to_string()),
+    ]);
+    let failure_writer = OzonAdsWriteClient::new_for_test(
+        &failure_write_base,
+        credentials.clone(),
+        Duration::from_secs(2),
+    );
+    let failure_server = server
+        .clone()
+        .with_ozon_control_services(OzonControlServices {
+            account_id: "ozon_one".to_owned(),
+            store_id: store_id.clone(),
+            reader: Arc::new(failure_reader),
+            writer: Some(Arc::new(failure_writer)),
+            plans: Arc::clone(&plans),
+        });
+    let mut ambiguous_plan_ids = Vec::new();
+    for (index, expected) in [
+        Some(OzonLaunchStatus::Failed),
+        Some(OzonLaunchStatus::Failed),
+        Some(OzonLaunchStatus::Failed),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut spec = ozon_launch_spec();
+        spec.title = format!("Ozon guarded failure {index}");
+        let prepared = failure_server
+            .prepare_ozon_campaign_launch(
+                fixtures.identity("launcher"),
+                Parameters(PrepareOzonCampaignLaunchInput { spec }),
+            )
+            .await
+            .unwrap()
+            .0;
+        if index == 0 {
+            let Err(error) = failure_server
+                .reconcile_ozon_campaign_launch(
+                    fixtures.identity("launcher"),
+                    Parameters(OzonCampaignPlanInput {
+                        plan_id: prepared.plan_id.clone(),
+                    }),
+                )
+                .await
+            else {
+                panic!("prepared plan must not reconcile");
+            };
+            assert_eq!(error, "CONTROL_PLAN_NOT_RECONCILABLE");
+        }
+        let approved = failure_server
+            .approve_ozon_campaign_launch(
+                fixtures.identity("approver"),
+                Parameters(ApproveOzonCampaignLaunchInput {
+                    plan_id: prepared.plan_id,
+                    plan_digest: prepared.plan_digest,
+                    approval_reference: format!("failure_{index}"),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        if index == 0 {
+            let Err(error) = failure_server
+                .apply_ozon_campaign_launch(
+                    fixtures.identity("launcher"),
+                    Parameters(ApplyOzonCampaignLaunchInput {
+                        plan_id: approved.plan_id.clone(),
+                        plan_digest: "d".repeat(64),
+                    }),
+                )
+                .await
+            else {
+                panic!("changed plan digest must fail");
+            };
+            assert_eq!(error, "CONTROL_PLAN_CHANGED");
+        }
+        let result = failure_server
+            .apply_ozon_campaign_launch(
+                fixtures.identity("launcher"),
+                Parameters(ApplyOzonCampaignLaunchInput {
+                    plan_id: approved.plan_id.clone(),
+                    plan_digest: approved.plan_digest,
+                }),
+            )
+            .await;
+        if let Some(expected) = expected {
+            assert_eq!(result.unwrap().0.status, expected);
+        } else {
+            let Err(error) = result else {
+                panic!("missing readback must be ambiguous");
+            };
+            assert!(error.starts_with("CONTROL_RECONCILIATION_FAILED:"));
+            let ambiguous = plans.load(&approved.plan_id).await.unwrap();
+            assert_eq!(ambiguous.status, OzonLaunchStatus::Ambiguous);
+            ambiguous_plan_ids.push(ambiguous.plan_id);
+        }
+    }
+
+    let known_campaign = plans.load(&ambiguous_plan_ids[0]).await.unwrap();
+    assert_eq!(known_campaign.campaign_id, Some(91_000_013));
+    let unknown_campaign_title = "Ozon guarded failure 4";
+    let (reconcile_base, _) = mock_http(vec![
+        (200, token.clone()),
+        (
+            200,
+            json!({"list": [{
+                "id": "91000013",
+                "title": known_campaign.manifest.spec.title,
+                "state": "CAMPAIGN_STATE_RUNNING"
+            }]})
+            .to_string(),
+        ),
+        (
+            200,
+            json!({"products": [{"sku": "1001", "bid": "7000000"}]}).to_string(),
+        ),
+        (
+            200,
+            json!({"list": [{
+                "id": "91000014",
+                "title": unknown_campaign_title,
+                "state": "CAMPAIGN_STATE_RUNNING"
+            }]})
+            .to_string(),
+        ),
+        (
+            200,
+            json!({"list": [{
+                "id": "91000014",
+                "title": unknown_campaign_title,
+                "state": "CAMPAIGN_STATE_RUNNING"
+            }]})
+            .to_string(),
+        ),
+        (
+            200,
+            json!({"products": [{"sku": "1001", "bid": "7000000"}]}).to_string(),
+        ),
+    ]);
+    let reconcile_reader = crate::ozon_performance::PerformanceClient::new_for_test(
+        reconcile_base,
+        Duration::from_secs(2),
+        BTreeMap::from([(store_id.clone(), credentials.clone())]),
+    );
+    let reconcile_server = server
+        .clone()
+        .with_ozon_control_services(OzonControlServices {
+            account_id: "ozon_one".to_owned(),
+            store_id: store_id.clone(),
+            reader: Arc::new(reconcile_reader),
+            writer: None,
+            plans: Arc::clone(&plans),
+        });
+    let known_recovered = reconcile_server
+        .reconcile_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(OzonCampaignPlanInput {
+                plan_id: ambiguous_plan_ids[0].clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(known_recovered.status, OzonLaunchStatus::Applied);
+    admin
+        .execute("DELETE FROM control.ozon_campaign_guards", &[])
+        .await
+        .unwrap();
+    let mut spec = ozon_launch_spec();
+    spec.title = unknown_campaign_title.to_owned();
+    let prepared = failure_server
+        .prepare_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(PrepareOzonCampaignLaunchInput { spec }),
+        )
+        .await
+        .unwrap()
+        .0;
+    let approved = failure_server
+        .approve_ozon_campaign_launch(
+            fixtures.identity("approver"),
+            Parameters(ApproveOzonCampaignLaunchInput {
+                plan_id: prepared.plan_id,
+                plan_digest: prepared.plan_digest,
+                approval_reference: "failure_4".to_owned(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    let ambiguous = failure_server
+        .apply_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(ApplyOzonCampaignLaunchInput {
+                plan_id: approved.plan_id.clone(),
+                plan_digest: approved.plan_digest,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(ambiguous.status, OzonLaunchStatus::Ambiguous);
+    let unknown_campaign = plans.load(&approved.plan_id).await.unwrap();
+    assert_eq!(unknown_campaign.status, OzonLaunchStatus::Ambiguous);
+    assert_eq!(unknown_campaign.campaign_id, None);
+    let recovered = reconcile_server
+        .reconcile_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(OzonCampaignPlanInput {
+                plan_id: unknown_campaign.plan_id,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(recovered.status, OzonLaunchStatus::Applied);
+    let Err(error) = reconcile_server
+        .reconcile_ozon_campaign_launch(
+            fixtures.identity("observer"),
+            Parameters(OzonCampaignPlanInput {
+                plan_id: recovered.plan_id,
+            }),
+        )
+        .await
+    else {
+        panic!("observer must not reconcile plans");
+    };
+    assert!(error.starts_with("CONTROL_ACCESS_DENIED:"));
+
+    let read_requests = read_requests.iter().take(7).collect::<Vec<_>>();
+    assert!(read_requests[0].starts_with("POST /api/client/token "));
+    assert!(read_requests[1].starts_with("GET /api/client/campaign?"));
+    assert!(read_requests[6].starts_with("GET /api/client/campaign/91000001/v2/products?"));
+    let write_requests = write_requests.iter().take(4).collect::<Vec<_>>();
+    assert!(write_requests[0].starts_with("POST /api/client/token "));
+    assert!(write_requests[1].starts_with("POST /api/client/campaign/cpc/v2/product "));
+    assert!(write_requests[2].starts_with("POST /api/client/campaign/91000001/products "));
+    assert!(write_requests[3].starts_with("POST /api/client/campaign/91000001/activate "));
+
+    admin
+        .batch_execute(
+            "ALTER ROLE control_writer NOLOGIN; \
+             SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename='control_writer'",
+        )
+        .await
+        .unwrap();
+    assert!(server.readiness().await.is_err());
+    admin
+        .batch_execute("ALTER ROLE control_writer LOGIN")
+        .await
+        .unwrap();
+
+    drop(server);
+    drop(plans);
+    drop(admin);
+    admin_connection_task.await.unwrap().unwrap();
+}
+
 #[test]
 fn inventory_exposes_local_inspection_and_guarded_wb_workflow() {
     let fixtures = Fixtures::new(false);
@@ -1995,6 +3083,190 @@ fn inventory_exposes_local_inspection_and_guarded_wb_workflow() {
             .unwrap()
             .contains("reconciliation_required")
     );
+}
+
+#[tokio::test]
+async fn ozon_preview_and_prepare_reject_unbound_inaccessible_and_multi_sku_targets() {
+    let fixtures = Fixtures::new_ozon(ControlMode::PlanOnly);
+    let server = fixtures.authenticated_server();
+    let mut unbound = ozon_launch_spec();
+    unbound.skus = vec![999];
+    let Err(error) = server
+        .preview_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(PreviewOzonCampaignLaunchInput {
+                spec: unbound.clone(),
+            }),
+        )
+        .await
+    else {
+        panic!("unbound preview must fail");
+    };
+    assert!(error.contains("launch target отсутствует"));
+
+    let Err(error) = server
+        .prepare_ozon_campaign_launch(
+            fixtures.identity("observer"),
+            Parameters(PrepareOzonCampaignLaunchInput {
+                spec: ozon_launch_spec(),
+            }),
+        )
+        .await
+    else {
+        panic!("actor without policy binding must not prepare");
+    };
+    assert!(error.contains("отсутствует Ozon policy binding"));
+
+    let Err(error) = server
+        .preview_ozon_campaign_launch(
+            fixtures.identity("observer"),
+            Parameters(PreviewOzonCampaignLaunchInput {
+                spec: ozon_launch_spec(),
+            }),
+        )
+        .await
+    else {
+        panic!("actor without policy binding must fail");
+    };
+    assert!(error.contains("отсутствует явная control policy binding"));
+
+    let mut missing_account = fixtures.identity("launcher");
+    let mut registry = missing_account.registry.as_ref().unwrap().as_ref().clone();
+    registry.accounts.clear();
+    missing_account.registry = Some(Arc::new(registry));
+    let Err(error) = server
+        .preview_ozon_campaign_launch(
+            missing_account,
+            Parameters(PreviewOzonCampaignLaunchInput {
+                spec: ozon_launch_spec(),
+            }),
+        )
+        .await
+    else {
+        panic!("missing account must fail");
+    };
+    assert!(error.contains("account отсутствует в registry"));
+
+    let mut missing_account = fixtures.identity("launcher");
+    let mut registry = missing_account.registry.as_ref().unwrap().as_ref().clone();
+    registry.accounts.clear();
+    missing_account.registry = Some(Arc::new(registry));
+    let Err(error) = server
+        .prepare_ozon_campaign_launch(
+            missing_account,
+            Parameters(PrepareOzonCampaignLaunchInput {
+                spec: ozon_launch_spec(),
+            }),
+        )
+        .await
+    else {
+        panic!("missing account must not prepare");
+    };
+    assert!(error.contains("Ozon account отсутствует"));
+
+    let mut malformed = ozon_launch_spec();
+    malformed.title.clear();
+    let Err(error) = server
+        .preview_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(PreviewOzonCampaignLaunchInput { spec: malformed }),
+        )
+        .await
+    else {
+        panic!("malformed manifest must fail");
+    };
+    assert!(error.starts_with("CONTROL_POLICY_DENIED:"));
+    let Err(error) = server
+        .prepare_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(PrepareOzonCampaignLaunchInput { spec: unbound }),
+        )
+        .await
+    else {
+        panic!("unbound prepare must fail");
+    };
+    assert!(error.contains("launch target отсутствует"));
+
+    let mut inaccessible = fixtures.identity("launcher");
+    let mut registry = inaccessible.registry.as_ref().unwrap().as_ref().clone();
+    registry.accounts[0].manager_id = "another_manager".to_owned();
+    inaccessible.registry = Some(Arc::new(registry));
+    let Err(error) = server
+        .preview_ozon_campaign_launch(
+            inaccessible.clone(),
+            Parameters(PreviewOzonCampaignLaunchInput {
+                spec: ozon_launch_spec(),
+            }),
+        )
+        .await
+    else {
+        panic!("inaccessible preview must fail");
+    };
+    assert!(error.contains("не имеет доступа"));
+    let Err(error) = server
+        .prepare_ozon_campaign_launch(
+            inaccessible,
+            Parameters(PrepareOzonCampaignLaunchInput {
+                spec: ozon_launch_spec(),
+            }),
+        )
+        .await
+    else {
+        panic!("inaccessible prepare must fail");
+    };
+    assert!(error.contains("не имеет доступа"));
+
+    let mut multi_server = server.clone();
+    let mut multi_policy = (*multi_server.policy).clone();
+    multi_policy.actors[0].ozon_campaign_launch_targets[0].skus = vec![1001, 1002];
+    multi_server.policy = Arc::new(multi_policy);
+    let mut multi_spec = ozon_launch_spec();
+    multi_spec.skus = vec![1001, 1002];
+    let Err(error) = multi_server
+        .prepare_ozon_campaign_launch(
+            fixtures.identity("launcher"),
+            Parameters(PrepareOzonCampaignLaunchInput { spec: multi_spec }),
+        )
+        .await
+    else {
+        panic!("multi-SKU plan must fail");
+    };
+    assert!(error.contains("один SKU"));
+
+    assert_eq!(
+        server.ozon_services("ozon_one").unwrap_err(),
+        "CONTROL_DISABLED: Ozon runtime не настроен"
+    );
+    let Err(error) = server
+        .approve_ozon_campaign_launch(
+            fixtures.identity("approver"),
+            Parameters(ApproveOzonCampaignLaunchInput {
+                plan_id: "plan".to_owned(),
+                plan_digest: "d".repeat(64),
+                approval_reference: "test".to_owned(),
+            }),
+        )
+        .await
+    else {
+        panic!("approval without plan store must fail");
+    };
+    assert!(error.contains("plan store не настроен"));
+
+    let enabled_fixtures = Fixtures::new_ozon(ControlMode::Enabled);
+    let enabled_server = enabled_fixtures.authenticated_server();
+    let Err(error) = enabled_server
+        .apply_ozon_campaign_launch(
+            enabled_fixtures.identity("launcher"),
+            Parameters(ApplyOzonCampaignLaunchInput {
+                plan_id: "plan".to_owned(),
+                plan_digest: "d".repeat(64),
+            }),
+        )
+        .await
+    else {
+        panic!("apply without runtime must fail");
+    };
+    assert!(error.contains("Ozon runtime не настроен"));
 }
 
 #[test]
@@ -2157,6 +3429,111 @@ async fn control_http_wire_lists_exact_inventory_and_propagates_request_identity
             "wb_promotion_reconcile_bid_plan",
         ]
     );
+
+    let ozon_spec = json!({
+        "account_id": "ozon_one",
+        "title": "Wire contract test",
+        "from_date": "2026-09-02",
+        "to_date": "2026-09-08",
+        "skus": [1001],
+        "weekly_budget_microrubles": 2_000_000_000_u64,
+        "per_sku_spend_cap_microrubles": 2_000_000_000_u64,
+        "initial_cpc_bid_microrubles": 7_000_000_u64,
+        "max_cpc_bid_microrubles": 12_000_000_u64,
+        "target_drr_percent": 15,
+        "target_position": 30
+    });
+    let digest = "a".repeat(64);
+    for (id, name, arguments, expect_error) in [
+        (10, "ozon_ads_control_scope", json!({}), false),
+        (
+            11,
+            "ozon_performance_preview_campaign_launch",
+            json!({"spec": ozon_spec.clone()}),
+            true,
+        ),
+        (
+            12,
+            "ozon_performance_prepare_campaign_launch",
+            json!({"spec": ozon_spec}),
+            true,
+        ),
+        (
+            13,
+            "ozon_performance_approve_campaign_launch",
+            json!({
+                "plan_id": digest,
+                "plan_digest": digest,
+                "approval_reference": "wire_test"
+            }),
+            true,
+        ),
+        (
+            14,
+            "ozon_performance_apply_campaign_launch",
+            json!({"plan_id": digest, "plan_digest": digest}),
+            true,
+        ),
+        (
+            15,
+            "ozon_performance_reconcile_campaign_launch",
+            json!({"plan_id": digest}),
+            true,
+        ),
+        (
+            16,
+            "wb_promotion_prepare_bid_update",
+            json!({"account_id": "wb_one", "advert_id": 77, "changes": []}),
+            true,
+        ),
+        (
+            17,
+            "wb_promotion_approve_bid_plan",
+            json!({
+                "plan_id": digest,
+                "plan_digest": digest,
+                "approval_reference": "wire_test"
+            }),
+            true,
+        ),
+        (
+            18,
+            "wb_promotion_apply_bid_plan",
+            json!({"plan_id": digest, "plan_digest": digest}),
+            true,
+        ),
+        (
+            19,
+            "wb_promotion_bid_plan_status",
+            json!({"plan_id": digest}),
+            true,
+        ),
+        (
+            20,
+            "wb_promotion_reconcile_bid_plan",
+            json!({"plan_id": digest}),
+            true,
+        ),
+    ] {
+        let (status, headers, body) = rpc(
+            &router,
+            Some(&session_id),
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body}");
+        let response = rpc_json(&headers, &body);
+        assert_eq!(
+            response.pointer("/result/isError").and_then(Value::as_bool),
+            Some(expect_error),
+            "{name}: {response}"
+        );
+    }
 
     // Prove that the exact registry snapshot attached to this HTTP request
     // reaches the tool context; a fallback reload can no longer succeed.

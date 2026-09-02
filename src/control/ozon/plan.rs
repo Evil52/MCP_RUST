@@ -347,4 +347,121 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn malformed_identity_digest_dates_and_spec_are_rejected() {
+        let expected = spec();
+        for actor_id in ["", "bad actor", "../actor", &"x".repeat(129)] {
+            assert_eq!(
+                prepare_campaign_launch_manifest(
+                    actor_id,
+                    1,
+                    9,
+                    &"a".repeat(64),
+                    &expected.account_id,
+                    &expected.skus,
+                    expected.weekly_budget_microrubles,
+                    expected.per_sku_spend_cap_microrubles,
+                    expected.initial_cpc_bid_microrubles,
+                    expected.max_cpc_bid_microrubles,
+                    expected.target_drr_percent,
+                    expected.target_position,
+                    expected.clone(),
+                ),
+                Err(OzonLaunchPlanError::InvalidSpec)
+            );
+        }
+        for digest in ["", &"A".repeat(64), &"a".repeat(63)] {
+            assert_eq!(
+                prepare_campaign_launch_manifest(
+                    "actor",
+                    1,
+                    9,
+                    digest,
+                    &expected.account_id,
+                    &expected.skus,
+                    expected.weekly_budget_microrubles,
+                    expected.per_sku_spend_cap_microrubles,
+                    expected.initial_cpc_bid_microrubles,
+                    expected.max_cpc_bid_microrubles,
+                    expected.target_drr_percent,
+                    expected.target_position,
+                    expected.clone(),
+                ),
+                Err(OzonLaunchPlanError::InvalidSpec)
+            );
+        }
+        for (schema, revision) in [(0, 9), (1, 0)] {
+            assert_eq!(
+                prepare_campaign_launch_manifest(
+                    "actor",
+                    schema,
+                    revision,
+                    &"a".repeat(64),
+                    &expected.account_id,
+                    &expected.skus,
+                    expected.weekly_budget_microrubles,
+                    expected.per_sku_spend_cap_microrubles,
+                    expected.initial_cpc_bid_microrubles,
+                    expected.max_cpc_bid_microrubles,
+                    expected.target_drr_percent,
+                    expected.target_position,
+                    expected.clone(),
+                ),
+                Err(OzonLaunchPlanError::InvalidSpec)
+            );
+        }
+
+        let mut invalid_specs = Vec::new();
+        invalid_specs.push(OzonCampaignLaunchSpec {
+            account_id: "bad account".to_owned(),
+            ..expected.clone()
+        });
+        invalid_specs.push(OzonCampaignLaunchSpec {
+            title: String::new(),
+            ..expected.clone()
+        });
+        invalid_specs.push(OzonCampaignLaunchSpec {
+            skus: Vec::new(),
+            weekly_budget_microrubles: 0,
+            ..expected.clone()
+        });
+        invalid_specs.push(OzonCampaignLaunchSpec {
+            skus: vec![1, 1],
+            weekly_budget_microrubles: 4_000_000_000,
+            ..expected.clone()
+        });
+        invalid_specs.push(OzonCampaignLaunchSpec {
+            from_date: "bad".to_owned(),
+            ..expected.clone()
+        });
+        invalid_specs.push(OzonCampaignLaunchSpec {
+            to_date: "2026-09-01".to_owned(),
+            ..expected.clone()
+        });
+        invalid_specs.push(OzonCampaignLaunchSpec {
+            to_date: "2026-10-31".to_owned(),
+            ..expected.clone()
+        });
+        for invalid in invalid_specs {
+            assert_eq!(
+                prepare_campaign_launch_manifest(
+                    "actor",
+                    1,
+                    9,
+                    &"a".repeat(64),
+                    &expected.account_id,
+                    &expected.skus,
+                    expected.weekly_budget_microrubles,
+                    expected.per_sku_spend_cap_microrubles,
+                    expected.initial_cpc_bid_microrubles,
+                    expected.max_cpc_bid_microrubles,
+                    expected.target_drr_percent,
+                    expected.target_position,
+                    invalid,
+                ),
+                Err(OzonLaunchPlanError::InvalidSpec)
+            );
+        }
+    }
 }

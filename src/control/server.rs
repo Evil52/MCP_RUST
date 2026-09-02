@@ -206,10 +206,9 @@ impl ControlMcp {
     }
 
     fn ozon_services(&self, account_id: &str) -> Result<&OzonControlServices, String> {
-        let services = self
-            .ozon
-            .as_ref()
-            .ok_or_else(|| "CONTROL_DISABLED: Ozon runtime не настроен".to_owned())?;
+        let Some(services) = self.ozon.as_ref() else {
+            return Err("CONTROL_DISABLED: Ozon runtime не настроен".to_owned());
+        };
         if services.account_id != account_id {
             return Err(format!(
                 "{ACCESS_DENIED}: Ozon account находится вне runtime scope"

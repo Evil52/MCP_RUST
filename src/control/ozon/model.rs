@@ -130,3 +130,41 @@ pub struct OzonCampaignGuard {
     pub spend_cap_microrubles: u64,
     pub target_drr_percent: u8,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_launch_status_has_an_exact_database_and_reconciliation_contract() {
+        for (status, database) in [
+            (OzonLaunchStatus::Prepared, "prepared"),
+            (OzonLaunchStatus::Approved, "approved"),
+            (OzonLaunchStatus::Creating, "creating"),
+            (OzonLaunchStatus::Created, "created"),
+            (OzonLaunchStatus::AddingProducts, "adding_products"),
+            (OzonLaunchStatus::ProductsAdded, "products_added"),
+            (OzonLaunchStatus::Activating, "activating"),
+            (OzonLaunchStatus::Applied, "applied"),
+            (OzonLaunchStatus::Ambiguous, "ambiguous"),
+            (OzonLaunchStatus::Failed, "failed"),
+            (OzonLaunchStatus::Expired, "expired"),
+        ] {
+            assert_eq!(status.as_db(), database);
+            assert_eq!(OzonLaunchStatus::from_db(database), Ok(status));
+        }
+        assert_eq!(
+            OzonLaunchStatus::from_db("unknown"),
+            Err(OzonPlanStoreError::Unavailable)
+        );
+        for status in [
+            OzonLaunchStatus::Creating,
+            OzonLaunchStatus::AddingProducts,
+            OzonLaunchStatus::Activating,
+            OzonLaunchStatus::Ambiguous,
+        ] {
+            assert!(status.requires_reconciliation());
+        }
+        assert!(!OzonLaunchStatus::Applied.requires_reconciliation());
+    }
+}

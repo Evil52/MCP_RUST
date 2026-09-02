@@ -106,6 +106,14 @@ mod tests {
     #[test]
     fn spend_cap_has_priority_and_uses_exact_currency_conversion() {
         assert_eq!(
+            OzonGuardStopReason::SpendCapReached.as_str(),
+            "spend_cap_reached"
+        );
+        assert_eq!(
+            OzonGuardStopReason::DrrCapExceeded.as_str(),
+            "drr_cap_exceeded"
+        );
+        assert_eq!(
             evaluate_ozon_campaign_guard(200_000, 10_000_000, 2_000_000_000, 15),
             Ok(Some(OzonGuardStopReason::SpendCapReached))
         );
@@ -200,5 +208,31 @@ mod tests {
             validate_ozon_campaign_product_guard(&snapshot, 3_588_576_015, 12_000_000, 7_000_000),
             Err(OzonProductGuardError::InvalidLimit)
         );
+        for (expected_sku, minimum, maximum) in [
+            (0, 7_000_000, 12_000_000),
+            (3_588_576_015, 0, 12_000_000),
+            (3_588_576_015, 7_000_001, 12_000_000),
+            (3_588_576_015, 7_000_000, 12_000_001),
+        ] {
+            assert_eq!(
+                validate_ozon_campaign_product_guard(&snapshot, expected_sku, minimum, maximum),
+                Err(OzonProductGuardError::InvalidLimit)
+            );
+        }
+        for snapshot in [
+            serde_json::json!({"products": [{"sku": null, "bid": "7000000"}]}),
+            serde_json::json!({"products": [{"sku": true, "bid": "7000000"}]}),
+            serde_json::json!({"products": [{"sku": 3_588_576_015_u64, "bid": "07000000"}]}),
+        ] {
+            assert_eq!(
+                validate_ozon_campaign_product_guard(
+                    &snapshot,
+                    3_588_576_015,
+                    7_000_000,
+                    12_000_000
+                ),
+                Err(OzonProductGuardError::InvalidSnapshot)
+            );
+        }
     }
 }

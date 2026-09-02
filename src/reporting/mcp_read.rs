@@ -3043,6 +3043,17 @@ mod tests {
         period_end: DateTime<Utc>,
         status: SnapshotStatus,
     ) -> SnapshotDescriptor {
+        sales_descriptor_rows(id, business_date, cutoff, period_end, status, 1)
+    }
+
+    fn sales_descriptor_rows(
+        id: i64,
+        business_date: NaiveDate,
+        cutoff: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+        status: SnapshotStatus,
+        row_count: u32,
+    ) -> SnapshotDescriptor {
         let offset = super::super::yekaterinburg_offset();
         let period_start = offset
             .from_local_datetime(&business_date.and_hms_opt(0, 0, 0).unwrap())
@@ -3058,7 +3069,7 @@ mod tests {
             cutoff,
             period_start,
             period_end,
-            1,
+            row_count,
             status == SnapshotStatus::Succeeded,
             status,
         )
@@ -3138,6 +3149,127 @@ mod tests {
         }
         assert_eq!(sales_direction_sql(SalesAnalyticsDirection::Asc), "ASC");
         assert_eq!(sales_direction_sql(SalesAnalyticsDirection::Desc), "DESC");
+
+        let unavailable = select_sales_snapshots(query, Vec::new()).unwrap();
+        assert_eq!(unavailable.state, DataState::Unavailable);
+        let preliminary = select_sales_snapshots(
+            SalesAnalyticsQuery {
+                date_from: first,
+                date_to: first,
+                ..query
+            },
+            vec![sales_descriptor(
+                10,
+                first,
+                Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 8, 20, 12, 0, 0).unwrap(),
+                SnapshotStatus::Succeeded,
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            preliminary.coverage[0].state,
+            SalesDateCoverageState::Preliminary
+        );
+
+        let invalid_source = SnapshotDescriptor::new(
+            11,
+            "store_1".to_owned(),
+            Marketplace::Ozon,
+            SnapshotSource::Stocks,
+            Utc.with_ymd_and_hms(2026, 8, 21, 3, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 21, 3, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 21, 3, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 21, 3, 0, 0).unwrap(),
+            1,
+            true,
+            SnapshotStatus::Succeeded,
+        )
+        .unwrap();
+        assert_eq!(
+            select_sales_snapshots(query, vec![invalid_source]).err(),
+            Some(ReportingReadError::InvalidPublishedData)
+        );
+        let invalid_period = sales_descriptor(
+            12,
+            first,
+            Utc.with_ymd_and_hms(2026, 8, 21, 3, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 20, 20, 0, 0).unwrap(),
+            SnapshotStatus::Succeeded,
+        );
+        assert_eq!(
+            select_sales_snapshots(query, vec![invalid_period]).err(),
+            Some(ReportingReadError::InvalidPublishedData)
+        );
+        let duplicate_cutoff = Utc.with_ymd_and_hms(2026, 8, 21, 3, 0, 0).unwrap();
+        assert_eq!(
+            select_sales_snapshots(
+                query,
+                vec![
+                    sales_descriptor(
+                        13,
+                        first,
+                        duplicate_cutoff,
+                        full_first_end,
+                        SnapshotStatus::Succeeded
+                    ),
+                    sales_descriptor(
+                        14,
+                        first,
+                        duplicate_cutoff,
+                        full_first_end,
+                        SnapshotStatus::Succeeded
+                    ),
+                ],
+            )
+            .err(),
+            Some(ReportingReadError::InvalidPublishedData)
+        );
+        assert_eq!(
+            select_sales_snapshots(
+                SalesAnalyticsQuery {
+                    date_from: first,
+                    date_to: second,
+                    ..query
+                },
+                vec![
+                    sales_descriptor(
+                        15,
+                        first,
+                        duplicate_cutoff,
+                        full_first_end,
+                        SnapshotStatus::Succeeded
+                    ),
+                    sales_descriptor(
+                        15,
+                        second,
+                        Utc.with_ymd_and_hms(2026, 8, 22, 3, 0, 0).unwrap(),
+                        full_second_end,
+                        SnapshotStatus::Succeeded
+                    ),
+                ],
+            )
+            .err(),
+            Some(ReportingReadError::InvalidPublishedData)
+        );
+        let oversized = BTreeMap::from([(
+            16,
+            (
+                first,
+                sales_descriptor_rows(
+                    16,
+                    first,
+                    duplicate_cutoff,
+                    full_first_end,
+                    SnapshotStatus::Succeeded,
+                    250_001,
+                ),
+            ),
+        )]);
+        assert_eq!(
+            validate_selected_sales_fact_count(&oversized),
+            Err(ReportingReadError::InvalidRequest)
+        );
     }
 
     #[tokio::test]
@@ -3312,6 +3444,30 @@ mod tests {
             .unwrap();
         assert_eq!(
             ready_report_item(&invalid_report_schedule),
+            Err(ReportingReadError::InvalidPublishedData)
+        );
+        let day_row = client
+            .query_one(
+                "SELECT '2026-08-20'::date, NULL::bigint, '1'::text, '2'::text",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(sales_analytics_row(&day_row, SalesAnalyticsGroup::Day).is_ok());
+        let sku_row = client
+            .query_one("SELECT NULL::date, 1001::bigint, '1'::text, '2'::text", &[])
+            .await
+            .unwrap();
+        assert!(sales_analytics_row(&sku_row, SalesAnalyticsGroup::Sku).is_ok());
+        let invalid_dimensions = client
+            .query_one(
+                "SELECT '2026-08-20'::date, 1001::bigint, '1'::text, '2'::text",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sales_analytics_row(&invalid_dimensions, SalesAnalyticsGroup::Day),
             Err(ReportingReadError::InvalidPublishedData)
         );
         drop(client);

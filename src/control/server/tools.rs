@@ -258,30 +258,37 @@ impl ControlMcp {
             return Err("CONTROL_DISABLED: preview launch выключен policy".to_owned());
         }
         let (registry, actor) = self.access_context(&identity)?;
-        let actor_policy = self
-            .policy
-            .actor_policy(&actor.id)
-            .ok_or_else(|| format!("{ACCESS_DENIED}: отсутствует явная control policy binding"))?;
-        let target = actor_policy
+        let Some(actor_policy) = self.policy.actor_policy(&actor.id) else {
+            return Err(format!(
+                "{ACCESS_DENIED}: отсутствует явная control policy binding"
+            ));
+        };
+        let Some(target) = actor_policy
             .ozon_campaign_launch_targets
             .iter()
             .find(|target| {
                 target.account_id == input.spec.account_id && target.skus == input.spec.skus
             })
-            .ok_or_else(|| {
-                format!("{ACCESS_DENIED}: Ozon launch target отсутствует в control policy")
-            })?;
-        let account = registry
+        else {
+            return Err(format!(
+                "{ACCESS_DENIED}: Ozon launch target отсутствует в control policy"
+            ));
+        };
+        let Some(account) = registry
             .accounts
             .iter()
             .find(|account| account.id == target.account_id)
-            .ok_or_else(|| format!("{ACCESS_DENIED}: Ozon account отсутствует в registry"))?;
+        else {
+            return Err(format!(
+                "{ACCESS_DENIED}: Ozon account отсутствует в registry"
+            ));
+        };
         if !actor.can_access_account(account) {
             return Err(format!(
                 "{ACCESS_DENIED}: actor не имеет доступа к Ozon account"
             ));
         }
-        prepare_campaign_launch_manifest(
+        let manifest = prepare_campaign_launch_manifest(
             &actor.id,
             self.policy.version,
             self.policy.revision,
@@ -295,9 +302,11 @@ impl ControlMcp {
             target.target_drr_percent,
             target.target_position,
             input.spec,
-        )
-        .map(Json)
-        .map_err(|error| format!("CONTROL_POLICY_DENIED: {error}"))
+        );
+        match manifest {
+            Ok(manifest) => Ok(Json(manifest)),
+            Err(error) => Err(format!("CONTROL_POLICY_DENIED: {error}")),
+        }
     }
 
     /// Persists one immutable, single-SKU Ozon launch plan after a live
@@ -321,25 +330,28 @@ impl ControlMcp {
             return Err("CONTROL_DISABLED: создание Ozon plan выключено policy".to_owned());
         }
         let (registry, actor) = self.access_context(&identity)?;
-        let actor_policy = self
-            .policy
-            .actor_policy(&actor.id)
-            .ok_or_else(|| format!("{ACCESS_DENIED}: отсутствует Ozon policy binding"))?;
-        let target = actor_policy
+        let Some(actor_policy) = self.policy.actor_policy(&actor.id) else {
+            return Err(format!("{ACCESS_DENIED}: отсутствует Ozon policy binding"));
+        };
+        let Some(target) = actor_policy
             .ozon_campaign_launch_targets
             .iter()
             .find(|target| {
                 target.account_id == input.spec.account_id && target.skus == input.spec.skus
             })
-            .ok_or_else(|| format!("{ACCESS_DENIED}: Ozon launch target отсутствует"))?;
+        else {
+            return Err(format!("{ACCESS_DENIED}: Ozon launch target отсутствует"));
+        };
         if input.spec.skus.len() != 1 {
             return Err("CONTROL_POLICY_DENIED: Ozon plan должен содержать один SKU".to_owned());
         }
-        let account = registry
+        let Some(account) = registry
             .accounts
             .iter()
             .find(|account| account.id == target.account_id)
-            .ok_or_else(|| format!("{ACCESS_DENIED}: Ozon account отсутствует"))?;
+        else {
+            return Err(format!("{ACCESS_DENIED}: Ozon account отсутствует"));
+        };
         if !actor.can_access_account(account) {
             return Err(format!(
                 "{ACCESS_DENIED}: actor не имеет доступа к Ozon account"
@@ -348,7 +360,7 @@ impl ControlMcp {
         let services = self.ozon_services(&input.spec.account_id)?;
         ensure_ozon_sku_not_running(&services.reader, &services.store_id, input.spec.skus[0])
             .await?;
-        let manifest = prepare_campaign_launch_manifest(
+        let manifest = match prepare_campaign_launch_manifest(
             &actor.id,
             self.policy.version,
             self.policy.revision,
@@ -362,8 +374,10 @@ impl ControlMcp {
             target.target_drr_percent,
             target.target_position,
             input.spec,
-        )
-        .map_err(|error| format!("CONTROL_POLICY_DENIED: {error}"))?;
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => return Err(format!("CONTROL_POLICY_DENIED: {error}")),
+        };
         let plan = services
             .plans
             .create(&manifest)
@@ -392,10 +406,9 @@ impl ControlMcp {
             return Err("CONTROL_DISABLED: Ozon approval выключен policy".to_owned());
         }
         let (registry, approver) = self.access_context(&identity)?;
-        let services = self
-            .ozon
-            .as_ref()
-            .ok_or_else(|| "CONTROL_DISABLED: Ozon plan store не настроен".to_owned())?;
+        let Some(services) = self.ozon.as_ref() else {
+            return Err("CONTROL_DISABLED: Ozon plan store не настроен".to_owned());
+        };
         let plan = services
             .plans
             .load(&input.plan_id)
@@ -436,14 +449,12 @@ impl ControlMcp {
             return Err("CONTROL_DISABLED: Ozon apply выключен policy".to_owned());
         }
         let (registry, actor) = self.access_context(&identity)?;
-        let services = self
-            .ozon
-            .as_ref()
-            .ok_or_else(|| "CONTROL_DISABLED: Ozon runtime не настроен".to_owned())?;
-        let writer = services
-            .writer
-            .as_ref()
-            .ok_or_else(|| "CONTROL_DISABLED: Ozon writer не вооружён".to_owned())?;
+        let Some(services) = self.ozon.as_ref() else {
+            return Err("CONTROL_DISABLED: Ozon runtime не настроен".to_owned());
+        };
+        let Some(writer) = services.writer.as_ref() else {
+            return Err("CONTROL_DISABLED: Ozon writer не вооружён".to_owned());
+        };
         let plan = services
             .plans
             .load(&input.plan_id)
@@ -622,6 +633,7 @@ impl ControlMcp {
             campaign_id,
             plan.sku,
             &plan.manifest.create_request.title,
+            plan.manifest.spec.initial_cpc_bid_microrubles,
         )
         .await;
         let readback = match readback {
@@ -680,24 +692,22 @@ impl ControlMcp {
         Parameters(input): Parameters<OzonCampaignPlanInput>,
     ) -> Result<Json<OzonCampaignPlanResult>, String> {
         let (registry, actor) = self.access_context(&identity)?;
-        let services = self
-            .ozon
-            .as_ref()
-            .ok_or_else(|| "CONTROL_DISABLED: Ozon runtime не настроен".to_owned())?;
+        let Some(services) = self.ozon.as_ref() else {
+            return Err("CONTROL_DISABLED: Ozon runtime не настроен".to_owned());
+        };
         let plan = services
             .plans
             .load(&input.plan_id)
             .await
             .map_err(ozon_plan_store_error)?;
-        if actor.id != plan.actor_id
-            || !actor.can_access_account(
-                registry
-                    .accounts
-                    .iter()
-                    .find(|account| account.id == plan.account_id)
-                    .ok_or_else(|| format!("{ACCESS_DENIED}: Ozon account отсутствует"))?,
-            )
-        {
+        let Some(account) = registry
+            .accounts
+            .iter()
+            .find(|account| account.id == plan.account_id)
+        else {
+            return Err(format!("{ACCESS_DENIED}: Ozon account отсутствует"));
+        };
+        if actor.id != plan.actor_id || !actor.can_access_account(account) {
             return Err(format!("{ACCESS_DENIED}: Ozon plan вне actor scope"));
         }
         if plan.status == OzonLaunchStatus::Applied {
@@ -723,6 +733,7 @@ impl ControlMcp {
             campaign_id,
             plan.sku,
             &plan.manifest.spec.title,
+            plan.manifest.spec.initial_cpc_bid_microrubles,
         )
         .await?;
         let plan = services
@@ -1221,7 +1232,7 @@ async fn finish_ozon_write_error(
     Ok(Json(ozon_plan_result(&plan)))
 }
 
-async fn ensure_ozon_sku_not_running(
+pub(super) async fn ensure_ozon_sku_not_running(
     reader: &crate::ozon_performance::PerformanceClient,
     store: &StoreId,
     sku: u64,
@@ -1229,7 +1240,7 @@ async fn ensure_ozon_sku_not_running(
     let mut page = 1_u32;
     let mut visited = 0_usize;
     loop {
-        let response = reader
+        let response = match reader
             .campaigns(
                 store,
                 CampaignsQuery {
@@ -1241,19 +1252,22 @@ async fn ensure_ozon_sku_not_running(
                 },
             )
             .await
-            .map_err(|error| format!("CONTROL_PREFLIGHT_FAILED: {error}"))?;
-        let campaigns = response
-            .get("list")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "CONTROL_PREFLIGHT_FAILED: invalid campaign list".to_owned())?;
+        {
+            Ok(response) => response,
+            Err(error) => return Err(format!("CONTROL_PREFLIGHT_FAILED: {error}")),
+        };
+        let Some(campaigns) = response.get("list").and_then(Value::as_array) else {
+            return Err("CONTROL_PREFLIGHT_FAILED: invalid campaign list".to_owned());
+        };
         for campaign in campaigns {
-            let campaign_id = positive_json_u64(campaign.get("id"))
-                .ok_or_else(|| "CONTROL_PREFLIGHT_FAILED: invalid campaign id".to_owned())?;
+            let Some(campaign_id) = positive_json_u64(campaign.get("id")) else {
+                return Err("CONTROL_PREFLIGHT_FAILED: invalid campaign id".to_owned());
+            };
             visited = visited.saturating_add(1);
             if visited > 1_000 {
                 return Err("CONTROL_PREFLIGHT_FAILED: campaign bound exceeded".to_owned());
             }
-            let products = reader
+            let products = match reader
                 .campaign_products(
                     store,
                     campaign_id,
@@ -1263,11 +1277,13 @@ async fn ensure_ozon_sku_not_running(
                     },
                 )
                 .await
-                .map_err(|error| format!("CONTROL_PREFLIGHT_FAILED: {error}"))?;
-            let rows = products
-                .get("products")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "CONTROL_PREFLIGHT_FAILED: invalid products list".to_owned())?;
+            {
+                Ok(products) => products,
+                Err(error) => return Err(format!("CONTROL_PREFLIGHT_FAILED: {error}")),
+            };
+            let Some(rows) = products.get("products").and_then(Value::as_array) else {
+                return Err("CONTROL_PREFLIGHT_FAILED: invalid products list".to_owned());
+            };
             if rows
                 .iter()
                 .any(|product| positive_json_u64(product.get("sku")) == Some(sku))
@@ -1286,20 +1302,18 @@ async fn ensure_ozon_sku_not_running(
         if campaigns.len() < 100 {
             return Ok(());
         }
-        page = page
-            .checked_add(1)
-            .ok_or_else(|| "CONTROL_PREFLIGHT_FAILED: page overflow".to_owned())?;
+        page = page.saturating_add(1);
     }
 }
 
-async fn find_ozon_campaign_by_title(
+pub(super) async fn find_ozon_campaign_by_title(
     reader: &crate::ozon_performance::PerformanceClient,
     store: &StoreId,
     title: &str,
 ) -> Result<u64, String> {
     let mut matches = Vec::new();
     for page in 1..=100_u32 {
-        let response = reader
+        let response = match reader
             .campaigns(
                 store,
                 CampaignsQuery {
@@ -1311,16 +1325,19 @@ async fn find_ozon_campaign_by_title(
                 },
             )
             .await
-            .map_err(|error| format!("CONTROL_RECONCILIATION_FAILED: {error}"))?;
-        let campaigns = response
-            .get("list")
-            .and_then(Value::as_array)
-            .ok_or_else(|| "CONTROL_RECONCILIATION_FAILED: invalid campaign list".to_owned())?;
+        {
+            Ok(response) => response,
+            Err(error) => return Err(format!("CONTROL_RECONCILIATION_FAILED: {error}")),
+        };
+        let Some(campaigns) = response.get("list").and_then(Value::as_array) else {
+            return Err("CONTROL_RECONCILIATION_FAILED: invalid campaign list".to_owned());
+        };
         for campaign in campaigns {
             if campaign.get("title").and_then(Value::as_str) == Some(title) {
-                matches.push(positive_json_u64(campaign.get("id")).ok_or_else(|| {
-                    "CONTROL_RECONCILIATION_FAILED: invalid campaign id".to_owned()
-                })?);
+                let Some(campaign_id) = positive_json_u64(campaign.get("id")) else {
+                    return Err("CONTROL_RECONCILIATION_FAILED: invalid campaign id".to_owned());
+                };
+                matches.push(campaign_id);
             }
         }
         if campaigns.len() < 100 {
@@ -1334,14 +1351,15 @@ async fn find_ozon_campaign_by_title(
     }
 }
 
-async fn exact_ozon_launch_readback(
+pub(super) async fn exact_ozon_launch_readback(
     reader: &crate::ozon_performance::PerformanceClient,
     store: &StoreId,
     campaign_id: u64,
     sku: u64,
     expected_title: &str,
+    expected_bid: u64,
 ) -> Result<Value, String> {
-    let response = reader
+    let response = match reader
         .campaigns(
             store,
             CampaignsQuery {
@@ -1353,27 +1371,29 @@ async fn exact_ozon_launch_readback(
             },
         )
         .await
-        .map_err(|error| format!("CONTROL_RECONCILIATION_FAILED: {error}"))?;
-    let campaigns = response
-        .get("list")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "CONTROL_RECONCILIATION_FAILED: invalid campaign list".to_owned())?;
-    let campaign = campaigns
+    {
+        Ok(response) => response,
+        Err(error) => return Err(format!("CONTROL_RECONCILIATION_FAILED: {error}")),
+    };
+    let Some(campaigns) = response.get("list").and_then(Value::as_array) else {
+        return Err("CONTROL_RECONCILIATION_FAILED: invalid campaign list".to_owned());
+    };
+    let Some(campaign) = campaigns
         .iter()
         .find(|campaign| positive_json_u64(campaign.get("id")) == Some(campaign_id))
-        .ok_or_else(|| "CONTROL_RECONCILIATION_FAILED: campaign missing".to_owned())?;
-    let title = campaign
-        .get("title")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "CONTROL_RECONCILIATION_FAILED: title missing".to_owned())?;
-    let state = campaign
-        .get("state")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "CONTROL_RECONCILIATION_FAILED: state missing".to_owned())?;
+    else {
+        return Err("CONTROL_RECONCILIATION_FAILED: campaign missing".to_owned());
+    };
+    let Some(title) = campaign.get("title").and_then(Value::as_str) else {
+        return Err("CONTROL_RECONCILIATION_FAILED: title missing".to_owned());
+    };
+    let Some(state) = campaign.get("state").and_then(Value::as_str) else {
+        return Err("CONTROL_RECONCILIATION_FAILED: state missing".to_owned());
+    };
     if title != expected_title || state != "CAMPAIGN_STATE_RUNNING" {
         return Err("CONTROL_RECONCILIATION_FAILED: exact campaign state not proven".to_owned());
     }
-    let products = reader
+    let products = match reader
         .campaign_products(
             store,
             campaign_id,
@@ -1383,27 +1403,29 @@ async fn exact_ozon_launch_readback(
             },
         )
         .await
-        .map_err(|error| format!("CONTROL_RECONCILIATION_FAILED: {error}"))?;
-    let rows = products
-        .get("products")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "CONTROL_RECONCILIATION_FAILED: invalid products list".to_owned())?;
+    {
+        Ok(products) => products,
+        Err(error) => return Err(format!("CONTROL_RECONCILIATION_FAILED: {error}")),
+    };
+    let Some(rows) = products.get("products").and_then(Value::as_array) else {
+        return Err("CONTROL_RECONCILIATION_FAILED: invalid products list".to_owned());
+    };
     if rows.len() != 1
         || positive_json_u64(rows[0].get("sku")) != Some(sku)
-        || positive_json_u64(rows[0].get("targetCir")) != Some(15)
+        || positive_json_u64(rows[0].get("bid")) != Some(expected_bid)
     {
-        return Err("CONTROL_RECONCILIATION_FAILED: exact SKU/DRR not proven".to_owned());
+        return Err("CONTROL_RECONCILIATION_FAILED: exact SKU/bid not proven".to_owned());
     }
     Ok(serde_json::json!({
         "campaign_id": campaign_id.to_string(),
         "sku": sku.to_string(),
         "state": state,
         "title": title,
-        "target_drr_percent": 15,
+        "bid_microrubles": expected_bid,
     }))
 }
 
-fn positive_json_u64(value: Option<&Value>) -> Option<u64> {
+pub(super) fn positive_json_u64(value: Option<&Value>) -> Option<u64> {
     let value = match value? {
         Value::Number(number) => number.as_u64(),
         Value::String(value) => value.parse().ok(),
