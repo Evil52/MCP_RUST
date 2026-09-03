@@ -26,6 +26,7 @@ use super::{
 const MAX_DELIVERY_ATTEMPTS: u8 = 5;
 const MAX_GENERATION_CANDIDATES: u16 = 16;
 const MAIL_CANARY_MAX_AGE: Duration = Duration::hours(24);
+const GENERATION_SOURCE_SETTLE_DELAY: Duration = Duration::minutes(30);
 
 /// First generation retry delay. Each further attempt doubles it, so a batch
 /// that keeps failing backs off to roughly a quarter of an hour before its
@@ -536,6 +537,10 @@ impl PostgresOutboxRepository {
         if limit == 0 || limit > MAX_GENERATION_CANDIDATES {
             return Err(PostgresOutboxError::InvalidDelivery);
         }
+
+        let generation_ready_before = now
+            .checked_sub_signed(GENERATION_SOURCE_SETTLE_DELAY)
+            .ok_or(PostgresOutboxError::InvalidDelivery)?;
         let client = self
             .client
             .acquire()
@@ -550,11 +555,11 @@ impl PostgresOutboxRepository {
                 "SELECT id \
                  FROM daily_reporting.generatable_batches \
                  WHERE scheduled_for <= $1 \
-                   AND deadline_at >= $1 \
-                   AND (retry_after IS NULL OR retry_after <= $1) \
+                   AND deadline_at >= $2 \
+                   AND (retry_after IS NULL OR retry_after <= $2) \
                  ORDER BY scheduled_for, id \
-                 LIMIT $2",
-                &[&now, &i64::from(limit)],
+                 LIMIT $3",
+                &[&generation_ready_before, &now, &i64::from(limit)],
             )
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
