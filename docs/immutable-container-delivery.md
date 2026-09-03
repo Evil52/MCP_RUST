@@ -4,9 +4,11 @@
 
 The repository implements the complete source-to-runtime identity chain. The
 selected registry is the public GitHub Container Registry package
-`ghcr.io/evil52/mcp-rust-runtime`. CI publishes only after all required quality,
-security, coverage and container jobs pass. Production never builds release
-images locally.
+`ghcr.io/evil52/mcp-rust-runtime`. `Rust CI` and `CodeQL` run on the pull
+request, while `Release CD` runs after the protected branch advances. Release
+CD first proves that the release tree is identical to the merged pull request
+tree and that every required PR check succeeded. Production never builds
+release images locally.
 
 The fixed policy is:
 
@@ -22,8 +24,10 @@ The fixed policy is:
   baked into an image;
 - every release image is built for `linux/amd64` and `linux/arm64`, scanned on
   both platforms and receives a GitHub build-provenance attestation;
-- the shared Rust builder cache is populated in parallel on native AMD64 and
-  ARM64 GitHub-hosted runners before the multi-platform image publication jobs;
+- Rust binaries and platform images are built separately on native AMD64 and
+  ARM64 GitHub-hosted runners; no release build uses QEMU;
+- immutable AMD64 and ARM64 image digests are combined into a multi-platform
+  manifest only after both native builds succeed;
 - discovery tags are mutable and cannot be deployment input; installers accept
   only references of the form `ghcr.io/evil52/mcp-rust-runtime@sha256:...`;
 - release evidence and image locks are retained as GitHub Actions artifacts for
@@ -38,14 +42,16 @@ than an inherited repository permission.
 
 The implementation preserves these invariants:
 
-1. CI builds every shipped image for `linux/amd64` and `linux/arm64` from one
-   tested Git SHA.
-2. CI scans the exact multi-platform digest it publishes.
+1. PR CI runs once and tests the source tree that is allowed to enter the
+   protected branch. Release CD rejects a direct or mismatched branch update.
+2. Release CD builds every shipped image for `linux/amd64` and `linux/arm64`
+   from that tested Git SHA and scans both platforms of the assembled digest.
 3. Publication produces `release-images.json`, mapping every logical image to a
    pullable immutable digest. The schema rejects missing, extra or mutable image
    references.
-4. `release.json` binds the Git SHA, source tree, successful workflow run and
-   SHA-256 of `release-images.json`.
+4. `release.json` binds the Git SHA, source tree, successful `Release CD`
+   workflow run and SHA-256 of `release-images.json`. Historical artifacts
+   created by the former combined `Rust CI` workflow remain verifiable.
 5. Installers revalidate both files, query GitHub for the successful workflow,
    verify the GitHub provenance attestation, pull the digest, verify
    `org.opencontainers.image.revision`, and invoke Compose with `--no-build`.
@@ -65,14 +71,18 @@ The lock contains the exact thirteen deployable image identities: `server`,
 The six Rust runtime Dockerfiles intentionally have an identical `builder`
 stage. After the required gates pass, `prime-rust-release-cache` compiles every
 Rust binary once for each target platform and exports that completed layer to
-the `release-rust-binaries` GitHub Actions cache scope with a cache-only output.
-The parallel image jobs import that scope, assemble their separate minimal
-runtime images, and continue to publish, scan and attest each immutable digest
-independently.
+platform-specific GitHub Actions cache scopes with a cache-only output. The
+platform image jobs run on the matching native architecture, import only that
+platform's completed Rust layer, and publish immutable candidate digests. The
+assembly jobs combine the two digests with `docker buildx imagetools create`,
+verify that the manifest contains exactly AMD64 and ARM64, scan both platforms,
+and attest the final immutable digest.
 
-The shared scope is written only by the prime job. Each parallel publisher
-writes only its image-specific cache scope, so concurrent jobs cannot overwrite
-the common cache. No credentials or runtime configuration enter the builder;
+Each shared platform scope is written only by its prime job. Every native
+publisher writes only its image-and-architecture-specific cache scope, so
+concurrent jobs cannot overwrite the common cache. Even with a cold cache, ARM64
+compilation runs natively instead of spending hours under emulation. No
+credentials or runtime configuration enter the builder;
 its inputs are the tested `Cargo.toml`, `Cargo.lock`, `vendor/`, and `src/`
 tree. `scripts/test-shared-rust-image-builder.sh` fails CI if a Dockerfile's
 builder stage or expected runtime artifact drifts from this contract.
@@ -86,7 +96,7 @@ builder stage or expected runtime artifact drifts from this contract.
    then under **Danger Zone** choose **Change visibility** and `Public`. GitHub
    requires the package name as confirmation and does not allow a public package
    to be made private again.
-4. Re-run the release workflow. It checks `public` visibility before and after
+4. Re-run `Release CD`. It checks `public` visibility before and after
    every publish, so a missing transition or later policy drift blocks releases.
 5. Do not configure a production GHCR token. Public container packages support
    anonymous pulls.

@@ -1,0 +1,552 @@
+name: Release CD
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  GHCR_PACKAGE: ghcr.io/evil52/mcp-rust-runtime
+
+jobs:
+  verify-tested-tree:
+    name: Verify tested PR tree
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout the exact release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require the release tree to match a successful merged PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          ./scripts/verify-merged-pr-release.sh
+          "$GITHUB_SHA"
+          "$GITHUB_REPOSITORY"
+          "$GITHUB_REF_NAME"
+          target/release-validation/tested-pr.json
+
+      - name: Publish tested PR evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-ozon-tested-pr-${{ github.sha }}
+          path: target/release-validation/tested-pr.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  prime-rust-release-cache:
+    name: Prime Rust binaries (${{ matrix.arch }})
+    needs: [verify-tested-tree]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            cache_scope: release-rust-binaries-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            cache_scope: release-rust-binaries-arm64
+    steps:
+      - name: Checkout the exact release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Compile every Rust runtime binary for ${{ matrix.platform }}
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          target: builder
+          platforms: ${{ matrix.platform }}
+          outputs: type=cacheonly
+          cache-from: |-
+            type=gha,scope=${{ matrix.cache_scope }}
+            type=gha,scope=release-rust-binaries
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }},timeout=20m
+          provenance: false
+          sbom: false
+
+  publish-platform-images:
+    name: Build ${{ matrix.image.id }} (${{ matrix.platform.arch }})
+    needs: [verify-tested-tree, prime-rust-release-cache]
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        image:
+          - id: server
+            context: .
+            dockerfile: Dockerfile
+          - id: control
+            context: .
+            dockerfile: Dockerfile.control
+          - id: position-db
+            context: position-monitor
+            dockerfile: position-monitor/Dockerfile
+          - id: position-collector
+            context: .
+            dockerfile: Dockerfile.position-collector
+          - id: report-collector
+            context: .
+            dockerfile: Dockerfile.report-collector
+          - id: report-worker
+            context: .
+            dockerfile: Dockerfile.report-worker
+          - id: wb-automation
+            context: .
+            dockerfile: Dockerfile.wb-automation-shadow
+          - id: ozon-egress
+            context: .
+            dockerfile: Dockerfile.ozon-egress
+          - id: control-ingress
+            context: .
+            dockerfile: Dockerfile.control-ingress
+          - id: control-auth-egress
+            context: .
+            dockerfile: Dockerfile.control-auth-egress
+          - id: control-ozon-write-egress
+            context: .
+            dockerfile: Dockerfile.control-ozon-write-egress
+          - id: control-write-egress
+            context: .
+            dockerfile: Dockerfile.control-write-egress
+          - id: mail-egress
+            context: .
+            dockerfile: Dockerfile.mail-egress
+        platform:
+          - arch: amd64
+            name: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            name: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout the exact release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require a public GHCR package
+        env:
+          GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+        run: |
+          if [[ -z "$GHCR_PUBLISH_TOKEN" ]]; then
+            echo "GHCR_PUBLISH_TOKEN with only write:packages is required." >&2
+            exit 1
+          fi
+          response="$RUNNER_TEMP/ghcr-package.json"
+          status="$(curl --silent --show-error \
+            --header "Authorization: Bearer $GHCR_PUBLISH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --output "$response" --write-out '%{http_code}' \
+            https://api.github.com/users/Evil52/packages/container/mcp-rust-runtime)"
+          test "$status" = "200"
+          jq -e '.visibility == "public"' "$response" >/dev/null \
+            || { echo "existing GHCR package is not public" >&2; exit 1; }
+
+      - name: Log in to GHCR publisher
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: Evil52
+          password: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build and publish the native platform candidate
+        id: publish
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          platforms: ${{ matrix.platform.name }}
+          push: true
+          tags: >-
+            ${{ env.GHCR_PACKAGE }}:candidate-${{ github.sha }}-${{ matrix.image.id }}-${{ matrix.platform.arch }}
+          build-args: MCP_RELEASE_GIT_SHA=${{ github.sha }}
+          cache-from: |-
+            type=gha,scope=release-${{ matrix.image.id }}-${{ matrix.platform.arch }}
+            type=gha,scope=release-${{ matrix.image.id }}
+            type=gha,scope=release-rust-binaries-${{ matrix.platform.arch }}
+          cache-to: >-
+            type=gha,mode=max,scope=release-${{ matrix.image.id }}-${{ matrix.platform.arch }}
+          provenance: false
+          sbom: false
+
+      - name: Confirm package remained public
+        env:
+          GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+        run: |
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GHCR_PUBLISH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            https://api.github.com/users/Evil52/packages/container/mcp-rust-runtime \
+            | jq -e '.visibility == "public"' >/dev/null
+
+      - name: Inspect the published native image
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+          RELEASE_SHA: ${{ github.sha }}
+          EXPECTED_ARCH: ${{ matrix.platform.arch }}
+          PLATFORM: ${{ matrix.platform.name }}
+        run: |
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Buildx returned an invalid platform image digest." >&2
+            exit 1
+          fi
+          reference="$GHCR_PACKAGE@$IMAGE_DIGEST"
+          docker pull --platform "$PLATFORM" "$reference"
+          test "$(docker image inspect --format '{{.Architecture}}' "$reference")" \
+            = "$EXPECTED_ARCH"
+          test "$(docker image inspect \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+            "$reference")" = "$RELEASE_SHA"
+          docker image rm "$reference" >/dev/null
+
+      - name: Write native platform fragment
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          mkdir -p target/platform-image-fragment
+          jq -n \
+            --arg id "${{ matrix.image.id }}" \
+            --arg arch "${{ matrix.platform.arch }}" \
+            --arg platform "${{ matrix.platform.name }}" \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg reference "$GHCR_PACKAGE@$IMAGE_DIGEST" '
+            {
+              schema_version: 1,
+              id: $id,
+              arch: $arch,
+              platform: $platform,
+              git_sha: $git_sha,
+              repository: $repository,
+              reference: $reference
+            }
+          ' >"target/platform-image-fragment/${{ matrix.image.id }}-${{ matrix.platform.arch }}.json"
+
+      - name: Publish native platform fragment
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: >-
+            mcp-ozon-platform-${{ matrix.image.id }}-${{ matrix.platform.arch }}-${{ github.sha }}
+          path: >-
+            target/platform-image-fragment/${{ matrix.image.id }}-${{ matrix.platform.arch }}.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  assemble-images:
+    name: Assemble ${{ matrix.id }}
+    needs: [publish-platform-images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        id:
+          - server
+          - control
+          - position-db
+          - position-collector
+          - report-collector
+          - report-worker
+          - wb-automation
+          - ozon-egress
+          - control-ingress
+          - control-auth-egress
+          - control-ozon-write-egress
+          - control-write-egress
+          - mail-egress
+    steps:
+      - name: Checkout the exact release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download both native platform fragments
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mcp-ozon-platform-${{ matrix.id }}-*-${{ github.sha }}
+          path: target/platform-image-fragments
+          merge-multiple: true
+
+      - name: Require a public GHCR package
+        env:
+          GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+        run: |
+          if [[ -z "$GHCR_PUBLISH_TOKEN" ]]; then
+            echo "GHCR_PUBLISH_TOKEN with only write:packages is required." >&2
+            exit 1
+          fi
+          response="$RUNNER_TEMP/ghcr-package.json"
+          status="$(curl --silent --show-error \
+            --header "Authorization: Bearer $GHCR_PUBLISH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --output "$response" --write-out '%{http_code}' \
+            https://api.github.com/users/Evil52/packages/container/mcp-rust-runtime)"
+          test "$status" = "200"
+          jq -e '.visibility == "public"' "$response" >/dev/null \
+            || { echo "existing GHCR package is not public" >&2; exit 1; }
+
+      - name: Log in to GHCR publisher
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: Evil52
+          password: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Assemble and verify the multi-platform manifest
+        id: manifest
+        run: |
+          fragment_dir=target/platform-image-fragments
+          amd64_fragment="$fragment_dir/${{ matrix.id }}-amd64.json"
+          arm64_fragment="$fragment_dir/${{ matrix.id }}-arm64.json"
+          test "$(find "$fragment_dir" -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')" = "2"
+          for identity in \
+            "amd64|linux/amd64|$amd64_fragment" \
+            "arm64|linux/arm64|$arm64_fragment"; do
+            IFS='|' read -r arch platform fragment <<<"$identity"
+            jq -e \
+              --arg id "${{ matrix.id }}" \
+              --arg arch "$arch" \
+              --arg platform "$platform" \
+              --arg git_sha "$GITHUB_SHA" \
+              --arg repository "$GITHUB_REPOSITORY" '
+                .schema_version == 1
+                and .id == $id
+                and .arch == $arch
+                and .platform == $platform
+                and .git_sha == $git_sha
+                and .repository == $repository
+                and (.reference | test(
+                  "^ghcr\\.io/evil52/mcp-rust-runtime@sha256:[0-9a-f]{64}$"
+                ))
+                and (keys | sort == [
+                  "arch", "git_sha", "id", "platform", "reference",
+                  "repository", "schema_version"
+                ])
+              ' "$fragment" >/dev/null
+          done
+          amd64_reference="$(jq -r '.reference' "$amd64_fragment")"
+          arm64_reference="$(jq -r '.reference' "$arm64_fragment")"
+          amd64_digest="${amd64_reference##*@}"
+          arm64_digest="${arm64_reference##*@}"
+          candidate_tag="$GHCR_PACKAGE:candidate-$GITHUB_SHA-${{ matrix.id }}"
+          mkdir -p target/release-image-fragment
+          docker buildx imagetools create \
+            --tag "$candidate_tag" \
+            --metadata-file target/release-image-fragment/manifest-metadata.json \
+            "$amd64_reference" \
+            "$arm64_reference"
+          image_digest="$(jq -er \
+            '.["containerimage.descriptor"].digest' \
+            target/release-image-fragment/manifest-metadata.json)"
+          if [[ ! "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Buildx returned an invalid multi-platform digest." >&2
+            exit 1
+          fi
+          reference="$GHCR_PACKAGE@$image_digest"
+          docker buildx imagetools inspect "$reference" \
+            --format '{{json .Manifest}}' \
+            >target/release-image-fragment/manifest.json
+          jq -e \
+            --arg image_digest "$image_digest" \
+            --arg amd64_digest "$amd64_digest" \
+            --arg arm64_digest "$arm64_digest" '
+              .digest == $image_digest
+              and (.manifests | length == 2)
+              and any(
+                .manifests[];
+                .platform.os == "linux"
+                and .platform.architecture == "amd64"
+                and .digest == $amd64_digest
+              )
+              and any(
+                .manifests[];
+                .platform.os == "linux"
+                and .platform.architecture == "arm64"
+                and .digest == $arm64_digest
+              )
+            ' target/release-image-fragment/manifest.json >/dev/null
+          echo "image_digest=$image_digest" >>"$GITHUB_OUTPUT"
+
+      - name: Confirm package remained public
+        env:
+          GHCR_PUBLISH_TOKEN: ${{ secrets.GHCR_PUBLISH_TOKEN }}
+        run: |
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer $GHCR_PUBLISH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            https://api.github.com/users/Evil52/packages/container/mcp-rust-runtime \
+            | jq -e '.visibility == "public"' >/dev/null
+
+      - name: Attest the immutable multi-platform digest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.GHCR_PACKAGE }}
+          subject-digest: ${{ steps.manifest.outputs.image_digest }}
+          push-to-registry: true
+
+      - name: Install verified Trivy
+        run: |
+          trivy_dir="$(mktemp -d)"
+          curl --fail --silent --show-error --location \
+            https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-64bit.tar.gz \
+            --output "$trivy_dir/trivy.tar.gz"
+          echo '2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b  trivy.tar.gz' \
+            | (cd "$trivy_dir" && sha256sum --check)
+          tar --extract --gzip --file "$trivy_dir/trivy.tar.gz" --directory "$trivy_dir"
+          sudo install --mode 0755 "$trivy_dir/trivy" /usr/local/bin/trivy
+
+      - name: Scan and inspect both manifest platforms
+        env:
+          IMAGE_DIGEST: ${{ steps.manifest.outputs.image_digest }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          reference="$GHCR_PACKAGE@$IMAGE_DIGEST"
+          for identity in linux/amd64:amd64 linux/arm64:arm64; do
+            platform="${identity%:*}"
+            architecture="${identity##*:}"
+            trivy image \
+              --platform "$platform" \
+              --scanners vuln,secret \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              "$reference"
+            docker pull --platform "$platform" "$reference"
+            test "$(docker image inspect --format '{{.Architecture}}' "$reference")" \
+              = "$architecture"
+            test "$(docker image inspect \
+              --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+              "$reference")" = "$RELEASE_SHA"
+            docker image rm "$reference" >/dev/null
+          done
+
+      - name: Write immutable image fragment
+        env:
+          IMAGE_DIGEST: ${{ steps.manifest.outputs.image_digest }}
+        run: |
+          jq -n \
+            --arg id "${{ matrix.id }}" \
+            --arg git_sha "$GITHUB_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg reference "$GHCR_PACKAGE@$IMAGE_DIGEST" '
+            {
+              schema_version: 1,
+              id: $id,
+              git_sha: $git_sha,
+              repository: $repository,
+              platforms: ["linux/amd64", "linux/arm64"],
+              reference: $reference
+            }
+          ' >"target/release-image-fragment/${{ matrix.id }}.json"
+
+      - name: Publish verified image fragment
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-ozon-image-${{ matrix.id }}-${{ github.sha }}
+          path: target/release-image-fragment/${{ matrix.id }}.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release-evidence:
+    name: Release evidence
+    needs: [verify-tested-tree, assemble-images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout the exact release revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download every verified image fragment
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mcp-ozon-image-*-${{ github.sha }}
+          path: target/release-image-fragments
+          merge-multiple: true
+
+      - name: Download tested PR evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mcp-ozon-tested-pr-${{ github.sha }}
+          path: target/release-evidence
+
+      - name: Write immutable release image lock
+        run: >-
+          ./scripts/create-release-image-lock.sh
+          target/release-image-fragments
+          "$GITHUB_SHA"
+          "$GITHUB_REPOSITORY"
+          target/release-evidence/release-images.json
+
+      - name: Write immutable release identity
+        run: >-
+          ./scripts/write-release-evidence.sh
+          "$GITHUB_SHA"
+          "$GITHUB_REPOSITORY"
+          "$GITHUB_RUN_ID"
+          target/release-evidence/release-images.json
+          target/release-evidence/release.json
+
+      - name: Publish release identity after every required gate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-ozon-release-${{ github.sha }}
+          path: |
+            target/release-evidence/release.json
+            target/release-evidence/release-images.json
+            target/release-evidence/tested-pr.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

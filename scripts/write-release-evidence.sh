@@ -55,7 +55,7 @@ jq -n \
   --argjson run_id "$run_id" \
   '{
     schema_version: 2,
-    workflow_path: ".github/workflows/ci.yml",
+    workflow_path: ".github/workflows/release.yml",
     git_sha: $git_sha,
     source_tree: $source_tree,
     image_lock_sha256: $image_lock_sha256,
