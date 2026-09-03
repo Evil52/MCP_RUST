@@ -426,42 +426,52 @@ jobs:
             --expect-overload
 
   prime-rust-release-cache:
-    name: Prime Rust release cache
+    name: Prime Rust release cache (${{ matrix.arch }})
     if: >-
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     needs: [quality, rust-version, coverage, dependency-security, container]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            platform: linux/amd64
+            cache_scope: release-rust-binaries-amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            cache_scope: release-rust-binaries-arm64
     steps:
       - name: Checkout the exact tested revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-        with:
-          platforms: amd64,arm64
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
-      # All six Rust Dockerfiles have the same builder stage. Build it once per
-      # platform and export the completed binary layer under a read-only scope;
-      # the parallel image jobs below keep their own writable cache scopes.
-      - name: Compile every Rust runtime binary once per platform
+      # The Rust Dockerfiles share the same builder stage. Compile it once on a
+      # native runner for this platform and export the completed binary layer
+      # under a platform-specific read-only scope. This keeps ARM64 compilation
+      # off QEMU while the image jobs below retain their own writable scopes.
+      - name: Compile every Rust runtime binary for ${{ matrix.platform }}
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: Dockerfile
           target: builder
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           outputs: type=cacheonly
-          cache-from: type=gha,scope=release-rust-binaries
-          cache-to: type=gha,mode=max,scope=release-rust-binaries,timeout=20m
+          cache-from: |-
+            type=gha,scope=${{ matrix.cache_scope }}
+            type=gha,scope=release-rust-binaries
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }},timeout=20m
           provenance: false
           sbom: false
 
@@ -488,13 +498,15 @@ jobs:
             dockerfile: Dockerfile
             cache_from: |-
               type=gha,scope=release-server
-              type=gha,scope=release-rust-binaries
+              type=gha,scope=release-rust-binaries-amd64
+              type=gha,scope=release-rust-binaries-arm64
           - id: control
             context: .
             dockerfile: Dockerfile.control
             cache_from: |-
               type=gha,scope=release-control
-              type=gha,scope=release-rust-binaries
+              type=gha,scope=release-rust-binaries-amd64
+              type=gha,scope=release-rust-binaries-arm64
           - id: position-db
             context: position-monitor
             dockerfile: position-monitor/Dockerfile
@@ -504,25 +516,29 @@ jobs:
             dockerfile: Dockerfile.position-collector
             cache_from: |-
               type=gha,scope=release-position-collector
-              type=gha,scope=release-rust-binaries
+              type=gha,scope=release-rust-binaries-amd64
+              type=gha,scope=release-rust-binaries-arm64
           - id: report-collector
             context: .
             dockerfile: Dockerfile.report-collector
             cache_from: |-
               type=gha,scope=release-report-collector
-              type=gha,scope=release-rust-binaries
+              type=gha,scope=release-rust-binaries-amd64
+              type=gha,scope=release-rust-binaries-arm64
           - id: report-worker
             context: .
             dockerfile: Dockerfile.report-worker
             cache_from: |-
               type=gha,scope=release-report-worker
-              type=gha,scope=release-rust-binaries
+              type=gha,scope=release-rust-binaries-amd64
+              type=gha,scope=release-rust-binaries-arm64
           - id: wb-automation
             context: .
             dockerfile: Dockerfile.wb-automation-shadow
             cache_from: |-
               type=gha,scope=release-wb-automation
-              type=gha,scope=release-rust-binaries
+              type=gha,scope=release-rust-binaries-amd64
+              type=gha,scope=release-rust-binaries-arm64
           - id: ozon-egress
             context: .
             dockerfile: Dockerfile.ozon-egress
