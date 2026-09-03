@@ -106,7 +106,12 @@ pub fn evaluate_ozon_campaign_guard(
     if spend_minor >= spend_cap_minor {
         return Ok(Some(OzonGuardStopReason::SpendCapReached));
     }
-    let drr_exceeded = spend_minor > 0
+    // A new campaign has no meaningful DRR before Ozon attributes its first
+    // order. Treating positive spend divided by zero revenue as an immediate
+    // breach shuts a test down after its first click and races the attribution
+    // window. The explicit per-SKU spend cap remains the hard zero-revenue
+    // backstop.
+    let drr_exceeded = attributed_revenue_minor > 0
         && u128::from(spend_minor) * 100
             > u128::from(attributed_revenue_minor) * u128::from(target_drr_percent);
     Ok(drr_exceeded.then_some(OzonGuardStopReason::DrrCapExceeded))
@@ -137,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn drr_boundary_is_inclusive_and_zero_revenue_stops_after_spend() {
+    fn drr_boundary_is_inclusive_and_zero_revenue_uses_the_spend_cap() {
         assert_eq!(
             evaluate_ozon_campaign_guard(15_000, 100_000, 2_000_000_000, 15),
             Ok(None)
@@ -148,7 +153,11 @@ mod tests {
         );
         assert_eq!(
             evaluate_ozon_campaign_guard(1, 0, 2_000_000_000, 15),
-            Ok(Some(OzonGuardStopReason::DrrCapExceeded))
+            Ok(None)
+        );
+        assert_eq!(
+            evaluate_ozon_campaign_guard(200_000, 0, 2_000_000_000, 15),
+            Ok(Some(OzonGuardStopReason::SpendCapReached))
         );
         assert_eq!(
             evaluate_ozon_campaign_guard(0, 0, 2_000_000_000, 15),

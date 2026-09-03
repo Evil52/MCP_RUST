@@ -36,7 +36,8 @@ jq -e \
   ])
   and (.images | keys | sort == [
     "control", "control-auth-egress", "control-ingress",
-    "control-write-egress", "mail-egress", "ozon-egress",
+    "control-ozon-write-egress", "control-write-egress", "mail-egress",
+    "ozon-egress",
     "position-collector", "position-db", "report-collector",
     "report-worker", "server", "wb-automation"
   ])

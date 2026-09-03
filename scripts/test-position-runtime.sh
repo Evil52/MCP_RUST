@@ -4,6 +4,7 @@ set -euo pipefail
 
 : "${POSITION_REPOSITORY_TEST_ADMIN_URL:?run through with-position-test-db.sh}"
 : "${POSITION_REPOSITORY_TEST_COLLECTOR_URL:?run through with-position-test-db.sh}"
+: "${POSITION_REPOSITORY_TEST_READER_URL:?run through with-position-test-db.sh}"
 : "${POSITION_COLLECTOR_DATABASE_URL:?run through with-position-test-db.sh}"
 : "${REPORT_OUTBOX_TEST_WORKER_URL:?run through with-position-test-db.sh}"
 : "${REPORT_SNAPSHOT_TEST_COLLECTOR_URL:?run through with-position-test-db.sh}"
@@ -15,6 +16,7 @@ set -euo pipefail
 # while still passing locally.
 cargo test --locked \
   --test position_postgres_repository \
+  --test ozon_bid_position_reader \
   --test postgres_session_hardening \
   --test reporting_postgres_outbox \
   --test reporting_postgres_snapshots \

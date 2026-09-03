@@ -1974,6 +1974,18 @@ check_contains \
   "$project_dir/position-monitor/control-write-egress/squid.conf" \
   "http_access deny all"
 check_contains \
+  "Ozon control write egress: proxy permits only the Performance API host" \
+  "$project_dir/position-monitor/control-ozon-write-egress/squid.conf" \
+  "acl ozon_performance_api dstdomain api-performance.ozon.ru"
+check_contains \
+  "Ozon control write egress: proxy applies exact CONNECT/TLS policy" \
+  "$project_dir/position-monitor/control-ozon-write-egress/squid.conf" \
+  "http_access allow connect ozon_performance_api tls_port"
+check_contains \
+  "Ozon control write egress: proxy denies every other destination" \
+  "$project_dir/position-monitor/control-ozon-write-egress/squid.conf" \
+  "http_access deny all"
+check_contains \
   "WB automation runtime: legacy state parent is private to the automation user" \
   "$project_dir/Dockerfile.wb-automation-shadow" \
   "&& chmod 0700 /var/lib/mcp-ozon-legacy"

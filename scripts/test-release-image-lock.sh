@@ -13,7 +13,8 @@ trap cleanup EXIT
 git_sha="$(printf 'a%.0s' {1..40})"
 repository="Evil52/MCP_RUST"
 ids=(
-  control control-auth-egress control-ingress control-write-egress
+  control control-auth-egress control-ingress control-ozon-write-egress
+  control-write-egress
   mail-egress ozon-egress position-collector position-db report-collector
   report-worker server wb-automation
 )

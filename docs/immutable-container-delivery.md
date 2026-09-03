@@ -22,6 +22,8 @@ The fixed policy is:
   baked into an image;
 - every release image is built for `linux/amd64` and `linux/arm64`, scanned on
   both platforms and receives a GitHub build-provenance attestation;
+- the shared Rust builder cache is populated in parallel on native AMD64 and
+  ARM64 GitHub-hosted runners before the multi-platform image publication jobs;
 - discovery tags are mutable and cannot be deployment input; installers accept
   only references of the form `ghcr.io/evil52/mcp-rust-runtime@sha256:...`;
 - release evidence and image locks are retained as GitHub Actions artifacts for
@@ -52,9 +54,10 @@ The implementation preserves these invariants:
 7. Production has anonymous, read-only registry access. CI's publish identity
    is separate and unavailable to the runtime.
 
-The lock contains the exact twelve deployable image identities: `server`,
-`control`, `control-ingress`, `control-auth-egress`, `control-write-egress`,
-`mail-egress`, `ozon-egress`, `position-db`, `position-collector`,
+The lock contains the exact thirteen deployable image identities: `server`,
+`control`, `control-ingress`, `control-auth-egress`,
+`control-ozon-write-egress`, `control-write-egress`, `mail-egress`,
+`ozon-egress`, `position-db`, `position-collector`,
 `report-collector`, `report-worker`, and `wb-automation`.
 
 ## Rust build cache topology

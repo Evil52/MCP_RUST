@@ -39,6 +39,8 @@ pub enum OzonStaticGuardError {
     ScopeMismatch,
     #[error("static Ozon guard entry has invalid data")]
     InvalidGuard,
+    #[error("static Ozon dynamic bid control has invalid bounds")]
+    InvalidDynamicBidControl,
 }
 
 /// One campaign a static guard run may act on.
@@ -49,10 +51,31 @@ pub struct OzonStaticCampaignGuard {
     pub max_cpc_bid_microrubles: u64,
 }
 
+/// Optional position-based bid controls from the reviewed static guard file.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OzonStaticDynamicBidControl {
+    pub position_store_id: String,
+    pub position_region_name: String,
+    pub target_position: u16,
+    pub bid_step_microrubles: u64,
+    pub cooldown_seconds: u64,
+    pub max_position_age_seconds: u64,
+}
+
+/// Fully validated contents of an operator-authored static guard file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OzonStaticGuardConfig {
+    pub guards: Vec<OzonStaticCampaignGuard>,
+    pub dynamic_bid_control: Option<OzonStaticDynamicBidControl>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StaticGuardFile {
     account_id: String,
+    #[serde(default)]
+    dynamic_bid_control: Option<OzonStaticDynamicBidControl>,
     guards: Vec<StaticGuardEntry>,
 }
 
@@ -85,10 +108,10 @@ const fn default_max_cpc_bid_microrubles() -> u64 {
 /// across the file: two entries naming one campaign, or one SKU reached through
 /// two campaigns, would let a single run apply two different corridors to the
 /// same target.
-pub fn parse_ozon_static_guards(
+pub fn parse_ozon_static_guard_config(
     bytes: &[u8],
     expected_account_id: &str,
-) -> Result<Vec<OzonStaticCampaignGuard>, OzonStaticGuardError> {
+) -> Result<OzonStaticGuardConfig, OzonStaticGuardError> {
     if bytes.is_empty() || bytes.len() > MAX_OZON_STATIC_GUARD_FILE_BYTES {
         return Err(OzonStaticGuardError::InvalidSize);
     }
@@ -100,9 +123,24 @@ pub fn parse_ozon_static_guards(
     {
         return Err(OzonStaticGuardError::ScopeMismatch);
     }
+    if let Some(dynamic) = config.dynamic_bid_control.as_ref()
+        && (dynamic.position_store_id != expected_account_id
+            || dynamic.position_region_name.is_empty()
+            || dynamic.position_region_name.trim() != dynamic.position_region_name
+            || dynamic.position_region_name.len() > 128
+            || dynamic.position_region_name.chars().any(char::is_control)
+            || dynamic.target_position == 0
+            || dynamic.bid_step_microrubles == 0
+            || !dynamic.bid_step_microrubles.is_multiple_of(1_000_000)
+            || dynamic.cooldown_seconds != 1_800
+            || dynamic.max_position_age_seconds < dynamic.cooldown_seconds)
+    {
+        return Err(OzonStaticGuardError::InvalidDynamicBidControl);
+    }
+    let dynamic_bid_control = config.dynamic_bid_control;
     let mut campaigns = std::collections::BTreeSet::new();
     let mut skus = std::collections::BTreeSet::new();
-    config
+    let guards = config
         .guards
         .into_iter()
         .map(|entry| {
@@ -139,7 +177,22 @@ pub fn parse_ozon_static_guards(
                 max_cpc_bid_microrubles: entry.max_cpc_bid_microrubles,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OzonStaticGuardConfig {
+        guards,
+        dynamic_bid_control,
+    })
+}
+
+/// Validates and returns the campaign guards, ignoring optional bid controls.
+///
+/// This compatibility entry point keeps callers that need only the guard list
+/// on the same fail-closed parser as callers that consume the whole config.
+pub fn parse_ozon_static_guards(
+    bytes: &[u8],
+    expected_account_id: &str,
+) -> Result<Vec<OzonStaticCampaignGuard>, OzonStaticGuardError> {
+    parse_ozon_static_guard_config(bytes, expected_account_id).map(|config| config.guards)
 }
 
 #[cfg(test)]
@@ -147,7 +200,7 @@ mod tests {
     use super::{
         DEFAULT_OZON_STATIC_MAX_CPC_BID_MICROROUBLES, DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES,
         MAX_OZON_STATIC_GUARD_FILE_BYTES, MAX_OZON_STATIC_GUARDS, OzonStaticGuardError,
-        parse_ozon_static_guards,
+        parse_ozon_static_guard_config, parse_ozon_static_guards,
     };
 
     const ACCOUNT: &str = "furnitura_dlya_doma";
@@ -169,7 +222,15 @@ mod tests {
     #[test]
     fn the_shipped_guard_file_parses_into_the_documented_corridor() {
         let bytes = include_bytes!("../../../config/ozon-furnitura-cpc7-live.json");
-        let guards = parse_ozon_static_guards(bytes, ACCOUNT).unwrap();
+        let config = parse_ozon_static_guard_config(bytes, ACCOUNT).unwrap();
+        let dynamic = config.dynamic_bid_control.as_ref().unwrap();
+        assert_eq!(dynamic.position_store_id, ACCOUNT);
+        assert_eq!(dynamic.position_region_name, "Москва");
+        assert_eq!(dynamic.target_position, 30);
+        assert_eq!(dynamic.bid_step_microrubles, 1_000_000);
+        assert_eq!(dynamic.cooldown_seconds, 1_800);
+        assert_eq!(dynamic.max_position_age_seconds, 2_700);
+        let guards = config.guards;
         assert_eq!(guards.len(), 5);
         for guard in &guards {
             // Omitting the corridor in the file must mean the reviewed default,
@@ -192,6 +253,65 @@ mod tests {
         assert_eq!(
             parse_ozon_static_guards(bytes, "another_account"),
             Err(OzonStaticGuardError::ScopeMismatch)
+        );
+    }
+
+    #[test]
+    fn dynamic_bid_control_is_optional_and_fails_closed_on_invalid_bounds() {
+        assert!(
+            parse_ozon_static_guard_config(&file(&[entry(1, 10)]), ACCOUNT)
+                .unwrap()
+                .dynamic_bid_control
+                .is_none()
+        );
+
+        let valid = serde_json::json!({
+            "position_store_id": ACCOUNT,
+            "position_region_name": "Москва",
+            "target_position": 30,
+            "bid_step_microrubles": 1_000_000_u64,
+            "cooldown_seconds": 1_800,
+            "max_position_age_seconds": 2_700
+        });
+        for overrides in [
+            serde_json::json!({"position_store_id": "another_account"}),
+            serde_json::json!({"position_region_name": ""}),
+            serde_json::json!({"position_region_name": " Москва"}),
+            serde_json::json!({"position_region_name": "a".repeat(129)}),
+            serde_json::json!({"position_region_name": "Москва\n"}),
+            serde_json::json!({"target_position": 0}),
+            serde_json::json!({"bid_step_microrubles": 0}),
+            serde_json::json!({"bid_step_microrubles": 1_000_001_u64}),
+            serde_json::json!({"cooldown_seconds": 1_799}),
+            serde_json::json!({"max_position_age_seconds": 1_799}),
+        ] {
+            let mut dynamic = valid.clone();
+            for (field, value) in overrides.as_object().unwrap() {
+                dynamic[field] = value.clone();
+            }
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "account_id": ACCOUNT,
+                "dynamic_bid_control": dynamic,
+                "guards": [entry(1, 10)]
+            }))
+            .unwrap();
+            assert_eq!(
+                parse_ozon_static_guard_config(&bytes, ACCOUNT),
+                Err(OzonStaticGuardError::InvalidDynamicBidControl)
+            );
+        }
+
+        let mut unknown = valid;
+        unknown["extra"] = serde_json::json!(true);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "account_id": ACCOUNT,
+            "dynamic_bid_control": unknown,
+            "guards": [entry(1, 10)]
+        }))
+        .unwrap();
+        assert_eq!(
+            parse_ozon_static_guard_config(&bytes, ACCOUNT),
+            Err(OzonStaticGuardError::InvalidFormat)
         );
     }
 
