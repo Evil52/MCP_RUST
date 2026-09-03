@@ -244,6 +244,36 @@ mod tests {
     }
 
     #[test]
+    fn action_reasons_have_stable_audit_labels() {
+        for (reason, expected) in [
+            (OzonBidPacingHoldReason::Cooldown, "cooldown"),
+            (
+                OzonBidPacingHoldReason::PositionUnavailable,
+                "position_unavailable",
+            ),
+            (OzonBidPacingHoldReason::PositionStale, "position_stale"),
+            (
+                OzonBidPacingHoldReason::TargetPositionReached,
+                "target_position_reached",
+            ),
+            (
+                OzonBidPacingHoldReason::BidCeilingReached,
+                "bid_ceiling_reached",
+            ),
+        ] {
+            assert_eq!(reason.as_str(), expected);
+        }
+        assert_eq!(
+            OzonBidPacingPauseReason::SpendCapReached.as_str(),
+            "spend_cap_reached"
+        );
+        assert_eq!(
+            OzonBidPacingPauseReason::DrrExceededAtBidFloor.as_str(),
+            "drr_exceeded_at_bid_floor"
+        );
+    }
+
+    #[test]
     fn bad_position_raises_one_ruble_and_never_crosses_ceiling() {
         assert_eq!(
             evaluate_ozon_bid_pacing(policy(), observation()),
@@ -345,6 +375,18 @@ mod tests {
         };
         assert_eq!(
             evaluate_ozon_bid_pacing(policy(), during_cooldown),
+            Ok(OzonBidPacingAction::Hold(OzonBidPacingHoldReason::Cooldown))
+        );
+        let high_drr_during_cooldown = OzonBidPacingObservation {
+            current_bid_microrubles: 8_000_000,
+            spend_minor: 15_001,
+            attributed_revenue_minor: 100_000,
+            position: None,
+            last_bid_change_at: Some(recent_change),
+            ..observation()
+        };
+        assert_eq!(
+            evaluate_ozon_bid_pacing(policy(), high_drr_during_cooldown),
             Ok(OzonBidPacingAction::Hold(OzonBidPacingHoldReason::Cooldown))
         );
         let cap = OzonBidPacingObservation {

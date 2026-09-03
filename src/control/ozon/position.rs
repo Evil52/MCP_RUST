@@ -108,12 +108,10 @@ impl OzonBidPositionReader {
             .await
             .map_err(|_| OzonBidPositionReadError::Unavailable)?;
         drop(client);
-        match rows.as_slice() {
-            [] => Ok(None),
-            [_first, _second] => Err(OzonBidPositionReadError::AmbiguousTarget),
-            [row] => position_from_row(row),
-            _ => unreachable!("query is bounded to two rows"),
+        if rows.len() > 1 {
+            return Err(OzonBidPositionReadError::AmbiguousTarget);
         }
+        rows.first().map_or(Ok(None), position_from_row)
     }
 }
 
