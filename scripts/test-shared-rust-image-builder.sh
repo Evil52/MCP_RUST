@@ -3,7 +3,9 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workflow="$project_root/.github/workflows/ci.yml"
+ci_workflow="$project_root/.github/workflows/ci.yml"
+codeql_workflow="$project_root/.github/workflows/codeql.yml"
+release_workflow="$project_root/.github/workflows/release.yml"
 dockerfiles=(
   Dockerfile
   Dockerfile.control
@@ -54,11 +56,14 @@ for index in "${!dockerfiles[@]}"; do
 done
 
 prime_job="$(sed -n \
-  '/^  prime-rust-release-cache:/,/^  publish-images:/p' \
-  "$workflow")"
-publish_job="$(sed -n \
-  '/^  publish-images:/,/^  release-evidence:/p' \
-  "$workflow")"
+  '/^  prime-rust-release-cache:/,/^  publish-platform-images:/p' \
+  "$release_workflow")"
+platform_job="$(sed -n \
+  '/^  publish-platform-images:/,/^  assemble-images:/p' \
+  "$release_workflow")"
+assembly_job="$(sed -n \
+  '/^  assemble-images:/,/^  release-evidence:/p' \
+  "$release_workflow")"
 
 for required_line in \
   '            runner: ubuntu-24.04' \
@@ -79,26 +84,83 @@ if grep -Fq 'docker/setup-qemu-action@' <<<"$prime_job"; then
   exit 1
 fi
 
+if grep -Fq 'docker/setup-qemu-action@' "$release_workflow"; then
+  echo "the release workflow must not build through QEMU" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC2016 # Literal GitHub expressions are the contract under test.
+for required_line in \
+  '    runs-on: ${{ matrix.platform.runner }}' \
+  '          - arch: amd64' \
+  '            name: linux/amd64' \
+  '            runner: ubuntu-24.04' \
+  '          - arch: arm64' \
+  '            name: linux/arm64' \
+  '            runner: ubuntu-24.04-arm' \
+  '          platforms: ${{ matrix.platform.name }}' \
+  '            type=gha,scope=release-${{ matrix.image.id }}-${{ matrix.platform.arch }}' \
+  '            type=gha,scope=release-rust-binaries-${{ matrix.platform.arch }}'; do
+  if ! grep -Fqx "$required_line" <<<"$platform_job"; then
+    echo "native platform publication is missing: $required_line" >&2
+    exit 1
+  fi
+done
+
 for image_id in \
   server \
   control \
+  position-db \
   position-collector \
   report-collector \
   report-worker \
-  wb-automation; do
-  image_config="$(awk -v marker="          - id: $image_id" '
-    $0 == marker { capture = 1 }
-    capture && $0 != marker && /^          - id: / { exit }
-    capture { print }
-  ' <<<"$publish_job")"
-  for cache_scope in \
-    release-rust-binaries-amd64 \
-    release-rust-binaries-arm64; do
-    if ! grep -Fq "type=gha,scope=$cache_scope" <<<"$image_config"; then
-      echo "$image_id does not consume $cache_scope" >&2
-      exit 1
-    fi
-  done
+  wb-automation \
+  ozon-egress \
+  control-ingress \
+  control-auth-egress \
+  control-ozon-write-egress \
+  control-write-egress \
+  mail-egress; do
+  if ! grep -Fqx "          - id: $image_id" <<<"$platform_job"; then
+    echo "the native platform matrix is missing $image_id" >&2
+    exit 1
+  fi
+done
+
+# shellcheck disable=SC2016 # Literal shell snippets are the contract under test.
+for required_text in \
+  'docker buildx imagetools create' \
+  '--metadata-file target/release-image-fragment/manifest-metadata.json' \
+  'amd64_reference="$(jq -r '\''.reference'\'' "$amd64_fragment")"' \
+  'arm64_reference="$(jq -r '\''.reference'\'' "$arm64_fragment")"' \
+  'and (.manifests | length == 2)'; do
+  if ! grep -Fq -- "$required_text" <<<"$assembly_job"; then
+    echo "multi-platform manifest assembly is missing: $required_text" >&2
+    exit 1
+  fi
+done
+
+if grep -Eq '^[[:space:]]+push:' "$ci_workflow" \
+  || grep -Eq '^[[:space:]]+push:' "$codeql_workflow"; then
+  echo "PR CI and CodeQL must not repeat on a push to the protected branch" >&2
+  exit 1
+fi
+if grep -Eq '^  (prime-rust-release-cache|publish-images|release-evidence):' \
+  "$ci_workflow"; then
+  echo "release jobs must live only in release.yml" >&2
+  exit 1
+fi
+for required_text in \
+  'name: Release CD' \
+  '  push:' \
+  '  verify-tested-tree:' \
+  '  publish-platform-images:' \
+  '  assemble-images:' \
+  '  release-evidence:'; do
+  if ! grep -Fqx "$required_text" "$release_workflow"; then
+    echo "release workflow is missing: $required_text" >&2
+    exit 1
+  fi
 done
 
 echo "shared Rust image builder contract passed"

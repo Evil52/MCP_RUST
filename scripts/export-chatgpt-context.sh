@@ -29,6 +29,7 @@ files=(
   .github/workflows/ci.yml
   .github/workflows/codeql.yml
   .github/workflows/dependency-review.yml
+  .github/workflows/release.yml
   ops/macos/com.ofk.mcp-ozon-runtime.plist.in
   scripts/ensure-local-runtime.sh
   scripts/canary-down.sh

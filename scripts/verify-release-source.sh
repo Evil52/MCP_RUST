@@ -19,7 +19,10 @@ fi
 
 if ! jq -e '
   .schema_version == 2
-  and .workflow_path == ".github/workflows/ci.yml"
+  and (
+    .workflow_path == ".github/workflows/ci.yml"
+    or .workflow_path == ".github/workflows/release.yml"
+  )
   and (.git_sha | type == "string" and test("^[0-9a-f]{40}$"))
   and (.source_tree | type == "string" and test("^[0-9a-f]{40}$"))
   and (.image_lock_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
@@ -38,7 +41,21 @@ git_sha="$(jq -r '.git_sha' "$evidence")"
 source_tree="$(jq -r '.source_tree' "$evidence")"
 repository="$(jq -r '.repository' "$evidence")"
 run_id="$(jq -r '.run_id' "$evidence")"
+workflow_path="$(jq -r '.workflow_path' "$evidence")"
 expected_image_lock_sha256="$(jq -r '.image_lock_sha256' "$evidence")"
+
+case "$workflow_path" in
+  .github/workflows/ci.yml)
+    workflow_name="Rust CI"
+    ;;
+  .github/workflows/release.yml)
+    workflow_name="Release CD"
+    ;;
+  *)
+    echo "CI release evidence names an unsupported workflow" >&2
+    exit 1
+    ;;
+esac
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   actual_image_lock_sha256="$(shasum -a 256 "$image_lock" | awk '{ print $1 }')"
@@ -69,13 +86,15 @@ fi
 run_json="$(gh api "repos/$repository/actions/runs/$run_id")"
 if ! jq -e \
   --arg git_sha "$git_sha" \
-  '.name == "Rust CI"
-   and .path == ".github/workflows/ci.yml"
+  --arg workflow_name "$workflow_name" \
+  --arg workflow_path "$workflow_path" \
+  '.name == $workflow_name
+   and .path == $workflow_path
    and .head_sha == $git_sha
    and .status == "completed"
    and .conclusion == "success"' \
   <<<"$run_json" >/dev/null; then
-  echo "GitHub does not confirm a successful Rust CI run for this SHA" >&2
+  echo "GitHub does not confirm a successful release workflow for this SHA" >&2
   exit 1
 fi
 

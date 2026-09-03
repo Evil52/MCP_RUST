@@ -3834,6 +3834,18 @@ mod tests {
         let mut policy =
             serde_json::from_slice::<WbAutomationPolicy>(&fs::read(&fixture.policy).unwrap())
                 .unwrap();
+        // Use the next UTC noon (15:00 Moscow): traffic pacing is then stable,
+        // while the instant remains after PostgreSQL's real reservation time.
+        let observed_at = Utc::now()
+            .date_naive()
+            .succ_opt()
+            .expect("test date has a successor")
+            .and_hms_opt(12, 0, 0)
+            .expect("test time is valid")
+            .and_utc();
+        policy.authorized_at = observed_at - ChronoDuration::hours(2);
+        policy.observe_until = observed_at - ChronoDuration::hours(1);
+        policy.authorization_expires_at = observed_at + ChronoDuration::days(1);
         policy.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV3;
         policy.target_impressions_per_day = 1_500;
         policy.target_orders_per_day = 3;
@@ -3847,7 +3859,6 @@ mod tests {
         policy.cooldown_seconds = 1_800;
         fs::write(&fixture.policy, serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
 
-        let observed_at = Utc::now();
         let business_date = wb_automation_business_date(observed_at);
         let current_date = business_date.format("%Y-%m-%d").to_string();
         let (reader_url, _) =

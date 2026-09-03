@@ -12,6 +12,7 @@ image_lock="${MCP_RELEASE_IMAGE_LOCK:?MCP_RELEASE_IMAGE_LOCK must point to relea
 evidence="${MCP_RELEASE_EVIDENCE:?MCP_RELEASE_EVIDENCE must point to release.json}"
 release_sha="$("$project_root/scripts/verify-release-source.sh")"
 repository="$(jq -r '.repository' "$evidence")"
+workflow_path="$(jq -r '.workflow_path' "$evidence")"
 
 "$project_root/scripts/validate-release-image-lock.sh" \
   "$image_lock" "$release_sha" "$repository"
@@ -42,7 +43,7 @@ for image_id in "$@"; do
   echo "==> verifying attestation for $image_id" >&2
   gh attestation verify "oci://$reference" \
     --repo "$repository" \
-    --signer-workflow "$repository/.github/workflows/ci.yml" \
+    --signer-workflow "$repository/$workflow_path" \
     --source-digest "$release_sha" \
     --deny-self-hosted-runners >&2
 
