@@ -1,5 +1,13 @@
 {
   "account_id": "furnitura_dlya_doma",
+  "dynamic_bid_control": {
+    "position_store_id": "furnitura_dlya_doma",
+    "position_region_name": "Москва",
+    "target_position": 30,
+    "bid_step_microrubles": 1000000,
+    "cooldown_seconds": 1800,
+    "max_position_age_seconds": 2700
+  },
   "guards": [
     {
       "campaign_id": 37756773,

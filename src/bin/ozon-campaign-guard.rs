@@ -9,12 +9,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use mcp_ozon::{
     control::{
-        ControlAppConfig, ControlMode, OzonAdsWriteClient, OzonCampaignGuard, OzonCampaignProduct,
-        OzonCampaignProductsRequest, OzonCampaignStrategy, OzonPlanRepository, OzonWriteErrorKind,
-        evaluate_ozon_campaign_guard, validate_ozon_campaign_product_guard,
+        ControlAppConfig, ControlMode, OzonAdsWriteClient, OzonBidPacingAction,
+        OzonBidPacingObservation, OzonBidPacingPolicy, OzonBidPositionReader, OzonCampaignGuard,
+        OzonCampaignProduct, OzonCampaignProductsRequest, OzonCampaignStrategy, OzonPlanRepository,
+        OzonWriteErrorKind, evaluate_ozon_bid_pacing, evaluate_ozon_campaign_guard,
+        validate_ozon_campaign_product_guard,
     },
     ozon_performance::{CampaignProductsQuery, CampaignsQuery, PerformanceClient, StatisticsQuery},
     reporting::{business_date, ozon_adapter::parse_performance_daily_campaigns},
@@ -31,6 +33,7 @@ const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const WRITE_BOUNDARY_INTERVAL: Duration = Duration::from_secs(2);
 const STATIC_GUARDS_FILE_ENV: &str = "CONTROL_MCP_OZON_STATIC_GUARDS_FILE";
 const STATIC_STATE_FILE_ENV: &str = "CONTROL_MCP_OZON_STATIC_GUARD_STATE_FILE";
+const POSITION_DATABASE_URL_ENV: &str = "CONTROL_MCP_OZON_POSITION_DATABASE_URL";
 const MAX_STATIC_GUARDS: usize = 50;
 const RECONCILE_COMMAND: &str = "reconcile-static-once";
 const RECONCILE_CONFIRMATION: &str = "--confirm-static-bid-corridor-and-activation";
@@ -47,7 +50,20 @@ enum Command {
 #[serde(deny_unknown_fields)]
 struct StaticGuardFile {
     account_id: String,
+    #[serde(default)]
+    dynamic_bid_control: Option<StaticDynamicBidControl>,
     guards: Vec<StaticGuard>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticDynamicBidControl {
+    position_store_id: String,
+    position_region_name: String,
+    target_position: u16,
+    bid_step_microrubles: u64,
+    cooldown_seconds: u64,
+    max_position_age_seconds: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,10 +95,22 @@ struct StaticCampaignGuard {
     max_cpc_bid_microrubles: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingStaticBidChange {
+    from_microrubles: u64,
+    to_microrubles: u64,
+    started_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct StaticGuardState {
     incident_campaign_ids: BTreeSet<u64>,
+    #[serde(default)]
+    last_bid_change_at: BTreeMap<u64, DateTime<Utc>>,
+    #[serde(default)]
+    pending_bid_changes: BTreeMap<u64, PendingStaticBidChange>,
 }
 
 #[tokio::main]
@@ -134,12 +162,22 @@ async fn main() -> Result<()> {
         let state_path = env::var_os(STATIC_STATE_FILE_ENV)
             .map(PathBuf::from)
             .context("static Ozon guard требует state file")?;
-        let static_guards =
+        let (static_guards, dynamic_bid_control) =
             load_static_guards(Path::new(&static_guards_path), &runtime.account_id)?;
+        let position_reader = if dynamic_bid_control.is_some() {
+            let database_url = env::var(POSITION_DATABASE_URL_ENV)
+                .context("dynamic Ozon bid control requires position database")?;
+            let reader = Arc::new(OzonBidPositionReader::connect(&database_url).await?);
+            reader.verify_runtime_contract().await?;
+            Some(reader)
+        } else {
+            None
+        };
         let mut state = load_static_state(&state_path)?;
         tracing::info!(
             account_id=%runtime.account_id,
             guards=static_guards.len(),
+            dynamic_bid_control=dynamic_bid_control.is_some(),
             "static Ozon campaign guard armed"
         );
         if command == Command::AuditStaticOnce {
@@ -158,6 +196,8 @@ async fn main() -> Result<()> {
                 &reader,
                 &writer,
                 &runtime.store_id,
+                dynamic_bid_control.as_ref(),
+                position_reader.as_deref(),
             )
             .await
             {
@@ -194,7 +234,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_static_guards(path: &Path, expected_account_id: &str) -> Result<Vec<StaticCampaignGuard>> {
+fn load_static_guards(
+    path: &Path,
+    expected_account_id: &str,
+) -> Result<(Vec<StaticCampaignGuard>, Option<StaticDynamicBidControl>)> {
     let bytes = fs::read(path).context("static Ozon guard config недоступен")?;
     if bytes.is_empty() || bytes.len() > 64 * 1024 {
         bail!("static Ozon guard config имеет недопустимый размер");
@@ -207,9 +250,24 @@ fn load_static_guards(path: &Path, expected_account_id: &str) -> Result<Vec<Stat
     {
         bail!("static Ozon guard config не совпадает с runtime scope");
     }
+    if let Some(dynamic) = config.dynamic_bid_control.as_ref()
+        && (dynamic.position_store_id != expected_account_id
+            || dynamic.position_region_name.is_empty()
+            || dynamic.position_region_name.trim() != dynamic.position_region_name
+            || dynamic.position_region_name.len() > 128
+            || dynamic.position_region_name.chars().any(char::is_control)
+            || dynamic.target_position == 0
+            || dynamic.bid_step_microrubles == 0
+            || !dynamic.bid_step_microrubles.is_multiple_of(1_000_000)
+            || dynamic.cooldown_seconds != 1_800
+            || dynamic.max_position_age_seconds < dynamic.cooldown_seconds)
+    {
+        bail!("static Ozon dynamic bid control has invalid bounds");
+    }
+    let dynamic_bid_control = config.dynamic_bid_control;
     let mut campaigns = BTreeSet::new();
     let mut skus = BTreeSet::new();
-    config
+    let guards = config
         .guards
         .into_iter()
         .map(|guard| {
@@ -246,7 +304,8 @@ fn load_static_guards(path: &Path, expected_account_id: &str) -> Result<Vec<Stat
                 max_cpc_bid_microrubles: guard.max_cpc_bid_microrubles,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((guards, dynamic_bid_control))
 }
 
 fn load_static_state(path: &Path) -> Result<StaticGuardState> {
@@ -270,6 +329,7 @@ fn persist_static_state(path: &Path, state: &StaticGuardState) -> Result<()> {
     fs::rename(&temporary, path).context("static Ozon guard state commit failed")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn guard_once_static(
     guards: &[StaticCampaignGuard],
     state: &mut StaticGuardState,
@@ -277,6 +337,8 @@ async fn guard_once_static(
     reader: &Arc<PerformanceClient>,
     writer: &Arc<OzonAdsWriteClient>,
     store: &mcp_ozon::config::StoreId,
+    dynamic_bid_control: Option<&StaticDynamicBidControl>,
+    position_reader: Option<&OzonBidPositionReader>,
 ) -> Result<()> {
     let running = running_static_campaigns(reader, store, guards).await?;
     tracing::info!(
@@ -324,30 +386,152 @@ async fn guard_once_static(
             static_guard.min_cpc_bid_microrubles,
             static_guard.max_cpc_bid_microrubles,
         );
-        let (spend_minor, revenue_minor, stop_reason) = match product_guard {
+        let (spend_minor, revenue_minor) =
+            metrics.get(&guard.campaign_id).copied().unwrap_or_default();
+        let current_bid_microrubles = match product_guard {
             Err(error) => {
                 tracing::warn!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"product or bid corridor invalid; fail-closed stop requested");
-                (0, 0, Some("product_guard_failed"))
+                if let Err(error) = guard_campaign_static(
+                    state,
+                    state_path,
+                    reader,
+                    writer,
+                    store,
+                    guard,
+                    0,
+                    0,
+                    Some("product_guard_failed"),
+                )
+                .await
+                {
+                    tracing::error!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"static Ozon guard item failed");
+                }
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                continue;
             }
             Ok(bid_microrubles) => {
-                let (spend_minor, revenue_minor) =
-                    metrics.get(&guard.campaign_id).copied().unwrap_or_default();
-                let stop_reason = evaluate_ozon_campaign_guard(
-                    spend_minor,
-                    revenue_minor,
-                    guard.spend_cap_microrubles,
-                    guard.target_drr_percent,
-                )?
-                .map(mcp_ozon::control::OzonGuardStopReason::as_str);
                 tracing::debug!(
                     campaign_id = guard.campaign_id,
                     sku = guard.sku,
                     bid_microrubles,
                     "static product guard passed"
                 );
-                (spend_minor, revenue_minor, stop_reason)
+                bid_microrubles
             }
         };
+
+        reconcile_pending_static_bid(
+            state,
+            state_path,
+            guard.campaign_id,
+            current_bid_microrubles,
+        )?;
+        if state.incident_campaign_ids.contains(&guard.campaign_id) {
+            continue;
+        }
+
+        if let Some(dynamic) = dynamic_bid_control {
+            let position = match position_reader {
+                Some(position_reader) => position_reader
+                    .latest_position(
+                        &dynamic.position_store_id,
+                        guard.sku,
+                        &dynamic.position_region_name,
+                    )
+                    .await
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            campaign_id = guard.campaign_id,
+                            sku = guard.sku,
+                            %error,
+                            "position unavailable; upward bid changes are held"
+                        );
+                    })
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let observed_at = Utc::now();
+            let action = evaluate_ozon_bid_pacing(
+                OzonBidPacingPolicy {
+                    min_bid_microrubles: static_guard.min_cpc_bid_microrubles,
+                    max_bid_microrubles: static_guard.max_cpc_bid_microrubles,
+                    bid_step_microrubles: dynamic.bid_step_microrubles,
+                    spend_cap_microrubles: guard.spend_cap_microrubles,
+                    target_drr_percent: guard.target_drr_percent,
+                    target_position: dynamic.target_position,
+                    cooldown_seconds: dynamic.cooldown_seconds,
+                    max_position_age_seconds: dynamic.max_position_age_seconds,
+                },
+                OzonBidPacingObservation {
+                    observed_at,
+                    current_bid_microrubles,
+                    spend_minor,
+                    attributed_revenue_minor: revenue_minor,
+                    position,
+                    last_bid_change_at: state.last_bid_change_at.get(&guard.campaign_id).copied(),
+                },
+            )?;
+            match action {
+                OzonBidPacingAction::Hold(reason) => {
+                    tracing::info!(
+                        campaign_id = guard.campaign_id,
+                        sku = guard.sku,
+                        spend_minor,
+                        revenue_minor,
+                        reason = reason.as_str(),
+                        "dynamic Ozon bid hold"
+                    );
+                }
+                OzonBidPacingAction::ChangeBid {
+                    from_microrubles,
+                    to_microrubles,
+                } => {
+                    if let Err(error) = change_static_campaign_bid(
+                        state,
+                        state_path,
+                        reader,
+                        writer,
+                        store,
+                        guard,
+                        from_microrubles,
+                        to_microrubles,
+                        observed_at,
+                    )
+                    .await
+                    {
+                        tracing::error!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"dynamic Ozon bid change failed");
+                    }
+                }
+                OzonBidPacingAction::Pause(reason) => {
+                    if let Err(error) = guard_campaign_static(
+                        state,
+                        state_path,
+                        reader,
+                        writer,
+                        store,
+                        guard,
+                        spend_minor,
+                        revenue_minor,
+                        Some(reason.as_str()),
+                    )
+                    .await
+                    {
+                        tracing::error!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"dynamic Ozon campaign pause failed");
+                    }
+                    tokio::time::sleep(Duration::from_secs(7)).await;
+                }
+            }
+            continue;
+        }
+
+        let stop_reason = evaluate_ozon_campaign_guard(
+            spend_minor,
+            revenue_minor,
+            guard.spend_cap_microrubles,
+            guard.target_drr_percent,
+        )?
+        .map(mcp_ozon::control::OzonGuardStopReason::as_str);
         let stop_requested = stop_reason.is_some();
         if let Err(error) = guard_campaign_static(
             state,
@@ -423,6 +607,108 @@ async fn campaign_product_snapshot(
         )
         .await
         .map_err(Into::into)
+}
+
+fn reconcile_pending_static_bid(
+    state: &mut StaticGuardState,
+    state_path: &Path,
+    campaign_id: u64,
+    current_bid_microrubles: u64,
+) -> Result<()> {
+    let Some(pending) = state.pending_bid_changes.get(&campaign_id).cloned() else {
+        return Ok(());
+    };
+    if current_bid_microrubles == pending.to_microrubles {
+        state.pending_bid_changes.remove(&campaign_id);
+        state
+            .last_bid_change_at
+            .insert(campaign_id, pending.started_at);
+        persist_static_state(state_path, state)?;
+        tracing::info!(
+            campaign_id,
+            from_bid_microrubles = pending.from_microrubles,
+            to_bid_microrubles = pending.to_microrubles,
+            "pending dynamic Ozon bid change reconciled"
+        );
+    } else {
+        state.incident_campaign_ids.insert(campaign_id);
+        persist_static_state(state_path, state)?;
+        tracing::error!(
+            campaign_id,
+            expected_bid_microrubles = pending.to_microrubles,
+            current_bid_microrubles,
+            "pending dynamic Ozon bid readback mismatch; campaign locked"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn change_static_campaign_bid(
+    state: &mut StaticGuardState,
+    state_path: &Path,
+    reader: &Arc<PerformanceClient>,
+    writer: &Arc<OzonAdsWriteClient>,
+    store: &mcp_ozon::config::StoreId,
+    guard: &OzonCampaignGuard,
+    from_microrubles: u64,
+    to_microrubles: u64,
+    started_at: DateTime<Utc>,
+) -> Result<()> {
+    state.pending_bid_changes.insert(
+        guard.campaign_id,
+        PendingStaticBidChange {
+            from_microrubles,
+            to_microrubles,
+            started_at,
+        },
+    );
+    persist_static_state(state_path, state)?;
+
+    let request = OzonCampaignProductsRequest {
+        bids: vec![OzonCampaignProduct {
+            sku: guard.sku,
+            bid: Some(to_microrubles),
+            target_cir: None,
+            top_position: None,
+        }],
+    };
+    tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
+    let write = writer
+        .update_products_with_permit(
+            guard.campaign_id,
+            OzonCampaignStrategy::TargetBids,
+            &request,
+            || async { Ok::<(), std::convert::Infallible>(()) },
+        )
+        .await;
+    tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
+    let readback = campaign_product_snapshot(reader, store, guard.campaign_id)
+        .await
+        .and_then(|snapshot| exact_static_product_bid(&snapshot, guard.sku));
+    if matches!(readback, Ok(actual) if actual == to_microrubles) {
+        state.pending_bid_changes.remove(&guard.campaign_id);
+        state
+            .last_bid_change_at
+            .insert(guard.campaign_id, started_at);
+        persist_static_state(state_path, state)?;
+        tracing::info!(
+            campaign_id = guard.campaign_id,
+            sku = guard.sku,
+            from_bid_microrubles = from_microrubles,
+            to_bid_microrubles = to_microrubles,
+            write_reported_error = write.is_err(),
+            "dynamic Ozon bid changed and read back"
+        );
+        return Ok(());
+    }
+
+    state.incident_campaign_ids.insert(guard.campaign_id);
+    persist_static_state(state_path, state)?;
+    match write {
+        Ok(()) => bail!("dynamic bid readback mismatch; campaign locked"),
+        Err(error) => bail!("dynamic bid write failed and readback did not confirm it: {error}"),
+    }
 }
 
 async fn validate_static_campaign_product(
