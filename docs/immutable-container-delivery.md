@@ -54,9 +54,10 @@ The implementation preserves these invariants:
 7. Production has anonymous, read-only registry access. CI's publish identity
    is separate and unavailable to the runtime.
 
-The lock contains the exact twelve deployable image identities: `server`,
-`control`, `control-ingress`, `control-auth-egress`, `control-write-egress`,
-`mail-egress`, `ozon-egress`, `position-db`, `position-collector`,
+The lock contains the exact thirteen deployable image identities: `server`,
+`control`, `control-ingress`, `control-auth-egress`,
+`control-ozon-write-egress`, `control-write-egress`, `mail-egress`,
+`ozon-egress`, `position-db`, `position-collector`,
 `report-collector`, `report-worker`, and `wb-automation`.
 
 ## Rust build cache topology
