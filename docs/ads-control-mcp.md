@@ -65,10 +65,31 @@ See the [official WB Promotion API](https://dev.wildberries.ru/docs/openapi/prom
 The reviewed Furnitura policy contains five independent one-SKU targets. Each
 campaign has a weekly budget of 2,000 RUB, a local total-spend stop at 2,000
 RUB and `TARGET_BIDS` with an initial 7 RUB CPC and an immutable 12 RUB policy
-ceiling. DRR 15% is a local fail-closed stop and TOP-30 is an observation goal,
-not an API placement guarantee. Position-based bid changes remain disabled
-until a reviewed live position provider supplies region-and-phrase observations;
-competitive-bid values must not be presented as measured search positions.
+ceiling. DRR 15% is a local fail-closed boundary and TOP-30 is an observation
+goal, not an API placement guarantee.
+
+The optional static-guard pacing controller consumes only a complete,
+non-partial Ozon search-position snapshot published for the exact account, SKU
+and region. A snapshot older than 45 minutes, a missing or ambiguous monitor,
+or a position read error blocks upward changes. When attributed DRR is at most
+15% and a fresh position is worse than TOP-30, the controller raises CPC by
+exactly 1 RUB after a 30-minute cooldown, capped at 12 RUB. TOP-30 holds the
+bid. Attributed DRR above 15% lowers CPC by exactly 1 RUB after the cooldown,
+floored at 7 RUB; a breach already at 7 RUB pauses the campaign immediately.
+The 2,000 RUB spend cap also pauses immediately.
+
+Before a bid request, the intended transition is saved in the guard state.
+After the single write attempt, the product bid is read back through the
+Performance API. Only an exact match completes the transition and starts the
+cooldown. An unavailable or mismatching readback creates a durable incident
+and blocks further automatic actions for that campaign. A process restart
+reconciles the saved pending transition by readback and never blindly repeats
+the write.
+
+This controller is not a position source. Position-based raises remain
+operationally disabled until a reviewed live provider is deployed and exactly
+one active Moscow monitor with a search phrase exists for each guarded SKU.
+Competitive-bid values must not be presented as measured search positions.
 
 Confirmation is an authenticated MCP action, not a message in chat. The plan
 author calls `ozon_performance_prepare_campaign_launch` and gives Diana the

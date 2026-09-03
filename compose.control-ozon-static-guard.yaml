@@ -16,7 +16,7 @@ services:
     security_opt: [no-new-privileges:true]
 
   ozon-campaign-guard:
-    image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:furnitura-cpc7-v5}
+    image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:furnitura-cpc7-v6}
     build:
       context: .
       dockerfile: Dockerfile.control
@@ -44,6 +44,7 @@ services:
       CONTROL_MCP_OZON_TIMEOUT_SECONDS: "20"
       CONTROL_MCP_OZON_STATIC_GUARDS_FILE: /etc/mcp-ozon/static-guards.json
       CONTROL_MCP_OZON_STATIC_GUARD_STATE_FILE: /var/lib/mcp-ozon-guard/state.json
+      CONTROL_MCP_OZON_POSITION_DATABASE_URL: postgresql://position_reader:${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
       RUST_LOG: ozon_campaign_guard=info
     volumes:
       - type: bind
@@ -66,6 +67,7 @@ services:
       - ozon-performance-client-secret
     networks:
       - control-ozon-write-egress-internal
+      - position-internal
     depends_on:
       guard-state-init:
         condition: service_completed_successfully
@@ -120,6 +122,9 @@ services:
 networks:
   control-ozon-write-egress-internal:
     internal: true
+  position-internal:
+    name: mcp-ozon-position-internal
+    external: true
   outbound:
     name: mcp-ozon-outbound
     external: true
