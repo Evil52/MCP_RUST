@@ -472,7 +472,7 @@ impl PostgresOutboxRepository {
         .await
     }
 
-    /// Loads one due, non-expired single-section batch for deterministic
+    /// Loads one settled, non-expired single-section batch for deterministic
     /// rendering or recovery. `ready` batches are accepted so an operator can
     /// verify an ambiguous post-persistence outcome without creating another
     /// delivery identity.
@@ -484,6 +484,9 @@ impl PostgresOutboxRepository {
         if batch_id <= 0 {
             return Err(PostgresOutboxError::InvalidDelivery);
         }
+        let generation_ready_before = now
+            .checked_sub_signed(GENERATION_SOURCE_SETTLE_DELAY)
+            .ok_or(PostgresOutboxError::InvalidDelivery)?;
         let client = self
             .client
             .acquire()
@@ -501,10 +504,10 @@ impl PostgresOutboxRepository {
                    AND batch.scheduled_for <= $2 \
                    AND EXISTS ( \
                        SELECT 1 FROM daily_reporting.delivery_coverage AS due \
-                       WHERE due.batch_id = batch.id AND due.deadline_at >= $2 \
+                       WHERE due.batch_id = batch.id AND due.deadline_at >= $3 \
                    ) \
                  ORDER BY coverage.report_kind",
-                &[&batch_id, &now],
+                &[&batch_id, &generation_ready_before, &now],
             )
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
