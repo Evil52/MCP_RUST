@@ -271,6 +271,7 @@ jobs:
           build mcp-ozon-egress:ci Dockerfile.ozon-egress
           build mcp-ozon-control-ingress:ci Dockerfile.control-ingress
           build mcp-ozon-control-auth-egress:ci Dockerfile.control-auth-egress
+          build mcp-ozon-control-ozon-write-egress:ci Dockerfile.control-ozon-write-egress
           build mcp-ozon-control-write-egress:ci Dockerfile.control-write-egress
           build mcp-ozon-mail-egress:ci Dockerfile.mail-egress
 
@@ -289,6 +290,7 @@ jobs:
             mcp-ozon-egress:ci
             mcp-ozon-control-ingress:ci
             mcp-ozon-control-auth-egress:ci
+            mcp-ozon-control-ozon-write-egress:ci
             mcp-ozon-control-write-egress:ci
             mcp-ozon-mail-egress:ci
           )
@@ -358,6 +360,7 @@ jobs:
             mcp-ozon-egress:ci
             mcp-ozon-control-ingress:ci
             mcp-ozon-control-auth-egress:ci
+            mcp-ozon-control-ozon-write-egress:ci
             mcp-ozon-control-write-egress:ci
             mcp-ozon-mail-egress:ci
           )
@@ -482,7 +485,7 @@ jobs:
       && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
     needs: [prime-rust-release-cache]
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       attestations: write
       contents: read
@@ -551,6 +554,10 @@ jobs:
             context: .
             dockerfile: Dockerfile.control-auth-egress
             cache_from: type=gha,scope=release-control-auth-egress
+          - id: control-ozon-write-egress
+            context: .
+            dockerfile: Dockerfile.control-ozon-write-egress
+            cache_from: type=gha,scope=release-control-ozon-write-egress
           - id: control-write-egress
             context: .
             dockerfile: Dockerfile.control-write-egress

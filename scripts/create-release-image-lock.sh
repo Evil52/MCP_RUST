@@ -27,6 +27,7 @@ expected_ids=(
   control
   control-auth-egress
   control-ingress
+  control-ozon-write-egress
   control-write-egress
   mail-egress
   ozon-egress
@@ -68,6 +69,7 @@ jq -n \
   --slurpfile control "$fragment_dir/control.json" \
   --slurpfile control_auth_egress "$fragment_dir/control-auth-egress.json" \
   --slurpfile control_ingress "$fragment_dir/control-ingress.json" \
+  --slurpfile control_ozon_write_egress "$fragment_dir/control-ozon-write-egress.json" \
   --slurpfile control_write_egress "$fragment_dir/control-write-egress.json" \
   --slurpfile mail_egress "$fragment_dir/mail-egress.json" \
   --slurpfile ozon_egress "$fragment_dir/ozon-egress.json" \
@@ -109,6 +111,7 @@ jq -n \
       "control": checked($control; "control"),
       "control-auth-egress": checked($control_auth_egress; "control-auth-egress"),
       "control-ingress": checked($control_ingress; "control-ingress"),
+      "control-ozon-write-egress": checked($control_ozon_write_egress; "control-ozon-write-egress"),
       "control-write-egress": checked($control_write_egress; "control-write-egress"),
       "mail-egress": checked($mail_egress; "mail-egress"),
       "ozon-egress": checked($ozon_egress; "ozon-egress"),
