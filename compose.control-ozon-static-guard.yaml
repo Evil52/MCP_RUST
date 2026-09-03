@@ -16,7 +16,7 @@ services:
     security_opt: [no-new-privileges:true]
 
   ozon-campaign-guard:
-    image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:furnitura-cpc7-v2}
+    image: ${MCP_CONTROL_IMAGE:-mcp-ozon-control:furnitura-cpc7-v5}
     build:
       context: .
       dockerfile: Dockerfile.control

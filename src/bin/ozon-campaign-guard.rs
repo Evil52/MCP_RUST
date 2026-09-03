@@ -24,6 +24,11 @@ use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Read and write clients have independent pacing gates, while Ozon applies
+/// one quota to both. Keep an explicit boundary around every marketplace
+/// mutation so a preceding read or following readback cannot burst the shared
+/// Performance API quota.
+const WRITE_BOUNDARY_INTERVAL: Duration = Duration::from_secs(2);
 const STATIC_GUARDS_FILE_ENV: &str = "CONTROL_MCP_OZON_STATIC_GUARDS_FILE";
 const STATIC_STATE_FILE_ENV: &str = "CONTROL_MCP_OZON_STATIC_GUARD_STATE_FILE";
 const MAX_STATIC_GUARDS: usize = 50;
@@ -282,7 +287,17 @@ async fn guard_once_static(
     if running.is_empty() {
         return Ok(());
     }
-    let metrics = static_guard_metrics(reader, store, guards, &running).await;
+    let metrics = match static_guard_metrics(reader, store, guards, &running).await {
+        Ok(metrics) => metrics,
+        Err(error) => {
+            tracing::warn!(
+                running = running.len(),
+                %error,
+                "statistics unavailable; no-write hold"
+            );
+            return Ok(());
+        }
+    };
     for static_guard in guards {
         let guard = &static_guard.guard;
         if state.incident_campaign_ids.contains(&guard.campaign_id)
@@ -290,13 +305,31 @@ async fn guard_once_static(
         {
             continue;
         }
-        let product_guard = validate_static_campaign_product(reader, store, static_guard).await;
-        let (spend_minor, revenue_minor, stop_reason) = match (&metrics, product_guard) {
-            (_, Err(error)) => {
+        let product_snapshot =
+            match campaign_product_snapshot(reader, store, guard.campaign_id).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(
+                        campaign_id = guard.campaign_id,
+                        sku = guard.sku,
+                        %error,
+                        "campaign product read unavailable; no-write hold"
+                    );
+                    continue;
+                }
+            };
+        let product_guard = validate_ozon_campaign_product_guard(
+            &product_snapshot,
+            guard.sku,
+            static_guard.min_cpc_bid_microrubles,
+            static_guard.max_cpc_bid_microrubles,
+        );
+        let (spend_minor, revenue_minor, stop_reason) = match product_guard {
+            Err(error) => {
                 tracing::warn!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"product or bid corridor invalid; fail-closed stop requested");
                 (0, 0, Some("product_guard_failed"))
             }
-            (Ok(metrics), Ok(bid_microrubles)) => {
+            Ok(bid_microrubles) => {
                 let (spend_minor, revenue_minor) =
                     metrics.get(&guard.campaign_id).copied().unwrap_or_default();
                 let stop_reason = evaluate_ozon_campaign_guard(
@@ -313,10 +346,6 @@ async fn guard_once_static(
                     "static product guard passed"
                 );
                 (spend_minor, revenue_minor, stop_reason)
-            }
-            (Err(error), Ok(_)) => {
-                tracing::warn!(campaign_id=guard.campaign_id,%error,"statistics unavailable; fail-closed stop requested");
-                (0, 0, Some("statistics_unavailable"))
             }
         };
         let stop_requested = stop_reason.is_some();
@@ -441,6 +470,7 @@ async fn reconcile_static_campaigns(
                     top_position: None,
                 }],
             };
+            tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
             let write = writer
                 .update_products_with_permit(
                     guard.campaign_id,
@@ -449,6 +479,7 @@ async fn reconcile_static_campaigns(
                     || async { Ok::<(), std::convert::Infallible>(()) },
                 )
                 .await;
+            tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
             if let Err(error) = write {
                 let readback = validate_static_campaign_product(reader, store, static_guard).await;
                 if !matches!(readback, Ok(value) if value == desired_bid) {
@@ -472,11 +503,13 @@ async fn reconcile_static_campaigns(
         }
 
         if !campaign_is_running(reader, store, guard.campaign_id).await? {
+            tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
             let activation = writer
                 .activate_campaign_with_permit(guard.campaign_id, || async {
                     Ok::<(), std::convert::Infallible>(())
                 })
                 .await;
+            tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
             if let Err(error) = activation
                 && !matches!(
                     campaign_is_running(reader, store, guard.campaign_id).await,
@@ -617,11 +650,13 @@ async fn guard_campaign_static(
         );
         return Ok(());
     };
+    tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
     let result = writer
         .deactivate_campaign_with_permit(guard.campaign_id, || async {
             Ok::<(), std::convert::Infallible>(())
         })
         .await;
+    tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
     if let Err(error) = result {
         let stopped_after_ambiguous = matches!(
             &error,
@@ -696,6 +731,7 @@ async fn guard_campaign(
             revenue_minor,
         )
         .await?;
+    tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
     let permit_plans = Arc::clone(plans);
     let plan_id = guard.plan_id.clone();
     let campaign_id = guard.campaign_id;
@@ -706,6 +742,7 @@ async fn guard_campaign(
                 .await
         })
         .await;
+    tokio::time::sleep(WRITE_BOUNDARY_INTERVAL).await;
     if let Err(error) = result {
         let error_class = match error {
             mcp_ozon::control::OzonGuardedWriteError::Permit(_) => "stop_permit_failed",
@@ -767,40 +804,29 @@ async fn evaluate_live_guard(
                 date_to,
             },
         )
-        .await;
-    let parsed_metrics = match metrics_response {
-        Ok(response) => parse_performance_daily_campaigns(&response)
-            .map_err(|error| format!("statistics parse failed: {error}")),
-        Err(error) => Err(format!("statistics request failed: {error}")),
-    };
-    let (spend_minor, revenue_minor, stop_reason) = match parsed_metrics {
-        Ok(rows) => {
-            let mut spend = 0_u64;
-            let mut revenue = 0_u64;
-            for row in rows {
-                if row.campaign_id == guard.campaign_id {
-                    spend = spend
-                        .checked_add(row.spend_minor)
-                        .context("spend overflow")?;
-                    revenue = revenue
-                        .checked_add(row.attributed_revenue_minor)
-                        .context("revenue overflow")?;
-                }
-            }
-            let reason = evaluate_ozon_campaign_guard(
-                spend,
-                revenue,
-                guard.spend_cap_microrubles,
-                guard.target_drr_percent,
-            )?
-            .map(mcp_ozon::control::OzonGuardStopReason::as_str);
-            (spend, revenue, reason)
+        .await
+        .context("statistics request failed; no-write hold")?;
+    let rows = parse_performance_daily_campaigns(&metrics_response)
+        .map_err(|error| anyhow::anyhow!("statistics parse failed; no-write hold: {error}"))?;
+    let mut spend_minor = 0_u64;
+    let mut revenue_minor = 0_u64;
+    for row in rows {
+        if row.campaign_id == guard.campaign_id {
+            spend_minor = spend_minor
+                .checked_add(row.spend_minor)
+                .context("spend overflow")?;
+            revenue_minor = revenue_minor
+                .checked_add(row.attributed_revenue_minor)
+                .context("revenue overflow")?;
         }
-        Err(error) => {
-            tracing::warn!(campaign_id=guard.campaign_id,%error,"statistics unavailable; fail-closed stop requested");
-            (0, 0, Some("statistics_unavailable"))
-        }
-    };
+    }
+    let stop_reason = evaluate_ozon_campaign_guard(
+        spend_minor,
+        revenue_minor,
+        guard.spend_cap_microrubles,
+        guard.target_drr_percent,
+    )?
+    .map(mcp_ozon::control::OzonGuardStopReason::as_str);
     Ok((spend_minor, revenue_minor, stop_reason))
 }
 
