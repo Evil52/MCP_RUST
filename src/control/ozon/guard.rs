@@ -35,6 +35,26 @@ pub enum OzonProductGuardError {
     BidOutOfRange,
 }
 
+/// Extracts the single `(sku, bid_microrubles)` pair a guarded campaign exposes.
+///
+/// The corridor check is deliberately not part of this function. Reconciliation
+/// has to read the current bid before it can decide whether that bid is inside
+/// the corridor, and an audit only reports what the campaign holds. Both of
+/// those callers must nevertheless canonicalise the wire representation exactly
+/// the way `validate_ozon_campaign_product_guard` does, so the parser lives
+/// here once instead of being restated at each call site.
+pub fn parse_ozon_campaign_product(snapshot: &Value) -> Result<(u64, u64), OzonProductGuardError> {
+    let products = snapshot
+        .get("products")
+        .and_then(Value::as_array)
+        .filter(|products| products.len() == 1)
+        .ok_or(OzonProductGuardError::InvalidSnapshot)?;
+    let product = &products[0];
+    let sku = canonical_u64(product.get("sku")).ok_or(OzonProductGuardError::InvalidSnapshot)?;
+    let bid = canonical_u64(product.get("bid")).ok_or(OzonProductGuardError::InvalidSnapshot)?;
+    Ok((sku, bid))
+}
+
 pub fn validate_ozon_campaign_product_guard(
     snapshot: &Value,
     expected_sku: u64,
@@ -49,17 +69,10 @@ pub fn validate_ozon_campaign_product_guard(
     {
         return Err(OzonProductGuardError::InvalidLimit);
     }
-    let products = snapshot
-        .get("products")
-        .and_then(Value::as_array)
-        .filter(|products| products.len() == 1)
-        .ok_or(OzonProductGuardError::InvalidSnapshot)?;
-    let product = &products[0];
-    let sku = canonical_u64(product.get("sku")).ok_or(OzonProductGuardError::InvalidSnapshot)?;
+    let (sku, bid) = parse_ozon_campaign_product(snapshot)?;
     if sku != expected_sku {
         return Err(OzonProductGuardError::SkuMismatch);
     }
-    let bid = canonical_u64(product.get("bid")).ok_or(OzonProductGuardError::InvalidSnapshot)?;
     if !(min_bid_microrubles..=max_bid_microrubles).contains(&bid) {
         return Err(OzonProductGuardError::BidOutOfRange);
     }
@@ -234,5 +247,91 @@ mod tests {
                 Err(OzonProductGuardError::InvalidSnapshot)
             );
         }
+    }
+
+    #[test]
+    fn the_shared_parser_canonicalises_every_wire_shape_the_same_way() {
+        // The reconcile and audit paths read `(sku, bid)` without a corridor,
+        // so this parser decides on its own what counts as a well-formed
+        // campaign before a live CPC bid is written. Numbers and their exact
+        // decimal strings are the only accepted spellings.
+        for snapshot in [
+            serde_json::json!({"products": [{"sku": 3_588_576_015_u64, "bid": 7_000_000_u64}]}),
+            serde_json::json!({"products": [{"sku": "3588576015", "bid": "7000000"}]}),
+            serde_json::json!({"products": [{"sku": 3_588_576_015_u64, "bid": "7000000"}]}),
+        ] {
+            assert_eq!(
+                parse_ozon_campaign_product(&snapshot),
+                Ok((3_588_576_015, 7_000_000))
+            );
+        }
+
+        for snapshot in [
+            // Zero or several products: the guard owns exactly one SKU.
+            serde_json::json!({"products": []}),
+            serde_json::json!({"products": [
+                {"sku": "3588576015", "bid": "7000000"},
+                {"sku": "3588576016", "bid": "7000000"}
+            ]}),
+            // The array itself is missing or is not an array.
+            serde_json::json!({}),
+            serde_json::json!({"products": {"sku": "3588576015", "bid": "7000000"}}),
+            // Non-canonical decimal spellings must not be silently accepted:
+            // two different strings would otherwise name the same campaign.
+            serde_json::json!({"products": [{"sku": "03588576015", "bid": "7000000"}]}),
+            serde_json::json!({"products": [{"sku": "3588576015", "bid": "+7000000"}]}),
+            serde_json::json!({"products": [{"sku": "3588576015", "bid": " 7000000"}]}),
+            // Values that are not whole non-negative integers at all.
+            serde_json::json!({"products": [{"sku": -1, "bid": "7000000"}]}),
+            serde_json::json!({"products": [{"sku": 3_588_576_015_u64, "bid": 7_000_000.5}]}),
+            serde_json::json!({"products": [{"sku": true, "bid": "7000000"}]}),
+            serde_json::json!({"products": [{"sku": null, "bid": "7000000"}]}),
+            // Either field missing.
+            serde_json::json!({"products": [{"bid": "7000000"}]}),
+            serde_json::json!({"products": [{"sku": "3588576015"}]}),
+        ] {
+            assert_eq!(
+                parse_ozon_campaign_product(&snapshot),
+                Err(OzonProductGuardError::InvalidSnapshot),
+                "{snapshot} must not parse as a guarded campaign product"
+            );
+        }
+    }
+
+    #[test]
+    fn the_corridor_guard_and_the_shared_parser_agree_on_what_they_read() {
+        // `validate_ozon_campaign_product_guard` is the only path allowed to
+        // authorise a write, and reconciliation reads the same snapshot through
+        // the bare parser first. If the two ever disagreed about the SKU or the
+        // bid, reconciliation would clamp against a value the guard never saw.
+        let snapshot = serde_json::json!({
+            "products": [{"sku": "3588576015", "bid": "9000000"}]
+        });
+        let (sku, bid) = parse_ozon_campaign_product(&snapshot).unwrap();
+        assert_eq!((sku, bid), (3_588_576_015, 9_000_000));
+        assert_eq!(
+            validate_ozon_campaign_product_guard(&snapshot, sku, 7_000_000, 12_000_000),
+            Ok(bid)
+        );
+
+        // Whatever the parser rejects, the guard rejects too, and it never
+        // reports a corridor verdict about a snapshot it could not read.
+        let unreadable =
+            serde_json::json!({"products": [{"sku": "03588576015", "bid": "9000000"}]});
+        assert_eq!(
+            parse_ozon_campaign_product(&unreadable),
+            Err(OzonProductGuardError::InvalidSnapshot)
+        );
+        assert_eq!(
+            validate_ozon_campaign_product_guard(&unreadable, 3_588_576_015, 7_000_000, 12_000_000),
+            Err(OzonProductGuardError::InvalidSnapshot)
+        );
+
+        // Invalid corridor bounds still fail before the snapshot is parsed, so
+        // a malformed limit can never be masked by a malformed campaign.
+        assert_eq!(
+            validate_ozon_campaign_product_guard(&unreadable, 3_588_576_015, 0, 12_000_000),
+            Err(OzonProductGuardError::InvalidLimit)
+        );
     }
 }

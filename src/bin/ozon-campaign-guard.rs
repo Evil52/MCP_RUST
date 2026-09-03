@@ -13,8 +13,10 @@ use chrono::Utc;
 use mcp_ozon::{
     control::{
         ControlAppConfig, ControlMode, OzonAdsWriteClient, OzonCampaignGuard, OzonCampaignProduct,
-        OzonCampaignProductsRequest, OzonCampaignStrategy, OzonPlanRepository, OzonWriteErrorKind,
-        evaluate_ozon_campaign_guard, validate_ozon_campaign_product_guard,
+        OzonCampaignProductsRequest, OzonCampaignStrategy, OzonPlanRepository,
+        OzonStaticCampaignGuard, OzonWriteErrorKind, evaluate_ozon_campaign_guard,
+        parse_ozon_campaign_product, parse_ozon_static_guards,
+        validate_ozon_campaign_product_guard,
     },
     ozon_performance::{CampaignProductsQuery, CampaignsQuery, PerformanceClient, StatisticsQuery},
     reporting::{business_date, ozon_adapter::parse_performance_daily_campaigns},
@@ -26,7 +28,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
 const STATIC_GUARDS_FILE_ENV: &str = "CONTROL_MCP_OZON_STATIC_GUARDS_FILE";
 const STATIC_STATE_FILE_ENV: &str = "CONTROL_MCP_OZON_STATIC_GUARD_STATE_FILE";
-const MAX_STATIC_GUARDS: usize = 50;
 const RECONCILE_COMMAND: &str = "reconcile-static-once";
 const RECONCILE_CONFIRMATION: &str = "--confirm-static-bid-corridor-and-activation";
 const AUDIT_COMMAND: &str = "audit-static-once";
@@ -36,42 +37,6 @@ enum Command {
     Serve,
     AuditStaticOnce,
     ReconcileStaticOnce,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StaticGuardFile {
-    account_id: String,
-    guards: Vec<StaticGuard>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StaticGuard {
-    campaign_id: u64,
-    sku: u64,
-    date_from: String,
-    spend_cap_microrubles: u64,
-    target_drr_percent: u8,
-    #[serde(default = "default_min_cpc_bid_microrubles")]
-    min_cpc_bid_microrubles: u64,
-    #[serde(default = "default_max_cpc_bid_microrubles")]
-    max_cpc_bid_microrubles: u64,
-}
-
-const fn default_min_cpc_bid_microrubles() -> u64 {
-    7_000_000
-}
-
-const fn default_max_cpc_bid_microrubles() -> u64 {
-    12_000_000
-}
-
-#[derive(Debug)]
-struct StaticCampaignGuard {
-    guard: OzonCampaignGuard,
-    min_cpc_bid_microrubles: u64,
-    max_cpc_bid_microrubles: u64,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -189,59 +154,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_static_guards(path: &Path, expected_account_id: &str) -> Result<Vec<StaticCampaignGuard>> {
+/// Reads the operator-authored guard file and validates it against the account
+/// this process is bound to.
+///
+/// Only the file access lives here. Every rule that decides whether a campaign
+/// may be acted on is `parse_ozon_static_guards`, in the library, so it is
+/// covered by the same lint and coverage gates as the guard it authorises.
+fn load_static_guards(
+    path: &Path,
+    expected_account_id: &str,
+) -> Result<Vec<OzonStaticCampaignGuard>> {
     let bytes = fs::read(path).context("static Ozon guard config недоступен")?;
-    if bytes.is_empty() || bytes.len() > 64 * 1024 {
-        bail!("static Ozon guard config имеет недопустимый размер");
-    }
-    let config: StaticGuardFile =
-        serde_json::from_slice(&bytes).context("static Ozon guard config имеет неверный формат")?;
-    if config.account_id != expected_account_id
-        || config.guards.is_empty()
-        || config.guards.len() > MAX_STATIC_GUARDS
-    {
-        bail!("static Ozon guard config не совпадает с runtime scope");
-    }
-    let mut campaigns = BTreeSet::new();
-    let mut skus = BTreeSet::new();
-    config
-        .guards
-        .into_iter()
-        .map(|guard| {
-            if guard.campaign_id == 0
-                || guard.sku == 0
-                || !campaigns.insert(guard.campaign_id)
-                || !skus.insert(guard.sku)
-                || chrono::NaiveDate::parse_from_str(&guard.date_from, "%Y-%m-%d").is_err()
-                || evaluate_ozon_campaign_guard(
-                    0,
-                    0,
-                    guard.spend_cap_microrubles,
-                    guard.target_drr_percent,
-                )
-                .is_err()
-                || guard.min_cpc_bid_microrubles == 0
-                || guard.min_cpc_bid_microrubles > guard.max_cpc_bid_microrubles
-                || !guard.min_cpc_bid_microrubles.is_multiple_of(1_000_000)
-                || !guard.max_cpc_bid_microrubles.is_multiple_of(1_000_000)
-            {
-                bail!("static Ozon guard item имеет недопустимые данные");
-            }
-            Ok(StaticCampaignGuard {
-                guard: OzonCampaignGuard {
-                    plan_id: format!("static-{}", guard.campaign_id),
-                    account_id: expected_account_id.to_owned(),
-                    sku: guard.sku,
-                    campaign_id: guard.campaign_id,
-                    date_from: guard.date_from,
-                    spend_cap_microrubles: guard.spend_cap_microrubles,
-                    target_drr_percent: guard.target_drr_percent,
-                },
-                min_cpc_bid_microrubles: guard.min_cpc_bid_microrubles,
-                max_cpc_bid_microrubles: guard.max_cpc_bid_microrubles,
-            })
-        })
-        .collect()
+    parse_ozon_static_guards(&bytes, expected_account_id).map_err(Into::into)
 }
 
 fn load_static_state(path: &Path) -> Result<StaticGuardState> {
@@ -266,7 +190,7 @@ fn persist_static_state(path: &Path, state: &StaticGuardState) -> Result<()> {
 }
 
 async fn guard_once_static(
-    guards: &[StaticCampaignGuard],
+    guards: &[OzonStaticCampaignGuard],
     state: &mut StaticGuardState,
     state_path: &Path,
     reader: &Arc<PerformanceClient>,
@@ -345,7 +269,7 @@ async fn guard_once_static(
 async fn running_static_campaigns(
     reader: &PerformanceClient,
     store: &mcp_ozon::config::StoreId,
-    guards: &[StaticCampaignGuard],
+    guards: &[OzonStaticCampaignGuard],
 ) -> Result<BTreeSet<u64>> {
     let response = reader
         .campaigns(
@@ -399,7 +323,7 @@ async fn campaign_product_snapshot(
 async fn validate_static_campaign_product(
     reader: &PerformanceClient,
     store: &mcp_ozon::config::StoreId,
-    static_guard: &StaticCampaignGuard,
+    static_guard: &OzonStaticCampaignGuard,
 ) -> Result<u64> {
     let snapshot = campaign_product_snapshot(reader, store, static_guard.guard.campaign_id).await?;
     validate_ozon_campaign_product_guard(
@@ -412,7 +336,7 @@ async fn validate_static_campaign_product(
 }
 
 async fn reconcile_static_campaigns(
-    guards: &[StaticCampaignGuard],
+    guards: &[OzonStaticCampaignGuard],
     reader: &Arc<PerformanceClient>,
     writer: &Arc<OzonAdsWriteClient>,
     store: &mcp_ozon::config::StoreId,
@@ -502,7 +426,7 @@ async fn reconcile_static_campaigns(
 }
 
 async fn audit_static_campaigns(
-    guards: &[StaticCampaignGuard],
+    guards: &[OzonStaticCampaignGuard],
     reader: &PerformanceClient,
     store: &mcp_ozon::config::StoreId,
 ) -> Result<()> {
@@ -510,7 +434,7 @@ async fn audit_static_campaigns(
     for static_guard in guards {
         let guard = &static_guard.guard;
         let snapshot = campaign_product_snapshot(reader, store, guard.campaign_id).await?;
-        let (actual_sku, actual_bid_microrubles) = exact_static_product(&snapshot)?;
+        let (actual_sku, actual_bid_microrubles) = parse_ozon_campaign_product(&snapshot)?;
         tracing::info!(
             campaign_id = guard.campaign_id,
             expected_sku = guard.sku,
@@ -523,41 +447,24 @@ async fn audit_static_campaigns(
     Ok(())
 }
 
+/// Reads the current bid of the one product a static guard owns.
+///
+/// The corridor is checked separately by `validate_ozon_campaign_product_guard`
+/// once the desired bid is known. Both paths share the library parser, so this
+/// process cannot canonicalise a marketplace bid differently from the guard
+/// that authorises writing one.
 fn exact_static_product_bid(snapshot: &serde_json::Value, expected_sku: u64) -> Result<u64> {
-    let (sku, bid) = exact_static_product(snapshot)?;
+    let (sku, bid) = parse_ozon_campaign_product(snapshot)?;
     if sku != expected_sku {
         bail!("campaign SKU differs from static guard: expected {expected_sku}, actual {sku}");
     }
     Ok(bid)
 }
 
-fn exact_static_product(snapshot: &serde_json::Value) -> Result<(u64, u64)> {
-    let products = snapshot
-        .get("products")
-        .and_then(serde_json::Value::as_array)
-        .filter(|products| products.len() == 1)
-        .context("campaign must contain exactly one product")?;
-    let product = &products[0];
-    let sku = canonical_wire_u64(product.get("sku")).context("campaign SKU is invalid")?;
-    let bid = canonical_wire_u64(product.get("bid")).context("campaign bid is invalid")?;
-    Ok((sku, bid))
-}
-
-fn canonical_wire_u64(value: Option<&serde_json::Value>) -> Option<u64> {
-    match value? {
-        serde_json::Value::Number(value) => value.as_u64(),
-        serde_json::Value::String(value) => value
-            .parse::<u64>()
-            .ok()
-            .filter(|parsed| parsed.to_string() == *value),
-        _ => None,
-    }
-}
-
 async fn static_guard_metrics(
     reader: &PerformanceClient,
     store: &mcp_ozon::config::StoreId,
-    guards: &[StaticCampaignGuard],
+    guards: &[OzonStaticCampaignGuard],
     running: &BTreeSet<u64>,
 ) -> Result<BTreeMap<u64, (u64, u64)>> {
     let date_from = guards

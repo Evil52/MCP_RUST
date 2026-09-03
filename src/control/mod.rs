@@ -38,11 +38,14 @@ pub use config::{
     ControlWbRuntimeConfig,
 };
 pub use ozon::{
-    OzonAdsWriteClient, OzonCampaignCreateRequest, OzonCampaignGuard, OzonCampaignLaunchManifest,
+    DEFAULT_OZON_STATIC_MAX_CPC_BID_MICROROUBLES, DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES,
+    MAX_OZON_STATIC_GUARD_FILE_BYTES, MAX_OZON_STATIC_GUARDS, OzonAdsWriteClient,
+    OzonCampaignCreateRequest, OzonCampaignGuard, OzonCampaignLaunchManifest,
     OzonCampaignLaunchSpec, OzonCampaignProduct, OzonCampaignProductsRequest, OzonCampaignStrategy,
     OzonGuardEvaluationError, OzonGuardStopReason, OzonGuardedWriteError, OzonLaunchPlanError,
     OzonLaunchStatus, OzonPlacement, OzonPlanRepository, OzonPlanStoreError, OzonProductGuardError,
-    OzonWriteError, OzonWriteErrorKind, evaluate_ozon_campaign_guard,
+    OzonStaticCampaignGuard, OzonStaticGuardError, OzonWriteError, OzonWriteErrorKind,
+    evaluate_ozon_campaign_guard, parse_ozon_campaign_product, parse_ozon_static_guards,
     prepare_campaign_launch_manifest, validate_ozon_campaign_product_guard,
 };
 pub use plan::{PlanStoreError, WbActionQuota, WbPlanRepository, WbPlanStatus};
