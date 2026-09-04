@@ -131,6 +131,8 @@ done
 for required_text in \
   'docker buildx imagetools create' \
   '--metadata-file target/release-image-fragment/manifest-metadata.json' \
+  'name: mcp-ozon-platform-${{ matrix.id }}-amd64-${{ github.sha }}' \
+  'name: mcp-ozon-platform-${{ matrix.id }}-arm64-${{ github.sha }}' \
   'amd64_reference="$(jq -r '\''.reference'\'' "$amd64_fragment")"' \
   'arm64_reference="$(jq -r '\''.reference'\'' "$arm64_fragment")"' \
   'and (.manifests | length == 2)'; do
@@ -139,6 +141,17 @@ for required_text in \
     exit 1
   fi
 done
+
+# `control` is a prefix of four other image IDs. A wildcard after the ID would
+# download all ten control-prefixed platform fragments and make the exact-two
+# assembly guard fail after every otherwise successful release build.
+# shellcheck disable=SC2016 # Literal GitHub expression is the rejected contract.
+if grep -Fq \
+  'pattern: mcp-ozon-platform-${{ matrix.id }}-*-${{ github.sha }}' \
+  <<<"$assembly_job"; then
+  echo "platform fragments must be downloaded by exact architecture names" >&2
+  exit 1
+fi
 
 if grep -Eq '^[[:space:]]+push:' "$ci_workflow" \
   || grep -Eq '^[[:space:]]+push:' "$codeql_workflow"; then
