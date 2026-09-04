@@ -198,9 +198,9 @@ pub fn parse_ozon_static_guards(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_OZON_STATIC_MAX_CPC_BID_MICROROUBLES, DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES,
-        MAX_OZON_STATIC_GUARD_FILE_BYTES, MAX_OZON_STATIC_GUARDS, OzonStaticGuardError,
-        parse_ozon_static_guard_config, parse_ozon_static_guards,
+        DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES, MAX_OZON_STATIC_GUARD_FILE_BYTES,
+        MAX_OZON_STATIC_GUARDS, OzonStaticGuardError, parse_ozon_static_guard_config,
+        parse_ozon_static_guards,
     };
 
     const ACCOUNT: &str = "furnitura_dlya_doma";
@@ -233,16 +233,13 @@ mod tests {
         let guards = config.guards;
         assert_eq!(guards.len(), 5);
         for guard in &guards {
-            // Omitting the corridor in the file must mean the reviewed default,
-            // never an unbounded one.
+            // The minimum remains the reviewed default. The active operator
+            // file may impose a stricter ceiling than the policy maximum.
             assert_eq!(
                 guard.min_cpc_bid_microrubles,
                 DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES
             );
-            assert_eq!(
-                guard.max_cpc_bid_microrubles,
-                DEFAULT_OZON_STATIC_MAX_CPC_BID_MICROROUBLES
-            );
+            assert_eq!(guard.max_cpc_bid_microrubles, 10_000_000);
             assert_eq!(guard.guard.account_id, ACCOUNT);
             assert_eq!(
                 guard.guard.plan_id,

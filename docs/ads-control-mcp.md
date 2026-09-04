@@ -65,7 +65,9 @@ See the [official WB Promotion API](https://dev.wildberries.ru/docs/openapi/prom
 The reviewed Furnitura policy contains five independent one-SKU targets. Each
 campaign has a weekly budget of 2,000 RUB, a local total-spend stop at 2,000
 RUB and `TARGET_BIDS` with an initial 7 RUB CPC and an immutable 12 RUB policy
-ceiling. DRR 15% is a local fail-closed boundary and TOP-30 is an observation
+ceiling. The active static guard may impose a stricter operational ceiling;
+`config/ozon-furnitura-cpc7-live.json` currently caps all five campaigns at
+10 RUB. DRR 15% is a local fail-closed boundary and TOP-30 is an observation
 goal, not an API placement guarantee.
 
 The optional static-guard pacing controller consumes only a complete,
@@ -73,10 +75,11 @@ non-partial Ozon search-position snapshot published for the exact account, SKU
 and region. A snapshot older than 45 minutes, a missing or ambiguous monitor,
 or a position read error blocks upward changes. When attributed DRR is at most
 15% and a fresh position is worse than TOP-30, the controller raises CPC by
-exactly 1 RUB after a 30-minute cooldown, capped at 12 RUB. TOP-30 holds the
-bid. Attributed DRR above 15% lowers CPC by exactly 1 RUB after the cooldown,
-floored at 7 RUB; a breach already at 7 RUB pauses the campaign immediately.
-The 2,000 RUB spend cap also pauses immediately.
+exactly 1 RUB after a 30-minute cooldown, capped at the per-campaign static
+ceiling (currently 10 RUB). TOP-30 holds the bid. Attributed DRR above 15%
+lowers CPC by exactly 1 RUB after the cooldown, floored at 7 RUB; a breach
+already at 7 RUB pauses the campaign immediately. The 2,000 RUB spend cap also
+pauses immediately.
 
 Before a bid request, the intended transition is saved in the guard state.
 After the single write attempt, the product bid is read back through the
