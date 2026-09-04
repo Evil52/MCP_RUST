@@ -14,6 +14,7 @@ use super::{
     PendingDelivery, ReportKey, ReportKind,
     bundle::artifact_object_key,
     business_date,
+    collector_schedule::COLLECTION_COMPLETION_WINDOW,
     outbox::{
         ArtifactIdentity, DeliveryErrorClass, DeliveryRecord, validate_artifact,
         validate_provider_message_id,
@@ -26,6 +27,17 @@ use super::{
 const MAX_DELIVERY_ATTEMPTS: u8 = 5;
 const MAX_GENERATION_CANDIDATES: u16 = 16;
 const MAIL_CANARY_MAX_AGE: Duration = Duration::hours(24);
+
+/// How long a batch waits after its scheduled instant before it may be
+/// rendered.
+///
+/// A report reads the published snapshots of its own cutoff, and the collector
+/// is allowed to keep publishing them for the whole completion window. Deriving
+/// this delay from `COLLECTION_COMPLETION_WINDOW` rather than repeating the
+/// literal keeps the two halves of that one invariant in one place: widening
+/// the collection window must never leave generation reading a cutoff that is
+/// still being published.
+const GENERATION_SOURCE_SETTLE_DELAY: Duration = COLLECTION_COMPLETION_WINDOW;
 
 /// First generation retry delay. Each further attempt doubles it, so a batch
 /// that keeps failing backs off to roughly a quarter of an hour before its
@@ -471,7 +483,7 @@ impl PostgresOutboxRepository {
         .await
     }
 
-    /// Loads one due, non-expired single-section batch for deterministic
+    /// Loads one settled, non-expired single-section batch for deterministic
     /// rendering or recovery. `ready` batches are accepted so an operator can
     /// verify an ambiguous post-persistence outcome without creating another
     /// delivery identity.
@@ -483,6 +495,9 @@ impl PostgresOutboxRepository {
         if batch_id <= 0 {
             return Err(PostgresOutboxError::InvalidDelivery);
         }
+        let generation_ready_before = now
+            .checked_sub_signed(GENERATION_SOURCE_SETTLE_DELAY)
+            .ok_or(PostgresOutboxError::InvalidDelivery)?;
         let client = self
             .client
             .acquire()
@@ -500,10 +515,10 @@ impl PostgresOutboxRepository {
                    AND batch.scheduled_for <= $2 \
                    AND EXISTS ( \
                        SELECT 1 FROM daily_reporting.delivery_coverage AS due \
-                       WHERE due.batch_id = batch.id AND due.deadline_at >= $2 \
+                       WHERE due.batch_id = batch.id AND due.deadline_at >= $3 \
                    ) \
                  ORDER BY coverage.report_kind",
-                &[&batch_id, &now],
+                &[&batch_id, &generation_ready_before, &now],
             )
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
@@ -536,6 +551,10 @@ impl PostgresOutboxRepository {
         if limit == 0 || limit > MAX_GENERATION_CANDIDATES {
             return Err(PostgresOutboxError::InvalidDelivery);
         }
+
+        let generation_ready_before = now
+            .checked_sub_signed(GENERATION_SOURCE_SETTLE_DELAY)
+            .ok_or(PostgresOutboxError::InvalidDelivery)?;
         let client = self
             .client
             .acquire()
@@ -550,11 +569,11 @@ impl PostgresOutboxRepository {
                 "SELECT id \
                  FROM daily_reporting.generatable_batches \
                  WHERE scheduled_for <= $1 \
-                   AND deadline_at >= $1 \
-                   AND (retry_after IS NULL OR retry_after <= $1) \
+                   AND deadline_at >= $2 \
+                   AND (retry_after IS NULL OR retry_after <= $2) \
                  ORDER BY scheduled_for, id \
-                 LIMIT $2",
-                &[&now, &i64::from(limit)],
+                 LIMIT $3",
+                &[&generation_ready_before, &now, &i64::from(limit)],
             )
             .await
             .map_err(|_| PostgresOutboxError::Unavailable)?;
@@ -1220,12 +1239,32 @@ const fn exactly_one(changed: u64) -> Result<(), PostgresOutboxError> {
 mod tests {
     use chrono::{TimeZone, Utc};
 
+    use std::collections::BTreeSet;
+
     use super::{
-        GenerationStatus, PostgresOutboxError, exactly_one, parse_generation_status, parse_kind,
-        permanent_error_text, transient_error_text, validate_attempt_times,
-        validate_mail_activation_state,
+        COLLECTION_COMPLETION_WINDOW, Duration, GENERATION_RETRY_BASE_SECONDS,
+        GENERATION_SOURCE_SETTLE_DELAY, GenerationStatus, PostgresOutboxError, exactly_one,
+        parse_generation_status, parse_kind, permanent_error_text, transient_error_text,
+        validate_attempt_times, validate_mail_activation_state,
     };
-    use crate::{reporting::ReportKind, reporting::outbox::DeliveryErrorClass};
+    use crate::reporting::{
+        ReportKind, due_deliveries,
+        outbox::{DeliveryErrorClass, DeliveryRecord},
+    };
+
+    /// Wall-clock cost of spending the whole generation retry budget.
+    ///
+    /// `generatable_batches` keeps a batch only while it has fewer than five
+    /// recorded failures, and every failure schedules the next attempt one
+    /// doubling further out, so 60 s, 120 s, 240 s and 480 s separate the first
+    /// attempt from the last one the budget allows.
+    fn exhausted_generation_ladder() -> Duration {
+        assert!(
+            (GENERATION_RETRY_BASE_SECONDS - 60.0).abs() < f64::EPSILON,
+            "the ladder below is written out for the shipped 60-second base delay"
+        );
+        Duration::seconds(60 + 120 + 240 + 480)
+    }
 
     #[test]
     fn database_text_mappings_and_row_counts_fail_closed() {
@@ -1327,5 +1366,60 @@ mod tests {
                 .canary_sent_at,
             now
         );
+    }
+
+    #[test]
+    fn generation_waits_for_exactly_the_collector_completion_window() {
+        // Two modules encode one invariant: the collector may publish into a
+        // cutoff for the whole completion window, and generation must not read
+        // that cutoff until it closes. Binding the constants here makes
+        // widening one of them a test failure rather than a silent source of
+        // half-published reports.
+        assert_eq!(GENERATION_SOURCE_SETTLE_DELAY, COLLECTION_COMPLETION_WINDOW);
+    }
+
+    #[test]
+    fn the_settle_delay_leaves_the_whole_retry_budget_inside_every_deadline() {
+        let ladder = exhausted_generation_ladder();
+        let sent = BTreeSet::new();
+        // 03:00 UTC is the 08:00 EKB morning boundary. 12:00 UTC is the 17:00
+        // EKB evening boundary, where empty coverage also queues the recovered
+        // morning occurrence: scheduled at the evening boundary, inheriting the
+        // evening deadline. Together they are every shape `due_deliveries` can
+        // produce, and the recovered one is what would break first if either
+        // window grew.
+        for (hour, expected) in [
+            (3_u32, vec![ReportKind::Morning]),
+            (12, vec![ReportKind::Morning, ReportKind::Evening]),
+        ] {
+            let now = Utc.with_ymd_and_hms(2026, 8, 16, hour, 0, 0).unwrap();
+            let deliveries = due_deliveries(now, "pilot_owner", 1, &sent).unwrap();
+            assert_eq!(
+                deliveries
+                    .iter()
+                    .map(|delivery| delivery.covered_keys[0].kind)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for delivery in deliveries {
+                let scheduled_for = delivery.scheduled_for;
+                let kind = delivery.covered_keys[0].kind;
+                let deadline = DeliveryRecord::planned(delivery)
+                    .unwrap()
+                    .deadline_at()
+                    .unwrap();
+                let first_attempt = scheduled_for + GENERATION_SOURCE_SETTLE_DELAY;
+                assert!(
+                    first_attempt < deadline,
+                    "{kind:?} scheduled at {scheduled_for} cannot become generatable \
+                     before its {deadline} deadline"
+                );
+                assert!(
+                    first_attempt + ladder < deadline,
+                    "{kind:?} scheduled at {scheduled_for} cannot spend its generation \
+                     retry budget before its {deadline} deadline"
+                );
+            }
+        }
     }
 }

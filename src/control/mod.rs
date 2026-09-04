@@ -38,15 +38,18 @@ pub use config::{
     ControlWbRuntimeConfig,
 };
 pub use ozon::{
-    OzonAdsWriteClient, OzonBidPacingAction, OzonBidPacingError, OzonBidPacingHoldReason,
-    OzonBidPacingObservation, OzonBidPacingPauseReason, OzonBidPacingPolicy,
-    OzonBidPositionReadError, OzonBidPositionReader, OzonCampaignCreateRequest, OzonCampaignGuard,
-    OzonCampaignLaunchManifest, OzonCampaignLaunchSpec, OzonCampaignProduct,
-    OzonCampaignProductsRequest, OzonCampaignStrategy, OzonGuardEvaluationError,
-    OzonGuardStopReason, OzonGuardedWriteError, OzonLaunchPlanError, OzonLaunchStatus,
-    OzonPlacement, OzonPlanRepository, OzonPlanStoreError, OzonPositionSignal,
-    OzonProductGuardError, OzonWriteError, OzonWriteErrorKind, evaluate_ozon_bid_pacing,
-    evaluate_ozon_campaign_guard, prepare_campaign_launch_manifest,
+    DEFAULT_OZON_STATIC_MAX_CPC_BID_MICROROUBLES, DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES,
+    MAX_OZON_STATIC_GUARD_FILE_BYTES, MAX_OZON_STATIC_GUARDS, OzonAdsWriteClient,
+    OzonBidPacingAction, OzonBidPacingError, OzonBidPacingHoldReason, OzonBidPacingObservation,
+    OzonBidPacingPauseReason, OzonBidPacingPolicy, OzonBidPositionReadError, OzonBidPositionReader,
+    OzonCampaignCreateRequest, OzonCampaignGuard, OzonCampaignLaunchManifest,
+    OzonCampaignLaunchSpec, OzonCampaignProduct, OzonCampaignProductsRequest, OzonCampaignStrategy,
+    OzonGuardEvaluationError, OzonGuardStopReason, OzonGuardedWriteError, OzonLaunchPlanError,
+    OzonLaunchStatus, OzonPlacement, OzonPlanRepository, OzonPlanStoreError, OzonPositionSignal,
+    OzonProductGuardError, OzonStaticCampaignGuard, OzonStaticDynamicBidControl,
+    OzonStaticGuardConfig, OzonStaticGuardError, OzonWriteError, OzonWriteErrorKind,
+    evaluate_ozon_bid_pacing, evaluate_ozon_campaign_guard, parse_ozon_campaign_product,
+    parse_ozon_static_guard_config, parse_ozon_static_guards, prepare_campaign_launch_manifest,
     validate_ozon_campaign_product_guard,
 };
 pub use plan::{PlanStoreError, WbActionQuota, WbPlanRepository, WbPlanStatus};

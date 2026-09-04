@@ -161,13 +161,25 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
         CreateOutcome::Inserted(id) => id,
         CreateOutcome::Existing(_) => unreachable!(),
     };
+    let early_candidates = repository
+        .pending_generation_ids(utc(3, 29), 16)
+        .await
+        .unwrap();
     assert!(
-        repository
-            .pending_generation_ids(utc(3, 1), 16)
-            .await
-            .unwrap()
-            .contains(&batch_id)
+        !early_candidates.contains(&batch_id),
+        "automatic generation must wait for the collection window to close"
     );
+
+    let ready_candidates = repository
+        .pending_generation_ids(utc(3, 30), 16)
+        .await
+        .unwrap();
+
+    assert!(
+        ready_candidates.contains(&batch_id),
+        "the report must become generatable when the collection window closes"
+    );
+
     for limit in [0, 17] {
         assert_eq!(
             repository.pending_generation_ids(utc(3, 1), limit).await,
@@ -178,20 +190,25 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
         repository.generation_candidate(batch_id, utc(2, 59)).await,
         Err(PostgresOutboxError::Conflict)
     );
+    assert_eq!(
+        repository.generation_candidate(batch_id, utc(3, 29)).await,
+        Err(PostgresOutboxError::Conflict),
+        "direct generation must not bypass the source collection window"
+    );
     let planned = repository
-        .generation_candidate(batch_id, utc(3, 1))
+        .generation_candidate(batch_id, utc(3, 30))
         .await
         .unwrap();
     assert_eq!(planned.status, GenerationStatus::Planned);
     assert_eq!(planned.batch_id, batch_id);
     assert_eq!(planned.key.recipient_id, recipient);
     assert_eq!(planned.key.kind, mcp_ozon::reporting::ReportKind::Morning);
-    assert!(planned.generated_at <= utc(3, 1));
+    assert!(planned.generated_at <= utc(3, 30));
 
     repository.start_generation(batch_id).await.unwrap();
     assert_eq!(
         repository
-            .generation_candidate(batch_id, utc(3, 2))
+            .generation_candidate(batch_id, utc(3, 31))
             .await
             .unwrap()
             .status,
@@ -206,7 +223,7 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
         .unwrap();
     assert_eq!(
         repository
-            .generation_candidate(batch_id, utc(3, 3))
+            .generation_candidate(batch_id, utc(3, 32))
             .await
             .unwrap()
             .status,
@@ -214,7 +231,7 @@ async fn scheduler_persists_each_daily_identity_once_without_delivery() {
     );
     assert!(
         !repository
-            .pending_generation_ids(utc(3, 3), 16)
+            .pending_generation_ids(utc(3, 32), 16)
             .await
             .unwrap()
             .contains(&batch_id)
@@ -1132,28 +1149,29 @@ async fn a_failing_generation_backs_off_and_then_exhausts_its_budget() {
     let recipient = format!("backoff_{}", std::process::id());
     let policy = disabled_policy(recipient);
 
-    let now = utc(3, 0);
-    let planned = repository.plan_due(now, &policy).await.unwrap();
+    let scheduled_at = utc(3, 0);
+    let planned = repository.plan_due(scheduled_at, &policy).await.unwrap();
     let CreateOutcome::Inserted(batch_id) = planned[0].1 else {
         panic!("the first planning pass inserts the batch");
     };
+    let first_attempt_at = scheduled_at + Duration::minutes(30);
     assert!(
         repository
-            .pending_generation_ids(now, 16)
+            .pending_generation_ids(first_attempt_at, 16)
             .await
             .unwrap()
             .contains(&batch_id),
-        "a fresh batch is a generation candidate"
+        "a fresh batch is a generation candidate after collection settles"
     );
 
     // One failure holds the batch back for the base delay, but not beyond it.
     repository
-        .record_generation_failure(batch_id, now, GenerationErrorClass::Failed)
+        .record_generation_failure(batch_id, first_attempt_at, GenerationErrorClass::Failed)
         .await
         .unwrap();
     assert!(
         !repository
-            .pending_generation_ids(now, 16)
+            .pending_generation_ids(first_attempt_at, 16)
             .await
             .unwrap()
             .contains(&batch_id),
@@ -1163,7 +1181,7 @@ async fn a_failing_generation_backs_off_and_then_exhausts_its_budget() {
     // Spend the rest of the budget. Each attempt is recorded against a batch
     // that is still generatable, so the append-only log stays consistent.
     for attempt in 2..=5 {
-        let elapsed = now + Duration::seconds(60 * 2_i64.pow(attempt));
+        let elapsed = first_attempt_at + Duration::seconds(60 * 2_i64.pow(attempt));
         assert!(
             repository
                 .pending_generation_ids(elapsed, 16)
@@ -1179,7 +1197,7 @@ async fn a_failing_generation_backs_off_and_then_exhausts_its_budget() {
     }
 
     // The budget is spent: no later time makes it a candidate again.
-    let far_future = now + Duration::days(1);
+    let far_future = first_attempt_at + Duration::days(1);
     assert!(
         !repository
             .pending_generation_ids(far_future, 16)
