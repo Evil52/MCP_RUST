@@ -1001,9 +1001,6 @@ impl PostgresReportingRepository {
         query: SalesAnalyticsQuery,
     ) -> Result<SalesAnalyticsResult, ReportingReadError> {
         validate_sales_analytics_query(query)?;
-        if account.marketplace() != Marketplace::Ozon {
-            return Err(ReportingReadError::InvalidRequest);
-        }
         let range = history_range(Some(query.date_from), Some(query.date_to))?;
         let client = self
             .client

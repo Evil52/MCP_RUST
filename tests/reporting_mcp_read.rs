@@ -379,6 +379,44 @@ async fn restricted_reader_rebuilds_complete_history_actions_and_safe_report_met
         sales_analytics.coverage[0].state,
         SalesDateCoverageState::Complete
     );
+    let missing_wb = AccountScope::new(
+        format!("missing_wb_mcp_read_{}", std::process::id()),
+        Marketplace::Wildberries,
+    )
+    .unwrap();
+    let wb_sales_analytics = reader
+        .sales_analytics(
+            &missing_wb,
+            SalesAnalyticsQuery {
+                date_from: business_date,
+                date_to: business_date,
+                group_by: SalesAnalyticsGroup::Day,
+                sort_by: SalesAnalyticsSort::Dimension,
+                direction: SalesAnalyticsDirection::Asc,
+                limit: 100,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(wb_sales_analytics.state, DataState::Unavailable);
+    assert!(wb_sales_analytics.rows.is_empty());
+
+    let ranking = reader
+        .weekly_marketplace_ranking(
+            &[missing.clone(), missing_wb],
+            business_date - Duration::days(6),
+            business_date,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ranking.state, DataState::Unavailable);
+    assert_eq!(ranking.expected_accounts, 2);
+    assert_eq!(ranking.complete_accounts, 0);
+    assert_eq!(ranking.missing.len(), 2);
+    assert!(ranking.ranking.is_empty());
+    assert!(ranking.leader.is_none());
+    assert!(ranking.outsider.is_none());
     assert!(
         reader
             .metrics_history(
