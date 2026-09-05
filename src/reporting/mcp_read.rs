@@ -381,6 +381,7 @@ fn validate_weekly_ranking_result(
         || result.group_by != SalesAnalyticsGroup::Day
         || result.sort_by != SalesAnalyticsSort::Dimension
         || result.direction != SalesAnalyticsDirection::Asc
+        || i64::from(result.limit) != WEEKLY_RANKING_DAYS
         || result.offset != 0
         || usize::try_from(result.total_rows).ok() != Some(result.rows.len())
     {
@@ -418,6 +419,10 @@ fn validate_weekly_ranking_result(
             || row.currency != "RUB"
             || !expected_dates.contains(business_date)
             || !row_dates.insert(business_date.clone())
+            || !result
+                .coverage
+                .iter()
+                .any(|date| date.business_date == *business_date && date.served)
         {
             return Err(ReportingReadError::InvalidPublishedData);
         }
@@ -3068,12 +3073,13 @@ mod tests {
         ) -> ReportingReadFuture<'a, SalesAnalyticsResult> {
             Box::pin(async move {
                 if account.account_id().starts_with("rank_") {
-                    let incomplete = account.account_id() == "rank_missing";
+                    let unavailable = account.account_id().starts_with("rank_unavailable_");
+                    let incomplete = account.account_id() == "rank_missing" || unavailable;
                     let mut coverage = Vec::new();
                     let mut rows = Vec::new();
                     let mut date = query.date_from;
                     loop {
-                        let missing = incomplete && date == query.date_to;
+                        let missing = unavailable || (incomplete && date == query.date_to);
                         coverage.push(SalesDateCoverage {
                             business_date: date.to_string(),
                             state: if missing {
@@ -3110,7 +3116,9 @@ mod tests {
                         marketplace: account.marketplace().into(),
                         date_from: query.date_from.to_string(),
                         date_to: query.date_to.to_string(),
-                        state: if incomplete {
+                        state: if unavailable {
+                            DataState::Unavailable
+                        } else if incomplete {
                             DataState::Partial
                         } else {
                             DataState::Complete
@@ -3278,6 +3286,93 @@ mod tests {
                 .await,
             Err(ReportingReadError::InvalidRequest)
         );
+    }
+
+    #[tokio::test]
+    async fn weekly_ranking_requires_all_fourteen_accounts_not_only_ozon() {
+        let reader = ReportingReader::from_repository(Arc::new(FakeReportingRepository));
+        let from = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 8, 30).unwrap();
+        let mut accounts = (0..14)
+            .map(|i| {
+                AccountScope::new(
+                    format!("rank_{i:02}"),
+                    if i < 7 {
+                        Marketplace::Ozon
+                    } else {
+                        Marketplace::Wildberries
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let complete = reader
+            .weekly_marketplace_ranking(&accounts, from, to)
+            .await
+            .unwrap();
+        assert_eq!(
+            (complete.expected_accounts, complete.complete_accounts),
+            (14, 14)
+        );
+        assert_eq!(complete.state, DataState::Complete);
+        assert_eq!(complete.ranking.len(), 14);
+        assert!(complete.leader.is_some() && complete.outsider.is_some());
+        for (i, account) in accounts.iter_mut().enumerate().skip(7) {
+            *account = AccountScope::new(format!("rank_unavailable_{i}"), Marketplace::Wildberries)
+                .unwrap();
+        }
+        let partial = reader
+            .weekly_marketplace_ranking(&accounts, from, to)
+            .await
+            .unwrap();
+        assert_eq!(
+            (partial.expected_accounts, partial.complete_accounts),
+            (14, 7)
+        );
+        assert_eq!(partial.state, DataState::Partial);
+        assert_eq!(partial.missing.len(), 7);
+        assert!(partial.missing.iter().all(|gap| gap.marketplace
+            == ReportingMarketplace::Wildberries
+            && gap.dates.len() == 7));
+        assert!(partial.ranking.is_empty());
+        assert!(partial.leader.is_none() && partial.outsider.is_none());
+    }
+
+    #[tokio::test]
+    async fn weekly_ranking_rejects_mixed_identity_period_truncation_and_unserved_facts() {
+        let account = AccountScope::new("rank_low".to_owned(), Marketplace::Ozon).unwrap();
+        let from = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 8, 30).unwrap();
+        let query = SalesAnalyticsQuery {
+            date_from: from,
+            date_to: to,
+            group_by: SalesAnalyticsGroup::Day,
+            sort_by: SalesAnalyticsSort::Dimension,
+            direction: SalesAnalyticsDirection::Asc,
+            limit: 7,
+            offset: 0,
+        };
+        let valid = FakeReportingRepository
+            .sales_analytics(&account, query)
+            .await
+            .unwrap();
+        for mutation in 0..8 {
+            let mut invalid = valid.clone();
+            match mutation {
+                0 => invalid.account_id = "other".to_owned(),
+                1 => invalid.marketplace = ReportingMarketplace::Wildberries,
+                2 => invalid.date_to = from.to_string(),
+                3 => invalid.total_rows += 1,
+                4 => invalid.coverage[0] = invalid.coverage[1].clone(),
+                5 => invalid.rows[0].currency = "USD".to_owned(),
+                6 => invalid.coverage[0].served = false,
+                _ => invalid.limit = 6,
+            }
+            assert_eq!(
+                validate_weekly_ranking_result(&account, from, to, &invalid),
+                Err(ReportingReadError::InvalidPublishedData)
+            );
+        }
     }
 
     #[tokio::test]

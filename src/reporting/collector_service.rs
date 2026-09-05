@@ -22,13 +22,14 @@ use crate::{
 };
 
 use super::{
-    collector_plan::{CollectionTarget, build_collection_plan},
-    policy::DailyReportPolicy,
+    collection_policy::CollectionPolicy,
+    collector_plan::{CollectionTarget, build_collection_plan_for_accounts},
     postgres_collector::CollectionClaim,
 };
 
 const DATABASE_URL_ENV: &str = "REPORT_COLLECTOR_DATABASE_URL";
 const POLICY_PATH_ENV: &str = "DAILY_REPORT_POLICY";
+const COLLECTION_POLICY_PATH_ENV: &str = "REPORT_COLLECTION_POLICY";
 const ACCESS_CONFIG_ENV: &str = "MCP_ACCESS_CONFIG";
 const MODE_ENV: &str = "REPORT_COLLECTOR_MODE";
 const CREDENTIAL_DIRECTORY_ENV: &str = "REPORT_COLLECTOR_CREDENTIAL_DIR";
@@ -116,7 +117,7 @@ fn is_valid_credential_name(value: &str) -> bool {
 pub struct ReportCollectorConfig {
     database: Config,
     mode: ReportCollectorMode,
-    policy: DailyReportPolicy,
+    policy: CollectionPolicy,
     registry: Arc<AccessRegistry>,
     collection_plan: Vec<CollectionTarget>,
     credential_directory: Option<CredentialDirectory>,
@@ -141,15 +142,23 @@ impl ReportCollectorConfig {
         let registry_path = lookup(ACCESS_CONFIG_ENV).context("MCP_ACCESS_CONFIG is required")?;
         let registry = RegistrySource::new(registry_path)
             .context("MCP_ACCESS_CONFIG must contain a valid access registry")?;
-        let policy_path = lookup(POLICY_PATH_ENV).context("DAILY_REPORT_POLICY is required")?;
+        let collection_path = lookup(COLLECTION_POLICY_PATH_ENV).filter(|path| !path.is_empty());
+        let legacy_path = lookup(POLICY_PATH_ENV).filter(|path| !path.is_empty());
+        ensure!(
+            collection_path.is_none() || legacy_path.is_none(),
+            "configure only REPORT_COLLECTION_POLICY or DAILY_REPORT_POLICY, not both"
+        );
+        let policy_path = collection_path
+            .or(legacy_path)
+            .context("REPORT_COLLECTION_POLICY (or legacy DAILY_REPORT_POLICY) is required")?;
         let policy_bytes = read_bounded_file(Path::new(&policy_path), MAX_POLICY_BYTES)
-            .context("DAILY_REPORT_POLICY cannot be read")?;
+            .context("collection policy cannot be read")?;
         let registry = registry
             .load()
             .context("MCP_ACCESS_CONFIG cannot be loaded")?;
-        let policy = DailyReportPolicy::from_slice(&policy_bytes, &registry)
-            .context("DAILY_REPORT_POLICY is invalid")?;
-        let collection_plan = build_collection_plan(&policy, &registry)
+        let policy = CollectionPolicy::from_slice(&policy_bytes, &registry)
+            .context("collection policy is invalid")?;
+        let collection_plan = build_collection_plan_for_accounts(&policy.account_ids, &registry)
             .context("daily report collection plan is invalid")?;
         let credential_directory = lookup(CREDENTIAL_DIRECTORY_ENV)
             .map(CredentialDirectory::open)
@@ -183,7 +192,7 @@ impl ReportCollectorConfig {
     }
 
     #[must_use]
-    pub const fn policy(&self) -> &DailyReportPolicy {
+    pub const fn policy(&self) -> &CollectionPolicy {
         &self.policy
     }
 
@@ -490,6 +499,43 @@ mod tests {
                 .iter()
                 .find_map(|(entry, value)| (*entry == key).then(|| value.clone()))
         })
+    }
+
+    #[test]
+    fn standalone_collection_config_never_reads_mail_or_marketplace_secrets() {
+        let path = file(
+            "collection-policy",
+            r#"{"version":1,"enabled":true,"timezone":"Asia/Yekaterinburg","account_ids":["ozon","wb"]}"#,
+        );
+        let mut values = entries();
+        values[2] = (COLLECTION_POLICY_PATH_ENV, path.display().to_string());
+        values.push((MODE_ENV, "scheduled".to_owned()));
+        values.push((
+            CREDENTIAL_DIRECTORY_ENV,
+            directory("empty-credentials").display().to_string(),
+        ));
+        let mut looked_up = Vec::new();
+        let config = ReportCollectorConfig::from_lookup(&mut |name| {
+            looked_up.push(name.to_owned());
+            values
+                .iter()
+                .find_map(|(key, value)| (*key == name).then(|| value.clone()))
+        })
+        .unwrap();
+        assert_eq!(config.collection_plan().len(), 2);
+        assert!(looked_up.iter().all(|name| {
+            [
+                DATABASE_URL_ENV,
+                ACCESS_CONFIG_ENV,
+                POLICY_PATH_ENV,
+                COLLECTION_POLICY_PATH_ENV,
+                MODE_ENV,
+                CREDENTIAL_DIRECTORY_ENV,
+            ]
+            .contains(&name.as_str())
+        }));
+        values.push((POLICY_PATH_ENV, path.display().to_string()));
+        assert!(self::config(&values).is_err());
     }
 
     fn personal_wb_token() -> String {

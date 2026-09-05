@@ -11,10 +11,16 @@ if [[ $# -ne 1 || "$1" != "$confirmation" ]]; then
 fi
 
 : "${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required}"
-: "${DAILY_REPORT_POLICY_HOST:?DAILY_REPORT_POLICY_HOST is required}"
+: "${REPORT_COLLECTION_POLICY_HOST:=${DAILY_REPORT_POLICY_HOST:-}}"
+: "${REPORT_COLLECTION_POLICY_HOST:?REPORT_COLLECTION_POLICY_HOST or DAILY_REPORT_POLICY_HOST is required}"
+if [[ -n "${DAILY_REPORT_POLICY_HOST:-}" && "$DAILY_REPORT_POLICY_HOST" != "$REPORT_COLLECTION_POLICY_HOST" ]]; then
+  echo "collection and legacy policy paths conflict; configure only one" >&2
+  exit 64
+fi
+export REPORT_COLLECTION_POLICY_HOST
 : "${REPORT_COLLECTOR_CREDENTIAL_DIR_HOST:?REPORT_COLLECTOR_CREDENTIAL_DIR_HOST is required}"
 
-for path in "$MCP_ACCESS_CONFIG_HOST" "$DAILY_REPORT_POLICY_HOST"; do
+for path in "$MCP_ACCESS_CONFIG_HOST" "$REPORT_COLLECTION_POLICY_HOST"; do
   if [[ ! -f "$path" || -L "$path" ]]; then
     echo "required scheduled-collection file is unavailable or unsafe: $path" >&2
     exit 66
