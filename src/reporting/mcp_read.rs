@@ -54,6 +54,8 @@ pub const MAX_SALES_ANALYTICS_ROWS: u16 = 1_000;
 pub const MAX_SALES_ANALYTICS_OFFSET: u32 = 100_000;
 const MAX_SALES_ANALYTICS_FACT_ROWS: u64 = 250_000;
 const MAX_SALES_SNAPSHOT_CANDIDATES: usize = 63;
+const WEEKLY_RANKING_DAYS: i64 = 7;
+const MAX_WEEKLY_RANKING_ACCOUNTS: usize = 100;
 const MAX_FACT_ROWS: usize = 25_000;
 const UTC_03_00: NaiveTime = NaiveTime::from_hms_opt(3, 0, 0).unwrap();
 const UTC_09_00: NaiveTime = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
@@ -216,6 +218,137 @@ impl ReportingReader {
         self.repository.sales_analytics(account, query).await
     }
 
+    /// Builds one cross-marketplace ranking exclusively from published
+    /// PostgreSQL sales snapshots. A ranking is withheld unless every account
+    /// has complete coverage for every day of the same seven-day period.
+    pub async fn weekly_marketplace_ranking(
+        &self,
+        accounts: &[AccountScope],
+        date_from: NaiveDate,
+        date_to: NaiveDate,
+    ) -> Result<WeeklyMarketplaceRankingResult, ReportingReadError> {
+        if accounts.is_empty()
+            || accounts.len() > MAX_WEEKLY_RANKING_ACCOUNTS
+            || date_to.signed_duration_since(date_from).num_days() + 1 != WEEKLY_RANKING_DAYS
+        {
+            return Err(ReportingReadError::InvalidRequest);
+        }
+        let mut identities = BTreeSet::new();
+        if accounts.iter().any(|account| {
+            !identities.insert((account.account_id().to_owned(), account.marketplace()))
+        }) {
+            return Err(ReportingReadError::InvalidRequest);
+        }
+
+        let mut complete = Vec::with_capacity(accounts.len());
+        let mut missing = Vec::new();
+        for account in accounts {
+            let result = self
+                .sales_analytics(
+                    account,
+                    SalesAnalyticsQuery {
+                        date_from,
+                        date_to,
+                        group_by: SalesAnalyticsGroup::Day,
+                        sort_by: SalesAnalyticsSort::Dimension,
+                        direction: SalesAnalyticsDirection::Asc,
+                        limit: u16::try_from(WEEKLY_RANKING_DAYS)
+                            .map_err(|_| ReportingReadError::InvalidRequest)?,
+                        offset: 0,
+                    },
+                )
+                .await?;
+            validate_weekly_ranking_result(account, date_from, date_to, &result)?;
+            let incomplete_dates = result
+                .coverage
+                .iter()
+                .filter(|date| date.state != SalesDateCoverageState::Complete || !date.served)
+                .cloned()
+                .collect::<Vec<_>>();
+            let complete_coverage = result.state == DataState::Complete
+                && result.coverage.len()
+                    == usize::try_from(WEEKLY_RANKING_DAYS)
+                        .map_err(|_| ReportingReadError::InvalidRequest)?
+                && incomplete_dates.is_empty();
+            if !complete_coverage {
+                missing.push(WeeklyRankingCoverageGap {
+                    account_id: result.account_id,
+                    marketplace: result.marketplace,
+                    dates: incomplete_dates,
+                });
+                continue;
+            }
+            let (ordered_units, operational_gmv_minor) = result
+                .rows
+                .iter()
+                .try_fold((0_u64, 0_u64), |(units, gmv), row| {
+                    Some((
+                        units.checked_add(row.ordered_units)?,
+                        gmv.checked_add(row.operational_gmv_minor)?,
+                    ))
+                })
+                .ok_or(ReportingReadError::InvalidPublishedData)?;
+            complete.push(WeeklyRankingEntry {
+                rank: 0,
+                account_id: result.account_id,
+                marketplace: result.marketplace,
+                ordered_units,
+                operational_gmv_minor,
+                currency: "RUB".to_owned(),
+            });
+        }
+
+        let expected_accounts =
+            u16::try_from(accounts.len()).map_err(|_| ReportingReadError::InvalidRequest)?;
+        let complete_accounts =
+            u16::try_from(complete.len()).map_err(|_| ReportingReadError::InvalidPublishedData)?;
+        let state = if complete_accounts == expected_accounts {
+            DataState::Complete
+        } else if complete_accounts == 0 {
+            DataState::Unavailable
+        } else {
+            DataState::Partial
+        };
+        if state != DataState::Complete {
+            return Ok(WeeklyMarketplaceRankingResult {
+                date_from: date_from.to_string(),
+                date_to: date_to.to_string(),
+                state,
+                source: "published_postgresql_snapshots".to_owned(),
+                expected_accounts,
+                complete_accounts,
+                missing,
+                ranking: Vec::new(),
+                leader: None,
+                outsider: None,
+            });
+        }
+
+        complete.sort_by(|left, right| {
+            right
+                .operational_gmv_minor
+                .cmp(&left.operational_gmv_minor)
+                .then_with(|| right.ordered_units.cmp(&left.ordered_units))
+                .then_with(|| left.account_id.cmp(&right.account_id))
+        });
+        for (index, entry) in complete.iter_mut().enumerate() {
+            entry.rank =
+                u16::try_from(index + 1).map_err(|_| ReportingReadError::InvalidPublishedData)?;
+        }
+        Ok(WeeklyMarketplaceRankingResult {
+            date_from: date_from.to_string(),
+            date_to: date_to.to_string(),
+            state,
+            source: "published_postgresql_snapshots".to_owned(),
+            expected_accounts,
+            complete_accounts,
+            missing,
+            leader: complete.first().cloned(),
+            outsider: complete.last().cloned(),
+            ranking: complete,
+        })
+    }
+
     pub async fn manager_actions(
         &self,
         account: &AccountScope,
@@ -231,6 +364,65 @@ impl ReportingReader {
         validate_limit(limit, MAX_READY_REPORTS)?;
         self.repository.ready_reports(limit).await
     }
+}
+
+fn validate_weekly_ranking_result(
+    account: &AccountScope,
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+    result: &SalesAnalyticsResult,
+) -> Result<(), ReportingReadError> {
+    let expected_marketplace: ReportingMarketplace = account.marketplace().into();
+    if result.account_id != account.account_id()
+        || result.marketplace != expected_marketplace
+        || result.date_from != date_from.to_string()
+        || result.date_to != date_to.to_string()
+        || result.source != "published_postgresql_snapshots"
+        || result.group_by != SalesAnalyticsGroup::Day
+        || result.sort_by != SalesAnalyticsSort::Dimension
+        || result.direction != SalesAnalyticsDirection::Asc
+        || result.offset != 0
+        || usize::try_from(result.total_rows).ok() != Some(result.rows.len())
+    {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+
+    let mut expected_dates = BTreeSet::new();
+    for offset in 0..WEEKLY_RANKING_DAYS {
+        let date = date_from
+            .checked_add_days(chrono::Days::new(
+                u64::try_from(offset).map_err(|_| ReportingReadError::InvalidPublishedData)?,
+            ))
+            .ok_or(ReportingReadError::InvalidPublishedData)?;
+        expected_dates.insert(date.to_string());
+    }
+    if expected_dates.last().map(String::as_str) != Some(date_to.to_string().as_str()) {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+
+    let coverage_dates = result
+        .coverage
+        .iter()
+        .map(|coverage| coverage.business_date.clone())
+        .collect::<BTreeSet<_>>();
+    if coverage_dates != expected_dates || coverage_dates.len() != result.coverage.len() {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+
+    let mut row_dates = BTreeSet::new();
+    for row in &result.rows {
+        let Some(business_date) = &row.business_date else {
+            return Err(ReportingReadError::InvalidPublishedData);
+        };
+        if row.sku.is_some()
+            || row.currency != "RUB"
+            || !expected_dates.contains(business_date)
+            || !row_dates.insert(business_date.clone())
+        {
+            return Err(ReportingReadError::InvalidPublishedData);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -445,6 +637,37 @@ pub struct SalesAnalyticsResult {
     pub total_rows: u64,
     pub rows: Vec<SalesAnalyticsRow>,
     pub coverage: Vec<SalesDateCoverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct WeeklyRankingCoverageGap {
+    pub account_id: String,
+    pub marketplace: ReportingMarketplace,
+    pub dates: Vec<SalesDateCoverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct WeeklyRankingEntry {
+    pub rank: u16,
+    pub account_id: String,
+    pub marketplace: ReportingMarketplace,
+    pub ordered_units: u64,
+    pub operational_gmv_minor: u64,
+    pub currency: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct WeeklyMarketplaceRankingResult {
+    pub date_from: String,
+    pub date_to: String,
+    pub state: DataState,
+    pub source: String,
+    pub expected_accounts: u16,
+    pub complete_accounts: u16,
+    pub missing: Vec<WeeklyRankingCoverageGap>,
+    pub ranking: Vec<WeeklyRankingEntry>,
+    pub leader: Option<WeeklyRankingEntry>,
+    pub outsider: Option<WeeklyRankingEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -2847,6 +3070,65 @@ mod tests {
             query: SalesAnalyticsQuery,
         ) -> ReportingReadFuture<'a, SalesAnalyticsResult> {
             Box::pin(async move {
+                if account.account_id().starts_with("rank_") {
+                    let incomplete = account.account_id() == "rank_missing";
+                    let mut coverage = Vec::new();
+                    let mut rows = Vec::new();
+                    let mut date = query.date_from;
+                    loop {
+                        let missing = incomplete && date == query.date_to;
+                        coverage.push(SalesDateCoverage {
+                            business_date: date.to_string(),
+                            state: if missing {
+                                SalesDateCoverageState::Unavailable
+                            } else {
+                                SalesDateCoverageState::Complete
+                            },
+                            served: !missing,
+                            cutoff_at: (!missing).then(|| "2026-08-31T03:00:00Z".to_owned()),
+                            source_as_of: (!missing).then(|| "2026-08-31T02:59:00Z".to_owned()),
+                            period_end: (!missing).then(|| "2026-08-31T19:00:00Z".to_owned()),
+                        });
+                        if !missing {
+                            let multiplier = if account.account_id() == "rank_high" {
+                                10
+                            } else {
+                                1
+                            };
+                            rows.push(SalesAnalyticsRow {
+                                business_date: Some(date.to_string()),
+                                sku: None,
+                                ordered_units: multiplier,
+                                operational_gmv_minor: multiplier * 1_000,
+                                currency: "RUB".to_owned(),
+                            });
+                        }
+                        if date == query.date_to {
+                            break;
+                        }
+                        date = date.succ_opt().unwrap();
+                    }
+                    return Ok(SalesAnalyticsResult {
+                        account_id: account.account_id().to_owned(),
+                        marketplace: account.marketplace().into(),
+                        date_from: query.date_from.to_string(),
+                        date_to: query.date_to.to_string(),
+                        state: if incomplete {
+                            DataState::Partial
+                        } else {
+                            DataState::Complete
+                        },
+                        source: "published_postgresql_snapshots".to_owned(),
+                        group_by: query.group_by,
+                        sort_by: query.sort_by,
+                        direction: query.direction,
+                        limit: query.limit,
+                        offset: query.offset,
+                        total_rows: rows.len() as u64,
+                        rows,
+                        coverage,
+                    });
+                }
                 Ok(SalesAnalyticsResult {
                     account_id: account.account_id().to_owned(),
                     marketplace: account.marketplace().into(),
@@ -2932,6 +3214,61 @@ mod tests {
         assert_eq!(
             ReportingReadError::Unavailable.to_string(),
             "reporting history is temporarily unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn weekly_ranking_is_published_only_for_complete_shared_coverage() {
+        let reader = ReportingReader::from_repository(Arc::new(FakeReportingRepository));
+        let from = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 8, 30).unwrap();
+        let complete_accounts = [
+            AccountScope::new("rank_low".to_owned(), Marketplace::Wildberries).unwrap(),
+            AccountScope::new("rank_high".to_owned(), Marketplace::Ozon).unwrap(),
+        ];
+        let complete = reader
+            .weekly_marketplace_ranking(&complete_accounts, from, to)
+            .await
+            .unwrap();
+        assert_eq!(complete.state, DataState::Complete);
+        assert_eq!(complete.expected_accounts, 2);
+        assert_eq!(complete.complete_accounts, 2);
+        assert!(complete.missing.is_empty());
+        assert_eq!(complete.ranking.len(), 2);
+        assert_eq!(complete.leader.unwrap().account_id, "rank_high");
+        assert_eq!(complete.outsider.unwrap().account_id, "rank_low");
+
+        let incomplete_accounts = [
+            complete_accounts[0].clone(),
+            AccountScope::new("rank_missing".to_owned(), Marketplace::Ozon).unwrap(),
+        ];
+        let incomplete = reader
+            .weekly_marketplace_ranking(&incomplete_accounts, from, to)
+            .await
+            .unwrap();
+        assert_eq!(incomplete.state, DataState::Partial);
+        assert_eq!(incomplete.complete_accounts, 1);
+        assert_eq!(incomplete.missing.len(), 1);
+        assert_eq!(incomplete.missing[0].dates.len(), 1);
+        assert!(incomplete.ranking.is_empty());
+        assert!(incomplete.leader.is_none());
+        assert!(incomplete.outsider.is_none());
+
+        assert_eq!(
+            reader
+                .weekly_marketplace_ranking(&complete_accounts, from, from)
+                .await,
+            Err(ReportingReadError::InvalidRequest)
+        );
+        assert_eq!(
+            reader
+                .weekly_marketplace_ranking(
+                    &[complete_accounts[0].clone(), complete_accounts[0].clone()],
+                    from,
+                    to,
+                )
+                .await,
+            Err(ReportingReadError::InvalidRequest)
         );
     }
 

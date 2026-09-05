@@ -383,8 +383,10 @@ logs or shell history.
 
 ### Enable the MCP reporting reader (explicit opt-in)
 
-`compose.reporting-reader.yaml` is deliberately not part of the default MCP
-deployment. It attaches only the MCP server to the already-created
+`compose.reporting-reader.yaml` is deliberately not part of the base Compose
+file. The production `install-local-runtime-agent.sh` now includes this overlay
+and fails closed unless the reporting database is already healthy. The overlay
+attaches only the MCP server to the already-created
 `mcp-ozon-position-internal` network and passes two independent credentials:
 the read-only `position_reader` URL and the function-only
 `report_refresh_requester` URL. It does not start, migrate, or depend on the
@@ -392,7 +394,7 @@ database service, and it does not expose the admin, collector, or worker
 passwords to the MCP container.
 
 Before enabling it, verify an integrity-checked protected backup (encrypt it
-when it leaves the protected host), migrations through `025`, the database
+when it leaves the protected host), migrations through `026`, the database
 healthcheck above, and a protected `.position.env` whose reader password is
 URL-safe (the documented hexadecimal bootstrap value is URL-safe). Existing
 installations must add a separate URL-safe
@@ -413,13 +415,12 @@ docker compose --env-file .position.env \
 ```
 
 Then recreate only the MCP server. The external database network must already
-exist because the separately managed position stack is running:
+exist because the separately managed position stack is running. For the
+production LaunchAgent use the installer, which performs the same merged
+Compose operation and verifies the immutable server revision:
 
 ```bash
-MCP_ACCESS_CONFIG_HOST="$HOME/.local/share/mcp-ozon-runtime/access.json" \
-docker compose --env-file .position.env \
-  -f compose.yaml -f compose.reporting-reader.yaml \
-  up -d --build --force-recreate --wait --wait-timeout 300 server
+./scripts/install-local-runtime-agent.sh
 ```
 
 If the operator uses another protected access registry, replace the example

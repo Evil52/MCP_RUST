@@ -336,7 +336,7 @@ async fn run_one_sales_refresh(
         .iter()
         .find(|target| {
             target.account_id == refresh_claim.account_id()
-                && target.marketplace == Marketplace::Ozon
+                && target.marketplace == refresh_claim.marketplace()
         })
         .cloned()
     else {
@@ -367,9 +367,10 @@ async fn run_one_sales_refresh(
         Ok(Ok(snapshot_ids)) => {
             tracing::info!(
                 account_id = refresh_claim.account_id(),
+                marketplace = ?refresh_claim.marketplace(),
                 snapshots = snapshot_ids.len(),
                 cutoff_at = %refresh_claim.cutoff_at(),
-                "manager-requested Ozon snapshot refresh completed"
+                "manager-requested marketplace snapshot refresh completed"
             );
         }
         Ok(Err(error)) => {
@@ -381,9 +382,10 @@ async fn run_one_sales_refresh(
             finish_failed_refresh(writer, &refresh_claim, error_class).await?;
             tracing::warn!(
                 account_id = refresh_claim.account_id(),
+                marketplace = ?refresh_claim.marketplace(),
                 released,
                 error_class,
-                "manager-requested Ozon snapshot refresh failed"
+                "manager-requested marketplace snapshot refresh failed"
             );
         }
         Err(_) => {
@@ -394,8 +396,9 @@ async fn run_one_sales_refresh(
             finish_failed_refresh(writer, &refresh_claim, "collection_deadline").await?;
             tracing::warn!(
                 account_id = refresh_claim.account_id(),
+                marketplace = ?refresh_claim.marketplace(),
                 released,
-                "manager-requested Ozon snapshot refresh reached its deadline"
+                "manager-requested marketplace snapshot refresh reached its deadline"
             );
         }
     }
@@ -432,36 +435,77 @@ async fn collect_sales_refresh_target(
     refresh_claim: &SalesRefreshClaim,
     target: &CollectionTarget,
 ) -> Result<Vec<i64>> {
+    if let Some(staged) = writer.load_staged_batch(collection_claim).await? {
+        tracing::info!(
+            account_id = collection_claim.account_id(),
+            marketplace = ?collection_claim.marketplace(),
+            snapshots = staged.len(),
+            "resuming marketplace refresh from normalized staging readback"
+        );
+        return writer
+            .persist_refresh_claimed_batch(collection_claim, refresh_claim, &staged)
+            .await
+            .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"));
+    }
     let period_start = refresh_period_start(refresh_claim.business_date())?;
     ensure!(
         refresh_claim.cutoff_at() > period_start,
         "refresh cutoff must be after the EKB business-day start"
     );
-    let (client, performance, store) = config.resolve_ozon_scheduled(collection_claim)?;
-    let performance_store = store.clone();
-    let transport = OzonClientReportTransport::new(client, store);
-    let performance_source = OzonPerformanceReportSource::new(
-        PerformanceClientReportTransport::new(performance, performance_store),
-    );
-    let performance_facts = performance_source
-        .collect_extended(refresh_claim.business_date())
-        .await
-        .map_err(|_| anyhow::anyhow!("performance_collection_failed"))?;
-    let snapshots = collect_complete_snapshots_extended(
-        &transport,
-        performance_facts.advertising,
-        performance_facts.expenses,
-        target.account_id.clone(),
-        refresh_claim.cutoff_at(),
-        Utc::now,
-        period_start,
-        refresh_claim.cutoff_at(),
-        env!("CARGO_PKG_VERSION").to_owned(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("seller_collection_failed"))?;
+    let snapshots = match refresh_claim.marketplace() {
+        Marketplace::Ozon => {
+            let (client, performance, store) = config.resolve_ozon_scheduled(collection_claim)?;
+            let performance_store = store.clone();
+            let transport = OzonClientReportTransport::new(client, store);
+            let performance_source = OzonPerformanceReportSource::new(
+                PerformanceClientReportTransport::new(performance, performance_store),
+            );
+            let performance_facts = performance_source
+                .collect_extended(refresh_claim.business_date())
+                .await
+                .map_err(|_| anyhow::anyhow!("performance_collection_failed"))?;
+            collect_complete_snapshots_extended(
+                &transport,
+                performance_facts.advertising,
+                performance_facts.expenses,
+                target.account_id.clone(),
+                refresh_claim.cutoff_at(),
+                Utc::now,
+                period_start,
+                refresh_claim.cutoff_at(),
+                env!("CARGO_PKG_VERSION").to_owned(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("seller_collection_failed"))?
+        }
+        Marketplace::Wildberries => {
+            let (client, account) = config.resolve_wb_scheduled(collection_claim)?;
+            let source = WbReportSource::new(WbClientReportTransport::new(client, account));
+            let facts = source
+                .collect(refresh_claim.business_date())
+                .await
+                .map_err(|_| anyhow::anyhow!("wb_collection_failed"))?;
+            facts
+                .into_snapshots(
+                    &target.account_id,
+                    refresh_claim.cutoff_at(),
+                    Utc::now(),
+                    period_start,
+                    refresh_claim.cutoff_at(),
+                    env!("CARGO_PKG_VERSION"),
+                )
+                .map_err(|_| anyhow::anyhow!("invalid_wb_snapshot_input"))?
+        }
+    };
     writer
-        .persist_refresh_claimed_batch(collection_claim, refresh_claim, &snapshots)
+        .stage_claimed_batch(collection_claim, &snapshots)
+        .await?;
+    let staged = writer
+        .load_staged_batch(collection_claim)
+        .await?
+        .context("staged marketplace refresh readback is incomplete")?;
+    writer
+        .persist_refresh_claimed_batch(collection_claim, refresh_claim, &staged)
         .await
         .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
 }
@@ -496,6 +540,10 @@ fn refresh_error_class(error: &anyhow::Error) -> &'static str {
         "performance_collection_failed"
     } else if message.contains("seller_collection_failed") {
         "seller_collection_failed"
+    } else if message.contains("wb_collection_failed") {
+        "wb_collection_failed"
+    } else if message.contains("invalid_wb_snapshot_input") {
+        "invalid_wb_snapshot_input"
     } else if message.contains("snapshot_persistence_failed") {
         "snapshot_persistence_failed"
     } else {
@@ -617,8 +665,20 @@ async fn collect_scheduled_target(
     target: &CollectionTarget,
     occurrence: &DueCollection,
 ) -> Result<Vec<i64>> {
+    if let Some(staged) = writer.load_staged_batch(claim).await? {
+        tracing::info!(
+            account_id = claim.account_id(),
+            marketplace = ?claim.marketplace(),
+            snapshots = staged.len(),
+            "resuming scheduled collection from normalized staging readback"
+        );
+        return writer
+            .persist_claimed_batch(claim, &staged)
+            .await
+            .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"));
+    }
     let date = business_date(occurrence.period_start);
-    match target.marketplace {
+    let snapshots = match target.marketplace {
         Marketplace::Ozon => {
             let (client, performance, store) = config.resolve_ozon_scheduled(claim)?;
             let performance_store = store.clone();
@@ -630,7 +690,7 @@ async fn collect_scheduled_target(
                 .collect_extended(date)
                 .await
                 .map_err(|error| anyhow::anyhow!("performance_{}", error.code()))?;
-            let snapshots = collect_complete_snapshots_extended(
+            collect_complete_snapshots_extended(
                 &transport,
                 performance_facts.advertising,
                 performance_facts.expenses,
@@ -642,11 +702,7 @@ async fn collect_scheduled_target(
                 env!("CARGO_PKG_VERSION").to_owned(),
             )
             .await
-            .map_err(anyhow::Error::from)?;
-            writer
-                .persist_claimed_batch(claim, &snapshots)
-                .await
-                .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
+            .map_err(anyhow::Error::from)?
         }
         Marketplace::Wildberries => {
             let (client, account) = config.resolve_wb_scheduled(claim)?;
@@ -655,7 +711,7 @@ async fn collect_scheduled_target(
                 .collect(date)
                 .await
                 .map_err(|error| anyhow::anyhow!("wb_{}", error.code()))?;
-            let snapshots = facts
+            facts
                 .into_snapshots(
                     &target.account_id,
                     occurrence.cutoff_at,
@@ -664,13 +720,18 @@ async fn collect_scheduled_target(
                     occurrence.period_end,
                     env!("CARGO_PKG_VERSION"),
                 )
-                .map_err(|_| anyhow::anyhow!("invalid_wb_snapshot_input"))?;
-            writer
-                .persist_claimed_batch(claim, &snapshots)
-                .await
-                .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
+                .map_err(|_| anyhow::anyhow!("invalid_wb_snapshot_input"))?
         }
-    }
+    };
+    writer.stage_claimed_batch(claim, &snapshots).await?;
+    let staged = writer
+        .load_staged_batch(claim)
+        .await?
+        .context("staged scheduled collection readback is incomplete")?;
+    writer
+        .persist_claimed_batch(claim, &staged)
+        .await
+        .map_err(|_| anyhow::anyhow!("snapshot_persistence_failed"))
 }
 
 async fn run_wb_dry_run(

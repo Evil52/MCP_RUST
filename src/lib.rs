@@ -12,6 +12,7 @@ pub mod postgres;
 pub mod reporting;
 pub mod runtime;
 pub mod server;
+pub mod tool_telemetry;
 pub mod wb;
 
 #[cfg(test)]

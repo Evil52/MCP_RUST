@@ -698,7 +698,7 @@ control_writer_psql=(
 )
 docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
 ledger_contract="$({ "${admin_psql[@]}" --tuples-only --no-align --command "
-	  SELECT count(*) = 25
+	  SELECT count(*) = 26
      AND bool_and(state = 'applied')
      AND bool_and(applied_at IS NOT NULL)
   FROM mcp_runtime.schema_migrations
@@ -1024,6 +1024,8 @@ migration_admin_psql=(
   --file /opt/mcp-ozon/migrations/024_ozon_control_campaign_plans.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /opt/mcp-ozon/migrations/025_ozon_durable_launch_workflow.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/026_marketplace_sales_refresh_queue.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \

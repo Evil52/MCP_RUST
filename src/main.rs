@@ -16,6 +16,7 @@ use mcp_ozon::{
         run_http_until_bounded_shutdown, serve_hardened_http,
     },
     server::OzonMcp,
+    tool_telemetry::ToolTelemetryService,
     wb::WbClient,
 };
 use rmcp::ServiceExt;
@@ -56,6 +57,8 @@ async fn main() -> Result<()> {
     };
     let refresh_requests =
         RefreshRequestService::connect_optional(refresh_database_url.as_deref()).await?;
+    let tool_telemetry =
+        ToolTelemetryService::connect_optional(refresh_database_url.as_deref()).await?;
     let client = OzonClient::new(
         config.ozon_api_base_url.clone(),
         config.request_timeout,
@@ -76,6 +79,7 @@ async fn main() -> Result<()> {
     .with_performance_client(performance_client)
     .with_reporting_reader(reporting_reader)
     .with_refresh_requests(refresh_requests)
+    .with_tool_telemetry(tool_telemetry)
     .with_preview_features(
         config.ozon_postings_vnext,
         config.ozon_finance_accruals_preview,

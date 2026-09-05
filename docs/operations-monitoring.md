@@ -17,6 +17,12 @@ MCP_HEALTH_REQUIRED_SERVICES=position-db,ozon-egress,position-collector \
   ./scripts/install-operations-agents.sh
 ```
 
+For the snapshot-first reporting rollout the production contract is
+`position-db,ozon-egress,report-collector`; keep `report-collector` in the
+required set after the guarded live overlay has been activated. The base
+Compose mode remains disabled so a repository checkout or ordinary database
+restart cannot start marketplace collection by itself.
+
 The installer persists both `MCP_HEALTH_REQUIRED_SERVICES` and
 `MCP_HEALTH_REQUIRED_LAUNCH_AGENTS` in the health LaunchAgent. The health probe
 rejects empty or malformed comma-separated contracts. Do not remove an enabled

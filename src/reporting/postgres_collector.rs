@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_postgres::{Client, Config, Transaction, error::SqlState};
 
@@ -23,7 +23,7 @@ const MAX_COLLECTION_TARGETS: usize = 64;
 const MAX_ACCOUNT_ID_BYTES: usize = 128;
 const COLLECTION_CANARY_MAX_AGE: Duration = Duration::hours(24);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedSalesFact {
     pub business_date: NaiveDate,
     pub sku: u64,
@@ -35,7 +35,7 @@ pub struct CollectedSalesFact {
     pub returned_units: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedAdvertisingFact {
     pub business_date: NaiveDate,
     pub campaign_id: u64,
@@ -54,7 +54,7 @@ pub struct CollectedAdvertisingFact {
     pub cpl_minor: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedAdvertisingExpenseFact {
     pub business_date: NaiveDate,
     pub campaign_id: u64,
@@ -63,7 +63,7 @@ pub struct CollectedAdvertisingExpenseFact {
     pub prepayment_spent_minor: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinanceCategory {
     Sale,
@@ -96,7 +96,7 @@ impl FinanceCategory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedFinanceFact {
     pub business_date: NaiveDate,
     /// `None` is an account-wide accrual which Ozon did not attribute to SKU.
@@ -108,21 +108,21 @@ pub struct CollectedFinanceFact {
     pub unknown_type_count: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedStockFact {
     pub sku: u64,
     pub warehouse_id: String,
     pub sellable_units: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedPriceFact {
     pub sku: u64,
     pub price_minor: u64,
     pub old_price_minor: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "source", content = "facts", rename_all = "snake_case")]
 pub enum CollectedFacts {
     Sales(Vec<CollectedSalesFact>),
@@ -154,7 +154,7 @@ impl CollectedFacts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedSnapshot {
     account_id: String,
     marketplace: Marketplace,
@@ -272,12 +272,13 @@ pub struct CollectionClaim {
     lease_until: DateTime<Utc>,
 }
 
-/// Fenced queue claim for one manager-requested Ozon refresh.
+/// Fenced queue claim for one manager-requested marketplace refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SalesRefreshClaim {
     id: i64,
     generation: i32,
     account_id: String,
+    marketplace: Marketplace,
     business_date: NaiveDate,
     cutoff_at: DateTime<Utc>,
     owner_id: String,
@@ -288,6 +289,11 @@ impl SalesRefreshClaim {
     #[must_use]
     pub fn account_id(&self) -> &str {
         &self.account_id
+    }
+
+    #[must_use]
+    pub const fn marketplace(&self) -> Marketplace {
+        self.marketplace
     }
 
     #[must_use]
@@ -390,6 +396,8 @@ impl PostgresSnapshotWriter {
                         'daily_reporting.stock_facts', 'INSERT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.price_facts', 'INSERT') \
+                    AND has_table_privilege(current_user, \
+                        'daily_reporting.collection_staging_snapshots', 'SELECT,INSERT,DELETE') \
                     AND has_function_privilege(current_user, \
                         'daily_reporting.claim_report_collection(text,text,timestamptz,text)', \
                         'EXECUTE') \
@@ -400,12 +408,12 @@ impl PostgresSnapshotWriter {
                         'daily_reporting.complete_report_collection_claim(bigint,bigint,text)', \
                         'EXECUTE') \
                     AND has_function_privilege(current_user, \
-                        'daily_reporting.claim_ozon_sales_refresh(text)', 'EXECUTE') \
+                        'daily_reporting.claim_marketplace_sales_refresh(text)', 'EXECUTE') \
                     AND has_function_privilege(current_user, \
-                        'daily_reporting.complete_ozon_sales_refresh(bigint,integer,text,timestamptz)', \
+                        'daily_reporting.complete_marketplace_sales_refresh(bigint,integer,text,timestamptz)', \
                         'EXECUTE') \
                     AND has_function_privilege(current_user, \
-                        'daily_reporting.fail_ozon_sales_refresh(bigint,integer,text,text)', \
+                        'daily_reporting.fail_marketplace_sales_refresh(bigint,integer,text,text)', \
                         'EXECUTE') \
                     AND NOT has_table_privilege(current_user, \
                         'daily_reporting.collection_claims', 'SELECT,INSERT,UPDATE,DELETE') \
@@ -438,21 +446,25 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         let row = client
             .query_opt(
-                "SELECT request_id, request_generation, account_id, business_date, \
+                "SELECT request_id, request_generation, account_id, marketplace, business_date, \
                         snapshot_cutoff_at, lease_until \
-                 FROM daily_reporting.claim_ozon_sales_refresh($1)",
+                 FROM daily_reporting.claim_marketplace_sales_refresh($1)",
                 &[&owner_id],
             )
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
-        Ok(row.map(|row| SalesRefreshClaim {
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(SalesRefreshClaim {
             id: row.get(0),
             generation: row.get(1),
             account_id: row.get(2),
-            business_date: row.get(3),
-            cutoff_at: row.get(4),
+            marketplace: parse_marketplace(row.get(3))?,
+            business_date: row.get(4),
+            cutoff_at: row.get(5),
             owner_id: owner_id.to_owned(),
-            lease_until: row.get(5),
+            lease_until: row.get(6),
         }))
     }
 
@@ -470,7 +482,7 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         client
             .query_one(
-                "SELECT daily_reporting.fail_ozon_sales_refresh($1, $2, $3, $4)",
+                "SELECT daily_reporting.fail_marketplace_sales_refresh($1, $2, $3, $4)",
                 &[&claim.id, &claim.generation, &claim.owner_id, &error_class],
             )
             .await
@@ -711,6 +723,7 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?
             .get::<_, bool>(0);
         require_claim_completed(completed)?;
+        clear_staging_in_transaction(&transaction, claim.id).await?;
         transaction
             .commit()
             .await
@@ -718,7 +731,7 @@ impl PostgresSnapshotWriter {
         Ok(snapshot_ids)
     }
 
-    /// Atomically publishes a complete five-source Ozon batch and completes
+    /// Atomically publishes a complete marketplace batch and completes
     /// both the snapshot claim and the manager refresh queue claim.
     pub async fn persist_refresh_claimed_batch(
         &self,
@@ -727,7 +740,7 @@ impl PostgresSnapshotWriter {
         snapshots: &[CollectedSnapshot],
     ) -> Result<Vec<i64>, PostgresCollectorError> {
         validate_claimed_batch(collection_claim, snapshots)?;
-        if collection_claim.marketplace != Marketplace::Ozon
+        if collection_claim.marketplace != refresh_claim.marketplace
             || collection_claim.account_id != refresh_claim.account_id
             || collection_claim.cutoff_at != refresh_claim.cutoff_at
             || collection_claim.owner_id != refresh_claim.owner_id
@@ -763,7 +776,7 @@ impl PostgresSnapshotWriter {
         require_claim_completed(collection_completed)?;
         let refresh_completed = transaction
             .query_one(
-                "SELECT daily_reporting.complete_ozon_sales_refresh($1, $2, $3, $4)",
+                "SELECT daily_reporting.complete_marketplace_sales_refresh($1, $2, $3, $4)",
                 &[
                     &refresh_claim.id,
                     &refresh_claim.generation,
@@ -775,12 +788,115 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?
             .get::<_, bool>(0);
         require_claim_completed(refresh_completed)?;
+        clear_staging_in_transaction(&transaction, collection_claim.id).await?;
         transaction
             .commit()
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         Ok(snapshot_ids)
     }
+
+    /// Replaces unpublished normalized checkpoints for one live claim.
+    /// Raw marketplace responses are never stored. The transaction is durable
+    /// before publication, so a restarted collector can read back and publish
+    /// the exact same normalized batch without repeating external requests.
+    pub async fn stage_claimed_batch(
+        &self,
+        claim: &CollectionClaim,
+        snapshots: &[CollectedSnapshot],
+    ) -> Result<(), PostgresCollectorError> {
+        validate_claimed_batch(claim, snapshots)?;
+        let mut client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        clear_staging_in_transaction(&transaction, claim.id).await?;
+        for snapshot in snapshots {
+            let payload = serde_json::to_string(snapshot)
+                .map_err(|_| PostgresCollectorError::InvalidInput)?;
+            let digest = sha256(payload.as_bytes());
+            transaction
+                .execute(
+                    "INSERT INTO daily_reporting.collection_staging_snapshots \
+                         (claim_id, source, payload_json, payload_sha256) \
+                     VALUES ($1, $2, $3, $4)",
+                    &[
+                        &claim.id,
+                        &snapshot_source_name(snapshot.facts.source()),
+                        &payload,
+                        &digest,
+                    ],
+                )
+                .await
+                .map_err(|error| map_snapshot_insert_error(&error))?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)
+    }
+
+    /// Loads only a complete, digest-verified batch for the current logical
+    /// claim. An incomplete checkpoint returns `None` and is replaced after a
+    /// fresh bounded collection; it can never be partially published.
+    pub async fn load_staged_batch(
+        &self,
+        claim: &CollectionClaim,
+    ) -> Result<Option<Vec<CollectedSnapshot>>, PostgresCollectorError> {
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let rows = client
+            .query(
+                "SELECT source, payload_json, payload_sha256 \
+                 FROM daily_reporting.collection_staging_snapshots \
+                 WHERE claim_id = $1 ORDER BY source",
+                &[&claim.id],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        if rows.len() != SnapshotSource::required_for(claim.marketplace).len() {
+            return Ok(None);
+        }
+        let mut snapshots = Vec::with_capacity(rows.len());
+        for row in rows {
+            let source: &str = row.get(0);
+            let payload: &str = row.get(1);
+            let digest: &str = row.get(2);
+            if sha256(payload.as_bytes()) != digest {
+                return Err(PostgresCollectorError::InvalidInput);
+            }
+            let snapshot: CollectedSnapshot =
+                serde_json::from_str(payload).map_err(|_| PostgresCollectorError::InvalidInput)?;
+            if snapshot_source_name(snapshot.facts.source()) != source {
+                return Err(PostgresCollectorError::InvalidInput);
+            }
+            snapshots.push(snapshot);
+        }
+        validate_claimed_batch(claim, &snapshots)?;
+        Ok(Some(snapshots))
+    }
+}
+
+async fn clear_staging_in_transaction(
+    transaction: &Transaction<'_>,
+    claim_id: i64,
+) -> Result<(), PostgresCollectorError> {
+    transaction
+        .execute(
+            "DELETE FROM daily_reporting.collection_staging_snapshots WHERE claim_id = $1",
+            &[&claim_id],
+        )
+        .await
+        .map(std::mem::drop)
+        .map_err(|_| PostgresCollectorError::Unavailable)
 }
 
 fn require_claim_completed(completed: bool) -> Result<(), PostgresCollectorError> {
@@ -874,6 +990,16 @@ const fn marketplace_name(marketplace: Marketplace) -> &'static str {
     }
 }
 
+const fn snapshot_source_name(source: SnapshotSource) -> &'static str {
+    match source {
+        SnapshotSource::Sales => "sales",
+        SnapshotSource::Advertising => "advertising",
+        SnapshotSource::Finance => "finance",
+        SnapshotSource::Stocks => "stocks",
+        SnapshotSource::Prices => "prices",
+    }
+}
+
 fn parse_marketplace(value: &str) -> Result<Marketplace, PostgresCollectorError> {
     match value {
         "ozon" => Ok(Marketplace::Ozon),
@@ -963,13 +1089,7 @@ async fn insert_snapshot(
     snapshot: &CollectedSnapshot,
 ) -> Result<i64, PostgresCollectorError> {
     let marketplace = marketplace_name(snapshot.marketplace);
-    let source = match snapshot.facts.source() {
-        SnapshotSource::Sales => "sales",
-        SnapshotSource::Advertising => "advertising",
-        SnapshotSource::Finance => "finance",
-        SnapshotSource::Stocks => "stocks",
-        SnapshotSource::Prices => "prices",
-    };
+    let source = snapshot_source_name(snapshot.facts.source());
     let row = transaction
         .query_opt(
             "INSERT INTO daily_reporting.source_snapshots \
@@ -1513,12 +1633,14 @@ mod tests {
             id: 2,
             generation: 1,
             account_id: "pilot".to_owned(),
+            marketplace: Marketplace::Ozon,
             business_date: cutoff().date_naive(),
             cutoff_at: cutoff(),
             owner_id: "test-owner".to_owned(),
             lease_until: cutoff() + Duration::minutes(15),
         };
         assert_eq!(refresh_claim.account_id(), "pilot");
+        assert_eq!(refresh_claim.marketplace(), Marketplace::Ozon);
         assert_eq!(refresh_claim.business_date(), cutoff().date_naive());
         assert_eq!(refresh_claim.cutoff_at(), cutoff());
         assert_eq!(
