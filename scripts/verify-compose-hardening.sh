@@ -1731,6 +1731,14 @@ check_not_contains \
   "$project_dir/scripts/install-local-runtime-agent.sh" \
   "'{{.State.Health.Status}}' mcp-ozon-position-db"
 check_contains \
+  "backup writer accepts the pinned Alpine patch tag" \
+  "$project_dir/scripts/backup-position-stack.sh" \
+  '^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$'
+check_contains \
+  "backup verifier accepts the same pinned Alpine patch tag" \
+  "$project_dir/scripts/verify-position-backup.sh" \
+  '^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$'
+check_contains \
   "live reporting: access registry has no fallback path" \
   "$project_dir/compose.reporting-live.yaml" \
   "\${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for live reporting}"
