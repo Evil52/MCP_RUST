@@ -3238,6 +3238,17 @@ mod tests {
         assert_eq!(complete.leader.unwrap().account_id, "rank_high");
         assert_eq!(complete.outsider.unwrap().account_id, "rank_low");
 
+        let tied_accounts = [
+            AccountScope::new("rank_beta".to_owned(), Marketplace::Ozon).unwrap(),
+            AccountScope::new("rank_alpha".to_owned(), Marketplace::Wildberries).unwrap(),
+        ];
+        let tied = reader
+            .weekly_marketplace_ranking(&tied_accounts, from, to)
+            .await
+            .unwrap();
+        assert_eq!(tied.ranking[0].account_id, "rank_alpha");
+        assert_eq!(tied.ranking[1].account_id, "rank_beta");
+
         let incomplete_accounts = [
             complete_accounts[0].clone(),
             AccountScope::new("rank_missing".to_owned(), Marketplace::Ozon).unwrap(),
