@@ -915,7 +915,8 @@ verify_reporting_live() {
        "REPORT_COLLECTOR_DATABASE_URL": $database_url,
        "REPORT_COLLECTOR_CREDENTIAL_DIR": "/run/mcp-ozon/report-credentials",
        "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
-       "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
+       "DAILY_REPORT_POLICY": "",
+       "REPORT_COLLECTION_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
        "RUST_LOG": "mcp_ozon::reporting=info"
      }'
   # shellcheck disable=SC2016
@@ -1743,9 +1744,9 @@ check_contains \
   "$project_dir/compose.reporting-live.yaml" \
   "\${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for live reporting}"
 check_contains \
-  "live reporting: enabled policy has no fallback path" \
+  "live reporting: collection policy requires an explicit new or legacy host path" \
   "$project_dir/compose.reporting-live.yaml" \
-  "\${DAILY_REPORT_POLICY_HOST:?DAILY_REPORT_POLICY_HOST is required for live reporting}"
+  "\${REPORT_COLLECTION_POLICY_HOST:-\${DAILY_REPORT_POLICY_HOST:?REPORT_COLLECTION_POLICY_HOST or DAILY_REPORT_POLICY_HOST is required for live reporting}}"
 check_contains \
   "live reporting: credential directory has no fallback path" \
   "$project_dir/compose.reporting-live.yaml" \
