@@ -202,14 +202,24 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         timestamp("2098-08-15T00:00:00Z"),
         timestamp("2098-08-16T00:00:00Z"),
         false,
-        CollectedFacts::Sales(vec![CollectedSalesFact {
-            business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
-            sku: 3_411_079_879,
-            ordered_units: 3,
-            operational_gmv_minor: 202_500,
-            cancelled_units: Some(0),
-            returned_units: Some(0),
-        }]),
+        CollectedFacts::Sales(vec![
+            CollectedSalesFact {
+                business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+                sku: 3_411_079_879,
+                ordered_units: 3,
+                operational_gmv_minor: 202_500,
+                cancelled_units: Some(0),
+                returned_units: Some(0),
+            },
+            CollectedSalesFact {
+                business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+                sku: 3_411_079_880,
+                ordered_units: 1,
+                operational_gmv_minor: 67_500,
+                cancelled_units: None,
+                returned_units: None,
+            },
+        ]),
     );
     let advertising = collected(
         &account_id,
@@ -217,31 +227,59 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         timestamp("2098-08-15T00:00:00Z"),
         timestamp("2098-08-16T00:00:00Z"),
         true,
-        CollectedFacts::Advertising(vec![CollectedAdvertisingFact {
+        CollectedFacts::Advertising(vec![
+            CollectedAdvertisingFact {
+                business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+                campaign_id: 35_751_912,
+                sku: 3_411_079_879,
+                impressions: 1000,
+                clicks: 20,
+                spend_minor: 12000,
+                attributed_orders: 2,
+                attributed_revenue_minor: 135_000,
+                basket_additions: 0,
+                model_attributed_orders: 0,
+                model_attributed_revenue_minor: 0,
+                product_price_minor: 0,
+                average_cpc_minor: None,
+                cpm_minor: None,
+                cpl_minor: None,
+            },
+            CollectedAdvertisingFact {
+                business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+                campaign_id: 35_751_913,
+                sku: 3_411_079_880,
+                impressions: 500,
+                clicks: 5,
+                spend_minor: 3_500,
+                attributed_orders: 1,
+                attributed_revenue_minor: 67_500,
+                basket_additions: 3,
+                model_attributed_orders: 1,
+                model_attributed_revenue_minor: 67_500,
+                product_price_minor: 67_500,
+                average_cpc_minor: Some(700),
+                cpm_minor: Some(7_000),
+                cpl_minor: Some(3_500),
+            },
+        ]),
+    )
+    .with_advertising_expenses(vec![
+        CollectedAdvertisingExpenseFact {
             business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
             campaign_id: 35_751_912,
-            sku: 3_411_079_879,
-            impressions: 1000,
-            clicks: 20,
-            spend_minor: 12000,
-            attributed_orders: 2,
-            attributed_revenue_minor: 135_000,
-            basket_additions: 0,
-            model_attributed_orders: 0,
-            model_attributed_revenue_minor: 0,
-            product_price_minor: 0,
-            average_cpc_minor: None,
-            cpm_minor: None,
-            cpl_minor: None,
-        }]),
-    )
-    .with_advertising_expenses(vec![CollectedAdvertisingExpenseFact {
-        business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
-        campaign_id: 35_751_912,
-        money_spent_minor: 12_000,
-        bonus_spent_minor: 2_500,
-        prepayment_spent_minor: 9_000,
-    }])
+            money_spent_minor: 12_000,
+            bonus_spent_minor: 2_500,
+            prepayment_spent_minor: 9_000,
+        },
+        CollectedAdvertisingExpenseFact {
+            business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+            campaign_id: 35_751_913,
+            money_spent_minor: 3_500,
+            bonus_spent_minor: 0,
+            prepayment_spent_minor: 3_500,
+        },
+    ])
     .unwrap();
     let finance = collected(
         &account_id,
@@ -249,14 +287,24 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         timestamp("2098-08-15T00:00:00Z"),
         timestamp("2098-08-16T00:00:00Z"),
         false,
-        CollectedFacts::Finance(vec![CollectedFinanceFact {
-            business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
-            sku: Some(3_411_079_879),
-            category: FinanceCategory::Sale,
-            amount_minor: 180_000,
-            line_count: 2,
-            unknown_type_count: 0,
-        }]),
+        CollectedFacts::Finance(vec![
+            CollectedFinanceFact {
+                business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+                sku: Some(3_411_079_879),
+                category: FinanceCategory::Sale,
+                amount_minor: 180_000,
+                line_count: 2,
+                unknown_type_count: 0,
+            },
+            CollectedFinanceFact {
+                business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+                sku: None,
+                category: FinanceCategory::Commission,
+                amount_minor: -20_000,
+                line_count: 1,
+                unknown_type_count: 0,
+            },
+        ]),
     );
     let stocks = collected(
         &account_id,
@@ -264,11 +312,18 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         timestamp("2098-08-16T02:45:00Z"),
         timestamp("2098-08-16T02:45:00Z"),
         false,
-        CollectedFacts::Stocks(vec![CollectedStockFact {
-            sku: 3_411_079_879,
-            warehouse_id: "fbo-msk".to_owned(),
-            sellable_units: 19,
-        }]),
+        CollectedFacts::Stocks(vec![
+            CollectedStockFact {
+                sku: 3_411_079_879,
+                warehouse_id: "fbo-msk".to_owned(),
+                sellable_units: 19,
+            },
+            CollectedStockFact {
+                sku: 3_411_079_880,
+                warehouse_id: "fbo-kzn".to_owned(),
+                sellable_units: 7,
+            },
+        ]),
     );
     let prices = collected(
         &account_id,
@@ -276,11 +331,18 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         timestamp("2098-08-16T02:40:00Z"),
         timestamp("2098-08-16T02:40:00Z"),
         false,
-        CollectedFacts::Prices(vec![CollectedPriceFact {
-            sku: 3_411_079_879,
-            price_minor: 67500,
-            old_price_minor: Some(70200),
-        }]),
+        CollectedFacts::Prices(vec![
+            CollectedPriceFact {
+                sku: 3_411_079_879,
+                price_minor: 67500,
+                old_price_minor: Some(70200),
+            },
+            CollectedPriceFact {
+                sku: 3_411_079_880,
+                price_minor: 54000,
+                old_price_minor: None,
+            },
+        ]),
     );
     let snapshot_ids = writer
         .persist_claimed_batch(&claim, &[sales, advertising, finance, stocks, prices])
@@ -384,9 +446,9 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(manifest.quality(), SnapshotQuality::Partial);
     assert!(!manifest.recommendations_allowed());
     let facts = repository.load_report_facts(&manifest).await.unwrap();
-    assert_eq!(facts.advertising.len(), 1);
+    assert_eq!(facts.advertising.len(), 2);
     assert_eq!(facts.advertising[0].sku, 3_411_079_879);
-    assert_eq!(facts.sales.len(), 1);
+    assert_eq!(facts.sales.len(), 2);
     assert_eq!(facts.sales[0].account_id, account_id);
     assert_eq!(facts.sales[0].business_date.to_string(), "2098-08-15");
     assert_eq!(facts.sales[0].sku, 3_411_079_879);
@@ -394,7 +456,14 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(facts.sales[0].operational_gmv_minor, 202_500);
     assert_eq!(facts.sales[0].cancelled_units, Some(0));
     assert_eq!(facts.sales[0].returned_units, Some(0));
-    assert_eq!(facts.advertising.len(), 1);
+    let second_sale = facts
+        .sales
+        .iter()
+        .find(|fact| fact.sku == 3_411_079_880)
+        .expect("second sales row must survive aligned array insertion");
+    assert_eq!(second_sale.cancelled_units, None);
+    assert_eq!(second_sale.returned_units, None);
+    assert_eq!(facts.advertising.len(), 2);
     assert_eq!(facts.advertising[0].campaign_id, 35_751_912);
     assert_eq!(facts.advertising[0].sku, 3_411_079_879);
     assert_eq!(facts.advertising[0].impressions, 1000);
@@ -402,21 +471,40 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
     assert_eq!(facts.advertising[0].spend_minor, 12000);
     assert_eq!(facts.advertising[0].attributed_orders, 2);
     assert_eq!(facts.advertising[0].attributed_revenue_minor, 135_000);
-    assert_eq!(facts.advertising_expenses.len(), 1);
+    let second_advertising = facts
+        .advertising
+        .iter()
+        .find(|fact| fact.campaign_id == 35_751_913)
+        .expect("second advertising row must survive aligned array insertion");
+    assert_eq!(second_advertising.average_cpc_minor, Some(700));
+    assert_eq!(second_advertising.cpm_minor, Some(7_000));
+    assert_eq!(second_advertising.cpl_minor, Some(3_500));
+    assert_eq!(facts.advertising_expenses.len(), 2);
     assert_eq!(facts.advertising_expenses[0].money_spent_minor, 12_000);
     assert_eq!(facts.advertising_expenses[0].bonus_spent_minor, 2_500);
     assert_eq!(facts.advertising_expenses[0].prepayment_spent_minor, 9_000);
-    assert_eq!(facts.finance.len(), 1);
-    assert_eq!(facts.finance[0].category, FinanceCategory::Sale);
-    assert_eq!(facts.finance[0].amount_minor, 180_000);
-    assert_eq!(facts.stocks.len(), 1);
+    assert_eq!(facts.finance.len(), 2);
+    let sale = facts
+        .finance
+        .iter()
+        .find(|fact| fact.category == FinanceCategory::Sale)
+        .expect("SKU-attributed sale row must survive batch insertion");
+    assert_eq!(sale.amount_minor, 180_000);
+    let commission = facts
+        .finance
+        .iter()
+        .find(|fact| fact.category == FinanceCategory::Commission)
+        .expect("account-wide finance row must survive batch insertion");
+    assert_eq!(commission.sku, None);
+    assert_eq!(commission.amount_minor, -20_000);
+    assert_eq!(facts.stocks.len(), 2);
     assert_eq!(facts.stocks[0].warehouse_id, "fbo-msk");
     assert_eq!(facts.stocks[0].sellable_units, 19);
     assert_eq!(
         facts.stocks[0].observed_at,
         timestamp("2098-08-16T02:45:00Z")
     );
-    assert_eq!(facts.prices.len(), 1);
+    assert_eq!(facts.prices.len(), 2);
     assert_eq!(facts.prices[0].price_minor, 67500);
     assert_eq!(facts.prices[0].old_price_minor, Some(70200));
     assert_eq!(
