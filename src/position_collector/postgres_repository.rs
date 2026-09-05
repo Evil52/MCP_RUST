@@ -265,27 +265,63 @@ async fn insert_measurements(
     run_id: i64,
     measurements: &[MeasurementRecord],
 ) -> Result<(), RepositoryError> {
-    let statement = transaction
-        .prepare(
+    if measurements.is_empty() {
+        return Ok(());
+    }
+    let monitor_ids = measurements
+        .iter()
+        .map(MeasurementRecord::monitor_id)
+        .collect::<Vec<_>>();
+    let observed_at = measurements
+        .iter()
+        .map(MeasurementRecord::observed_at)
+        .collect::<Vec<_>>();
+    let outcomes = measurements
+        .iter()
+        .map(|measurement| outcome_text(measurement.outcome()).to_owned())
+        .collect::<Vec<_>>();
+    let overall_positions = measurements
+        .iter()
+        .map(|measurement| measurement.overall_position().map(i32::from))
+        .collect::<Vec<_>>();
+    let placements = measurements
+        .iter()
+        .map(|measurement| {
+            measurement
+                .placement()
+                .map(|placement| placement_text(placement).to_owned())
+        })
+        .collect::<Vec<_>>();
+    let organic_positions = measurements
+        .iter()
+        .map(|measurement| measurement.organic_position().map(i32::from))
+        .collect::<Vec<_>>();
+    let sponsored_positions = measurements
+        .iter()
+        .map(|measurement| measurement.sponsored_position().map(i32::from))
+        .collect::<Vec<_>>();
+    let values: [&(dyn ToSql + Sync); 8] = [
+        &run_id,
+        &monitor_ids,
+        &observed_at,
+        &outcomes,
+        &overall_positions,
+        &placements,
+        &organic_positions,
+        &sponsored_positions,
+    ];
+    transaction
+        .execute(
             "INSERT INTO search_position.measurements (\
                 run_id, monitor_id, observed_at, outcome, overall_position, \
                 placement, organic_position, sponsored_position\
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             ) \
+             SELECT $1, batch.* \
+             FROM unnest($2::bigint[], $3::timestamptz[], $4::text[], $5::integer[], \
+                         $6::text[], $7::integer[], $8::integer[]) AS batch",
+            &values,
         )
         .await?;
-    for measurement in measurements {
-        let values: [&(dyn ToSql + Sync); 8] = [
-            &run_id,
-            &measurement.monitor_id(),
-            &measurement.observed_at(),
-            &outcome_text(measurement.outcome()),
-            &measurement.overall_position().map(i32::from),
-            &measurement.placement().map(placement_text),
-            &measurement.organic_position().map(i32::from),
-            &measurement.sponsored_position().map(i32::from),
-        ];
-        transaction.execute(&statement, &values).await?;
-    }
     Ok(())
 }
 
