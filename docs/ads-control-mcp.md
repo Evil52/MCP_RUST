@@ -1,6 +1,6 @@
 # OzonOFK Control MCP: Ozon campaigns and WB promotion bids
 
-`mcp-ozon-control` is a separate fail-closed process for marketplace writes.
+`mcp-ozon-control` is a separate fail-closed authorization and planning process.
 It does not extend the analytics server or its read-only allowlists. Without an
 explicit policy, JWT auth, restricted PostgreSQL session, fixed egress and
 dedicated marketplace credentials, it starts with all writes disabled.
@@ -9,8 +9,10 @@ dedicated marketplace credentials, it starts with all writes disabled.
 
 The WB workflow changes product-card bids through `PATCH /api/advert/v1/bids`.
 The Ozon workflow creates one CPC SKU campaign, adds its one product and
-activates it through the fixed Performance API origin. Ozon write calls are
-single-attempt and cannot be sent by the Analytics MCP.
+activates it through the fixed Performance API origin. The MCP request only
+enqueues approved work; a separate durable executor claims each stage. Ozon
+write calls are single-attempt per persisted mutation boundary and cannot be
+sent by the Analytics MCP.
 
 Available tools:
 
@@ -21,10 +23,10 @@ Available tools:
   preflight and persists an immutable single-SKU plan;
 - `ozon_performance_approve_campaign_launch` — records a distinct authorized
   actor's approval of the exact plan digest;
-- `ozon_performance_apply_campaign_launch` — performs one guarded
-  create → add product → activate sequence;
-- `ozon_performance_reconcile_campaign_launch` — read-back only after an
-  ambiguous result; it never repeats a write;
+- `ozon_performance_apply_campaign_launch` — durably enqueues one approved
+  create → add product → activate workflow without making a marketplace call;
+- `ozon_performance_reconcile_campaign_launch` — reads the durable workflow
+  status; recovery readback belongs to the executor and never repeats a write;
 - `wb_promotion_prepare_bid_update` — first reserves a bounded preparation
   attempt, then reads current campaign bids and creates an immutable
   five-minute PostgreSQL plan;
@@ -40,20 +42,23 @@ This is a separate twelve-tool Control registry. It is not part of the Analytics
 MCP release contract, which contains exactly 79 tools. Seventy-eight are
 read-only; `ofk_request_ozon_sales_refresh` only mutates the internal deduplicated
 snapshot-refresh queue and has no marketplace egress. In Control,
-`prepare`, `approve`, `apply`, and `reconcile` intentionally advertise
-non-read-only annotations because they change durable Control state; only
-`apply` sends a marketplace mutation. `approve` is also marked destructive
-because it grants execution authority, even though it has no WB egress.
+`prepare`, `approve`, and `apply` intentionally advertise non-read-only
+annotations because they change durable Control state. Ozon `reconcile` is a
+closed-world durable status read. The workflow executor, not the HTTP/MCP
+apply request, owns marketplace mutations. `approve` and `apply` are marked
+destructive because they grant and enqueue execution authority, even though
+neither has marketplace egress.
 
 Prices, stocks, product cards, arbitrary campaign deletion and search-cluster
 bids are not enabled. Ozon creation is limited to exact policy-bound SKU,
 budget, DRR and approver tuples.
 
-These seven tools are a supervised execution kernel, not an autonomous store
-manager. There is no scheduled decision worker, bid optimizer, forecast model
-or policy-learning loop in this workflow. ChatGPT can analyze data and prepare
-a bounded proposal, but production execution still requires the independent
-approval identity and short-lived operator leases described below.
+These tools are a supervised execution kernel, not an autonomous store
+manager. The durable worker executes only an already approved, policy-bound
+outbox item; it is not a forecast model or policy-learning loop. ChatGPT can
+analyze data and prepare a bounded proposal, but production execution still
+requires the independent approval identity and short-lived operator leases
+described below.
 
 WB currently documents campaign bid changes for statuses `4`, `9`, and `11`,
 with `combined` placement for a unified bid and `search`/`recommendations` for
@@ -84,10 +89,55 @@ pauses immediately.
 Before a bid request, the intended transition is saved in the guard state.
 After the single write attempt, the product bid is read back through the
 Performance API. Only an exact match completes the transition and starts the
-cooldown. An unavailable or mismatching readback creates a durable incident
-and blocks further automatic actions for that campaign. A process restart
+cooldown. An unavailable readback retains the pending transition for a later
+readback-only recovery; a definite mismatch creates a durable incident and
+blocks further automatic actions for that campaign. A process restart
 reconciles the saved pending transition by readback and never blindly repeats
 the write.
+
+Database mode runs launch consumption and campaign guarding as independent,
+cancellation-aware loops. Launch recovery is drained before new launch work;
+expired guard-stop leases are likewise reconciled before active guards. Each
+marketplace mutation has a fenced lease and a durable write-start marker placed
+at the final permit, after local validation and request pacing. Once that marker
+exists, recovery is readback-only: an unavailable readback keeps the intent in
+`stopping`, an exact stopped state completes it, and an exact running state is
+locked as an incident without repeating the POST. Stop telemetry is stored as
+an all-or-nothing spend/revenue pair; unavailable telemetry is explicit and is
+never represented by fabricated zeroes.
+
+Static mode uses the same boundary in its private local state. Pending bid,
+activation and deactivation records bind the account, campaign, SKU, limits and
+date window that authorised them. Startup reconciles every pending record
+before filtering for running campaigns, and ordinary polling never clears an
+incident. Only the explicit confirmed reconcile command may clear a lock after
+exact product and campaign-state proof. That command cannot waive a lost or
+rolled-back state history: the matching state volume must first be restored or
+reconstructed through a separately reviewed operator repair.
+
+The policy document is immutable for one executor process lifetime: every
+effective document change requires a higher revision and a restart. The final
+static write permit still locks and verifies that exact startup
+version/revision/digest plus the global, account and SKU database gates; an
+emergency revocation therefore starts by closing the database gate and does not
+depend on a policy-file reload.
+
+Both modes also hold one PostgreSQL session advisory lock keyed by the bound
+executor Client-Id fingerprint. This prevents database and static guard
+processes—even on different hosts using the same Control database—from sharing
+one executor identity concurrently. The lock connection is dedicated and its
+loss is fatal. Static campaign evidence remains in the private atomic state
+file, and every final write permit also appends an immutable PostgreSQL audit
+event whose account-wide event ID is stored atomically with the local pending
+marker. Startup requires the local high-water mark to equal PostgreSQL exactly;
+a missing or older state volume therefore blocks all writes. Before the first
+static serve, an operator must review the existing local state and run
+`ozon-campaign-guard initialize-static-state --confirm-static-state-baseline`.
+That one-time command preserves pending records, incidents and cooldowns while
+atomically recording a PostgreSQL genesis event and its local cursor; it cannot
+overwrite an existing or mismatched history. The audit command remains
+available for read-only diagnosis, but neither normal startup nor the confirmed
+reconcile command silently adopts a missing or mismatched cursor.
 
 This controller is not a position source. Position-based raises remain
 operationally disabled until a reviewed live provider is deployed and exactly
@@ -110,14 +160,103 @@ OIDC provider as the registry principal `diana_serafimovich` and calls:
 }
 ```
 
-The approval lasts at most three minutes and cannot be created by the plan
-author. Apply additionally requires enabled policy, the write-capability flag,
-and active database leases for `global`, `account/furnitura_dlya_doma` and the
-exact `sku/furnitura_dlya_doma/<sku>` key. After successful activation, a
-separate guard polls Performance statistics every minute. It deactivates the
-campaign once spend reaches 2,000 RUB or attributed DRR exceeds 15%; an
-unreadable statistics response requests a fail-closed stop. A timeout or
-uncertain stop becomes an incident and is never retried blindly.
+The approval lasts at most three minutes, cannot be created by the plan author,
+and must still be live when the initial create action is claimed. Apply
+additionally requires enabled policy, the write-capability flag, and active
+database leases for `global`, `account/furnitura_dlya_doma` and the exact
+`sku/furnitura_dlya_doma/<sku>` key. Once create is authorized, the immutable
+approval artifact remains bound to the add-product and activation continuation;
+every stage still rechecks the current policy and runtime gates.
+
+After successful activation, a separate guard polls Performance statistics
+every minute. It deactivates the campaign once spend reaches 2,000 RUB or
+attributed DRR exceeds 15%; an unreadable statistics response requests a
+fail-closed stop. A timeout or uncertain post-write readback retains the
+durable stopping intent for readback-only recovery; an exact running mismatch
+becomes an incident, and the write is never retried blindly after its marker.
+
+The human `spec.title` remains part of the signed intent, while a new plan's
+provider title is mechanically fixed to `mcp-ozon-<full plan_id>`. Create
+recovery may bind only one exact occurrence of that title after a persisted
+absence preflight. Do not let another cabinet client create or reuse this title
+during an active workflow; a duplicate or ambiguous match fails closed for
+manual investigation.
+
+## Ozon credential and process isolation
+
+Use different Ozon Performance Client-Ids for reporting/Analytics and the
+durable workflow executor. The interactive planner has no marketplace
+credential, proxy, or outbound network; prepare is a policy-bound database
+operation and the executor repeats the live SKU/title preflight at its final
+permit. In the access registry, `client_id_env` names reporting/Analytics and
+`control_executor_client_id_sha256` binds the executor identity to the exact
+account. Fingerprints are lowercase SHA-256 of the normalized Client-Id value,
+not of the secret. `compose.control-ozon-live.yaml` and the static guard mount
+executor files through `CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_*_FILE_HOST`.
+Never point them at reporting credentials.
+
+Both runtimes also require separate PostgreSQL identities:
+`CONTROL_MCP_OZON_PLANNER_DATABASE_URL` must use `ozon_control_planner`, while
+`CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL` must use `ozon_control_executor`.
+The legacy `control_writer` role has no Ozon privileges after migration 025.
+The planner can prepare, approve and enqueue but cannot claim or complete a
+workflow; the executor can claim, fence and complete but cannot create,
+approve or enqueue a plan.
+
+Before any Performance client is constructed, the guard holds a
+process-lifetime PostgreSQL advisory lease keyed by the executor Client-Id
+fingerprint. A second static or durable process using that identity, including
+on another host, fails startup. The executor read/write pacer is shared by all
+Performance clients inside the owner process. The generic database roles
+are trusted across this deployment's Ozon rows; do not reuse their credentials
+across independent tenant trust zones without per-account database principals.
+
+Plan creation, approval and enqueue share one trusted planner process and one
+database capability. The self-approval constraint catches ordinary misuse but
+is not a cryptographically independent two-person guarantee if that process or
+role is compromised. The executor still enforces the exact current policy,
+account, plan digest and runtime gates. A compromise-resistant approval boundary
+needs a separate issuer-verifiable signer and database role.
+
+Migration 025 can recompute the complete timestamp-bound identity chain for new
+plans. Migration 024 replaced `created_at` after the old repository had already
+hashed an earlier database timestamp, so that exact preimage cannot be
+reconstructed. The upgrade treats a legacy `plan_digest` as an opaque artifact
+of the formerly trusted writer, verifies its append-only `prepared` event and
+recomputed manifest digest, and derives `plan_id` from it again. Legacy
+human-title plans cannot enqueue a create; only already provider-bound stages
+with a campaign ID may continue by exact readback. This compatibility path is
+not retroactive cryptographic proof against compromise of the old writer role.
+
+Before upgrading a database that has Ozon plans, run this read-only preflight.
+Any returned row blocks migration and needs an operator to reconcile the exact
+provider campaign state before retrying; do not delete it or replay the write:
+
+```sql
+WITH latest_action AS (
+    SELECT plan.plan_id,plan.status,plan.campaign_id,
+           (
+               SELECT event.event_type
+               FROM control.ozon_campaign_audit_events event
+               WHERE event.plan_id=plan.plan_id
+                 AND event.event_type IN ('creating','adding_products','activating')
+               ORDER BY event.event_id DESC
+               LIMIT 1
+           ) AS action
+    FROM control.ozon_campaign_plans plan
+)
+SELECT plan_id,status,campaign_id,action
+FROM latest_action
+WHERE status='creating'
+   OR (status='ambiguous' AND action='creating')
+   OR (status='failed' AND (action='creating' OR campaign_id IS NULL))
+   OR (status IN ('ambiguous','failed') AND action IS NULL)
+ORDER BY plan_id;
+```
+
+Legacy failed add-products/activate rows with a campaign ID are reclassified
+to `ambiguous`, audited as `legacy_failed_reclassified`, and claimed only for
+readback recovery. The executor never repeats their provider mutation.
 
 Use `config/control-policy.ozon-furnitura.live.example.json` only with the
 reviewed five SKUs. The plan-only rehearsal file has a different revision, so
@@ -165,8 +304,9 @@ Every bid change must pass all of these gates:
    `ambiguous` before read-back. It still never repeats PATCH.
 
 Plan and audit rows are durable and append-only from the application workflow.
-The restricted `control_writer` role has no access to reporting or position
-schemas and cannot delete plans or audit events.
+The restricted Ozon planner/executor roles have no access to reporting or
+position schemas and cannot delete plans or audit events; `control_writer`
+retains only its WB Control privileges.
 
 Preparation reservations, plans, approvals, write reservations and audit rows
 are deliberately retained for forensic history. Before live activation,
@@ -207,9 +347,9 @@ The access registry already binds account `ip_domnyshev_wb` to actor `wb6`
 (`Вахрушева Наталья / Торсунова Вероника`). Campaign and product IDs still need
 to be copied from the actual cabinet; do not use example numbers in production.
 
-`wb6` currently represents two people behind one OIDC username. That is enough
-for a plan-only technical rehearsal, but it is not individual accountability
-for live writes. Before enabling the executor, create separate reviewed actors
+`wb6` currently represents two people behind one legacy registry username. It
+cannot authorize JWT mode without a real immutable subject and is not individual
+accountability for live writes. Before enabling the executor, create separate reviewed actors
 and OIDC principals for Natalia Vakhrusheva and Veronika Torsunova, bind the
 chosen plan author explicitly, and keep every approver/operator identity
 separate. Do not invent those identifiers in this repository before IAM has
@@ -266,13 +406,14 @@ limit numbers in this example with reviewed production values. Replace the
 zero `seller_sid` too: the exact non-zero registry value is required in the
 target and becomes part of the policy/plan digest.
 
-When `CONTROL_MCP_DATABASE_URL` is present in JWT mode, startup registers the
-current policy revision/digest even if `mode` is `disabled`; no WB token is read
-in that mode. This persists a rollback-prevention tombstone, so an older
-previously enabled revision cannot be restored later. For an emergency stop,
-first disable the operator-owned global DB gate, then restart with a higher
-disabled revision using the planner overlay only (never the live writer
-overlay).
+When `CONTROL_MCP_DATABASE_URL` is present in JWT mode, WB Control startup
+registers the current policy revision/digest even if `mode` is `disabled`; no
+WB token is read in that mode. Ozon policy revisions are registered through
+the role-specific planner URL while Ozon Control is configured. These records
+are rollback-prevention tombstones, so an older previously enabled revision
+cannot be restored later. For an emergency stop, first disable the
+operator-owned global DB gate, then restart with a higher disabled revision
+using the planner overlay only (never the live writer overlay).
 
 ## Dedicated WB tokens
 
@@ -341,9 +482,12 @@ permissions to group/other because startup deliberately rejects those modes.
 
 ## PostgreSQL activation
 
-Add a new random `CONTROL_WRITER_DB_PASSWORD` to the ignored `.position.env`.
-For a new database volume, migrations `020_wb_control_plans.sql` and
-`024_ozon_control_campaign_plans.sql` run during normal initialization.
+Add distinct random `CONTROL_WRITER_DB_PASSWORD`,
+`OZON_CONTROL_PLANNER_DB_PASSWORD`, and
+`OZON_CONTROL_EXECUTOR_DB_PASSWORD` values to the ignored `.position.env`.
+For a new database volume, migrations `020_wb_control_plans.sql`,
+`024_ozon_control_campaign_plans.sql`, and
+`025_ozon_durable_launch_workflow.sql` run during normal initialization.
 Existing volumes do not rerun init scripts. After a
 verified backup, rebuild the database image and use the ledger-backed
 migrator. The one-time baseline is accepted only when the complete structural
@@ -366,7 +510,7 @@ Use the repository bootstrap script when creating a fresh position environment:
 It refuses to overwrite an existing secret file.
 
 Runtime write gates live in PostgreSQL and are fail-closed. Migration creates a
-disabled global gate; `control_writer` can only read gates, never enable them.
+disabled global gate; application roles can only read gates, never enable them.
 Before an executor can claim a plan, a separate database operator must issue
 short-lived enabled leases (at most 15 minutes) for all three scopes: `global`,
 the exact account and the exact campaign. Missing, disabled, expired or

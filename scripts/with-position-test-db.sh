@@ -19,6 +19,8 @@ report_worker_password="report-worker-repository-test"
 report_collector_password="report-collector-repository-test"
 report_refresh_requester_password="report-refresh-requester-test"
 control_writer_password="control-writer-repository-test"
+ozon_planner_password="ozon-planner-repository-test"
+ozon_executor_password="ozon-executor-repository-test"
 wb_automation_password="wb-automation-repository-test"
 
 cleanup() {
@@ -45,6 +47,8 @@ docker run --detach --rm --name "$container" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   --env REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  --env OZON_CONTROL_PLANNER_DB_PASSWORD="$ozon_planner_password" \
+  --env OZON_CONTROL_EXECUTOR_DB_PASSWORD="$ozon_executor_password" \
   --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$image" >/dev/null
 
@@ -77,7 +81,8 @@ export REPORT_OUTBOX_TEST_WORKER_URL="postgresql://report_worker:${report_worker
 export REPORT_SNAPSHOT_TEST_COLLECTOR_URL="postgresql://report_collector:${report_collector_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export REPORT_REFRESH_TEST_REQUESTER_URL="postgresql://report_refresh_requester:${report_refresh_requester_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export WB_CONTROL_TEST_DATABASE_URL="postgresql://control_writer:${control_writer_password}@127.0.0.1:${mapped_port}/ozon_positions"
-export OZON_CONTROL_TEST_DATABASE_URL="$WB_CONTROL_TEST_DATABASE_URL"
+export OZON_CONTROL_TEST_DATABASE_URL="postgresql://ozon_control_planner:${ozon_planner_password}@127.0.0.1:${mapped_port}/ozon_positions"
+export OZON_EXECUTOR_TEST_DATABASE_URL="postgresql://ozon_control_executor:${ozon_executor_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export WB_AUTOMATION_TEST_DATABASE_URL="postgresql://wb_automation_writer:${wb_automation_password}@127.0.0.1:${mapped_port}/ozon_positions"
 export POSITION_COLLECTOR_MODE=disabled
 export POSITION_COLLECTOR_DATABASE_URL="$POSITION_REPOSITORY_TEST_COLLECTOR_URL"

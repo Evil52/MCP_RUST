@@ -16,6 +16,7 @@ use mcp_ozon::reporting::{
     snapshot::Marketplace,
     wb_source::{WbClientReportTransport, WbReportSource},
 };
+use mcp_ozon::runtime::print_runtime_version_if_requested;
 use std::path::PathBuf;
 use tokio::signal;
 use tokio::time::{Duration, MissedTickBehavior, timeout};
@@ -36,6 +37,10 @@ const MAX_CONSECUTIVE_SCHEDULER_FAILURES: u32 = 5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if print_runtime_version_if_requested("report-collector", &arguments)? {
+        return Ok(());
+    }
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -43,7 +48,6 @@ async fn main() -> Result<()> {
         )
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let command = parse_command(&arguments)?;
     if let Command::BootstrapCredentials {
         registry,

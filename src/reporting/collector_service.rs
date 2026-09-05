@@ -14,7 +14,7 @@ use tokio_postgres::{Config, config::Host};
 use crate::{
     config::{
         AccessRegistry, Marketplace, PerformanceCredentials, RegistrySource, StoreCredentials,
-        StoreId, validate_wb_token_type,
+        StoreId, credential_sha256, validate_wb_token_type,
     },
     ozon::OzonClient,
     ozon_performance::PerformanceClient,
@@ -278,6 +278,15 @@ impl ReportCollectorConfig {
             &performance.client_id_env,
             "Ozon Performance report collection",
         )?;
+        let performance_client_id_fingerprint = credential_sha256(&performance_client_id);
+        if self
+            .registry
+            .has_control_performance_client_id_fingerprint(&performance_client_id_fingerprint)
+        {
+            bail!(
+                "Ozon report collector не может использовать выделенный Control Performance Client-Id"
+            );
+        }
         let performance_client_secret = required_secret(
             lookup,
             &performance.client_secret_env,
@@ -648,6 +657,104 @@ mod tests {
                 .resolve_ozon_dry_run(&expired_claim, &mut unexpected_secret_lookup)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn report_collector_rejects_the_dedicated_control_performance_identity() {
+        let mut values = entries();
+        let registry_path = PathBuf::from(&values[1].1);
+        let mut registry: serde_json::Value =
+            serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+        registry["accounts"][0]["ozon"]["performance"]["control_executor_client_id_sha256"] =
+            crate::config::credential_sha256("dedicated-control-client").into();
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).unwrap(),
+        )
+        .unwrap();
+        values.push((MODE_ENV, "ozon_dry_run".to_owned()));
+        let collector = config(&values).unwrap();
+        let claim = claim("ozon", super::super::snapshot::Marketplace::Ozon);
+        let result = collector.resolve_ozon_dry_run(&claim, &mut |key| {
+            Some(
+                match key {
+                    "PERF_ID" => "dedicated-control-client",
+                    "PERF_SECRET" => "performance-secret",
+                    "ID" => "seller-client",
+                    "KEY" => "seller-secret",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
+        });
+        let error = match result {
+            Ok(_) => panic!("dedicated Control Performance Client-Id must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("выделенный Control Performance Client-Id"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn report_collector_rejects_another_accounts_control_performance_identity() {
+        let mut values = entries();
+        let registry_path = PathBuf::from(&values[1].1);
+        let mut registry: serde_json::Value =
+            serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+        registry["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "second-ozon",
+                "organization": "Second Ozon",
+                "marketplace": "ozon",
+                "seller_client_id": "3",
+                "manager_id": "diana",
+                "ozon": {
+                    "store_id": "3",
+                    "client_id_env": "SECOND_ID",
+                    "api_key_env": "SECOND_KEY",
+                    "performance": {
+                        "client_id_env": "SECOND_PERF_ID",
+                        "client_secret_env": "SECOND_PERF_SECRET",
+                        "control_executor_client_id_sha256":
+                            crate::config::credential_sha256("cross-account-control-client")
+                    }
+                }
+            }));
+        fs::write(
+            &registry_path,
+            serde_json::to_vec_pretty(&registry).unwrap(),
+        )
+        .unwrap();
+        values.push((MODE_ENV, "ozon_dry_run".to_owned()));
+        let collector = config(&values).unwrap();
+        let claim = claim("ozon", super::super::snapshot::Marketplace::Ozon);
+        let result = collector.resolve_ozon_dry_run(&claim, &mut |key| {
+            Some(
+                match key {
+                    "PERF_ID" => "cross-account-control-client",
+                    "PERF_SECRET" => "performance-secret",
+                    "ID" => "seller-client",
+                    "KEY" => "seller-secret",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
+        });
+        let error = match result {
+            Ok(_) => panic!("another account's Control Performance Client-Id must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("выделенный Control Performance Client-Id"),
+            "{error}"
+        );
+        for sensitive in ["cross-account-control-client", "performance-secret"] {
+            assert!(!error.contains(sensitive), "{error}");
+        }
     }
 
     #[test]

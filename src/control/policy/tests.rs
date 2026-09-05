@@ -49,6 +49,8 @@ fn registry() -> AccessRegistry {
                     performance: Some(OzonPerformanceAccount {
                         client_id_env: "UNUSED_PERF_ID".to_owned(),
                         client_secret_env: "UNUSED_PERF_SECRET".to_owned(),
+                        control_planner_client_id_sha256: None,
+                        control_executor_client_id_sha256: None,
                     }),
                 }),
                 wildberries: None,

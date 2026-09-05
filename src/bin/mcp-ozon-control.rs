@@ -7,14 +7,14 @@ use mcp_ozon::{
     auth::JwtAuthenticator,
     config::TransportMode,
     control::{
-        ControlAppConfig, ControlAuthConfig, ControlMcp, OzonAdsWriteClient, OzonControlServices,
-        OzonPlanRepository, WbBidWriteClient, WbControlServices, WbPlanRepository,
+        ControlAppConfig, ControlAuthConfig, ControlMcp, OzonControlServices, OzonPlanRepository,
+        WbBidWriteClient, WbControlServices, WbPlanRepository,
     },
     http::build_router_for_server_with_cancellation_and_session_idle_timeout,
-    ozon_performance::PerformanceClient,
     runtime::{
         HTTP_CANCELLED_DRAIN_TIMEOUT, HTTP_HEADER_READ_TIMEOUT, HTTP_MAX_CONNECTIONS,
-        HTTP_NATURAL_DRAIN_TIMEOUT, run_http_until_bounded_shutdown, serve_hardened_http,
+        HTTP_NATURAL_DRAIN_TIMEOUT, print_runtime_version_if_requested,
+        run_http_until_bounded_shutdown, serve_hardened_http,
     },
     wb::{WbClient, WbCredentials},
 };
@@ -25,6 +25,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if print_runtime_version_if_requested("mcp-ozon-control", &arguments)? {
+        return Ok(());
+    }
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -36,20 +40,25 @@ async fn main() -> Result<()> {
     // ControlAppConfig never loads `.env`. A write token can only be read from
     // the explicitly mounted Control-only credential file when every gate is on.
     let config = ControlAppConfig::from_env()?;
+    let registry = config.registry.clone();
+    // Bind JWT authorization before connecting to either policy store or
+    // constructing marketplace clients. A subjectless registry must fail
+    // startup without registering policy state or causing any other external
+    // side effect.
+    let authenticator = match &config.auth {
+        ControlAuthConfig::Dev { .. } => None,
+        ControlAuthConfig::Jwt(jwt_config) => {
+            Some(JwtAuthenticator::new(jwt_config.clone(), registry.clone())?)
+        }
+    };
     let ozon_services = match &config.ozon_runtime {
         Some(runtime) => {
-            let database = &config
-                .policy_database
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Ozon Control требует plan store"))?
-                .database;
-            let plans = OzonPlanRepository::connect(database)
+            let plans = OzonPlanRepository::connect(&runtime.database)
                 .await
                 .map_err(|_| anyhow::anyhow!("Ozon Control plan store недоступен"))?;
-            plans
-                .verify_runtime_contract()
-                .await
-                .map_err(|_| anyhow::anyhow!("Ozon control_writer runtime contract неверен"))?;
+            plans.verify_runtime_contract().await.map_err(|_| {
+                anyhow::anyhow!("Ozon ozon_control_planner runtime contract неверен")
+            })?;
             plans
                 .register_policy(
                     config.policy.version,
@@ -58,29 +67,8 @@ async fn main() -> Result<()> {
                 )
                 .await
                 .map_err(|_| anyhow::anyhow!("Ozon policy rollback/reuse отклонён"))?;
-            let credentials =
-                BTreeMap::from([(runtime.store_id.clone(), runtime.credentials.clone())]);
-            let reader = PerformanceClient::new_with_https_proxy(
-                runtime.request_timeout,
-                credentials,
-                &runtime.proxy_url,
-            )?;
-            let writer = runtime
-                .writer_enabled
-                .then(|| {
-                    OzonAdsWriteClient::new(
-                        runtime.request_timeout,
-                        runtime.credentials.clone(),
-                        &runtime.proxy_url,
-                    )
-                    .map(Arc::new)
-                })
-                .transpose()?;
             Some(OzonControlServices {
                 account_id: runtime.account_id.clone(),
-                store_id: runtime.store_id.clone(),
-                reader: Arc::new(reader),
-                writer,
                 plans: Arc::new(plans),
             })
         }
@@ -156,15 +144,14 @@ async fn main() -> Result<()> {
                 anyhow::anyhow!("Control disabled policy tombstone rollback/reuse отклонён")
             })?;
     }
-    let registry = config.registry.clone();
-    let mut server = match &config.auth {
-        ControlAuthConfig::Dev { actor_id } => {
+    let mut server = match (&config.auth, authenticator) {
+        (ControlAuthConfig::Dev { actor_id }, None) => {
             ControlMcp::new_disabled(actor_id.clone(), registry, config.policy)
         }
-        ControlAuthConfig::Jwt(jwt_config) => {
-            let authenticator = JwtAuthenticator::new(jwt_config.clone(), registry.clone())?;
+        (ControlAuthConfig::Jwt(_), Some(authenticator)) => {
             ControlMcp::new_authenticated_disabled(registry, config.policy, authenticator)
         }
+        _ => unreachable!("prepared Control authentication must match its configuration"),
     };
     if let Some(services) = wb_services {
         server = server.with_wb_control_services(services);

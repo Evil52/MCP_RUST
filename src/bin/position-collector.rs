@@ -2,7 +2,10 @@
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, FixedOffset, Utc};
-use mcp_ozon::position_collector::{CollectorRuntimeConfig, CollectorRuntimeMode};
+use mcp_ozon::{
+    position_collector::{CollectorRuntimeConfig, CollectorRuntimeMode},
+    runtime::print_runtime_version_if_requested,
+};
 use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -14,6 +17,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if print_runtime_version_if_requested("position-collector", &arguments)? {
+        return Ok(());
+    }
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -22,7 +29,7 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    let command = match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+    let command = match arguments.as_slice() {
         [] => Command::Serve,
         [argument] if argument == "healthcheck" => Command::Healthcheck,
         [argument, slot] if argument == "canary-plan" => Command::CanaryPlan(

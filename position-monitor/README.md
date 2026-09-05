@@ -392,7 +392,7 @@ database service, and it does not expose the admin, collector, or worker
 passwords to the MCP container.
 
 Before enabling it, verify an integrity-checked protected backup (encrypt it
-when it leaves the protected host), migrations through `024`, the database
+when it leaves the protected host), migrations through `025`, the database
 healthcheck above, and a protected `.position.env` whose reader password is
 URL-safe (the documented hexadecimal bootstrap value is URL-safe). Existing
 installations must add a separate URL-safe

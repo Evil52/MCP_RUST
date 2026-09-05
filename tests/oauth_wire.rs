@@ -159,10 +159,10 @@ struct TestClaims<'a> {
 }
 
 fn token(audience: &str, scope: &str) -> String {
-    token_for_username(audience, scope, "admin")
+    token_for_identity(audience, scope, "wire-test-subject", "admin")
 }
 
-fn token_for_username(audience: &str, scope: &str, username: &str) -> String {
+fn token_for_identity(audience: &str, scope: &str, subject: &str, username: &str) -> String {
     let now = chrono::Utc::now().timestamp();
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(KID.to_owned());
@@ -171,7 +171,7 @@ fn token_for_username(audience: &str, scope: &str, username: &str) -> String {
         &TestClaims {
             iss: ISSUER,
             aud: audience,
-            sub: "wire-test-subject",
+            sub: subject,
             scope,
             preferred_username: username,
             exp: now + 3_600,
@@ -192,12 +192,20 @@ fn registry() -> TempRegistry {
         &path,
         serde_json::to_vec_pretty(&json!({
             "version": 1,
-            "actors": [{
-                "id": "admin",
-                "name": "OAuth Wire Administrator",
-                "role": "admin",
-                "oidc": {"username": "admin"}
-            }],
+            "actors": [
+                {
+                    "id": "admin",
+                    "name": "OAuth Wire Administrator",
+                    "role": "admin",
+                    "oidc": {"subject": "wire-test-subject", "username": "admin"}
+                },
+                {
+                    "id": "second",
+                    "name": "Second OAuth Actor",
+                    "role": "manager",
+                    "oidc": {"subject": "wire-test-second-subject", "username": "second"}
+                }
+            ],
             "accounts": []
         }))
         .expect("test registry must serialize"),
@@ -756,7 +764,8 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         "Требуется повторная авторизация: access token выпущен для другого ресурса.",
     );
 
-    let unknown_actor_token = token_for_username(AUDIENCE, "mcp:tools", "not-provisioned");
+    let unknown_actor_token =
+        token_for_identity(AUDIENCE, "mcp:tools", "not-provisioned-subject", "admin");
     let unknown_actor = post_rpc(
         &client,
         &endpoint,
@@ -776,6 +785,85 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         None,
         "Доступ для подтверждённой учётной записи не разрешён.",
     );
+
+    let second_actor_token =
+        token_for_identity(AUDIENCE, "mcp:tools", "wire-test-second-subject", "second");
+    let cross_actor_post = post_rpc(
+        &client,
+        &endpoint,
+        Some(&session_id),
+        Some(&second_actor_token),
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    assert_eq!(cross_actor_post.status, StatusCode::NOT_FOUND);
+    assert_eq!(cross_actor_post.raw_body, "Not Found: Session not found");
+    assert!(cross_actor_post.headers.get(WWW_AUTHENTICATE).is_none());
+
+    let cross_actor_get = finite_wire_response(
+        client
+            .get(&endpoint)
+            .header(HOST, "localhost:8788")
+            .header(ACCEPT, "text/event-stream")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+            .header(SESSION_HEADER, &session_id)
+            .bearer_auth(&second_actor_token)
+            .send()
+            .await
+            .expect("cross-actor session GET must complete"),
+    )
+    .await;
+    assert_eq!(cross_actor_get.status, StatusCode::NOT_FOUND);
+    assert_eq!(cross_actor_get.raw_body, "Not Found: Session not found");
+
+    let cross_actor_delete = finite_wire_response(
+        client
+            .delete(&endpoint)
+            .header(HOST, "localhost:8788")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+            .header(SESSION_HEADER, &session_id)
+            .bearer_auth(&second_actor_token)
+            .send()
+            .await
+            .expect("cross-actor session DELETE must complete"),
+    )
+    .await;
+    assert_eq!(cross_actor_delete.status, StatusCode::NOT_FOUND);
+    assert_eq!(cross_actor_delete.raw_body, "Not Found: Session not found");
+
+    for session_ids in [
+        [&*session_id, "not-a-retained-session"],
+        ["not-a-retained-session", &*session_id],
+    ] {
+        let mut request = client
+            .post(&endpoint)
+            .header(HOST, "localhost:8788")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .header(CONTENT_TYPE, "application/json")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+            .bearer_auth(&valid_token);
+        for session_id in session_ids {
+            request = request.header(SESSION_HEADER, session_id);
+        }
+        let duplicate = finite_wire_response(
+            request
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 10,
+                    "method": "tools/list",
+                    "params": {}
+                }))
+                .send()
+                .await
+                .expect("duplicate-session request must complete"),
+        )
+        .await;
+        assert_eq!(duplicate.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            duplicate.raw_body,
+            "Bad Request: invalid MCP session identifier"
+        );
+    }
 
     let missing_get = finite_wire_response(
         client

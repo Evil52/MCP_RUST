@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::control::{
-    ozon::{OzonCampaignPlan, OzonLaunchStatus, OzonPlanStoreError},
+    ozon::{OzonCampaignPlan, OzonPlanStoreError},
     plan::{PlanStoreError, WbControlPlan, WbPlanStatus},
     wb::{WbCampaignBidSnapshot, WbWriteError, WbWriteOutcomeKind},
 };
@@ -21,6 +21,15 @@ pub(super) fn ozon_plan_result(plan: &OzonCampaignPlan) -> OzonCampaignPlanResul
         policy_schema_version: plan.schema_version,
         policy_revision: plan.policy_revision,
         policy_digest: plan.policy_digest.clone(),
+        provider_identity_version: if plan.manifest.create_request.title
+            == format!("mcp-ozon-{}", plan.plan_id)
+        {
+            "plan_id_v1"
+        } else {
+            "legacy_title_v0"
+        }
+        .to_owned(),
+        provider_title: plan.manifest.create_request.title.clone(),
         status: plan.status,
         campaign_id: plan.campaign_id,
         approval: plan
@@ -36,6 +45,11 @@ pub(super) fn ozon_plan_result(plan: &OzonCampaignPlan) -> OzonCampaignPlanResul
         created_at: format_timestamp(plan.created_at),
         expires_at: format_timestamp(plan.expires_at),
         last_error_class: plan.last_error_class.clone(),
+        execution_requested_at: plan.execution_requested_at.map(format_timestamp),
+        current_action: plan.current_action.as_db().to_owned(),
+        workflow_generation: plan.workflow_generation,
+        workflow_lease_expires_at: plan.workflow_lease_expires_at.map(format_timestamp),
+        workflow_write_started_at: plan.workflow_write_started_at.map(format_timestamp),
         requires_reconciliation: plan.status.requires_reconciliation(),
     }
 }
@@ -51,29 +65,10 @@ pub(super) fn ozon_plan_store_error(error: OzonPlanStoreError) -> String {
         OzonPlanStoreError::RuntimeDisabled => "CONTROL_RUNTIME_DISABLED",
         OzonPlanStoreError::SkuLocked => "CONTROL_SKU_INCIDENT_LOCKED",
         OzonPlanStoreError::InvalidPlan => "CONTROL_PLAN_INVALID",
+        OzonPlanStoreError::LeaseLost => "CONTROL_WORKFLOW_LEASE_LOST",
         OzonPlanStoreError::Unavailable => "CONTROL_PERSISTENCE_UNAVAILABLE",
     }
     .to_owned()
-}
-
-pub(super) fn ozon_write_failure(
-    kind: crate::control::ozon::OzonWriteErrorKind,
-    operation: &'static str,
-) -> (OzonLaunchStatus, &'static str) {
-    match (kind, operation) {
-        (crate::control::ozon::OzonWriteErrorKind::Definite, "create") => {
-            (OzonLaunchStatus::Failed, "ozon_create_rejected")
-        }
-        (crate::control::ozon::OzonWriteErrorKind::Definite, "products") => {
-            (OzonLaunchStatus::Failed, "ozon_products_rejected")
-        }
-        (crate::control::ozon::OzonWriteErrorKind::Definite, "activate") => {
-            (OzonLaunchStatus::Failed, "ozon_activate_rejected")
-        }
-        (_, "create") => (OzonLaunchStatus::Ambiguous, "ozon_create_ambiguous"),
-        (_, "products") => (OzonLaunchStatus::Ambiguous, "ozon_products_ambiguous"),
-        _ => (OzonLaunchStatus::Ambiguous, "ozon_activate_ambiguous"),
-    }
 }
 
 #[derive(Debug)]

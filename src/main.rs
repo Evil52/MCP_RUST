@@ -12,7 +12,8 @@ use mcp_ozon::{
     reporting::{mcp_read::ReportingReader, refresh_queue::RefreshRequestService},
     runtime::{
         HTTP_CANCELLED_DRAIN_TIMEOUT, HTTP_HEADER_READ_TIMEOUT, HTTP_MAX_CONNECTIONS,
-        HTTP_NATURAL_DRAIN_TIMEOUT, run_http_until_bounded_shutdown, serve_hardened_http,
+        HTTP_NATURAL_DRAIN_TIMEOUT, print_runtime_version_if_requested,
+        run_http_until_bounded_shutdown, serve_hardened_http,
     },
     server::OzonMcp,
     wb::WbClient,
@@ -24,6 +25,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if print_runtime_version_if_requested("mcp-ozon", &arguments)? {
+        return Ok(());
+    }
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()

@@ -13,7 +13,7 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, SemaphorePermit};
 
 use crate::config::{PerformanceCredentials, StoreId};
 
@@ -292,23 +292,24 @@ struct TokenSlot {
     cooldown: Option<TokenCooldown>,
 }
 
-#[derive(Debug)]
-struct AccountState {
-    credentials: PerformanceCredentials,
-    token: Mutex<TokenSlot>,
-    next_allowed: Mutex<Instant>,
-    in_flight: Semaphore,
-    statistics_in_flight: Semaphore,
+/// Shared request-start boundary for one Ozon Performance credential scope.
+///
+/// The read and write clients are deliberately separate capability objects,
+/// but Ozon applies pacing to the underlying `Client-Id`.  A guard runtime
+/// therefore injects the same arbiter into both clients.  Read requests claim
+/// short start slots; a write keeps an exclusive guard from its final durable
+/// permit through the HTTP result, so another read cannot slip between the
+/// write marker and the actual mutation.
+#[derive(Debug, Clone)]
+pub(crate) struct PerformanceRequestPacer {
+    next_allowed: Arc<Mutex<Instant>>,
 }
 
-impl AccountState {
-    fn new(credentials: PerformanceCredentials) -> Self {
+impl PerformanceRequestPacer {
+    #[must_use]
+    pub(crate) fn new() -> Self {
         Self {
-            credentials,
-            token: Mutex::new(TokenSlot::default()),
-            next_allowed: Mutex::new(Instant::now()),
-            in_flight: Semaphore::new(MAX_IN_FLIGHT_PER_CLIENT),
-            statistics_in_flight: Semaphore::new(1),
+            next_allowed: Arc::new(Mutex::new(Instant::now())),
         }
     }
 
@@ -333,6 +334,68 @@ impl AccountState {
         }
         *next_allowed = now + interval;
         true
+    }
+
+    /// Reserves the credential scope for a mutation. The returned guard must
+    /// remain alive through the marketplace write result.
+    pub(crate) async fn reserve_write(&self) -> PerformanceWritePacingGuard {
+        let mut next_allowed = Arc::clone(&self.next_allowed).lock_owned().await;
+        let wait = next_allowed.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+        // The caller records the real request-start boundary immediately
+        // before polling the HTTP send future.
+        *next_allowed = Instant::now();
+        PerformanceWritePacingGuard { next_allowed }
+    }
+}
+
+impl Default for PerformanceRequestPacer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Exclusive write-side claim on a shared Performance pacing boundary.
+pub(crate) struct PerformanceWritePacingGuard {
+    next_allowed: OwnedMutexGuard<Instant>,
+}
+
+impl PerformanceWritePacingGuard {
+    /// Records when the write request is about to start. Readers remain
+    /// excluded until this guard is dropped after the write result.
+    pub(crate) fn mark_request_started(&mut self, interval: Duration) {
+        *self.next_allowed = Instant::now() + interval;
+    }
+}
+
+#[derive(Debug)]
+struct AccountState {
+    credentials: PerformanceCredentials,
+    token: Mutex<TokenSlot>,
+    pacing: PerformanceRequestPacer,
+    in_flight: Semaphore,
+    statistics_in_flight: Semaphore,
+}
+
+impl AccountState {
+    fn new(credentials: PerformanceCredentials, pacing: PerformanceRequestPacer) -> Self {
+        Self {
+            credentials,
+            token: Mutex::new(TokenSlot::default()),
+            pacing,
+            in_flight: Semaphore::new(MAX_IN_FLIGHT_PER_CLIENT),
+            statistics_in_flight: Semaphore::new(1),
+        }
+    }
+
+    async fn wait_until_ready(&self) {
+        self.pacing.wait_until_ready().await;
+    }
+
+    async fn try_claim_request_slot(&self, interval: Duration) -> bool {
+        self.pacing.try_claim_request_slot(interval).await
     }
 }
 
@@ -369,6 +432,7 @@ impl PerformanceClient {
             credentials,
             concat!("mcp-ozon/", env!("CARGO_PKG_VERSION")),
             None,
+            None,
         )
     }
 
@@ -389,6 +453,28 @@ impl PerformanceClient {
             credentials,
             concat!("mcp-ozon/", env!("CARGO_PKG_VERSION")),
             Some(proxy_url),
+            None,
+        )
+    }
+
+    /// Builds the isolated read client with a pacing boundary shared by every
+    /// configured credential. Guard runtimes currently bind exactly one
+    /// account, so sharing one arbiter is both exact and fail-closed if that
+    /// invariant ever broadens.
+    pub(crate) fn new_with_https_proxy_and_pacer(
+        timeout: Duration,
+        credentials: BTreeMap<StoreId, PerformanceCredentials>,
+        proxy_url: &str,
+        pacing: &PerformanceRequestPacer,
+    ) -> Result<Self, PerformanceClientBuildError> {
+        Self::build(
+            PERFORMANCE_API_BASE_URL.to_owned(),
+            timeout,
+            MIN_REQUEST_INTERVAL,
+            credentials,
+            concat!("mcp-ozon/", env!("CARGO_PKG_VERSION")),
+            Some(proxy_url),
+            Some(pacing),
         )
     }
 
@@ -409,6 +495,7 @@ impl PerformanceClient {
         credentials: BTreeMap<StoreId, PerformanceCredentials>,
         user_agent: &str,
         explicit_https_proxy: Option<&str>,
+        shared_pacing: Option<&PerformanceRequestPacer>,
     ) -> Result<Self, PerformanceClientBuildError> {
         let http = Client::builder()
             .timeout(timeout)
@@ -434,7 +521,8 @@ impl PerformanceClient {
             if !client_ids.insert(credentials.client_id.clone()) {
                 return Err(PerformanceClientBuildError::SharedClientId);
             }
-            accounts.insert(store, Arc::new(AccountState::new(credentials)));
+            let pacing = shared_pacing.cloned().unwrap_or_default();
+            accounts.insert(store, Arc::new(AccountState::new(credentials, pacing)));
         }
         Ok(Self {
             http,
@@ -458,6 +546,7 @@ impl PerformanceClient {
             Duration::ZERO,
             credentials,
             "mcp-ozon-test",
+            None,
             None,
         )
         .unwrap()
@@ -959,6 +1048,46 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_pacer_orders_reads_around_an_exclusive_write_boundary() {
+        let pacer = PerformanceRequestPacer::new();
+        assert!(pacer.try_claim_request_slot(Duration::from_secs(10)).await);
+
+        let writer_pacer = pacer.clone();
+        let mut writer = tokio::spawn(async move { writer_pacer.reserve_write().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !writer.is_finished(),
+            "a write must wait for the preceding read start interval"
+        );
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let mut write_guard = (&mut writer).await.unwrap();
+        drop(writer);
+        write_guard.mark_request_started(Duration::from_secs(5));
+
+        let reader_pacer = pacer.clone();
+        let reader = tokio::spawn(async move {
+            reader_pacer.wait_until_ready().await;
+            reader_pacer
+                .try_claim_request_slot(Duration::from_secs(1))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !reader.is_finished(),
+            "a read must not cross an active write marker-to-result boundary"
+        );
+
+        drop(write_guard);
+        tokio::task::yield_now().await;
+        assert!(
+            !reader.is_finished(),
+            "the write request-start interval remains active after its result"
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(reader.await.unwrap());
     }
 
     async fn cache_access_token(
@@ -1663,7 +1792,7 @@ mod tests {
             Some("new-token")
         );
 
-        *state.next_allowed.lock().await = Instant::now() + Duration::from_secs(1);
+        *state.pacing.next_allowed.lock().await = Instant::now() + Duration::from_secs(1);
         assert_eq!(
             client
                 .campaigns(&StoreId::from("shop"), campaigns_query())
@@ -1687,6 +1816,7 @@ mod tests {
             credentials_for(&["noisy-a", "noisy-b", "noisy-c", "noisy-d", "quiet"]),
             "mcp-ozon-test",
             None,
+            None,
         )
         .unwrap();
         let noisy_states = noisy_stores
@@ -1694,10 +1824,10 @@ mod tests {
             .map(|store| Arc::clone(client.accounts.get(&StoreId::from(*store)).unwrap()))
             .collect::<Vec<_>>();
         let pacing_gates = [
-            noisy_states[0].next_allowed.lock().await,
-            noisy_states[1].next_allowed.lock().await,
-            noisy_states[2].next_allowed.lock().await,
-            noisy_states[3].next_allowed.lock().await,
+            noisy_states[0].pacing.next_allowed.lock().await,
+            noisy_states[1].pacing.next_allowed.lock().await,
+            noisy_states[2].pacing.next_allowed.lock().await,
+            noisy_states[3].pacing.next_allowed.lock().await,
         ];
         let query = vec![("page", "1".to_owned())];
         let mut attempts = Vec::with_capacity(MAX_GLOBAL_IN_FLIGHT);
@@ -1759,7 +1889,7 @@ mod tests {
         // Hold the pacing mutex while both futures queue in a known FIFO order:
         // the request first performs its readiness check, then the competing
         // claimant takes the slot before that request can claim it itself.
-        let pacing_gate = state.next_allowed.lock().await;
+        let pacing_gate = state.pacing.next_allowed.lock().await;
         let mut request = Box::pin(client.request_attempt(
             &state,
             Method::GET,
@@ -2036,6 +2166,7 @@ mod tests {
             Duration::ZERO,
             BTreeMap::new(),
             "invalid\nuser-agent",
+            None,
             None,
         )
         .expect_err("invalid HTTP client configuration must fail");

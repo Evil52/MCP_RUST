@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{sync::Mutex, time::Instant};
 
-use crate::config::PerformanceCredentials;
+use crate::{config::PerformanceCredentials, ozon_performance::PerformanceRequestPacer};
 
 const PERFORMANCE_BASE_URL: &str = "https://api-performance.ozon.ru";
 const TOKEN_PATH: &str = "/api/client/token";
@@ -84,6 +84,10 @@ pub enum OzonWriteError {
     InvalidRequest,
     #[error("Ozon Performance OAuth token response некорректен")]
     InvalidToken,
+    #[error("Ozon Performance OAuth token transport недоступен")]
+    TokenTransport,
+    #[error("Ozon Performance OAuth endpoint вернул HTTP {status}")]
+    TokenHttp { status: StatusCode },
     #[error("Ozon Performance write endpoint отклонил авторизацию")]
     Unauthorized,
     #[error("Ozon Performance write endpoint запретил операцию")]
@@ -92,6 +96,8 @@ pub enum OzonWriteError {
     Http { status: StatusCode },
     #[error("Ozon Performance write request завершился с неопределённым результатом")]
     AmbiguousTransport,
+    #[error("Ozon Performance OAuth token response превышает безопасный лимит")]
+    TokenResponseTooLarge,
     #[error("Ozon Performance write response превышает безопасный лимит")]
     ResponseTooLarge,
     #[error("Ozon Performance campaign create response некорректен")]
@@ -102,14 +108,18 @@ impl OzonWriteError {
     #[must_use]
     pub fn kind(&self) -> OzonWriteErrorKind {
         match self {
-            Self::AmbiguousTransport | Self::InvalidCreateResponse => OzonWriteErrorKind::Ambiguous,
+            Self::AmbiguousTransport | Self::ResponseTooLarge | Self::InvalidCreateResponse => {
+                OzonWriteErrorKind::Ambiguous
+            }
             Self::Http { status } if status.is_server_error() => OzonWriteErrorKind::Ambiguous,
             Self::InvalidRequest
             | Self::InvalidToken
+            | Self::TokenTransport
+            | Self::TokenHttp { .. }
             | Self::Unauthorized
             | Self::Forbidden
             | Self::Http { .. }
-            | Self::ResponseTooLarge => OzonWriteErrorKind::Definite,
+            | Self::TokenResponseTooLarge => OzonWriteErrorKind::Definite,
         }
     }
 }
@@ -140,6 +150,7 @@ pub struct OzonAdsWriteClient {
     credentials: PerformanceCredentials,
     token: Arc<Mutex<TokenState>>,
     write_lock: Arc<Mutex<Instant>>,
+    pacing: PerformanceRequestPacer,
     minimum_interval: Duration,
 }
 
@@ -178,6 +189,38 @@ impl OzonAdsWriteClient {
             http,
             PERFORMANCE_BASE_URL,
             credentials,
+            PerformanceRequestPacer::new(),
+            MIN_WRITE_INTERVAL,
+        ))
+    }
+
+    /// Builds a write client sharing the exact `Client-Id` pacing boundary
+    /// with its read-side `PerformanceClient`.
+    pub(crate) fn new_with_pacer(
+        timeout: Duration,
+        credentials: PerformanceCredentials,
+        proxy_url: &str,
+        pacing: PerformanceRequestPacer,
+    ) -> Result<Self> {
+        if timeout.is_zero() || timeout > Duration::from_secs(30) {
+            bail!("CONTROL_MCP_OZON_TIMEOUT_SECONDS должен задавать 1..=30 секунд");
+        }
+        validate_credentials(&credentials)?;
+        let proxy = Proxy::https(proxy_url).context("неверный CONTROL_MCP_OZON_PROXY")?;
+        let http = Client::builder()
+            .redirect(Policy::none())
+            .no_proxy()
+            .https_only(true)
+            .connect_timeout(timeout.min(Duration::from_secs(5)))
+            .timeout(timeout)
+            .proxy(proxy)
+            .build()
+            .context("не удалось создать изолированный Ozon Performance write client")?;
+        Ok(Self::from_parts(
+            http,
+            PERFORMANCE_BASE_URL,
+            credentials,
+            pacing,
             MIN_WRITE_INTERVAL,
         ))
     }
@@ -194,7 +237,13 @@ impl OzonAdsWriteClient {
             .timeout(timeout)
             .build()
             .expect("test Ozon write client");
-        Self::from_parts(http, base_url, credentials, Duration::ZERO)
+        Self::from_parts(
+            http,
+            base_url,
+            credentials,
+            PerformanceRequestPacer::new(),
+            Duration::ZERO,
+        )
     }
 
     #[cfg(test)]
@@ -210,13 +259,20 @@ impl OzonAdsWriteClient {
             .timeout(timeout)
             .build()
             .expect("test Ozon write client");
-        Self::from_parts(http, base_url, credentials, minimum_interval)
+        Self::from_parts(
+            http,
+            base_url,
+            credentials,
+            PerformanceRequestPacer::new(),
+            minimum_interval,
+        )
     }
 
     fn from_parts(
         http: Client,
         base_url: &str,
         credentials: PerformanceCredentials,
+        pacing: PerformanceRequestPacer,
         minimum_interval: Duration,
     ) -> Self {
         Self {
@@ -225,6 +281,7 @@ impl OzonAdsWriteClient {
             credentials,
             token: Arc::new(Mutex::new(TokenState::default())),
             write_lock: Arc::new(Mutex::new(Instant::now())),
+            pacing,
             minimum_interval,
         }
     }
@@ -365,16 +422,23 @@ impl OzonAdsWriteClient {
         PermitFuture: Future<Output = Result<(), E>>,
     {
         let token = self.access_token().await?;
+        // Header construction is a local, definite precondition. It must be
+        // completed before the durable permit marks the mutation boundary.
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| OzonWriteError::InvalidToken)?;
+        authorization.set_sensitive(true);
         let mut next_start = self.write_lock.lock().await;
         if *next_start > Instant::now() {
             tokio::time::sleep_until(*next_start).await;
         }
+        // Exclude read starts for this Client-Id from the final durable permit
+        // through the write result. This makes the marker-to-HTTP boundary
+        // atomic with respect to all in-process Performance data-endpoint
+        // traffic. OAuth refreshes happen before this write-side boundary.
+        let mut pacing = self.pacing.reserve_write().await;
         permit().await.map_err(OzonGuardedWriteError::Permit)?;
         *next_start = Instant::now() + self.minimum_interval;
-
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| OzonWriteError::InvalidToken)?;
-        authorization.set_sensitive(true);
+        pacing.mark_request_started(self.minimum_interval);
         let response = self
             .http
             .request(method, format!("{}{path}", self.base_url))
@@ -384,6 +448,7 @@ impl OzonAdsWriteClient {
             .send()
             .await
             .map_err(|_| OzonWriteError::AmbiguousTransport)?;
+        drop(pacing);
         decode_write_response(response).await.map_err(Into::into)
     }
 
@@ -408,12 +473,20 @@ impl OzonAdsWriteClient {
             }))
             .send()
             .await
-            .map_err(|_| OzonWriteError::AmbiguousTransport)?;
+            .map_err(|_| OzonWriteError::TokenTransport)?;
         let status = response.status();
         if !status.is_success() {
-            return Err(classify_status(status));
+            return Err(OzonWriteError::TokenHttp { status });
         }
-        let bytes = read_bounded(response, MAX_TOKEN_BYTES).await?;
+        let bytes = read_bounded(response, MAX_TOKEN_BYTES)
+            .await
+            .map_err(|error| match error {
+                // The token exchange happens before the guarded mutation and
+                // therefore cannot make the marketplace write ambiguous.
+                OzonWriteError::ResponseTooLarge => OzonWriteError::TokenResponseTooLarge,
+                OzonWriteError::AmbiguousTransport => OzonWriteError::TokenTransport,
+                other => other,
+            })?;
         let token: TokenResponse =
             serde_json::from_slice(&bytes).map_err(|_| OzonWriteError::InvalidToken)?;
         if token.access_token.is_empty()

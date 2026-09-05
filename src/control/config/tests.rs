@@ -1,12 +1,9 @@
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
     fs,
     path::PathBuf,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,47 +17,7 @@ use super::*;
 
 static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const TEST_WB_SELLER_SID: &str = "123e4567-e89b-42d3-a456-426614174000";
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct ProcessEnvGuard {
-    previous: Vec<(&'static str, Option<OsString>)>,
-}
-
-impl ProcessEnvGuard {
-    fn isolated(keys: &[&'static str]) -> Self {
-        let previous = keys
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
-        for key in keys {
-            // SAFETY: this module serializes its process-environment test
-            // with `ENV_LOCK`; production code only reads these variables.
-            unsafe { std::env::remove_var(key) };
-        }
-        Self { previous }
-    }
-
-    fn set(&self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) {
-        assert!(self.previous.iter().any(|(known, _)| *known == key));
-        // SAFETY: see `isolated`; the guard restores every touched value.
-        unsafe { std::env::set_var(key, value) };
-    }
-}
-
-impl Drop for ProcessEnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.drain(..) {
-            // SAFETY: see `isolated`; restoration also runs during unwind.
-            unsafe {
-                if let Some(value) = value {
-                    std::env::set_var(key, value);
-                } else {
-                    std::env::remove_var(key);
-                }
-            }
-        }
-    }
-}
+const CONTROL_CONFIG_ENV_CHILD: &str = "MCP_OZON_CONTROL_CONFIG_ENV_CHILD";
 
 struct Fixtures {
     registry: PathBuf,
@@ -81,12 +38,12 @@ impl Fixtures {
                     "id": "manager",
                     "name": "Manager",
                     "role": "manager",
-                    "oidc": { "username": "manager" }
+                    "oidc": { "subject": "manager-subject", "username": "manager" }
                 }, {
                     "id": "approver",
                     "name": "Approver",
                     "role": "finance",
-                    "oidc": { "username": "approver" }
+                    "oidc": { "subject": "approver-subject", "username": "approver" }
                 }],
                 "accounts": [{
                     "id": "ozon_one",
@@ -100,7 +57,9 @@ impl Fixtures {
                         "api_key_env": "UNUSED_API_KEY",
                         "performance": {
                             "client_id_env": "UNUSED_PERF_ID",
-                            "client_secret_env": "UNUSED_PERF_SECRET"
+                            "client_secret_env": "UNUSED_PERF_SECRET",
+                            "control_planner_client_id_sha256": crate::config::credential_sha256("planner-client"),
+                            "control_executor_client_id_sha256": crate::config::credential_sha256("executor-client")
                         }
                     }
                 }]
@@ -145,13 +104,13 @@ impl Fixtures {
                     "id": "manager",
                     "name": "Manager",
                     "role": "manager",
-                    "oidc": { "username": "manager" }
+                    "oidc": { "subject": "manager-subject", "username": "manager" }
                 }, {
                     "id": "approver",
                     "name": "Approver",
                     "role": "finance",
                     "account_ids": ["wb_one"],
-                    "oidc": { "username": "approver" }
+                    "oidc": { "subject": "approver-subject", "username": "approver" }
                 }],
                 "accounts": [{
                     "id": "wb_one",
@@ -212,13 +171,13 @@ impl Fixtures {
                     "id": "manager",
                     "name": "Manager",
                     "role": "manager",
-                    "oidc": { "username": "manager" }
+                    "oidc": { "subject": "manager-subject", "username": "manager" }
                 }, {
                     "id": "approver",
                     "name": "Approver",
                     "role": "finance",
                     "account_ids": ["ozon_one"],
-                    "oidc": { "username": "approver" }
+                    "oidc": { "subject": "approver-subject", "username": "approver" }
                 }],
                 "accounts": [{
                     "id": "ozon_one",
@@ -232,7 +191,9 @@ impl Fixtures {
                         "api_key_env": "UNUSED_API_KEY",
                         "performance": {
                             "client_id_env": "UNUSED_PERF_ID",
-                            "client_secret_env": "UNUSED_PERF_SECRET"
+                            "client_secret_env": "UNUSED_PERF_SECRET",
+                            "control_planner_client_id_sha256": crate::config::credential_sha256("planner-client"),
+                            "control_executor_client_id_sha256": crate::config::credential_sha256("executor-client")
                         }
                     }
                 }]
@@ -328,55 +289,40 @@ fn defaults_are_disabled_and_do_not_request_marketplace_credentials() {
 
 #[test]
 fn process_environment_loader_reads_only_the_control_namespace() {
-    let _lock = ENV_LOCK.lock().unwrap();
-    let fixtures = Fixtures::new();
-    let guard = ProcessEnvGuard::isolated(&[
-        "CONTROL_MCP_ACCESS_CONFIG",
-        "CONTROL_MCP_POLICY",
-        "CONTROL_MCP_ACTOR_ID",
-        "CONTROL_MCP_BIND",
-        "CONTROL_MCP_TRANSPORT",
-        "CONTROL_MCP_MAX_SESSIONS",
-        "CONTROL_MCP_SESSION_IDLE_TIMEOUT_SECONDS",
-        "CONTROL_MCP_AUTH_MODE",
-        "CONTROL_MCP_DEV_ALLOW_NON_LOOPBACK",
-        "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED",
-        "CONTROL_MCP_ALLOW_BROAD_READ_TOKEN",
-        "CONTROL_MCP_WB_ACCOUNT_ID",
-        "CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE",
-        "CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE",
-        "CONTROL_MCP_DATABASE_URL",
-        "CONTROL_MCP_WB_PROXY",
-        "CONTROL_MCP_WB_TIMEOUT_SECONDS",
-    ]);
-    guard.set("CONTROL_MCP_ACCESS_CONFIG", &fixtures.registry);
-    guard.set("CONTROL_MCP_POLICY", &fixtures.policy);
-    guard.set("CONTROL_MCP_ACTOR_ID", "manager");
-
-    let config = ControlAppConfig::from_env().expect("process control environment");
-    assert!(matches!(
-        config.auth,
-        ControlAuthConfig::Dev { ref actor_id } if actor_id == "manager"
-    ));
-    assert_eq!(config.policy.mode, crate::control::ControlMode::Disabled);
-}
-
-#[test]
-fn process_environment_guard_restores_a_preexisting_value() {
-    let _lock = ENV_LOCK.lock().unwrap();
-    let outer = ProcessEnvGuard::isolated(&["CONTROL_MCP_BIND"]);
-    // SAFETY: both guards run while the process-environment test lock is held,
-    // and `outer` restores the original value at the end of the test.
-    unsafe { std::env::set_var("CONTROL_MCP_BIND", "127.0.0.1:8799") };
-    {
-        let inner = ProcessEnvGuard::isolated(&["CONTROL_MCP_BIND"]);
-        inner.set("CONTROL_MCP_BIND", "127.0.0.1:8790");
+    if std::env::var_os(CONTROL_CONFIG_ENV_CHILD).is_some() {
+        let config = ControlAppConfig::from_env().expect("process control environment");
+        assert!(matches!(
+            config.auth,
+            ControlAuthConfig::Dev { ref actor_id } if actor_id == "manager"
+        ));
+        assert_eq!(config.policy.mode, crate::control::ControlMode::Disabled);
+        return;
     }
-    assert_eq!(
-        std::env::var("CONTROL_MCP_BIND").as_deref(),
-        Ok("127.0.0.1:8799")
+
+    let fixtures = Fixtures::new();
+    let mut command = Command::new(std::env::current_exe().expect("test executable is known"));
+    command
+        .args([
+            "--exact",
+            "control::config::tests::process_environment_loader_reads_only_the_control_namespace",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .env(CONTROL_CONFIG_ENV_CHILD, "1")
+        .env("CONTROL_MCP_ACCESS_CONFIG", &fixtures.registry)
+        .env("CONTROL_MCP_POLICY", &fixtures.policy)
+        .env("CONTROL_MCP_ACTOR_ID", "manager");
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let output = command.output().expect("child config test starts");
+    assert!(
+        output.status.success(),
+        "child test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    drop(outer);
 }
 
 #[test]
@@ -487,25 +433,44 @@ fn jwt_values(fixtures: &Fixtures) -> BTreeMap<String, String> {
 
 fn ozon_runtime_values(
     fixtures: &Fixtures,
+    _client_id: &TempCredential,
+    _client_secret: &TempCredential,
+) -> BTreeMap<String, String> {
+    let mut values = jwt_values(fixtures);
+    values.extend([
+        (
+            "CONTROL_MCP_OZON_PLANNER_DATABASE_URL".to_owned(),
+            "postgresql://ozon_control_planner:secret@position-db:5432/ozon_positions".to_owned(),
+        ),
+        (
+            "CONTROL_MCP_OZON_ACCOUNT_ID".to_owned(),
+            "ozon_one".to_owned(),
+        ),
+    ]);
+    values
+}
+
+fn ozon_executor_runtime_values(
+    fixtures: &Fixtures,
     client_id: &TempCredential,
     client_secret: &TempCredential,
 ) -> BTreeMap<String, String> {
     let mut values = jwt_values(fixtures);
     values.extend([
         (
-            "CONTROL_MCP_DATABASE_URL".to_owned(),
-            "postgresql://control_writer:secret@position-db:5432/ozon_positions".to_owned(),
+            "CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL".to_owned(),
+            "postgresql://ozon_control_executor:secret@position-db:5432/ozon_positions".to_owned(),
         ),
         (
             "CONTROL_MCP_OZON_ACCOUNT_ID".to_owned(),
             "ozon_one".to_owned(),
         ),
         (
-            "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE".to_owned(),
+            "CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE".to_owned(),
             client_id.display(),
         ),
         (
-            "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE".to_owned(),
+            "CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE".to_owned(),
             client_secret.display(),
         ),
         (
@@ -517,53 +482,170 @@ fn ozon_runtime_values(
 }
 
 #[test]
-fn ozon_runtime_loads_exact_credentials_and_arms_only_enabled_writes() {
+fn ozon_planner_loads_without_marketplace_credentials_or_write_capability() {
     let fixtures = Fixtures::new();
     fixtures.configure_ozon("plan_only");
-    let client_id = TempCredential::new("ozon-client-id", "write-client");
+    let client_id = TempCredential::new("ozon-client-id", "planner-client");
     let client_secret = TempCredential::new("ozon-client-secret", "write-secret");
-    let mut values = ozon_runtime_values(&fixtures, &client_id, &client_secret);
+    let values = ozon_runtime_values(&fixtures, &client_id, &client_secret);
 
     let config = from(&values).expect("plan-only Ozon runtime");
     let runtime = config.ozon_runtime.expect("Ozon runtime");
     assert_eq!(runtime.account_id, "ozon_one");
-    assert_eq!(runtime.store_id.0, "store_one");
-    assert_eq!(runtime.credentials.client_id, "write-client");
-    assert_eq!(runtime.credentials.client_secret, "write-secret");
+    assert!(runtime.marketplace.is_none());
+    assert_eq!(runtime.database.get_user(), Some("ozon_control_planner"));
+    assert_eq!(
+        runtime.database.get_application_name(),
+        Some("mcp-ozon-control-planner")
+    );
+    assert_eq!(
+        runtime.database.get_connect_timeout(),
+        Some(&crate::postgres::CONNECT_TIMEOUT)
+    );
     assert!(!runtime.writer_enabled);
-    assert_eq!(runtime.request_timeout, Duration::from_secs(20));
     assert!(format!("{runtime:?}").contains("<redacted>"));
+}
 
+#[test]
+fn ozon_planner_and_executor_require_distinct_account_bound_identities() {
+    let fixtures = Fixtures::new();
     fixtures.configure_ozon("enabled");
-    values.insert(
-        "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED".to_owned(),
-        "true".to_owned(),
-    );
-    values.insert(
-        "CONTROL_MCP_OZON_TIMEOUT_SECONDS".to_owned(),
-        "1".to_owned(),
-    );
-    let runtime = from(&values)
-        .expect("enabled Ozon runtime")
+    let planner_id = TempCredential::new("ozon-planner-id", "planner-client");
+    let executor_id = TempCredential::new("ozon-executor-id", "executor-client");
+    let secret = TempCredential::new("ozon-runtime-secret", "runtime-secret");
+
+    let planner_values = ozon_runtime_values(&fixtures, &planner_id, &secret);
+    let planner = from(&planner_values)
+        .unwrap()
         .ozon_runtime
-        .unwrap();
-    assert!(runtime.writer_enabled);
-    assert_eq!(runtime.request_timeout, Duration::from_secs(1));
+        .expect("planner runtime");
+    assert!(planner.marketplace.is_none());
+    assert!(!planner.writer_enabled);
+
+    let executor_values = ozon_executor_runtime_values(&fixtures, &executor_id, &secret);
+    let executor =
+        ControlAppConfig::from_lookup_for_ozon_executor(|key| executor_values.get(key).cloned())
+            .unwrap()
+            .ozon_runtime
+            .expect("executor runtime");
+    let marketplace = executor.marketplace.as_ref().expect("executor marketplace");
+    assert_eq!(marketplace.credentials.client_id, "executor-client");
+    assert_eq!(marketplace.credentials.client_secret, "runtime-secret");
+    assert_eq!(marketplace.store_id.0, "store_one");
+    assert_eq!(marketplace.request_timeout, Duration::from_secs(20));
+    assert_eq!(executor.database.get_user(), Some("ozon_control_executor"));
+    assert_eq!(
+        executor.database.get_application_name(),
+        Some("mcp-ozon-control-executor")
+    );
+
+    let crossed = ozon_executor_runtime_values(&fixtures, &planner_id, &secret);
+    let error = ControlAppConfig::from_lookup_for_ozon_executor(|key| crossed.get(key).cloned())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("executor Performance Client-Id"), "{error}");
+    assert!(!error.contains("planner-client"), "{error}");
+
+    let mut crossed_database = executor_values;
+    crossed_database.insert(
+        "CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL".to_owned(),
+        "postgresql://ozon_control_planner:secret@position-db:5432/ozon_positions".to_owned(),
+    );
+    let error =
+        ControlAppConfig::from_lookup_for_ozon_executor(|key| crossed_database.get(key).cloned())
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("ozon_control_executor"), "{error}");
+}
+
+#[test]
+fn ozon_executor_rejects_a_client_id_bound_to_another_account() {
+    let fixtures = Fixtures::new();
+    fixtures.configure_ozon("enabled");
+
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixtures.registry).unwrap()).unwrap();
+    registry["accounts"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "ozon_two",
+            "organization": "Second account",
+            "marketplace": "ozon",
+            "seller_client_id": "seller-two",
+            "manager_id": "manager",
+            "ozon": {
+                "store_id": "store_two",
+                "client_id_env": "UNUSED_SECOND_CLIENT_ID",
+                "api_key_env": "UNUSED_SECOND_API_KEY",
+                "performance": {
+                    "client_id_env": "UNUSED_SECOND_PERF_ID",
+                    "client_secret_env": "UNUSED_SECOND_PERF_SECRET",
+                    "control_planner_client_id_sha256": crate::config::credential_sha256(
+                        "second-account-control-client"
+                    ),
+                    "control_executor_client_id_sha256": crate::config::credential_sha256(
+                        "second-account-executor-client"
+                    )
+                }
+            }
+        }));
+    fs::write(
+        &fixtures.registry,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let swapped_client_id = TempCredential::new(
+        "ozon-swapped-account-client-id",
+        "second-account-control-client",
+    );
+    let client_secret = TempCredential::new("ozon-bound-client-secret", "write-secret");
+    let values = ozon_executor_runtime_values(&fixtures, &swapped_client_id, &client_secret);
+    let error = ControlAppConfig::from_lookup_for_ozon_executor(|key| values.get(key).cloned())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("не соответствует выбранному Ozon account"),
+        "{error}"
+    );
+}
+
+#[test]
+fn ozon_executor_requires_an_account_bound_client_fingerprint() {
+    let fixtures = Fixtures::new();
+    fixtures.configure_ozon("enabled");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&fixtures.registry).unwrap()).unwrap();
+    registry["accounts"][0]["ozon"]["performance"]
+        .as_object_mut()
+        .unwrap()
+        .remove("control_executor_client_id_sha256");
+    fs::write(
+        &fixtures.registry,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let client_id = TempCredential::new("ozon-unbound-client-id", "planner-client");
+    let client_secret = TempCredential::new("ozon-unbound-client-secret", "write-secret");
+    let values = ozon_executor_runtime_values(&fixtures, &client_id, &client_secret);
+    let error = ControlAppConfig::from_lookup_for_ozon_executor(|key| values.get(key).cloned())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("executor runtime"), "{error}");
 }
 
 #[test]
 fn ozon_runtime_configuration_fails_closed_on_every_external_boundary() {
     let fixtures = Fixtures::new();
     fixtures.configure_ozon("plan_only");
-    let client_id = TempCredential::new("ozon-client-id-errors", "write-client");
+    let client_id = TempCredential::new("ozon-client-id-errors", "planner-client");
     let client_secret = TempCredential::new("ozon-client-secret-errors", "write-secret");
     let valid = ozon_runtime_values(&fixtures, &client_id, &client_secret);
 
-    for key in [
-        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE",
-        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE",
-        "CONTROL_MCP_OZON_PROXY",
-    ] {
+    {
+        let key = "CONTROL_MCP_OZON_PLANNER_DATABASE_URL";
         let mut values = valid.clone();
         values.remove(key);
         assert!(from(&values).is_err(), "missing {key} must fail");
@@ -573,12 +655,56 @@ fn ozon_runtime_configuration_fails_closed_on_every_external_boundary() {
         assert!(from(&values).is_err(), "invalid {key} must fail");
     }
 
-    let mut same_file = valid.clone();
-    same_file.insert(
-        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE".to_owned(),
-        client_id.display(),
-    );
-    assert!(from(&same_file).is_err());
+    for forbidden in [
+        (
+            "CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_ID_FILE",
+            client_id.display(),
+        ),
+        (
+            "CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_SECRET_FILE",
+            client_secret.display(),
+        ),
+        (
+            "CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL",
+            "postgresql://ozon_control_executor:secret@position-db:5432/ozon_positions".to_owned(),
+        ),
+        (
+            "CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE",
+            client_id.display(),
+        ),
+        (
+            "CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE",
+            client_secret.display(),
+        ),
+        (
+            "CONTROL_MCP_OZON_PROXY",
+            "http://ozon-control-egress:3128".to_owned(),
+        ),
+        ("CONTROL_MCP_OZON_TIMEOUT_SECONDS", "20".to_owned()),
+    ] {
+        let mut values = valid.clone();
+        values.insert(forbidden.0.to_owned(), forbidden.1);
+        let error = from(&values).unwrap_err().to_string();
+        assert!(error.contains("credentialless Ozon planner"), "{error}");
+    }
+
+    for database_url in [
+        "postgresql://control_writer:secret@position-db:5432/ozon_positions",
+        "postgresql://ozon_control_executor:secret@position-db:5432/ozon_positions",
+        "postgresql://ozon_control_planner@position-db:5432/ozon_positions",
+        "postgresql://ozon_control_planner:secret@first:5432,second:5432/ozon_positions",
+        "postgresql://ozon_control_planner:secret@/ozon_positions",
+    ] {
+        let mut values = valid.clone();
+        values.insert(
+            "CONTROL_MCP_OZON_PLANNER_DATABASE_URL".to_owned(),
+            database_url.to_owned(),
+        );
+        assert!(
+            from(&values).is_err(),
+            "unsafe planner database URL {database_url} must fail"
+        );
+    }
 
     for timeout in ["0", "31", "not-a-number"] {
         let mut values = valid.clone();
@@ -631,12 +757,12 @@ fn ozon_runtime_configuration_fails_closed_on_every_external_boundary() {
 }
 
 #[test]
-fn ozon_runtime_direct_loader_rejects_auth_scope_binding_and_unreadable_credentials() {
+fn ozon_runtime_direct_loader_rejects_auth_scope_and_marketplace_settings() {
     let fixtures = Fixtures::new();
     fixtures.configure_ozon("plan_only");
     let registry = crate::config::AccessRegistry::load(&fixtures.registry).unwrap();
     let policy = crate::control::policy::ControlPolicy::load(&fixtures.policy, &registry).unwrap();
-    let client_id = TempCredential::new("ozon-direct-client-id", "write-client");
+    let client_id = TempCredential::new("ozon-direct-client-id", "planner-client");
     let client_secret = TempCredential::new("ozon-direct-client-secret", "write-secret");
     let valid = ozon_runtime_values(&fixtures, &client_id, &client_secret);
 
@@ -649,6 +775,7 @@ fn ozon_runtime_direct_loader_rejects_auth_scope_binding_and_unreadable_credenti
             },
             &policy,
             &registry,
+            OzonRuntimeIdentity::Planner,
         )
         .is_err()
     );
@@ -657,16 +784,34 @@ fn ozon_runtime_direct_loader_rejects_auth_scope_binding_and_unreadable_credenti
     let mut wrong_marketplace = registry.clone();
     wrong_marketplace.accounts[0].marketplace = crate::config::Marketplace::Wildberries;
     let mut lookup = |key: &str| valid.get(key).cloned();
-    assert!(load_ozon_runtime(&mut lookup, &auth, &policy, &wrong_marketplace,).is_err());
+    assert!(
+        load_ozon_runtime(
+            &mut lookup,
+            &auth,
+            &policy,
+            &wrong_marketplace,
+            OzonRuntimeIdentity::Planner,
+        )
+        .is_err()
+    );
 
     let mut no_target = policy.clone();
     no_target.actors[0].ozon_campaign_launch_targets.clear();
     let mut lookup = |key: &str| valid.get(key).cloned();
-    assert!(load_ozon_runtime(&mut lookup, &auth, &no_target, &registry,).is_err());
+    assert!(
+        load_ozon_runtime(
+            &mut lookup,
+            &auth,
+            &no_target,
+            &registry,
+            OzonRuntimeIdentity::Planner,
+        )
+        .is_err()
+    );
 
     for key in [
-        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE",
-        "CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE",
+        "CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_ID_FILE",
+        "CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_SECRET_FILE",
     ] {
         let mut unreadable = valid.clone();
         unreadable.insert(
@@ -678,7 +823,16 @@ fn ozon_runtime_direct_loader_rejects_auth_scope_binding_and_unreadable_credenti
                 .to_string(),
         );
         let mut lookup = |name: &str| unreadable.get(name).cloned();
-        assert!(load_ozon_runtime(&mut lookup, &auth, &policy, &registry).is_err());
+        assert!(
+            load_ozon_runtime(
+                &mut lookup,
+                &auth,
+                &policy,
+                &registry,
+                OzonRuntimeIdentity::Planner,
+            )
+            .is_err()
+        );
     }
 }
 

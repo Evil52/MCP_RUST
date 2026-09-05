@@ -32,11 +32,21 @@ pub struct ControlAppConfig {
 #[derive(Clone)]
 pub struct ControlOzonRuntimeConfig {
     pub account_id: String,
+    /// Role-specific PostgreSQL identity. The HTTP planner and the durable
+    /// executor deliberately cannot share database credentials or grants.
+    pub database: PostgresConfig,
+    /// Always false for the credentialless planner. The executor sets it only
+    /// when policy and the explicit process gate both allow marketplace writes.
+    pub writer_enabled: bool,
+    /// Marketplace identity and egress exist only in the executor process. The
+    /// HTTP planner is intentionally incapable of bypassing the DB outbox.
+    pub marketplace: Option<ControlOzonMarketplaceRuntimeConfig>,
+}
+
+#[derive(Clone)]
+pub struct ControlOzonMarketplaceRuntimeConfig {
     pub store_id: StoreId,
     pub credentials: PerformanceCredentials,
-    /// Credentials may be loaded for plan/read-back while the write executor
-    /// remains absent. This is true only when every write gate is enabled.
-    pub writer_enabled: bool,
     pub proxy_url: String,
     pub request_timeout: Duration,
 }
@@ -46,9 +56,19 @@ impl std::fmt::Debug for ControlOzonRuntimeConfig {
         formatter
             .debug_struct("ControlOzonRuntimeConfig")
             .field("account_id", &self.account_id)
+            .field("database", &"<redacted>")
+            .field("writer_enabled", &self.writer_enabled)
+            .field("marketplace_configured", &self.marketplace.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ControlOzonMarketplaceRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ControlOzonMarketplaceRuntimeConfig")
             .field("store_id", &self.store_id)
             .field("credentials", &"<redacted>")
-            .field("writer_enabled", &self.writer_enabled)
             .field("proxy_url", &self.proxy_url)
             .field("request_timeout", &self.request_timeout)
             .finish()

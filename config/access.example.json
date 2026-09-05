@@ -5,13 +5,13 @@
       "id": "admin",
       "name": "Administrator",
       "role": "admin",
-      "oidc": { "username": "admin" }
+      "oidc": { "subject": "replace-with-idp-subject", "username": "admin" }
     },
     {
       "id": "manager",
       "name": "Store manager",
       "role": "manager",
-      "oidc": { "username": "manager" }
+      "oidc": { "subject": "replace-with-another-idp-subject", "username": "manager" }
     }
   ],
   "accounts": [
@@ -27,7 +27,8 @@
         "api_key_env": "EXAMPLE_OZON_API_KEY",
         "performance": {
           "client_id_env": "EXAMPLE_OZON_PERFORMANCE_CLIENT_ID",
-          "client_secret_env": "EXAMPLE_OZON_PERFORMANCE_CLIENT_SECRET"
+          "client_secret_env": "EXAMPLE_OZON_PERFORMANCE_CLIENT_SECRET",
+          "control_executor_client_id_sha256": "68e50ce0a1f7ee377aaa6110d589055696d01f7d547d161e37523a94bf721b51"
         }
       }
     },

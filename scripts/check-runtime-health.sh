@@ -278,8 +278,9 @@ probe_sql() {
     ' 2>/dev/null
 }
 
+probe_status=0
 probe_output="$(
-  probe_sql <<'SQL' || true
+  probe_sql <<'SQL'
 SELECT 'incident|' || account_id || '|' || advert_id || '|' || incident_class
 FROM wb_automation.execution_state
 WHERE incident_class IS NOT NULL;
@@ -293,13 +294,69 @@ SELECT 'cycle_age|' || COALESCE(
 )
 FROM wb_automation.cycles;
 
+SELECT 'ozon_launch_recovery|' || plan.plan_id || '|' || plan.status || '|' ||
+       workflow.action || '|' || GREATEST(
+           0,
+           EXTRACT(EPOCH FROM (
+               now() - COALESCE(plan.operation_started_at,plan.created_at)
+           ))
+       )::bigint::text
+FROM control.ozon_campaign_plans plan
+JOIN control.ozon_campaign_launch_workflows workflow
+  ON workflow.plan_id=plan.plan_id
+WHERE plan.status IN ('creating','adding_products','activating','ambiguous');
+
+SELECT 'ozon_launch_pending|' || plan.plan_id || '|' || plan.status || '|' ||
+       workflow.action || '|' || GREATEST(
+           0,
+           EXTRACT(EPOCH FROM (now() - workflow.requested_at))
+       )::bigint::text
+FROM control.ozon_campaign_plans plan
+JOIN control.ozon_campaign_launch_workflows workflow
+  ON workflow.plan_id=plan.plan_id
+WHERE workflow.requested_at IS NOT NULL
+  AND plan.status IN ('approved','created','products_added');
+
+SELECT 'ozon_launch_failed|' || plan.plan_id || '|' ||
+       COALESCE(plan.campaign_id::text,'none') || '|' ||
+       COALESCE(plan.last_error_class,'unknown')
+FROM control.ozon_campaign_plans plan
+WHERE plan.status='failed' AND plan.campaign_id IS NOT NULL;
+
+SELECT 'ozon_applied_without_guard|' || plan.plan_id || '|' ||
+       COALESCE(plan.campaign_id::text,'none')
+FROM control.ozon_campaign_plans plan
+LEFT JOIN control.ozon_campaign_guards guard ON guard.plan_id=plan.plan_id
+WHERE plan.status='applied' AND guard.plan_id IS NULL;
+
+SELECT 'ozon_guard_state|' || plan_id || '|' || campaign_id::text || '|' ||
+       status || '|' || COALESCE(incident_error_class,stop_reason,'unknown') || '|' ||
+       GREATEST(
+           0,
+           EXTRACT(EPOCH FROM (now() - COALESCE(last_checked_at,created_at)))
+       )::bigint::text
+FROM control.ozon_campaign_guards
+WHERE status IN ('stopping','incident');
+
+SELECT 'ozon_guard_cycle|' || plan_id || '|' || campaign_id::text || '|' ||
+       GREATEST(
+           0,
+           EXTRACT(EPOCH FROM (now() - COALESCE(last_checked_at,created_at)))
+       )::bigint::text
+FROM control.ozon_campaign_guards
+WHERE status='active';
+
 SELECT 'stalled|' || stall_kind || '|' || reference
 FROM daily_reporting.stalled_report_work;
 SQL
-)"
+)" || probe_status=$?
 
+if ((probe_status != 0)); then
+  add_finding "position database health probe failed before returning complete evidence"
+  report_and_exit
+fi
 if [[ -z "$probe_output" ]]; then
-  add_finding "position database did not answer the health probe"
+  add_finding "position database returned no health evidence"
   report_and_exit
 fi
 
@@ -322,6 +379,48 @@ while IFS= read -r row; do
       age="${row#cycle_age|}"
       if [[ "$age" =~ ^[0-9]+$ ]] && ((age > cycle_stale_seconds)); then
         add_finding "WB robot last ran $((age / 60)) minutes ago; the daily spend cap is only enforced while it polls"
+      elif [[ ! "$age" =~ ^[0-9]+$ ]]; then
+        add_finding "WB robot returned an invalid cycle age"
+      fi
+      ;;
+    ozon_launch_recovery\|*)
+      IFS='|' read -r _ plan_id status action age <<<"$row"
+      if [[ ! "$age" =~ ^[0-9]+$ ]]; then
+        add_finding "Ozon launch recovery returned an invalid age: $plan_id/$status/$action"
+      elif ((age > cycle_stale_seconds)); then
+        add_finding "Ozon launch requires readback recovery: $plan_id/$status/$action ($((age / 60)) minutes)"
+      fi
+      ;;
+    ozon_launch_pending\|*)
+      IFS='|' read -r _ plan_id status action age <<<"$row"
+      if [[ ! "$age" =~ ^[0-9]+$ ]]; then
+        add_finding "Ozon launch outbox returned an invalid age: $plan_id/$status/$action"
+      elif ((age > cycle_stale_seconds)); then
+        add_finding "Ozon launch outbox is stalled: $plan_id/$status/$action ($((age / 60)) minutes)"
+      fi
+      ;;
+    ozon_launch_failed\|*)
+      add_finding "Ozon launch failed after obtaining a campaign identity: ${row#ozon_launch_failed|}"
+      ;;
+    ozon_applied_without_guard\|*)
+      add_finding "Ozon applied campaign has no durable spend guard: ${row#ozon_applied_without_guard|}"
+      ;;
+    ozon_guard_state\|*)
+      IFS='|' read -r _ plan_id campaign_id status reason age <<<"$row"
+      if [[ "$status" == incident ]]; then
+        add_finding "Ozon campaign guard is incident-locked: $plan_id/$campaign_id/$reason"
+      elif [[ ! "$age" =~ ^[0-9]+$ ]]; then
+        add_finding "Ozon campaign guard returned an invalid stopping age: $plan_id/$campaign_id"
+      elif ((age > cycle_stale_seconds)); then
+        add_finding "Ozon campaign stop is unresolved: $plan_id/$campaign_id/$reason ($((age / 60)) minutes)"
+      fi
+      ;;
+    ozon_guard_cycle\|*)
+      IFS='|' read -r _ plan_id campaign_id age <<<"$row"
+      if [[ ! "$age" =~ ^[0-9]+$ ]]; then
+        add_finding "Ozon campaign guard returned an invalid cycle age: $plan_id/$campaign_id"
+      elif ((age > cycle_stale_seconds)); then
+        add_finding "Ozon campaign guard is stale: $plan_id/$campaign_id ($((age / 60)) minutes)"
       fi
       ;;
   esac

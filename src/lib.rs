@@ -1,4 +1,4 @@
-#![cfg_attr(not(test), forbid(unsafe_code))]
+#![forbid(unsafe_code)]
 
 pub mod auth;
 pub mod config;

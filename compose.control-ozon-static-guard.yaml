@@ -2,7 +2,7 @@ name: mcp-ozon-furnitura-cpc7
 
 services:
   guard-state-init:
-    image: alpine:3.24
+    image: alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
     command: ["sh", "-c", "chown 10001:10001 /state && chmod 700 /state"]
     user: "0:0"
     volumes:
@@ -33,19 +33,17 @@ services:
       CONTROL_MCP_JWT_AUDIENCE: https://static-guard.invalid/mcp
       CONTROL_MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
       CONTROL_MCP_POLICY: /etc/mcp-ozon/control-policy.json
-      # Parsed by the shared fail-closed loader; static guard mode does not
-      # connect to this address or use the plan database.
-      CONTROL_MCP_DATABASE_URL: postgresql://control_writer:unused@127.0.0.1:5432/unused
       CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: "true"
       CONTROL_MCP_OZON_ACCOUNT_ID: furnitura_dlya_doma
-      CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE: /run/secrets/ozon-performance-client-id
-      CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE: /run/secrets/ozon-performance-client-secret
+      CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL: postgresql://ozon_control_executor:${OZON_CONTROL_EXECUTOR_DB_PASSWORD:?OZON_CONTROL_EXECUTOR_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE: /run/secrets/ozon-executor-performance-client-id
+      CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE: /run/secrets/ozon-executor-performance-client-secret
       CONTROL_MCP_OZON_PROXY: http://control-ozon-write-egress:3130
       CONTROL_MCP_OZON_TIMEOUT_SECONDS: "20"
       CONTROL_MCP_OZON_STATIC_GUARDS_FILE: /etc/mcp-ozon/static-guards.json
       CONTROL_MCP_OZON_STATIC_GUARD_STATE_FILE: /var/lib/mcp-ozon-guard/state.json
       CONTROL_MCP_OZON_POSITION_DATABASE_URL: postgresql://position_reader:${POSITION_READER_DB_PASSWORD:?POSITION_READER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
-      RUST_LOG: ozon_campaign_guard=info
+      RUST_LOG: mcp_ozon::control::ozon=info
     volumes:
       - type: bind
         source: ./config/access.json
@@ -63,8 +61,8 @@ services:
         source: guard-state
         target: /var/lib/mcp-ozon-guard
     secrets:
-      - ozon-performance-client-id
-      - ozon-performance-client-secret
+      - ozon-executor-performance-client-id
+      - ozon-executor-performance-client-secret
     networks:
       - control-ozon-write-egress-internal
       - position-internal
@@ -74,6 +72,12 @@ services:
       control-ozon-write-egress:
         condition: service_healthy
     restart: unless-stopped
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
     mem_limit: 128m
     cpus: 0.25
     pids_limit: 64
@@ -83,9 +87,11 @@ services:
     tmpfs:
       - /tmp:size=8m,mode=1777
     healthcheck:
-      test: ["CMD-SHELL", "pidof ozon-campaign-guard >/dev/null"]
+      test:
+        - CMD-SHELL
+        - "set -- $$(pidof ozon-campaign-guard) && test \"$$#\" -eq 1 && test \"$$(cat /var/lib/mcp-ozon-guard/.state.json.lease)\" = \"pid=$$1\" && test \"$$(stat -c %a /var/lib/mcp-ozon-guard)\" = 700 && test \"$$(stat -c %a /var/lib/mcp-ozon-guard/.state.json.lease)\" = 600 && exec /usr/local/bin/ozon-campaign-guard healthcheck"
       interval: 15s
-      timeout: 3s
+      timeout: 8s
       retries: 3
       start_period: 10s
 
@@ -100,6 +106,12 @@ services:
       - control-ozon-write-egress-internal
       - outbound
     restart: unless-stopped
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m
+        max-file: "2"
     mem_limit: 256m
     cpus: 0.25
     pids_limit: 32
@@ -134,7 +146,7 @@ volumes:
     name: ${CONTROL_MCP_OZON_GUARD_STATE_VOLUME:-mcp-ozon-furnitura-cpc7-guard-state}
 
 secrets:
-  ozon-performance-client-id:
-    file: ${CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE_HOST:-/Users/user/.local/share/mcp-ozon-runtime/report-credentials-ozon7-20260824/OZON_PERFORMANCE_CLIENT_ID}
-  ozon-performance-client-secret:
-    file: ${CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE_HOST:-/Users/user/.local/share/mcp-ozon-runtime/report-credentials-ozon7-20260824/OZON_PERFORMANCE_CLIENT_SECRET}
+  ozon-executor-performance-client-id:
+    file: ${CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE_HOST:?dedicated Ozon workflow executor Performance Client-Id file is required}
+  ozon-executor-performance-client-secret:
+    file: ${CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE_HOST:?dedicated Ozon workflow executor Performance Client-Secret file is required}

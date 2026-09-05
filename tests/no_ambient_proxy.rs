@@ -8,16 +8,16 @@
 //! answers it chooses the signing keys this process will trust and can mint
 //! tokens for any actor. Both clients therefore call `.no_proxy()`.
 //!
-//! This lives in its own test binary on purpose. The test has to mutate
-//! process-wide environment variables, and doing that inside the shared library
-//! test binary would intermittently reroute the loopback HTTP that other tests
-//! depend on. A separate binary is a separate process, so the mutation cannot
-//! reach them.
+//! The proxy-enabled request path runs in a child process. Mutating libc's
+//! process-wide environment is not sound once another thread may consult it;
+//! configuring a fresh child through `Command::env` gives the test an isolated
+//! environment without mutating this test harness.
 
 use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    process::Command,
     sync::mpsc,
     thread,
     time::Duration,
@@ -35,6 +35,10 @@ use mcp_ozon::{
     },
 };
 use serde_json::json;
+
+const CHILD_MARKER: &str = "MCP_OZON_NO_AMBIENT_PROXY_CHILD";
+const CHILD_OZON_URL: &str = "MCP_OZON_NO_AMBIENT_PROXY_OZON_URL";
+const CHILD_JWKS_URL: &str = "MCP_OZON_NO_AMBIENT_PROXY_JWKS_URL";
 
 /// Accepts up to `accepts` connections, answers each with a small JSON body and
 /// reports every request line it saw.
@@ -83,10 +87,6 @@ fn read_request_line(stream: &TcpStream) -> String {
     let mut body = vec![0_u8; content_length];
     let _ = reader.read_exact(&mut body);
     first.trim_end().to_owned()
-}
-
-fn saw_request(receiver: &mpsc::Receiver<String>) -> bool {
-    receiver.recv_timeout(Duration::from_millis(1_500)).is_ok()
 }
 
 fn stores() -> BTreeMap<StoreId, StoreCredentials> {
@@ -170,7 +170,12 @@ fn registry() -> RegistrySource {
         &path,
         serde_json::to_vec_pretty(&json!({
             "version": 1,
-            "actors": [{"id": "admin", "name": "Administrator", "role": "admin"}],
+            "actors": [{
+                "id": "admin",
+                "name": "Administrator",
+                "role": "admin",
+                "oidc": {"subject": "proxy-test-admin", "username": "admin"}
+            }],
             "accounts": [],
         }))
         .expect("registry fixture serializes"),
@@ -208,100 +213,105 @@ fn header_only_bearer() -> HeaderMap {
     headers
 }
 
-/// Removes the proxy variables on the way out, including while a panic unwinds,
-/// so one failed assertion cannot leave the rest of the binary proxied.
-struct AmbientProxy;
-
-impl AmbientProxy {
-    fn set(url: &str) -> Self {
-        // SAFETY: this binary contains exactly one test, so no other thread is
-        // reading the environment while it is being modified.
-        unsafe {
-            std::env::set_var("HTTP_PROXY", url);
-            std::env::set_var("ALL_PROXY", url);
-        }
-        Self
-    }
-}
-
-impl Drop for AmbientProxy {
-    fn drop(&mut self) {
-        // SAFETY: as above.
-        unsafe {
-            std::env::remove_var("HTTP_PROXY");
-            std::env::remove_var("ALL_PROXY");
-        }
-    }
-}
-
-/// One test function, so the environment mutation is never concurrent with
-/// another test in this binary.
 #[tokio::test]
 async fn no_outbound_client_follows_an_ambient_http_proxy() {
+    if std::env::var_os(CHILD_MARKER).is_some() {
+        let ozon_url = std::env::var(CHILD_OZON_URL).expect("child Ozon URL is present");
+        let jwks_url = std::env::var(CHILD_JWKS_URL).expect("child JWKS URL is present");
+
+        // Control. Without this, the parent assertions would pass vacuously the
+        // moment the HTTP stack stopped honouring proxy variables altogether.
+        let unprotected = reqwest::Client::builder()
+            .build()
+            .expect("a default client builds");
+        let _ = unprotected
+            .post(format!("{ozon_url}/v1/rating/summary"))
+            .json(&json!({}))
+            .send()
+            .await;
+
+        let client = OzonClient::new(ozon_url, Duration::from_secs(3), stores())
+            .expect("the Ozon client builds");
+        let transport = OzonClientReportTransport::new(client, StoreId::from("shop"));
+        let _ = transport
+            .post(
+                product_page_request("/v4/product/info/stocks", None)
+                    .expect("the read-only report request builds"),
+            )
+            .await;
+
+        // Drive the production report adapter through its local admission retry
+        // as well as the successful direct request above.
+        exercise_real_report_transport_overload().await;
+
+        let authenticator = JwtAuthenticator::new(jwt_config(jwks_url), registry())
+            .expect("the authenticator builds");
+        let _ = authenticator.authenticate(&header_only_bearer()).await;
+        return;
+    }
+
     let (proxy_url, proxy_requests) = mock_http(3);
     let (ozon_url, ozon_requests) = mock_http(1);
     let (jwks_url, jwks_requests) = mock_http(1);
 
-    let _ambient_proxy = AmbientProxy::set(&proxy_url);
+    let mut command = Command::new(std::env::current_exe().expect("test executable is known"));
+    command
+        .args([
+            "--exact",
+            "no_outbound_client_follows_an_ambient_http_proxy",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .env(CHILD_MARKER, "1")
+        .env(CHILD_OZON_URL, &ozon_url)
+        .env(CHILD_JWKS_URL, &jwks_url)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("ALL_PROXY", &proxy_url);
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let output = command.output().expect("child test starts");
+    assert!(
+        output.status.success(),
+        "child test failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    // Control. Without this, the test would pass vacuously the moment the HTTP
-    // stack stopped honouring proxy variables at all — the assertions below
-    // would hold for the wrong reason and the invariant would be unguarded.
-    let unprotected = reqwest::Client::builder()
-        .build()
-        .expect("a default client builds");
-    let _ = unprotected
-        .post(format!("{ozon_url}/v1/rating/summary"))
-        .json(&json!({}))
-        .send()
-        .await;
+    let proxy_request = proxy_requests
+        .recv_timeout(Duration::from_millis(1_500))
+        .expect("an unprotected client must reach the ambient proxy");
     assert!(
-        saw_request(&proxy_requests),
-        "a client that has not opted out must reach the proxy; if this fails the \
-         HTTP stack no longer honours HTTP_PROXY/ALL_PROXY and the assertions \
-         below prove nothing — fix this test before trusting them"
-    );
-    assert!(
-        !saw_request(&ozon_requests),
-        "the control request must have been diverted to the proxy"
+        proxy_request.contains("/v1/rating/summary"),
+        "the proxy control must be the deliberately unprotected request: {proxy_request}"
     );
 
-    // The Ozon client must reach the marketplace directly, credentials and all.
-    let client = OzonClient::new(ozon_url, Duration::from_secs(3), stores())
-        .expect("the Ozon client builds");
-    let transport = OzonClientReportTransport::new(client, StoreId::from("shop"));
-    let _ = transport
-        .post(
-            product_page_request("/v4/product/info/stocks", None)
-                .expect("the read-only report request builds"),
-        )
-        .await;
+    let ozon_request = ozon_requests
+        .recv_timeout(Duration::from_millis(1_500))
+        .expect("the Ozon client must contact the marketplace directly");
     assert!(
-        saw_request(&ozon_requests),
-        "the Ozon client must contact the marketplace directly"
+        ozon_request.contains("/v4/product/info/stocks"),
+        "the unprotected control must not consume the direct Ozon socket: {ozon_request}"
     );
     assert!(
-        !saw_request(&proxy_requests),
+        proxy_requests
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
         "Ozon requests carry Client-Id and Api-Key and must never traverse an ambient proxy"
     );
 
-    // Drive the production report adapter through the local admission-control
-    // retry as well as the successful request above. This is deliberately a
-    // real OzonClient: the generic retry has a distinct production coverage
-    // instantiation that policy-only unit tests cannot execute.
-    exercise_real_report_transport_overload().await;
-
-    // The JWKS fetch is a trust anchor: whoever answers it decides which keys
-    // this process accepts, so it must not be interceptable either.
-    let authenticator =
-        JwtAuthenticator::new(jwt_config(jwks_url), registry()).expect("the authenticator builds");
-    let _ = authenticator.authenticate(&header_only_bearer()).await;
+    let jwks_request = jwks_requests
+        .recv_timeout(Duration::from_millis(1_500))
+        .expect("the JWKS fetch must contact the issuer directly");
     assert!(
-        saw_request(&jwks_requests),
-        "the JWKS fetch must contact the issuer directly"
+        jwks_request.starts_with("GET "),
+        "the direct JWKS request must be a GET: {jwks_request}"
     );
     assert!(
-        !saw_request(&proxy_requests),
+        proxy_requests
+            .recv_timeout(Duration::from_millis(300))
+            .is_err(),
         "an ambient proxy must never be able to substitute JWT signing keys"
     );
 }

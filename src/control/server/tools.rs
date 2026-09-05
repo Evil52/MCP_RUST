@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use chrono::Utc;
 use rmcp::{
     Json,
@@ -12,10 +10,7 @@ use serde_json::Value;
 use crate::{
     auth::JwtAuthenticator,
     control::{
-        ozon::{
-            OzonCampaignLaunchManifest, OzonGuardedWriteError, OzonLaunchStatus,
-            prepare_campaign_launch_manifest,
-        },
+        ozon::{OzonCampaignLaunchManifest, prepare_campaign_launch_manifest},
         plan::{WbActionQuota, WbApplyContext, WbControlPlan, WbPlanFinish, WbPlanStatus},
         policy::ControlMode,
         wb::{
@@ -24,8 +19,14 @@ use crate::{
     },
 };
 
+#[cfg(test)]
+pub(super) use crate::control::ozon::{
+    ensure_ozon_sku_not_running, exact_ozon_launch_readback, find_ozon_campaign_by_title,
+    positive_json_u64,
+};
+
 use super::{
-    ACCESS_DENIED, ControlMcp, OzonControlServices, WbControlServices,
+    ACCESS_DENIED, ControlMcp, WbControlServices,
     authorization::{
         ControlIdentity, authorize_ozon_plan_apply, authorize_ozon_plan_approval,
         authorize_plan_account_access, authorize_plan_apply, authorize_plan_approval,
@@ -39,14 +40,8 @@ use super::{
     },
     presentation::{
         WritePermitFailure, guarded_write_permit_error_class, ozon_plan_result,
-        ozon_plan_store_error, ozon_write_failure, plan_result, plan_store_error,
-        write_failure_finish,
+        ozon_plan_store_error, plan_result, plan_store_error, write_failure_finish,
     },
-};
-
-use crate::{
-    config::StoreId,
-    ozon_performance::{CampaignProductsQuery, CampaignsQuery},
 };
 
 impl ControlMcp {
@@ -109,15 +104,13 @@ impl ControlMcp {
     ) -> Result<Json<ControlStatusResult>, String> {
         let (_registry, actor) = self.access_context(&identity)?;
         let actor_id = actor.id;
-        let runtime_ready = self.wb.is_some() || self.ozon.is_some();
+        // Ozon writes are deliberately owned by the separate durable guard
+        // runtime. This process can report only its local WB executor; merely
+        // having Ozon read credentials must never be advertised as a writer.
         let writer_ready = self
             .wb
             .as_ref()
-            .is_some_and(|services| services.writer.is_some())
-            || self
-                .ozon
-                .as_ref()
-                .is_some_and(|services| services.writer.is_some());
+            .is_some_and(|services| services.writer.is_some());
         Ok(Json(ControlStatusResult {
             explicit_policy_binding: self.policy.actor_policy(&actor_id).is_some(),
             actor_id,
@@ -127,8 +120,8 @@ impl ControlMcp {
             mode: self.policy.mode,
             write_executor_configured: writer_ready && self.policy.mode == ControlMode::Enabled,
             runtime_gates_required: true,
-            credentials_loaded: runtime_ready,
-            marketplace_egress_enabled: runtime_ready,
+            credentials_loaded: self.wb.is_some(),
+            marketplace_egress_enabled: self.wb.is_some(),
             persistence_configured: self.wb.is_some() || self.ozon.is_some(),
         }))
     }
@@ -309,8 +302,9 @@ impl ControlMcp {
         }
     }
 
-    /// Persists one immutable, single-SKU Ozon launch plan after a live
-    /// duplicate-campaign preflight. It performs no marketplace mutation.
+    /// Persists one immutable, single-SKU Ozon launch plan. The credentialless
+    /// planner performs no marketplace I/O; the executor owns the final live
+    /// preflight immediately before the durable write marker.
     #[tool(
         name = "ozon_performance_prepare_campaign_launch",
         annotations(
@@ -318,7 +312,7 @@ impl ControlMcp {
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = false,
-            open_world_hint = true
+            open_world_hint = false
         )
     )]
     pub(super) async fn prepare_ozon_campaign_launch(
@@ -358,8 +352,6 @@ impl ControlMcp {
             ));
         }
         let services = self.ozon_services(&input.spec.account_id)?;
-        ensure_ozon_sku_not_running(&services.reader, &services.store_id, input.spec.skus[0])
-            .await?;
         let manifest = match prepare_campaign_launch_manifest(
             &actor.id,
             self.policy.version,
@@ -428,16 +420,16 @@ impl ControlMcp {
         Ok(Json(ozon_plan_result(&plan)))
     }
 
-    /// Applies one approved Ozon launch plan as create -> products -> activate.
-    /// Every POST has a fresh database permit and is never retried.
+    /// Durably requests execution of an approved Ozon launch plan. The
+    /// independent consumer owns every marketplace POST and recovery readback.
     #[tool(
         name = "ozon_performance_apply_campaign_launch",
         annotations(
             title = "Запустить кампанию Ozon",
             read_only_hint = false,
             destructive_hint = true,
-            idempotent_hint = false,
-            open_world_hint = true
+            idempotent_hint = true,
+            open_world_hint = false
         )
     )]
     pub(super) async fn apply_ozon_campaign_launch(
@@ -452,9 +444,6 @@ impl ControlMcp {
         let Some(services) = self.ozon.as_ref() else {
             return Err("CONTROL_DISABLED: Ozon runtime не настроен".to_owned());
         };
-        let Some(writer) = services.writer.as_ref() else {
-            return Err("CONTROL_DISABLED: Ozon writer не вооружён".to_owned());
-        };
         let plan = services
             .plans
             .load(&input.plan_id)
@@ -464,218 +453,16 @@ impl ControlMcp {
         if plan.plan_digest != input.plan_digest {
             return Err("CONTROL_PLAN_CHANGED".to_owned());
         }
-        ensure_ozon_sku_not_running(&services.reader, &services.store_id, plan.sku).await?;
-        let plan = services
+        let queued = services
             .plans
-            .claim_create(&input.plan_id, &actor.id, &input.plan_digest)
+            .enqueue_launch(&input.plan_id, &actor.id, &input.plan_digest)
             .await
             .map_err(ozon_plan_store_error)?;
-
-        let plans = Arc::clone(&services.plans);
-        let reader = Arc::clone(&services.reader);
-        let store = services.store_id.clone();
-        let plan_id = input.plan_id.clone();
-        let actor_id = actor.id.clone();
-        let digest = input.plan_digest.clone();
-        let sku = plan.sku;
-        let create = writer
-            .create_campaign_with_permit(&plan.manifest.create_request, move || async move {
-                plans
-                    .revalidate_write_permit(
-                        &plan_id,
-                        &actor_id,
-                        &digest,
-                        OzonLaunchStatus::Creating,
-                    )
-                    .await
-                    .map_err(ozon_plan_store_error)?;
-                ensure_ozon_sku_not_running(&reader, &store, sku).await
-            })
-            .await;
-        let campaign_id = match create {
-            Ok(campaign_id) => campaign_id,
-            Err(error) => {
-                return finish_ozon_write_error(
-                    services,
-                    &input,
-                    &actor.id,
-                    OzonLaunchStatus::Creating,
-                    "create",
-                    error,
-                )
-                .await;
-            }
-        };
-        services
-            .plans
-            .transition(
-                &input.plan_id,
-                &actor.id,
-                &input.plan_digest,
-                OzonLaunchStatus::Creating,
-                OzonLaunchStatus::Created,
-                Some(campaign_id),
-                None,
-                None,
-                false,
-            )
-            .await
-            .map_err(ozon_plan_store_error)?;
-        let plan = services
-            .plans
-            .transition(
-                &input.plan_id,
-                &actor.id,
-                &input.plan_digest,
-                OzonLaunchStatus::Created,
-                OzonLaunchStatus::AddingProducts,
-                None,
-                None,
-                None,
-                false,
-            )
-            .await
-            .map_err(ozon_plan_store_error)?;
-        let plans = Arc::clone(&services.plans);
-        let plan_id = input.plan_id.clone();
-        let actor_id = actor.id.clone();
-        let digest = input.plan_digest.clone();
-        let products = writer
-            .add_products_with_permit(
-                campaign_id,
-                plan.manifest.create_request.product_autopilot_strategy,
-                &plan.manifest.products_request,
-                move || async move {
-                    plans
-                        .revalidate_write_permit(
-                            &plan_id,
-                            &actor_id,
-                            &digest,
-                            OzonLaunchStatus::AddingProducts,
-                        )
-                        .await
-                        .map_err(ozon_plan_store_error)
-                },
-            )
-            .await;
-        if let Err(error) = products {
-            return finish_ozon_write_error(
-                services,
-                &input,
-                &actor.id,
-                OzonLaunchStatus::AddingProducts,
-                "products",
-                error,
-            )
-            .await;
-        }
-        services
-            .plans
-            .transition(
-                &input.plan_id,
-                &actor.id,
-                &input.plan_digest,
-                OzonLaunchStatus::AddingProducts,
-                OzonLaunchStatus::ProductsAdded,
-                None,
-                None,
-                None,
-                false,
-            )
-            .await
-            .map_err(ozon_plan_store_error)?;
-        services
-            .plans
-            .transition(
-                &input.plan_id,
-                &actor.id,
-                &input.plan_digest,
-                OzonLaunchStatus::ProductsAdded,
-                OzonLaunchStatus::Activating,
-                None,
-                None,
-                None,
-                false,
-            )
-            .await
-            .map_err(ozon_plan_store_error)?;
-        let plans = Arc::clone(&services.plans);
-        let plan_id = input.plan_id.clone();
-        let actor_id = actor.id.clone();
-        let digest = input.plan_digest.clone();
-        let activate = writer
-            .activate_campaign_with_permit(campaign_id, move || async move {
-                plans
-                    .revalidate_write_permit(
-                        &plan_id,
-                        &actor_id,
-                        &digest,
-                        OzonLaunchStatus::Activating,
-                    )
-                    .await
-                    .map_err(ozon_plan_store_error)
-            })
-            .await;
-        if let Err(error) = activate {
-            return finish_ozon_write_error(
-                services,
-                &input,
-                &actor.id,
-                OzonLaunchStatus::Activating,
-                "activate",
-                error,
-            )
-            .await;
-        }
-        let readback = exact_ozon_launch_readback(
-            &services.reader,
-            &services.store_id,
-            campaign_id,
-            plan.sku,
-            &plan.manifest.create_request.title,
-            plan.manifest.spec.initial_cpc_bid_microrubles,
-        )
-        .await;
-        let readback = match readback {
-            Ok(readback) => readback,
-            Err(error) => {
-                services
-                    .plans
-                    .transition(
-                        &input.plan_id,
-                        &actor.id,
-                        &input.plan_digest,
-                        OzonLaunchStatus::Activating,
-                        OzonLaunchStatus::Ambiguous,
-                        Some(campaign_id),
-                        Some("activation_readback_unavailable"),
-                        None,
-                        false,
-                    )
-                    .await
-                    .map_err(ozon_plan_store_error)?;
-                return Err(error);
-            }
-        };
-        let plan = services
-            .plans
-            .transition(
-                &input.plan_id,
-                &actor.id,
-                &input.plan_digest,
-                OzonLaunchStatus::Activating,
-                OzonLaunchStatus::Applied,
-                None,
-                None,
-                Some(&readback),
-                false,
-            )
-            .await
-            .map_err(ozon_plan_store_error)?;
-        Ok(Json(ozon_plan_result(&plan)))
+        Ok(Json(ozon_plan_result(&queued)))
     }
 
-    /// Performs read-back only. It never repeats any marketplace mutation.
+    /// Reads the durable recovery status. The independent consumer performs
+    /// every readback; this tool never claims workflow ownership.
     #[tool(
         name = "ozon_performance_reconcile_campaign_launch",
         annotations(
@@ -683,7 +470,7 @@ impl ControlMcp {
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
-            open_world_hint = true
+            open_world_hint = false
         )
     )]
     pub(super) async fn reconcile_ozon_campaign_launch(
@@ -710,47 +497,6 @@ impl ControlMcp {
         if actor.id != plan.actor_id || !actor.can_access_account(account) {
             return Err(format!("{ACCESS_DENIED}: Ozon plan вне actor scope"));
         }
-        if plan.status == OzonLaunchStatus::Applied {
-            return Ok(Json(ozon_plan_result(&plan)));
-        }
-        if plan.status != OzonLaunchStatus::Ambiguous {
-            return Err("CONTROL_PLAN_NOT_RECONCILABLE".to_owned());
-        }
-        let campaign_id = match plan.campaign_id {
-            Some(campaign_id) => campaign_id,
-            None => {
-                find_ozon_campaign_by_title(
-                    &services.reader,
-                    &services.store_id,
-                    &plan.manifest.spec.title,
-                )
-                .await?
-            }
-        };
-        let readback = exact_ozon_launch_readback(
-            &services.reader,
-            &services.store_id,
-            campaign_id,
-            plan.sku,
-            &plan.manifest.spec.title,
-            plan.manifest.spec.initial_cpc_bid_microrubles,
-        )
-        .await?;
-        let plan = services
-            .plans
-            .transition(
-                &plan.plan_id,
-                &actor.id,
-                &plan.plan_digest,
-                OzonLaunchStatus::Ambiguous,
-                OzonLaunchStatus::Applied,
-                Some(campaign_id),
-                None,
-                Some(&readback),
-                false,
-            )
-            .await
-            .map_err(ozon_plan_store_error)?;
         Ok(Json(ozon_plan_result(&plan)))
     }
 
@@ -1200,236 +946,4 @@ async fn load_plan_result(
         .await
         .map_err(plan_store_error)?;
     Ok(Json(plan_result(&plan)))
-}
-
-async fn finish_ozon_write_error(
-    services: &OzonControlServices,
-    input: &ApplyOzonCampaignLaunchInput,
-    actor_id: &str,
-    from: OzonLaunchStatus,
-    operation: &'static str,
-    error: OzonGuardedWriteError<String>,
-) -> Result<Json<OzonCampaignPlanResult>, String> {
-    let (status, error_class) = match error {
-        OzonGuardedWriteError::Permit(_) => (OzonLaunchStatus::Failed, "ozon_write_permit_denied"),
-        OzonGuardedWriteError::Write(error) => ozon_write_failure(error.kind(), operation),
-    };
-    let plan = services
-        .plans
-        .transition(
-            &input.plan_id,
-            actor_id,
-            &input.plan_digest,
-            from,
-            status,
-            None,
-            Some(error_class),
-            None,
-            false,
-        )
-        .await
-        .map_err(ozon_plan_store_error)?;
-    Ok(Json(ozon_plan_result(&plan)))
-}
-
-pub(super) async fn ensure_ozon_sku_not_running(
-    reader: &crate::ozon_performance::PerformanceClient,
-    store: &StoreId,
-    sku: u64,
-) -> Result<(), String> {
-    let mut page = 1_u32;
-    let mut visited = 0_usize;
-    loop {
-        let response = match reader
-            .campaigns(
-                store,
-                CampaignsQuery {
-                    campaign_ids: Vec::new(),
-                    adv_object_type: Some("SKU"),
-                    state: Some("CAMPAIGN_STATE_RUNNING"),
-                    page,
-                    page_size: 100,
-                },
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return Err(format!("CONTROL_PREFLIGHT_FAILED: {error}")),
-        };
-        let Some(campaigns) = response.get("list").and_then(Value::as_array) else {
-            return Err("CONTROL_PREFLIGHT_FAILED: invalid campaign list".to_owned());
-        };
-        for campaign in campaigns {
-            let Some(campaign_id) = positive_json_u64(campaign.get("id")) else {
-                return Err("CONTROL_PREFLIGHT_FAILED: invalid campaign id".to_owned());
-            };
-            visited = visited.saturating_add(1);
-            if visited > 1_000 {
-                return Err("CONTROL_PREFLIGHT_FAILED: campaign bound exceeded".to_owned());
-            }
-            let products = match reader
-                .campaign_products(
-                    store,
-                    campaign_id,
-                    CampaignProductsQuery {
-                        page: 1,
-                        page_size: 100,
-                    },
-                )
-                .await
-            {
-                Ok(products) => products,
-                Err(error) => return Err(format!("CONTROL_PREFLIGHT_FAILED: {error}")),
-            };
-            let Some(rows) = products.get("products").and_then(Value::as_array) else {
-                return Err("CONTROL_PREFLIGHT_FAILED: invalid products list".to_owned());
-            };
-            if rows
-                .iter()
-                .any(|product| positive_json_u64(product.get("sku")) == Some(sku))
-            {
-                return Err(format!(
-                    "CONTROL_PRECONDITION_CHANGED: SKU {sku} уже участвует в running campaign {campaign_id}"
-                ));
-            }
-            if rows.len() == 100 {
-                return Err(
-                    "CONTROL_PREFLIGHT_FAILED: campaign products require unbounded pagination"
-                        .to_owned(),
-                );
-            }
-        }
-        if campaigns.len() < 100 {
-            return Ok(());
-        }
-        page = page.saturating_add(1);
-    }
-}
-
-pub(super) async fn find_ozon_campaign_by_title(
-    reader: &crate::ozon_performance::PerformanceClient,
-    store: &StoreId,
-    title: &str,
-) -> Result<u64, String> {
-    let mut matches = Vec::new();
-    for page in 1..=100_u32 {
-        let response = match reader
-            .campaigns(
-                store,
-                CampaignsQuery {
-                    campaign_ids: Vec::new(),
-                    adv_object_type: Some("SKU"),
-                    state: None,
-                    page,
-                    page_size: 100,
-                },
-            )
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => return Err(format!("CONTROL_RECONCILIATION_FAILED: {error}")),
-        };
-        let Some(campaigns) = response.get("list").and_then(Value::as_array) else {
-            return Err("CONTROL_RECONCILIATION_FAILED: invalid campaign list".to_owned());
-        };
-        for campaign in campaigns {
-            if campaign.get("title").and_then(Value::as_str) == Some(title) {
-                let Some(campaign_id) = positive_json_u64(campaign.get("id")) else {
-                    return Err("CONTROL_RECONCILIATION_FAILED: invalid campaign id".to_owned());
-                };
-                matches.push(campaign_id);
-            }
-        }
-        if campaigns.len() < 100 {
-            break;
-        }
-    }
-    match matches.as_slice() {
-        [campaign_id] => Ok(*campaign_id),
-        [] => Err("CONTROL_RECONCILIATION_FAILED: campaign not found".to_owned()),
-        _ => Err("CONTROL_RECONCILIATION_FAILED: duplicate exact title".to_owned()),
-    }
-}
-
-pub(super) async fn exact_ozon_launch_readback(
-    reader: &crate::ozon_performance::PerformanceClient,
-    store: &StoreId,
-    campaign_id: u64,
-    sku: u64,
-    expected_title: &str,
-    expected_bid: u64,
-) -> Result<Value, String> {
-    let response = match reader
-        .campaigns(
-            store,
-            CampaignsQuery {
-                campaign_ids: vec![campaign_id],
-                adv_object_type: Some("SKU"),
-                state: None,
-                page: 1,
-                page_size: 10,
-            },
-        )
-        .await
-    {
-        Ok(response) => response,
-        Err(error) => return Err(format!("CONTROL_RECONCILIATION_FAILED: {error}")),
-    };
-    let Some(campaigns) = response.get("list").and_then(Value::as_array) else {
-        return Err("CONTROL_RECONCILIATION_FAILED: invalid campaign list".to_owned());
-    };
-    let Some(campaign) = campaigns
-        .iter()
-        .find(|campaign| positive_json_u64(campaign.get("id")) == Some(campaign_id))
-    else {
-        return Err("CONTROL_RECONCILIATION_FAILED: campaign missing".to_owned());
-    };
-    let Some(title) = campaign.get("title").and_then(Value::as_str) else {
-        return Err("CONTROL_RECONCILIATION_FAILED: title missing".to_owned());
-    };
-    let Some(state) = campaign.get("state").and_then(Value::as_str) else {
-        return Err("CONTROL_RECONCILIATION_FAILED: state missing".to_owned());
-    };
-    if title != expected_title || state != "CAMPAIGN_STATE_RUNNING" {
-        return Err("CONTROL_RECONCILIATION_FAILED: exact campaign state not proven".to_owned());
-    }
-    let products = match reader
-        .campaign_products(
-            store,
-            campaign_id,
-            CampaignProductsQuery {
-                page: 1,
-                page_size: 100,
-            },
-        )
-        .await
-    {
-        Ok(products) => products,
-        Err(error) => return Err(format!("CONTROL_RECONCILIATION_FAILED: {error}")),
-    };
-    let Some(rows) = products.get("products").and_then(Value::as_array) else {
-        return Err("CONTROL_RECONCILIATION_FAILED: invalid products list".to_owned());
-    };
-    if rows.len() != 1
-        || positive_json_u64(rows[0].get("sku")) != Some(sku)
-        || positive_json_u64(rows[0].get("bid")) != Some(expected_bid)
-    {
-        return Err("CONTROL_RECONCILIATION_FAILED: exact SKU/bid not proven".to_owned());
-    }
-    Ok(serde_json::json!({
-        "campaign_id": campaign_id.to_string(),
-        "sku": sku.to_string(),
-        "state": state,
-        "title": title,
-        "bid_microrubles": expected_bid,
-    }))
-}
-
-pub(super) fn positive_json_u64(value: Option<&Value>) -> Option<u64> {
-    let value = match value? {
-        Value::Number(number) => number.as_u64(),
-        Value::String(value) => value.parse().ok(),
-        _ => None,
-    }?;
-    (value > 0).then_some(value)
 }

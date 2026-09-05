@@ -53,6 +53,8 @@ printf '%s\n' \
   'REPORT_COLLECTOR_DB_PASSWORD=verify-only-report-collector-not-a-secret' \
   'REPORT_REFRESH_REQUESTER_DB_PASSWORD=verify-only-refresh-requester-not-a-secret' \
   'CONTROL_WRITER_DB_PASSWORD=verify-only-control-writer-not-a-secret' \
+  'OZON_CONTROL_PLANNER_DB_PASSWORD=verify-only-ozon-planner-not-a-secret' \
+  'OZON_CONTROL_EXECUTOR_DB_PASSWORD=verify-only-ozon-executor-not-a-secret' \
   'WB_AUTOMATION_DB_PASSWORD=verify-only-wb-automation-not-a-secret' \
   >"$interpolation_env"
 chmod 600 "$interpolation_env"
@@ -76,6 +78,16 @@ check_contains() {
   else
     printf 'FAIL %s\n' "$description" >&2
     failures=$((failures + 1))
+  fi
+}
+
+check_not_contains() {
+  local description="$1" path="$2" forbidden="$3"
+  if grep -Fq -- "$forbidden" "$path"; then
+    printf 'FAIL %s\n' "$description" >&2
+    failures=$((failures + 1))
+  else
+    printf 'ok   %s\n' "$description"
   fi
 }
 
@@ -157,6 +169,42 @@ render_control_wb_live_compose() {
       -f "$project_dir/compose.control.yaml" \
       -f "$project_dir/compose.control-wb-plan.yaml" \
       -f "$project_dir/compose.control-wb-live.yaml" \
+      config --no-env-resolution --format json
+}
+
+render_control_ozon_live_compose() {
+  local executor_id="$scratch/ozon-executor-client-id"
+  local executor_secret="$scratch/ozon-executor-client-secret"
+  printf 'verification-executor-client-id\n' >"$executor_id"
+  printf 'verification-executor-client-secret\n' >"$executor_secret"
+  chmod 600 "$executor_id" "$executor_secret"
+  CONTROL_MCP_ACCESS_CONFIG_HOST="$project_dir/config/access.example.json" \
+    CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.ozon-furnitura.live.example.json" \
+    CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE_HOST="$executor_id" \
+    CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE_HOST="$executor_secret" \
+    CONTROL_MCP_JWT_ISSUER="https://auth.example.test/realms/ofk" \
+    CONTROL_MCP_JWT_JWKS_HOST="auth.example.test" \
+    CONTROL_MCP_JWT_JWKS_PATH="/realms/ofk/protocol/openid-connect/certs" \
+    CONTROL_MCP_PUBLIC_URL="https://control.example.test/mcp" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.control.yaml" \
+      -f "$project_dir/compose.control-ozon-plan.yaml" \
+      -f "$project_dir/compose.control-ozon-live.yaml" \
+      config --no-env-resolution --format json
+}
+
+render_control_ozon_static_guard_compose() {
+  local executor_id="$scratch/static-ozon-executor-client-id"
+  local executor_secret="$scratch/static-ozon-executor-client-secret"
+  printf 'verification-static-executor-client-id\n' >"$executor_id"
+  printf 'verification-static-executor-client-secret\n' >"$executor_secret"
+  chmod 600 "$executor_id" "$executor_secret"
+  CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE_HOST="$executor_id" \
+    CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE_HOST="$executor_secret" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.control-ozon-static-guard.yaml" \
       config --no-env-resolution --format json
 }
 
@@ -1509,6 +1557,60 @@ verify_control_wb_live() {
        .bind == null or .bind == {} or .bind == {"create_host_path":false})'
 }
 
+verify_control_ozon_guards() {
+  local live="$1" static="$2" live_control live_guard static_guard live_proxy static_proxy executor_url
+  live_control="$(jq -c '.services.control' <<<"$live")"
+  live_guard="$(jq -c '.services["ozon-campaign-guard"]' <<<"$live")"
+  static_guard="$(jq -c '.services["ozon-campaign-guard"]' <<<"$static")"
+  live_proxy="$(jq -c '.services["control-ozon-write-egress"]' <<<"$live")"
+  static_proxy="$(jq -c '.services["control-ozon-write-egress"]' <<<"$static")"
+  executor_url='postgresql://ozon_control_executor:verify-only-ozon-executor-not-a-secret@position-db:5432/ozon_positions'
+
+  check "Ozon live: MCP ingress remains planner-only" "$live_control" \
+    '.environment.CONTROL_MCP_MARKETPLACE_WRITES_ENABLED == "false"
+     and (.environment | has("CONTROL_MCP_OZON_PLANNER_DATABASE_URL"))
+     and (.environment | has("CONTROL_MCP_OZON_PROXY") | not)
+     and (.environment | has("CONTROL_MCP_OZON_TIMEOUT_SECONDS") | not)
+     and (.environment | has("CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_ID_FILE") | not)
+     and (.environment | has("CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_SECRET_FILE") | not)
+     and (.environment | has("CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL") | not)
+     and ((.volumes // []) | all(.[]; (.target | startswith("/run/mcp-ozon/control-credentials/ozon-")) | not))
+     and (.networks | keys | sort) == ["control-auth-egress-internal","control_ingress_internal","control_isolated","position-internal"]
+     and (.depends_on | keys) == ["control-auth-egress"]'
+  check "Ozon live: only the durable guard is armed and uses the executor database role" "$live_guard" \
+    --arg executor_url "$executor_url" \
+    '.environment.CONTROL_MCP_MARKETPLACE_WRITES_ENABLED == "true"
+     and .environment.CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL == $executor_url
+     and (.environment | has("CONTROL_MCP_DATABASE_URL") | not)'
+  check "Ozon live: guard health proves one process and held PostgreSQL identity lease" "$live_guard" \
+    '.healthcheck == {
+       "test":["CMD-SHELL","set -- $$(pidof ozon-campaign-guard) && test \"$$#\" -eq 1 && exec /usr/local/bin/ozon-campaign-guard healthcheck"],
+       "timeout":"8s", "interval":"15s", "retries":3, "start_period":"15s"
+     }
+     and .stop_grace_period == "10s"
+     and .logging == {"driver":"json-file","options":{"max-file":"2","max-size":"1m"}}
+     and (.networks | keys | sort) == ["control-ozon-write-egress-internal","position-internal"]'
+  check "Ozon live: write egress has bounded shutdown and logs" "$live_proxy" \
+    '.stop_grace_period == "10s"
+     and .logging == {"driver":"json-file","options":{"max-file":"2","max-size":"1m"}}'
+  check "Ozon static: guard is armed only with executor DB identity" "$static_guard" \
+    --arg executor_url "$executor_url" \
+    '.environment.CONTROL_MCP_MARKETPLACE_WRITES_ENABLED == "true"
+     and .environment.CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL == $executor_url
+     and (.environment | has("CONTROL_MCP_DATABASE_URL") | not)'
+  check "Ozon static: health binds PID/local state lease and PostgreSQL identity lease" "$static_guard" \
+    '.healthcheck == {
+       "test":["CMD-SHELL","set -- $$(pidof ozon-campaign-guard) && test \"$$#\" -eq 1 && test \"$$(cat /var/lib/mcp-ozon-guard/.state.json.lease)\" = \"pid=$$1\" && test \"$$(stat -c %a /var/lib/mcp-ozon-guard)\" = 700 && test \"$$(stat -c %a /var/lib/mcp-ozon-guard/.state.json.lease)\" = 600 && exec /usr/local/bin/ozon-campaign-guard healthcheck"],
+       "timeout":"8s", "interval":"15s", "retries":3, "start_period":"10s"
+     }
+     and .stop_grace_period == "10s"
+     and .logging == {"driver":"json-file","options":{"max-file":"2","max-size":"1m"}}
+     and (.networks | keys | sort) == ["control-ozon-write-egress-internal","position-internal"]'
+  check "Ozon static: write egress has bounded shutdown and logs" "$static_proxy" \
+    '.stop_grace_period == "10s"
+     and .logging == {"driver":"json-file","options":{"max-file":"2","max-size":"1m"}}'
+}
+
 main_rendered="$(render_compose "$project_dir/compose.yaml")"
 canary_rendered="$(render_compose "$project_dir/compose.canary.yaml")"
 position_rendered="$(render_position_compose)"
@@ -1523,6 +1625,8 @@ control_rendered="$(render_control_compose)"
 control_actor_override_rendered="$(render_control_compose verify_actor)"
 control_wb_plan_rendered="$(render_control_wb_plan_compose)"
 control_wb_live_rendered="$(render_control_wb_live_compose)"
+control_ozon_live_rendered="$(render_control_ozon_live_compose)"
+control_ozon_static_guard_rendered="$(render_control_ozon_static_guard_compose)"
 
 # Rendering uses isolated, existing placeholder files so the result is the
 # same in a clean checkout and on a developer machine with ignored secrets.
@@ -1990,6 +2094,38 @@ check_contains \
   "$project_dir/Dockerfile.wb-automation-shadow" \
   "&& chmod 0700 /var/lib/mcp-ozon-legacy"
 check_contains \
+  "static Ozon guard: init image is immutable" \
+  "$project_dir/compose.control-ozon-static-guard.yaml" \
+  "image: alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b"
+check_contains \
+  "static Ozon guard: health binds one live process to its private local and database leases" \
+  "$project_dir/compose.control-ozon-static-guard.yaml" \
+  'set -- $$(pidof ozon-campaign-guard) && test \"$$#\" -eq 1 && test \"$$(cat /var/lib/mcp-ozon-guard/.state.json.lease)\" = \"pid=$$1\" && test \"$$(stat -c %a /var/lib/mcp-ozon-guard)\" = 700 && test \"$$(stat -c %a /var/lib/mcp-ozon-guard/.state.json.lease)\" = 600 && exec /usr/local/bin/ozon-campaign-guard healthcheck'
+check_contains \
+  "static Ozon guard: dedicated Control Performance identity is mandatory" \
+  "$project_dir/compose.control-ozon-static-guard.yaml" \
+  'CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE_HOST:?dedicated Ozon workflow executor Performance Client-Id file is required'
+check_not_contains \
+  "Ozon planner: marketplace credentials are absent" \
+  "$project_dir/compose.control-ozon-plan.yaml" \
+  'PERFORMANCE_CLIENT'
+check_not_contains \
+  "Ozon planner: marketplace egress is absent" \
+  "$project_dir/compose.control-ozon-plan.yaml" \
+  'control-ozon-write-egress'
+check_contains \
+  "durable Ozon guard: dedicated executor identity is mandatory" \
+  "$project_dir/compose.control-ozon-live.yaml" \
+  'CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE_HOST:?dedicated Ozon workflow executor Performance Client-Id file is required'
+check_contains \
+  "static Ozon guard: library tracing target is visible at info" \
+  "$project_dir/compose.control-ozon-static-guard.yaml" \
+  "RUST_LOG: mcp_ozon::control::ozon=info"
+check_contains \
+  "durable Ozon guard: library tracing target is visible at info" \
+  "$project_dir/compose.control-ozon-live.yaml" \
+  "RUST_LOG: mcp_ozon::control::ozon=info"
+check_contains \
   "control auth egress: only the exact local JWKS path reaches upstream" \
   "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
   'location = /jwks {'
@@ -2066,6 +2202,7 @@ verify_control "$control_rendered"
 verify_control_actor_override "$control_actor_override_rendered" "$control_rendered"
 verify_control_wb_plan "$control_wb_plan_rendered" "$control_rendered"
 verify_control_wb_live "$control_wb_live_rendered" "$control_wb_plan_rendered"
+verify_control_ozon_guards "$control_ozon_live_rendered" "$control_ozon_static_guard_rendered"
 
 if (( failures > 0 )); then
   echo "compose hardening verification failed with $failures problem(s)" >&2
