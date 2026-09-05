@@ -35,6 +35,7 @@ migrations="
 024_ozon_control_campaign_plans.sql
 025_ozon_durable_launch_workflow.sql
 026_marketplace_sales_refresh_queue.sql
+027_position_latest_lookup.sql
 "
 
 case "$mode" in
@@ -114,7 +115,8 @@ unexpected_migration_count() {
        '023_daily_reporting_ozon_refresh_queue.sql',
        '024_ozon_control_campaign_plans.sql',
        '025_ozon_durable_launch_workflow.sql',
-       '026_marketplace_sales_refresh_queue.sql'
+       '026_marketplace_sales_refresh_queue.sql',
+       '027_position_latest_lookup.sql'
      )"
 }
 
@@ -165,7 +167,7 @@ COMMIT;
 SQL
   done
   "$migration_dir/003_roles.sh"
-  echo "migration ledger baselined at 026_marketplace_sales_refresh_queue.sql"
+  echo "migration ledger baselined at 027_position_latest_lookup.sql"
   exit 0
 fi
 
@@ -250,4 +252,4 @@ if [ "$roles_refreshed" != true ]; then
   exit 1
 fi
 
-echo "database migrations verified through 026_marketplace_sales_refresh_queue.sql"
+echo "database migrations verified through 027_position_latest_lookup.sql"

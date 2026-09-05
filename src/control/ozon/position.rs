@@ -62,7 +62,7 @@ impl OzonBidPositionReader {
                         has_table_privilege(current_user, \
                             'search_position.monitors', 'SELECT'), \
                         has_table_privilege(current_user, \
-                            'search_position.latest_measurements', 'SELECT'), \
+                            'search_position.published_measurements', 'SELECT'), \
                         NOT has_table_privilege(current_user, \
                             'search_position.measurements', 'SELECT')",
                 &[],
@@ -95,8 +95,16 @@ impl OzonBidPositionReader {
                 "SELECT latest.observed_at, latest.outcome, latest.overall_position, \
                         monitor.max_position, latest.run_status, latest.is_partial \
                  FROM search_position.monitors AS monitor \
-                 LEFT JOIN search_position.latest_measurements AS latest \
-                   ON latest.monitor_id = monitor.id \
+                 LEFT JOIN LATERAL ( \
+                     SELECT measurement.observed_at, measurement.outcome, \
+                            measurement.overall_position, measurement.run_status, \
+                            measurement.is_partial \
+                     FROM search_position.published_measurements AS measurement \
+                     WHERE measurement.monitor_id = monitor.id \
+                     ORDER BY measurement.scheduled_for DESC, \
+                              measurement.observed_at DESC, measurement.id DESC \
+                     LIMIT 1 \
+                 ) AS latest ON true \
                  WHERE monitor.active \
                    AND monitor.store_id = $1 \
                    AND monitor.product_id = $2 \

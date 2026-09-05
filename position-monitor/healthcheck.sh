@@ -25,6 +25,7 @@ SELECT
     to_regclass('search_position.monitors') IS NOT NULL
     AND to_regclass('search_position.collection_runs') IS NOT NULL
     AND to_regclass('search_position.measurements') IS NOT NULL
+    AND to_regclass('search_position.measurements_monitor_slot') IS NOT NULL
     AND to_regclass('search_position.latest_measurements') IS NOT NULL
     AND to_regclass('search_position.published_measurements') IS NOT NULL
     AND to_regclass('search_position.published_alerts') IS NOT NULL
@@ -1758,7 +1759,7 @@ SELECT
         OR (
             to_regclass('mcp_runtime.schema_migrations') IS NOT NULL
             AND (
-                SELECT count(*) = 26
+                SELECT count(*) = 27
                     AND bool_and(state = 'applied')
                     AND bool_and(applied_at IS NOT NULL)
                 FROM mcp_runtime.schema_migrations

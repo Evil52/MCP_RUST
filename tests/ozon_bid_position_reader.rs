@@ -250,7 +250,7 @@ async fn position_reader_accepts_only_one_published_complete_monitor() {
     let admin = connect(&admin_url).await;
     admin
         .execute(
-            "REVOKE SELECT ON search_position.latest_measurements FROM position_reader",
+            "REVOKE SELECT ON search_position.published_measurements FROM position_reader",
             &[],
         )
         .await
