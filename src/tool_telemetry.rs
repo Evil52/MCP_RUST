@@ -108,10 +108,9 @@ impl ToolTelemetryService {
                     .map_err(|_| anyhow!("tool telemetry database contract is unavailable"))?,
             )),
         };
-        service
-            .verify_runtime_contract()
-            .await
-            .map_err(|_| anyhow!("tool telemetry database contract is unavailable"))?;
+        if service.verify_runtime_contract().await.is_err() {
+            return Err(anyhow!("tool telemetry database contract is unavailable"));
+        }
         Ok(service)
     }
 
@@ -429,7 +428,14 @@ mod tests {
     async fn disabled_mode_is_explicit_and_does_not_block_tool_calls() {
         let service = ToolTelemetryService::disabled();
         assert!(!service.is_enabled());
+        assert!(format!("{service:?}").contains("enabled: false"));
         assert_eq!(service.probe().await, Ok(()));
+        assert!(
+            !ToolTelemetryService::connect_optional(None)
+                .await
+                .unwrap()
+                .is_enabled()
+        );
         assert_eq!(
             service
                 .begin(
@@ -441,7 +447,167 @@ mod tests {
                 .await,
             Ok(None)
         );
+        assert_eq!(
+            service
+                .finish(
+                    None,
+                    ToolCallOutcome::Cancelled,
+                    Duration::from_millis(1),
+                    None
+                )
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            service.list(0).await,
+            Err(ToolTelemetryError::InvalidRequest)
+        );
+        assert_eq!(
+            service.list(MAX_TOOL_CALL_LOG_ROWS + 1).await,
+            Err(ToolTelemetryError::InvalidRequest)
+        );
         assert_eq!(service.list(10).await, Err(ToolTelemetryError::Disabled));
+    }
+
+    #[tokio::test]
+    async fn postgres_mode_records_every_terminal_outcome_and_rejects_bad_inputs() {
+        assert!(
+            ToolTelemetryService::connect_optional(Some("not a database URL"))
+                .await
+                .is_err()
+        );
+        assert!(
+            ToolTelemetryService::connect_optional(Some(
+                "postgresql://position_reader:secret@db/ozon_positions"
+            ))
+            .await
+            .is_err()
+        );
+        assert!(
+            ToolTelemetryService::connect_optional(Some(
+                "postgresql://report_refresh_requester:secret@127.0.0.1:1/ozon_positions?connect_timeout=1"
+            ))
+            .await
+            .is_err()
+        );
+        let Ok(database_url) = std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL") else {
+            return;
+        };
+        let contractless_database_url = database_url.replacen("/ozon_positions", "/template1", 1);
+        assert_eq!(
+            ToolTelemetryService::connect_optional(Some(&contractless_database_url))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "tool telemetry database contract is unavailable"
+        );
+        let service = ToolTelemetryService::connect_optional(Some(&database_url))
+            .await
+            .unwrap();
+        assert!(service.is_enabled());
+        assert!(format!("{service:?}").contains("enabled: true"));
+        service.probe().await.unwrap();
+
+        assert_eq!(
+            service.begin("bad actor", "ofk_test", None, None).await,
+            Err(ToolTelemetryError::InvalidRequest)
+        );
+        assert_eq!(
+            service.begin("admin", "BadTool", None, None).await,
+            Err(ToolTelemetryError::InvalidRequest)
+        );
+        assert_eq!(
+            service
+                .begin("admin", "ofk_test", Some("bad/account"), None)
+                .await,
+            Err(ToolTelemetryError::InvalidRequest)
+        );
+
+        let outcomes = [
+            (ToolCallOutcome::Succeeded, ToolCallLogOutcome::Succeeded),
+            (ToolCallOutcome::Failed, ToolCallLogOutcome::Failed),
+            (ToolCallOutcome::Cancelled, ToolCallLogOutcome::Cancelled),
+            (ToolCallOutcome::Overloaded, ToolCallLogOutcome::Overloaded),
+        ];
+        let account_prefix = format!("telemetry_{}", std::process::id());
+        for (sequence, (outcome, expected)) in outcomes.into_iter().enumerate() {
+            let account_id = format!("{account_prefix}_{sequence}");
+            let receipt = service
+                .begin(
+                    "admin@example.test",
+                    "ofk_test",
+                    Some(&account_id),
+                    Some(if sequence % 2 == 0 {
+                        Marketplace::Ozon
+                    } else {
+                        Marketplace::Wildberries
+                    }),
+                )
+                .await
+                .unwrap();
+            service
+                .finish(
+                    receipt,
+                    outcome,
+                    Duration::from_millis(u64::try_from(sequence + 1).unwrap()),
+                    (outcome != ToolCallOutcome::Succeeded).then_some("TEST_FAILURE"),
+                )
+                .await
+                .unwrap();
+            let recorded = service
+                .list(MAX_TOOL_CALL_LOG_ROWS)
+                .await
+                .unwrap()
+                .calls
+                .into_iter()
+                .find(|call| call.account_id.as_deref() == Some(&account_id))
+                .unwrap();
+            assert_eq!(recorded.outcome, expected);
+            assert_eq!(
+                recorded.marketplace,
+                Some(if sequence % 2 == 0 {
+                    Marketplace::Ozon
+                } else {
+                    Marketplace::Wildberries
+                })
+            );
+        }
+
+        let receipt = service
+            .begin("admin", "ofk_test", Some(&account_prefix), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .finish(
+                    receipt,
+                    ToolCallOutcome::Failed,
+                    MAX_TOOL_CALL_DURATION + Duration::from_millis(1),
+                    None
+                )
+                .await,
+            Err(ToolTelemetryError::InvalidRequest)
+        );
+        assert_eq!(
+            service
+                .finish(
+                    receipt,
+                    ToolCallOutcome::Failed,
+                    Duration::from_millis(1),
+                    Some("bad-code")
+                )
+                .await,
+            Err(ToolTelemetryError::InvalidRequest)
+        );
+        service
+            .finish(
+                receipt,
+                ToolCallOutcome::Failed,
+                Duration::from_millis(1),
+                Some("TEST_FAILURE"),
+            )
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -456,8 +622,42 @@ mod tests {
         assert!(validate_error_code("bad-code").is_err());
         assert_eq!(parse_outcome("running"), Ok(ToolCallLogOutcome::Running));
         assert_eq!(
+            parse_outcome("succeeded"),
+            Ok(ToolCallLogOutcome::Succeeded)
+        );
+        assert_eq!(parse_outcome("failed"), Ok(ToolCallLogOutcome::Failed));
+        assert_eq!(
+            parse_outcome("cancelled"),
+            Ok(ToolCallLogOutcome::Cancelled)
+        );
+        assert_eq!(
+            parse_outcome("overloaded"),
+            Ok(ToolCallLogOutcome::Overloaded)
+        );
+        assert_eq!(
+            parse_outcome("unknown"),
+            Err(ToolTelemetryError::InvalidData)
+        );
+        assert_eq!(parse_marketplace("ozon"), Ok(Marketplace::Ozon));
+        assert_eq!(
+            parse_marketplace("wildberries"),
+            Ok(Marketplace::Wildberries)
+        );
+        assert_eq!(
             parse_marketplace("unknown"),
             Err(ToolTelemetryError::InvalidData)
+        );
+
+        let valid = Config::from_str(
+            "postgresql://report_refresh_requester:secret@localhost/position_data",
+        )
+        .unwrap();
+        assert_eq!(validate_database_config(&valid), Ok(()));
+        let invalid =
+            Config::from_str("postgresql://wrong:secret@localhost/position_data").unwrap();
+        assert_eq!(
+            validate_database_config(&invalid),
+            Err(ToolTelemetryError::InvalidRequest)
         );
     }
 }
