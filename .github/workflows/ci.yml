@@ -110,7 +110,7 @@ jobs:
         run: cargo +1.98.0 test --locked --all-targets --all-features -- --test-threads=1
 
   coverage:
-    name: Library and runtime contracts
+    name: Core library source lines
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
