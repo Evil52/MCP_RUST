@@ -1,6 +1,13 @@
-//! Shared bounded HTTP runtime for isolated MCP binaries.
+//! Shared bounded HTTP runtime and process probes for isolated binaries.
 
-use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    io::{self, Write as _},
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use hyper::server::conn::http1::Builder as HttpConnectionBuilder;
 use hyper_util::{
@@ -15,6 +22,24 @@ pub const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 pub const HTTP_NATURAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(55);
 pub const HTTP_CANCELLED_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Handles the side-effect-free probe shared by every shipped runtime binary.
+///
+/// The probe intentionally runs before logging, configuration, credentials,
+/// database connections, or marketplace clients are initialized. CI can
+/// therefore execute the optimized binary copied into each final image without
+/// granting that image secrets or network access.
+pub fn print_runtime_version_if_requested(
+    binary_name: &str,
+    arguments: &[String],
+) -> io::Result<bool> {
+    if !matches!(arguments, [argument] if argument == "--version") {
+        return Ok(false);
+    }
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{binary_name} {}", env!("CARGO_PKG_VERSION"))?;
+    Ok(true)
+}
 
 struct AcceptedTcpStream {
     stream: tokio::net::TcpStream,
@@ -257,6 +282,25 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn optimized_runtime_probe_is_exact_and_side_effect_free() {
+        assert!(
+            print_runtime_version_if_requested("test-runtime", &["--version".to_owned()])
+                .expect("stdout accepts the runtime version")
+        );
+        assert!(
+            !print_runtime_version_if_requested("test-runtime", &[])
+                .expect("a non-probe does not touch stdout")
+        );
+        assert!(
+            !print_runtime_version_if_requested(
+                "test-runtime",
+                &["--version".to_owned(), "unexpected".to_owned()],
+            )
+            .expect("the existing command parser owns non-exact arguments")
+        );
+    }
 
     struct PendingUntilDropped {
         dropped: Arc<AtomicBool>,

@@ -60,6 +60,10 @@ pub struct OzonCampaignPlanResult {
     pub policy_schema_version: u32,
     pub policy_revision: u64,
     pub policy_digest: String,
+    /// Exact collision-resistant title sent to Ozon. `spec.title` remains the
+    /// human intent reviewed by the operator.
+    pub provider_title: String,
+    pub provider_identity_version: String,
     pub status: OzonLaunchStatus,
     pub campaign_id: Option<u64>,
     pub approval: Option<OzonCampaignPlanApprovalResult>,
@@ -67,6 +71,11 @@ pub struct OzonCampaignPlanResult {
     pub created_at: String,
     pub expires_at: String,
     pub last_error_class: Option<String>,
+    pub execution_requested_at: Option<String>,
+    pub current_action: String,
+    pub workflow_generation: u64,
+    pub workflow_lease_expires_at: Option<String>,
+    pub workflow_write_started_at: Option<String>,
     pub requires_reconciliation: bool,
 }
 

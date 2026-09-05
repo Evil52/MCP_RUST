@@ -8,63 +8,13 @@ services:
       CONTROL_MCP_JWT_AUDIENCE: ${CONTROL_MCP_PUBLIC_URL:?CONTROL_MCP_PUBLIC_URL is required}
       CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: "false"
       CONTROL_MCP_OZON_ACCOUNT_ID: furnitura_dlya_doma
-      CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE: /run/mcp-ozon/control-credentials/ozon-performance-client-id
-      CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE: /run/mcp-ozon/control-credentials/ozon-performance-client-secret
-      CONTROL_MCP_DATABASE_URL: postgresql://control_writer:${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
-      CONTROL_MCP_OZON_PROXY: http://control-ozon-write-egress:3130
-      CONTROL_MCP_OZON_TIMEOUT_SECONDS: "20"
-    volumes:
-      - type: bind
-        source: ${CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE_HOST:?CONTROL_MCP_OZON_PERFORMANCE_CLIENT_ID_FILE_HOST is required}
-        target: /run/mcp-ozon/control-credentials/ozon-performance-client-id
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ${CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE_HOST:?CONTROL_MCP_OZON_PERFORMANCE_CLIENT_SECRET_FILE_HOST is required}
-        target: /run/mcp-ozon/control-credentials/ozon-performance-client-secret
-        read_only: true
-        bind:
-          create_host_path: false
+      CONTROL_MCP_OZON_PLANNER_DATABASE_URL: postgresql://ozon_control_planner:${OZON_CONTROL_PLANNER_DB_PASSWORD:?OZON_CONTROL_PLANNER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
     networks:
       - position-internal
-      - control-ozon-write-egress-internal
       - control-auth-egress-internal
     depends_on:
-      control-ozon-write-egress:
-        condition: service_healthy
       control-auth-egress:
         condition: service_healthy
-
-  control-ozon-write-egress:
-    image: ${MCP_CONTROL_OZON_WRITE_EGRESS_IMAGE:-mcp-ozon-control-ozon-write-egress:local}
-    build:
-      context: .
-      dockerfile: Dockerfile.control-ozon-write-egress
-      args:
-        MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
-    networks:
-      - control-ozon-write-egress-internal
-      - outbound
-    restart: unless-stopped
-    mem_limit: 256m
-    cpus: 0.25
-    pids_limit: 32
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    tmpfs:
-      - /var/cache/squid:size=4m,mode=1777
-      - /var/log/squid:size=2m,mode=1777
-      - /var/run/squid:size=1m,mode=1777
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - "printf 'GET http://healthcheck.invalid/ HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 3130 | head -1 | grep -q '403 Forbidden'"
-      interval: 30s
-      timeout: 8s
-      retries: 3
-      start_period: 10s
 
   control-auth-egress:
     image: ${MCP_CONTROL_AUTH_EGRESS_IMAGE:-mcp-ozon-control-auth-egress:local}
@@ -99,8 +49,6 @@ networks:
   position-internal:
     name: mcp-ozon-position-internal
     external: true
-  control-ozon-write-egress-internal:
-    internal: true
   control-auth-egress-internal:
     internal: true
   outbound:

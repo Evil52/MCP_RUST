@@ -81,18 +81,27 @@ The following properties are treated as release gates:
    negative write-paths, retries, compression limits, and RBAC are covered by local mock tests. No
    live marketplace request is part of CI.
 9. The separate `mcp-ozon-control` process remains disabled and credentialless in base Compose. Its
-   separate seven-tool registry contains status, scope, prepare, approve, apply, plan status and
-   reconcile; only `wb_promotion_apply_bid_plan` can issue a marketplace mutation, fixed to one
-   attempt of `PATCH /api/advert/v1/bids` on `advert-api.wildberries.ru`. Live wiring requires JWT scope
-   `mcp:ads-control`, an explicit positive policy revision and actor/target/approver allowlist,
-   separate dedicated Promotion-only read-only and read/write token files, restricted
-   `control_writer` persistence and every runtime gate. A plan author cannot approve the same plan;
-   approval is an append-only artifact bound to the immutable plan digest.
-   No Analytics admin receives implicit Control scope. Control has no direct outbound network:
-   marketplace reads/writes cross a credentialless CONNECT proxy limited to the one WB host, while
-   the direct `.no_proxy()` JWKS client reaches only an internal exact-path TLS-verifying auth proxy.
-   Only those two credentialless proxies attach to the outbound bridge. Any additional credential,
-   host, method, path or write tool requires a new threat-model and release-gate review.
+   twelve-tool registry contains the Ozon and WB status, scope, plan and reconciliation surfaces.
+   `wb_promotion_apply_bid_plan` can issue at most one
+   `PATCH /api/advert/v1/bids` attempt. Ozon MCP `apply` has no marketplace writer: it only appends an
+   approved request to the durable launch outbox. The separate `ozon-campaign-guard` executor owns
+   fixed Ozon create/product/activate/deactivate operations, fenced database leases, final write
+   markers, append-only audit and readback-only crash recovery. Live wiring requires JWT scope
+   `mcp:ads-control`, immutable OIDC `sub` bindings, subject-owned MCP sessions, a positive policy
+   revision and explicit actor/target/approver allowlists. WB uses the restricted `control_writer`;
+   Ozon planning and execution use mutually exclusive `ozon_control_planner` and
+   `ozon_control_executor` database roles. The planner has no marketplace credential or egress;
+   only the executor has an account-bound Performance Client-Id. A
+   PostgreSQL advisory lease permits only one executor for that Client-Id across hosts. A plan
+   author cannot approve the same plan; approval and workflow history are append-only artifacts
+   bound to the immutable plan digest.
+   No Analytics admin receives implicit Control scope. Control processes have no direct outbound
+   network. WB marketplace I/O crosses its fixed-host credentialless CONNECT proxy; only the Ozon
+   executor joins a separate credentialless CONNECT proxy restricted to the Performance API host.
+   The Ozon planner joins neither marketplace proxy. The direct `.no_proxy()` JWKS client reaches
+   only an internal exact-path TLS-verifying auth proxy. Only these proxy services attach to the
+   outbound bridge. Any additional credential, host, method, path or write tool requires a new
+   threat-model and release-gate review.
 
 ## Resource and availability controls
 
@@ -104,7 +113,11 @@ The following properties are treated as release gates:
 - Ozon Performance: fixed official host, one-second per-Client-Id pacing, per-client concurrency 2,
   global concurrency 8, bounded cached OAuth tokens, and at most one replay after an HTTP 401 token
   refresh. OAuth refresh and pacing hold no business-request permits. There is no generic retry
-  that can create or duplicate an advertising operation.
+  that can create or duplicate an advertising operation. Reporting and Control execution use two
+  distinct account-bound Client-Ids; Control planning is credentialless and has no Performance
+  egress. Executor reads and writes share one local pacer, while a process-lifetime PostgreSQL
+  advisory lease rejects a second static or durable
+  executor using the same identity before any Performance client is constructed.
 - Wildberries: quota is shared by token rather than account alias, funnel pacing is 20 seconds,
   ping pacing is 10 seconds, per-token concurrency is 4, global concurrency is 8, and the complete
   operation has a 60-second deadline. Promotion campaign reads share a 200 ms quota bucket and
@@ -202,7 +215,9 @@ metadata and `/health` remain public, while every HTTP request to `/mcp` — inc
 notifications, tool discovery/calls, session GET, and session DELETE — validates the RS256 signature,
 issuer, resource audience, required scope, time claims, and provisioned actor after bounded transport
 admission but before body polling or session lookup/allocation. The registry snapshot used to map the
-OIDC identity is reused for that request's tool RBAC, and identity is never cached in the MCP session.
+OIDC identity is reused for that request's tool RBAC. Every request is re-authenticated; the transport
+retains only the immutable OIDC `sub` needed to bind a legacy session ID to its creator, never cached
+roles or account permissions.
 The repository does not bundle an identity provider. For production, use public HTTPS
 issuer/resource URLs, a correctly configured reverse proxy, exact redirect URIs, PKCE S256,
 disabled Direct Access Grants, immutable
@@ -239,6 +254,16 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   being protected. New age v1 archives are authenticated. Legacy manifest-version-1 AES-256-CBC
   backups remain readable, but their recorded SHA-256 only detects accidental corruption, not an
   attacker who can rewrite an archive and its manifest together.
+- The static Ozon guard state volume is not part of that database/artifact backup. Back it up and
+  restore it from the same recovery point as PostgreSQL. Each local snapshot carries the exact
+  account-wide append-only static-write audit high-water mark, so a missing, older, or independently
+  restored volume blocks the executor before recovery or a provider write. A fresh or legacy
+  deployment must explicitly establish its genesis with
+  `initialize-static-state --confirm-static-state-baseline`; the command preserves the reviewed
+  pending records, incidents and cooldowns, and refuses an existing or mismatched database history.
+  `audit-static-once` remains read-only when continuity is absent; ordinary startup and confirmed
+  reconcile cannot waive the mismatch. Restoring or reconstructing the exact cursor and unresolved
+  intents is a separate, reviewed operator repair.
 - Application logs provide safe transport/error telemetry but are not an append-only corporate audit
   ledger. A production rollout that requires non-repudiation must add an external protected audit sink
   for actor/tool/account/outcome without payloads or credentials.
@@ -255,11 +280,21 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   Compromise of both identities, or of the database-operator identity that controls runtime leases,
   remains outside the application boundary and requires independent IAM, audit and incident-response
   controls.
+- Ozon plan creation, approval and enqueue share the trusted `mcp-ozon-control` planner process and
+  `ozon_control_planner` database capability. The database prevents accidental self-approval, but
+  it does not provide issuer-verifiable independence against compromise of that process or role.
+  The executor still revalidates exact policy, account, immutable digest and runtime gates. A
+  process-compromise-resistant two-person guarantee requires a separate approval signer and
+  database capability and is future hardening, not a property of this deployment.
 
 ## Release checklist
 
 - Run `./scripts/local-ci.sh`, require 100% line coverage, Clippy/rustdoc warnings as errors,
   RustSec/cargo-deny, CodeQL, dependency review, secret scanning, and the hardened-container job.
+- In JWT mode, reject every registry actor without an immutable OIDC `subject`; username and email
+  claims must never select an actor. Verify POST, GET and DELETE cannot use another subject's MCP
+  session ID and return the same 404 as an unknown session. Saturate and time out readiness probes,
+  confirm only one dependency probe runs, and confirm `/livez` plus MCP traffic remain responsive.
 - Verify the Analytics MCP production tool list contains exactly 79 stable tools, no preview tools,
   and every tool advertises `destructiveHint=false` and the expected OAuth/noauth policy.
   Exactly `ofk_request_ozon_sales_refresh` has `readOnlyHint=false`: it inserts or reuses one
@@ -272,11 +307,13 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   `ozon_performance_reconcile_campaign_launch`, `wb_promotion_prepare_bid_update`,
   `wb_promotion_approve_bid_plan`, `wb_promotion_apply_bid_plan`,
   `wb_promotion_bid_plan_status`, and `wb_promotion_reconcile_bid_plan`. Status, scope and plan status
-  must be read-only; prepare and reconcile must be non-read-only but non-destructive; approval must
-  be non-read-only, destructive, idempotent and closed-world because it grants execution authority;
-  apply must be non-read-only, destructive and idempotent in the sense that a plan can be claimed
-  only once. The combined implementation inventory is 91, but no release check may treat it as one
-  security boundary.
+  must be read-only. Ozon preview and reconcile are read-only, idempotent and closed-world; Ozon
+  reconcile reads durable status and never performs marketplace I/O. Both prepare tools and WB
+  reconcile are non-read-only because they persist Control state. Approval must be non-read-only,
+  destructive, idempotent and closed-world because it grants execution authority. Both apply tools
+  must be non-read-only, destructive and idempotent; Ozon apply is also closed-world because it only
+  enqueues the durable workflow. The combined implementation inventory is 91, but no release check
+  may treat it as one security boundary.
 - Verify `ofk_collection_status`, `ofk_data_completeness`, `ofk_metrics_history`,
   `ofk_manager_actions`, `ofk_ozon_sales_analytics`, `ofk_ozon_sales_refresh_status`, and
   `ofk_reports` are internal read-only reporting tools with
@@ -307,6 +344,22 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   `/api/client/campaign/all_sku_promo/activate`,
   `/api/client/campaign/all_sku_promo/deactivate`, and
   `/api/client/campaign/all_sku_promo/set_bid` fail locally without credentials or network access.
+- Before any Ozon Control rollout, require different Performance Client-Ids for
+  reporting/Analytics and execution, and bind the executor Client-Id to the selected registry
+  account by a lowercase SHA-256 fingerprint. The planning process must have no marketplace
+  credential, proxy or outbound network and must use only
+  `CONTROL_MCP_OZON_PLANNER_DATABASE_URL` as `ozon_control_planner`; the guard must use only
+  `CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL` as `ozon_control_executor`. Verify `control_writer` has
+  no Ozon privileges, the planner cannot claim/fence/complete workflows, and the executor cannot
+  create/approve/enqueue plans. These generic roles are trusted across the deployment's Ozon rows;
+  never reuse their credentials across independent tenant trust zones without per-account database
+  principals or an administrator-owned role-to-account binding.
+- Verify the Ozon executor obtains its process-lifetime PostgreSQL advisory lease, keyed by the
+  executor Client-Id fingerprint, before constructing any Performance client. Starting static and
+  durable modes, another host, or another replica with the same identity must fail closed. Exercise
+  outbox claim contention, generation fencing, lease expiry, final-marker commit uncertainty,
+  policy/gate revocation between claim and marker, and post-marker readback recovery. No uncertain
+  create, add-product, activation or deactivation may be posted a second time.
 - Verify the Analytics WB Search namespace contains exactly `wb_search_product_queries` and
   `wb_search_orders_positions`. Verify the WB Promotion namespace contains exactly
   `wb_promotion_campaigns`, `wb_promotion_campaign_details`, `wb_promotion_stats`,
@@ -340,8 +393,9 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   database denial of self-approval, consumed-attempt quota reservation, and active bounded global,
   account and campaign leases before `approved -> applying`. Require JWT mode, exact audience and
   `mcp:ads-control` scope, separate exact-purpose Promotion read/write token files, the restricted
-  `control_writer` role and a successful plan-store runtime-contract check. Base Compose must remain
-  disabled, credentialless and internal-only.
+  `control_writer` role for WB, separate `ozon_control_planner`/`ozon_control_executor` roles for
+  Ozon, and successful role-specific runtime-contract checks. Base Compose must remain disabled,
+  credentialless and internal-only.
 - Confirm the runtime registry and `.env` are ignored regular files with mode `600`; never copy their
   contents into logs, screenshots, CI artifacts, or Git.
 - Generate a scheduled-report credential directory only with the policy-scoped

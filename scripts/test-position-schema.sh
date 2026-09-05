@@ -14,6 +14,8 @@ report_worker_password="report-worker-schema-test"
 report_collector_password="report-collector-schema-test"
 report_refresh_requester_password="report-refresh-requester-schema-test"
 control_writer_password="control-writer-schema-test"
+ozon_planner_password="ozon-planner-schema-test-password"
+ozon_executor_password="ozon-executor-schema-test-password"
 wb_automation_password="wb-automation-schema-test"
 release_sha="${MCP_RELEASE_GIT_SHA:-unverified}"
 
@@ -114,7 +116,15 @@ assert_control_schema_contract() {
           ('ozon_campaign_guards', 'ozon_guards_validate_insert',
            'validate_ozon_guard_insert', 7),
           ('ozon_campaign_guards', 'ozon_guards_transition_guard',
-           'enforce_ozon_guard_transition', 19)
+           'enforce_ozon_guard_transition', 19),
+          ('ozon_campaign_launch_workflows', 'ozon_launch_workflow_update_guard',
+           'enforce_ozon_launch_workflow_update', 19),
+          ('ozon_campaign_launch_workflows', 'ozon_launch_workflow_no_delete',
+           'reject_ozon_append_only_mutation', 11),
+          ('ozon_campaign_plans', 'ozon_launch_workflow_initialize',
+           'initialize_ozon_launch_workflow', 5),
+          ('ozon_static_guard_audit_events', 'ozon_static_guard_audit_append_only',
+           'reject_ozon_append_only_mutation', 27)
     ),
     other_app_roles(role_name) AS (
         VALUES
@@ -143,8 +153,10 @@ assert_control_schema_contract() {
       (
           SELECT string_agg(relation.relname::text, ',' ORDER BY relation.relname)
                  = 'ozon_campaign_action_reservations,ozon_campaign_audit_events,' ||
-                   'ozon_campaign_guards,ozon_campaign_plan_approvals,' ||
+                   'ozon_campaign_guards,ozon_campaign_launch_workflows,' ||
+                   'ozon_campaign_plan_approvals,' ||
                    'ozon_campaign_plans,ozon_policy_revisions,ozon_runtime_gates,' ||
+                   'ozon_static_guard_audit_events,' ||
                    'wb_action_reservations,wb_audit_events,wb_plan_approvals,' ||
                    'wb_plans,wb_policy_revisions,wb_prepare_reservations,' ||
                    'wb_runtime_gates'
@@ -159,16 +171,6 @@ assert_control_schema_contract() {
                      relation.relname::text || ':' || acl.privilege_type,
                      ',' ORDER BY relation.relname, acl.privilege_type
                  ) =
-                 'ozon_campaign_action_reservations:INSERT,' ||
-                 'ozon_campaign_action_reservations:SELECT,' ||
-                 'ozon_campaign_audit_events:INSERT,' ||
-                 'ozon_campaign_audit_events:SELECT,' ||
-                 'ozon_campaign_guards:INSERT,ozon_campaign_guards:SELECT,' ||
-                 'ozon_campaign_plan_approvals:INSERT,' ||
-                 'ozon_campaign_plan_approvals:SELECT,' ||
-                 'ozon_campaign_plans:INSERT,ozon_campaign_plans:SELECT,' ||
-                 'ozon_policy_revisions:INSERT,ozon_policy_revisions:SELECT,' ||
-                 'ozon_runtime_gates:SELECT,' ||
                  'wb_action_reservations:INSERT,wb_action_reservations:SELECT,' ||
                  'wb_audit_events:INSERT,wb_audit_events:SELECT,' ||
                  'wb_plan_approvals:INSERT,wb_plan_approvals:SELECT,' ||
@@ -193,18 +195,6 @@ assert_control_schema_contract() {
                      ',' ORDER BY relation.relname, attribute.attname,
                                   acl.privilege_type
                  ) =
-                 'ozon_campaign_guards.last_checked_at:UPDATE,' ||
-                 'ozon_campaign_guards.last_revenue_minor:UPDATE,' ||
-                 'ozon_campaign_guards.last_spend_minor:UPDATE,' ||
-                 'ozon_campaign_guards.status:UPDATE,' ||
-                 'ozon_campaign_guards.stop_reason:UPDATE,' ||
-                 'ozon_campaign_guards.stopped_at:UPDATE,' ||
-                 'ozon_campaign_plans.campaign_id:UPDATE,' ||
-                 'ozon_campaign_plans.finished_at:UPDATE,' ||
-                 'ozon_campaign_plans.last_error_class:UPDATE,' ||
-                 'ozon_campaign_plans.operation_started_at:UPDATE,' ||
-                 'ozon_campaign_plans.readback_json:UPDATE,' ||
-                 'ozon_campaign_plans.status:UPDATE,' ||
                  'wb_plans.apply_started_at:UPDATE,' ||
                  'wb_plans.finished_at:UPDATE,' ||
                  'wb_plans.last_error_class:UPDATE,' ||
@@ -245,6 +235,143 @@ assert_control_schema_contract() {
             AND relation.relname = 'wb_audit_events_id_seq'
             AND acl.grantee = 'control_writer'::regrole
       )
+      AND NOT has_sequence_privilege(
+          'control_writer','control.ozon_campaign_audit_events_event_id_seq',
+          'SELECT,USAGE'
+      )
+      AND (
+          SELECT array_agg(
+                     relation.relname::text || ':' || acl.privilege_type
+                     ORDER BY relation.relname,acl.privilege_type
+                 )
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(
+              coalesce(relation.relacl,acldefault('r',relation.relowner))
+          ) AS acl
+          WHERE namespace.nspname='control'
+            AND relation.relname LIKE 'ozon\_%' ESCAPE '\'
+            AND relation.relkind IN ('r','p')
+            AND acl.grantee='ozon_control_planner'::regrole
+      ) = ARRAY[
+          'ozon_campaign_audit_events:INSERT','ozon_campaign_audit_events:SELECT',
+          'ozon_campaign_launch_workflows:SELECT',
+          'ozon_campaign_plan_approvals:INSERT','ozon_campaign_plan_approvals:SELECT',
+          'ozon_campaign_plans:INSERT','ozon_campaign_plans:SELECT',
+          'ozon_policy_revisions:INSERT','ozon_policy_revisions:SELECT',
+          'ozon_runtime_gates:SELECT'
+      ]::text[]
+      AND (
+          SELECT array_agg(
+                     relation.relname::text || '.' || attribute.attname::text ||
+                     ':' || acl.privilege_type
+                     ORDER BY relation.relname,attribute.attname,acl.privilege_type
+                 )
+          FROM pg_attribute AS attribute
+          JOIN pg_class AS relation ON relation.oid=attribute.attrelid
+          JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+          WHERE namespace.nspname='control' AND attribute.attnum>0
+            AND NOT attribute.attisdropped
+            AND acl.grantee='ozon_control_planner'::regrole
+      ) = ARRAY[
+          'ozon_campaign_launch_workflows.available_at:UPDATE',
+          'ozon_campaign_launch_workflows.requested_at:UPDATE',
+          'ozon_campaign_launch_workflows.requested_by_actor_id:UPDATE',
+          'ozon_campaign_plans.finished_at:UPDATE',
+          'ozon_campaign_plans.status:UPDATE'
+      ]::text[]
+      AND (
+          SELECT array_agg(
+                     relation.relname::text || ':' || acl.privilege_type
+                     ORDER BY relation.relname,acl.privilege_type
+                 )
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(
+              coalesce(relation.relacl,acldefault('r',relation.relowner))
+          ) AS acl
+          WHERE namespace.nspname='control'
+            AND relation.relname LIKE 'ozon\_%' ESCAPE '\'
+            AND relation.relkind IN ('r','p')
+            AND acl.grantee='ozon_control_executor'::regrole
+      ) = ARRAY[
+          'ozon_campaign_action_reservations:INSERT','ozon_campaign_action_reservations:SELECT',
+          'ozon_campaign_audit_events:INSERT','ozon_campaign_audit_events:SELECT',
+          'ozon_campaign_guards:INSERT','ozon_campaign_guards:SELECT',
+          'ozon_campaign_launch_workflows:SELECT',
+          'ozon_campaign_plan_approvals:SELECT','ozon_campaign_plans:SELECT',
+          'ozon_policy_revisions:SELECT','ozon_runtime_gates:SELECT',
+          'ozon_static_guard_audit_events:INSERT',
+          'ozon_static_guard_audit_events:SELECT'
+      ]::text[]
+      AND (
+          SELECT array_agg(
+                     relation.relname::text || '.' || attribute.attname::text ||
+                     ':' || acl.privilege_type
+                     ORDER BY relation.relname,attribute.attname,acl.privilege_type
+                 )
+          FROM pg_attribute AS attribute
+          JOIN pg_class AS relation ON relation.oid=attribute.attrelid
+          JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+          CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+          WHERE namespace.nspname='control' AND attribute.attnum>0
+            AND NOT attribute.attisdropped
+            AND acl.grantee='ozon_control_executor'::regrole
+      ) = ARRAY[
+          'ozon_campaign_guards.incident_error_class:UPDATE',
+          'ozon_campaign_guards.last_checked_at:UPDATE',
+          'ozon_campaign_guards.last_revenue_minor:UPDATE',
+          'ozon_campaign_guards.last_spend_minor:UPDATE',
+          'ozon_campaign_guards.status:UPDATE',
+          'ozon_campaign_guards.stop_generation:UPDATE',
+          'ozon_campaign_guards.stop_lease_claimed_at:UPDATE',
+          'ozon_campaign_guards.stop_lease_expires_at:UPDATE',
+          'ozon_campaign_guards.stop_lease_owner_id:UPDATE',
+          'ozon_campaign_guards.stop_lease_token:UPDATE',
+          'ozon_campaign_guards.stop_reason:UPDATE',
+          'ozon_campaign_guards.stop_write_started_at:UPDATE',
+          'ozon_campaign_guards.stopped_at:UPDATE',
+          'ozon_campaign_launch_workflows.action:UPDATE',
+          'ozon_campaign_launch_workflows.available_at:UPDATE',
+          'ozon_campaign_launch_workflows.create_identity_preflight_at:UPDATE',
+          'ozon_campaign_launch_workflows.create_identity_preflight_digest:UPDATE',
+          'ozon_campaign_launch_workflows.generation:UPDATE',
+          'ozon_campaign_launch_workflows.last_completed_at:UPDATE',
+          'ozon_campaign_launch_workflows.last_error_class:UPDATE',
+          'ozon_campaign_launch_workflows.last_readback_json:UPDATE',
+          'ozon_campaign_launch_workflows.lease_claimed_at:UPDATE',
+          'ozon_campaign_launch_workflows.lease_expires_at:UPDATE',
+          'ozon_campaign_launch_workflows.lease_owner_id:UPDATE',
+          'ozon_campaign_launch_workflows.lease_token:UPDATE',
+          'ozon_campaign_launch_workflows.write_started_at:UPDATE',
+          'ozon_campaign_plans.campaign_id:UPDATE',
+          'ozon_campaign_plans.finished_at:UPDATE',
+          'ozon_campaign_plans.last_error_class:UPDATE',
+          'ozon_campaign_plans.operation_started_at:UPDATE',
+          'ozon_campaign_plans.readback_json:UPDATE',
+          'ozon_campaign_plans.status:UPDATE'
+      ]::text[]
+      AND has_schema_privilege('ozon_control_planner','control','USAGE')
+      AND NOT has_schema_privilege('ozon_control_planner','control','CREATE')
+      AND has_schema_privilege('ozon_control_executor','control','USAGE')
+      AND NOT has_schema_privilege('ozon_control_executor','control','CREATE')
+      AND has_sequence_privilege(
+          'ozon_control_planner','control.ozon_campaign_audit_events_event_id_seq',
+          'SELECT,USAGE'
+      )
+      AND has_sequence_privilege(
+          'ozon_control_executor','control.ozon_campaign_audit_events_event_id_seq',
+          'SELECT,USAGE'
+      )
+      AND has_sequence_privilege(
+          'ozon_control_executor','control.ozon_static_guard_audit_events_event_id_seq',
+          'SELECT,USAGE'
+      )
+      AND NOT has_sequence_privilege(
+          'ozon_control_planner','control.ozon_static_guard_audit_events_event_id_seq',
+          'SELECT,USAGE'
+      )
       AND NOT EXISTS (
           SELECT 1
           FROM pg_namespace AS namespace
@@ -268,8 +395,16 @@ assert_control_schema_contract() {
       AND NOT EXISTS (
           SELECT 1
           FROM pg_auth_members AS membership
-          WHERE membership.roleid = 'control_writer'::regrole
-             OR membership.member = 'control_writer'::regrole
+          WHERE membership.roleid IN (
+                    'control_writer'::regrole,
+                    'ozon_control_planner'::regrole,
+                    'ozon_control_executor'::regrole
+                )
+             OR membership.member IN (
+                    'control_writer'::regrole,
+                    'ozon_control_planner'::regrole,
+                    'ozon_control_executor'::regrole
+                )
       )
       AND NOT EXISTS (
           SELECT 1
@@ -277,6 +412,7 @@ assert_control_schema_contract() {
           CROSS JOIN unnest(ARRAY[
               'position_collector', 'position_reader', 'report_worker',
               'report_collector', 'report_refresh_requester', 'control_writer',
+              'ozon_control_planner','ozon_control_executor',
               'wb_automation_writer'
           ]::name[]) AS application_role(role_name)
           WHERE namespace.nspname <> 'information_schema'
@@ -319,10 +455,29 @@ assert_control_schema_contract() {
             AND (
                 acl.grantee = 0
                 OR acl.grantee = 'control_writer'::regrole
+                OR (
+                    acl.grantee IN (
+                        'ozon_control_planner'::regrole,
+                        'ozon_control_executor'::regrole
+                    )
+                    AND routine.proname<>'ozon_runtime_gates_active_locked'
+                )
                 OR acl.grantee IN (
                     SELECT role_name::regrole::oid FROM other_app_roles
                 )
             )
+      )
+      AND has_function_privilege(
+          'ozon_control_planner',
+          'control.ozon_runtime_gates_active_locked(text,bigint)','EXECUTE'
+      )
+      AND has_function_privilege(
+          'ozon_control_executor',
+          'control.ozon_runtime_gates_active_locked(text,bigint)','EXECUTE'
+      )
+      AND NOT has_function_privilege(
+          'control_writer',
+          'control.ozon_runtime_gates_active_locked(text,bigint)','EXECUTE'
       )
       AND NOT EXISTS (
           SELECT 1
@@ -332,6 +487,8 @@ assert_control_schema_contract() {
             AND (
                 acl.grantee = 0
                 OR acl.grantee = 'control_writer'::regrole
+                OR acl.grantee = 'ozon_control_planner'::regrole
+                OR acl.grantee = 'ozon_control_executor'::regrole
                 OR acl.grantee IN (
                     SELECT role_name::regrole::oid FROM other_app_roles
                 )
@@ -339,9 +496,11 @@ assert_control_schema_contract() {
       )
       AND (
           SELECT string_agg(routine.proname::text, ',' ORDER BY routine.proname)
-                 = 'enforce_ozon_guard_transition,enforce_ozon_plan_transition,' ||
-                   'enforce_wb_plan_transition,reject_ozon_append_only_mutation,' ||
-                   'reject_wb_append_only_mutation,validate_ozon_approval_insert,' ||
+                 = 'enforce_ozon_guard_transition,' ||
+                   'enforce_ozon_launch_workflow_update,enforce_ozon_plan_transition,' ||
+                   'enforce_wb_plan_transition,initialize_ozon_launch_workflow,' ||
+                   'reject_ozon_append_only_mutation,reject_wb_append_only_mutation,' ||
+                   'validate_ozon_approval_insert,' ||
                    'validate_ozon_guard_insert,validate_ozon_plan_insert,' ||
                    'validate_ozon_policy_revision_insert,' ||
                    'validate_ozon_reservation_insert,' ||
@@ -361,6 +520,13 @@ assert_control_schema_contract() {
                      ':' || constraint_row.contype::text,
                      ',' ORDER BY relation.relname, constraint_row.conname
                  ) =
+                 'ozon_campaign_guards:ozon_guard_metric_evidence_pair:c,' ||
+                 'ozon_campaign_guards:ozon_guard_stop_lease_shape:c,' ||
+                 'ozon_campaign_launch_workflows:ozon_campaign_launch_workflows_pkey:p,' ||
+                 'ozon_campaign_launch_workflows:ozon_campaign_launch_workflows_plan_id_fkey:f,' ||
+                 'ozon_campaign_launch_workflows:ozon_launch_workflow_identity_preflight_shape:c,' ||
+                 'ozon_campaign_launch_workflows:ozon_launch_workflow_lease_shape:c,' ||
+                 'ozon_campaign_launch_workflows:ozon_launch_workflow_request_shape:c,' ||
                  'wb_plan_approvals:wb_approval_ttl:c,' ||
                  'wb_plans:wb_plan_state_shape:c,' ||
                  'wb_plans:wb_plan_ttl:c,' ||
@@ -378,6 +544,13 @@ assert_control_schema_contract() {
             ON namespace.oid = relation.relnamespace
           WHERE namespace.nspname = 'control'
             AND constraint_row.conname IN (
+                'ozon_guard_metric_evidence_pair',
+                'ozon_guard_stop_lease_shape',
+                'ozon_campaign_launch_workflows_pkey',
+                'ozon_campaign_launch_workflows_plan_id_fkey',
+                'ozon_launch_workflow_identity_preflight_shape',
+                'ozon_launch_workflow_lease_shape',
+                'ozon_launch_workflow_request_shape',
                 'wb_approval_ttl',
                 'wb_plan_state_shape',
                 'wb_plan_ttl',
@@ -391,7 +564,7 @@ assert_control_schema_contract() {
             )
       )
       AND (
-          SELECT count(*) = 23
+          SELECT count(*) = 27
           FROM actual_triggers
       )
       AND NOT EXISTS (
@@ -426,6 +599,8 @@ expect_exact_validation_failure \
   REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  OZON_CONTROL_PLANNER_DB_PASSWORD="$ozon_planner_password" \
+  OZON_CONTROL_EXECUTOR_DB_PASSWORD="$ozon_executor_password" \
   WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
 
@@ -442,6 +617,8 @@ expect_exact_validation_failure \
   REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  OZON_CONTROL_PLANNER_DB_PASSWORD="$ozon_planner_password" \
+  OZON_CONTROL_EXECUTOR_DB_PASSWORD="$ozon_executor_password" \
   WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$project_root/position-monitor/initdb/003_roles.sh"
 
@@ -465,6 +642,8 @@ docker run --detach --name "$container" \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   --env REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  --env OZON_CONTROL_PLANNER_DB_PASSWORD="$ozon_planner_password" \
+  --env OZON_CONTROL_EXECUTOR_DB_PASSWORD="$ozon_executor_password" \
   --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$image" >/dev/null
 
@@ -519,7 +698,7 @@ control_writer_psql=(
 )
 docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
 ledger_contract="$({ "${admin_psql[@]}" --tuples-only --no-align --command "
-  SELECT count(*) = 24
+	  SELECT count(*) = 25
      AND bool_and(state = 'applied')
      AND bool_and(applied_at IS NOT NULL)
   FROM mcp_runtime.schema_migrations
@@ -661,22 +840,33 @@ assert_control_schema_contract \
 "${admin_psql[@]}" --command "
   GRANT position_reader TO control_writer;
   GRANT control_writer TO report_worker;
+  GRANT ozon_control_planner TO ozon_control_executor;
+  GRANT ozon_control_executor TO report_worker;
+  GRANT position_reader TO ozon_control_planner;
   GRANT CREATE, CONNECT, TEMPORARY ON DATABASE postgres TO
       position_collector, position_reader, report_worker,
-      report_collector, report_refresh_requester, control_writer, wb_automation_writer;
+      report_collector, report_refresh_requester, control_writer,
+      ozon_control_planner,ozon_control_executor,wb_automation_writer;
   GRANT CREATE ON SCHEMA public TO
       position_collector, position_reader, report_worker,
-      report_collector, report_refresh_requester, control_writer, wb_automation_writer;
+      report_collector, report_refresh_requester, control_writer,
+      ozon_control_planner,ozon_control_executor,wb_automation_writer;
 " >/dev/null
 seeded_control_memberships="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "
     SELECT count(*)
     FROM pg_auth_members AS membership
-    WHERE membership.roleid = 'control_writer'::regrole
-       OR membership.member = 'control_writer'::regrole
+    WHERE membership.roleid IN (
+              'control_writer'::regrole,'ozon_control_planner'::regrole,
+              'ozon_control_executor'::regrole
+          )
+       OR membership.member IN (
+              'control_writer'::regrole,'ozon_control_planner'::regrole,
+              'ozon_control_executor'::regrole
+          )
   "; } | tr -d '[:space:]')"
-if [[ "$seeded_control_memberships" != 2 ]]; then
-  echo "failed to seed both stale control_writer membership directions" >&2
+if [[ "$seeded_control_memberships" != 5 ]]; then
+  echo "failed to seed stale Ozon/control role membership directions" >&2
   printf '%s\n' "$seeded_control_memberships" >&2
   exit 1
 fi
@@ -690,6 +880,8 @@ docker exec \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   --env REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  --env OZON_CONTROL_PLANNER_DB_PASSWORD="$ozon_planner_password" \
+  --env OZON_CONTROL_EXECUTOR_DB_PASSWORD="$ozon_executor_password" \
   --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$container" \
   /opt/mcp-ozon/migrations/003_roles.sh >/dev/null
@@ -698,7 +890,7 @@ assert_control_schema_contract \
   "${admin_psql[@]}"
 converged_database_acl="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "
-    SELECT count(*) = 7 AND bool_and(
+    SELECT count(*) = 9 AND bool_and(
         NOT has_database_privilege(role_name, 'postgres', 'CONNECT')
         AND NOT has_database_privilege(role_name, 'postgres', 'TEMP')
         AND NOT has_database_privilege(role_name, 'postgres', 'CREATE')
@@ -706,6 +898,7 @@ converged_database_acl="$({ "${admin_psql[@]}" --tuples-only --no-align \
     FROM unnest(ARRAY[
         'position_collector', 'position_reader', 'report_worker',
         'report_collector', 'report_refresh_requester', 'control_writer',
+        'ozon_control_planner','ozon_control_executor',
         'wb_automation_writer'
     ]::name[]) AS application_role(role_name)
   "; } | tr -d '[:space:]')"
@@ -716,12 +909,13 @@ if [[ "$converged_database_acl" != t ]]; then
 fi
 converged_schema_acl="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "
-    SELECT count(*) = 7 AND bool_and(
+    SELECT count(*) = 9 AND bool_and(
         NOT has_schema_privilege(role_name, 'public', 'CREATE')
     )
     FROM unnest(ARRAY[
         'position_collector', 'position_reader', 'report_worker',
         'report_collector', 'report_refresh_requester', 'control_writer',
+        'ozon_control_planner','ozon_control_executor',
         'wb_automation_writer'
     ]::name[]) AS application_role(role_name)
   "; } | tr -d '[:space:]')"
@@ -828,6 +1022,8 @@ migration_admin_psql=(
   --file /opt/mcp-ozon/migrations/023_daily_reporting_ozon_refresh_queue.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /opt/mcp-ozon/migrations/024_ozon_control_campaign_plans.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/025_ozon_durable_launch_workflow.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \
@@ -1151,6 +1347,8 @@ expect_failure_containing \
   --env REPORT_COLLECTOR_DB_PASSWORD="$report_collector_password" \
   --env REPORT_REFRESH_REQUESTER_DB_PASSWORD="$report_refresh_requester_password" \
   --env CONTROL_WRITER_DB_PASSWORD="$control_writer_password" \
+  --env OZON_CONTROL_PLANNER_DB_PASSWORD="$ozon_planner_password" \
+  --env OZON_CONTROL_EXECUTOR_DB_PASSWORD="$ozon_executor_password" \
   --env WB_AUTOMATION_DB_PASSWORD="$wb_automation_password" \
   "$container" \
   /opt/mcp-ozon/migrations/003_roles.sh
@@ -3121,7 +3319,7 @@ expect_failure_containing \
     VALUES ('denied', 'denied', 'denied', 'denied', 'denied')
   "
 
-for role in position_collector position_reader report_collector report_refresh_requester report_worker control_writer wb_automation_writer; do
+for role in position_collector position_reader report_collector report_refresh_requester report_worker control_writer ozon_control_planner ozon_control_executor wb_automation_writer; do
   case "$role" in
     position_collector) role_password="$collector_password" ;;
     position_reader) role_password="$reader_password" ;;
@@ -3129,6 +3327,8 @@ for role in position_collector position_reader report_collector report_refresh_r
     report_collector) role_password="$report_collector_password" ;;
     report_refresh_requester) role_password="$report_refresh_requester_password" ;;
     control_writer) role_password="$control_writer_password" ;;
+    ozon_control_planner) role_password="$ozon_planner_password" ;;
+    ozon_control_executor) role_password="$ozon_executor_password" ;;
     wb_automation_writer) role_password="$wb_automation_password" ;;
   esac
   expect_failure_containing \
@@ -3203,11 +3403,12 @@ role_attributes="$("${admin_psql[@]}" --tuples-only --no-align --field-separator
     FROM pg_roles
     WHERE rolname IN (
         'position_collector', 'position_reader', 'report_collector', 'report_worker',
-        'report_refresh_requester', 'control_writer', 'wb_automation_writer'
+        'report_refresh_requester', 'control_writer','ozon_control_planner',
+        'ozon_control_executor','wb_automation_writer'
     )
     ORDER BY rolname
   ")"
-expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_refresh_requester:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4\nwb_automation_writer:t:f:f:f:f:f:f:2'
+expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nozon_control_executor:t:f:f:f:f:f:f:4\nozon_control_planner:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_refresh_requester:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4\nwb_automation_writer:t:f:f:f:f:f:f:2'
 if [[ "$role_attributes" != "$expected_attributes" ]]; then
   echo "restricted database role attributes differ from the expected policy" >&2
   printf '%s\n' "$role_attributes" >&2

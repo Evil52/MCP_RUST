@@ -11,13 +11,10 @@ use crate::{
     auth::{JwtAuthenticator, ProtectedResourceMetadata},
     config::{AccessRegistry, Actor, RegistrySource},
     control::{
-        ozon::{OzonAdsWriteClient, OzonPlanRepository},
-        plan::WbPlanRepository,
-        policy::ControlPolicy,
+        ozon::OzonPlanRepository, plan::WbPlanRepository, policy::ControlPolicy,
         wb::WbBidWriteClient,
     },
     http::HttpMcpServer,
-    ozon_performance::PerformanceClient,
     wb::WbClient,
 };
 
@@ -52,9 +49,6 @@ pub struct WbControlServices {
 #[derive(Clone)]
 pub struct OzonControlServices {
     pub account_id: String,
-    pub store_id: crate::config::StoreId,
-    pub reader: Arc<PerformanceClient>,
-    pub writer: Option<Arc<OzonAdsWriteClient>>,
     pub plans: Arc<OzonPlanRepository>,
 }
 
@@ -63,9 +57,6 @@ impl std::fmt::Debug for OzonControlServices {
         formatter
             .debug_struct("OzonControlServices")
             .field("account_id", &self.account_id)
-            .field("store_id", &self.store_id)
-            .field("reader", &"<configured>")
-            .field("writer_configured", &self.writer.is_some())
             .field("plans", &"<configured>")
             .finish()
     }
@@ -131,7 +122,7 @@ impl ControlMcp {
         if self.authenticator.is_some() {
             self.ozon = Some(services);
         } else {
-            tracing::error!("refusing to attach Ozon write services to dev/no-auth Control MCP");
+            tracing::error!("refusing to attach Ozon plan services to dev/no-auth Control MCP");
         }
         self
     }
@@ -228,7 +219,7 @@ impl ServerHandler for ControlMcp {
                     .with_title("OzonOFK Advertising Control"),
             )
             .with_instructions(
-                "Отдельный fail-closed контур управления рекламой. По умолчанию marketplace credentials, egress, persistence и writes отключены. WB-план живёт пять минут, требует short-lived approval другого явно делегированного actor, точный plan_digest и три runtime lease-gate. Apply исполняет не более одного PATCH и перед ним повторно проверяет approval/gates/incident lock. Никогда не повторяйте apply после ambiguous/reconciliation_required: вызывайте reconcile, который выполняет только read-back. Не просите API-ключи через чат и не заявляйте об успехе, пока status не равен applied.",
+                "Отдельный fail-closed контур управления рекламой. По умолчанию marketplace credentials, egress, persistence и writes отключены. WB apply исполняет не более одного PATCH после short-lived approval и повторной проверки permit. Ozon apply только атомарно ставит одобренный plan в durable outbox; отдельный guard runtime владеет lease, marketplace writes и readback recovery. Ozon reconcile читает сохранённый статус и никогда не выполняет write. Не просите API-ключи через чат и не заявляйте об успехе, пока status не равен applied.",
             )
     }
 }

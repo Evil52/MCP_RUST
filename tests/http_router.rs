@@ -81,7 +81,7 @@ fn registry_with_path() -> (RegistrySource, std::path::PathBuf) {
                 "id": "admin",
                 "name": "Administrator",
                 "role": "admin",
-                "oidc": {"username": "admin"}
+                "oidc": {"subject": "router-test-subject", "username": "admin"}
             }],
             "accounts": [],
         }))

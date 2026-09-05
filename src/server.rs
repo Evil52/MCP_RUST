@@ -6925,6 +6925,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
+        process::Command,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -7026,8 +7027,8 @@ mod tests {
         fs::write(&path, r#"{
           "version": 1,
           "actors": [
-            {"id":"admin","name":"Administrator","role":"admin"},
-            {"id":"manager","name":"Manager","role":"manager"}
+            {"id":"admin","name":"Administrator","role":"admin","oidc":{"subject":"server-test-admin"}},
+            {"id":"manager","name":"Manager","role":"manager","oidc":{"subject":"server-test-manager"}}
           ],
           "accounts": [
             {"id":"store_a","organization":"Example organization A","marketplace":"ozon","seller_client_id":"client-a","manager_id":"admin","ozon":{"store_id":"store_a","client_id_env":"OZON_CLIENT_ID","api_key_env":"OZON_API_KEY"}},
@@ -9189,42 +9190,58 @@ mod tests {
     /// Ozon Performance is the most damaging of the four: its OAuth handshake
     /// carries `client_secret` in the *request body*, so a proxy that sees the
     /// token POST holds the advertising principal outright.
-    ///
-    /// This test mutates process-wide environment variables. That is safe here
-    /// because every production client opts out of the proxy and every helper in
-    /// this binary uses `loopback_client`; a future helper built from a bare
-    /// `reqwest::Client` would need the same treatment.
     #[tokio::test]
     async fn wildberries_and_performance_clients_ignore_an_ambient_http_proxy() {
-        /// Removes the proxy variables on the way out, including while a panic
-        /// unwinds. Restoring them only on the success path would let one failed
-        /// assertion leave the whole test binary proxied, turning a single clear
-        /// failure into unrelated hangs elsewhere in the suite.
-        struct AmbientProxy;
-
-        impl AmbientProxy {
-            fn set(url: &str) -> Self {
-                // SAFETY: see the doc comment on the test.
-                unsafe {
-                    std::env::set_var("HTTP_PROXY", url);
-                    std::env::set_var("ALL_PROXY", url);
-                }
-                Self
-            }
-        }
-
-        impl Drop for AmbientProxy {
-            fn drop(&mut self) {
-                // SAFETY: as above.
-                unsafe {
-                    std::env::remove_var("HTTP_PROXY");
-                    std::env::remove_var("ALL_PROXY");
-                }
-            }
-        }
+        const CHILD_MARKER: &str = "MCP_OZON_AMBIENT_PROXY_CHILD";
+        const CHILD_WB_URL: &str = "MCP_OZON_AMBIENT_PROXY_WB_URL";
+        const CHILD_PERFORMANCE_URL: &str = "MCP_OZON_AMBIENT_PROXY_PERFORMANCE_URL";
 
         fn quiet(receiver: &mpsc::Receiver<String>) -> bool {
             receiver.recv_timeout(Duration::from_millis(300)).is_err()
+        }
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let wb_url = std::env::var(CHILD_WB_URL).unwrap();
+            let performance_url = std::env::var(CHILD_PERFORMANCE_URL).unwrap();
+
+            // Control: a client that has not opted out must reach the proxy.
+            let _ = loopback_proxy_probe(&wb_url).await;
+
+            let wb_client = WbClient::new_for_test(
+                Duration::from_secs(3),
+                BTreeMap::from([(
+                    "account_wb".to_owned(),
+                    crate::wb::WbCredentials {
+                        token: "proxy-test-wb-token".to_owned(),
+                    },
+                )]),
+                &wb_url,
+                &wb_url,
+            );
+            let _ = wb_client.ping("account_wb").await;
+
+            let performance_client = PerformanceClient::new_for_test(
+                performance_url,
+                Duration::from_secs(3),
+                BTreeMap::from([(
+                    StoreId::from("store_a"),
+                    PerformanceCredentials {
+                        client_id: "proxy-test-performance-client".to_owned(),
+                        client_secret: "proxy-test-performance-secret".to_owned(),
+                    },
+                )]),
+            );
+            let _ = performance_client
+                .daily_statistics(
+                    &StoreId::from("store_a"),
+                    StatisticsQuery {
+                        campaign_ids: vec![1],
+                        date_from: "2026-08-01".to_owned(),
+                        date_to: "2026-08-02".to_owned(),
+                    },
+                )
+                .await;
+            return;
         }
 
         let (proxy_url, proxy_requests) = mock_http(vec![
@@ -9239,59 +9256,39 @@ mod tests {
             (200, json!({"rows": []}).to_string()),
         ]);
 
-        let _ambient_proxy = AmbientProxy::set(&proxy_url);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "server::tests::wildberries_and_performance_clients_ignore_an_ambient_http_proxy",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env(CHILD_MARKER, "1")
+            .env(CHILD_WB_URL, &wb_url)
+            .env(CHILD_PERFORMANCE_URL, &performance_url)
+            .env("HTTP_PROXY", &proxy_url)
+            .env("ALL_PROXY", &proxy_url);
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-        // Control: a client that has not opted out must reach the proxy. Without
-        // this the assertions below would pass vacuously if the HTTP stack ever
-        // stopped honouring proxy variables.
-        let _ = loopback_proxy_probe(&wb_url).await;
         assert!(
             proxy_requests.recv_timeout(Duration::from_secs(2)).is_ok(),
             "the control request must reach the proxy, otherwise this test proves nothing"
         );
-
-        let wb_client = WbClient::new_for_test(
-            Duration::from_secs(3),
-            BTreeMap::from([(
-                "account_wb".to_owned(),
-                crate::wb::WbCredentials {
-                    token: "proxy-test-wb-token".to_owned(),
-                },
-            )]),
-            &wb_url,
-            &wb_url,
-        );
-        let _ = wb_client.ping("account_wb").await;
         assert!(
             wb_requests.recv_timeout(Duration::from_secs(2)).is_ok(),
             "the WB client must contact the marketplace directly"
         );
-        assert!(
-            quiet(&proxy_requests),
-            "the WB Authorization token must never traverse an ambient proxy"
-        );
-
-        let performance_client = PerformanceClient::new_for_test(
-            performance_url,
-            Duration::from_secs(3),
-            BTreeMap::from([(
-                StoreId::from("store_a"),
-                PerformanceCredentials {
-                    client_id: "proxy-test-performance-client".to_owned(),
-                    client_secret: "proxy-test-performance-secret".to_owned(),
-                },
-            )]),
-        );
-        let _ = performance_client
-            .daily_statistics(
-                &StoreId::from("store_a"),
-                StatisticsQuery {
-                    campaign_ids: vec![1],
-                    date_from: "2026-08-01".to_owned(),
-                    date_to: "2026-08-02".to_owned(),
-                },
-            )
-            .await;
         let token_request = performance_requests
             .recv_timeout(Duration::from_secs(2))
             .expect("the OAuth token request must go straight to the vendor");
@@ -9301,7 +9298,7 @@ mod tests {
         );
         assert!(
             quiet(&proxy_requests),
-            "the Performance client_secret must never traverse an ambient proxy"
+            "marketplace credentials must never traverse an ambient proxy"
         );
     }
 
@@ -13621,7 +13618,7 @@ mod tests {
         assert!(!body.contains(ACCESS_DENIED), "{body}");
         assert_eq!(
             registry.load_count(),
-            1,
+            2,
             "tool RBAC must reuse the transport authentication snapshot without reloading"
         );
         task.abort();

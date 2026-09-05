@@ -110,7 +110,7 @@ db_image="$(
   awk '/^FROM postgres:/ { print $2; exit }' \
     "$project_root/position-monitor/Dockerfile"
 )"
-if [[ ! "$db_image" =~ ^postgres:[0-9]+-alpine@sha256:[0-9a-f]{64}$ ]]; then
+if [[ ! "$db_image" =~ ^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$ ]]; then
   echo "pinned PostgreSQL image could not be resolved from position-monitor/Dockerfile" >&2
   exit 1
 fi

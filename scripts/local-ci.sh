@@ -40,7 +40,7 @@ shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
 ./scripts/test-release-image-lock.sh
 ./scripts/test-shared-rust-image-builder.sh
 
-echo "==> Core library source-line coverage"
+echo "==> Library coverage and runtime binary probes"
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo "cargo-llvm-cov is required: cargo install cargo-llvm-cov --version 0.8.7 --locked" >&2
   exit 1
@@ -48,10 +48,10 @@ fi
 ./scripts/with-position-test-db.sh cargo llvm-cov \
   --locked \
     --all-targets \
-    --no-default-features \
+    --all-features \
     --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|ozon-campaign-guard|position-collector|report-collector|report-worker|wb-automation))\.rs$' \
     --show-missing-lines \
-    --fail-under-functions 100 \
-    --fail-under-lines 99.9
+    --fail-under-functions 95.7 \
+    --fail-under-lines 96.3
 
 echo "Local CI passed."

@@ -8,6 +8,8 @@ set -eu
 : "${REPORT_COLLECTOR_DB_PASSWORD:?REPORT_COLLECTOR_DB_PASSWORD is required}"
 : "${REPORT_REFRESH_REQUESTER_DB_PASSWORD:?REPORT_REFRESH_REQUESTER_DB_PASSWORD is required}"
 : "${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}"
+: "${OZON_CONTROL_PLANNER_DB_PASSWORD:?OZON_CONTROL_PLANNER_DB_PASSWORD is required}"
+: "${OZON_CONTROL_EXECUTOR_DB_PASSWORD:?OZON_CONTROL_EXECUTOR_DB_PASSWORD is required}"
 : "${WB_AUTOMATION_DB_PASSWORD:?WB_AUTOMATION_DB_PASSWORD is required}"
 
 validate_password() {
@@ -32,6 +34,8 @@ validate_password REPORT_WORKER_DB_PASSWORD "$REPORT_WORKER_DB_PASSWORD"
 validate_password REPORT_COLLECTOR_DB_PASSWORD "$REPORT_COLLECTOR_DB_PASSWORD"
 validate_password REPORT_REFRESH_REQUESTER_DB_PASSWORD "$REPORT_REFRESH_REQUESTER_DB_PASSWORD"
 validate_password CONTROL_WRITER_DB_PASSWORD "$CONTROL_WRITER_DB_PASSWORD"
+validate_password OZON_CONTROL_PLANNER_DB_PASSWORD "$OZON_CONTROL_PLANNER_DB_PASSWORD"
+validate_password OZON_CONTROL_EXECUTOR_DB_PASSWORD "$OZON_CONTROL_EXECUTOR_DB_PASSWORD"
 validate_password WB_AUTOMATION_DB_PASSWORD "$WB_AUTOMATION_DB_PASSWORD"
 
 if [ "$POSTGRES_USER" = position_collector ] ||
@@ -40,6 +44,8 @@ if [ "$POSTGRES_USER" = position_collector ] ||
    [ "$POSTGRES_USER" = report_collector ] ||
    [ "$POSTGRES_USER" = report_refresh_requester ] ||
    [ "$POSTGRES_USER" = control_writer ] ||
+   [ "$POSTGRES_USER" = ozon_control_planner ] ||
+   [ "$POSTGRES_USER" = ozon_control_executor ] ||
    [ "$POSTGRES_USER" = wb_automation_writer ]; then
   echo "POSTGRES_USER must not reuse a restricted application role" >&2
   exit 1
@@ -68,12 +74,32 @@ if [ "$POSITION_COLLECTOR_DB_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
   echo "all application database passwords must be different" >&2
   exit 1
 fi
+if [ "$OZON_CONTROL_PLANNER_DB_PASSWORD" = "$OZON_CONTROL_EXECUTOR_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_PLANNER_DB_PASSWORD" = "$POSITION_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_PLANNER_DB_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_PLANNER_DB_PASSWORD" = "$REPORT_WORKER_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_PLANNER_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_PLANNER_DB_PASSWORD" = "$REPORT_REFRESH_REQUESTER_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_PLANNER_DB_PASSWORD" = "$CONTROL_WRITER_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_PLANNER_DB_PASSWORD" = "$WB_AUTOMATION_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_EXECUTOR_DB_PASSWORD" = "$POSITION_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_EXECUTOR_DB_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_EXECUTOR_DB_PASSWORD" = "$REPORT_WORKER_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_EXECUTOR_DB_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_EXECUTOR_DB_PASSWORD" = "$REPORT_REFRESH_REQUESTER_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_EXECUTOR_DB_PASSWORD" = "$CONTROL_WRITER_DB_PASSWORD" ] ||
+   [ "$OZON_CONTROL_EXECUTOR_DB_PASSWORD" = "$WB_AUTOMATION_DB_PASSWORD" ]; then
+  echo "all application database passwords must be different" >&2
+  exit 1
+fi
 if [ "$POSTGRES_PASSWORD" = "$POSITION_COLLECTOR_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$POSITION_READER_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$REPORT_WORKER_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$REPORT_COLLECTOR_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$REPORT_REFRESH_REQUESTER_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$CONTROL_WRITER_DB_PASSWORD" ] ||
+   [ "$POSTGRES_PASSWORD" = "$OZON_CONTROL_PLANNER_DB_PASSWORD" ] ||
+   [ "$POSTGRES_PASSWORD" = "$OZON_CONTROL_EXECUTOR_DB_PASSWORD" ] ||
    [ "$POSTGRES_PASSWORD" = "$WB_AUTOMATION_DB_PASSWORD" ]; then
   echo "application database passwords must differ from the admin password" >&2
   exit 1
@@ -90,6 +116,8 @@ PGPASSWORD="$POSTGRES_PASSWORD" psql --set=ON_ERROR_STOP=1 \
 \getenv report_collector_password REPORT_COLLECTOR_DB_PASSWORD
 \getenv report_refresh_requester_password REPORT_REFRESH_REQUESTER_DB_PASSWORD
 \getenv control_writer_password CONTROL_WRITER_DB_PASSWORD
+\getenv ozon_control_planner_password OZON_CONTROL_PLANNER_DB_PASSWORD
+\getenv ozon_control_executor_password OZON_CONTROL_EXECUTOR_DB_PASSWORD
 \getenv wb_automation_password WB_AUTOMATION_DB_PASSWORD
 
 BEGIN;
@@ -124,6 +152,20 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'control_writer')
 \gexec
 
 SELECT format(
+    'CREATE ROLE ozon_control_planner LOGIN PASSWORD %L',
+    :'ozon_control_planner_password'
+)
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ozon_control_planner')
+\gexec
+
+SELECT format(
+    'CREATE ROLE ozon_control_executor LOGIN PASSWORD %L',
+    :'ozon_control_executor_password'
+)
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ozon_control_executor')
+\gexec
+
+SELECT format(
     'CREATE ROLE wb_automation_writer LOGIN PASSWORD %L',
     :'wb_automation_password'
 )
@@ -143,6 +185,12 @@ ALTER ROLE report_refresh_requester WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATERO
     PASSWORD :'report_refresh_requester_password';
 ALTER ROLE control_writer WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 PASSWORD :'control_writer_password';
+ALTER ROLE ozon_control_planner WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+    NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4
+    PASSWORD :'ozon_control_planner_password';
+ALTER ROLE ozon_control_executor WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+    NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4
+    PASSWORD :'ozon_control_executor_password';
 ALTER ROLE wb_automation_writer WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
     NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 2
     PASSWORD :'wb_automation_password';
@@ -157,10 +205,12 @@ FROM pg_auth_members AS membership
 JOIN pg_roles AS granted_role ON granted_role.oid = membership.roleid
 JOIN pg_roles AS member_role ON member_role.oid = membership.member
 WHERE granted_role.rolname IN (
-        'report_refresh_requester', 'control_writer', 'wb_automation_writer'
+        'report_refresh_requester', 'control_writer', 'ozon_control_planner',
+        'ozon_control_executor', 'wb_automation_writer'
       )
    OR member_role.rolname IN (
-        'report_refresh_requester', 'control_writer', 'wb_automation_writer'
+        'report_refresh_requester', 'control_writer', 'ozon_control_planner',
+        'ozon_control_executor', 'wb_automation_writer'
       )
 ORDER BY granted_role.rolname, member_role.rolname
 \gexec
@@ -178,6 +228,10 @@ ALTER ROLE report_refresh_requester SET statement_timeout = '15s';
 ALTER ROLE report_refresh_requester SET idle_in_transaction_session_timeout = '15s';
 ALTER ROLE control_writer SET statement_timeout = '30s';
 ALTER ROLE control_writer SET idle_in_transaction_session_timeout = '15s';
+ALTER ROLE ozon_control_planner SET statement_timeout = '30s';
+ALTER ROLE ozon_control_planner SET idle_in_transaction_session_timeout = '15s';
+ALTER ROLE ozon_control_executor SET statement_timeout = '30s';
+ALTER ROLE ozon_control_executor SET idle_in_transaction_session_timeout = '15s';
 ALTER ROLE wb_automation_writer SET statement_timeout = '30s';
 ALTER ROLE wb_automation_writer SET idle_in_transaction_session_timeout = '15s';
 
@@ -202,6 +256,8 @@ CROSS JOIN (
       ('report_collector'),
       ('report_refresh_requester'),
       ('control_writer'),
+      ('ozon_control_planner'),
+      ('ozon_control_executor'),
       ('wb_automation_writer')
 ) AS application_role(rolname)
 ORDER BY database_row.datname, application_role.rolname
@@ -229,6 +285,8 @@ CROSS JOIN (
       ('report_collector'),
       ('report_refresh_requester'),
       ('control_writer'),
+      ('ozon_control_planner'),
+      ('ozon_control_executor'),
       ('wb_automation_writer')
 ) AS application_role(rolname)
 WHERE namespace_row.nspname <> 'information_schema'
@@ -237,17 +295,20 @@ ORDER BY namespace_row.nspname, application_role.rolname
 \gexec
 
 GRANT CONNECT ON DATABASE :"db_name" TO position_collector, position_reader, report_worker,
-    report_collector, report_refresh_requester, control_writer, wb_automation_writer;
+    report_collector, report_refresh_requester, control_writer,
+    ozon_control_planner, ozon_control_executor, wb_automation_writer;
 GRANT USAGE ON SCHEMA search_position TO position_collector, position_reader;
 
 -- Make re-running this role bootstrap converge to the exact ACL instead of
 -- retaining stale grants from an older schema revision.
 REVOKE ALL ON ALL TABLES IN SCHEMA search_position
     FROM position_collector, position_reader, report_worker, report_collector,
-    report_refresh_requester, control_writer, wb_automation_writer;
+    report_refresh_requester, control_writer, ozon_control_planner,
+    ozon_control_executor, wb_automation_writer;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA search_position
     FROM position_collector, position_reader, report_worker, report_collector,
-    report_refresh_requester, control_writer, wb_automation_writer;
+    report_refresh_requester, control_writer, ozon_control_planner,
+    ozon_control_executor, wb_automation_writer;
 
 GRANT SELECT ON search_position.monitors TO position_collector;
 GRANT SELECT, INSERT ON search_position.collection_runs TO position_collector;

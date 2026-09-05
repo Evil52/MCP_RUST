@@ -45,6 +45,54 @@ pub struct OzonCampaignLaunchManifest {
     pub activation_required: bool,
 }
 
+impl OzonCampaignLaunchManifest {
+    /// Recomputes the signed intent and verifies that every provider request is
+    /// an exact mechanical projection of that intent.
+    pub(super) fn has_exact_integrity(&self) -> bool {
+        self.has_exact_integrity_for_title(&self.spec.title)
+    }
+
+    pub(super) fn has_exact_persisted_integrity(&self, plan_id: &str) -> bool {
+        let provider_title = provider_title_for_plan_id(plan_id);
+        self.has_exact_integrity_for_title(&provider_title)
+            // Rows created before migration 025 used the human title. Their
+            // stable post-create stages remain safe because campaign_id is
+            // already provider-issued; a legacy Approved row is never allowed
+            // to start a create write by repository validation below.
+            || self.has_exact_integrity()
+    }
+
+    fn has_exact_integrity_for_title(&self, expected_title: &str) -> bool {
+        validate_spec(&self.spec).is_ok()
+            && self.manifest_digest
+                == make_manifest_digest(
+                    &self.actor_id,
+                    self.policy_schema_version,
+                    self.policy_revision,
+                    &self.policy_digest,
+                    &self.spec,
+                )
+            && self.create_request.title == expected_title
+            && self.create_request.from_date == self.spec.from_date
+            && self.create_request.to_date == self.spec.to_date
+            && self.create_request.weekly_budget == self.spec.weekly_budget_microrubles
+            && self.create_request.placement == OzonPlacement::SearchAndCategory
+            && self.create_request.product_autopilot_strategy == OzonCampaignStrategy::TargetBids
+            && self.products_request.bids.as_slice()
+                == [OzonCampaignProduct {
+                    sku: self.spec.skus[0],
+                    bid: Some(self.spec.initial_cpc_bid_microrubles),
+                    target_cir: None,
+                    top_position: None,
+                }]
+            && self.activation_required
+    }
+}
+
+pub(super) fn provider_title_for_plan_id(plan_id: &str) -> String {
+    format!("mcp-ozon-{plan_id}")
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum OzonLaunchPlanError {
     #[error("Ozon campaign launch spec имеет недопустимые данные")]

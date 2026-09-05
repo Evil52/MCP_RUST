@@ -17,6 +17,7 @@ use rmcp::{
     schemars::JsonSchema, transport::streamable_http_server::session::local::LocalSessionManager,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::wb::WbCredentials;
 
@@ -162,6 +163,18 @@ pub struct OzonAccount {
 pub struct OzonPerformanceAccount {
     pub client_id_env: String,
     pub client_secret_env: String,
+    /// Deprecated input retained only so older registries can be read during
+    /// migration. The credentialless planner ignores it; new registries must
+    /// omit it.
+    #[serde(default)]
+    pub control_planner_client_id_sha256: Option<String>,
+    /// SHA-256 of the dedicated Ozon workflow executor Performance Client-Id.
+    ///
+    /// Keeping this identity distinct from both reporting and planner reads
+    /// gives the separate guard process exclusive ownership of its quota and
+    /// preserves the final marker-to-write pacing boundary across processes.
+    #[serde(default)]
+    pub control_executor_client_id_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,12 +352,35 @@ impl AccessRegistry {
         Ok(())
     }
 
+    pub(crate) fn has_control_performance_client_id_fingerprint(&self, fingerprint: &str) -> bool {
+        self.accounts.iter().any(|account| {
+            account
+                .ozon
+                .as_ref()
+                .and_then(|ozon| ozon.performance.as_ref())
+                .and_then(|performance| performance.control_executor_client_id_sha256.as_deref())
+                == Some(fingerprint)
+        })
+    }
+
     fn validate_accounts(&self, actor_ids: &BTreeSet<&str>) -> Result<()> {
         let mut store_ids = BTreeSet::new();
         let mut wb_seller_sids = BTreeSet::new();
+        let mut ozon_control_client_ids = BTreeSet::new();
         let mut selectors = self.account_selectors()?;
         for account in &self.accounts {
             Self::validate_account(account, actor_ids, &mut store_ids, &mut selectors)?;
+            if let Some(performance) = account
+                .ozon
+                .as_ref()
+                .and_then(|ozon| ozon.performance.as_ref())
+                && let Some(fingerprint) = performance.control_executor_client_id_sha256.as_deref()
+                && !ozon_control_client_ids.insert(fingerprint)
+            {
+                bail!(
+                    "Control Performance Client-Id fingerprint должен быть уникальным между account bindings и runtime roles"
+                );
+            }
             if let Some(seller_sid) = account
                 .wildberries
                 .as_ref()
@@ -433,6 +469,14 @@ impl AccessRegistry {
                 &performance.client_secret_env,
                 "performance.client_secret_env",
             )?;
+            for (field, fingerprint) in [(
+                "performance.control_executor_client_id_sha256",
+                performance.control_executor_client_id_sha256.as_deref(),
+            )] {
+                if let Some(fingerprint) = fingerprint {
+                    validate_sha256_fingerprint(fingerprint, field)?;
+                }
+            }
         }
         if !store_ids.insert(ozon.store_id.clone()) {
             bail!("store_id={} должен быть уникальным", ozon.store_id);
@@ -526,6 +570,29 @@ impl AccessRegistry {
         Ok(())
     }
 
+    /// Enforces the immutable identity boundary required by JWT/OIDC mode.
+    ///
+    /// `username` and `email` remain accepted as human-readable registry
+    /// metadata, but neither is a stable security identifier: both may be
+    /// renamed or reassigned by the identity provider. Only the issuer-scoped
+    /// `sub` claim is used to grant an actor's roles and account access.
+    fn validate_jwt_oidc_bindings(&self) -> Result<()> {
+        for actor in &self.actors {
+            if actor
+                .oidc
+                .as_ref()
+                .and_then(|identity| identity.subject.as_ref())
+                .is_none()
+            {
+                bail!(
+                    "OIDC identity пользователя {} должен содержать immutable subject при MCP_AUTH_MODE=jwt; username/email не используются для авторизации",
+                    actor.id
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn actor(&self, id: &str) -> Result<&Actor> {
         self.actors
             .iter()
@@ -553,22 +620,13 @@ impl AccessRegistry {
         })
     }
 
-    pub fn actor_for_oidc(
-        &self,
-        subject: &str,
-        username: Option<&str>,
-        email: Option<&str>,
-    ) -> Result<&Actor> {
+    pub fn actor_for_oidc(&self, subject: &str) -> Result<&Actor> {
         let mut matches = self.actors.iter().filter(|actor| {
-            actor.oidc.as_ref().is_some_and(|identity| {
-                identity.subject.as_deref().map_or_else(
-                    || {
-                        username.is_some_and(|value| identity.username.as_deref() == Some(value))
-                            || email.is_some_and(|value| identity.email.as_deref() == Some(value))
-                    },
-                    |expected_subject| expected_subject == subject,
-                )
-            })
+            actor
+                .oidc
+                .as_ref()
+                .and_then(|identity| identity.subject.as_deref())
+                == Some(subject)
         });
         let actor = matches
             .next()
@@ -589,6 +647,7 @@ struct OzonCredentialBinding {
     api_key_env: String,
     performance_client_id_env: Option<String>,
     performance_client_secret_env: Option<String>,
+    performance_control_executor_client_id_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -636,9 +695,39 @@ impl OzonCredentialBinding {
                         .performance
                         .as_ref()
                         .map(|performance| performance.client_secret_env.clone()),
+                    performance_control_executor_client_id_sha256: ozon
+                        .performance
+                        .as_ref()
+                        .and_then(|performance| {
+                            performance.control_executor_client_id_sha256.clone()
+                        }),
                 })
             })
             .collect()
+    }
+}
+
+/// Computes the non-secret registry binding for one exact credential value.
+#[must_use]
+pub(crate) fn credential_sha256(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            use std::fmt::Write as _;
+            write!(output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
+}
+
+fn validate_sha256_fingerprint(value: &str, field: &str) -> Result<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        bail!("{field} должен быть lowercase SHA-256 digest")
     }
 }
 
@@ -653,18 +742,59 @@ struct CachedRegistry {
     registry: Arc<AccessRegistry>,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct TestLoadBlockState {
+    entered: tokio::sync::Notify,
+    released: std::sync::Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestLoadBlockControl(Arc<TestLoadBlockState>);
+
+#[cfg(test)]
+impl TestLoadBlockControl {
+    async fn wait_until_entered(&self) {
+        self.0.entered.notified().await;
+    }
+
+    fn release(&self) {
+        let mut released = self
+            .0
+            .released
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *released = true;
+        drop(released);
+        self.0.release.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestLoadBlockControl {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RegistrySource {
     path: Arc<PathBuf>,
     credential_bindings: Arc<BTreeSet<OzonCredentialBinding>>,
     wb_credential_bindings: Arc<BTreeSet<WbCredentialBinding>>,
     cache: Arc<RwLock<Option<CachedRegistry>>>,
+    jwt_oidc_bindings_required: Arc<std::sync::atomic::AtomicBool>,
+    async_load_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     load_count: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     last_load_thread: Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
     #[cfg(test)]
     panic_next_load: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    block_next_load: Arc<std::sync::Mutex<Option<Arc<TestLoadBlockState>>>>,
 }
 
 impl RegistrySource {
@@ -680,12 +810,16 @@ impl RegistrySource {
                 raw,
                 registry: Arc::new(registry),
             }))),
+            jwt_oidc_bindings_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            async_load_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             load_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             last_load_thread: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             panic_next_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            block_next_load: Arc::new(std::sync::Mutex::new(None)),
         };
         Ok(source)
     }
@@ -711,13 +845,38 @@ impl RegistrySource {
                 !self.panic_next_load.swap(false, Ordering::Relaxed),
                 "injected registry load panic"
             );
+            let block = {
+                let mut block_next_load = self
+                    .block_next_load
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let block = block_next_load.take();
+                drop(block_next_load);
+                block
+            };
+            if let Some(block) = block {
+                block.entered.notify_one();
+                let mut released = block
+                    .released
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                while !*released {
+                    released = block
+                        .release
+                        .wait(released)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                drop(released);
+            }
         }
 
         let raw = read_registry_bytes(&self.path)?;
         if let Some(cached) = self.cached(&raw) {
+            self.validate_runtime_identity_contract(&cached)?;
             return Ok(cached);
         }
         let registry = AccessRegistry::from_slice(&raw, &self.path)?;
+        self.validate_runtime_identity_contract(&registry)?;
         if OzonCredentialBinding::snapshot(&registry) != *self.credential_bindings {
             bail!(
                 "MCP_ACCESS_CONFIG_RESTART_REQUIRED: привязки Ozon credentials изменились; перезапустите MCP, чтобы атомарно перечитать реестр и ключи"
@@ -736,15 +895,46 @@ impl RegistrySource {
         Ok(registry)
     }
 
+    /// Enables the JWT-only immutable-subject contract for this source and all
+    /// of its clones, including future hot reloads.
+    pub(crate) fn require_jwt_oidc_bindings(&self) -> Result<()> {
+        let snapshot = self.load()?;
+        snapshot.validate_jwt_oidc_bindings()?;
+        self.jwt_oidc_bindings_required
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    fn validate_runtime_identity_contract(&self, registry: &AccessRegistry) -> Result<()> {
+        if self
+            .jwt_oidc_bindings_required
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            registry.validate_jwt_oidc_bindings()?;
+        }
+        Ok(())
+    }
+
     /// Loads and validates the hot-reloadable registry without blocking a
     /// Tokio runtime worker on filesystem I/O or JSON validation.
     pub(crate) async fn load_async(&self) -> Result<Arc<AccessRegistry>> {
-        let source = self.clone();
-        tokio::task::spawn_blocking(move || source.load())
+        let permit = Arc::clone(&self.async_load_gate)
+            .acquire_owned()
             .await
-            .map_err(|_| {
-                anyhow::anyhow!("не удалось безопасно выполнить фоновую загрузку реестра доступа")
-            })?
+            .map_err(|_| anyhow::anyhow!("фоновая загрузка реестра доступа остановлена"))?;
+        let source = self.clone();
+        tokio::task::spawn_blocking(move || {
+            // A timed-out caller drops only the JoinHandle; Tokio cannot cancel
+            // an already-running blocking closure. Keeping the shared permit in
+            // that closure prevents subsequent probes from spawning additional
+            // detached filesystem tasks until the real read has completed.
+            let _permit = permit;
+            source.load()
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("не удалось безопасно выполнить фоновую загрузку реестра доступа")
+        })?
     }
 
     fn cached(&self, raw: &[u8]) -> Option<Arc<AccessRegistry>> {
@@ -790,6 +980,22 @@ impl RegistrySource {
         use std::sync::atomic::Ordering;
 
         self.panic_next_load.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn block_next_load(&self) -> TestLoadBlockControl {
+        let state = Arc::new(TestLoadBlockState {
+            entered: tokio::sync::Notify::new(),
+            released: std::sync::Mutex::new(false),
+            release: std::sync::Condvar::new(),
+        });
+        let previous = self
+            .block_next_load
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(Arc::clone(&state));
+        assert!(previous.is_none(), "only one load may be blocked at a time");
+        TestLoadBlockControl(state)
     }
 }
 
@@ -1077,7 +1283,10 @@ fn load_auth_config(
             snapshot.actor(&actor_id)?;
             Ok(AuthConfig::Dev { actor_id })
         }
-        AuthMode::Jwt => Ok(AuthConfig::Jwt(load_jwt_config(lookup)?)),
+        AuthMode::Jwt => {
+            snapshot.validate_jwt_oidc_bindings()?;
+            Ok(AuthConfig::Jwt(load_jwt_config(lookup)?))
+        }
     }
 }
 
@@ -1101,6 +1310,7 @@ fn load_credential_pair(
 }
 
 fn load_ozon_credentials(
+    registry: &AccessRegistry,
     account: &MarketplaceAccount,
     lookup: &mut dyn FnMut(&str) -> Option<String>,
     stores: &mut BTreeMap<StoreId, StoreCredentials>,
@@ -1134,6 +1344,13 @@ fn load_ozon_credentials(
             ),
         )?
     {
+        let client_id_fingerprint = credential_sha256(&client_id);
+        if registry.has_control_performance_client_id_fingerprint(&client_id_fingerprint) {
+            bail!(
+                "read-only MCP не может использовать выделенный Control Performance Client-Id для магазина {}",
+                ozon.store_id
+            );
+        }
         performance_stores.insert(
             ozon.store_id.clone(),
             PerformanceCredentials {
@@ -1180,6 +1397,7 @@ fn load_marketplace_credentials(
     };
     for account in &snapshot.accounts {
         load_ozon_credentials(
+            snapshot,
             account,
             lookup,
             &mut credentials.stores,
@@ -1236,6 +1454,9 @@ impl AppConfig {
         let registry = RegistrySource::new(registry_path)?;
         let snapshot = registry.load()?;
         let auth = load_auth_config(lookup, &snapshot)?;
+        if matches!(auth, AuthConfig::Jwt(_)) {
+            registry.require_jwt_oidc_bindings()?;
+        }
         if transport == TransportMode::Http
             && matches!(auth, AuthConfig::Dev { .. })
             && !bind.ip().is_loopback()
@@ -1278,13 +1499,16 @@ fn finish_optional_dotenv_load(result: dotenvy::Result<PathBuf>) -> Result<()> {
 mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-    use std::sync::{
-        Barrier, Mutex,
-        atomic::{AtomicU64, Ordering},
+    use std::{
+        process::Command,
+        sync::{
+            Barrier,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const APP_CONFIG_ENV_CHILD: &str = "MCP_OZON_APP_CONFIG_ENV_CHILD";
 
     fn wb_token_with_payload(payload: &[u8]) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
@@ -1319,8 +1543,9 @@ mod tests {
                     role: Role::Admin,
                     account_ids: BTreeSet::from(["shop".into()]),
                     oidc: Some(OidcIdentity {
+                        subject: Some("subject-1".into()),
                         username: Some("admin-user".into()),
-                        ..OidcIdentity::default()
+                        email: None,
                     }),
                 },
                 Actor {
@@ -1328,7 +1553,11 @@ mod tests {
                     name: "Manager".into(),
                     role: Role::Manager,
                     account_ids: BTreeSet::new(),
-                    oidc: None,
+                    oidc: Some(OidcIdentity {
+                        subject: Some("subject-2".into()),
+                        username: None,
+                        email: None,
+                    }),
                 },
             ],
             accounts: vec![MarketplaceAccount {
@@ -1353,6 +1582,8 @@ mod tests {
         registry.accounts[0].ozon.as_mut().unwrap().performance = Some(OzonPerformanceAccount {
             client_id_env: "SHOP_PERFORMANCE_ID".into(),
             client_secret_env: "SHOP_PERFORMANCE_SECRET".into(),
+            control_planner_client_id_sha256: None,
+            control_executor_client_id_sha256: None,
         });
         registry
     }
@@ -1372,6 +1603,8 @@ mod tests {
                 performance: Some(OzonPerformanceAccount {
                     client_id_env: "SECOND_PERFORMANCE_ID".into(),
                     client_secret_env: "SECOND_PERFORMANCE_SECRET".into(),
+                    control_planner_client_id_sha256: None,
+                    control_executor_client_id_sha256: None,
                 }),
             }),
             wildberries: None,
@@ -1400,22 +1633,12 @@ mod tests {
                 .unwrap()
                 .can_access_store(&store, &registry)
         );
-        assert_eq!(
-            registry
-                .actor_for_oidc("unrelated-subject", Some("admin-user"), None)
-                .unwrap()
-                .id,
-            "admin"
-        );
-        assert!(
-            registry
-                .actor_for_oidc("unknown", Some("unknown"), None)
-                .is_err()
-        );
+        assert_eq!(registry.actor_for_oidc("subject-1").unwrap().id, "admin");
+        assert!(registry.actor_for_oidc("unknown").is_err());
     }
 
     #[test]
-    fn oidc_subject_pinning_has_precedence_over_username_and_email_fallback() {
+    fn oidc_subject_is_the_only_authorization_selector() {
         let mut registry = sample_registry();
         registry.actors[0].oidc = Some(OidcIdentity {
             subject: Some("pinned-subject".into()),
@@ -1423,46 +1646,25 @@ mod tests {
             email: Some("admin@example.test".into()),
         });
         registry.actors[1].oidc = Some(OidcIdentity {
-            subject: None,
+            subject: Some("second-subject".into()),
             username: Some("fallback-user".into()),
             email: Some("fallback@example.test".into()),
         });
         registry.validate().unwrap();
 
-        assert!(
-            registry
-                .actor_for_oidc(
-                    "unrelated-subject",
-                    Some("admin-user"),
-                    Some("admin@example.test")
-                )
-                .is_err()
-        );
+        assert!(registry.actor_for_oidc("unrelated-subject").is_err());
         assert_eq!(
-            registry
-                .actor_for_oidc("pinned-subject", Some("different-user"), None)
-                .unwrap()
-                .id,
+            registry.actor_for_oidc("pinned-subject").unwrap().id,
             "admin"
         );
         assert_eq!(
-            registry
-                .actor_for_oidc("unrelated-subject", Some("fallback-user"), None)
-                .unwrap()
-                .id,
+            registry.actor_for_oidc("second-subject").unwrap().id,
             "manager"
         );
-        assert_eq!(
-            registry
-                .actor_for_oidc(
-                    "another-unrelated-subject",
-                    None,
-                    Some("fallback@example.test")
-                )
-                .unwrap()
-                .id,
-            "manager"
-        );
+
+        registry.actors[1].oidc.as_mut().unwrap().subject = None;
+        registry.validate().unwrap();
+        assert!(registry.actor_for_oidc("fallback-user").is_err());
     }
 
     #[test]
@@ -1523,6 +1725,45 @@ mod tests {
         );
         assert!(!error.contains("injected registry load panic"), "{error}");
         assert_eq!(source.load_count(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_async_registry_load_retains_admission_until_blocking_work_finishes() {
+        let path = write_registry(&sample_registry());
+        let source = RegistrySource::new(&path).unwrap();
+        let blocker = source.block_next_load();
+
+        let first_source = source.clone();
+        let first = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(50), first_source.load_async()).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), blocker.wait_until_entered())
+            .await
+            .expect("the blocking load must start");
+        assert!(
+            first.await.unwrap().is_err(),
+            "the caller must time out while the filesystem task remains blocked"
+        );
+        assert_eq!(source.load_count(), 1);
+
+        let second_source = source.clone();
+        let mut second = tokio::spawn(async move { second_source.load_async().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second)
+                .await
+                .is_err(),
+            "a second caller must wait instead of spawning another blocking load"
+        );
+        assert_eq!(source.load_count(), 1);
+
+        blocker.release();
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("the queued load must resume after the real blocking work exits")
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.load_count(), 2);
+        assert_eq!(second.actor("admin").unwrap().id, "admin");
     }
 
     #[test]
@@ -2054,10 +2295,14 @@ mod tests {
             OzonPerformanceAccount {
                 client_id_env: " ".into(),
                 client_secret_env: "SHOP_PERFORMANCE_SECRET".into(),
+                control_planner_client_id_sha256: None,
+                control_executor_client_id_sha256: None,
             },
             OzonPerformanceAccount {
                 client_id_env: "SHOP_PERFORMANCE_ID".into(),
                 client_secret_env: " ".into(),
+                control_planner_client_id_sha256: None,
+                control_executor_client_id_sha256: None,
             },
         ] {
             let mut registry = sample_registry();
@@ -2080,6 +2325,127 @@ mod tests {
 
         let error = registry.validate().unwrap_err().to_string();
         assert!(error.contains("performance.client_secret_env"), "{error}");
+    }
+
+    #[test]
+    fn malformed_executor_performance_identity_fingerprint_is_rejected() {
+        let mut registry = performance_registry();
+        registry.accounts[0]
+            .ozon
+            .as_mut()
+            .unwrap()
+            .performance
+            .as_mut()
+            .unwrap()
+            .control_executor_client_id_sha256 = Some("not-a-sha256".to_owned());
+
+        let error = registry.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("control_executor_client_id_sha256"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn duplicate_control_performance_identity_fingerprint_is_rejected() {
+        let mut registry = two_store_performance_registry();
+        let fingerprint = credential_sha256("dedicated-control-client");
+        for account in &mut registry.accounts {
+            account
+                .ozon
+                .as_mut()
+                .unwrap()
+                .performance
+                .as_mut()
+                .unwrap()
+                .control_executor_client_id_sha256 = Some(fingerprint.clone());
+        }
+
+        let error = registry.validate().unwrap_err().to_string();
+        assert!(error.contains("должен быть уникальным"), "{error}");
+        assert!(!error.contains(&fingerprint), "{error}");
+    }
+
+    #[test]
+    fn deprecated_planner_fingerprint_is_ignored_for_migration_compatibility() {
+        let mut registry = performance_registry();
+        let performance = registry.accounts[0]
+            .ozon
+            .as_mut()
+            .unwrap()
+            .performance
+            .as_mut()
+            .unwrap();
+        let fingerprint = credential_sha256("executor-client");
+        let deprecated = "legacy-planner-fingerprint".to_owned();
+        performance.control_planner_client_id_sha256 = Some(deprecated.clone());
+        performance.control_executor_client_id_sha256 = Some(fingerprint.clone());
+
+        registry.validate().unwrap();
+        assert!(registry.has_control_performance_client_id_fingerprint(&fingerprint));
+        assert!(!registry.has_control_performance_client_id_fingerprint(&deprecated));
+    }
+
+    #[test]
+    fn read_only_mcp_rejects_the_dedicated_control_performance_client_id() {
+        let mut registry = performance_registry();
+        registry.accounts[0]
+            .ozon
+            .as_mut()
+            .unwrap()
+            .performance
+            .as_mut()
+            .unwrap()
+            .control_executor_client_id_sha256 = Some(credential_sha256("performance-client"));
+        let path = write_registry(&registry);
+        let values = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("SHOP_PERFORMANCE_ID", "performance-client"),
+            ("SHOP_PERFORMANCE_SECRET", "performance-secret"),
+        ]);
+
+        let error = AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("выделенный Control Performance Client-Id"),
+            "{error}"
+        );
+        for sensitive in ["performance-client", "performance-secret"] {
+            assert!(!error.contains(sensitive), "{error}");
+        }
+    }
+
+    #[test]
+    fn read_only_mcp_rejects_another_accounts_control_performance_client_id() {
+        let mut registry = two_store_performance_registry();
+        registry.accounts[1]
+            .ozon
+            .as_mut()
+            .unwrap()
+            .performance
+            .as_mut()
+            .unwrap()
+            .control_executor_client_id_sha256 = Some(credential_sha256("performance-client"));
+        let path = write_registry(&registry);
+        let values = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("SHOP_PERFORMANCE_ID", "performance-client"),
+            ("SHOP_PERFORMANCE_SECRET", "performance-secret"),
+        ]);
+
+        let error = AppConfig::from_lookup(|key| values.get(key).map(|value| (*value).to_owned()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("выделенный Control Performance Client-Id"),
+            "{error}"
+        );
+        for sensitive in ["performance-client", "performance-secret"] {
+            assert!(!error.contains(sensitive), "{error}");
+        }
     }
 
     #[test]
@@ -2682,6 +3048,72 @@ mod tests {
     }
 
     #[test]
+    fn jwt_mode_requires_immutable_subject_bindings_but_dev_mode_does_not() {
+        let mut registry = sample_registry();
+        registry.actors[0].oidc.as_mut().unwrap().subject = None;
+        let path = write_registry(&registry);
+        let dev_values = BTreeMap::from([
+            ("MCP_ACTOR_ID", "admin"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+        ]);
+        AppConfig::from_lookup(|key| dev_values.get(key).map(|value| (*value).to_owned()))
+            .expect("trusted local development mode does not consume OIDC bindings");
+
+        let jwt_values = BTreeMap::from([
+            ("MCP_AUTH_MODE", "jwt"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("MCP_JWT_ISSUER", "https://issuer.example.com"),
+            ("MCP_JWT_AUDIENCE", "https://mcp.example.com/mcp"),
+            ("MCP_PUBLIC_URL", "https://mcp.example.com/mcp"),
+        ]);
+        let error =
+            AppConfig::from_lookup(|key| jwt_values.get(key).map(|value| (*value).to_owned()))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("immutable subject"), "{error}");
+
+        let mut registry_without_oidc = sample_registry();
+        registry_without_oidc.actors[0].oidc = None;
+        let path = write_registry(&registry_without_oidc);
+        let jwt_values = BTreeMap::from([
+            ("MCP_AUTH_MODE", "jwt"),
+            ("MCP_ACCESS_CONFIG", path.to_str().unwrap()),
+            ("MCP_JWT_ISSUER", "https://issuer.example.com"),
+            ("MCP_JWT_AUDIENCE", "https://mcp.example.com/mcp"),
+            ("MCP_PUBLIC_URL", "https://mcp.example.com/mcp"),
+        ]);
+        let error =
+            AppConfig::from_lookup(|key| jwt_values.get(key).map(|value| (*value).to_owned()))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("immutable subject"), "{error}");
+    }
+
+    #[test]
+    fn jwt_subject_contract_is_enforced_on_registry_hot_reload() {
+        let path = write_registry(&sample_registry());
+        let source = RegistrySource::new(&path).unwrap();
+        source.require_jwt_oidc_bindings().unwrap();
+
+        let mut subjectless = sample_registry();
+        subjectless.actors[0].oidc.as_mut().unwrap().subject = None;
+        std::fs::write(&path, serde_json::to_vec_pretty(&subjectless).unwrap()).unwrap();
+
+        let error = source.load().unwrap_err().to_string();
+        assert!(error.contains("immutable subject"), "{error}");
+
+        let path = write_registry(&sample_registry());
+        let source = RegistrySource::new(&path).unwrap();
+        source.require_jwt_oidc_bindings().unwrap();
+        let mut missing_identity = sample_registry();
+        missing_identity.actors[0].oidc = None;
+        std::fs::write(&path, serde_json::to_vec_pretty(&missing_identity).unwrap()).unwrap();
+
+        let error = source.load().unwrap_err().to_string();
+        assert!(error.contains("immutable subject"), "{error}");
+    }
+
+    #[test]
     fn jwt_audience_must_be_the_normalized_public_resource_url() {
         let path = write_registry(&sample_registry());
         let config_from = |audience: &str, public_url: &str| {
@@ -2755,21 +3187,39 @@ mod tests {
 
     #[test]
     fn app_config_can_load_from_process_environment() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        if std::env::var_os(APP_CONFIG_ENV_CHILD).is_some() {
+            let config = AppConfig::from_env().unwrap();
+            assert!(matches!(
+                config.auth,
+                AuthConfig::Dev { ref actor_id } if actor_id == "admin"
+            ));
+            return;
+        }
+
         let path = write_registry(&sample_registry());
-        unsafe {
-            std::env::set_var("MCP_ACTOR_ID", "admin");
-            std::env::set_var("MCP_ACCESS_CONFIG", &path);
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "config::tests::app_config_can_load_from_process_environment",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(path.parent().unwrap())
+            .env_clear()
+            .env(APP_CONFIG_ENV_CHILD, "1")
+            .env("MCP_ACTOR_ID", "admin")
+            .env("MCP_ACCESS_CONFIG", &path);
+        if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile);
         }
-        let config = AppConfig::from_env().unwrap();
-        assert!(matches!(
-            config.auth,
-            AuthConfig::Dev { ref actor_id } if actor_id == "admin"
-        ));
-        unsafe {
-            std::env::remove_var("MCP_ACTOR_ID");
-            std::env::remove_var("MCP_ACCESS_CONFIG");
-        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

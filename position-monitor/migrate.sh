@@ -33,6 +33,7 @@ migrations="
 022_wb_automation_explicit_resume.sql
 023_daily_reporting_ozon_refresh_queue.sql
 024_ozon_control_campaign_plans.sql
+025_ozon_durable_launch_workflow.sql
 "
 
 case "$mode" in
@@ -110,7 +111,8 @@ unexpected_migration_count() {
        '021_wb_automation_state.sql',
        '022_wb_automation_explicit_resume.sql',
        '023_daily_reporting_ozon_refresh_queue.sql',
-       '024_ozon_control_campaign_plans.sql'
+       '024_ozon_control_campaign_plans.sql',
+       '025_ozon_durable_launch_workflow.sql'
      )"
 }
 
@@ -161,7 +163,7 @@ COMMIT;
 SQL
   done
   "$migration_dir/003_roles.sh"
-  echo "migration ledger baselined at 024_ozon_control_campaign_plans.sql"
+  echo "migration ledger baselined at 025_ozon_durable_launch_workflow.sql"
   exit 0
 fi
 
@@ -246,4 +248,4 @@ if [ "$roles_refreshed" != true ]; then
   exit 1
 fi
 
-echo "database migrations verified through 024_ozon_control_campaign_plans.sql"
+echo "database migrations verified through 025_ozon_durable_launch_workflow.sql"

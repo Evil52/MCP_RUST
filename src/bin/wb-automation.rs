@@ -16,6 +16,7 @@ use mcp_ozon::control::{
     WbAutomationPostgresStore, WbAutomationStateView, persist_wb_automation_snapshot,
     wb_automation_business_date,
 };
+use mcp_ozon::runtime::print_runtime_version_if_requested;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio_postgres::Config;
@@ -26,7 +27,11 @@ const DATABASE_URL_ENV: &str = "WB_AUTOMATION_DATABASE_URL";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    match parse_command(&std::env::args().skip(1).collect::<Vec<_>>())? {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if print_runtime_version_if_requested("wb-automation", &arguments)? {
+        return Ok(());
+    }
+    match parse_command(&arguments)? {
         Command::Observe(options) => observe_once(options).await,
         Command::ShadowPostgres(options) => shadow_postgres_once(options).await,
         Command::ActivateProtectiveLivePostgres(options) => {

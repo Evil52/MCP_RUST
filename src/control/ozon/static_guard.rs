@@ -10,6 +10,8 @@
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::control::policy::{ControlMode, ControlPolicy};
+
 use super::{guard::evaluate_ozon_campaign_guard, model::OzonCampaignGuard};
 
 /// Upper bound on how many campaigns one file may authorise.
@@ -41,6 +43,8 @@ pub enum OzonStaticGuardError {
     InvalidGuard,
     #[error("static Ozon dynamic bid control has invalid bounds")]
     InvalidDynamicBidControl,
+    #[error("static Ozon guard is not bounded by the loaded control policy")]
+    PolicyMismatch,
 }
 
 /// One campaign a static guard run may act on.
@@ -172,6 +176,9 @@ pub fn parse_ozon_static_guard_config(
                     date_from: entry.date_from,
                     spend_cap_microrubles: entry.spend_cap_microrubles,
                     target_drr_percent: entry.target_drr_percent,
+                    status: super::model::OzonCampaignGuardStatus::Active,
+                    stop_reason: None,
+                    incident_error_class: None,
                 },
                 min_cpc_bid_microrubles: entry.min_cpc_bid_microrubles,
                 max_cpc_bid_microrubles: entry.max_cpc_bid_microrubles,
@@ -195,12 +202,50 @@ pub fn parse_ozon_static_guards(
     parse_ozon_static_guard_config(bytes, expected_account_id).map(|config| config.guards)
 }
 
+/// Proves that every static write corridor is bounded by the active policy.
+///
+/// Spend and DRR boundaries, the initial/minimum bid, and the position target
+/// must match the reviewed launch target exactly. A static file may lower the
+/// maximum bid, but can never raise it above the policy ceiling.
+pub fn validate_ozon_static_guard_policy(
+    config: &OzonStaticGuardConfig,
+    policy: &ControlPolicy,
+) -> Result<(), OzonStaticGuardError> {
+    if policy.mode != ControlMode::Enabled {
+        return Err(OzonStaticGuardError::PolicyMismatch);
+    }
+    for static_guard in &config.guards {
+        let guard = &static_guard.guard;
+        let target = policy
+            .actors
+            .iter()
+            .flat_map(|actor| &actor.ozon_campaign_launch_targets)
+            .find(|target| {
+                target.account_id == guard.account_id
+                    && target.skus.as_slice() == [guard.sku]
+                    && target.per_sku_spend_cap_microrubles == guard.spend_cap_microrubles
+                    && target.target_drr_percent == guard.target_drr_percent
+                    && target.initial_cpc_bid_microrubles == static_guard.min_cpc_bid_microrubles
+                    && static_guard.max_cpc_bid_microrubles <= target.max_cpc_bid_microrubles
+            })
+            .ok_or(OzonStaticGuardError::PolicyMismatch)?;
+        if config
+            .dynamic_bid_control
+            .as_ref()
+            .is_some_and(|dynamic| u16::from(target.target_position) != dynamic.target_position)
+        {
+            return Err(OzonStaticGuardError::PolicyMismatch);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_OZON_STATIC_MAX_CPC_BID_MICROROUBLES, DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES,
-        MAX_OZON_STATIC_GUARD_FILE_BYTES, MAX_OZON_STATIC_GUARDS, OzonStaticGuardError,
-        parse_ozon_static_guard_config, parse_ozon_static_guards,
+        DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES, MAX_OZON_STATIC_GUARD_FILE_BYTES,
+        MAX_OZON_STATIC_GUARDS, OzonStaticGuardError, parse_ozon_static_guard_config,
+        parse_ozon_static_guards, validate_ozon_static_guard_policy,
     };
 
     const ACCOUNT: &str = "furnitura_dlya_doma";
@@ -219,6 +264,29 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({"account_id": ACCOUNT, "guards": entries})).unwrap()
     }
 
+    fn policy(max_bid_microrubles: u64, target_position: u8) -> crate::control::ControlPolicy {
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "revision": 1,
+            "mode": "enabled",
+            "actors": [{
+                "actor_id": "operator",
+                "ozon_campaign_launch_targets": [{
+                    "account_id": ACCOUNT,
+                    "skus": [1],
+                    "weekly_budget_microrubles": 2_000_000_000_u64,
+                    "per_sku_spend_cap_microrubles": 2_000_000_000_u64,
+                    "initial_cpc_bid_microrubles": 7_000_000_u64,
+                    "max_cpc_bid_microrubles": max_bid_microrubles,
+                    "target_drr_percent": 15,
+                    "target_position": target_position,
+                    "approver_actor_ids": ["approver"]
+                }]
+            }]
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn the_shipped_guard_file_parses_into_the_documented_corridor() {
         let bytes = include_bytes!("../../../config/ozon-furnitura-cpc7-live.json");
@@ -233,16 +301,13 @@ mod tests {
         let guards = config.guards;
         assert_eq!(guards.len(), 5);
         for guard in &guards {
-            // Omitting the corridor in the file must mean the reviewed default,
-            // never an unbounded one.
+            // The minimum remains the reviewed default. The active operator
+            // file may impose a stricter ceiling than the policy maximum.
             assert_eq!(
                 guard.min_cpc_bid_microrubles,
                 DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES
             );
-            assert_eq!(
-                guard.max_cpc_bid_microrubles,
-                DEFAULT_OZON_STATIC_MAX_CPC_BID_MICROROUBLES
-            );
+            assert_eq!(guard.max_cpc_bid_microrubles, 10_000_000);
             assert_eq!(guard.guard.account_id, ACCOUNT);
             assert_eq!(
                 guard.guard.plan_id,
@@ -418,5 +483,68 @@ mod tests {
         let parsed = parse_ozon_static_guards(&file(&[widened]), ACCOUNT).unwrap();
         assert_eq!(parsed[0].min_cpc_bid_microrubles, 8_000_000);
         assert_eq!(parsed[0].max_cpc_bid_microrubles, 20_000_000);
+    }
+
+    #[test]
+    fn static_corridor_must_be_bounded_by_the_enabled_control_policy() {
+        let mut candidate = entry(1, 1);
+        candidate["max_cpc_bid_microrubles"] = serde_json::json!(10_000_000_u64);
+        let config = parse_ozon_static_guard_config(&file(&[candidate]), ACCOUNT).unwrap();
+        assert!(validate_ozon_static_guard_policy(&config, &policy(12_000_000, 30)).is_ok());
+
+        let mut dynamic_value: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../config/ozon-furnitura-cpc7-live.json"
+        ))
+        .unwrap();
+        dynamic_value["guards"] = serde_json::json!([entry(1, 1)]);
+        let dynamic_config =
+            parse_ozon_static_guard_config(&serde_json::to_vec(&dynamic_value).unwrap(), ACCOUNT)
+                .unwrap();
+        assert!(
+            validate_ozon_static_guard_policy(&dynamic_config, &policy(12_000_000, 30)).is_ok()
+        );
+        assert_eq!(
+            validate_ozon_static_guard_policy(&dynamic_config, &policy(12_000_000, 29)),
+            Err(OzonStaticGuardError::PolicyMismatch)
+        );
+    }
+
+    #[test]
+    fn static_policy_binding_rejects_every_scope_or_limit_expansion() {
+        let base = parse_ozon_static_guard_config(&file(&[entry(1, 1)]), ACCOUNT).unwrap();
+
+        let mut disabled = policy(12_000_000, 30);
+        disabled.mode = crate::control::ControlMode::PlanOnly;
+        assert_eq!(
+            validate_ozon_static_guard_policy(&base, &disabled),
+            Err(OzonStaticGuardError::PolicyMismatch)
+        );
+
+        let mut cases = Vec::new();
+        let mut missing_sku = base.clone();
+        missing_sku.guards[0].guard.sku = 2;
+        cases.push(missing_sku);
+        let mut wrong_account = base.clone();
+        wrong_account.guards[0].guard.account_id = "another".to_owned();
+        cases.push(wrong_account);
+        let mut spend_expansion = base.clone();
+        spend_expansion.guards[0].guard.spend_cap_microrubles += 10_000;
+        cases.push(spend_expansion);
+        let mut drr_expansion = base.clone();
+        drr_expansion.guards[0].guard.target_drr_percent += 1;
+        cases.push(drr_expansion);
+        let mut lower_floor = base.clone();
+        lower_floor.guards[0].min_cpc_bid_microrubles = 6_000_000;
+        cases.push(lower_floor);
+        let mut higher_ceiling = base;
+        higher_ceiling.guards[0].max_cpc_bid_microrubles = 13_000_000;
+        cases.push(higher_ceiling);
+
+        for candidate in cases {
+            assert_eq!(
+                validate_ozon_static_guard_policy(&candidate, &policy(12_000_000, 30)),
+                Err(OzonStaticGuardError::PolicyMismatch)
+            );
+        }
     }
 }

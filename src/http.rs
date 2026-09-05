@@ -6,6 +6,7 @@
 //! binary — liveness/readiness and the OAuth resource metadata — go unverified.
 
 use std::{
+    collections::{HashMap, HashSet},
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
@@ -19,7 +20,7 @@ use axum::{
     body::{Body, HttpBody},
     extract::{Request, State},
     http::{
-        HeaderValue, Method, StatusCode,
+        HeaderMap, HeaderValue, Method, StatusCode,
         header::{CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE},
     },
     middleware::{self, Next},
@@ -116,6 +117,12 @@ pub const MCP_MAX_IN_FLIGHT_STREAMS: usize = 64;
 /// reclaimed. In-flight requests suspend this countdown.
 pub const MCP_SESSION_IDLE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(120);
 
+/// Readiness is intentionally cheaper and more tightly bounded than the
+/// listener's 128-connection budget. One dependency probe may run at a time;
+/// concurrent unauthenticated probes fail fast instead of retaining sockets.
+const READINESS_MAX_IN_FLIGHT: usize = 1;
+const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 const DEV_MCP_ALLOWED_HOSTS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 
 /// Browser origins permitted by the single-user development mode.
@@ -133,6 +140,87 @@ const DEV_MCP_ALLOWED_ORIGINS: &[&str] = &[
     "https://[::1]",
 ];
 
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+
+#[derive(Clone)]
+struct ReadinessGate {
+    permits: Arc<Semaphore>,
+}
+
+impl ReadinessGate {
+    fn new() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(READINESS_MAX_IN_FLIGHT)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionOwners {
+    owners: Arc<tokio::sync::Mutex<HashMap<String, SessionOwner>>>,
+    sessions: Arc<LocalSessionManager>,
+}
+
+#[derive(Debug)]
+struct SessionOwner {
+    subject: String,
+}
+
+impl SessionOwners {
+    fn new(sessions: Arc<LocalSessionManager>) -> Self {
+        Self {
+            owners: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sessions,
+        }
+    }
+
+    async fn retained_session_ids(&self) -> HashSet<String> {
+        self.sessions
+            .sessions
+            .read()
+            .await
+            .keys()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    async fn authorize(&self, session_id: &str, subject: &str) -> bool {
+        let retained_session_ids = self.retained_session_ids().await;
+        let mut owners = self.owners.lock().await;
+        owners.retain(|owned_session_id, _| retained_session_ids.contains(owned_session_id));
+        let authorized = owners
+            .get(session_id)
+            .is_some_and(|owner| owner.subject == subject);
+        drop(owners);
+        authorized
+    }
+
+    async fn bind_created(&self, session_id: &str, subject: &str) -> bool {
+        let retained_session_ids = self.retained_session_ids().await;
+        let mut owners = self.owners.lock().await;
+        owners.retain(|owned_session_id, _| retained_session_ids.contains(owned_session_id));
+        let bound = if !retained_session_ids.contains(session_id) {
+            false
+        } else if let Some(owner) = owners.get(session_id) {
+            owner.subject == subject
+        } else {
+            owners.insert(
+                session_id.to_owned(),
+                SessionOwner {
+                    subject: subject.to_owned(),
+                },
+            );
+            true
+        };
+        drop(owners);
+        bound
+    }
+
+    async fn remove(&self, session_id: &str) {
+        self.owners.lock().await.remove(session_id);
+    }
+}
+
 #[derive(Clone)]
 struct McpHttpLimits {
     auth_request_permits: Arc<Semaphore>,
@@ -143,6 +231,7 @@ struct McpHttpLimits {
     body_read_timeout: Duration,
     transport_config: Arc<StreamableHttpServerConfig>,
     authenticator: Option<JwtAuthenticator>,
+    session_owners: Option<SessionOwners>,
 }
 
 struct PermitBody {
@@ -183,7 +272,11 @@ impl McpHttpLimits {
     fn production(
         transport_config: StreamableHttpServerConfig,
         authenticator: Option<JwtAuthenticator>,
+        session_manager: Arc<LocalSessionManager>,
     ) -> Self {
+        let session_owners = authenticator
+            .as_ref()
+            .map(|_| SessionOwners::new(session_manager));
         Self {
             auth_request_permits: Arc::new(Semaphore::new(MCP_MAX_IN_FLIGHT_REQUESTS)),
             auth_stream_permits: Arc::new(Semaphore::new(MCP_MAX_IN_FLIGHT_STREAMS)),
@@ -193,6 +286,7 @@ impl McpHttpLimits {
             body_read_timeout: MCP_REQUEST_BODY_READ_TIMEOUT,
             transport_config: Arc::new(transport_config),
             authenticator,
+            session_owners,
         }
     }
 
@@ -216,6 +310,7 @@ impl McpHttpLimits {
                     .with_allowed_origins(DEV_MCP_ALLOWED_ORIGINS.iter().copied()),
             ),
             authenticator: None,
+            session_owners: None,
         }
     }
 
@@ -918,6 +1013,54 @@ fn hold_permit_through_body(response: Response, permit: OwnedSemaphorePermit) ->
     )
 }
 
+fn unknown_mcp_session_response() -> Response {
+    (StatusCode::NOT_FOUND, "Not Found: Session not found").into_response()
+}
+
+fn exact_mcp_session_id(headers: &HeaderMap) -> Result<Option<&str>, ()> {
+    let mut values = headers.get_all(MCP_SESSION_ID_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    value.to_str().map(Some).map_err(|_| ())
+}
+
+async fn reconcile_session_ownership(
+    owners: Option<&SessionOwners>,
+    subject: Option<&str>,
+    method: &Method,
+    incoming_session_id: Option<&str>,
+    response_status: StatusCode,
+    response_session_id: Option<&str>,
+) -> Result<(), Box<Response>> {
+    let (Some(owners), Some(subject)) = (owners, subject) else {
+        return Ok(());
+    };
+    if let Some(session_id) = incoming_session_id {
+        if (method == Method::DELETE && response_status.is_success())
+            || response_status == StatusCode::NOT_FOUND
+        {
+            owners.remove(session_id).await;
+        }
+        return Ok(());
+    }
+
+    let Some(session_id) = response_session_id else {
+        return Ok(());
+    };
+    if owners.bind_created(session_id, subject).await {
+        Ok(())
+    } else {
+        Err(Box::new(body_failure_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error: session ownership conflict",
+        )))
+    }
+}
+
 async fn limit_mcp_request_concurrency(
     State(limits): State<McpHttpLimits>,
     mut request: Request,
@@ -945,6 +1088,7 @@ async fn limit_mcp_request_concurrency(
     // so downstream RBAC cannot observe a different reload. A dedicated gate
     // bounds JWT/JWKS futures without letting unauthenticated work occupy the
     // subsequent MCP execution/stream budget.
+    let mut authenticated_subject = None;
     if let Some(authenticator) = &limits.authenticator {
         let Some(auth_permit) = limits.try_enter_auth(&method) else {
             return capacity_exhausted_response("MCP authentication capacity exhausted");
@@ -954,12 +1098,33 @@ async fn limit_mcp_request_concurrency(
             .await
         {
             Ok(access) => {
+                authenticated_subject = Some(access.subject.clone());
                 request.extensions_mut().insert(access.actor);
                 request.extensions_mut().insert(access.registry);
             }
             Err(failure) => return authentication_failure_response(authenticator, failure),
         }
         drop(auth_permit);
+    }
+
+    let incoming_session_id = match exact_mcp_session_id(request.headers()) {
+        Ok(value) => value.map(ToOwned::to_owned),
+        Err(()) => {
+            return body_failure_response(
+                StatusCode::BAD_REQUEST,
+                "Bad Request: invalid MCP session identifier",
+            );
+        }
+    };
+    if let (Some(owners), Some(subject), Some(session_id)) = (
+        limits.session_owners.as_ref(),
+        authenticated_subject.as_deref(),
+        incoming_session_id.as_deref(),
+    ) && !owners.authorize(session_id, subject).await
+    {
+        // Deliberately indistinguishable from an unknown/expired session: a
+        // valid token must not turn another actor's session ID into an oracle.
+        return unknown_mcp_session_response();
     }
 
     let permit = if method == Method::GET {
@@ -976,6 +1141,27 @@ async fn limit_mcp_request_concurrency(
 
     if method == Method::GET {
         let response = next.run(request).await;
+        let response_session_id = match exact_mcp_session_id(response.headers()) {
+            Ok(value) => value.map(ToOwned::to_owned),
+            Err(()) => {
+                return body_failure_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error: invalid session identifier",
+                );
+            }
+        };
+        if let Err(response) = reconcile_session_ownership(
+            limits.session_owners.as_ref(),
+            authenticated_subject.as_deref(),
+            &method,
+            incoming_session_id.as_deref(),
+            response.status(),
+            response_session_id.as_deref(),
+        )
+        .await
+        {
+            return *response;
+        }
         if is_sse_response(&response) {
             return hold_permit_through_body(response, permit);
         }
@@ -997,6 +1183,27 @@ async fn limit_mcp_request_concurrency(
         (request, None)
     };
     let response = next.run(request).await;
+    let response_session_id = match exact_mcp_session_id(response.headers()) {
+        Ok(value) => value.map(ToOwned::to_owned),
+        Err(()) => {
+            return body_failure_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error: invalid session identifier",
+            );
+        }
+    };
+    if let Err(response) = reconcile_session_ownership(
+        limits.session_owners.as_ref(),
+        authenticated_subject.as_deref(),
+        &method,
+        incoming_session_id.as_deref(),
+        response.status(),
+        response_session_id.as_deref(),
+    )
+    .await
+    {
+        return *response;
+    }
     drop(permit);
     match post_response_permit {
         Some(response_permit) => hold_permit_through_body(response, response_permit),
@@ -1088,19 +1295,22 @@ where
         .with_allowed_hosts(allowed_hosts)
         .with_allowed_origins(allowed_origins)
         .with_cancellation_token(cancellation_token);
-    let http_limits = McpHttpLimits::production(
-        transport_config.clone(),
-        server.transport_authenticator().cloned(),
-    );
-    let metrics_limits = http_limits.clone();
-    let server = Arc::new(server);
-    let health_server = Arc::clone(&server);
-    let readiness_server = Arc::clone(&server);
     let session_manager = Arc::new(
         LocalSessionManager::default()
             .with_max_sessions(max_sessions)
             .with_session_idle_timeout(session_idle_timeout),
     );
+    let http_limits = McpHttpLimits::production(
+        transport_config.clone(),
+        server.transport_authenticator().cloned(),
+        Arc::clone(&session_manager),
+    );
+    let metrics_limits = http_limits.clone();
+    let server = Arc::new(server);
+    let health_server = Arc::clone(&server);
+    let readiness_server = Arc::clone(&server);
+    let readiness_gate = ReadinessGate::new();
+    let health_gate = readiness_gate.clone();
     let service: StreamableHttpService<S, LocalSessionManager> = StreamableHttpService::new(
         move || Ok((*server).clone()),
         session_manager,
@@ -1116,11 +1326,11 @@ where
         .route("/livez", get(|| async { "live" }))
         .route(
             "/health",
-            get(move || readiness_response(Arc::clone(&health_server))),
+            get(move || readiness_response(Arc::clone(&health_server), health_gate.clone())),
         )
         .route(
             "/readyz",
-            get(move || readiness_response(Arc::clone(&readiness_server))),
+            get(move || readiness_response(Arc::clone(&readiness_server), readiness_gate.clone())),
         )
         .route(
             "/metrics",
@@ -1150,13 +1360,27 @@ fn metrics_response(limits: &McpHttpLimits) -> Response {
         .into_response()
 }
 
-async fn readiness_response<S>(server: Arc<S>) -> Response
+async fn readiness_response<S>(server: Arc<S>, gate: ReadinessGate) -> Response
 where
     S: HttpMcpServer,
 {
-    match server.readiness().await {
-        Ok(()) => (StatusCode::OK, "ready").into_response(),
-        Err(()) => (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response(),
+    let Ok(permit) = gate.permits.try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response();
+    };
+    // Dropping a PostgreSQL query future does not necessarily cancel work
+    // already sent to the server. Detach one bounded dependency task and keep
+    // the sole gate permit inside it: the HTTP response still times out, but
+    // repeated unauthenticated probes cannot pipeline abandoned queries while
+    // the first one is genuinely in flight.
+    let probe = tokio::spawn(async move {
+        let _permit = permit;
+        server.readiness().await
+    });
+    match tokio::time::timeout(READINESS_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(Ok(()))) => (StatusCode::OK, "ready").into_response(),
+        Err(_) | Ok(Err(_) | Ok(Err(()))) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "not ready").into_response()
+        }
     }
 }
 
@@ -1187,6 +1411,31 @@ mod tests {
 
     static AUTH_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+    #[derive(Clone)]
+    struct FirstBlockingReadinessServer {
+        entered: Arc<AtomicUsize>,
+    }
+
+    impl ServerHandler for FirstBlockingReadinessServer {}
+
+    impl HttpMcpServer for FirstBlockingReadinessServer {
+        fn protected_resource_metadata(&self) -> Option<ProtectedResourceMetadata> {
+            None
+        }
+
+        fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
+            None
+        }
+
+        fn readiness(&self) -> ReadinessFuture<'_> {
+            if self.entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+    }
+
     struct PendingBody;
 
     impl HttpBody for PendingBody {
@@ -1199,6 +1448,241 @@ mod tests {
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             Poll::Pending
         }
+    }
+
+    #[tokio::test]
+    async fn readiness_saturation_is_fail_fast_without_blocking_liveness_or_mcp() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let router = build_router_for_server_with_cancellation_and_session_idle_timeout(
+            FirstBlockingReadinessServer {
+                entered: Arc::clone(&entered),
+            },
+            NonZeroUsize::new(4).unwrap(),
+            MCP_SESSION_IDLE_TIMEOUT_DEFAULT,
+            CancellationToken::new(),
+        );
+
+        let first_probe = tokio::spawn(
+            router.clone().oneshot(
+                HttpRequest::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first readiness probe must enter its dependency future");
+
+        let mut saturated = tokio::task::JoinSet::new();
+        for _ in 0..128 {
+            saturated.spawn(
+                router.clone().oneshot(
+                    HttpRequest::builder()
+                        .uri("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                ),
+            );
+        }
+        while let Some(response) = saturated.join_next().await {
+            assert_eq!(
+                response.unwrap().unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+
+        let live = tokio::time::timeout(
+            Duration::from_millis(250),
+            router.clone().oneshot(
+                HttpRequest::builder()
+                    .uri("/livez")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("liveness must remain responsive")
+        .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+
+        let mcp = tokio::time::timeout(
+            Duration::from_millis(250),
+            router.oneshot(
+                HttpRequest::builder()
+                    .uri("/mcp")
+                    .header(HOST, "localhost")
+                    .header(ACCEPT, "text/event-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("the MCP route must retain independent capacity")
+        .unwrap();
+        assert!(mcp.status().is_client_error());
+
+        first_probe.abort();
+    }
+
+    #[derive(Clone)]
+    struct ReleasableReadinessServer {
+        entered: Arc<AtomicUsize>,
+        release: Arc<Semaphore>,
+    }
+
+    impl ServerHandler for ReleasableReadinessServer {}
+
+    impl HttpMcpServer for ReleasableReadinessServer {
+        fn protected_resource_metadata(&self) -> Option<ProtectedResourceMetadata> {
+            None
+        }
+
+        fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
+            None
+        }
+
+        fn readiness(&self) -> ReadinessFuture<'_> {
+            if self.entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    let _permit = release.acquire().await.map_err(|_| ())?;
+                    Ok(())
+                })
+            } else {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn readiness_timeout_keeps_gate_until_the_dependency_probe_really_finishes() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let router = build_router_for_server_with_cancellation_and_session_idle_timeout(
+            ReleasableReadinessServer {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            NonZeroUsize::new(4).unwrap(),
+            MCP_SESSION_IDLE_TIMEOUT_DEFAULT,
+            CancellationToken::new(),
+        );
+
+        let first_probe = tokio::spawn(
+            router.clone().oneshot(
+                HttpRequest::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        while entered.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(READINESS_PROBE_TIMEOUT).await;
+        let first_response = first_probe.await.unwrap().unwrap();
+        assert_eq!(first_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let still_saturated = router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(still_saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+
+        release.add_permits(1);
+        let mut recovered = None;
+        for _ in 0..100 {
+            let response = router
+                .clone()
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri("/readyz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                recovered = Some(response);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(recovered.unwrap().status(), StatusCode::OK);
+        assert_eq!(entered.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn duplicate_session_headers_are_rejected_without_selecting_an_id() {
+        for values in [
+            ["known-session", "unknown-session"],
+            ["unknown-session", "known-session"],
+        ] {
+            let mut headers = HeaderMap::new();
+            for value in values {
+                headers.append(MCP_SESSION_ID_HEADER, HeaderValue::from_str(value).unwrap());
+            }
+            assert_eq!(exact_mcp_session_id(&headers), Err(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_session_ownership_is_subject_bound_and_tracks_transport_lifecycle() {
+        use rmcp::transport::streamable_http_server::session::SessionManager as _;
+
+        let sessions = Arc::new(
+            LocalSessionManager::default()
+                .with_max_sessions(NonZeroUsize::new(2).unwrap())
+                .with_session_idle_timeout(Duration::from_secs(120)),
+        );
+        let (first, _first_transport) = sessions.create_session().await.unwrap();
+        let (second, _second_transport) = sessions.create_session().await.unwrap();
+        let owners = SessionOwners::new(Arc::clone(&sessions));
+
+        assert!(owners.bind_created(&first, "subject-a").await);
+        assert!(owners.bind_created(&second, "subject-b").await);
+        assert!(owners.authorize(&first, "subject-a").await);
+        assert!(!owners.authorize(&first, "subject-b").await);
+        assert!(!owners.bind_created(&first, "subject-b").await);
+        assert!(!owners.bind_created("not-retained", "subject-a").await);
+
+        sessions.sessions.write().await.remove(&first);
+        let (replacement, _replacement_transport) = sessions.create_session().await.unwrap();
+        assert!(owners.bind_created(&replacement, "subject-c").await);
+        assert!(!owners.authorize(&first, "subject-a").await);
+        assert!(owners.authorize(&second, "subject-b").await);
+        assert!(owners.authorize(&replacement, "subject-c").await);
+        assert_eq!(owners.owners.lock().await.len(), 2);
+
+        reconcile_session_ownership(
+            Some(&owners),
+            Some("subject-c"),
+            &Method::DELETE,
+            Some(&replacement),
+            StatusCode::ACCEPTED,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!owners.authorize(&replacement, "subject-c").await);
+        assert!(owners.authorize(&second, "subject-b").await);
+        assert_eq!(
+            unknown_mcp_session_response().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     struct OversizedHintBody;
@@ -1269,7 +1753,7 @@ mod tests {
                     "id": "admin",
                     "name": "Administrator",
                     "role": "admin",
-                    "oidc": {"username": "admin"}
+                    "oidc": {"subject": "http-test-subject", "username": "admin"}
                 }],
                 "accounts": []
             }))

@@ -29,6 +29,9 @@ pub(super) fn ozon_plan_target<'a>(
                 && target.weekly_budget_microrubles == plan.manifest.spec.weekly_budget_microrubles
                 && target.per_sku_spend_cap_microrubles
                     == plan.manifest.spec.per_sku_spend_cap_microrubles
+                && target.initial_cpc_bid_microrubles
+                    == plan.manifest.spec.initial_cpc_bid_microrubles
+                && target.max_cpc_bid_microrubles == plan.manifest.spec.max_cpc_bid_microrubles
                 && target.target_drr_percent == plan.manifest.spec.target_drr_percent
                 && target.target_position == plan.manifest.spec.target_position
         })

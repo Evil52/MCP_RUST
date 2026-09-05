@@ -88,6 +88,7 @@ SELECT
     AND to_regclass('control.ozon_campaign_action_reservations') IS NOT NULL
     AND to_regclass('control.ozon_campaign_audit_events') IS NOT NULL
     AND to_regclass('control.ozon_campaign_guards') IS NOT NULL
+    AND to_regclass('control.ozon_campaign_launch_workflows') IS NOT NULL
     AND to_regclass('wb_automation.cycles') IS NOT NULL
     AND to_regclass('wb_automation.action_attempts') IS NOT NULL
     AND to_regclass('wb_automation.execution_state') IS NOT NULL
@@ -135,6 +136,10 @@ SELECT
     AND to_regprocedure('control.enforce_wb_plan_transition()') IS NOT NULL
     AND to_regprocedure('control.enforce_ozon_plan_transition()') IS NOT NULL
     AND to_regprocedure('control.enforce_ozon_guard_transition()') IS NOT NULL
+    AND to_regprocedure(
+        'control.enforce_ozon_launch_workflow_update()'
+    ) IS NOT NULL
+    AND to_regprocedure('control.initialize_ozon_launch_workflow()') IS NOT NULL
     AND to_regprocedure('control.reject_ozon_append_only_mutation()') IS NOT NULL
     AND to_regprocedure('control.validate_ozon_policy_revision_insert()') IS NOT NULL
     AND to_regprocedure('control.validate_ozon_plan_insert()') IS NOT NULL
@@ -144,8 +149,10 @@ SELECT
     AND (
         SELECT string_agg(relation.relname::text, ',' ORDER BY relation.relname)
                = 'ozon_campaign_action_reservations,ozon_campaign_audit_events,' ||
-                 'ozon_campaign_guards,ozon_campaign_plan_approvals,' ||
+                 'ozon_campaign_guards,ozon_campaign_launch_workflows,' ||
+                 'ozon_campaign_plan_approvals,' ||
                  'ozon_campaign_plans,ozon_policy_revisions,ozon_runtime_gates,' ||
+                 'ozon_static_guard_audit_events,' ||
                  'wb_action_reservations,wb_audit_events,wb_plan_approvals,' ||
                  'wb_plans,wb_policy_revisions,wb_prepare_reservations,' ||
                  'wb_runtime_gates'
@@ -157,8 +164,10 @@ SELECT
     )
     AND (
         SELECT string_agg(routine.proname::text, ',' ORDER BY routine.proname)
-               = 'enforce_ozon_guard_transition,enforce_ozon_plan_transition,' ||
-                 'enforce_wb_plan_transition,reject_ozon_append_only_mutation,' ||
+               = 'enforce_ozon_guard_transition,' ||
+                 'enforce_ozon_launch_workflow_update,enforce_ozon_plan_transition,' ||
+                 'enforce_wb_plan_transition,initialize_ozon_launch_workflow,' ||
+                 'reject_ozon_append_only_mutation,' ||
                  'reject_wb_append_only_mutation,validate_ozon_approval_insert,' ||
                  'validate_ozon_guard_insert,validate_ozon_plan_insert,' ||
                  'validate_ozon_policy_revision_insert,' ||
@@ -174,7 +183,7 @@ SELECT
           AND routine.prorettype = 'trigger'::regtype
     )
     AND (
-        SELECT count(*) = 23
+        SELECT count(*) = 27
         FROM pg_trigger AS trigger
         JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
         JOIN pg_namespace AS namespace
@@ -183,7 +192,7 @@ SELECT
           AND NOT trigger.tgisinternal
     )
     AND (
-        SELECT count(*) = 23
+        SELECT count(*) = 27
         FROM pg_trigger AS trigger
         JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
         JOIN pg_namespace AS namespace
@@ -353,6 +362,34 @@ SELECT
                   AND trigger.tgfoid =
                       'control.enforce_ozon_guard_transition()'::regprocedure
               )
+              OR (
+                  relation.relname = 'ozon_campaign_launch_workflows'
+                  AND trigger.tgname = 'ozon_launch_workflow_update_guard'
+                  AND trigger.tgtype = 19
+                  AND trigger.tgfoid =
+                      'control.enforce_ozon_launch_workflow_update()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_launch_workflows'
+                  AND trigger.tgname = 'ozon_launch_workflow_no_delete'
+                  AND trigger.tgtype = 11
+                  AND trigger.tgfoid =
+                      'control.reject_ozon_append_only_mutation()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_campaign_plans'
+                  AND trigger.tgname = 'ozon_launch_workflow_initialize'
+                  AND trigger.tgtype = 5
+                  AND trigger.tgfoid =
+                      'control.initialize_ozon_launch_workflow()'::regprocedure
+              )
+              OR (
+                  relation.relname = 'ozon_static_guard_audit_events'
+                  AND trigger.tgname = 'ozon_static_guard_audit_append_only'
+                  AND trigger.tgtype = 27
+                  AND trigger.tgfoid =
+                      'control.reject_ozon_append_only_mutation()'::regprocedure
+              )
           )
     )
     AND (
@@ -361,6 +398,13 @@ SELECT
                    ':' || constraint_row.contype::text,
                    ',' ORDER BY relation.relname, constraint_row.conname
                ) =
+               'ozon_campaign_guards:ozon_guard_metric_evidence_pair:c,' ||
+               'ozon_campaign_guards:ozon_guard_stop_lease_shape:c,' ||
+               'ozon_campaign_launch_workflows:ozon_campaign_launch_workflows_pkey:p,' ||
+               'ozon_campaign_launch_workflows:ozon_campaign_launch_workflows_plan_id_fkey:f,' ||
+               'ozon_campaign_launch_workflows:ozon_launch_workflow_identity_preflight_shape:c,' ||
+               'ozon_campaign_launch_workflows:ozon_launch_workflow_lease_shape:c,' ||
+               'ozon_campaign_launch_workflows:ozon_launch_workflow_request_shape:c,' ||
                'wb_plan_approvals:wb_approval_ttl:c,' ||
                'wb_plans:wb_plan_state_shape:c,' ||
                'wb_plans:wb_plan_ttl:c,' ||
@@ -376,8 +420,15 @@ SELECT
         JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
         JOIN pg_namespace AS namespace
           ON namespace.oid = relation.relnamespace
-        WHERE namespace.nspname = 'control'
+          WHERE namespace.nspname = 'control'
           AND constraint_row.conname IN (
+              'ozon_guard_metric_evidence_pair',
+              'ozon_guard_stop_lease_shape',
+              'ozon_campaign_launch_workflows_pkey',
+              'ozon_campaign_launch_workflows_plan_id_fkey',
+              'ozon_launch_workflow_identity_preflight_shape',
+              'ozon_launch_workflow_lease_shape',
+              'ozon_launch_workflow_request_shape',
               'wb_approval_ttl',
               'wb_plan_state_shape',
               'wb_plan_ttl',
@@ -1142,11 +1193,9 @@ SELECT
     AND NOT has_function_privilege(
         'report_collector', 'daily_reporting.enforce_source_snapshot_state()', 'EXECUTE'
     )
-    AND EXISTS (
-        SELECT 1
-        FROM pg_roles
-        WHERE rolname = 'control_writer'
-          AND rolcanlogin
+    AND (
+        SELECT count(*) = 3 AND bool_and(
+              rolcanlogin
           AND NOT rolsuper
           AND NOT rolcreatedb
           AND NOT rolcreaterole
@@ -1154,19 +1203,33 @@ SELECT
           AND NOT rolreplication
           AND NOT rolbypassrls
           AND rolconnlimit = 4
+        )
+        FROM pg_roles
+        WHERE rolname IN (
+            'control_writer','ozon_control_planner','ozon_control_executor'
+        )
     )
     AND NOT EXISTS (
         SELECT 1
         FROM pg_auth_members AS membership
-        WHERE membership.roleid = 'control_writer'::regrole
-           OR membership.member = 'control_writer'::regrole
+        WHERE membership.roleid IN (
+                  'control_writer'::regrole,
+                  'ozon_control_planner'::regrole,
+                  'ozon_control_executor'::regrole
+              )
+           OR membership.member IN (
+                  'control_writer'::regrole,
+                  'ozon_control_planner'::regrole,
+                  'ozon_control_executor'::regrole
+              )
     )
     AND NOT EXISTS (
         SELECT 1
         FROM pg_namespace AS namespace
         CROSS JOIN unnest(ARRAY[
             'position_collector', 'position_reader', 'report_worker',
-            'report_collector', 'report_refresh_requester', 'control_writer'
+            'report_collector', 'report_refresh_requester', 'control_writer',
+            'ozon_control_planner','ozon_control_executor'
         ]::name[]) AS application_role(role_name)
         WHERE namespace.nspname <> 'information_schema'
           AND namespace.nspname !~ '^pg_'
@@ -1178,7 +1241,7 @@ SELECT
     AND NOT has_database_privilege('control_writer', current_database(), 'CREATE')
     AND NOT has_database_privilege('control_writer', current_database(), 'TEMP')
     AND (
-        SELECT count(*) = 6 AND bool_and(
+        SELECT count(*) = 8 AND bool_and(
             has_database_privilege(role_name, current_database(), 'CONNECT')
             AND NOT has_database_privilege(
                 role_name, current_database(), 'CREATE'
@@ -1189,7 +1252,8 @@ SELECT
         )
         FROM unnest(ARRAY[
             'position_collector', 'position_reader', 'report_worker',
-            'report_collector', 'report_refresh_requester', 'control_writer'
+            'report_collector', 'report_refresh_requester', 'control_writer',
+            'ozon_control_planner','ozon_control_executor'
         ]::name[]) AS application_role(role_name)
     )
     AND NOT EXISTS (
@@ -1197,7 +1261,8 @@ SELECT
         FROM pg_database AS database_row
         CROSS JOIN unnest(ARRAY[
             'position_collector', 'position_reader', 'report_worker',
-            'report_collector', 'report_refresh_requester', 'control_writer'
+            'report_collector', 'report_refresh_requester', 'control_writer',
+            'ozon_control_planner','ozon_control_executor'
         ]::name[]) AS application_role(role_name)
         WHERE database_row.datname <> current_database()
           AND (
@@ -1221,16 +1286,6 @@ SELECT
                    relation.relname::text || ':' || acl.privilege_type,
                    ',' ORDER BY relation.relname, acl.privilege_type
                ) =
-               'ozon_campaign_action_reservations:INSERT,' ||
-               'ozon_campaign_action_reservations:SELECT,' ||
-               'ozon_campaign_audit_events:INSERT,' ||
-               'ozon_campaign_audit_events:SELECT,' ||
-               'ozon_campaign_guards:INSERT,ozon_campaign_guards:SELECT,' ||
-               'ozon_campaign_plan_approvals:INSERT,' ||
-               'ozon_campaign_plan_approvals:SELECT,' ||
-               'ozon_campaign_plans:INSERT,ozon_campaign_plans:SELECT,' ||
-               'ozon_policy_revisions:INSERT,ozon_policy_revisions:SELECT,' ||
-               'ozon_runtime_gates:SELECT,' ||
                'wb_action_reservations:INSERT,wb_action_reservations:SELECT,' ||
                'wb_audit_events:INSERT,wb_audit_events:SELECT,' ||
                'wb_plan_approvals:INSERT,wb_plan_approvals:SELECT,' ||
@@ -1255,18 +1310,6 @@ SELECT
                    ',' ORDER BY relation.relname, attribute.attname,
                                 acl.privilege_type
                ) =
-               'ozon_campaign_guards.last_checked_at:UPDATE,' ||
-               'ozon_campaign_guards.last_revenue_minor:UPDATE,' ||
-               'ozon_campaign_guards.last_spend_minor:UPDATE,' ||
-               'ozon_campaign_guards.status:UPDATE,' ||
-               'ozon_campaign_guards.stop_reason:UPDATE,' ||
-               'ozon_campaign_guards.stopped_at:UPDATE,' ||
-               'ozon_campaign_plans.campaign_id:UPDATE,' ||
-               'ozon_campaign_plans.finished_at:UPDATE,' ||
-               'ozon_campaign_plans.last_error_class:UPDATE,' ||
-               'ozon_campaign_plans.operation_started_at:UPDATE,' ||
-               'ozon_campaign_plans.readback_json:UPDATE,' ||
-               'ozon_campaign_plans.status:UPDATE,' ||
                'wb_plans.apply_started_at:UPDATE,' ||
                'wb_plans.finished_at:UPDATE,' ||
                'wb_plans.last_error_class:UPDATE,' ||
@@ -1307,6 +1350,174 @@ SELECT
           AND relation.relname = 'wb_audit_events_id_seq'
           AND acl.grantee = 'control_writer'::regrole
     )
+    AND NOT has_sequence_privilege(
+        'control_writer','control.ozon_campaign_audit_events_event_id_seq',
+        'SELECT,USAGE'
+    )
+    AND (
+        SELECT array_agg(
+                   relation.relname::text || ':' || acl.privilege_type
+                   ORDER BY relation.relname,acl.privilege_type
+               )
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(relation.relacl,acldefault('r',relation.relowner))
+        ) AS acl
+        WHERE namespace.nspname='control'
+          AND relation.relname LIKE 'ozon\_%' ESCAPE '\'
+          AND relation.relkind IN ('r','p')
+          AND acl.grantee='ozon_control_planner'::regrole
+    ) = ARRAY[
+        'ozon_campaign_audit_events:INSERT','ozon_campaign_audit_events:SELECT',
+        'ozon_campaign_launch_workflows:SELECT',
+        'ozon_campaign_plan_approvals:INSERT','ozon_campaign_plan_approvals:SELECT',
+        'ozon_campaign_plans:INSERT','ozon_campaign_plans:SELECT',
+        'ozon_policy_revisions:INSERT','ozon_policy_revisions:SELECT',
+        'ozon_runtime_gates:SELECT'
+    ]::text[]
+    AND (
+        SELECT array_agg(
+                   relation.relname::text || '.' || attribute.attname::text ||
+                   ':' || acl.privilege_type
+                   ORDER BY relation.relname,attribute.attname,acl.privilege_type
+               )
+        FROM pg_attribute AS attribute
+        JOIN pg_class AS relation ON relation.oid=attribute.attrelid
+        JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+        WHERE namespace.nspname='control' AND attribute.attnum>0
+          AND NOT attribute.attisdropped
+          AND acl.grantee='ozon_control_planner'::regrole
+    ) = ARRAY[
+        'ozon_campaign_launch_workflows.available_at:UPDATE',
+        'ozon_campaign_launch_workflows.requested_at:UPDATE',
+        'ozon_campaign_launch_workflows.requested_by_actor_id:UPDATE',
+        'ozon_campaign_plans.finished_at:UPDATE',
+        'ozon_campaign_plans.status:UPDATE'
+    ]::text[]
+    AND (
+        SELECT string_agg(acl.privilege_type,',' ORDER BY acl.privilege_type)
+        FROM pg_namespace AS namespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(namespace.nspacl,acldefault('n',namespace.nspowner))
+        ) AS acl
+        WHERE namespace.nspname='control'
+          AND acl.grantee='ozon_control_planner'::regrole
+    ) = 'USAGE'
+    AND (
+        SELECT string_agg(acl.privilege_type,',' ORDER BY acl.privilege_type)
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(relation.relacl,acldefault('S',relation.relowner))
+        ) AS acl
+        WHERE namespace.nspname='control'
+          AND relation.relname='ozon_campaign_audit_events_event_id_seq'
+          AND acl.grantee='ozon_control_planner'::regrole
+    ) = 'SELECT,USAGE'
+    AND (
+        SELECT array_agg(
+                   relation.relname::text || ':' || acl.privilege_type
+                   ORDER BY relation.relname,acl.privilege_type
+               )
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(relation.relacl,acldefault('r',relation.relowner))
+        ) AS acl
+        WHERE namespace.nspname='control'
+          AND relation.relname LIKE 'ozon\_%' ESCAPE '\'
+          AND relation.relkind IN ('r','p')
+          AND acl.grantee='ozon_control_executor'::regrole
+    ) = ARRAY[
+        'ozon_campaign_action_reservations:INSERT','ozon_campaign_action_reservations:SELECT',
+        'ozon_campaign_audit_events:INSERT','ozon_campaign_audit_events:SELECT',
+        'ozon_campaign_guards:INSERT','ozon_campaign_guards:SELECT',
+        'ozon_campaign_launch_workflows:SELECT',
+        'ozon_campaign_plan_approvals:SELECT','ozon_campaign_plans:SELECT',
+        'ozon_policy_revisions:SELECT','ozon_runtime_gates:SELECT',
+        'ozon_static_guard_audit_events:INSERT',
+        'ozon_static_guard_audit_events:SELECT'
+    ]::text[]
+    AND (
+        SELECT array_agg(
+                   relation.relname::text || '.' || attribute.attname::text ||
+                   ':' || acl.privilege_type
+                   ORDER BY relation.relname,attribute.attname,acl.privilege_type
+               )
+        FROM pg_attribute AS attribute
+        JOIN pg_class AS relation ON relation.oid=attribute.attrelid
+        JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(attribute.attacl) AS acl
+        WHERE namespace.nspname='control' AND attribute.attnum>0
+          AND NOT attribute.attisdropped
+          AND acl.grantee='ozon_control_executor'::regrole
+    ) = ARRAY[
+        'ozon_campaign_guards.incident_error_class:UPDATE',
+        'ozon_campaign_guards.last_checked_at:UPDATE',
+        'ozon_campaign_guards.last_revenue_minor:UPDATE',
+        'ozon_campaign_guards.last_spend_minor:UPDATE',
+        'ozon_campaign_guards.status:UPDATE',
+        'ozon_campaign_guards.stop_generation:UPDATE',
+        'ozon_campaign_guards.stop_lease_claimed_at:UPDATE',
+        'ozon_campaign_guards.stop_lease_expires_at:UPDATE',
+        'ozon_campaign_guards.stop_lease_owner_id:UPDATE',
+        'ozon_campaign_guards.stop_lease_token:UPDATE',
+        'ozon_campaign_guards.stop_reason:UPDATE',
+        'ozon_campaign_guards.stop_write_started_at:UPDATE',
+        'ozon_campaign_guards.stopped_at:UPDATE',
+        'ozon_campaign_launch_workflows.action:UPDATE',
+        'ozon_campaign_launch_workflows.available_at:UPDATE',
+        'ozon_campaign_launch_workflows.create_identity_preflight_at:UPDATE',
+        'ozon_campaign_launch_workflows.create_identity_preflight_digest:UPDATE',
+        'ozon_campaign_launch_workflows.generation:UPDATE',
+        'ozon_campaign_launch_workflows.last_completed_at:UPDATE',
+        'ozon_campaign_launch_workflows.last_error_class:UPDATE',
+        'ozon_campaign_launch_workflows.last_readback_json:UPDATE',
+        'ozon_campaign_launch_workflows.lease_claimed_at:UPDATE',
+        'ozon_campaign_launch_workflows.lease_expires_at:UPDATE',
+        'ozon_campaign_launch_workflows.lease_owner_id:UPDATE',
+        'ozon_campaign_launch_workflows.lease_token:UPDATE',
+        'ozon_campaign_launch_workflows.write_started_at:UPDATE',
+        'ozon_campaign_plans.campaign_id:UPDATE',
+        'ozon_campaign_plans.finished_at:UPDATE',
+        'ozon_campaign_plans.last_error_class:UPDATE',
+        'ozon_campaign_plans.operation_started_at:UPDATE',
+        'ozon_campaign_plans.readback_json:UPDATE',
+        'ozon_campaign_plans.status:UPDATE'
+    ]::text[]
+    AND (
+        SELECT string_agg(acl.privilege_type,',' ORDER BY acl.privilege_type)
+        FROM pg_namespace AS namespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(namespace.nspacl,acldefault('n',namespace.nspowner))
+        ) AS acl
+        WHERE namespace.nspname='control'
+          AND acl.grantee='ozon_control_executor'::regrole
+    ) = 'USAGE'
+    AND (
+        SELECT string_agg(acl.privilege_type,',' ORDER BY acl.privilege_type)
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(relation.relacl,acldefault('S',relation.relowner))
+        ) AS acl
+        WHERE namespace.nspname='control'
+          AND relation.relname='ozon_campaign_audit_events_event_id_seq'
+          AND acl.grantee='ozon_control_executor'::regrole
+    ) = 'SELECT,USAGE'
+    AND (
+        SELECT string_agg(acl.privilege_type,',' ORDER BY acl.privilege_type)
+        FROM pg_class AS relation
+        JOIN pg_namespace AS namespace ON namespace.oid=relation.relnamespace
+        CROSS JOIN LATERAL aclexplode(
+            coalesce(relation.relacl,acldefault('S',relation.relowner))
+        ) AS acl
+        WHERE namespace.nspname='control'
+          AND relation.relname='ozon_static_guard_audit_events_event_id_seq'
+          AND acl.grantee='ozon_control_executor'::regrole
+    ) = 'SELECT,USAGE'
     AND NOT EXISTS (
         SELECT 1
         FROM unnest(ARRAY[
@@ -1374,6 +1585,13 @@ SELECT
           AND (
               acl.grantee = 0
               OR acl.grantee = 'control_writer'::regrole
+              OR (
+                  acl.grantee IN (
+                      'ozon_control_planner'::regrole,
+                      'ozon_control_executor'::regrole
+                  )
+                  AND routine.proname<>'ozon_runtime_gates_active_locked'
+              )
               OR acl.grantee IN (
                   SELECT oid
                   FROM pg_roles
@@ -1384,6 +1602,18 @@ SELECT
               )
           )
     )
+    AND has_function_privilege(
+        'ozon_control_planner',
+        'control.ozon_runtime_gates_active_locked(text,bigint)','EXECUTE'
+    )
+    AND has_function_privilege(
+        'ozon_control_executor',
+        'control.ozon_runtime_gates_active_locked(text,bigint)','EXECUTE'
+    )
+    AND NOT has_function_privilege(
+        'control_writer',
+        'control.ozon_runtime_gates_active_locked(text,bigint)','EXECUTE'
+    )
     AND NOT EXISTS (
         SELECT 1
         FROM pg_default_acl AS defaults
@@ -1392,6 +1622,8 @@ SELECT
           AND (
               acl.grantee = 0
               OR acl.grantee = 'control_writer'::regrole
+              OR acl.grantee = 'ozon_control_planner'::regrole
+              OR acl.grantee = 'ozon_control_executor'::regrole
               OR acl.grantee IN (
                   SELECT oid
                   FROM pg_roles
@@ -1412,7 +1644,7 @@ SELECT
         OR (
             to_regclass('mcp_runtime.schema_migrations') IS NOT NULL
             AND (
-                SELECT count(*) = 24
+                SELECT count(*) = 25
                     AND bool_and(state = 'applied')
                     AND bool_and(applied_at IS NOT NULL)
                 FROM mcp_runtime.schema_migrations

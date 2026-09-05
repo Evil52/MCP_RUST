@@ -20,6 +20,7 @@ use mcp_ozon::reporting::{
     report_cutoff,
     service::{ReportPreviewScope, ReportWorkerConfig, ReportWorkerMode},
 };
+use mcp_ozon::runtime::print_runtime_version_if_requested;
 use tokio::{
     signal,
     time::{MissedTickBehavior, timeout},
@@ -41,6 +42,10 @@ const MAX_CONSECUTIVE_TICK_FAILURES: u32 = 5;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if print_runtime_version_if_requested("report-worker", &arguments)? {
+        return Ok(());
+    }
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -48,7 +53,6 @@ async fn main() -> Result<()> {
         )
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let healthcheck = matches!(arguments.as_slice(), [argument] if argument == "healthcheck");
     let config = ReportWorkerConfig::from_lookup(|key| std::env::var(key).ok())?;
     config.artifact_store().verify_writable()?;

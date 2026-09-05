@@ -25,6 +25,7 @@ pub struct AuthenticatedActor {
 pub(crate) struct AuthenticatedAccess {
     pub(crate) actor: AuthenticatedActor,
     pub(crate) registry: Arc<AccessRegistry>,
+    pub(crate) subject: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,12 +92,6 @@ struct AccessTokenClaims {
     sub: String,
     #[serde(default)]
     scope: Option<String>,
-    #[serde(default)]
-    preferred_username: Option<String>,
-    #[serde(default)]
-    email: Option<String>,
-    #[serde(default)]
-    email_verified: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -168,6 +163,10 @@ pub struct JwtAuthenticator {
 
 impl JwtAuthenticator {
     pub fn new(config: JwtConfig, registry: RegistrySource) -> Result<Self> {
+        // JWT authorization must never fall back to mutable/reassignable
+        // username or email claims. Enabling this contract on RegistrySource
+        // also keeps subsequent hot reloads fail-closed.
+        registry.require_jwt_oidc_bindings()?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             // JWKS is an authentication trust anchor. Fetch it directly so a
@@ -421,22 +420,14 @@ impl JwtAuthenticator {
             .load_async()
             .await
             .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
-        let verified_email = if claims.email_verified == Some(true) {
-            claims.email.as_deref()
-        } else {
-            None
-        };
         let actor = registry
-            .actor_for_oidc(
-                &claims.sub,
-                claims.preferred_username.as_deref(),
-                verified_email,
-            )
+            .actor_for_oidc(&claims.sub)
             .map_err(|_| JwtAuthenticationFailure::AccessDenied)?;
         let actor_id = actor.id.clone();
         Ok(AuthenticatedAccess {
             actor: AuthenticatedActor { actor_id },
             registry,
+            subject: claims.sub,
         })
     }
 }
@@ -566,7 +557,7 @@ mod tests {
             "id": "admin",
             "name": "Administrator",
             "role": "admin",
-            "oidc": {"username": "admin"}
+            "oidc": {"subject": "subject-1", "username": "admin"}
         }]))
     }
 
@@ -882,7 +873,7 @@ mod tests {
         let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
 
-        assert_eq!(registry.load_count(), 0);
+        assert_eq!(registry.load_count(), 1);
         let missing = call_mcp_tool(&endpoint, None, "ozon_analytics", json!({})).await;
         assert_eq!(missing["result"]["isError"], true);
         assert!(missing["result"]["_meta"]["mcp/www_authenticate"].is_array());
@@ -890,7 +881,7 @@ mod tests {
             missing["result"]["content"][0]["text"],
             "Требуется авторизация: access token не передан."
         );
-        assert_eq!(registry.load_count(), 0);
+        assert_eq!(registry.load_count(), 1);
 
         let valid_token = token(Some(KID), "ozonofk-mcp", "admin");
         let valid = call_mcp_tool(&endpoint, Some(&valid_token), "list_members", json!({})).await;
@@ -898,11 +889,19 @@ mod tests {
         assert_eq!(valid["result"]["structuredContent"]["actor"]["id"], "admin");
         assert_eq!(
             registry.load_count(),
-            1,
+            2,
             "JWT subject mapping and tool RBAC must use one registry snapshot"
         );
 
-        let unknown_token = token(Some(KID), "ozonofk-mcp", "not-provisioned");
+        let unknown_token = token_with_identity(
+            Some(KID),
+            "ozonofk-mcp",
+            "not-provisioned-subject",
+            Some("admin"),
+            Some("admin@example.test"),
+            Some(true),
+            Some("mcp:tools"),
+        );
         let unknown =
             call_mcp_tool(&endpoint, Some(&unknown_token), "list_members", json!({})).await;
         assert_eq!(unknown["result"]["isError"], true);
@@ -911,7 +910,7 @@ mod tests {
             unknown["result"]["content"][0]["text"],
             "Доступ для подтверждённой учётной записи не разрешён."
         );
-        assert_eq!(registry.load_count(), 2);
+        assert_eq!(registry.load_count(), 3);
 
         task.abort();
     }
@@ -961,7 +960,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().get("mcp-session-id").is_some());
-        assert_eq!(registry.load_count(), 1);
+        assert_eq!(registry.load_count(), 2);
         assert!(requests.recv_timeout(Duration::from_secs(1)).is_ok());
         assert!(requests.try_recv().is_err());
     }
@@ -1388,64 +1387,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn email_fallback_requires_email_verified_true() {
+    async fn jwt_authenticator_rejects_subjectless_registry_at_construction() {
         let registry = registry_with_actors(&json!([{
-            "id": "email-fallback",
-            "name": "Email Fallback",
+            "id": "subjectless",
+            "name": "Subjectless Actor",
             "role": "manager",
-            "oidc": {"email": "verified@example.test"}
+            "oidc": {"username": "mutable-name", "email": "mutable@example.test"}
         }]));
-        let (base_url, _) = mock_http(vec![(200, jwks())]);
-        let auth = JwtAuthenticator::new(config(base_url), registry).unwrap();
-
-        for email_verified in [None, Some(false)] {
-            let token = token_with_identity(
-                Some(KID),
-                "ozonofk-mcp",
-                "unrelated-subject",
-                None,
-                Some("verified@example.test"),
-                email_verified,
-                Some("mcp:tools"),
-            );
-            assert_eq!(
-                auth.authenticate(&bearer(&token)).await.unwrap_err(),
-                JwtAuthenticationFailure::AccessDenied
-            );
-        }
-
-        let verified = token_with_identity(
-            Some(KID),
-            "ozonofk-mcp",
-            "unrelated-subject",
-            None,
-            Some("verified@example.test"),
-            Some(true),
-            Some("mcp:tools"),
-        );
-        assert_eq!(
-            auth.authenticate(&bearer(&verified))
-                .await
-                .unwrap()
-                .actor_id,
-            "email-fallback"
-        );
+        let error = JwtAuthenticator::new(config("http://127.0.0.1:1".to_owned()), registry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("immutable subject"), "{error}");
     }
 
     #[tokio::test]
-    async fn ambiguous_username_and_verified_email_fallback_is_rejected() {
+    async fn mutable_username_and_email_claims_cannot_select_another_subject() {
         let registry = registry_with_actors(&json!([
             {
-                "id": "username-fallback",
-                "name": "Username Fallback",
+                "id": "first",
+                "name": "First Actor",
                 "role": "manager",
-                "oidc": {"username": "shared-user"}
+                "oidc": {"subject": "first-subject", "username": "shared-user"}
             },
             {
-                "id": "email-fallback",
-                "name": "Email Fallback",
+                "id": "second",
+                "name": "Second Actor",
                 "role": "manager",
-                "oidc": {"email": "shared@example.test"}
+                "oidc": {"subject": "second-subject", "email": "shared@example.test"}
             }
         ]));
         let (base_url, _) = mock_http(vec![(200, jwks())]);
@@ -1453,14 +1421,16 @@ mod tests {
         let token = token_with_identity(
             Some(KID),
             "ozonofk-mcp",
-            "unrelated-subject",
+            "unregistered-subject",
             Some("shared-user"),
             Some("shared@example.test"),
             Some(true),
             Some("mcp:tools"),
         );
-        let error = auth.authenticate(&bearer(&token)).await.unwrap_err();
-        assert_eq!(error, JwtAuthenticationFailure::AccessDenied);
+        assert_eq!(
+            auth.authenticate(&bearer(&token)).await.unwrap_err(),
+            JwtAuthenticationFailure::AccessDenied
+        );
     }
 
     #[tokio::test]
@@ -1581,9 +1551,17 @@ mod tests {
             JwtAuthenticationFailure::WrongAudience
         );
         assert_eq!(
-            auth.authenticate(&bearer(&token(Some(KID), "ozonofk-mcp", "unknown")))
-                .await
-                .unwrap_err(),
+            auth.authenticate(&bearer(&token_with_identity(
+                Some(KID),
+                "ozonofk-mcp",
+                "unknown-subject",
+                Some("admin"),
+                Some("admin@example.test"),
+                Some(true),
+                Some("mcp:tools"),
+            )))
+            .await
+            .unwrap_err(),
             JwtAuthenticationFailure::AccessDenied
         );
     }
