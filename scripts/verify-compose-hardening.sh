@@ -1715,9 +1715,21 @@ check_contains \
   "$project_dir/scripts/install-local-runtime-agent.sh" \
   '--env-file "$position_environment_file"'
 check_contains \
-  "production MCP installer requires a healthy reporting database" \
+  "production MCP installer selects the reporting database by Compose project" \
   "$project_dir/scripts/install-local-runtime-agent.sh" \
-  'mcp-ozon-position-db'
+  '--filter label=com.docker.compose.project=mcp-ozon-position'
+check_contains \
+  "production MCP installer selects the reporting database by Compose service" \
+  "$project_dir/scripts/install-local-runtime-agent.sh" \
+  '--filter label=com.docker.compose.service=position-db'
+check_contains \
+  "production MCP installer requires an unambiguous reporting database" \
+  "$project_dir/scripts/install-local-runtime-agent.sh" \
+  'multiple reporting database containers are running; refusing an ambiguous deployment'
+check_not_contains \
+  "production MCP installer does not assume a non-Compose database container name" \
+  "$project_dir/scripts/install-local-runtime-agent.sh" \
+  "'{{.State.Health.Status}}' mcp-ozon-position-db"
 check_contains \
   "live reporting: access registry has no fallback path" \
   "$project_dir/compose.reporting-live.yaml" \
