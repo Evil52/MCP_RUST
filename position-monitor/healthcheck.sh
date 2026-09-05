@@ -46,6 +46,7 @@ SELECT
     AND to_regclass('daily_reporting.claimable_deliveries') IS NOT NULL
     AND to_regclass('daily_reporting.generation_attempts') IS NOT NULL
     AND to_regclass('daily_reporting.generatable_batches') IS NOT NULL
+    AND to_regclass('daily_reporting.delivery_batches_generatable_schedule_idx') IS NOT NULL
     AND to_regclass('daily_reporting.stalled_report_work') IS NOT NULL
     AND to_regclass('daily_reporting.source_snapshots') IS NOT NULL
     AND to_regclass('daily_reporting.sales_facts') IS NOT NULL
@@ -1759,7 +1760,7 @@ SELECT
         OR (
             to_regclass('mcp_runtime.schema_migrations') IS NOT NULL
             AND (
-                SELECT count(*) = 27
+                SELECT count(*) = 28
                     AND bool_and(state = 'applied')
                     AND bool_and(applied_at IS NOT NULL)
                 FROM mcp_runtime.schema_migrations
