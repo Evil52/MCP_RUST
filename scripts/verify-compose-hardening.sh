@@ -1707,6 +1707,18 @@ check_contains \
   "$project_dir/compose.reporting-reader.yaml" \
   "name: mcp-ozon-position-internal"
 check_contains \
+  "production MCP installer includes the reporting reader overlay" \
+  "$project_dir/scripts/install-local-runtime-agent.sh" \
+  'reporting_compose_file="$project_root/compose.reporting-reader.yaml"'
+check_contains \
+  "production MCP installer uses the protected position interpolation file" \
+  "$project_dir/scripts/install-local-runtime-agent.sh" \
+  '--env-file "$position_environment_file"'
+check_contains \
+  "production MCP installer requires a healthy reporting database" \
+  "$project_dir/scripts/install-local-runtime-agent.sh" \
+  'mcp-ozon-position-db'
+check_contains \
   "live reporting: access registry has no fallback path" \
   "$project_dir/compose.reporting-live.yaml" \
   "\${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for live reporting}"
@@ -1782,6 +1794,10 @@ check_contains \
   "scheduled collection: runner requires explicit canary reconciliation" \
   "$project_dir/scripts/start-report-collector-scheduler.sh" \
   "--confirm-canaries-published-and-reconciled"
+check_contains \
+  "scheduled collection: runner requires immutable release images" \
+  "$project_dir/scripts/start-report-collector-scheduler.sh" \
+  'verify-release-images.sh" report-collector ozon-egress'
 check_contains \
   "scheduled collection: runner requires a database-backed activation preflight" \
   "$project_dir/scripts/start-report-collector-scheduler.sh" \

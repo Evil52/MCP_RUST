@@ -16,6 +16,7 @@ use mcp_ozon::{
         run_http_until_bounded_shutdown, serve_hardened_http,
     },
     server::OzonMcp,
+    tool_telemetry::ToolTelemetryService,
     wb::WbClient,
 };
 use rmcp::ServiceExt;
@@ -56,6 +57,8 @@ async fn main() -> Result<()> {
     };
     let refresh_requests =
         RefreshRequestService::connect_optional(refresh_database_url.as_deref()).await?;
+    let tool_telemetry =
+        ToolTelemetryService::connect_optional(refresh_database_url.as_deref()).await?;
     let client = OzonClient::new(
         config.ozon_api_base_url.clone(),
         config.request_timeout,
@@ -76,6 +79,7 @@ async fn main() -> Result<()> {
     .with_performance_client(performance_client)
     .with_reporting_reader(reporting_reader)
     .with_refresh_requests(refresh_requests)
+    .with_tool_telemetry(tool_telemetry)
     .with_preview_features(
         config.ozon_postings_vnext,
         config.ozon_finance_accruals_preview,
@@ -172,5 +176,63 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     if signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDate;
+    use mcp_ozon::{
+        reporting::mcp_read::ReportingReadError,
+        tool_telemetry::{ToolCallOutcome, ToolTelemetryError},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn reporting_runtime_dependencies_execute_from_the_primary_binary() {
+        let disabled = ToolTelemetryService::connect_optional(None).await.unwrap();
+        assert!(!disabled.is_enabled());
+        assert!(format!("{disabled:?}").contains("enabled: false"));
+
+        let Ok(requester_url) = std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL") else {
+            return;
+        };
+        let telemetry = ToolTelemetryService::connect_optional(Some(&requester_url))
+            .await
+            .unwrap();
+        assert!(telemetry.is_enabled());
+        telemetry.probe().await.unwrap();
+        let receipt = telemetry
+            .begin("runtime_probe", "ofk_runtime_probe", None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            telemetry
+                .finish(
+                    receipt,
+                    ToolCallOutcome::Failed,
+                    Duration::from_millis(1),
+                    Some("RUNTIME_PROBE")
+                )
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            telemetry.list(0).await,
+            Err(ToolTelemetryError::InvalidRequest)
+        );
+
+        let reader_url = std::env::var("POSITION_REPOSITORY_TEST_READER_URL").unwrap();
+        let reader = ReportingReader::connect_optional(Some(&reader_url))
+            .await
+            .unwrap();
+        assert!(reader.is_enabled());
+        reader.probe().await.unwrap();
+        let date = NaiveDate::from_ymd_opt(2026, 8, 30).unwrap();
+        assert_eq!(
+            reader.weekly_marketplace_ranking(&[], date, date).await,
+            Err(ReportingReadError::InvalidRequest)
+        );
     }
 }

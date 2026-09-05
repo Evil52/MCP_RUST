@@ -29,6 +29,16 @@ if [[ ! -f .position.env || -L .position.env ]]; then
   exit 66
 fi
 
+release_record="$(
+  "$project_dir/scripts/verify-release-images.sh" report-collector ozon-egress
+)"
+export MCP_RELEASE_GIT_SHA
+export MCP_REPORT_COLLECTOR_IMAGE
+export MCP_OZON_EGRESS_IMAGE
+MCP_RELEASE_GIT_SHA="$(jq -r '.git_sha' <<<"$release_record")"
+MCP_REPORT_COLLECTOR_IMAGE="$(jq -r '.images["report-collector"]' <<<"$release_record")"
+MCP_OZON_EGRESS_IMAGE="$(jq -r '.images["ozon-egress"]' <<<"$release_record")"
+
 compose=(
   docker compose --env-file .position.env
   -f compose.position.yaml

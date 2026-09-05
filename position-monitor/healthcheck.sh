@@ -25,6 +25,7 @@ SELECT
     to_regclass('search_position.monitors') IS NOT NULL
     AND to_regclass('search_position.collection_runs') IS NOT NULL
     AND to_regclass('search_position.measurements') IS NOT NULL
+    AND to_regclass('search_position.measurements_monitor_slot') IS NOT NULL
     AND to_regclass('search_position.latest_measurements') IS NOT NULL
     AND to_regclass('search_position.published_measurements') IS NOT NULL
     AND to_regclass('search_position.published_alerts') IS NOT NULL
@@ -45,6 +46,7 @@ SELECT
     AND to_regclass('daily_reporting.claimable_deliveries') IS NOT NULL
     AND to_regclass('daily_reporting.generation_attempts') IS NOT NULL
     AND to_regclass('daily_reporting.generatable_batches') IS NOT NULL
+    AND to_regclass('daily_reporting.delivery_batches_generatable_schedule_idx') IS NOT NULL
     AND to_regclass('daily_reporting.stalled_report_work') IS NOT NULL
     AND to_regclass('daily_reporting.source_snapshots') IS NOT NULL
     AND to_regclass('daily_reporting.sales_facts') IS NOT NULL
@@ -56,7 +58,13 @@ SELECT
     AND to_regclass('daily_reporting.unit_economics_inputs') IS NOT NULL
     AND to_regclass('daily_reporting.collection_claims') IS NOT NULL
     AND to_regclass('daily_reporting.ozon_sales_refresh_requests') IS NOT NULL
-    AND to_regclass('daily_reporting.ozon_sales_refresh_one_active_account_idx') IS NOT NULL
+    AND to_regclass('daily_reporting.marketplace_sales_refresh_one_active_account_idx') IS NOT NULL
+    AND to_regclass('daily_reporting.marketplace_sales_refresh_history_idx') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_tool_calls') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_tool_calls_admin_log_idx') IS NOT NULL
+    AND to_regclass('daily_reporting.mcp_tool_calls_running_idx') IS NOT NULL
+    AND to_regclass('daily_reporting.collection_staging_snapshots') IS NOT NULL
+    AND to_regclass('daily_reporting.collection_staging_snapshots_age_idx') IS NOT NULL
     AND to_regclass('daily_reporting.ozon_sales_refresh_one_running_global_idx') IS NOT NULL
     AND to_regclass('daily_reporting.published_source_snapshots') IS NOT NULL
     AND to_regclass('daily_reporting.published_sales_facts') IS NOT NULL
@@ -561,10 +569,40 @@ SELECT
     AND to_regprocedure(
         'daily_reporting.fail_ozon_sales_refresh(bigint,integer,text,text)'
     ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.request_marketplace_sales_refresh(text,text,text,date)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.marketplace_sales_refresh_status(text,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.claim_marketplace_sales_refresh(text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.complete_marketplace_sales_refresh(bigint,integer,text,timestamp with time zone)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.fail_marketplace_sales_refresh(bigint,integer,text,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.begin_mcp_tool_call(text,text,text,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.finish_mcp_tool_call(bigint,text,integer,text)'
+    ) IS NOT NULL
+    AND to_regprocedure(
+        'daily_reporting.list_mcp_tool_calls(integer)'
+    ) IS NOT NULL
     AND EXISTS (
         SELECT 1
         FROM pg_trigger
         WHERE tgname = 'source_snapshots_require_active_collection_claim'
+          AND NOT tgisinternal
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'collection_staging_snapshots_require_active_claim'
           AND NOT tgisinternal
     )
     AND (
@@ -765,9 +803,44 @@ SELECT
         'daily_reporting.ozon_sales_refresh_status(text)',
         'EXECUTE'
     )
+    AND has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.request_marketplace_sales_refresh(text,text,text,date)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.marketplace_sales_refresh_status(text,text)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.begin_mcp_tool_call(text,text,text,text)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.finish_mcp_tool_call(bigint,text,integer,text)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.list_mcp_tool_calls(integer)',
+        'EXECUTE'
+    )
     AND NOT has_table_privilege(
         'report_refresh_requester',
         'daily_reporting.ozon_sales_refresh_requests',
+        'SELECT,INSERT,UPDATE,DELETE'
+    )
+    AND NOT has_table_privilege(
+        'report_refresh_requester',
+        'daily_reporting.mcp_tool_calls',
+        'SELECT,INSERT,UPDATE,DELETE'
+    )
+    AND NOT has_table_privilege(
+        'report_refresh_requester',
+        'daily_reporting.collection_staging_snapshots',
         'SELECT,INSERT,UPDATE,DELETE'
     )
     AND NOT has_table_privilege(
@@ -777,6 +850,16 @@ SELECT
     AND NOT has_function_privilege(
         'report_refresh_requester',
         'daily_reporting.claim_ozon_sales_refresh(text)',
+        'EXECUTE'
+    )
+    AND NOT has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.claim_marketplace_sales_refresh(text)',
+        'EXECUTE'
+    )
+    AND NOT has_function_privilege(
+        'report_refresh_requester',
+        'daily_reporting.claim_marketplace_sales_refresh_for(text,text)',
         'EXECUTE'
     )
     AND has_table_privilege(
@@ -1166,9 +1249,42 @@ SELECT
         'daily_reporting.fail_ozon_sales_refresh(bigint,integer,text,text)',
         'EXECUTE'
     )
+    AND has_function_privilege(
+        'report_collector',
+        'daily_reporting.claim_marketplace_sales_refresh(text)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_collector',
+        'daily_reporting.complete_marketplace_sales_refresh(bigint,integer,text,timestamp with time zone)',
+        'EXECUTE'
+    )
+    AND has_function_privilege(
+        'report_collector',
+        'daily_reporting.fail_marketplace_sales_refresh(bigint,integer,text,text)',
+        'EXECUTE'
+    )
+    AND NOT has_function_privilege(
+        'report_collector',
+        'daily_reporting.claim_marketplace_sales_refresh_for(text,text)',
+        'EXECUTE'
+    )
+    AND NOT has_function_privilege(
+        'report_collector',
+        'daily_reporting.finish_marketplace_sales_refresh(bigint,integer,text,timestamp with time zone,text,text)',
+        'EXECUTE'
+    )
     AND NOT has_table_privilege(
         'report_collector', 'daily_reporting.ozon_sales_refresh_requests',
         'SELECT,INSERT,UPDATE,DELETE'
+    )
+    AND has_table_privilege(
+        'report_collector', 'daily_reporting.collection_staging_snapshots',
+        'SELECT,INSERT,DELETE'
+    )
+    AND NOT has_table_privilege(
+        'report_collector', 'daily_reporting.collection_staging_snapshots',
+        'UPDATE,TRUNCATE,REFERENCES,TRIGGER'
     )
     AND NOT has_function_privilege(
         'report_worker',
@@ -1644,7 +1760,7 @@ SELECT
         OR (
             to_regclass('mcp_runtime.schema_migrations') IS NOT NULL
             AND (
-                SELECT count(*) = 25
+                SELECT count(*) = 28
                     AND bool_and(state = 'applied')
                     AND bool_and(applied_at IS NOT NULL)
                 FROM mcp_runtime.schema_migrations

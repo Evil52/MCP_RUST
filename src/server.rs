@@ -3,7 +3,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
@@ -48,10 +48,14 @@ use crate::{
             MAX_SALES_ANALYTICS_OFFSET, MAX_SALES_ANALYTICS_ROWS, ManagerActionsResult,
             MetricsHistoryResult, ReadyReportsResult, ReportingReadError, ReportingReader,
             SalesAnalyticsDirection, SalesAnalyticsGroup, SalesAnalyticsQuery,
-            SalesAnalyticsResult, SalesAnalyticsSort,
+            SalesAnalyticsResult, SalesAnalyticsSort, WeeklyMarketplaceRankingResult,
         },
         refresh_queue::{RefreshRequestError, RefreshRequestService, SalesRefreshStatus},
         snapshot::{AccountScope, Marketplace as ReportingMarketplace},
+    },
+    tool_telemetry::{
+        MAX_TOOL_CALL_LOG_ROWS, ToolCallLogResult, ToolCallOutcome, ToolTelemetryError,
+        ToolTelemetryService,
     },
     wb::WbClient,
 };
@@ -110,7 +114,12 @@ const REPORT_REFRESH_UNAVAILABLE: &str = "REPORT_REFRESH_UNAVAILABLE";
 const REPORT_REFRESH_INVALID_REQUEST: &str = "REPORT_REFRESH_INVALID_REQUEST";
 const REPORT_REFRESH_TEMPORARILY_UNAVAILABLE: &str = "REPORT_REFRESH_TEMPORARILY_UNAVAILABLE";
 const REPORT_REFRESH_INVALID_DATA: &str = "REPORT_REFRESH_INVALID_DATA";
-const REQUEST_OZON_SALES_REFRESH_TOOL: &str = "ofk_request_ozon_sales_refresh";
+const TOOL_TELEMETRY_UNAVAILABLE: &str = "TOOL_TELEMETRY_UNAVAILABLE";
+const TOOL_TELEMETRY_INVALID_REQUEST: &str = "TOOL_TELEMETRY_INVALID_REQUEST";
+const REPORT_REFRESH_WRITE_TOOLS: &[&str] = &[
+    "ofk_request_marketplace_sales_refresh",
+    "ofk_request_ozon_sales_refresh",
+];
 const MAX_REPORTING_STATUS_ROWS: u16 = 50;
 const MAX_REPORTING_HISTORY_POINTS: u16 = 100;
 const MAX_REPORTING_REPORTS: u16 = 100;
@@ -226,6 +235,7 @@ pub struct OzonMcp {
     registry: RegistrySource,
     reporting_reader: ReportingReader,
     refresh_requests: RefreshRequestService,
+    tool_telemetry: ToolTelemetryService,
     tool_router: ToolRouter<Self>,
     tool_call_slots: Arc<Semaphore>,
 }
@@ -266,7 +276,7 @@ impl OzonMcp {
                 .collect(),
         );
         for route in tool_router.map.values_mut() {
-            let read_only = route.attr.name.as_ref() != REQUEST_OZON_SALES_REFRESH_TOOL;
+            let read_only = !REPORT_REFRESH_WRITE_TOOLS.contains(&route.attr.name.as_ref());
             let annotations = route.attr.annotations.get_or_insert_default();
             annotations.read_only_hint = Some(read_only);
             annotations.destructive_hint = Some(false);
@@ -294,6 +304,7 @@ impl OzonMcp {
             registry,
             reporting_reader: ReportingReader::disabled(),
             refresh_requests: RefreshRequestService::disabled(),
+            tool_telemetry: ToolTelemetryService::disabled(),
             tool_router: Self::default_tool_router(None),
             tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
         }
@@ -315,15 +326,13 @@ impl OzonMcp {
             registry,
             reporting_reader: ReportingReader::disabled(),
             refresh_requests: RefreshRequestService::disabled(),
+            tool_telemetry: ToolTelemetryService::disabled(),
             tool_router,
             tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
         }
     }
 
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "tokio::select owns the admission future inside its generated state"
-    )]
+    #[cfg(test)]
     async fn run_tool_call_with_admission(
         &self,
         cancellation: tokio_util::sync::CancellationToken,
@@ -331,24 +340,45 @@ impl OzonMcp {
             Box<dyn Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_>,
         >,
     ) -> Result<CallToolResponse, rmcp::ErrorData> {
+        let (result, _permit) = self
+            .run_tool_call_with_admission_held(cancellation, dispatch)
+            .await;
+        result
+    }
+
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the returned permit deliberately extends admission through terminal telemetry"
+    )]
+    async fn run_tool_call_with_admission_held(
+        &self,
+        cancellation: tokio_util::sync::CancellationToken,
+        dispatch: Pin<
+            Box<dyn Future<Output = Result<CallToolResponse, rmcp::ErrorData>> + Send + '_>,
+        >,
+    ) -> (
+        Result<CallToolResponse, rmcp::ErrorData>,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         let cancellation = cancellation.cancelled_owned();
         tokio::pin!(cancellation);
-        let admission = std::future::ready(self.tool_call_slots.try_acquire());
-        let _tool_call_slot = tokio::select! {
+        let admission = std::future::ready(Arc::clone(&self.tool_call_slots).try_acquire_owned());
+        let tool_call_slot = tokio::select! {
             biased;
-            () = &mut cancellation => return Ok(tool_call_cancelled_response()),
+            () = &mut cancellation => return (Ok(tool_call_cancelled_response()), None),
             permit = admission => match permit {
                 Ok(permit) => permit,
-                Err(_) => return Ok(tool_call_overloaded_response()),
+                Err(_) => return (Ok(tool_call_overloaded_response()), None),
             },
         };
 
         tokio::pin!(dispatch);
-        tokio::select! {
+        let result = tokio::select! {
             biased;
             () = &mut cancellation => Ok(tool_call_cancelled_response()),
             result = &mut dispatch => result,
-        }
+        };
+        (result, Some(tool_call_slot))
     }
 
     #[must_use]
@@ -372,6 +402,12 @@ impl OzonMcp {
     #[must_use]
     pub fn with_refresh_requests(mut self, refresh_requests: RefreshRequestService) -> Self {
         self.refresh_requests = refresh_requests;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_telemetry(mut self, tool_telemetry: ToolTelemetryService) -> Self {
+        self.tool_telemetry = tool_telemetry;
         self
     }
 
@@ -400,6 +436,10 @@ impl OzonMcp {
             && let Err(error) = self.refresh_requests.probe().await
         {
             tracing::warn!(%error, "MCP readiness failed: report refresh queue is unavailable");
+            return Err(());
+        }
+        if let Err(error) = self.tool_telemetry.probe().await {
+            tracing::warn!(%error, "MCP readiness failed: tool telemetry is unavailable");
             return Err(());
         }
         Ok(())
@@ -436,6 +476,54 @@ impl OzonMcp {
             .map_err(|error| config_error(&error))?
             .clone();
         Ok((registry, actor))
+    }
+
+    fn tool_telemetry_dimensions(
+        &self,
+        request: &CallToolRequestParams,
+        context: &RequestContext<RoleServer>,
+    ) -> (String, Option<String>, Option<ReportingMarketplace>) {
+        let actor_id = context
+            .extensions
+            .get::<AuthenticatedActor>()
+            .map(|actor| actor.actor_id.clone())
+            .or_else(|| self.default_actor_id.clone())
+            .unwrap_or_else(|| "unknown".to_owned());
+        let Some(RequestRegistry::Loaded(registry)) = context.extensions.get::<RequestRegistry>()
+        else {
+            return (actor_id, None, None);
+        };
+        let selected = request.arguments.as_ref().and_then(|arguments| {
+            arguments
+                .get("account")
+                .or_else(|| arguments.get("store"))
+                .and_then(Value::as_str)
+        });
+        let account = selected
+            .and_then(|selector| {
+                registry
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == selector)
+                    .or_else(|| registry.account_for_store_selector(&StoreId::from(selector)))
+            })
+            .or_else(|| {
+                let actor = registry.actor(&actor_id).ok()?;
+                let mut accessible = registry
+                    .accounts
+                    .iter()
+                    .filter(|account| actor.can_access_account(account));
+                let first = accessible.next()?;
+                accessible.next().is_none().then_some(first)
+            });
+        let Some(account) = account else {
+            return (actor_id, None, None);
+        };
+        let marketplace = match account.marketplace {
+            Marketplace::Ozon => ReportingMarketplace::Ozon,
+            Marketplace::Wildberries => ReportingMarketplace::Wildberries,
+        };
+        (actor_id, Some(account.id.clone()), Some(marketplace))
     }
 
     fn registry_without_request_snapshot(&self) -> Result<Arc<AccessRegistry>, String> {
@@ -629,6 +717,20 @@ impl OzonMcp {
             ),
             RefreshRequestError::InvalidData => {
                 format!("{REPORT_REFRESH_INVALID_DATA}: состояние очереди не прошло проверку")
+            }
+        }
+    }
+
+    fn tool_telemetry_error(error: ToolTelemetryError) -> String {
+        match error {
+            ToolTelemetryError::Disabled => {
+                format!("{TOOL_TELEMETRY_UNAVAILABLE}: журнал вызовов не подключён")
+            }
+            ToolTelemetryError::InvalidRequest => {
+                format!("{TOOL_TELEMETRY_INVALID_REQUEST}: параметры журнала недопустимы")
+            }
+            ToolTelemetryError::Unavailable | ToolTelemetryError::InvalidData => {
+                format!("{TOOL_TELEMETRY_UNAVAILABLE}: журнал вызовов временно недоступен")
             }
         }
     }
@@ -1056,6 +1158,30 @@ fn tool_call_cancelled_response() -> CallToolResponse {
         "cancelled",
         "Вызов инструмента отменён клиентом и больше не выполняется.",
     )
+}
+
+fn classify_tool_call_result(
+    result: &Result<CallToolResponse, rmcp::ErrorData>,
+) -> (ToolCallOutcome, Option<&'static str>) {
+    let Ok(response) = result else {
+        return (ToolCallOutcome::Failed, Some("MCP_PROTOCOL_ERROR"));
+    };
+    let CallToolResponse::Complete(result) = response else {
+        return (ToolCallOutcome::Succeeded, None);
+    };
+    if !result.is_error.unwrap_or(false) {
+        return (ToolCallOutcome::Succeeded, None);
+    }
+    match result
+        .structured_content
+        .as_ref()
+        .and_then(|value| value.pointer("/kind"))
+        .and_then(Value::as_str)
+    {
+        Some("cancelled") => (ToolCallOutcome::Cancelled, Some("MCP_CANCELLED")),
+        Some("local_overloaded") => (ToolCallOutcome::Overloaded, Some("MCP_LOCAL_OVERLOADED")),
+        _ => (ToolCallOutcome::Failed, Some("MCP_TOOL_FAILURE")),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3476,6 +3602,10 @@ const fn default_reporting_reports_limit() -> u16 {
     20
 }
 
+const fn default_tool_call_log_limit() -> u16 {
+    50
+}
+
 const fn default_sales_analytics_limit() -> u16 {
     100
 }
@@ -3545,6 +3675,23 @@ pub struct ReportingMetricsHistoryInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ReportingWeeklyMarketplaceRankingInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Начало одной завершённой семидневной недели YYYY-MM-DD; без обеих дат выбирается предыдущая календарная неделя",
+        length(equal = 10)
+    )]
+    pub date_from: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Конец той же семидневной недели YYYY-MM-DD; без обеих дат выбирается предыдущая календарная неделя",
+        length(equal = 10)
+    )]
+    pub date_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReportingOzonSalesAnalyticsInput {
     #[serde(default)]
     #[schemars(
@@ -3603,6 +3750,14 @@ pub struct ReportingManagerActionsInput {
 pub struct ReportingReadyReportsInput {
     #[serde(default = "default_reporting_reports_limit")]
     #[schemars(range(min = 1, max = 100))]
+    pub limit: u16,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCallLogInput {
+    #[serde(default = "default_tool_call_log_limit")]
+    #[schemars(range(min = 1, max = 200))]
     pub limit: u16,
 }
 
@@ -3685,6 +3840,52 @@ impl OzonMcp {
         Self::authorize_reporting_details_for_role(role)?;
         self.reporting_reader
             .metrics_history(&account, date_from, date_to, input.limit)
+            .await
+            .map(Json)
+            .map_err(Self::reporting_error)
+    }
+
+    /// Строит единый рейтинг Ozon и Wildberries только из опубликованных PostgreSQL-снимков.
+    /// Лидер и аутсайдер появляются только при полной недельной выборке по всем кабинетам реестра.
+    #[tool(
+        name = "ofk_weekly_marketplace_ranking",
+        annotations(
+            title = "Недельный рейтинг маркетплейсов OFK",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn reporting_weekly_marketplace_ranking(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ReportingWeeklyMarketplaceRankingInput>,
+    ) -> Result<Json<WeeklyMarketplaceRankingResult>, String> {
+        let (registry, actor) = self.access_context(&identity)?;
+        Self::authorize_report_catalog_for_role(actor.role)?;
+        let (date_from, date_to) = weekly_ranking_period(
+            input.date_from.as_deref(),
+            input.date_to.as_deref(),
+            crate::reporting::business_date(Utc::now()),
+        )?;
+        let accounts = registry
+            .accounts
+            .iter()
+            .map(|account| {
+                let marketplace = match account.marketplace {
+                    Marketplace::Ozon => ReportingMarketplace::Ozon,
+                    Marketplace::Wildberries => ReportingMarketplace::Wildberries,
+                };
+                AccountScope::new(account.id.clone(), marketplace).map_err(|_| {
+                    format!(
+                        "{REPORTING_INVALID_REQUEST}: кабинет реестра имеет недопустимый идентификатор"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.reporting_reader
+            .weekly_marketplace_ranking(&accounts, date_from, date_to)
             .await
             .map(Json)
             .map_err(Self::reporting_error)
@@ -3776,6 +3977,7 @@ impl OzonMcp {
         self.refresh_requests
             .request(
                 account.account_id(),
+                account.marketplace(),
                 &actor.id,
                 crate::reporting::business_date(Utc::now()),
             )
@@ -3808,7 +4010,63 @@ impl OzonMcp {
             ));
         }
         self.refresh_requests
-            .status(account.account_id())
+            .status(account.account_id(), account.marketplace())
+            .await
+            .map(Json)
+            .map_err(Self::refresh_request_error)
+    }
+
+    /// Ставит единое фоновое обновление снимков Ozon или Wildberries для разрешённого кабинета.
+    /// Маркетплейс берётся из серверного реестра, а не из недоверенного аргумента модели.
+    #[tool(
+        name = "ofk_request_marketplace_sales_refresh",
+        annotations(
+            title = "Запросить фоновое обновление маркетплейса OFK",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn request_marketplace_sales_refresh(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ReportingOzonSalesRefreshInput>,
+    ) -> Result<Json<SalesRefreshStatus>, String> {
+        let (_, actor) = self.access_context(&identity)?;
+        let (account, _) = self.resolve_reporting_account(&identity, input.account.as_deref())?;
+        self.refresh_requests
+            .request(
+                account.account_id(),
+                account.marketplace(),
+                &actor.id,
+                crate::reporting::business_date(Utc::now()),
+            )
+            .await
+            .map(Json)
+            .map_err(Self::refresh_request_error)
+    }
+
+    /// Показывает состояние последнего durable refresh Ozon или Wildberries.
+    /// Никаких внешних API-вызовов этот метод не выполняет.
+    #[tool(
+        name = "ofk_marketplace_sales_refresh_status",
+        annotations(
+            title = "Статус фонового обновления маркетплейса OFK",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn marketplace_sales_refresh_status(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ReportingOzonSalesRefreshInput>,
+    ) -> Result<Json<SalesRefreshStatus>, String> {
+        let (account, _) = self.resolve_reporting_account(&identity, input.account.as_deref())?;
+        self.refresh_requests
+            .status(account.account_id(), account.marketplace())
             .await
             .map(Json)
             .map_err(Self::refresh_request_error)
@@ -3867,6 +4125,37 @@ impl OzonMcp {
             .await
             .map(Json)
             .map_err(Self::reporting_error)
+    }
+
+    /// Возвращает очищенную структурированную telemetry вызовов без аргументов,
+    /// ответов, credentials и vendor payloads. Доступ разрешён только admin.
+    #[tool(
+        name = "ofk_tool_call_log",
+        annotations(
+            title = "Журнал вызовов инструментов OFK",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn tool_call_log(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ToolCallLogInput>,
+    ) -> Result<Json<ToolCallLogResult>, String> {
+        if !(1..=MAX_TOOL_CALL_LOG_ROWS).contains(&input.limit) {
+            return Err(format!(
+                "{TOOL_TELEMETRY_INVALID_REQUEST}: limit должен быть от 1 до {MAX_TOOL_CALL_LOG_ROWS}"
+            ));
+        }
+        let (_, actor) = self.access_context(&identity)?;
+        Self::authorize_report_catalog_for_role(actor.role)?;
+        self.tool_telemetry
+            .list(input.limit)
+            .await
+            .map(Json)
+            .map_err(Self::tool_telemetry_error)
     }
 
     /// Показывает локально настроенные магазины и наличие ключей, не раскрывая секреты. Не проверяет сеть или авторизацию Ozon API.
@@ -6242,6 +6531,30 @@ impl ServerHandler for OzonMcp {
             context.extensions.insert(actor);
         }
 
+        if context.extensions.get::<RequestRegistry>().is_none() {
+            context
+                .extensions
+                .insert(RequestRegistry::load(&self.registry).await);
+        }
+        let tool_name = request.name.to_string();
+        let (actor_id, account_id, marketplace) =
+            self.tool_telemetry_dimensions(&request, &context);
+        let telemetry_receipt = match self
+            .tool_telemetry
+            .begin(&actor_id, &tool_name, account_id.as_deref(), marketplace)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tracing::error!(%error, tool_name, actor_id, "tool call refused because telemetry could not start");
+                return Ok(tool_call_control_failure(
+                    "telemetry_unavailable",
+                    "Журнал вызовов временно недоступен; инструмент не был запущен.",
+                ));
+            }
+        };
+        let telemetry_started = Instant::now();
+
         // Authentication deliberately precedes admission control so an
         // unauthenticated caller cannot use the response to observe whether
         // the server is currently saturated. Once authenticated, fail fast:
@@ -6257,8 +6570,24 @@ impl ServerHandler for OzonMcp {
                 .call(ToolCallContext::new(self, request, context))
                 .await
         };
-        self.run_tool_call_with_admission(cancellation, Box::pin(dispatch))
+        let (result, final_permit) = self
+            .run_tool_call_with_admission_held(cancellation, Box::pin(dispatch))
+            .await;
+        let (outcome, error_code) = classify_tool_call_result(&result);
+        if let Err(error) = self
+            .tool_telemetry
+            .finish(
+                telemetry_receipt,
+                outcome,
+                telemetry_started.elapsed(),
+                error_code,
+            )
             .await
+        {
+            tracing::error!(%error, tool_name, actor_id, "tool call finished but terminal telemetry could not be recorded");
+        }
+        drop(final_permit);
+        result
     }
 
     fn get_info(&self) -> ServerInfo {
@@ -6333,6 +6662,44 @@ fn parse_reporting_date_range(
             "{REPORTING_INVALID_REQUEST}: date_from и date_to нужно передавать вместе"
         )),
     }
+}
+
+fn weekly_ranking_period(
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+    current_business_date: NaiveDate,
+) -> Result<(NaiveDate, NaiveDate), String> {
+    let (from, to) = match (date_from, date_to) {
+        (None, None) => {
+            let current_week_start = current_business_date
+                - chrono::Duration::days(i64::from(
+                    current_business_date.weekday().num_days_from_monday(),
+                ));
+            (
+                current_week_start - chrono::Duration::days(7),
+                current_week_start - chrono::Duration::days(1),
+            )
+        }
+        (Some(date_from), Some(date_to)) => (
+            parse_date(date_from, "date_from")?,
+            parse_date(date_to, "date_to")?,
+        ),
+        _ => {
+            return Err(format!(
+                "{REPORTING_INVALID_REQUEST}: date_from и date_to нужно передавать вместе"
+            ));
+        }
+    };
+    if (to - from).num_days() != 6
+        || from.weekday() != chrono::Weekday::Mon
+        || to.weekday() != chrono::Weekday::Sun
+        || to >= current_business_date
+    {
+        return Err(format!(
+            "{REPORTING_INVALID_REQUEST}: рейтинг требует одну завершённую календарную неделю с понедельника по воскресенье"
+        ));
+    }
+    Ok((from, to))
 }
 
 fn validate_reporting_limit(limit: u16, maximum: u16) -> Result<(), String> {
@@ -7225,6 +7592,67 @@ mod tests {
             account: &'a AccountScope,
             query: SalesAnalyticsQuery,
         ) -> ReportingReadFuture<'a, SalesAnalyticsResult> {
+            if query
+                .date_to
+                .signed_duration_since(query.date_from)
+                .num_days()
+                == 6
+            {
+                let incomplete = account.account_id() == "account_b"
+                    || account.marketplace() == ReportingMarketplace::Wildberries;
+                let mut coverage = Vec::with_capacity(7);
+                let mut rows = Vec::with_capacity(7);
+                let mut date = query.date_from;
+                loop {
+                    let missing = incomplete && date == query.date_to;
+                    coverage.push(SalesDateCoverage {
+                        business_date: date.to_string(),
+                        state: if missing {
+                            SalesDateCoverageState::Unavailable
+                        } else {
+                            SalesDateCoverageState::Complete
+                        },
+                        served: !missing,
+                        cutoff_at: (!missing).then(|| "2026-08-31T03:00:00Z".to_owned()),
+                        source_as_of: (!missing).then(|| "2026-08-31T02:59:00Z".to_owned()),
+                        period_end: (!missing).then(|| "2026-08-31T19:00:00Z".to_owned()),
+                    });
+                    if !missing {
+                        rows.push(SalesAnalyticsRow {
+                            business_date: Some(date.to_string()),
+                            sku: None,
+                            ordered_units: 2,
+                            operational_gmv_minor: 1_000,
+                            currency: "RUB".to_owned(),
+                        });
+                    }
+                    if date == query.date_to {
+                        break;
+                    }
+                    date = date.succ_opt().expect("bounded test date");
+                }
+                let total_rows = rows.len() as u64;
+                return self.complete(SalesAnalyticsResult {
+                    account_id: account.account_id().to_owned(),
+                    marketplace: Self::marketplace(account),
+                    date_from: query.date_from.to_string(),
+                    date_to: query.date_to.to_string(),
+                    state: if incomplete {
+                        DataState::Partial
+                    } else {
+                        DataState::Complete
+                    },
+                    source: "published_postgresql_snapshots".to_owned(),
+                    group_by: query.group_by,
+                    sort_by: query.sort_by,
+                    direction: query.direction,
+                    limit: query.limit,
+                    offset: query.offset,
+                    total_rows,
+                    rows,
+                    coverage,
+                });
+            }
             self.complete(SalesAnalyticsResult {
                 account_id: account.account_id().to_owned(),
                 marketplace: Self::marketplace(account),
@@ -7315,7 +7743,7 @@ mod tests {
     #[derive(Default)]
     struct FakeRefreshRequestRepository {
         calls: AtomicU64,
-        last_request: Mutex<Option<(String, String, NaiveDate)>>,
+        last_request: Mutex<Option<(String, ReportingMarketplace, String, NaiveDate)>>,
         probe_error: bool,
     }
 
@@ -7331,9 +7759,14 @@ mod tests {
             }
         }
 
-        fn result(account_id: &str, created: Option<bool>) -> SalesRefreshStatus {
+        fn result(
+            account_id: &str,
+            marketplace: ReportingMarketplace,
+            created: Option<bool>,
+        ) -> SalesRefreshStatus {
             SalesRefreshStatus {
                 account_id: account_id.to_owned(),
+                marketplace,
                 request_id: Some(17),
                 state: SalesRefreshState::Queued,
                 business_date: Some("2026-09-02".to_owned()),
@@ -7363,21 +7796,27 @@ mod tests {
         fn request<'a>(
             &'a self,
             account_id: &'a str,
+            marketplace: ReportingMarketplace,
             actor_id: &'a str,
             business_date: NaiveDate,
         ) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_request.lock().unwrap() =
-                Some((account_id.to_owned(), actor_id.to_owned(), business_date));
-            Box::pin(async move { Ok(Self::result(account_id, Some(true))) })
+            *self.last_request.lock().unwrap() = Some((
+                account_id.to_owned(),
+                marketplace,
+                actor_id.to_owned(),
+                business_date,
+            ));
+            Box::pin(async move { Ok(Self::result(account_id, marketplace, Some(true))) })
         }
 
         fn status<'a>(
             &'a self,
             account_id: &'a str,
+            marketplace: ReportingMarketplace,
         ) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok(Self::result(account_id, None)) })
+            Box::pin(async move { Ok(Self::result(account_id, marketplace, None)) })
         }
     }
 
@@ -7415,8 +7854,9 @@ mod tests {
 
         let recorded = repository.last_request.lock().unwrap().clone().unwrap();
         assert_eq!(recorded.0, "account_b");
-        assert_eq!(recorded.1, "manager");
-        assert_eq!(recorded.2, crate::reporting::business_date(Utc::now()));
+        assert_eq!(recorded.1, ReportingMarketplace::Ozon);
+        assert_eq!(recorded.2, "manager");
+        assert_eq!(recorded.3, crate::reporting::business_date(Utc::now()));
 
         let status = manager
             .ozon_sales_refresh_status(
@@ -8191,6 +8631,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admitted_permit_can_be_held_through_terminal_telemetry() {
+        let server = server();
+        let (result, final_permit) = server
+            .run_tool_call_with_admission_held(
+                tokio_util::sync::CancellationToken::new(),
+                Box::pin(async {
+                    Ok(CallToolResult::success(vec![ContentBlock::text("ok")]).into())
+                }),
+            )
+            .await;
+
+        assert!(result.is_ok());
+        assert!(final_permit.is_some());
+        assert_eq!(
+            server.tool_call_slots.available_permits(),
+            MAX_IN_FLIGHT_TOOL_CALLS - 1
+        );
+        drop(final_permit);
+        assert_eq!(
+            server.tool_call_slots.available_permits(),
+            MAX_IN_FLIGHT_TOOL_CALLS
+        );
+    }
+
+    #[tokio::test]
     async fn authentication_still_precedes_tool_call_admission_control() {
         let seed = server();
         let authenticator = jwt_authenticator(&seed.registry);
@@ -8213,11 +8678,15 @@ mod tests {
             "ofk_collection_status",
             "ofk_data_completeness",
             "ofk_manager_actions",
+            "ofk_marketplace_sales_refresh_status",
             "ofk_metrics_history",
             "ofk_ozon_sales_analytics",
             "ofk_ozon_sales_refresh_status",
+            "ofk_request_marketplace_sales_refresh",
             "ofk_request_ozon_sales_refresh",
             "ofk_reports",
+            "ofk_tool_call_log",
+            "ofk_weekly_marketplace_ranking",
         ];
         let tools = server()
             .with_preview_features(false, true)
@@ -8230,7 +8699,7 @@ mod tests {
                 tool.annotations
                     .as_ref()
                     .and_then(|annotations| annotations.read_only_hint),
-                Some(tool.name.as_ref() != REQUEST_OZON_SALES_REFRESH_TOOL),
+                Some(!REPORT_REFRESH_WRITE_TOOLS.contains(&tool.name.as_ref())),
                 "{} has an incorrect read-only annotation",
                 tool.name
             );
@@ -8309,6 +8778,17 @@ mod tests {
                 )
                 .await,
         );
+        let ranking = reporting_tool_error(
+            admin
+                .reporting_weekly_marketplace_ranking(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingWeeklyMarketplaceRankingInput {
+                        date_from: Some("2026-08-24".to_owned()),
+                        date_to: Some("2026-08-30".to_owned()),
+                    }),
+                )
+                .await,
+        );
         let actions = reporting_tool_error(
             admin
                 .reporting_manager_actions(
@@ -8329,10 +8809,94 @@ mod tests {
                 .await,
         );
 
-        for error in [status, completeness, history, sales, actions, reports] {
+        for error in [
+            status,
+            completeness,
+            history,
+            sales,
+            ranking,
+            actions,
+            reports,
+        ] {
             assert!(error.starts_with(REPORTING_UNAVAILABLE), "{error}");
             assert!(!error.contains("postgres"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn weekly_marketplace_ranking_is_admin_only_and_withholds_partial_results() {
+        let repository = Arc::new(FakeReportingRepository::succeeding());
+        let manager = reporting_test_server("manager", repository.clone());
+        let denied = reporting_tool_error(
+            manager
+                .reporting_weekly_marketplace_ranking(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingWeeklyMarketplaceRankingInput {
+                        date_from: Some("2026-08-24".to_owned()),
+                        date_to: Some("2026-08-30".to_owned()),
+                    }),
+                )
+                .await,
+        );
+        assert!(denied.starts_with(ROLE_ACCESS_DENIED), "{denied}");
+        assert_eq!(repository.calls(), 0);
+
+        let admin = reporting_test_server("admin", repository.clone());
+        let result = admin
+            .reporting_weekly_marketplace_ranking(
+                RequestIdentity::dev(),
+                Parameters(ReportingWeeklyMarketplaceRankingInput {
+                    date_from: Some("2026-08-24".to_owned()),
+                    date_to: Some("2026-08-30".to_owned()),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_ne!(result.state, DataState::Complete);
+        assert!(result.ranking.is_empty());
+        assert!(result.leader.is_none());
+        assert!(result.outsider.is_none());
+
+        let invalid = reporting_tool_error(
+            admin
+                .reporting_weekly_marketplace_ranking(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingWeeklyMarketplaceRankingInput {
+                        date_from: Some("2026-08-25".to_owned()),
+                        date_to: Some("2026-08-31".to_owned()),
+                    }),
+                )
+                .await,
+        );
+        assert!(invalid.starts_with(REPORTING_INVALID_REQUEST), "{invalid}");
+    }
+
+    #[tokio::test]
+    async fn structured_tool_call_log_is_admin_only() {
+        let manager = manager_server("manager");
+        let denied = reporting_tool_error(
+            manager
+                .tool_call_log(
+                    RequestIdentity::dev(),
+                    Parameters(ToolCallLogInput { limit: 50 }),
+                )
+                .await,
+        );
+        assert!(denied.starts_with(ROLE_ACCESS_DENIED), "{denied}");
+
+        let unavailable = reporting_tool_error(
+            server()
+                .tool_call_log(
+                    RequestIdentity::dev(),
+                    Parameters(ToolCallLogInput { limit: 50 }),
+                )
+                .await,
+        );
+        assert!(
+            unavailable.starts_with(TOOL_TELEMETRY_UNAVAILABLE),
+            "{unavailable}"
+        );
     }
 
     #[tokio::test]
@@ -8772,6 +9336,11 @@ mod tests {
                 admin.clone(),
                 "ofk_metrics_history",
                 json!({"account": "account_a", "unexpected": true}),
+            ),
+            (
+                admin.clone(),
+                "ofk_weekly_marketplace_ranking",
+                json!({"unexpected": true}),
             ),
             (
                 manager,
@@ -12408,7 +12977,7 @@ mod tests {
         // The release checklist in `SECURITY.md` states this count verbatim.
         // Changing it here without updating that gate leaves the gate
         // describing a router that no longer exists.
-        assert_eq!(dev_tools.len(), 79);
+        assert_eq!(dev_tools.len(), 83);
         assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
         let seed = server();
@@ -12419,7 +12988,7 @@ mod tests {
         assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
         let jwt_tools = authenticated.tool_router.list_all();
-        assert_eq!(jwt_tools.len(), 79);
+        assert_eq!(jwt_tools.len(), 83);
         assert_policy(
             jwt_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -12432,7 +13001,7 @@ mod tests {
                 .with_preview_features(false, true)
                 .tool_router
                 .list_all();
-        assert_eq!(legacy_flag_tools.len(), 79);
+        assert_eq!(legacy_flag_tools.len(), 83);
         assert_policy(
             legacy_flag_tools,
             &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -12447,12 +13016,16 @@ mod tests {
             "list_members",
             "ofk_collection_status",
             "ofk_data_completeness",
+            "ofk_marketplace_sales_refresh_status",
             "ofk_metrics_history",
             "ofk_manager_actions",
             "ofk_ozon_sales_analytics",
             "ofk_ozon_sales_refresh_status",
+            "ofk_request_marketplace_sales_refresh",
             "ofk_request_ozon_sales_refresh",
             "ofk_reports",
+            "ofk_tool_call_log",
+            "ofk_weekly_marketplace_ranking",
             "wb_stores_status",
             "wb_ping",
             "wb_sales_funnel",

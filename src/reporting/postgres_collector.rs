@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_postgres::{Client, Config, Transaction, error::SqlState};
 
@@ -23,7 +23,7 @@ const MAX_COLLECTION_TARGETS: usize = 64;
 const MAX_ACCOUNT_ID_BYTES: usize = 128;
 const COLLECTION_CANARY_MAX_AGE: Duration = Duration::hours(24);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedSalesFact {
     pub business_date: NaiveDate,
     pub sku: u64,
@@ -35,7 +35,7 @@ pub struct CollectedSalesFact {
     pub returned_units: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedAdvertisingFact {
     pub business_date: NaiveDate,
     pub campaign_id: u64,
@@ -54,7 +54,7 @@ pub struct CollectedAdvertisingFact {
     pub cpl_minor: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedAdvertisingExpenseFact {
     pub business_date: NaiveDate,
     pub campaign_id: u64,
@@ -63,7 +63,7 @@ pub struct CollectedAdvertisingExpenseFact {
     pub prepayment_spent_minor: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinanceCategory {
     Sale,
@@ -96,7 +96,7 @@ impl FinanceCategory {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedFinanceFact {
     pub business_date: NaiveDate,
     /// `None` is an account-wide accrual which Ozon did not attribute to SKU.
@@ -108,21 +108,21 @@ pub struct CollectedFinanceFact {
     pub unknown_type_count: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedStockFact {
     pub sku: u64,
     pub warehouse_id: String,
     pub sellable_units: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedPriceFact {
     pub sku: u64,
     pub price_minor: u64,
     pub old_price_minor: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "source", content = "facts", rename_all = "snake_case")]
 pub enum CollectedFacts {
     Sales(Vec<CollectedSalesFact>),
@@ -154,7 +154,7 @@ impl CollectedFacts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedSnapshot {
     account_id: String,
     marketplace: Marketplace,
@@ -272,12 +272,13 @@ pub struct CollectionClaim {
     lease_until: DateTime<Utc>,
 }
 
-/// Fenced queue claim for one manager-requested Ozon refresh.
+/// Fenced queue claim for one manager-requested marketplace refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SalesRefreshClaim {
     id: i64,
     generation: i32,
     account_id: String,
+    marketplace: Marketplace,
     business_date: NaiveDate,
     cutoff_at: DateTime<Utc>,
     owner_id: String,
@@ -288,6 +289,11 @@ impl SalesRefreshClaim {
     #[must_use]
     pub fn account_id(&self) -> &str {
         &self.account_id
+    }
+
+    #[must_use]
+    pub const fn marketplace(&self) -> Marketplace {
+        self.marketplace
     }
 
     #[must_use]
@@ -390,6 +396,8 @@ impl PostgresSnapshotWriter {
                         'daily_reporting.stock_facts', 'INSERT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.price_facts', 'INSERT') \
+                    AND has_table_privilege(current_user, \
+                        'daily_reporting.collection_staging_snapshots', 'SELECT,INSERT,DELETE') \
                     AND has_function_privilege(current_user, \
                         'daily_reporting.claim_report_collection(text,text,timestamptz,text)', \
                         'EXECUTE') \
@@ -400,12 +408,12 @@ impl PostgresSnapshotWriter {
                         'daily_reporting.complete_report_collection_claim(bigint,bigint,text)', \
                         'EXECUTE') \
                     AND has_function_privilege(current_user, \
-                        'daily_reporting.claim_ozon_sales_refresh(text)', 'EXECUTE') \
+                        'daily_reporting.claim_marketplace_sales_refresh(text)', 'EXECUTE') \
                     AND has_function_privilege(current_user, \
-                        'daily_reporting.complete_ozon_sales_refresh(bigint,integer,text,timestamptz)', \
+                        'daily_reporting.complete_marketplace_sales_refresh(bigint,integer,text,timestamptz)', \
                         'EXECUTE') \
                     AND has_function_privilege(current_user, \
-                        'daily_reporting.fail_ozon_sales_refresh(bigint,integer,text,text)', \
+                        'daily_reporting.fail_marketplace_sales_refresh(bigint,integer,text,text)', \
                         'EXECUTE') \
                     AND NOT has_table_privilege(current_user, \
                         'daily_reporting.collection_claims', 'SELECT,INSERT,UPDATE,DELETE') \
@@ -438,21 +446,25 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         let row = client
             .query_opt(
-                "SELECT request_id, request_generation, account_id, business_date, \
+                "SELECT request_id, request_generation, account_id, marketplace, business_date, \
                         snapshot_cutoff_at, lease_until \
-                 FROM daily_reporting.claim_ozon_sales_refresh($1)",
+                 FROM daily_reporting.claim_marketplace_sales_refresh($1)",
                 &[&owner_id],
             )
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
-        Ok(row.map(|row| SalesRefreshClaim {
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(SalesRefreshClaim {
             id: row.get(0),
             generation: row.get(1),
             account_id: row.get(2),
-            business_date: row.get(3),
-            cutoff_at: row.get(4),
+            marketplace: parse_marketplace(row.get(3))?,
+            business_date: row.get(4),
+            cutoff_at: row.get(5),
             owner_id: owner_id.to_owned(),
-            lease_until: row.get(5),
+            lease_until: row.get(6),
         }))
     }
 
@@ -470,7 +482,7 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         client
             .query_one(
-                "SELECT daily_reporting.fail_ozon_sales_refresh($1, $2, $3, $4)",
+                "SELECT daily_reporting.fail_marketplace_sales_refresh($1, $2, $3, $4)",
                 &[&claim.id, &claim.generation, &claim.owner_id, &error_class],
             )
             .await
@@ -711,6 +723,7 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?
             .get::<_, bool>(0);
         require_claim_completed(completed)?;
+        clear_staging_in_transaction(&transaction, claim.id).await?;
         transaction
             .commit()
             .await
@@ -718,7 +731,7 @@ impl PostgresSnapshotWriter {
         Ok(snapshot_ids)
     }
 
-    /// Atomically publishes a complete five-source Ozon batch and completes
+    /// Atomically publishes a complete marketplace batch and completes
     /// both the snapshot claim and the manager refresh queue claim.
     pub async fn persist_refresh_claimed_batch(
         &self,
@@ -727,7 +740,7 @@ impl PostgresSnapshotWriter {
         snapshots: &[CollectedSnapshot],
     ) -> Result<Vec<i64>, PostgresCollectorError> {
         validate_claimed_batch(collection_claim, snapshots)?;
-        if collection_claim.marketplace != Marketplace::Ozon
+        if collection_claim.marketplace != refresh_claim.marketplace
             || collection_claim.account_id != refresh_claim.account_id
             || collection_claim.cutoff_at != refresh_claim.cutoff_at
             || collection_claim.owner_id != refresh_claim.owner_id
@@ -763,7 +776,7 @@ impl PostgresSnapshotWriter {
         require_claim_completed(collection_completed)?;
         let refresh_completed = transaction
             .query_one(
-                "SELECT daily_reporting.complete_ozon_sales_refresh($1, $2, $3, $4)",
+                "SELECT daily_reporting.complete_marketplace_sales_refresh($1, $2, $3, $4)",
                 &[
                     &refresh_claim.id,
                     &refresh_claim.generation,
@@ -775,12 +788,115 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)?
             .get::<_, bool>(0);
         require_claim_completed(refresh_completed)?;
+        clear_staging_in_transaction(&transaction, collection_claim.id).await?;
         transaction
             .commit()
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         Ok(snapshot_ids)
     }
+
+    /// Replaces unpublished normalized checkpoints for one live claim.
+    /// Raw marketplace responses are never stored. The transaction is durable
+    /// before publication, so a restarted collector can read back and publish
+    /// the exact same normalized batch without repeating external requests.
+    pub async fn stage_claimed_batch(
+        &self,
+        claim: &CollectionClaim,
+        snapshots: &[CollectedSnapshot],
+    ) -> Result<(), PostgresCollectorError> {
+        validate_claimed_batch(claim, snapshots)?;
+        let mut client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let transaction = client
+            .transaction()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        clear_staging_in_transaction(&transaction, claim.id).await?;
+        for snapshot in snapshots {
+            let payload = serde_json::to_string(snapshot)
+                .map_err(|_| PostgresCollectorError::InvalidInput)?;
+            let digest = sha256(payload.as_bytes());
+            transaction
+                .execute(
+                    "INSERT INTO daily_reporting.collection_staging_snapshots \
+                         (claim_id, source, payload_json, payload_sha256) \
+                     VALUES ($1, $2, $3, $4)",
+                    &[
+                        &claim.id,
+                        &snapshot_source_name(snapshot.facts.source()),
+                        &payload,
+                        &digest,
+                    ],
+                )
+                .await
+                .map_err(|error| map_snapshot_insert_error(&error))?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)
+    }
+
+    /// Loads only a complete, digest-verified batch for the current logical
+    /// claim. An incomplete checkpoint returns `None` and is replaced after a
+    /// fresh bounded collection; it can never be partially published.
+    pub async fn load_staged_batch(
+        &self,
+        claim: &CollectionClaim,
+    ) -> Result<Option<Vec<CollectedSnapshot>>, PostgresCollectorError> {
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let rows = client
+            .query(
+                "SELECT source, payload_json, payload_sha256 \
+                 FROM daily_reporting.collection_staging_snapshots \
+                 WHERE claim_id = $1 ORDER BY source",
+                &[&claim.id],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        if rows.len() != SnapshotSource::required_for(claim.marketplace).len() {
+            return Ok(None);
+        }
+        let mut snapshots = Vec::with_capacity(rows.len());
+        for row in rows {
+            let source: &str = row.get(0);
+            let payload: &str = row.get(1);
+            let digest: &str = row.get(2);
+            if sha256(payload.as_bytes()) != digest {
+                return Err(PostgresCollectorError::InvalidInput);
+            }
+            let snapshot: CollectedSnapshot =
+                serde_json::from_str(payload).map_err(|_| PostgresCollectorError::InvalidInput)?;
+            if snapshot_source_name(snapshot.facts.source()) != source {
+                return Err(PostgresCollectorError::InvalidInput);
+            }
+            snapshots.push(snapshot);
+        }
+        validate_claimed_batch(claim, &snapshots)?;
+        Ok(Some(snapshots))
+    }
+}
+
+async fn clear_staging_in_transaction(
+    transaction: &Transaction<'_>,
+    claim_id: i64,
+) -> Result<(), PostgresCollectorError> {
+    transaction
+        .execute(
+            "DELETE FROM daily_reporting.collection_staging_snapshots WHERE claim_id = $1",
+            &[&claim_id],
+        )
+        .await
+        .map(std::mem::drop)
+        .map_err(|_| PostgresCollectorError::Unavailable)
 }
 
 fn require_claim_completed(completed: bool) -> Result<(), PostgresCollectorError> {
@@ -874,6 +990,16 @@ const fn marketplace_name(marketplace: Marketplace) -> &'static str {
     }
 }
 
+const fn snapshot_source_name(source: SnapshotSource) -> &'static str {
+    match source {
+        SnapshotSource::Sales => "sales",
+        SnapshotSource::Advertising => "advertising",
+        SnapshotSource::Finance => "finance",
+        SnapshotSource::Stocks => "stocks",
+        SnapshotSource::Prices => "prices",
+    }
+}
+
 fn parse_marketplace(value: &str) -> Result<Marketplace, PostgresCollectorError> {
     match value {
         "ozon" => Ok(Marketplace::Ozon),
@@ -923,25 +1049,51 @@ async fn insert_advertising_expenses(
     snapshot_id: i64,
     facts: &[CollectedAdvertisingExpenseFact],
 ) -> Result<(), PostgresCollectorError> {
-    for fact in facts {
-        transaction
-            .execute(
-                "INSERT INTO daily_reporting.advertising_expense_facts \
-                 (snapshot_id, business_date, campaign_id, money_spent_minor, \
-                  bonus_spent_minor, prepayment_spent_minor) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
-                &[
-                    &snapshot_id,
-                    &fact.business_date,
-                    &as_i64(fact.campaign_id)?,
-                    &as_i64(fact.money_spent_minor)?,
-                    &as_i64(fact.bonus_spent_minor)?,
-                    &as_i64(fact.prepayment_spent_minor)?,
-                ],
-            )
-            .await
-            .map_err(|_| PostgresCollectorError::Unavailable)?;
+    if facts.is_empty() {
+        return Ok(());
     }
+    let business_dates = facts
+        .iter()
+        .map(|fact| fact.business_date)
+        .collect::<Vec<_>>();
+    let campaign_ids = facts
+        .iter()
+        .map(|fact| as_i64(fact.campaign_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let money_spent = facts
+        .iter()
+        .map(|fact| as_i64(fact.money_spent_minor))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bonus_spent = facts
+        .iter()
+        .map(|fact| as_i64(fact.bonus_spent_minor))
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepayment_spent = facts
+        .iter()
+        .map(|fact| as_i64(fact.prepayment_spent_minor))
+        .collect::<Result<Vec<_>, _>>()?;
+    transaction
+        .execute(
+            "INSERT INTO daily_reporting.advertising_expense_facts \
+             (snapshot_id, business_date, campaign_id, money_spent_minor, \
+              bonus_spent_minor, prepayment_spent_minor) \
+             SELECT $1, batch.business_date, batch.campaign_id, batch.money_spent_minor, \
+                    batch.bonus_spent_minor, batch.prepayment_spent_minor \
+             FROM unnest($2::date[], $3::bigint[], $4::bigint[], $5::bigint[], \
+                         $6::bigint[]) \
+                  AS batch(business_date, campaign_id, money_spent_minor, \
+                           bonus_spent_minor, prepayment_spent_minor)",
+            &[
+                &snapshot_id,
+                &business_dates,
+                &campaign_ids,
+                &money_spent,
+                &bonus_spent,
+                &prepayment_spent,
+            ],
+        )
+        .await
+        .map_err(|_| PostgresCollectorError::Unavailable)?;
     Ok(())
 }
 
@@ -963,13 +1115,7 @@ async fn insert_snapshot(
     snapshot: &CollectedSnapshot,
 ) -> Result<i64, PostgresCollectorError> {
     let marketplace = marketplace_name(snapshot.marketplace);
-    let source = match snapshot.facts.source() {
-        SnapshotSource::Sales => "sales",
-        SnapshotSource::Advertising => "advertising",
-        SnapshotSource::Finance => "finance",
-        SnapshotSource::Stocks => "stocks",
-        SnapshotSource::Prices => "prices",
-    };
+    let source = snapshot_source_name(snapshot.facts.source());
     let row = transaction
         .query_opt(
             "INSERT INTO daily_reporting.source_snapshots \
@@ -1003,129 +1149,270 @@ async fn insert_facts(
     facts: &CollectedFacts,
 ) -> Result<(), PostgresCollectorError> {
     match facts {
-        CollectedFacts::Sales(facts) => {
-            for fact in facts {
-                let cancelled_units = fact.cancelled_units.map(as_i32).transpose()?;
-                let returned_units = fact.returned_units.map(as_i32).transpose()?;
-                transaction
-                    .execute(
-                        "INSERT INTO daily_reporting.sales_facts \
-                         (snapshot_id, business_date, sku, ordered_units, \
-                          operational_gmv_minor, cancelled_units, returned_units) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            &snapshot_id,
-                            &fact.business_date,
-                            &as_i64(fact.sku)?,
-                            &as_i32(fact.ordered_units)?,
-                            &as_i64(fact.operational_gmv_minor)?,
-                            &cancelled_units,
-                            &returned_units,
-                        ],
-                    )
-                    .await
-                    .map_err(|_| PostgresCollectorError::Unavailable)?;
-            }
-        }
+        CollectedFacts::Sales(facts) => insert_sales_facts(transaction, snapshot_id, facts).await?,
         CollectedFacts::Advertising(facts) => {
-            for fact in facts {
-                transaction
-                    .execute(
-                        "INSERT INTO daily_reporting.advertising_facts \
-                         (snapshot_id, business_date, campaign_id, sku, impressions, clicks, \
-                          spend_minor, attributed_orders, attributed_revenue_minor, \
-                          basket_additions, model_attributed_orders, \
-                          model_attributed_revenue_minor, product_price_minor, \
-                          average_cpc_minor, cpm_minor, cpl_minor) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-                                 $13, $14, $15, $16)",
-                        &[
-                            &snapshot_id,
-                            &fact.business_date,
-                            &as_i64(fact.campaign_id)?,
-                            &as_i64(fact.sku)?,
-                            &as_i64(fact.impressions)?,
-                            &as_i64(fact.clicks)?,
-                            &as_i64(fact.spend_minor)?,
-                            &as_i32(fact.attributed_orders)?,
-                            &as_i64(fact.attributed_revenue_minor)?,
-                            &as_i32(fact.basket_additions)?,
-                            &as_i32(fact.model_attributed_orders)?,
-                            &as_i64(fact.model_attributed_revenue_minor)?,
-                            &as_i64(fact.product_price_minor)?,
-                            &fact.average_cpc_minor.map(as_i64).transpose()?,
-                            &fact.cpm_minor.map(as_i64).transpose()?,
-                            &fact.cpl_minor.map(as_i64).transpose()?,
-                        ],
-                    )
-                    .await
-                    .map_err(|_| PostgresCollectorError::Unavailable)?;
-            }
+            insert_advertising_facts(transaction, snapshot_id, facts).await?;
         }
         CollectedFacts::Finance(facts) => {
-            for fact in facts {
-                let sku = fact.sku.map(as_i64).transpose()?;
-                transaction
-                    .execute(
-                        "INSERT INTO daily_reporting.finance_facts \
-                         (snapshot_id, business_date, sku, category, amount_minor, \
-                          line_count, unknown_type_count) \
-                         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                        &[
-                            &snapshot_id,
-                            &fact.business_date,
-                            &sku,
-                            &fact.category.as_str(),
-                            &fact.amount_minor,
-                            &i32::try_from(fact.line_count)
-                                .map_err(|_| PostgresCollectorError::InvalidInput)?,
-                            &i32::try_from(fact.unknown_type_count)
-                                .map_err(|_| PostgresCollectorError::InvalidInput)?,
-                        ],
-                    )
-                    .await
-                    .map_err(|_| PostgresCollectorError::Unavailable)?;
-            }
+            insert_finance_facts(transaction, snapshot_id, facts).await?;
         }
         CollectedFacts::Stocks(facts) => {
-            for fact in facts {
-                transaction
-                    .execute(
-                        "INSERT INTO daily_reporting.stock_facts \
-                         (snapshot_id, sku, warehouse_id, sellable_units) \
-                         VALUES ($1, $2, $3, $4)",
-                        &[
-                            &snapshot_id,
-                            &as_i64(fact.sku)?,
-                            &fact.warehouse_id,
-                            &as_i32(fact.sellable_units)?,
-                        ],
-                    )
-                    .await
-                    .map_err(|_| PostgresCollectorError::Unavailable)?;
-            }
+            insert_stock_facts(transaction, snapshot_id, facts).await?;
         }
         CollectedFacts::Prices(facts) => {
-            for fact in facts {
-                let old_price_minor = fact.old_price_minor.map(as_i64).transpose()?;
-                transaction
-                    .execute(
-                        "INSERT INTO daily_reporting.price_facts \
-                         (snapshot_id, sku, price_minor, old_price_minor) \
-                         VALUES ($1, $2, $3, $4)",
-                        &[
-                            &snapshot_id,
-                            &as_i64(fact.sku)?,
-                            &as_i64(fact.price_minor)?,
-                            &old_price_minor,
-                        ],
-                    )
-                    .await
-                    .map_err(|_| PostgresCollectorError::Unavailable)?;
-            }
+            insert_price_facts(transaction, snapshot_id, facts).await?;
         }
     }
     Ok(())
+}
+
+async fn insert_sales_facts(
+    transaction: &Transaction<'_>,
+    snapshot_id: i64,
+    facts: &[CollectedSalesFact],
+) -> Result<(), PostgresCollectorError> {
+    if facts.is_empty() {
+        return Ok(());
+    }
+    let business_dates = facts
+        .iter()
+        .map(|fact| fact.business_date)
+        .collect::<Vec<_>>();
+    let skus = facts
+        .iter()
+        .map(|fact| as_i64(fact.sku))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ordered_units = facts
+        .iter()
+        .map(|fact| as_i32(fact.ordered_units))
+        .collect::<Result<Vec<_>, _>>()?;
+    let operational_gmv = facts
+        .iter()
+        .map(|fact| as_i64(fact.operational_gmv_minor))
+        .collect::<Result<Vec<_>, _>>()?;
+    let cancelled_units = facts
+        .iter()
+        .map(|fact| fact.cancelled_units.map(as_i32).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+    let returned_units = facts
+        .iter()
+        .map(|fact| fact.returned_units.map(as_i32).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+    transaction
+        .execute(
+            "INSERT INTO daily_reporting.sales_facts \
+             (snapshot_id, business_date, sku, ordered_units, operational_gmv_minor, \
+              cancelled_units, returned_units) \
+             SELECT $1, batch.business_date, batch.sku, batch.ordered_units, \
+                    batch.operational_gmv_minor, batch.cancelled_units, batch.returned_units \
+             FROM unnest($2::date[], $3::bigint[], $4::integer[], $5::bigint[], \
+                         $6::integer[], $7::integer[]) \
+                  AS batch(business_date, sku, ordered_units, operational_gmv_minor, \
+                           cancelled_units, returned_units)",
+            &[
+                &snapshot_id,
+                &business_dates,
+                &skus,
+                &ordered_units,
+                &operational_gmv,
+                &cancelled_units,
+                &returned_units,
+            ],
+        )
+        .await
+        .map_err(|_| PostgresCollectorError::Unavailable)?;
+    Ok(())
+}
+
+async fn insert_advertising_facts(
+    transaction: &Transaction<'_>,
+    snapshot_id: i64,
+    facts: &[CollectedAdvertisingFact],
+) -> Result<(), PostgresCollectorError> {
+    if facts.is_empty() {
+        return Ok(());
+    }
+    let business_dates = facts
+        .iter()
+        .map(|fact| fact.business_date)
+        .collect::<Vec<_>>();
+    let campaign_ids = collect_i64(facts.iter().map(|fact| fact.campaign_id))?;
+    let skus = collect_i64(facts.iter().map(|fact| fact.sku))?;
+    let impressions = collect_i64(facts.iter().map(|fact| fact.impressions))?;
+    let clicks = collect_i64(facts.iter().map(|fact| fact.clicks))?;
+    let spend = collect_i64(facts.iter().map(|fact| fact.spend_minor))?;
+    let attributed_orders = facts
+        .iter()
+        .map(|fact| as_i32(fact.attributed_orders))
+        .collect::<Result<Vec<_>, _>>()?;
+    let attributed_revenue = collect_i64(facts.iter().map(|fact| fact.attributed_revenue_minor))?;
+    let basket_additions = facts
+        .iter()
+        .map(|fact| as_i32(fact.basket_additions))
+        .collect::<Result<Vec<_>, _>>()?;
+    let model_orders = facts
+        .iter()
+        .map(|fact| as_i32(fact.model_attributed_orders))
+        .collect::<Result<Vec<_>, _>>()?;
+    let model_revenue = collect_i64(facts.iter().map(|fact| fact.model_attributed_revenue_minor))?;
+    let product_prices = collect_i64(facts.iter().map(|fact| fact.product_price_minor))?;
+    let average_cpc = collect_optional_i64(facts.iter().map(|fact| fact.average_cpc_minor))?;
+    let cpm = collect_optional_i64(facts.iter().map(|fact| fact.cpm_minor))?;
+    let cpl = collect_optional_i64(facts.iter().map(|fact| fact.cpl_minor))?;
+    transaction
+        .execute(
+            "INSERT INTO daily_reporting.advertising_facts \
+             (snapshot_id, business_date, campaign_id, sku, impressions, clicks, spend_minor, \
+              attributed_orders, attributed_revenue_minor, basket_additions, \
+              model_attributed_orders, model_attributed_revenue_minor, product_price_minor, \
+              average_cpc_minor, cpm_minor, cpl_minor) \
+             SELECT $1, batch.* \
+             FROM unnest($2::date[], $3::bigint[], $4::bigint[], $5::bigint[], \
+                         $6::bigint[], $7::bigint[], $8::integer[], $9::bigint[], \
+                         $10::integer[], $11::integer[], $12::bigint[], $13::bigint[], \
+                         $14::bigint[], $15::bigint[], $16::bigint[]) AS batch",
+            &[
+                &snapshot_id,
+                &business_dates,
+                &campaign_ids,
+                &skus,
+                &impressions,
+                &clicks,
+                &spend,
+                &attributed_orders,
+                &attributed_revenue,
+                &basket_additions,
+                &model_orders,
+                &model_revenue,
+                &product_prices,
+                &average_cpc,
+                &cpm,
+                &cpl,
+            ],
+        )
+        .await
+        .map_err(|_| PostgresCollectorError::Unavailable)?;
+    Ok(())
+}
+
+async fn insert_finance_facts(
+    transaction: &Transaction<'_>,
+    snapshot_id: i64,
+    facts: &[CollectedFinanceFact],
+) -> Result<(), PostgresCollectorError> {
+    if facts.is_empty() {
+        return Ok(());
+    }
+    let business_dates = facts
+        .iter()
+        .map(|fact| fact.business_date)
+        .collect::<Vec<_>>();
+    let skus = collect_optional_i64(facts.iter().map(|fact| fact.sku))?;
+    let categories = facts
+        .iter()
+        .map(|fact| fact.category.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let amounts = facts
+        .iter()
+        .map(|fact| fact.amount_minor)
+        .collect::<Vec<_>>();
+    let line_counts = facts
+        .iter()
+        .map(|fact| {
+            i32::try_from(fact.line_count).map_err(|_| PostgresCollectorError::InvalidInput)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let unknown_counts = facts
+        .iter()
+        .map(|fact| {
+            i32::try_from(fact.unknown_type_count).map_err(|_| PostgresCollectorError::InvalidInput)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    transaction
+        .execute(
+            "INSERT INTO daily_reporting.finance_facts \
+             (snapshot_id, business_date, sku, category, amount_minor, line_count, \
+              unknown_type_count) \
+             SELECT $1, batch.* \
+             FROM unnest($2::date[], $3::bigint[], $4::text[], $5::bigint[], \
+                         $6::integer[], $7::integer[]) AS batch",
+            &[
+                &snapshot_id,
+                &business_dates,
+                &skus,
+                &categories,
+                &amounts,
+                &line_counts,
+                &unknown_counts,
+            ],
+        )
+        .await
+        .map_err(|_| PostgresCollectorError::Unavailable)?;
+    Ok(())
+}
+
+async fn insert_stock_facts(
+    transaction: &Transaction<'_>,
+    snapshot_id: i64,
+    facts: &[CollectedStockFact],
+) -> Result<(), PostgresCollectorError> {
+    if facts.is_empty() {
+        return Ok(());
+    }
+    let skus = collect_i64(facts.iter().map(|fact| fact.sku))?;
+    let warehouse_ids = facts
+        .iter()
+        .map(|fact| fact.warehouse_id.clone())
+        .collect::<Vec<_>>();
+    let sellable_units = facts
+        .iter()
+        .map(|fact| as_i32(fact.sellable_units))
+        .collect::<Result<Vec<_>, _>>()?;
+    transaction
+        .execute(
+            "INSERT INTO daily_reporting.stock_facts \
+             (snapshot_id, sku, warehouse_id, sellable_units) \
+             SELECT $1, batch.* \
+             FROM unnest($2::bigint[], $3::text[], $4::integer[]) AS batch",
+            &[&snapshot_id, &skus, &warehouse_ids, &sellable_units],
+        )
+        .await
+        .map_err(|_| PostgresCollectorError::Unavailable)?;
+    Ok(())
+}
+
+async fn insert_price_facts(
+    transaction: &Transaction<'_>,
+    snapshot_id: i64,
+    facts: &[CollectedPriceFact],
+) -> Result<(), PostgresCollectorError> {
+    if facts.is_empty() {
+        return Ok(());
+    }
+    let skus = collect_i64(facts.iter().map(|fact| fact.sku))?;
+    let prices = collect_i64(facts.iter().map(|fact| fact.price_minor))?;
+    let old_prices = collect_optional_i64(facts.iter().map(|fact| fact.old_price_minor))?;
+    transaction
+        .execute(
+            "INSERT INTO daily_reporting.price_facts \
+             (snapshot_id, sku, price_minor, old_price_minor) \
+             SELECT $1, batch.* \
+             FROM unnest($2::bigint[], $3::bigint[], $4::bigint[]) AS batch",
+            &[&snapshot_id, &skus, &prices, &old_prices],
+        )
+        .await
+        .map_err(|_| PostgresCollectorError::Unavailable)?;
+    Ok(())
+}
+
+fn collect_i64(values: impl Iterator<Item = u64>) -> Result<Vec<i64>, PostgresCollectorError> {
+    values.map(as_i64).collect()
+}
+
+fn collect_optional_i64(
+    values: impl Iterator<Item = Option<u64>>,
+) -> Result<Vec<Option<i64>>, PostgresCollectorError> {
+    values.map(|value| value.map(as_i64).transpose()).collect()
 }
 
 fn validate_facts(facts: &CollectedFacts) -> Result<(), PostgresCollectorError> {
@@ -1513,12 +1800,14 @@ mod tests {
             id: 2,
             generation: 1,
             account_id: "pilot".to_owned(),
+            marketplace: Marketplace::Ozon,
             business_date: cutoff().date_naive(),
             cutoff_at: cutoff(),
             owner_id: "test-owner".to_owned(),
             lease_until: cutoff() + Duration::minutes(15),
         };
         assert_eq!(refresh_claim.account_id(), "pilot");
+        assert_eq!(refresh_claim.marketplace(), Marketplace::Ozon);
         assert_eq!(refresh_claim.business_date(), cutoff().date_naive());
         assert_eq!(refresh_claim.cutoff_at(), cutoff());
         assert_eq!(

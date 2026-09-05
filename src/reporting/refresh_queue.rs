@@ -15,6 +15,8 @@ use tokio_postgres::{Config, Row, config::Host};
 
 use crate::postgres::SupervisedClient;
 
+use super::snapshot::Marketplace;
+
 const REQUESTER_COMPONENT: &str = "mcp-ozon-report-refresh-requester";
 
 pub type RefreshRequestFuture<'a, T> =
@@ -45,6 +47,7 @@ pub enum SalesRefreshState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SalesRefreshStatus {
     pub account_id: String,
+    pub marketplace: Marketplace,
     pub request_id: Option<u64>,
     pub state: SalesRefreshState,
     pub business_date: Option<String>,
@@ -65,11 +68,16 @@ pub trait RefreshRequestRepository: Send + Sync {
     fn request<'a>(
         &'a self,
         account_id: &'a str,
+        marketplace: Marketplace,
         actor_id: &'a str,
         business_date: NaiveDate,
     ) -> RefreshRequestFuture<'a, SalesRefreshStatus>;
 
-    fn status<'a>(&'a self, account_id: &'a str) -> RefreshRequestFuture<'a, SalesRefreshStatus>;
+    fn status<'a>(
+        &'a self,
+        account_id: &'a str,
+        marketplace: Marketplace,
+    ) -> RefreshRequestFuture<'a, SalesRefreshStatus>;
 }
 
 #[derive(Clone)]
@@ -123,22 +131,24 @@ impl RefreshRequestService {
     pub async fn request(
         &self,
         account_id: &str,
+        marketplace: Marketplace,
         actor_id: &str,
         business_date: NaiveDate,
     ) -> Result<SalesRefreshStatus, RefreshRequestError> {
         validate_identifier(account_id, 128)?;
         validate_actor(actor_id)?;
         self.repository
-            .request(account_id, actor_id, business_date)
+            .request(account_id, marketplace, actor_id, business_date)
             .await
     }
 
     pub async fn status(
         &self,
         account_id: &str,
+        marketplace: Marketplace,
     ) -> Result<SalesRefreshStatus, RefreshRequestError> {
         validate_identifier(account_id, 128)?;
-        self.repository.status(account_id).await
+        self.repository.status(account_id, marketplace).await
     }
 }
 
@@ -152,13 +162,18 @@ impl RefreshRequestRepository for DisabledRefreshRequestRepository {
     fn request<'a>(
         &'a self,
         _account_id: &'a str,
+        _marketplace: Marketplace,
         _actor_id: &'a str,
         _business_date: NaiveDate,
     ) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
         disabled()
     }
 
-    fn status<'a>(&'a self, _account_id: &'a str) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
+    fn status<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _marketplace: Marketplace,
+    ) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
         disabled()
     }
 }
@@ -199,9 +214,9 @@ impl PostgresRefreshRequestRepository {
                     AND has_schema_privilege(current_user, 'daily_reporting', 'USAGE') \
                     AND NOT has_schema_privilege(current_user, 'daily_reporting', 'CREATE') \
                     AND has_function_privilege(current_user, \
-                        'daily_reporting.request_ozon_sales_refresh(text,text,date)', 'EXECUTE') \
+                        'daily_reporting.request_marketplace_sales_refresh(text,text,text,date)', 'EXECUTE') \
                     AND has_function_privilege(current_user, \
-                        'daily_reporting.ozon_sales_refresh_status(text)', 'EXECUTE') \
+                        'daily_reporting.marketplace_sales_refresh_status(text,text)', 'EXECUTE') \
                     AND NOT has_table_privilege(current_user, \
                         'daily_reporting.ozon_sales_refresh_requests', \
                         'SELECT,INSERT,UPDATE,DELETE') \
@@ -219,6 +234,7 @@ impl PostgresRefreshRequestRepository {
     async fn request_impl(
         &self,
         account_id: &str,
+        marketplace: Marketplace,
         actor_id: &str,
         business_date: NaiveDate,
     ) -> Result<SalesRefreshStatus, RefreshRequestError> {
@@ -229,20 +245,26 @@ impl PostgresRefreshRequestRepository {
             .map_err(|_| RefreshRequestError::Unavailable)?;
         let row = client
             .query_one(
-                "SELECT request_id, request_status, business_date, requested_at, \
+                "SELECT request_id, request_status, marketplace, business_date, requested_at, \
                         started_at, finished_at, snapshot_cutoff_at, created \
-                 FROM daily_reporting.request_ozon_sales_refresh($1, $2, $3)",
-                &[&account_id, &actor_id, &business_date],
+                 FROM daily_reporting.request_marketplace_sales_refresh($1, $2, $3, $4)",
+                &[
+                    &account_id,
+                    &marketplace_name(marketplace),
+                    &actor_id,
+                    &business_date,
+                ],
             )
             .await
             .map_err(|_| RefreshRequestError::Unavailable)?;
         drop(client);
-        refresh_status(account_id, &row, true)
+        refresh_status(account_id, marketplace, &row, true)
     }
 
     async fn status_impl(
         &self,
         account_id: &str,
+        marketplace: Marketplace,
     ) -> Result<SalesRefreshStatus, RefreshRequestError> {
         let client = self
             .client
@@ -251,10 +273,10 @@ impl PostgresRefreshRequestRepository {
             .map_err(|_| RefreshRequestError::Unavailable)?;
         let row = client
             .query_opt(
-                "SELECT request_id, request_status, business_date, requested_at, \
+                "SELECT request_id, request_status, marketplace, business_date, requested_at, \
                         started_at, finished_at, snapshot_cutoff_at \
-                 FROM daily_reporting.ozon_sales_refresh_status($1)",
-                &[&account_id],
+                 FROM daily_reporting.marketplace_sales_refresh_status($1, $2)",
+                &[&account_id, &marketplace_name(marketplace)],
             )
             .await
             .map_err(|_| RefreshRequestError::Unavailable)?;
@@ -263,6 +285,7 @@ impl PostgresRefreshRequestRepository {
             || {
                 Ok(SalesRefreshStatus {
                     account_id: account_id.to_owned(),
+                    marketplace,
                     request_id: None,
                     state: SalesRefreshState::NeverRequested,
                     business_date: None,
@@ -273,7 +296,7 @@ impl PostgresRefreshRequestRepository {
                     created: None,
                 })
             },
-            |row| refresh_status(account_id, row, false),
+            |row| refresh_status(account_id, marketplace, row, false),
         )
     }
 }
@@ -290,19 +313,28 @@ impl RefreshRequestRepository for PostgresRefreshRequestRepository {
     fn request<'a>(
         &'a self,
         account_id: &'a str,
+        marketplace: Marketplace,
         actor_id: &'a str,
         business_date: NaiveDate,
     ) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
-        Box::pin(async move { self.request_impl(account_id, actor_id, business_date).await })
+        Box::pin(async move {
+            self.request_impl(account_id, marketplace, actor_id, business_date)
+                .await
+        })
     }
 
-    fn status<'a>(&'a self, account_id: &'a str) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
-        Box::pin(async move { self.status_impl(account_id).await })
+    fn status<'a>(
+        &'a self,
+        account_id: &'a str,
+        marketplace: Marketplace,
+    ) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
+        Box::pin(async move { self.status_impl(account_id, marketplace).await })
     }
 }
 
 fn refresh_status(
     account_id: &str,
+    expected_marketplace: Marketplace,
     row: &Row,
     with_created: bool,
 ) -> Result<SalesRefreshStatus, RefreshRequestError> {
@@ -312,26 +344,34 @@ fn refresh_status(
     let state: String = row
         .try_get(1)
         .map_err(|_| RefreshRequestError::InvalidData)?;
-    let business_date: NaiveDate = row
+    let marketplace: String = row
         .try_get(2)
         .map_err(|_| RefreshRequestError::InvalidData)?;
-    let requested_at: DateTime<Utc> = row
+    let marketplace = parse_marketplace(&marketplace)?;
+    if marketplace != expected_marketplace {
+        return Err(RefreshRequestError::InvalidData);
+    }
+    let business_date: NaiveDate = row
         .try_get(3)
         .map_err(|_| RefreshRequestError::InvalidData)?;
-    let started_at: Option<DateTime<Utc>> = row
+    let requested_at: DateTime<Utc> = row
         .try_get(4)
         .map_err(|_| RefreshRequestError::InvalidData)?;
-    let finished_at: Option<DateTime<Utc>> = row
+    let started_at: Option<DateTime<Utc>> = row
         .try_get(5)
         .map_err(|_| RefreshRequestError::InvalidData)?;
-    let snapshot_cutoff_at: Option<DateTime<Utc>> = row
+    let finished_at: Option<DateTime<Utc>> = row
         .try_get(6)
         .map_err(|_| RefreshRequestError::InvalidData)?;
+    let snapshot_cutoff_at: Option<DateTime<Utc>> = row
+        .try_get(7)
+        .map_err(|_| RefreshRequestError::InvalidData)?;
     let created = with_created
-        .then(|| row.try_get(7).map_err(|_| RefreshRequestError::InvalidData))
+        .then(|| row.try_get(8).map_err(|_| RefreshRequestError::InvalidData))
         .transpose()?;
     Ok(SalesRefreshStatus {
         account_id: account_id.to_owned(),
+        marketplace,
         request_id: Some(u64::try_from(request_id).map_err(|_| RefreshRequestError::InvalidData)?),
         state: parse_state(&state)?,
         business_date: Some(business_date.to_string()),
@@ -341,6 +381,21 @@ fn refresh_status(
         snapshot_cutoff_at: snapshot_cutoff_at.map(|value| value.to_rfc3339()),
         created,
     })
+}
+
+const fn marketplace_name(marketplace: Marketplace) -> &'static str {
+    match marketplace {
+        Marketplace::Ozon => "ozon",
+        Marketplace::Wildberries => "wildberries",
+    }
+}
+
+fn parse_marketplace(value: &str) -> Result<Marketplace, RefreshRequestError> {
+    match value {
+        "ozon" => Ok(Marketplace::Ozon),
+        "wildberries" => Ok(Marketplace::Wildberries),
+        _ => Err(RefreshRequestError::InvalidData),
+    }
 }
 
 fn parse_state(value: &str) -> Result<SalesRefreshState, RefreshRequestError> {
@@ -409,6 +464,7 @@ mod tests {
         fn request<'a>(
             &'a self,
             _account_id: &'a str,
+            _marketplace: Marketplace,
             _actor_id: &'a str,
             _business_date: NaiveDate,
         ) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
@@ -418,6 +474,7 @@ mod tests {
         fn status<'a>(
             &'a self,
             _account_id: &'a str,
+            _marketplace: Marketplace,
         ) -> RefreshRequestFuture<'a, SalesRefreshStatus> {
             Box::pin(async { Err(RefreshRequestError::InvalidData) })
         }
@@ -429,11 +486,13 @@ mod tests {
         assert!(!service.is_enabled());
         let date = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
         assert_eq!(
-            service.request("account_a", "manager", date).await,
+            service
+                .request("account_a", Marketplace::Ozon, "manager", date)
+                .await,
             Err(RefreshRequestError::Disabled)
         );
         assert_eq!(
-            service.status("account_a").await,
+            service.status("account_a", Marketplace::Ozon).await,
             Err(RefreshRequestError::Disabled)
         );
         assert_eq!(
@@ -453,23 +512,29 @@ mod tests {
         );
         assert_eq!(service.probe().await, Ok(()));
         assert_eq!(
-            service.request("bad/account", "manager", date).await,
+            service
+                .request("bad/account", Marketplace::Ozon, "manager", date)
+                .await,
             Err(RefreshRequestError::InvalidRequest)
         );
         assert_eq!(
-            service.request("account_a", "bad actor", date).await,
+            service
+                .request("account_a", Marketplace::Ozon, "bad actor", date)
+                .await,
             Err(RefreshRequestError::InvalidRequest)
         );
         assert_eq!(
-            service.status("").await,
+            service.status("", Marketplace::Ozon).await,
             Err(RefreshRequestError::InvalidRequest)
         );
         assert_eq!(
-            service.request("account_a", "manager", date).await,
+            service
+                .request("account_a", Marketplace::Ozon, "manager", date)
+                .await,
             Err(RefreshRequestError::InvalidData)
         );
         assert_eq!(
-            service.status("account_a").await,
+            service.status("account_a", Marketplace::Ozon).await,
             Err(RefreshRequestError::InvalidData)
         );
     }
@@ -498,18 +563,26 @@ mod tests {
             Utc::now().timestamp_micros()
         );
         assert_eq!(
-            service.status(&account_id).await.unwrap().state,
+            service
+                .status(&account_id, Marketplace::Ozon)
+                .await
+                .unwrap()
+                .state,
             SalesRefreshState::NeverRequested
         );
         let date = crate::reporting::business_date(Utc::now());
         let requested = service
-            .request(&account_id, "unit_test_manager", date)
+            .request(&account_id, Marketplace::Ozon, "unit_test_manager", date)
             .await
             .unwrap();
         assert_eq!(requested.state, SalesRefreshState::Queued);
         assert_eq!(requested.created, Some(true));
         assert_eq!(
-            service.status(&account_id).await.unwrap().request_id,
+            service
+                .status(&account_id, Marketplace::Ozon)
+                .await
+                .unwrap()
+                .request_id,
             requested.request_id
         );
 
@@ -532,7 +605,11 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            service.status(&account_id).await.unwrap().state,
+            service
+                .status(&account_id, Marketplace::Ozon)
+                .await
+                .unwrap()
+                .state,
             SalesRefreshState::Failed
         );
     }

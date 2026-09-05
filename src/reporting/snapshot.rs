@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MAX_ACCOUNTS: usize = 64;
@@ -14,7 +15,9 @@ const MAX_IDENTIFIER_BYTES: usize = 128;
 /// time of current-state sources.
 const MAX_POST_CUTOFF_OBSERVATION_DELAY: Duration = Duration::hours(24);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Marketplace {
     Ozon,
@@ -60,7 +63,7 @@ impl SnapshotSource {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotStatus {
     Succeeded,

@@ -698,7 +698,7 @@ control_writer_psql=(
 )
 docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
 ledger_contract="$({ "${admin_psql[@]}" --tuples-only --no-align --command "
-	  SELECT count(*) = 25
+	  SELECT count(*) = 28
      AND bool_and(state = 'applied')
      AND bool_and(applied_at IS NOT NULL)
   FROM mcp_runtime.schema_migrations
@@ -1024,6 +1024,12 @@ migration_admin_psql=(
   --file /opt/mcp-ozon/migrations/024_ozon_control_campaign_plans.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /opt/mcp-ozon/migrations/025_ozon_durable_launch_workflow.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/026_marketplace_sales_refresh_queue.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/027_position_latest_lookup.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/028_reporting_outbox_candidates.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \
@@ -1449,6 +1455,34 @@ collector_run="$({ "${collector_psql[@]}" --tuples-only --no-align --field-separ
 if [[ "$collector_run" != "failed:1:0:upstream:502" ]]; then
   echo "position_collector did not persist the intended run INSERT/UPDATE" >&2
   printf '%s\n' "$collector_run" >&2
+  exit 1
+fi
+
+measurement_slot="$({ "${admin_psql[@]}" --tuples-only --no-align --command "
+  SELECT measurement.scheduled_for = run.scheduled_for
+  FROM search_position.measurements AS measurement
+  JOIN search_position.collection_runs AS run ON run.id = measurement.run_id
+  WHERE measurement.id = 1
+"; } | tr -d '[:space:]')"
+if [[ "$measurement_slot" != t ]]; then
+  echo "measurement trigger did not copy the authoritative logical run slot" >&2
+  exit 1
+fi
+
+latest_plan="$({ "${reader_psql[@]}" --tuples-only --no-align --command "
+  SET enable_seqscan = off;
+  EXPLAIN (COSTS OFF)
+  SELECT measurement.observed_at
+  FROM search_position.published_measurements AS measurement
+  WHERE measurement.monitor_id = 1
+  ORDER BY measurement.scheduled_for DESC,
+           measurement.observed_at DESC,
+           measurement.id DESC
+  LIMIT 1
+"; } | tr -d '\r')"
+if [[ "$latest_plan" != *"measurements_monitor_slot"* ]]; then
+  echo "latest-position query plan does not use measurements_monitor_slot" >&2
+  printf '%s\n' "$latest_plan" >&2
   exit 1
 fi
 
@@ -2994,6 +3028,37 @@ expect_failure_containing \
   FROM daily_reporting.delivery_batches
   WHERE recipient_id = 'recovered_owner';
 " >/dev/null
+
+generatable_view_contract="$({ "${admin_psql[@]}" --tuples-only --no-align \
+  --command "
+    SELECT
+      pg_get_viewdef('daily_reporting.generatable_batches'::regclass, true)
+          LIKE '%JOIN LATERAL%'
+      AND pg_get_viewdef('daily_reporting.generatable_batches'::regclass, true)
+          LIKE '%attempt.batch_id = batch.id%'
+  "; } | tr -d '[:space:]')"
+if [[ "$generatable_view_contract" != t ]]; then
+  echo "generatable report view does not correlate attempt history to its batch" >&2
+  exit 1
+fi
+
+generatable_plan="$({ "${report_worker_psql[@]}" --tuples-only --no-align \
+  --command "
+    SET enable_seqscan = off;
+    EXPLAIN (COSTS OFF)
+    SELECT id
+    FROM daily_reporting.generatable_batches
+    WHERE scheduled_for <= '2099-08-17 12:30:00+00'
+      AND deadline_at >= '2099-08-17 12:30:00+00'
+      AND (retry_after IS NULL OR retry_after <= '2099-08-17 12:30:00+00')
+    ORDER BY scheduled_for, id
+    LIMIT 16
+  "; } | tr -d '\r')"
+if [[ "$generatable_plan" != *"delivery_batches_generatable_schedule_idx"* ]]; then
+  echo "generation candidate query plan does not use the bounded hot index" >&2
+  printf '%s\n' "$generatable_plan" >&2
+  exit 1
+fi
 
 expect_failure_containing \
   "invalid recovered morning deadline" \

@@ -155,19 +155,29 @@ Normal freshness comes exclusively from the guarded `report-collector`
 scheduler, so marketplace request volume scales with scheduled account
 collection rather than the number of managers or ChatGPT prompts.
 
+`ofk_weekly_marketplace_ranking` is an administrator-only cross-marketplace
+read model. It accepts exactly one completed Monday-Sunday period and reads
+only the same published PostgreSQL sales projection. The result contains a
+leader, outsider and ordered ranking only when all accounts in the access
+registry have seven complete served dates for that exact period. Otherwise it
+returns only the overall coverage state and per-account missing dates; partial
+turnover is never ranked.
+
 For an on-demand current-day update, ChatGPT calls
-`ofk_request_ozon_sales_refresh`. The tool only inserts or reuses a PostgreSQL
-queue request; it never calls Ozon synchronously. Concurrent requests from all
-managers for one account share one request ID, and a successful result is reused
-for ten minutes. A queued current-day request may wait for up to four hours, so
+`ofk_request_marketplace_sales_refresh` (the Ozon-specific compatibility name
+is retained). The tool binds marketplace from the canonical account registry,
+only inserts or reuses a PostgreSQL queue request, and never calls either
+marketplace synchronously. Concurrent requests from all managers for one
+account/marketplace share one request ID, and a successful result is reused for
+ten minutes. A queued current-day request may wait for up to four hours, so
 fourteen distinct accounts fit the globally sequential worst case.
-`ofk_ozon_sales_refresh_status` reports `queued`, `running`, `succeeded`, or
-`failed`. The single `report-collector` loop claims at most one
+`ofk_marketplace_sales_refresh_status` reports `queued`, `running`,
+`succeeded`, or `failed`. The single `report-collector` loop claims at most one
 job at a time. It will not start during the 12 minutes before either scheduled
 cutoff, throughout the 08:00-08:30 and 17:00-17:30 EKB report windows, or
 during the following 65-second Seller API pacing tail. It collects all five
-Ozon sources and publishes the snapshot and queue completion in one
-transaction.
+Ozon sources or all four WB sources and publishes the complete marketplace
+snapshot set and queue completion in one transaction.
 
 This prevents a manager burst from becoming a marketplace burst. It cannot
 promise that Ozon will never return HTTP 429: the same Client-Id may be used by
@@ -427,6 +437,21 @@ runtime validates only the directory. A value is read after the corresponding
 database claim succeeds, so a busy/completed or unrelated account reads no
 secret. The shipped Compose mode and policy both remain disabled and do not
 mount this directory, so scheduled collection cannot be enabled accidentally.
+
+After a complete normalized batch is fetched, the collector commits an
+internal-fact staging checkpoint before publication and immediately reads it
+back with a SHA-256 integrity check. Raw marketplace payloads are never staged.
+If the process dies after this checkpoint, an expired lease is reclaimed with a
+larger fencing generation and the replacement owner publishes the same staged
+batch without another marketplace call. Publication, both claim completions,
+and staging cleanup remain one PostgreSQL transaction.
+
+Every authenticated MCP tool call is recorded as structured metadata only:
+canonical actor, tool, optional canonical account/marketplace, timestamps,
+duration, terminal outcome and bounded error code. Arguments, responses,
+credentials and vendor payloads are excluded. Admission remains held through
+terminal telemetry. Only administrators can read the bounded projection via
+`ofk_tool_call_log`; the application database role has no direct table access.
 
 `collection-preflight` performs no marketplace request. It requires every
 target in the enabled policy to share one successful, fully paginated
