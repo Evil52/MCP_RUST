@@ -1,0 +1,18 @@
+{
+  "name": "ozonofk-suite",
+  "version": "0.1.0",
+  "description": "Snapshot-first Ozon/WB analytics and evidence-locked daily Ozon reports.",
+  "author": {
+    "name": "OFK"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "OzonOFK Suite",
+    "shortDescription": "Ozon/WB analytics from published snapshots.",
+    "longDescription": "Weekly marketplace ranking with full-coverage gates and role-aware daily Ozon reports. Requires an authenticated OzonOFK connection; this package does not install or migrate that connection.",
+    "developerName": "OFK",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Покажи рейтинг за прошлую завершённую неделю и полноту данных Ozon/WB."
+  }
+}

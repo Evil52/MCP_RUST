@@ -74,6 +74,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check OzonOFK Suite source allowlist and synchronization
+        run: bash scripts/build-ozonofk-suite.sh --check
+
       - name: Run tests
         run: cargo test --locked --all-targets --all-features -- --test-threads=1
 

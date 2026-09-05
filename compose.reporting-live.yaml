@@ -11,6 +11,10 @@ services:
       - run-scheduler
     environment:
       REPORT_COLLECTOR_MODE: scheduled
+      # The container receives one collection policy; mail routing stays with
+      # report-worker. The legacy host variable remains supported.
+      DAILY_REPORT_POLICY: ""
+      REPORT_COLLECTION_POLICY: /etc/mcp-ozon/daily-report-policy.json
       REPORT_COLLECTOR_CREDENTIAL_DIR: /run/mcp-ozon/report-credentials
     volumes:
       - type: bind
@@ -20,7 +24,7 @@ services:
         bind:
           create_host_path: false
       - type: bind
-        source: ${DAILY_REPORT_POLICY_HOST:?DAILY_REPORT_POLICY_HOST is required for live reporting}
+        source: ${REPORT_COLLECTION_POLICY_HOST:-${DAILY_REPORT_POLICY_HOST:?REPORT_COLLECTION_POLICY_HOST or DAILY_REPORT_POLICY_HOST is required for live reporting}}
         target: /etc/mcp-ozon/daily-report-policy.json
         read_only: true
         bind:

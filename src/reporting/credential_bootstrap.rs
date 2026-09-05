@@ -17,7 +17,7 @@ use anyhow::{Context, Result, ensure};
 
 use crate::config::{AccessRegistry, Marketplace, RegistrySource};
 
-use super::policy::DailyReportPolicy;
+use super::collection_policy::CollectionPolicy;
 
 const MAX_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_SECRET_BYTES: usize = 16_384;
@@ -45,7 +45,7 @@ pub fn bootstrap_report_credentials(
         .load()
         .context("access registry cannot be loaded")?;
     let policy_bytes = read_bounded(policy_path)?;
-    let policy = DailyReportPolicy::from_slice(&policy_bytes, &registry)
+    let policy = CollectionPolicy::from_slice(&policy_bytes, &registry)
         .context("daily report policy is invalid")?;
     ensure!(
         policy.enabled,
@@ -85,20 +85,15 @@ fn read_bounded(path: &Path) -> Result<Vec<u8>> {
 
 fn required_credential_names(
     registry: &AccessRegistry,
-    policy: &DailyReportPolicy,
+    policy: &CollectionPolicy,
 ) -> Result<(usize, BTreeSet<String>)> {
-    let account_ids = policy
-        .audiences
-        .iter()
-        .flat_map(|audience| &audience.managers)
-        .flat_map(|manager| &manager.account_ids)
-        .collect::<BTreeSet<_>>();
+    let account_ids = policy.account_ids.iter().collect::<BTreeSet<_>>();
     let mut names = BTreeSet::new();
     for account_id in &account_ids {
         let account = registry
             .accounts
             .iter()
-            .find(|account| account.id == ***account_id)
+            .find(|account| account.id == **account_id)
             .context("policy account disappeared from the access registry")?;
         match account.marketplace {
             Marketplace::Ozon => {
@@ -314,6 +309,23 @@ mod tests {
             r#"{"version":1,"enabled":true,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"pilot","email_env":"RECIPIENT","managers":[{"actor_id":"diana","account_ids":["ozon"]},{"actor_id":"anna","account_ids":["wb"]}]}]}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn standalone_collection_bootstrap_does_not_require_or_copy_email() {
+        let root = directory("collection-only");
+        write_fixture(
+            &root,
+            true,
+            "OZON_ID=123\nOZON_KEY=key\nPERF_ID=456\nPERF_SECRET=secret\nWB_TOKEN=token\nSMTP_PASSWORD=ignored\n",
+        );
+        fs::write(root.join("policy.json"),
+            r#"{"version":1,"enabled":true,"timezone":"Asia/Yekaterinburg","account_ids":["ozon","wb"]}"#).unwrap();
+        let summary = bootstrap(&root).unwrap();
+        assert_eq!(summary.account_count, 2);
+        assert_eq!(summary.credential_count, 5);
+        assert!(!root.join("credentials/SMTP_PASSWORD").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

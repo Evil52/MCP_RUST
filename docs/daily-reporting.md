@@ -1,5 +1,10 @@
 # Daily manager reports
 
+For mail-independent Ozon/WB collection scope and the prepared analytics Suite,
+see [Reporting + Suite readiness](reporting-suite-readiness.md).
+`REPORT_COLLECTION_POLICY` selects collection accounts without recipient or
+sender email configuration; legacy delivery-policy files remain supported.
+
 The daily reporting subsystem is intentionally separate from search-position
 monitoring and from the write-capable Control MCP.
 
