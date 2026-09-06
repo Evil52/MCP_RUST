@@ -19,6 +19,7 @@ use tokio::{
 };
 
 use crate::config::{StoreCredentials, StoreId};
+use crate::retry::RetryPolicy;
 
 const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;
@@ -47,6 +48,10 @@ const FINANCE_ACCRUAL_RETRY_ALLOWANCE: Duration = Duration::from_secs(60);
 const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_TOTAL_RETRY_OVERHEAD: Duration = Duration::from_secs(5);
+// Ozon retries inside a five-second total overhead budget, so its ceiling is
+// far below the Wildberries one. The shared policy keeps that difference
+// explicit instead of implying it through module constants.
+const RETRY_POLICY: RetryPolicy = RetryPolicy::new(MAX_ATTEMPTS, BASE_RETRY_DELAY, MAX_RETRY_DELAY);
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
@@ -801,7 +806,8 @@ impl OzonClient {
             Err(source) => {
                 let error = classify_transport_error(source, None);
                 let kind = error.kind();
-                let will_retry = is_retriable_transport(kind) && attempt < MAX_ATTEMPTS;
+                let will_retry =
+                    is_retriable_transport(kind) && RETRY_POLICY.allows_attempt(attempt);
                 trace_transport_failure(&request_trace, kind, will_retry);
                 if will_retry {
                     return Ok(RequestAttempt::Retry {
@@ -873,9 +879,9 @@ impl OzonClient {
         // all Ozon routes exposed by this client are read-only, so replaying
         // that interrupted attempt is safe and prevents partial analytics from
         // surfacing to browser clients.
-        let will_retry = result
-            .as_ref()
-            .is_err_and(|error| is_retriable_transport(error.kind()) && attempt < MAX_ATTEMPTS);
+        let will_retry = result.as_ref().is_err_and(|error| {
+            is_retriable_transport(error.kind()) && RETRY_POLICY.allows_attempt(attempt)
+        });
         trace_response(
             &request_trace,
             status,
@@ -945,13 +951,13 @@ fn retry_plan(
     if path == ANALYTICS_DATA_PATH && status == StatusCode::TOO_MANY_REQUESTS {
         return None;
     }
-    if !is_retriable(status) || attempt >= MAX_ATTEMPTS {
+    if !is_retriable(status) || !RETRY_POLICY.allows_attempt(attempt) {
         return None;
     }
 
     let retry_after = match retry_after {
         ParsedRetryAfter::Absent => None,
-        ParsedRetryAfter::Valid(delay) if delay <= MAX_RETRY_DELAY => Some(delay),
+        ParsedRetryAfter::Valid(delay) if delay <= RETRY_POLICY.max_delay() => Some(delay),
         ParsedRetryAfter::Valid(_) | ParsedRetryAfter::Invalid => return None,
     };
     let kind = if status == StatusCode::TOO_MANY_REQUESTS {
@@ -972,7 +978,7 @@ fn analytics_queued_retry_plan(
     if path != ANALYTICS_DATA_PATH
         || status != StatusCode::TOO_MANY_REQUESTS
         || pacing_mode != AnalyticsPacingMode::Queue
-        || attempt >= MAX_ATTEMPTS
+        || !RETRY_POLICY.allows_attempt(attempt)
     {
         return None;
     }
@@ -990,7 +996,9 @@ fn analytics_cache_key(store: &StoreId, payload: &Value) -> String {
 /// and deliberately over-limit values keep the existing local retry policy.
 fn shared_retry_cooldown(status: StatusCode, retry_after: ParsedRetryAfter) -> Option<Duration> {
     match retry_after {
-        ParsedRetryAfter::Valid(delay) if is_retriable(status) && delay <= MAX_RETRY_DELAY => {
+        ParsedRetryAfter::Valid(delay)
+            if is_retriable(status) && delay <= RETRY_POLICY.max_delay() =>
+        {
             Some(delay)
         }
         ParsedRetryAfter::Absent | ParsedRetryAfter::Valid(_) | ParsedRetryAfter::Invalid => None,
@@ -1147,11 +1155,7 @@ const fn is_retriable_transport(kind: OzonErrorKind) -> bool {
 }
 
 fn retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
-    retry_after.unwrap_or_else(|| {
-        BASE_RETRY_DELAY
-            .saturating_mul(1_u32 << attempt.saturating_sub(1).min(8))
-            .min(MAX_RETRY_DELAY)
-    })
+    RETRY_POLICY.delay(attempt, retry_after)
 }
 
 fn safe_request_id(headers: &HeaderMap) -> Option<String> {
