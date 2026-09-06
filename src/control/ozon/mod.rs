@@ -31,8 +31,8 @@ pub use guard_workflow::{
 };
 #[cfg(test)]
 pub(in crate::control) use launch_workflow::{
-    ensure_ozon_sku_not_running, exact_ozon_launch_readback, find_ozon_campaign_by_title,
-    positive_json_u64,
+    OzonFinalPermitError, ensure_ozon_sku_not_running, exact_ozon_launch_readback,
+    find_ozon_campaign_by_title, positive_json_u64,
 };
 pub use model::{
     OzonCampaignGuard, OzonGuardStopReadback, OzonLaunchStatus, OzonPlanStoreError,

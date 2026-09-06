@@ -55,8 +55,8 @@ use super::{
         plan_store_error, write_failure_finish,
     },
     tools::{
-        ensure_ozon_sku_not_running, exact_ozon_launch_readback, find_ozon_campaign_by_title,
-        positive_json_u64, read_plan_snapshot,
+        OzonFinalPermitError, ensure_ozon_sku_not_running, exact_ozon_launch_readback,
+        find_ozon_campaign_by_title, positive_json_u64, read_plan_snapshot,
     },
 };
 
@@ -423,6 +423,7 @@ async fn ozon_read_helpers_reject_ambiguous_campaign_and_product_shapes() {
         ensure_ozon_sku_not_running(&client, &store, 1001)
             .await
             .unwrap_err()
+            .to_string()
             .starts_with("SKU preflight failed:")
     );
 
@@ -442,6 +443,7 @@ async fn ozon_read_helpers_reject_ambiguous_campaign_and_product_shapes() {
         ensure_ozon_sku_not_running(&client, &store, 1001)
             .await
             .unwrap_err()
+            .to_string()
             .starts_with("SKU preflight failed:")
     );
 
@@ -500,7 +502,12 @@ async fn ozon_read_helpers_reject_ambiguous_campaign_and_product_shapes() {
     let error = ensure_ozon_sku_not_running(&client, &store, 1001)
         .await
         .unwrap_err();
-    assert!(error.contains("already belongs to running campaign"));
+    // The permanent conflict is asserted as a variant rather than as prose:
+    // reclassification is exactly what the typed error exists to prevent.
+    assert!(matches!(
+        error,
+        OzonFinalPermitError::Conflict("ozon_create_precondition_conflict")
+    ));
 
     for campaign_body in [json!({}), json!({"list": [{"id": 0}]})] {
         let (client, _) = test_performance_client(vec![(200, campaign_body.to_string())]);
@@ -508,6 +515,7 @@ async fn ozon_read_helpers_reject_ambiguous_campaign_and_product_shapes() {
             ensure_ozon_sku_not_running(&client, &store, 1001)
                 .await
                 .unwrap_err()
+                .to_string()
                 .starts_with("SKU preflight")
         );
     }
@@ -528,6 +536,7 @@ async fn ozon_read_helpers_reject_ambiguous_campaign_and_product_shapes() {
         ensure_ozon_sku_not_running(&client, &store, 1001)
             .await
             .unwrap_err()
+            .to_string()
             .contains("products list is invalid")
     );
 
@@ -550,6 +559,7 @@ async fn ozon_read_helpers_reject_ambiguous_campaign_and_product_shapes() {
         ensure_ozon_sku_not_running(&client, &store, 1001)
             .await
             .unwrap_err()
+            .to_string()
             .contains("pagination is incomplete")
     );
 
@@ -581,6 +591,7 @@ async fn ozon_read_helpers_reject_ambiguous_campaign_and_product_shapes() {
         ensure_ozon_sku_not_running(&client, &store, 9_999)
             .await
             .unwrap_err()
+            .to_string()
             .contains("campaign bound exceeded")
     );
 
