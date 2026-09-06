@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "enabled": false,
+  "timezone": "Asia/Yekaterinburg",
+  "account_ids": ["furnitura_dlya_doma", "ip_domnyshev_wb"]
+}

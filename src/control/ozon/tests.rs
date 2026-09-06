@@ -2058,8 +2058,8 @@ async fn postgres_durable_launch_and_guard_workflows_are_fenced_and_recoverable(
     admin
         .execute(
             "UPDATE control.ozon_campaign_launch_workflows SET \
-             lease_claimed_at=clock_timestamp()-interval '5 minutes', \
-             lease_expires_at=clock_timestamp()-interval '1 microsecond' \
+             lease_claimed_at=statement_timestamp()-interval '5 minutes', \
+             lease_expires_at=statement_timestamp()-interval '1 microsecond' \
              WHERE plan_id=$1",
             &[&uncertain.plan_id],
         )

@@ -24,6 +24,158 @@ use tokio_postgres::{Config, NoTls};
 
 static DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[tokio::test]
+async fn weekly_ranking_reads_fourteen_published_accounts_and_withholds_seven_of_fourteen() {
+    let (Ok(reader_url), Ok(collector_url)) = (
+        std::env::var("POSITION_REPOSITORY_TEST_READER_URL"),
+        std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL"),
+    ) else {
+        return;
+    };
+    let _guard = DB_TEST_LOCK.lock().await;
+    let reader = ReportingReader::connect_optional(Some(&reader_url))
+        .await
+        .unwrap();
+    let writer = PostgresSnapshotWriter::connect(&Config::from_str(&collector_url).unwrap())
+        .await
+        .unwrap();
+    let from = NaiveDate::from_ymd_opt(2097, 8, 19).unwrap();
+    let to = from + Duration::days(6);
+    let accounts = (0..14)
+        .map(|i| {
+            AccountScope::new(
+                format!("suite_rank_{}_{i}", std::process::id()),
+                if i < 7 {
+                    Marketplace::Ozon
+                } else {
+                    Marketplace::Wildberries
+                },
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+
+    for (index, account) in accounts.iter().enumerate() {
+        for day in 0..7 {
+            publish_ranking_day(
+                &writer,
+                account,
+                from + Duration::days(day),
+                u64::try_from(index).unwrap(),
+            )
+            .await;
+        }
+        if index == 6 {
+            let partial = reader
+                .weekly_marketplace_ranking(&accounts, from, to)
+                .await
+                .unwrap();
+            assert_eq!(partial.state, DataState::Partial);
+            assert_eq!(
+                (partial.complete_accounts, partial.expected_accounts),
+                (7, 14)
+            );
+            assert_eq!(partial.missing.len(), 7);
+            assert!(partial.ranking.is_empty());
+            assert!(partial.leader.is_none() && partial.outsider.is_none());
+        }
+    }
+    let complete = reader
+        .weekly_marketplace_ranking(&accounts, from, to)
+        .await
+        .unwrap();
+    assert_eq!(complete.state, DataState::Complete);
+    assert_eq!(
+        (complete.complete_accounts, complete.expected_accounts),
+        (14, 14)
+    );
+    assert!(complete.missing.is_empty());
+    assert_eq!(complete.ranking.len(), 14);
+    let leader = complete.leader.unwrap();
+    assert_eq!(leader.account_id, accounts[13].account_id());
+    assert_eq!(leader.operational_gmv_minor, 9_100);
+    let outsider = complete.outsider.unwrap();
+    assert_eq!(outsider.account_id, accounts[0].account_id());
+    assert_eq!(outsider.operational_gmv_minor, 0);
+}
+
+async fn publish_ranking_day(
+    writer: &PostgresSnapshotWriter,
+    account: &AccountScope,
+    day: NaiveDate,
+    amount: u64,
+) {
+    let start = day.and_hms_opt(0, 0, 0).unwrap().and_utc() - Duration::hours(5);
+    let end = start + Duration::days(1);
+    let cutoff = end + Duration::hours(8);
+    let source_as_of = cutoff - Duration::minutes(1);
+    let mut sources = vec![
+        SnapshotSource::Sales,
+        SnapshotSource::Advertising,
+        SnapshotSource::Stocks,
+        SnapshotSource::Prices,
+    ];
+    if account.marketplace() == Marketplace::Ozon {
+        sources.push(SnapshotSource::Finance);
+    }
+    let target = CollectionTarget {
+        account_id: account.account_id().to_owned(),
+        marketplace: account.marketplace(),
+        sources,
+    };
+    let claim = writer
+        .claim_target(&target, cutoff, "suite-ranking-test")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut facts = vec![
+        CollectedFacts::Sales(vec![CollectedSalesFact {
+            business_date: day,
+            sku: 1,
+            ordered_units: amount,
+            operational_gmv_minor: amount * 100,
+            cancelled_units: Some(0),
+            returned_units: Some(0),
+        }]),
+        CollectedFacts::Advertising(Vec::new()),
+        CollectedFacts::Stocks(Vec::new()),
+        CollectedFacts::Prices(Vec::new()),
+    ];
+    if account.marketplace() == Marketplace::Ozon {
+        facts.push(CollectedFacts::Finance(Vec::new()));
+    }
+    let snapshots = facts
+        .into_iter()
+        .map(|facts| {
+            let (period_start, period_end) = if matches!(
+                &facts,
+                CollectedFacts::Stocks(_) | CollectedFacts::Prices(_)
+            ) {
+                (source_as_of, source_as_of)
+            } else {
+                (start, end)
+            };
+            CollectedSnapshot::new(
+                account.account_id().to_owned(),
+                account.marketplace(),
+                cutoff,
+                source_as_of,
+                period_start,
+                period_end,
+                SnapshotStatus::Succeeded,
+                true,
+                "suite-ranking-test".to_owned(),
+                facts,
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    writer
+        .persist_claimed_batch(&claim, &snapshots)
+        .await
+        .unwrap();
+}
+
 fn timestamp(value: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(value)
         .unwrap()
@@ -379,6 +531,44 @@ async fn restricted_reader_rebuilds_complete_history_actions_and_safe_report_met
         sales_analytics.coverage[0].state,
         SalesDateCoverageState::Complete
     );
+    let missing_wb = AccountScope::new(
+        format!("missing_wb_mcp_read_{}", std::process::id()),
+        Marketplace::Wildberries,
+    )
+    .unwrap();
+    let wb_sales_analytics = reader
+        .sales_analytics(
+            &missing_wb,
+            SalesAnalyticsQuery {
+                date_from: business_date,
+                date_to: business_date,
+                group_by: SalesAnalyticsGroup::Day,
+                sort_by: SalesAnalyticsSort::Dimension,
+                direction: SalesAnalyticsDirection::Asc,
+                limit: 100,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(wb_sales_analytics.state, DataState::Unavailable);
+    assert!(wb_sales_analytics.rows.is_empty());
+
+    let ranking = reader
+        .weekly_marketplace_ranking(
+            &[missing.clone(), missing_wb],
+            business_date - Duration::days(6),
+            business_date,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ranking.state, DataState::Unavailable);
+    assert_eq!(ranking.expected_accounts, 2);
+    assert_eq!(ranking.complete_accounts, 0);
+    assert_eq!(ranking.missing.len(), 2);
+    assert!(ranking.ranking.is_empty());
+    assert!(ranking.leader.is_none());
+    assert!(ranking.outsider.is_none());
     assert!(
         reader
             .metrics_history(

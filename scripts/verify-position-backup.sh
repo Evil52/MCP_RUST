@@ -147,7 +147,7 @@ case "$manifest_version" in
     ;;
 esac
 
-if [[ ! "$db_image" =~ ^postgres:[0-9]+-alpine@sha256:[0-9a-f]{64}$ ]] \
+if [[ ! "$db_image" =~ ^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$ ]] \
   || [[ ! "$db_name" =~ ^[A-Za-z0-9_]+$ ]] \
   || [[ ! "$db_owner" =~ ^[A-Za-z0-9_]+$ ]] \
   || [[ ! "$expected_db_sha" =~ ^[0-9a-f]{64}$ ]] \

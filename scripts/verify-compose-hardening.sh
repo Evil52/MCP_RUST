@@ -915,7 +915,8 @@ verify_reporting_live() {
        "REPORT_COLLECTOR_DATABASE_URL": $database_url,
        "REPORT_COLLECTOR_CREDENTIAL_DIR": "/run/mcp-ozon/report-credentials",
        "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
-       "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
+       "DAILY_REPORT_POLICY": "",
+       "REPORT_COLLECTION_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
        "RUST_LOG": "mcp_ozon::reporting=info"
      }'
   # shellcheck disable=SC2016
@@ -1715,17 +1716,37 @@ check_contains \
   "$project_dir/scripts/install-local-runtime-agent.sh" \
   '--env-file "$position_environment_file"'
 check_contains \
-  "production MCP installer requires a healthy reporting database" \
+  "production MCP installer selects the reporting database by Compose project" \
   "$project_dir/scripts/install-local-runtime-agent.sh" \
-  'mcp-ozon-position-db'
+  '--filter label=com.docker.compose.project=mcp-ozon-position'
+check_contains \
+  "production MCP installer selects the reporting database by Compose service" \
+  "$project_dir/scripts/install-local-runtime-agent.sh" \
+  '--filter label=com.docker.compose.service=position-db'
+check_contains \
+  "production MCP installer requires an unambiguous reporting database" \
+  "$project_dir/scripts/install-local-runtime-agent.sh" \
+  'multiple reporting database containers are running; refusing an ambiguous deployment'
+check_not_contains \
+  "production MCP installer does not assume a non-Compose database container name" \
+  "$project_dir/scripts/install-local-runtime-agent.sh" \
+  "'{{.State.Health.Status}}' mcp-ozon-position-db"
+check_contains \
+  "backup writer accepts the pinned Alpine patch tag" \
+  "$project_dir/scripts/backup-position-stack.sh" \
+  '^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$'
+check_contains \
+  "backup verifier accepts the same pinned Alpine patch tag" \
+  "$project_dir/scripts/verify-position-backup.sh" \
+  '^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$'
 check_contains \
   "live reporting: access registry has no fallback path" \
   "$project_dir/compose.reporting-live.yaml" \
   "\${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required for live reporting}"
 check_contains \
-  "live reporting: enabled policy has no fallback path" \
+  "live reporting: collection policy requires an explicit new or legacy host path" \
   "$project_dir/compose.reporting-live.yaml" \
-  "\${DAILY_REPORT_POLICY_HOST:?DAILY_REPORT_POLICY_HOST is required for live reporting}"
+  "\${REPORT_COLLECTION_POLICY_HOST:-\${DAILY_REPORT_POLICY_HOST:?REPORT_COLLECTION_POLICY_HOST or DAILY_REPORT_POLICY_HOST is required for live reporting}}"
 check_contains \
   "live reporting: credential directory has no fallback path" \
   "$project_dir/compose.reporting-live.yaml" \

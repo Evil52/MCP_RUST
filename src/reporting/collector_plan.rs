@@ -51,10 +51,21 @@ pub fn build_collection_plan(
             account_ids.extend(manager.account_ids.iter().cloned());
         }
     }
+    build_collection_plan_for_accounts(&account_ids.into_iter().collect::<Vec<_>>(), registry)
+}
+
+/// Builds the same source inventory without depending on mail routing.
+pub fn build_collection_plan_for_accounts(
+    account_ids: &[String],
+    registry: &AccessRegistry,
+) -> Result<Vec<CollectionTarget>, CollectionPlanError> {
     if account_ids.len() > MAX_COLLECTION_TARGETS {
         return Err(CollectionPlanError::TooManyTargets);
     }
     account_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|account_id| {
             let account = registry

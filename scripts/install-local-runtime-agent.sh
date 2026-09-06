@@ -114,8 +114,22 @@ if ! "$docker_bin" network inspect mcp-ozon-position-internal >/dev/null 2>&1; t
   echo "reporting database network is unavailable; start and migrate the position stack first" >&2
   exit 1
 fi
+position_containers="$(
+  "$docker_bin" ps \
+    --filter label=com.docker.compose.project=mcp-ozon-position \
+    --filter label=com.docker.compose.service=position-db \
+    --format '{{.ID}}'
+)"
+if [[ -z "$position_containers" ]]; then
+  echo "reporting database container is unavailable; start and migrate the position stack first" >&2
+  exit 1
+fi
+if [[ "$position_containers" == *$'\n'* ]]; then
+  echo "multiple reporting database containers are running; refusing an ambiguous deployment" >&2
+  exit 1
+fi
 if [[ "$(
-  "$docker_bin" container inspect --format '{{.State.Health.Status}}' mcp-ozon-position-db \
+  "$docker_bin" container inspect --format '{{.State.Health.Status}}' "$position_containers" \
     2>/dev/null || true
 )" != "healthy" ]]; then
   echo "reporting database is not healthy; start and migrate the position stack first" >&2
