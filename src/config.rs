@@ -779,14 +779,15 @@ impl Drop for TestLoadBlockControl {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct RegistrySource {
-    path: Arc<PathBuf>,
-    credential_bindings: Arc<BTreeSet<OzonCredentialBinding>>,
-    wb_credential_bindings: Arc<BTreeSet<WbCredentialBinding>>,
-    cache: Arc<RwLock<Option<CachedRegistry>>>,
-    jwt_oidc_bindings_required: Arc<std::sync::atomic::AtomicBool>,
-    async_load_gate: Arc<tokio::sync::Semaphore>,
+/// Test-only observation points for [`RegistrySource::load`].
+///
+/// These hooks used to sit inline in `load`, which meant the shipped body and
+/// the tested body had different shapes — the one place where the coverage
+/// figure did not describe production code. Collapsing them behind a single
+/// call keeps `load` identical in both builds: only this type differs, and
+/// outside `cfg(test)` it is a zero-sized no-op.
+#[derive(Debug, Clone, Default)]
+struct LoadInstrumentation {
     #[cfg(test)]
     load_count: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
@@ -795,6 +796,72 @@ pub struct RegistrySource {
     panic_next_load: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     block_next_load: Arc<std::sync::Mutex<Option<Arc<TestLoadBlockState>>>>,
+}
+
+#[cfg(not(test))]
+impl LoadInstrumentation {
+    /// The production seam. Present so `load` has one shape in both builds.
+    #[allow(
+        clippy::unused_self,
+        reason = "the production hook deliberately observes nothing"
+    )]
+    const fn entering_load(&self) {}
+}
+
+#[cfg(test)]
+impl LoadInstrumentation {
+    /// Records the load, then honors any injected panic or block.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a test has armed `panic_on_next_load`.
+    fn entering_load(&self) {
+        use std::sync::atomic::Ordering;
+
+        self.load_count.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_load_thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(std::thread::current().id());
+        assert!(
+            !self.panic_next_load.swap(false, Ordering::Relaxed),
+            "injected registry load panic"
+        );
+        let block = {
+            let mut block_next_load = self
+                .block_next_load
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let block = block_next_load.take();
+            drop(block_next_load);
+            block
+        };
+        if let Some(block) = block {
+            block.entered.notify_one();
+            let mut released = block
+                .released
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            while !*released {
+                released = block
+                    .release
+                    .wait(released)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            drop(released);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistrySource {
+    path: Arc<PathBuf>,
+    credential_bindings: Arc<BTreeSet<OzonCredentialBinding>>,
+    wb_credential_bindings: Arc<BTreeSet<WbCredentialBinding>>,
+    cache: Arc<RwLock<Option<CachedRegistry>>>,
+    jwt_oidc_bindings_required: Arc<std::sync::atomic::AtomicBool>,
+    async_load_gate: Arc<tokio::sync::Semaphore>,
+    instrumentation: LoadInstrumentation,
 }
 
 impl RegistrySource {
@@ -812,14 +879,7 @@ impl RegistrySource {
             }))),
             jwt_oidc_bindings_required: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             async_load_gate: Arc::new(tokio::sync::Semaphore::new(1)),
-            #[cfg(test)]
-            load_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            #[cfg(test)]
-            last_load_thread: Arc::new(std::sync::Mutex::new(None)),
-            #[cfg(test)]
-            panic_next_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            #[cfg(test)]
-            block_next_load: Arc::new(std::sync::Mutex::new(None)),
+            instrumentation: LoadInstrumentation::default(),
         };
         Ok(source)
     }
@@ -830,45 +890,8 @@ impl RegistrySource {
     /// Every tool call needs the registry to resolve the caller's identity and
     /// stores, so the unchanged-file path avoids a full JSON parse, a full
     /// validation pass and a deep clone per call.
-    #[cfg_attr(test, allow(clippy::missing_panics_doc))]
     pub fn load(&self) -> Result<Arc<AccessRegistry>> {
-        #[cfg(test)]
-        {
-            use std::sync::atomic::Ordering;
-
-            self.load_count.fetch_add(1, Ordering::Relaxed);
-            *self
-                .last_load_thread
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(std::thread::current().id());
-            assert!(
-                !self.panic_next_load.swap(false, Ordering::Relaxed),
-                "injected registry load panic"
-            );
-            let block = {
-                let mut block_next_load = self
-                    .block_next_load
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let block = block_next_load.take();
-                drop(block_next_load);
-                block
-            };
-            if let Some(block) = block {
-                block.entered.notify_one();
-                let mut released = block
-                    .released
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                while !*released {
-                    released = block
-                        .release
-                        .wait(released)
-                        .unwrap_or_else(PoisonError::into_inner);
-                }
-                drop(released);
-            }
-        }
+        self.instrumentation.entering_load();
 
         let raw = read_registry_bytes(&self.path)?;
         if let Some(cached) = self.cached(&raw) {
@@ -964,12 +987,13 @@ impl RegistrySource {
     pub(crate) fn load_count(&self) -> u64 {
         use std::sync::atomic::Ordering;
 
-        self.load_count.load(Ordering::Relaxed)
+        self.instrumentation.load_count.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
     fn last_load_thread(&self) -> Option<std::thread::ThreadId> {
         *self
+            .instrumentation
             .last_load_thread
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -979,7 +1003,9 @@ impl RegistrySource {
     fn panic_on_next_load(&self) {
         use std::sync::atomic::Ordering;
 
-        self.panic_next_load.store(true, Ordering::Relaxed);
+        self.instrumentation
+            .panic_next_load
+            .store(true, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -990,6 +1016,7 @@ impl RegistrySource {
             release: std::sync::Condvar::new(),
         });
         let previous = self
+            .instrumentation
             .block_next_load
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
