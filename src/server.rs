@@ -6536,7 +6536,15 @@ impl ServerHandler for OzonMcp {
                 .extensions
                 .insert(RequestRegistry::load(&self.registry).await);
         }
-        let tool_name = request.name.to_string();
+        // Resolve the name before telemetry so rejected input never reaches
+        // logs or the audit store. Use the registered name for every later
+        // diagnostic, including failures while opening the telemetry row.
+        let tool_name = self
+            .tool_router
+            .get(&request.name)
+            .ok_or_else(|| rmcp::ErrorData::invalid_params("tool not found", None))?
+            .name
+            .to_string();
         let (actor_id, account_id, marketplace) =
             self.tool_telemetry_dimensions(&request, &context);
         let telemetry_receipt = match self

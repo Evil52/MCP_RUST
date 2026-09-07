@@ -14,8 +14,8 @@
     <string>__HOME__</string>
     <key>MCP_RUNTIME_DIR</key>
     <string>__RUNTIME_DIR__</string>
-    <key>MCP_OPS_PROJECT_DIR</key>
-    <string>__PROJECT_DIR__</string>
+    <key>MCP_OPS_POSTGRES_IMAGE</key>
+    <string>__POSTGRES_IMAGE__</string>
     <key>MCP_BACKUP_POSITION_ENV</key>
     <string>__POSITION_ENV__</string>
     <key>MCP_BACKUP_DIR</key>

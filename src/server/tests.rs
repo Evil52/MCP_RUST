@@ -1355,6 +1355,111 @@ async fn admitted_permit_can_be_held_through_terminal_telemetry() {
     );
 }
 
+#[derive(Clone)]
+struct ToolNameLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for ToolNameLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn closed_telemetry_client() -> tokio_postgres::Client {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (client_stream, mut database_stream) = tokio::io::duplex(1_024);
+    let handshake = tokio::spawn(async move {
+        let length = database_stream.read_u32().await.unwrap();
+        let mut startup = vec![0; usize::try_from(length).unwrap() - 4];
+        database_stream.read_exact(&mut startup).await.unwrap();
+        // AuthenticationOk and ReadyForQuery are enough to establish a local
+        // driver; no TCP socket, live database or production credentials exist.
+        database_stream
+            .write_all(b"R\0\0\0\x08\0\0\0\0Z\0\0\0\x05I")
+            .await
+            .unwrap();
+    });
+    let mut config = tokio_postgres::Config::new();
+    config
+        .user("report_refresh_requester")
+        .ssl_mode(tokio_postgres::config::SslMode::Disable);
+    let (client, connection) = config
+        .connect_raw(client_stream, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    handshake.await.unwrap();
+    drop(connection);
+    assert!(client.is_closed());
+    client
+}
+
+#[tokio::test]
+async fn tool_names_are_resolved_before_telemetry_and_never_logged_unvalidated() {
+    use tracing::instrument::WithSubscriber;
+
+    let mut server = server();
+    server.tool_telemetry = ToolTelemetryService::from_test_client(closed_telemetry_client().await);
+    assert!(server.tool_telemetry.is_enabled());
+    server.tool_router.disable_route("ozon_stores_status");
+    let (transport, _remote) = tokio::io::duplex(1_024);
+    let running =
+        rmcp::service::serve_directly::<RoleServer, _, _, _, _>(server.clone(), transport, None);
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer = ToolNameLogWriter(Arc::clone(&logs));
+    let subscriber = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let marker = "untrusted_tool_name_marker";
+    for name in [
+        format!("{marker}\n{}", "x".repeat(200 * 1_024)),
+        marker.to_owned(),
+        "ozon_stores_status".to_owned(),
+    ] {
+        let request = serde_json::from_value(json!({"name": name, "arguments": {}})).unwrap();
+        let context =
+            RequestContext::new(rmcp::model::RequestId::Number(1), running.peer().clone());
+        let result = server
+            .call_tool(request, context)
+            .with_subscriber(subscriber.clone())
+            .await;
+        let captured = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            !captured.contains(marker),
+            "unvalidated tool name must not enter application logs"
+        );
+        let error = result.expect_err("unknown and disabled tools are protocol parameter errors");
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(error.message, "tool not found");
+    }
+
+    // A registered tool must still fail closed when its required audit store
+    // is unavailable, rather than executing successfully without telemetry.
+    let request = serde_json::from_value(json!({
+        "name": "marketplace_accounts", "arguments": {}
+    }))
+    .unwrap();
+    let context = RequestContext::new(rmcp::model::RequestId::Number(2), running.peer().clone());
+    let response = server
+        .call_tool(request, context)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_control_failure(&response, "telemetry_unavailable");
+    let captured = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(captured.contains("marketplace_accounts"));
+    assert!(!captured.contains(marker));
+    running.cancel().await.unwrap();
+}
+
 #[tokio::test]
 async fn authentication_still_precedes_tool_call_admission_control() {
     let seed = server();

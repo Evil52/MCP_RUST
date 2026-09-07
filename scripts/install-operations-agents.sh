@@ -20,8 +20,11 @@ offsite_command="${MCP_BACKUP_OFFSITE_COMMAND:-}"
 allow_local_only="${MCP_BACKUP_ALLOW_LOCAL_ONLY:-false}"
 health_required_services="${MCP_HEALTH_REQUIRED_SERVICES-position-db,ozon-egress}"
 health_required_launch_agents="${MCP_HEALTH_REQUIRED_LAUNCH_AGENTS-com.ofk.mcp-ozon-runtime,com.ofk.mcp-ozon-backup,com.ofk.mcp-ozon-health,com.ofk.mcp-ozon-restore-verify}"
-position_env_source="$project_root/.position.env"
+health_reporting_policy="${MCP_HEALTH_REPORTING_POLICY:-}"
+health_reporting_registry="${MCP_HEALTH_REPORTING_REGISTRY:-}"
+position_env_source="${MCP_OPS_POSITION_ENV_SOURCE:-$project_root/.position.env}"
 position_env_target="$runtime_dir/position.env"
+db_image="$(awk '/^FROM postgres:/ { print $2; exit }' "$project_root/position-monitor/Dockerfile")"
 libexec_dir="$HOME/.local/libexec/mcp-ozon"
 agent_dir="$HOME/Library/LaunchAgents"
 log_dir="$HOME/Library/Logs/MCP_OZON"
@@ -43,7 +46,8 @@ fi
 
 for path in \
   "$backup_source" "$verify_source" "$health_source" \
-  "$backup_template" "$health_template" "$restore_template" "$position_env_source"; do
+  "$backup_template" "$health_template" "$restore_template" "$position_env_source" \
+  "$project_root/scripts/reporting-health-contract.py" "$project_root/scripts/reporting-health.sql"; do
   if [[ ! -f "$path" || -L "$path" ]]; then
     echo "required installer input is unavailable or unsafe: $path" >&2
     exit 1
@@ -63,6 +67,25 @@ for csv_contract in "$health_required_services" "$health_required_launch_agents"
     exit 1
   fi
 done
+if [[ ! "$db_image" =~ ^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$ ]]; then
+  echo "the operations installer requires a pinned PostgreSQL image" >&2
+  exit 1
+fi
+reporting_scope='[]'
+if [[ -n "$health_reporting_policy" || -n "$health_reporting_registry" ]]; then
+  for path in "$health_reporting_policy" "$health_reporting_registry"; do
+    if [[ ! -f "$path" || -L "$path" ]]; then
+      echo "both reporting policy and registry must be regular files" >&2
+      exit 1
+    fi
+  done
+  reporting_scope="$(python3 "$project_root/scripts/reporting-health-contract.py" \
+    "$health_reporting_policy" "$health_reporting_registry")"
+fi
+if [[ ",$health_required_services," == *,report-collector,* && "$reporting_scope" == '[]' ]]; then
+  echo "a required report-collector needs an enabled reporting health policy and registry" >&2
+  exit 1
+fi
 if [[ -z "$offsite_command" && "$allow_local_only" != true ]]; then
   echo "MCP_BACKUP_OFFSITE_COMMAND is required for scheduled production backups" >&2
   echo "set MCP_BACKUP_ALLOW_LOCAL_ONLY=true only to record an explicit accepted risk" >&2
@@ -120,7 +143,37 @@ chmod 700 "$runtime_dir" "$libexec_dir" "$backup_dir"
 install -m 700 "$backup_source" "$libexec_dir/backup-position-stack.sh"
 install -m 700 "$verify_source" "$libexec_dir/verify-position-backup.sh"
 install -m 700 "$health_source" "$libexec_dir/check-runtime-health.sh"
-install -m 600 "$position_env_source" "$position_env_target"
+if [[ -L "$position_env_target" ]]; then
+  echo "persistent database env must not be a symlink" >&2
+  exit 1
+fi
+if [[ ! "$position_env_source" -ef "$position_env_target" ]]; then
+  install -m 600 "$position_env_source" "$position_env_target"
+fi
+chmod 600 "$position_env_target"
+install -m 700 "$project_root/scripts/reporting-health-contract.py" "$libexec_dir/reporting-health-contract.py"
+install -m 600 "$project_root/scripts/reporting-health.sql" "$libexec_dir/reporting-health.sql"
+if [[ -n "$health_reporting_policy" ]]; then
+  mkdir -p "$runtime_dir/ops"
+  chmod 700 "$runtime_dir/ops"
+  for metadata_kind in policy registry; do
+    case "$metadata_kind" in
+      policy) metadata_source="$health_reporting_policy" ;;
+      registry) metadata_source="$health_reporting_registry" ;;
+    esac
+    metadata_target="$runtime_dir/ops/reporting-$metadata_kind.json"
+    if [[ -L "$metadata_target" ]]; then
+      echo "persistent reporting metadata must not be a symlink" >&2
+      exit 1
+    fi
+    if [[ ! "$metadata_source" -ef "$metadata_target" ]]; then
+      install -m 600 "$metadata_source" "$metadata_target"
+    fi
+    chmod 600 "$metadata_target"
+  done
+  health_reporting_policy="$runtime_dir/ops/reporting-policy.json"
+  health_reporting_registry="$runtime_dir/ops/reporting-registry.json"
+fi
 
 render() {
   sed \
@@ -128,7 +181,7 @@ render() {
     -e "s|__HOME__|$HOME|g" \
     -e "s|__LOG_DIR__|$log_dir|g" \
     -e "s|__RUNTIME_DIR__|$runtime_dir|g" \
-    -e "s|__PROJECT_DIR__|$project_root|g" \
+    -e "s|__POSTGRES_IMAGE__|$db_image|g" \
     -e "s|__POSITION_ENV__|$position_env_target|g" \
     -e "s|__BACKUP_DIR__|$backup_dir|g" \
     -e "s|__AGE_RECIPIENTS_FILE__|$recipients_file|g" \
@@ -138,6 +191,8 @@ render() {
     -e "s|__ALLOW_LOCAL_ONLY__|$allow_local_only|g" \
     -e "s|__HEALTH_REQUIRED_SERVICES__|$health_required_services|g" \
     -e "s|__HEALTH_REQUIRED_LAUNCH_AGENTS__|$health_required_launch_agents|g" \
+    -e "s|__HEALTH_REPORTING_POLICY__|$health_reporting_policy|g" \
+    -e "s|__HEALTH_REPORTING_REGISTRY__|$health_reporting_registry|g" \
     "$2"
 }
 
@@ -162,7 +217,7 @@ plutil -lint "$temporary_backup_plist" "$temporary_health_plist" \
 # Prove one full round trip before scheduling anything. A backup that has never
 # been restored is not yet a backup.
 echo "==> taking one backup"
-MCP_OPS_PROJECT_DIR="$project_root" \
+MCP_OPS_POSTGRES_IMAGE="$db_image" \
 MCP_BACKUP_POSITION_ENV="$position_env_target" \
 MCP_BACKUP_AGE_RECIPIENTS_FILE="$recipients_file" \
 MCP_BACKUP_DIR="$backup_dir" \
@@ -177,12 +232,14 @@ MCP_BACKUP_DIR="$backup_dir" \
 
 echo "==> running one health check"
 health_status=0
-MCP_OPS_PROJECT_DIR="$project_root" \
+MCP_OPS_POSTGRES_IMAGE="$db_image" \
 MCP_HEALTH_POSITION_ENV="$position_env_target" \
 MCP_BACKUP_DIR="$backup_dir" \
 MCP_BACKUP_ALLOW_LOCAL_ONLY="$allow_local_only" \
 MCP_HEALTH_REQUIRED_SERVICES="$health_required_services" \
 MCP_HEALTH_REQUIRED_LAUNCH_AGENTS="$health_required_launch_agents" \
+MCP_HEALTH_REPORTING_POLICY="$health_reporting_policy" \
+MCP_HEALTH_REPORTING_REGISTRY="$health_reporting_registry" \
 MCP_HEALTH_SKIP_LAUNCH_AGENT_CHECK=true \
   "$libexec_dir/check-runtime-health.sh" || health_status=$?
 if ((health_status > 1)); then

@@ -1550,6 +1550,8 @@ mod tests {
         executions: VecDeque<OzonLaunchLease>,
         events: Vec<String>,
         fail_claim: Option<OzonPlanStoreError>,
+        fail_complete: Option<OzonPlanStoreError>,
+        ambiguous_readbacks: Vec<Option<Value>>,
     }
 
     #[derive(Default)]
@@ -1568,6 +1570,8 @@ mod tests {
                     executions: executions.into_iter().collect(),
                     events: Vec::new(),
                     fail_claim: None,
+                    fail_complete: None,
+                    ambiguous_readbacks: Vec::new(),
                 }),
             }
         }
@@ -1615,12 +1619,17 @@ mod tests {
             campaign_id: Option<u64>,
             readback: Option<&Value>,
         ) -> Result<OzonCampaignPlan, OzonPlanStoreError> {
-            self.state.lock().unwrap().events.push(format!(
+            let mut state = self.state.lock().unwrap();
+            state.events.push(format!(
                 "complete:{}:{}:{}",
                 lease.action.as_db(),
                 campaign_id.unwrap_or_default(),
                 readback.is_some()
             ));
+            if let Some(error) = state.fail_complete.take() {
+                return Err(error);
+            }
+            drop(state);
             Ok(plan_at(lease, lease.action.completed_status(), campaign_id))
         }
 
@@ -1645,12 +1654,15 @@ mod tests {
             campaign_id: Option<u64>,
             readback: Option<&Value>,
         ) -> Result<OzonCampaignPlan, OzonPlanStoreError> {
-            self.state.lock().unwrap().events.push(format!(
+            let mut state = self.state.lock().unwrap();
+            state.events.push(format!(
                 "ambiguous:{}:{error_class}:{}:{}",
                 lease.action.as_db(),
                 campaign_id.unwrap_or_default(),
                 readback.is_some()
             ));
+            state.ambiguous_readbacks.push(readback.cloned());
+            drop(state);
             Ok(plan_at(lease, OzonLaunchStatus::Ambiguous, campaign_id))
         }
 
@@ -2213,6 +2225,8 @@ mod tests {
             OzonLaunchWorkflowError::Repository(OzonPlanStoreError::InvalidState)
         );
     }
+
+    mod regression;
 
     #[test]
     fn parser_error_classes_and_budget_constants_are_exact() {

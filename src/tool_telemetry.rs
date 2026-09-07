@@ -92,6 +92,13 @@ impl ToolTelemetryService {
         Self { client: None }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_client(client: tokio_postgres::Client) -> Self {
+        Self {
+            client: Some(Arc::new(SupervisedClient::preconnected(client, COMPONENT))),
+        }
+    }
+
     pub async fn connect_optional(database_url: Option<&str>) -> AnyResult<Self> {
         let Some(database_url) = database_url else {
             return Ok(Self::disabled());

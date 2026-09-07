@@ -533,8 +533,11 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
         Err(PostgresSnapshotError::InvalidManifest)
     );
 
-    let admin_config =
+    let mut admin_config =
         Config::from_str(&std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL").unwrap()).unwrap();
+    // Bound only these administrator fixture sessions: both runtime contracts
+    // must still reject the role after connection-time timeout validation.
+    admin_config.options("-c statement_timeout=60000 -c idle_in_transaction_session_timeout=30000");
     let wrong_role = PostgresSnapshotRepository::connect(&admin_config)
         .await
         .unwrap();

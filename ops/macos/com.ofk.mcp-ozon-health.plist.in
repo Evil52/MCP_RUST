@@ -14,8 +14,8 @@
     <string>__HOME__</string>
     <key>MCP_RUNTIME_DIR</key>
     <string>__RUNTIME_DIR__</string>
-    <key>MCP_OPS_PROJECT_DIR</key>
-    <string>__PROJECT_DIR__</string>
+    <key>MCP_OPS_POSTGRES_IMAGE</key>
+    <string>__POSTGRES_IMAGE__</string>
     <key>MCP_HEALTH_POSITION_ENV</key>
     <string>__POSITION_ENV__</string>
     <key>MCP_BACKUP_DIR</key>
@@ -26,6 +26,10 @@
     <string>__HEALTH_REQUIRED_SERVICES__</string>
     <key>MCP_HEALTH_REQUIRED_LAUNCH_AGENTS</key>
     <string>__HEALTH_REQUIRED_LAUNCH_AGENTS__</string>
+    <key>MCP_HEALTH_REPORTING_POLICY</key>
+    <string>__HEALTH_REPORTING_POLICY__</string>
+    <key>MCP_HEALTH_REPORTING_REGISTRY</key>
+    <string>__HEALTH_REPORTING_REGISTRY__</string>
     <key>MCP_BACKUP_ALLOW_LOCAL_ONLY</key>
     <string>__ALLOW_LOCAL_ONLY__</string>
     <key>PATH</key>
