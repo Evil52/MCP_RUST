@@ -8,36 +8,39 @@ set -eu
 
 mode="${1:-migrate}"
 migration_dir="/opt/mcp-ozon/migrations"
-migrations="
-001_schema.sql
-002_ozon_collector_contract.sql
-002_wb_official_history.sql
-004_ozon_postgres_adapter.sql
-005_daily_reporting_outbox.sql
-006_daily_report_snapshots.sql
-007_daily_reporting_optional_metrics.sql
-008_daily_reporting_artifact_identity.sql
-009_daily_reporting_generation_backoff.sql
-010_daily_reporting_observation_window.sql
-011_daily_reporting_collection_claims.sql
-012_daily_reporting_delivery_error_classes.sql
-013_daily_reporting_delivery_reconciliation.sql
-014_daily_reporting_period_preserving_catchup.sql
-015_daily_reporting_ozon_finance.sql
-016_daily_reporting_unit_economics.sql
-017_daily_reporting_advertising_extensions.sql
-018_daily_reporting_recovery_observation_window.sql
-019_daily_reporting_mcp_read_views.sql
-020_wb_control_plans.sql
-021_wb_automation_state.sql
-022_wb_automation_explicit_resume.sql
-023_daily_reporting_ozon_refresh_queue.sql
-024_ozon_control_campaign_plans.sql
-025_ozon_durable_launch_workflow.sql
-026_marketplace_sales_refresh_queue.sql
-027_position_latest_lookup.sql
-028_reporting_outbox_candidates.sql
-"
+
+# The shipped migration set is derived from the image rather than restated
+# here. A hand-maintained list silently skips any migration that reaches
+# `initdb/` (which the Dockerfile copies by glob) but is forgotten in this
+# file: the image carries the SQL, the ledger never records it, and CI stays
+# green. Deriving both the apply order and the known-id set from one directory
+# listing removes that failure mode.
+#
+# `-type f` also rejects symlinks, matching the per-file safety check below.
+# C collation reproduces the historical apply order, in which the two 002_*
+# migrations run ozon-before-wb.
+migrations="$(
+  find "$migration_dir" -maxdepth 1 -type f -name '*.sql' |
+    sed 's|.*/||' |
+    LC_ALL=C sort
+)"
+
+if [ -z "$migrations" ]; then
+  echo "no migrations found in $migration_dir" >&2
+  exit 1
+fi
+
+# Enforce the ledger's own identifier grammar at the source. This keeps the
+# derived names safe to inline into the SQL id list below and rejects a
+# malformed migration before it can reach the database.
+for candidate in $migrations; do
+  if ! printf '%s' "$candidate" | grep -Eq '^[0-9]{3}_[a-z0-9_]+[.]sql$'; then
+    echo "migration file name is not a valid migration id: $candidate" >&2
+    exit 1
+  fi
+done
+
+latest_migration="$(printf '%s\n' "$migrations" | tail -n 1)"
 
 case "$mode" in
   migrate | --baseline-current) ;;
@@ -87,39 +90,25 @@ COMMIT;
 SQL
 }
 
+# Renders the derived migration set as a quoted SQL id list. The names are
+# constrained by the ledger's own CHECK to `[0-9]{3}_[a-z0-9_]+[.]sql`, so no
+# name that reaches this point can carry a quote.
+known_migration_id_list() {
+  known_list=""
+  for known_file in $migrations; do
+    if [ -z "$known_list" ]; then
+      known_list="'$known_file'"
+    else
+      known_list="$known_list, '$known_file'"
+    fi
+  done
+  printf '%s' "$known_list"
+}
+
 unexpected_migration_count() {
   psql_admin --tuples-only --no-align --command \
     "SELECT count(*) FROM mcp_runtime.schema_migrations
-     WHERE migration_id NOT IN (
-       '001_schema.sql',
-       '002_ozon_collector_contract.sql',
-       '002_wb_official_history.sql',
-       '004_ozon_postgres_adapter.sql',
-       '005_daily_reporting_outbox.sql',
-       '006_daily_report_snapshots.sql',
-       '007_daily_reporting_optional_metrics.sql',
-       '008_daily_reporting_artifact_identity.sql',
-       '009_daily_reporting_generation_backoff.sql',
-       '010_daily_reporting_observation_window.sql',
-       '011_daily_reporting_collection_claims.sql',
-       '012_daily_reporting_delivery_error_classes.sql',
-       '013_daily_reporting_delivery_reconciliation.sql',
-       '014_daily_reporting_period_preserving_catchup.sql',
-       '015_daily_reporting_ozon_finance.sql',
-       '016_daily_reporting_unit_economics.sql',
-       '017_daily_reporting_advertising_extensions.sql',
-       '018_daily_reporting_recovery_observation_window.sql',
-       '019_daily_reporting_mcp_read_views.sql',
-       '020_wb_control_plans.sql',
-       '021_wb_automation_state.sql',
-       '022_wb_automation_explicit_resume.sql',
-       '023_daily_reporting_ozon_refresh_queue.sql',
-       '024_ozon_control_campaign_plans.sql',
-       '025_ozon_durable_launch_workflow.sql',
-       '026_marketplace_sales_refresh_queue.sql',
-       '027_position_latest_lookup.sql',
-       '028_reporting_outbox_candidates.sql'
-     )"
+     WHERE migration_id NOT IN ($(known_migration_id_list))"
 }
 
 refuse_unknown_migrations() {
@@ -169,7 +158,7 @@ COMMIT;
 SQL
   done
   "$migration_dir/003_roles.sh"
-  echo "migration ledger baselined at 028_reporting_outbox_candidates.sql"
+  echo "migration ledger baselined at $latest_migration"
   exit 0
 fi
 
@@ -254,4 +243,4 @@ if [ "$roles_refreshed" != true ]; then
   exit 1
 fi
 
-echo "database migrations verified through 028_reporting_outbox_candidates.sql"
+echo "database migrations verified through $latest_migration"

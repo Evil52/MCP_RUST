@@ -19,6 +19,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+use crate::retry::RetryPolicy;
+
 const ANALYTICS_API_BASE_URL: &str = "https://seller-analytics-api.wildberries.ru";
 const STATISTICS_API_BASE_URL: &str = "https://statistics-api.wildberries.ru";
 const CONTENT_API_BASE_URL: &str = "https://content-api.wildberries.ru";
@@ -512,6 +514,18 @@ struct ClientPolicy {
 }
 
 impl ClientPolicy {
+    /// The generic slice of this policy, used for the backoff arithmetic that
+    /// is shared with the Ozon client. The Wildberries ceiling is deliberately
+    /// far above Ozon's: retries here run inside a sixty-second logical
+    /// request deadline rather than a five-second overhead budget.
+    const fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::new(
+            self.max_attempts,
+            self.base_retry_delay,
+            self.max_retry_delay,
+        )
+    }
+
     fn production(request_timeout: Duration) -> Self {
         Self {
             ping_interval: PING_MIN_REQUEST_INTERVAL,
@@ -2075,12 +2089,7 @@ fn retry_plan(
 }
 
 fn retry_delay(attempt: usize, server_delay: Option<Duration>, policy: &ClientPolicy) -> Duration {
-    server_delay.unwrap_or_else(|| {
-        policy
-            .base_retry_delay
-            .saturating_mul(1_u32 << attempt.saturating_sub(1).min(8))
-            .min(policy.max_retry_delay)
-    })
+    policy.retry_policy().delay(attempt, server_delay)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -21,8 +21,8 @@ use crate::{
 
 #[cfg(test)]
 pub(super) use crate::control::ozon::{
-    ensure_ozon_sku_not_running, exact_ozon_launch_readback, find_ozon_campaign_by_title,
-    positive_json_u64,
+    OzonFinalPermitError, ensure_ozon_sku_not_running, exact_ozon_launch_readback,
+    find_ozon_campaign_by_title, positive_json_u64,
 };
 
 use super::{

@@ -10,6 +10,7 @@ pub mod ozon_posting_sales;
 pub mod position_collector;
 pub mod postgres;
 pub mod reporting;
+mod retry;
 pub mod runtime;
 pub mod server;
 pub mod tool_telemetry;

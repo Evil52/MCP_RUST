@@ -160,9 +160,18 @@ pub(in crate::control) enum OzonLaunchWriteFailure {
 }
 
 #[derive(Debug)]
-enum OzonFinalPermitError {
+pub(in crate::control) enum OzonFinalPermitError {
     Transient(String),
     Conflict(&'static str),
+}
+
+impl std::fmt::Display for OzonFinalPermitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(message) => formatter.write_str(message),
+            Self::Conflict(class) => formatter.write_str(class),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -686,15 +695,13 @@ where
                             &self.store_id,
                             lease.plan.sku,
                         )
-                        .await
-                        .map_err(classify_create_preflight_error)?;
+                        .await?;
                         ensure_ozon_campaign_title_absent(
                             self.reader.as_ref(),
                             &self.store_id,
                             &lease.plan.manifest.create_request.title,
                         )
-                        .await
-                        .map_err(classify_create_preflight_error)?;
+                        .await?;
                     }
                     OzonLaunchAction::AddProducts => {
                         ensure_add_products_precondition(
@@ -1030,11 +1037,17 @@ fn authorize_launch_plan(
         .ok_or_else(|| "launch delegation changed".to_owned())
 }
 
+/// Refuses a create when the SKU is already served by a running campaign.
+///
+/// The permanent-versus-transient distinction is returned as a type. It used
+/// to be recovered downstream by comparing the error prose, so editing a
+/// message would silently reclassify a permanent conflict as retryable and
+/// send the workflow back at a launch that can never succeed.
 pub(in crate::control) async fn ensure_ozon_sku_not_running(
     reader: &PerformanceClient,
     store: &StoreId,
     sku: u64,
-) -> Result<(), String> {
+) -> Result<(), OzonFinalPermitError> {
     let mut page = 1_u32;
     let mut visited = 0_usize;
     loop {
@@ -1050,20 +1063,29 @@ pub(in crate::control) async fn ensure_ozon_sku_not_running(
                 },
             )
             .await
-            .map_err(|error| format!("SKU preflight failed: {error}"))?;
+            .map_err(|error| {
+                OzonFinalPermitError::Transient(format!("SKU preflight failed: {error}"))
+            })?;
         let campaigns = response
             .get("list")
             .and_then(Value::as_array)
-            .ok_or_else(|| "SKU preflight campaign list is invalid".to_owned())?;
+            .ok_or_else(|| {
+                OzonFinalPermitError::Transient("SKU preflight campaign list is invalid".to_owned())
+            })?;
         for campaign in campaigns {
-            let (campaign_id, _, state) =
-                campaign_identity(campaign).map_err(|error| format!("SKU preflight {error}"))?;
+            let (campaign_id, _, state) = campaign_identity(campaign).map_err(|error| {
+                OzonFinalPermitError::Transient(format!("SKU preflight {error}"))
+            })?;
             if state != "CAMPAIGN_STATE_RUNNING" {
-                return Err("SKU preflight campaign state is not running".to_owned());
+                return Err(OzonFinalPermitError::Transient(
+                    "SKU preflight campaign state is not running".to_owned(),
+                ));
             }
             visited = visited.saturating_add(1);
             if visited > 1_000 {
-                return Err("SKU preflight campaign bound exceeded".to_owned());
+                return Err(OzonFinalPermitError::Transient(
+                    "SKU preflight campaign bound exceeded".to_owned(),
+                ));
             }
             let products = reader
                 .campaign_products(
@@ -1075,32 +1097,43 @@ pub(in crate::control) async fn ensure_ozon_sku_not_running(
                     },
                 )
                 .await
-                .map_err(|error| format!("SKU preflight failed: {error}"))?;
+                .map_err(|error| {
+                    OzonFinalPermitError::Transient(format!("SKU preflight failed: {error}"))
+                })?;
             let rows = products
                 .get("products")
                 .and_then(Value::as_array)
-                .ok_or_else(|| "SKU preflight products list is invalid".to_owned())?;
+                .ok_or_else(|| {
+                    OzonFinalPermitError::Transient(
+                        "SKU preflight products list is invalid".to_owned(),
+                    )
+                })?;
             let mut contains_sku = false;
             for product in rows {
-                let observed_sku = positive_json_u64(product.get("sku"))
-                    .ok_or_else(|| "SKU preflight product SKU is invalid".to_owned())?;
+                let observed_sku = positive_json_u64(product.get("sku")).ok_or_else(|| {
+                    OzonFinalPermitError::Transient(
+                        "SKU preflight product SKU is invalid".to_owned(),
+                    )
+                })?;
                 contains_sku |= observed_sku == sku;
             }
             if contains_sku {
-                return Err(format!(
-                    "SKU {sku} already belongs to running campaign {campaign_id}"
+                return Err(OzonFinalPermitError::Conflict(
+                    "ozon_create_precondition_conflict",
                 ));
             }
             if rows.len() == 100 {
-                return Err("SKU preflight products pagination is incomplete".to_owned());
+                return Err(OzonFinalPermitError::Transient(
+                    "SKU preflight products pagination is incomplete".to_owned(),
+                ));
             }
         }
         if campaigns.len() < 100 {
             return Ok(());
         }
-        page = page
-            .checked_add(1)
-            .ok_or_else(|| "SKU preflight page overflow".to_owned())?;
+        page = page.checked_add(1).ok_or_else(|| {
+            OzonFinalPermitError::Transient("SKU preflight page overflow".to_owned())
+        })?;
     }
 }
 
@@ -1162,11 +1195,14 @@ async fn find_ozon_campaign_identity_by_title(
     }
 }
 
+/// Refuses a create when the campaign title is already taken.
+///
+/// Returns the same typed conflict as [`ensure_ozon_sku_not_running`].
 async fn ensure_ozon_campaign_title_absent(
     reader: &PerformanceClient,
     store: &StoreId,
     title: &str,
-) -> Result<(), String> {
+) -> Result<(), OzonFinalPermitError> {
     for page in 1..=100_u32 {
         let response = reader
             .campaigns(
@@ -1180,33 +1216,34 @@ async fn ensure_ozon_campaign_title_absent(
                 },
             )
             .await
-            .map_err(|error| format!("title preflight failed: {error}"))?;
+            .map_err(|error| {
+                OzonFinalPermitError::Transient(format!("title preflight failed: {error}"))
+            })?;
         let campaigns = response
             .get("list")
             .and_then(Value::as_array)
-            .ok_or_else(|| "title preflight campaign list is invalid".to_owned())?;
+            .ok_or_else(|| {
+                OzonFinalPermitError::Transient(
+                    "title preflight campaign list is invalid".to_owned(),
+                )
+            })?;
         for campaign in campaigns {
-            let (_, observed_title, _) =
-                campaign_identity(campaign).map_err(|error| format!("title preflight {error}"))?;
+            let (_, observed_title, _) = campaign_identity(campaign).map_err(|error| {
+                OzonFinalPermitError::Transient(format!("title preflight {error}"))
+            })?;
             if observed_title == title {
-                return Err("campaign title already exists".to_owned());
+                return Err(OzonFinalPermitError::Conflict(
+                    "ozon_create_precondition_conflict",
+                ));
             }
         }
         if campaigns.len() < 100 {
             return Ok(());
         }
     }
-    Err("title preflight campaign listing bound exceeded".to_owned())
-}
-
-fn classify_create_preflight_error(error: String) -> OzonFinalPermitError {
-    if error == "campaign title already exists"
-        || (error.starts_with("SKU ") && error.contains(" already belongs "))
-    {
-        OzonFinalPermitError::Conflict("ozon_create_precondition_conflict")
-    } else {
-        OzonFinalPermitError::Transient(error)
-    }
+    Err(OzonFinalPermitError::Transient(
+        "title preflight campaign listing bound exceeded".to_owned(),
+    ))
 }
 
 async fn ensure_add_products_precondition(
@@ -2216,14 +2253,6 @@ mod tests {
         ] {
             assert_eq!(readback_error_class(action), expected);
         }
-        assert!(matches!(
-            classify_create_preflight_error("campaign title already exists".to_owned()),
-            OzonFinalPermitError::Conflict("ozon_create_precondition_conflict")
-        ));
-        assert!(matches!(
-            classify_create_preflight_error("network".to_owned()),
-            OzonFinalPermitError::Transient(error) if error == "network"
-        ));
         for error in [
             OzonWriteError::Http {
                 status: reqwest::StatusCode::BAD_REQUEST,

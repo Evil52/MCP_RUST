@@ -45,13 +45,15 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo "cargo-llvm-cov is required: cargo install cargo-llvm-cov --version 0.8.7 --locked" >&2
   exit 1
 fi
+# Production-only baseline after the inline src/server.rs test module moved to
+# src/server/tests.rs; covered test code must not inflate the enforced figure.
 ./scripts/with-position-test-db.sh cargo llvm-cov \
   --locked \
     --all-targets \
     --all-features \
     --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|ozon-campaign-guard|position-collector|report-collector|report-worker|wb-automation))\.rs$' \
     --show-missing-lines \
-    --fail-under-functions 95.7 \
-    --fail-under-lines 96.3
+    --fail-under-functions 95.5 \
+    --fail-under-lines 95.8
 
 echo "Local CI passed."

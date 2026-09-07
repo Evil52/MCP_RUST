@@ -697,14 +697,26 @@ control_writer_psql=(
   --no-psqlrc --set ON_ERROR_STOP=1
 )
 docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
-ledger_contract="$({ "${admin_psql[@]}" --tuples-only --no-align --command "
-	  SELECT count(*) = 28
-     AND bool_and(state = 'applied')
-     AND bool_and(applied_at IS NOT NULL)
-  FROM mcp_runtime.schema_migrations
-"; } | tr -d '[:space:]')"
-if [[ "$ledger_contract" != t ]]; then
-  echo "fresh database migration ledger is incomplete" >&2
+
+# Compare the ledger against the migrations this repository actually ships
+# rather than against a hand-updated count. A literal count only failed when a
+# migration was added to both `initdb/` and the migrator; it stayed green in
+# the dangerous direction, where a new file reaches the image by glob and is
+# never applied. Comparing the full id set catches a missing migration and an
+# unexpected one alike, and needs no edit when a migration is added.
+expected_migrations="$(
+  find "$project_root/position-monitor/initdb" -maxdepth 1 -type f -name '*.sql' |
+    sed 's|.*/||' |
+    LC_ALL=C sort
+)"
+applied_migrations="$({ "${admin_psql[@]}" --tuples-only --no-align --command "
+  SELECT migration_id FROM mcp_runtime.schema_migrations
+  WHERE state = 'applied' AND applied_at IS NOT NULL
+  ORDER BY migration_id COLLATE \"C\"
+"; } | tr -d '\r')"
+if [[ "$applied_migrations" != "$expected_migrations" ]]; then
+  echo "fresh database migration ledger does not match the shipped migrations" >&2
+  diff <(printf '%s\n' "$expected_migrations") <(printf '%s\n' "$applied_migrations") >&2 || true
   exit 1
 fi
 refresh_dedup_contract="$({ "${report_refresh_requester_psql[@]}" \
