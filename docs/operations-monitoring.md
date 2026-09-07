@@ -80,3 +80,76 @@ configured, the installer validates the policy and registry and copies them to
 the private runtime `ops` directory. Reinstall after changing that expected
 scope. The portability regression deletes the source checkout before exercising
 both installed jobs.
+
+## Notifications, recovery and independent heartbeat
+
+`operations_notify.py` and `operations_heartbeat.py` are installed alongside
+the health script. They provide a delivery contract without choosing a
+notification provider or an external monitoring service. Configuring these
+helpers alone does not send anything: the operator must supply each executable
+hook and its private destination/credentials.
+
+| Variable | Default | Contract |
+| --- | --- | --- |
+| `MCP_HEALTH_NOTIFY_COMMAND` | empty | One absolute executable; receives the health report on stdin. |
+| `MCP_HEALTH_HEARTBEAT_COMMAND` | empty | One absolute executable; receives a small core-availability JSON event on stdin. |
+| `MCP_HEALTH_HOOK_TIMEOUT_SECONDS` | `10` | Each hook has a total deadline from 1 to 30 seconds. |
+| `MCP_HEALTH_EVENT_STATE_DIR` | `$MCP_RUNTIME_DIR/ops/health-events` | Private notification delivery state; directory0700, files0600. |
+| `MCP_HEALTH_CHECK_TUNNEL` | `false` | Enable explicitly for a deployment that requires the local tunnel. |
+| `MCP_HEALTH_TUNNEL_URL_FILE` | `$HOME/Library/Application Support/tunnel-client/health/ozon-local.url` | File containing only the loopback HTTP base URL, including its dynamic port. |
+| `MCP_HEALTH_TUNNEL_POLL_STALE_SECONDS` | `90` | Maximum age of the last successful control-plane poll, from 1 to 600 seconds. |
+
+Hooks execute directly, without a shell or command-line credentials.
+`MCP_HEALTH_EVENT` identifies `alert`, `recovery`, or `heartbeat`. Notification
+stdin starts with the event type followed by the human-readable health report;
+heartbeat stdin is JSON with `version`, `event`, `core_available`, and
+`observed_at`. A hook must return zero only after its destination has accepted
+the event. Hook output is discarded to avoid exposing credentials in health
+logs. Timeout or nonzero exit becomes a visible health finding; timeout or
+TERM/INT interruption kills the hook process group, including its child HTTP
+client. Neither helper retries
+external delivery within the same probe.
+
+Notifications are sent when the set of actual findings changes. Time-varying
+ages have stable finding keys, so an unchanged incident does not generate a new
+notification every fifteen minutes. A transition from previously delivered
+findings to a clean check sends a recovery event. Initial clean checks are
+silent. Only acknowledged deliveries update the private fingerprint; a failed
+delivery is attempted again by the next scheduled probe. A crash after remote
+acceptance but before the local state replacement can duplicate an event.
+Changing the hook path or executable contents automatically resends ongoing
+findings to the replacement receiver. When changing a destination only in the
+hook's external configuration, reset its `delivered.json` for the same effect.
+The state contains only finding/hook fingerprints and a count, and can be
+recreated after recovery. SIGKILL or a host crash cannot run process cleanup;
+the external receiver must still detect a missing heartbeat independently.
+
+The heartbeat represents core availability: Docker, healthy base services,
+main MCP container/readiness, a completed read-only database probe, and the
+tunnel when that check is enabled. The tunnel probe reads `/healthz`, `/readyz`,
+and `/metrics` from the validated loopback address with proxy use and redirects
+disabled, bounded responses and deadlines. It requires exactly one finite,
+positive, nonfuture `commands_poll_last_successful_timestamp_seconds` sample.
+It checks poll freshness after SQL and immediately before heartbeat delivery.
+
+A WB or Ozon guard lock, reporting finding, backup finding, or failed alert
+delivery does not falsely classify an available MCP as a core outage. Such
+findings still affect the health report and notification channel. A failed DB
+probe or unavailable/stale tunnel suppresses the success heartbeat; its external
+receiver must detect the missing pulse independently. Heartbeat delivery errors
+are also reported locally and through the configured notification hook.
+
+For the backup and restore-verification LaunchAgents, a recorded nonzero last
+exit code generates a finding immediately, even while the previous archive is
+still younger than the stale-backup threshold. Other agents' exit codes are not
+interpreted this way: in particular health exit1 describes findings, not a
+broken health job. A missing or `never exited` result is unknown, not successful
+execution; fresh backup/restore artifacts provide the separate proof until the
+periodic job has run. The monitor never restarts a job to clear its failure.
+
+Offline validation uses temporary local hooks, a fake Docker CLI and a loopback
+tunnel fixture, with no marketplace requests or real external notifications:
+
+```bash
+python3 -B -m unittest discover -s tests -p test_operations_notifications.py
+```

@@ -56,6 +56,11 @@ jobs:
           tar --extract --gzip --file "$actionlint_dir/actionlint.tar.gz" --directory "$actionlint_dir"
           "$actionlint_dir/actionlint" -color
 
+      - name: Install authenticated backup test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes age
+
       - name: Check shell scripts
         run: |
           command -v shellcheck >/dev/null
@@ -63,7 +68,10 @@ jobs:
           shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
           ./scripts/test-runtime-health-contract.sh
           bash ./scripts/test-operations-portability.sh
+          bash ./scripts/test-local-runtime-recovery.sh
           python3 -B -m unittest discover -s tests -p test_reporting_health_contract.py
+          python3 -B -m unittest discover -s tests -p test_operations_notifications.py
+          python3 -B -m unittest discover -s tests -p test_recovery_bundle.py
           ./scripts/test-release-image-lock.sh
           ./scripts/test-release-evidence.sh
           ./scripts/test-merged-pr-release.sh

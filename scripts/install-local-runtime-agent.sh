@@ -29,6 +29,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The installed watchdog uses a kernel lock through Python. Check its runtime
+# dependency before replacing any registry, container or LaunchAgent.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required for the runtime watchdog" >&2
+  exit 1
+fi
+
 if [[ ! -f "$compose_file" || -L "$compose_file" ]]; then
   echo "compose.yaml must be an existing regular file" >&2
   exit 1
