@@ -22,6 +22,16 @@
     <string>__BACKUP_DIR__</string>
     <key>MCP_HEALTH_NOTIFY_COMMAND</key>
     <string>__NOTIFY_COMMAND__</string>
+    <key>MCP_HEALTH_HEARTBEAT_COMMAND</key>
+    <string>__HEARTBEAT_COMMAND__</string>
+    <key>MCP_HEALTH_HOOK_TIMEOUT_SECONDS</key>
+    <string>__HOOK_TIMEOUT__</string>
+    <key>MCP_HEALTH_CHECK_TUNNEL</key>
+    <string>__HEALTH_CHECK_TUNNEL__</string>
+    <key>MCP_HEALTH_TUNNEL_URL_FILE</key>
+    <string>__HEALTH_TUNNEL_URL_FILE__</string>
+    <key>MCP_HEALTH_TUNNEL_POLL_STALE_SECONDS</key>
+    <string>__HEALTH_TUNNEL_POLL_STALE_SECONDS__</string>
     <key>MCP_HEALTH_REQUIRED_SERVICES</key>
     <string>__HEALTH_REQUIRED_SERVICES__</string>
     <key>MCP_HEALTH_REQUIRED_LAUNCH_AGENTS</key>

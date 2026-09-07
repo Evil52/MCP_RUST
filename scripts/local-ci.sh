@@ -38,7 +38,12 @@ fi
 shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
 ./scripts/test-runtime-health-contract.sh
 bash ./scripts/test-operations-portability.sh
+bash ./scripts/test-local-runtime-recovery.sh
 python3 -B -m unittest discover -s tests -p test_reporting_health_contract.py
+python3 -B -m unittest discover -s tests -p test_operations_notifications.py
+command -v age >/dev/null
+command -v age-keygen >/dev/null
+python3 -B -m unittest discover -s tests -p test_recovery_bundle.py
 ./scripts/test-release-image-lock.sh
 ./scripts/test-shared-rust-image-builder.sh
 

@@ -16,6 +16,11 @@ recipients_file="${MCP_BACKUP_AGE_RECIPIENTS_FILE:-$runtime_dir/backup-age-recip
 identity_file="${MCP_BACKUP_AGE_IDENTITY_FILE:-$runtime_dir/backup-age-identity.txt}"
 backup_dir="${MCP_BACKUP_DIR:-$HOME/MCP_OZON-backups}"
 notify_command="${MCP_HEALTH_NOTIFY_COMMAND:-}"
+heartbeat_command="${MCP_HEALTH_HEARTBEAT_COMMAND:-}"
+hook_timeout="${MCP_HEALTH_HOOK_TIMEOUT_SECONDS:-10}"
+health_check_tunnel="${MCP_HEALTH_CHECK_TUNNEL:-true}"
+health_tunnel_url_file="${MCP_HEALTH_TUNNEL_URL_FILE:-$HOME/Library/Application Support/tunnel-client/health/ozon-local.url}"
+health_tunnel_poll_stale_seconds="${MCP_HEALTH_TUNNEL_POLL_STALE_SECONDS:-90}"
 offsite_command="${MCP_BACKUP_OFFSITE_COMMAND:-}"
 allow_local_only="${MCP_BACKUP_ALLOW_LOCAL_ONLY:-false}"
 health_required_services="${MCP_HEALTH_REQUIRED_SERVICES-position-db,ozon-egress}"
@@ -47,7 +52,8 @@ fi
 for path in \
   "$backup_source" "$verify_source" "$health_source" \
   "$backup_template" "$health_template" "$restore_template" "$position_env_source" \
-  "$project_root/scripts/reporting-health-contract.py" "$project_root/scripts/reporting-health.sql"; do
+  "$project_root/scripts/reporting-health-contract.py" "$project_root/scripts/reporting-health.sql" \
+  "$project_root/scripts/operations_notify.py" "$project_root/scripts/operations_heartbeat.py"; do
   if [[ ! -f "$path" || -L "$path" ]]; then
     echo "required installer input is unavailable or unsafe: $path" >&2
     exit 1
@@ -61,6 +67,19 @@ case "$allow_local_only" in
     exit 1
     ;;
 esac
+case "$health_check_tunnel" in
+  true | false) ;;
+  *) echo "MCP_HEALTH_CHECK_TUNNEL must be true or false" >&2; exit 1 ;;
+esac
+if [[ ! "$hook_timeout" =~ ^[1-9][0-9]*$ ]] || ((hook_timeout > 30)); then
+  echo "MCP_HEALTH_HOOK_TIMEOUT_SECONDS must be an integer from 1 to 30" >&2
+  exit 1
+fi
+if [[ ! "$health_tunnel_poll_stale_seconds" =~ ^[1-9][0-9]*$ ]] \
+  || ((health_tunnel_poll_stale_seconds > 600)); then
+  echo "MCP_HEALTH_TUNNEL_POLL_STALE_SECONDS must be an integer from 1 to 600" >&2
+  exit 1
+fi
 for csv_contract in "$health_required_services" "$health_required_launch_agents"; do
   if [[ ! "$csv_contract" =~ ^[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*$ ]]; then
     echo "MCP_HEALTH_REQUIRED_SERVICES and MCP_HEALTH_REQUIRED_LAUNCH_AGENTS must be non-empty comma-separated identifiers" >&2
@@ -116,9 +135,9 @@ for command in age age-keygen openssl; do
   fi
 done
 
-for hook in "$notify_command" "$offsite_command"; do
+for hook in "$notify_command" "$heartbeat_command" "$offsite_command"; do
   if [[ -n "$hook" && ! -x "$hook" ]]; then
-    echo "notify and offsite hooks must each be one executable file: $hook" >&2
+    echo "notify, heartbeat and offsite hooks must each be one executable file: $hook" >&2
     exit 1
   fi
 done
@@ -153,6 +172,8 @@ fi
 chmod 600 "$position_env_target"
 install -m 700 "$project_root/scripts/reporting-health-contract.py" "$libexec_dir/reporting-health-contract.py"
 install -m 600 "$project_root/scripts/reporting-health.sql" "$libexec_dir/reporting-health.sql"
+install -m 700 "$project_root/scripts/operations_notify.py" "$libexec_dir/operations_notify.py"
+install -m 700 "$project_root/scripts/operations_heartbeat.py" "$libexec_dir/operations_heartbeat.py"
 if [[ -n "$health_reporting_policy" ]]; then
   mkdir -p "$runtime_dir/ops"
   chmod 700 "$runtime_dir/ops"
@@ -187,6 +208,11 @@ render() {
     -e "s|__AGE_RECIPIENTS_FILE__|$recipients_file|g" \
     -e "s|__AGE_IDENTITY_FILE__|$identity_file|g" \
     -e "s|__NOTIFY_COMMAND__|$notify_command|g" \
+    -e "s|__HEARTBEAT_COMMAND__|$heartbeat_command|g" \
+    -e "s|__HOOK_TIMEOUT__|$hook_timeout|g" \
+    -e "s|__HEALTH_CHECK_TUNNEL__|$health_check_tunnel|g" \
+    -e "s|__HEALTH_TUNNEL_URL_FILE__|$health_tunnel_url_file|g" \
+    -e "s|__HEALTH_TUNNEL_POLL_STALE_SECONDS__|$health_tunnel_poll_stale_seconds|g" \
     -e "s|__OFFSITE_COMMAND__|$offsite_command|g" \
     -e "s|__ALLOW_LOCAL_ONLY__|$allow_local_only|g" \
     -e "s|__HEALTH_REQUIRED_SERVICES__|$health_required_services|g" \
@@ -240,6 +266,10 @@ MCP_HEALTH_REQUIRED_SERVICES="$health_required_services" \
 MCP_HEALTH_REQUIRED_LAUNCH_AGENTS="$health_required_launch_agents" \
 MCP_HEALTH_REPORTING_POLICY="$health_reporting_policy" \
 MCP_HEALTH_REPORTING_REGISTRY="$health_reporting_registry" \
+MCP_HEALTH_CHECK_TUNNEL="$health_check_tunnel" \
+MCP_HEALTH_TUNNEL_URL_FILE="$health_tunnel_url_file" \
+MCP_HEALTH_TUNNEL_POLL_STALE_SECONDS="$health_tunnel_poll_stale_seconds" \
+MCP_HEALTH_HOOK_TIMEOUT_SECONDS="$hook_timeout" \
 MCP_HEALTH_SKIP_LAUNCH_AGENT_CHECK=true \
   "$libexec_dir/check-runtime-health.sh" || health_status=$?
 if ((health_status > 1)); then

@@ -17,7 +17,8 @@ tunnel_restart_state="$runtime_dir/tunnel-restart.state"
 tunnel_poll_stale_after_seconds="${TUNNEL_POLL_STALE_AFTER_SECONDS:-90}"
 tunnel_poll_startup_grace_seconds="${TUNNEL_POLL_STARTUP_GRACE_SECONDS:-75}"
 tunnel_restart_cooldown_seconds="${TUNNEL_RESTART_COOLDOWN_SECONDS:-300}"
-lock_dir="${TMPDIR:-/tmp}/mcp-ozon-runtime-agent.lock"
+runtime_lock_file="$runtime_dir/watchdog.lock"
+curl_bin="${MCP_RUNTIME_CURL_BIN:-/usr/bin/curl}"
 
 if [[ ! "$tunnel_poll_stale_after_seconds" =~ ^[0-9]+$ ]] \
   || ((tunnel_poll_stale_after_seconds < 45 || tunnel_poll_stale_after_seconds > 600)); then
@@ -34,17 +35,6 @@ if [[ ! "$tunnel_restart_cooldown_seconds" =~ ^[0-9]+$ ]] \
   echo "TUNNEL_RESTART_COOLDOWN_SECONDS must be an integer from 60 to 3600" >&2
   exit 1
 fi
-
-if ! mkdir "$lock_dir" 2>/dev/null; then
-  exit 0
-fi
-# shellcheck disable=SC2317,SC2329 # Called indirectly by the EXIT trap.
-# SC2317 is the pre-0.11 code for the same finding; both are listed so the
-# directive works on the shellcheck shipped by Ubuntu and on newer releases.
-cleanup() {
-  rmdir "$lock_dir" 2>/dev/null || true
-}
-trap cleanup EXIT
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   runtime_mode_command=(/usr/bin/stat -f '%Lp')
@@ -74,6 +64,103 @@ if [[ "$("${runtime_mode_command[@]}" "$runtime_registry")" != "644" ]]; then
   echo "persistent runtime registry must have mode 644 inside its private directory" >&2
   exit 1
 fi
+
+if [[ "$curl_bin" != /* || ! -f "$curl_bin" || ! -x "$curl_bin" ]]; then
+  echo "MCP_RUNTIME_CURL_BIN must be an absolute executable path" >&2
+  exit 1
+fi
+python_bin="$(command -v python3 || true)"
+if [[ -z "$python_bin" || ! -x "$python_bin" ]]; then
+  echo "python3 is required for the runtime watchdog kernel lock" >&2
+  exit 1
+fi
+
+# The kernel owns this lock, not a PID file or a removable directory. An old
+# file after SIGKILL is harmless: the next process acquires the released lock.
+# Never unlink it, since replacing an inode could admit two concurrent owners.
+# The inherited open-file description also covers an in-flight child command;
+# it is released once the owner and its children have all exited.
+if [[ "${_MCP_RUNTIME_LOCK_PID:-}" != "$$" ]]; then
+  exec "$python_bin" - "$runtime_lock_file" "$0" "$@" <<'PY'
+import fcntl
+import json
+import os
+import stat
+import sys
+import time
+
+try:
+    descriptor = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    metadata = os.fstat(descriptor)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1):
+        raise ValueError('unsafe lock')
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(0)
+    # Diagnostic metadata only. Lock ownership is the kernel file description,
+    # so PID reuse cannot release another watchdog's active lock.
+    os.ftruncate(descriptor, 0)
+    os.write(descriptor, json.dumps({'pid': os.getpid(), 'started_at': time.time(),
+                                   'script': os.path.realpath(sys.argv[2])}).encode())
+    os.set_inheritable(descriptor, True)
+    environment = dict(os.environ, _MCP_RUNTIME_LOCK_PID=str(os.getpid()),
+                       _MCP_RUNTIME_LOCK_FD=str(descriptor))
+    os.execve('/bin/bash', ['/bin/bash', sys.argv[2], *sys.argv[3:]], environment)
+except (OSError, ValueError):
+    print('runtime watchdog kernel lock is unavailable or unsafe', file=sys.stderr)
+    sys.exit(1)
+PY
+fi
+
+# Do not trust an environment marker alone. The re-executed shell must hold
+# the same regular file, owned by this user, and its actual exclusive lock.
+"$python_bin" - "$runtime_lock_file" "${_MCP_RUNTIME_LOCK_FD:-}" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+
+try:
+    descriptor = int(sys.argv[2])
+    opened = os.fstat(descriptor)
+    path = os.lstat(sys.argv[1])
+    if (not stat.S_ISREG(path.st_mode) or path.st_uid != os.getuid()
+            or stat.S_IMODE(path.st_mode) != 0o600 or path.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (path.st_dev, path.st_ino)):
+        raise ValueError('lock identity mismatch')
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (OSError, ValueError):
+    print('runtime watchdog inherited lock is unavailable or unsafe', file=sys.stderr)
+    sys.exit(1)
+PY
+
+runtime_curl() {
+  "$curl_bin" --connect-timeout 3 --max-time 6 "$@"
+}
+
+runtime_tunnel_command() {
+  local timeout_seconds="$1"
+  shift
+  # Keep the lock in this short-lived supervisor while the CLI is active, but
+  # never pass it into a runtime daemon spawned by `runtimes connect`.
+  "$python_bin" - "$timeout_seconds" "$tunnel_client" "$@" <<'PY'
+import subprocess
+import sys
+
+try:
+    result = subprocess.run(sys.argv[2:], stdin=subprocess.DEVNULL,
+                            close_fds=True, timeout=int(sys.argv[1]), check=False)
+except subprocess.TimeoutExpired:
+    print('tunnel-client operation exceeded its watchdog deadline', file=sys.stderr)
+    sys.exit(124)
+except OSError:
+    print('tunnel-client operation could not start', file=sys.stderr)
+    sys.exit(1)
+sys.exit(result.returncode if result.returncode >= 0 else 128 - result.returncode)
+PY
+}
 
 docker_bin="${DOCKER_BIN:-$(command -v docker || true)}"
 if [[ -z "$docker_bin" ]]; then
@@ -128,9 +215,9 @@ tunnel_local_ready() {
   local health_base_url
 
   health_base_url="$(tunnel_health_base_url)" || return 1
-  /usr/bin/curl --max-time 3 --fail --silent --show-error \
+  runtime_curl --max-time 3 --fail --silent --show-error \
     "$health_base_url/healthz" >/dev/null 2>&1 \
-    && /usr/bin/curl --max-time 3 --fail --silent --show-error \
+    && runtime_curl --max-time 3 --fail --silent --show-error \
       "$health_base_url/readyz" >/dev/null 2>&1
 }
 
@@ -140,7 +227,7 @@ tunnel_poll_is_fresh() {
   tunnel_local_ready || return 1
   health_base_url="$(tunnel_health_base_url)" || return 1
   if ! last_success="$(
-    /usr/bin/curl --max-time 3 --fail --silent --show-error \
+    runtime_curl --max-time 3 --fail --silent --show-error \
       "$health_base_url/metrics" 2>/dev/null \
       | awk '/^commands_poll_last_successful_timestamp_seconds[{ ]/ {
           printf "%.0f\n", $2
@@ -165,7 +252,7 @@ tunnel_poll_is_fresh_or_starting() {
   tunnel_local_ready || return 1
   health_base_url="$(tunnel_health_base_url)" || return 1
   if ! process_started="$(
-    /usr/bin/curl --max-time 3 --fail --silent --show-error \
+    runtime_curl --max-time 3 --fail --silent --show-error \
       "$health_base_url/metrics" 2>/dev/null \
       | awk '/^process_start_time_seconds[ {]/ {
           printf "%.0f\n", $2
@@ -184,7 +271,7 @@ openai_control_plane_preflight() {
   local status
 
   status="$(
-    /usr/bin/curl --noproxy '*' --connect-timeout 3 --max-time 6 \
+    runtime_curl --noproxy '*' \
       --silent --output /dev/null --write-out '%{http_code}' \
       https://api.openai.com/v1/models 2>/dev/null || true
   )"
@@ -243,7 +330,7 @@ if [[ "$mounted_registry" != "$runtime_registry" ]]; then
   echo "MCP container uses an unmanaged registry mount; rerun the installer" >&2
   exit 1
 fi
-if ! /usr/bin/curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&1; then
+if ! runtime_curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&1; then
   container_running="$(
     "$docker_bin" container inspect --format '{{.State.Running}}' "$mcp_container_name"
   )"
@@ -254,14 +341,14 @@ if ! /usr/bin/curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&
   fi
 
   for _attempt in $(seq 1 60); do
-    if /usr/bin/curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&1; then
+    if runtime_curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&1; then
       break
     fi
     sleep 1
   done
 fi
 
-if ! /usr/bin/curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&1; then
+if ! runtime_curl --fail --silent --show-error "$mcp_health_url" >/dev/null 2>&1; then
   echo "MCP server is not healthy: $mcp_health_url" >&2
   exit 1
 fi
@@ -291,11 +378,11 @@ if [[ ! "$tunnel_id" =~ ^tunnel_[0-9a-f]{32}$ ]]; then
 fi
 
 record_tunnel_restart
-"$tunnel_client" runtimes stop "$profile_name" >/dev/null 2>&1 || true
-"$tunnel_client" doctor \
+runtime_tunnel_command 15 runtimes stop "$profile_name" >/dev/null 2>&1 || true
+runtime_tunnel_command 30 doctor \
   --profile "$profile_name" \
   --profile-dir "$profile_dir" >/dev/null
-"$tunnel_client" runtimes connect \
+runtime_tunnel_command 60 runtimes connect \
   --alias "$profile_name" \
   --profile "$profile_name" \
   --profile-dir "$profile_dir" \

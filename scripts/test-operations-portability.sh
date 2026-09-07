@@ -18,7 +18,9 @@ cp "$project_root/scripts/check-runtime-health.sh" \
   "$project_root/scripts/backup-position-stack.sh" "$staging/scripts/"
 cp "$staging/scripts/"*.sh "$installed/"
 cp "$project_root/scripts/reporting-health-contract.py" \
-  "$project_root/scripts/reporting-health.sql" "$installed/"
+  "$project_root/scripts/reporting-health.sql" \
+  "$project_root/scripts/operations_notify.py" \
+  "$project_root/scripts/operations_heartbeat.py" "$installed/"
 db_image="$(awk '/^FROM postgres:/ { print $2; exit }' "$project_root/position-monitor/Dockerfile")"
 rm -rf "$staging"
 
@@ -93,6 +95,8 @@ health_env=(
   'MCP_HEALTH_REPORTING_POLICY='
   'MCP_HEALTH_REPORTING_REGISTRY='
   'MCP_HEALTH_NOTIFY_COMMAND='
+  'MCP_HEALTH_HEARTBEAT_COMMAND='
+  'MCP_HEALTH_CHECK_TUNNEL=false'
   "TEST_OPS_SQL_CAPTURE=$test_root/health.sql"
 )
 output="$(env "${health_env[@]}" bash "$installed/check-runtime-health.sh")"
