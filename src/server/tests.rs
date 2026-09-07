@@ -1753,10 +1753,7 @@ async fn reporting_validation_and_rbac_precede_repository_access() {
             )
             .await,
     );
-    assert!(
-        unknown_account.starts_with("UNKNOWN_REPORTING_ACCOUNT"),
-        "{unknown_account}"
-    );
+    assert!(unknown_account.starts_with("UNKNOWN_REPORTING_ACCOUNT"));
 
     let denied_account = reporting_tool_error(
         manager
@@ -1769,10 +1766,7 @@ async fn reporting_validation_and_rbac_precede_repository_access() {
             )
             .await,
     );
-    assert!(
-        denied_account.starts_with(ACCESS_DENIED),
-        "{denied_account}"
-    );
+    assert!(denied_account.starts_with(ACCESS_DENIED));
 
     let denied_history = reporting_tool_error(
         manager
@@ -1838,10 +1832,7 @@ async fn reporting_account_resolution_is_explicit_fail_closed_and_maps_wb() {
             )
             .await,
     );
-    assert!(
-        no_account.starts_with("NO_ACCESSIBLE_REPORTING_ACCOUNT"),
-        "{no_account}"
-    );
+    assert!(no_account.starts_with("NO_ACCESSIBLE_REPORTING_ACCOUNT"));
 
     let admin = reporting_edge_test_server("admin", repository.clone());
     let ambiguous = reporting_tool_error(
@@ -1908,10 +1899,7 @@ async fn reporting_account_resolution_is_explicit_fail_closed_and_maps_wb() {
             )
             .await,
     );
-    assert!(
-        invalid_account.starts_with(REPORTING_INVALID_REQUEST),
-        "{invalid_account}"
-    );
+    assert!(invalid_account.starts_with(REPORTING_INVALID_REQUEST));
     assert_eq!(repository.calls(), 1);
 }
 
