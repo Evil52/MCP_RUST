@@ -1,12 +1,13 @@
 //! Bounded read-only Wildberries source for daily reports.
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::time::{Instant, sleep};
 
-use crate::wb::{WbClient, WbErrorKind};
+use crate::wb::{WbClient, WbError, WbErrorKind};
 
 use super::{
     postgres_collector::{
@@ -24,6 +25,7 @@ const PAGE_SIZE: usize = 1_000;
 const PAGE_SIZE_U32: u32 = 1_000;
 const MAX_PAGES: usize = 25;
 const CAMPAIGNS_PER_REQUEST: usize = 50;
+const PROMOTION_STATS_ADMISSION_BUDGET: Duration = Duration::from_secs(60);
 
 pub trait WbReportTransport: Send + Sync {
     fn sales_page<'a>(
@@ -69,6 +71,61 @@ impl WbClientReportTransport {
     pub const fn new(client: WbClient, account_id: String) -> Self {
         Self { client, account_id }
     }
+}
+
+/// Only background fullstats collection queues a rejected local departure.
+/// The admitted HTTP request retains `WbClient`'s own bounded retry policy;
+/// this helper never repeats a vendor failure or holds a network permit.
+/// The collector additionally bounds the entire account run to twelve minutes.
+async fn wait_for_local_admission<F, Request>(
+    deadline: Instant,
+    mut request: F,
+) -> Result<Value, WbError>
+where
+    F: FnMut() -> Request,
+    Request: Future<Output = Result<Value, WbError>>,
+{
+    loop {
+        if Instant::now() >= deadline {
+            return Err(WbError::DeadlineExceeded);
+        }
+        match request().await {
+            Err(error @ WbError::LocalRateLimited { retry_after }) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if retry_after.is_zero() || retry_after >= remaining {
+                    return Err(error);
+                }
+                tracing::info!(
+                    source = "advertising",
+                    admission = "local_wait",
+                    retry_after_ms = ?retry_after.as_millis(),
+                    "WB background report waiting for local quota"
+                );
+                sleep(retry_after).await;
+                // Scheduling may wake us after the strict admission deadline.
+                // Preserve the local refusal and never send a late request.
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+fn promotion_stats_failure(error: &WbError) -> WbReportSourceError {
+    let failure = match error {
+        WbError::LocalRateLimited { .. } => "local_admission_exhausted",
+        WbError::RateLimited { .. } => "vendor_rate_limited",
+        _ => "upstream_failure",
+    };
+    tracing::warn!(
+        source = "advertising",
+        failure,
+        error_code = error.kind().code(),
+        "WB background report source failed"
+    );
+    WbReportSourceError::Upstream(error.kind())
 }
 
 impl WbReportTransport for WbClientReportTransport {
@@ -149,15 +206,18 @@ impl WbReportTransport for WbClientReportTransport {
         end: NaiveDate,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
         Box::pin(async move {
-            self.client
-                .promotion_stats(
+            let start = start.format("%Y-%m-%d").to_string();
+            let end = end.format("%Y-%m-%d").to_string();
+            wait_for_local_admission(Instant::now() + PROMOTION_STATS_ADMISSION_BUDGET, || {
+                self.client.promotion_stats(
                     &self.account_id,
-                    ids,
-                    start.format("%Y-%m-%d").to_string(),
-                    end.format("%Y-%m-%d").to_string(),
+                    ids.clone(),
+                    start.clone(),
+                    end.clone(),
                 )
-                .await
-                .map_err(|error| WbReportSourceError::Upstream(error.kind()))
+            })
+            .await
+            .map_err(|error| promotion_stats_failure(&error))
         })
     }
 }
@@ -410,6 +470,8 @@ fn page_offset(page: usize) -> Result<u32, WbReportSourceError> {
 
 #[cfg(test)]
 mod tests {
+    mod admission;
+
     use std::{
         collections::BTreeMap,
         collections::VecDeque,

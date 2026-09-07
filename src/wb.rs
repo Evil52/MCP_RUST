@@ -2214,6 +2214,8 @@ fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod reporting_admission;
+
     use std::{
         io::{Read, Write},
         net::TcpListener,

@@ -18,15 +18,10 @@
 
 set -euo pipefail
 
-# A LaunchAgent runs an installed copy from ~/.local/libexec, where the
-# path relative to this file no longer points at the project. The agent
-# therefore passes the project directory explicitly, exactly as the WB
-# automation runner already does.
+# Installed agents receive the pinned image and private env path directly.
+# Keep checkout lookup only for manual invocations, never as a dependency of
+# the permanent backup schedule.
 project_root="${MCP_OPS_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-if [[ ! -d "$project_root" || -L "$project_root" ]]; then
-  echo "project directory is unavailable or unsafe: $project_root" >&2
-  exit 1
-fi
 position_env="${MCP_BACKUP_POSITION_ENV:-$project_root/.position.env}"
 runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
 recipients_file="${MCP_BACKUP_AGE_RECIPIENTS_FILE:-$runtime_dir/backup-age-recipients.txt}"
@@ -106,12 +101,14 @@ fi
 # Restoring with a different PostgreSQL build is the classic way to discover
 # that a backup was never restorable. Pin the dump and the future restore to
 # the exact digest the running database was built from.
-db_image="$(
-  awk '/^FROM postgres:/ { print $2; exit }' \
-    "$project_root/position-monitor/Dockerfile"
-)"
+db_image="${MCP_OPS_POSTGRES_IMAGE:-}"
+if [[ -z "$db_image" && -f "$project_root/position-monitor/Dockerfile" \
+  && ! -L "$project_root/position-monitor/Dockerfile" ]]; then
+  db_image="$(awk '/^FROM postgres:/ { print $2; exit }' \
+    "$project_root/position-monitor/Dockerfile")"
+fi
 if [[ ! "$db_image" =~ ^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$ ]]; then
-  echo "pinned PostgreSQL image could not be resolved from position-monitor/Dockerfile" >&2
+  echo "a pinned PostgreSQL image is required via MCP_OPS_POSTGRES_IMAGE or position-monitor/Dockerfile" >&2
   exit 1
 fi
 

@@ -599,7 +599,10 @@ async fn postgres_report_outbox_is_idempotent_bounded_and_audited() {
     let config = Config::from_str(&url).expect("report worker URL must be valid");
     let repository = PostgresOutboxRepository::connect(&config).await.unwrap();
     let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL").unwrap();
-    let admin_config = Config::from_str(&admin_url).unwrap();
+    let mut admin_config = Config::from_str(&admin_url).unwrap();
+    // This fixture must pass connection-time timeout validation so the
+    // runtime contract rejects its wrong role, rather than missing bounds.
+    admin_config.options("-c statement_timeout=60000 -c idle_in_transaction_session_timeout=30000");
     let wrong_role = PostgresOutboxRepository::connect(&admin_config)
         .await
         .unwrap();

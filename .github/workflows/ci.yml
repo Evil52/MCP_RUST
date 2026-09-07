@@ -62,6 +62,8 @@ jobs:
           shellcheck --version
           shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
           ./scripts/test-runtime-health-contract.sh
+          bash ./scripts/test-operations-portability.sh
+          python3 -B -m unittest discover -s tests -p test_reporting_health_contract.py
           ./scripts/test-release-image-lock.sh
           ./scripts/test-release-evidence.sh
           ./scripts/test-merged-pr-release.sh
@@ -135,10 +137,10 @@ jobs:
           tool: cargo-llvm-cov@0.8.7
 
       - name: Enforce all-feature library coverage and execute every runtime probe
-        # These floors are the production-only baseline established after the
-        # 11k-line inline server test module moved to src/server/tests.rs.
-        # Keeping the tests outside src/server.rs prevents covered test code
-        # from inflating the library coverage percentage.
+        # Baseline after the large inline server test module moved out of
+        # src/server.rs. Other inline test modules still contribute, so these
+        # percentages are not production-only coverage. Runtime entrypoints
+        # are exercised by separate probes.
         run: >-
           ./scripts/with-position-test-db.sh
           cargo llvm-cov

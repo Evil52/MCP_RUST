@@ -59,6 +59,14 @@ accounts' vendor credentials, never SMTP credentials or addresses.
    fill seven historical days. The current refresh queue collects today's
    business date; do not use it as an imaginary historical backfill API.
 
+Collection currently runs accounts serially: each target has a 12-minute
+deadline inside the shared 30-minute cutoff window. Before enabling concurrency,
+prove isolation of the actual Seller/Performance credential identities and WB
+quota scope, or share the applicable limiter across clients. Distinct account
+IDs or credential environment names are not that proof. A 14-account canary
+with delayed responses and 429s must demonstrate completion inside the window;
+passing fixture tests does not establish live capacity or weekly completeness.
+
 Keep `snapshot=STALE` and `last_refresh=FAILED` as independent facts when both
 are supported. Collection status/completeness and refresh status are separate
 MCP reads. An unrelated current-day failure does not invalidate an already

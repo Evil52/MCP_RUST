@@ -1,8 +1,3 @@
-#![expect(
-    clippy::significant_drop_tightening,
-    reason = "the supervised session guard must remain valid while its client is borrowed"
-)]
-
 //! Supervised PostgreSQL connectivity shared by the isolated worker binaries.
 //!
 //! Every worker owns exactly one logical database session. Three properties
@@ -104,7 +99,7 @@ pub struct SupervisedClient {
 }
 
 impl SupervisedClient {
-    /// Connects and supervises the driver task.
+    /// Connects, verifies server-side session bounds, and supervises the driver.
     pub async fn connect(
         config: &Config,
         component: &'static str,
@@ -188,40 +183,51 @@ impl SupervisedClient {
     /// Those bounds live on the database role rather than in this process, so
     /// they can be audited and retuned without a redeploy. The cost of that
     /// choice is that dropping an `ALTER ROLE` would silently unbound every
-    /// worker; checking the effective values at startup turns that into a
-    /// refusal to start instead.
+    /// worker. New sessions are checked before publication, including after
+    /// reconnection; this method also audits caller-supplied sessions.
     pub async fn verify_session_bounds(&self) -> Result<(), PostgresUnavailable> {
         let client = self.acquire().await?;
-        // `pg_settings.setting` reports the effective value in the parameter's
-        // base unit — milliseconds here — so no unit string has to be parsed.
-        let row = client
-            .query_one(
-                "SELECT \
-                    (SELECT setting::bigint FROM pg_settings \
-                       WHERE name = 'statement_timeout'), \
-                    (SELECT setting::bigint FROM pg_settings \
-                       WHERE name = 'idle_in_transaction_session_timeout')",
-                &[],
-            )
-            .await
-            .ok()
-            .ok_or(PostgresUnavailable)?;
-        let statement_timeout: i64 = row.get(0);
-        let idle_in_transaction: i64 = row.get(1);
-        let bounded = |value: i64, ceiling: i64| value > 0 && value <= ceiling;
-        if bounded(statement_timeout, MAX_STATEMENT_TIMEOUT_MILLIS)
-            && bounded(idle_in_transaction, MAX_IDLE_IN_TRANSACTION_MILLIS)
-        {
-            return Ok(());
-        }
-        tracing::error!(
-            component = self.component,
-            statement_timeout_millis = statement_timeout,
-            idle_in_transaction_millis = idle_in_transaction,
-            "PostgreSQL role is missing a bounded statement or transaction timeout"
-        );
-        Err(PostgresUnavailable)
+        verify_client_session_bounds(&client, self.component).await
     }
+}
+
+async fn verify_client_session_bounds(
+    client: &Client,
+    component: &'static str,
+) -> Result<(), PostgresUnavailable> {
+    // Inspect the client directly: reconnect already holds the slot mutex,
+    // so calling `acquire` here would deadlock. The query has its own deadline
+    // because the server's statement bound has not yet been established.
+    // `pg_settings.setting` reports milliseconds without unit-string parsing.
+    let row = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        client.query_one(
+            "SELECT \
+                (SELECT setting::bigint FROM pg_settings \
+                   WHERE name = 'statement_timeout'), \
+                (SELECT setting::bigint FROM pg_settings \
+                   WHERE name = 'idle_in_transaction_session_timeout')",
+            &[],
+        ),
+    )
+    .await
+    .map_err(|_| PostgresUnavailable)?
+    .map_err(|_| PostgresUnavailable)?;
+    let statement_timeout: i64 = row.get(0);
+    let idle_in_transaction: i64 = row.get(1);
+    let bounded = |value: i64, ceiling: i64| value > 0 && value <= ceiling;
+    if bounded(statement_timeout, MAX_STATEMENT_TIMEOUT_MILLIS)
+        && bounded(idle_in_transaction, MAX_IDLE_IN_TRANSACTION_MILLIS)
+    {
+        return Ok(());
+    }
+    tracing::error!(
+        component,
+        statement_timeout_millis = statement_timeout,
+        idle_in_transaction_millis = idle_in_transaction,
+        "PostgreSQL role is missing a bounded statement or transaction timeout"
+    );
+    Err(PostgresUnavailable)
 }
 
 async fn connect_supervised(
@@ -242,6 +248,9 @@ async fn connect_supervised(
             }
         }
     }));
+    // Keep the new client private until its effective server-side bounds are
+    // accepted. On failure it is dropped and never becomes an acquirable slot.
+    verify_client_session_bounds(&client, component).await?;
     Ok(client)
 }
 

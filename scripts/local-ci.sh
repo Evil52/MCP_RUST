@@ -37,6 +37,8 @@ if ! command -v shellcheck >/dev/null 2>&1; then
 fi
 shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
 ./scripts/test-runtime-health-contract.sh
+bash ./scripts/test-operations-portability.sh
+python3 -B -m unittest discover -s tests -p test_reporting_health_contract.py
 ./scripts/test-release-image-lock.sh
 ./scripts/test-shared-rust-image-builder.sh
 
@@ -45,8 +47,9 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo "cargo-llvm-cov is required: cargo install cargo-llvm-cov --version 0.8.7 --locked" >&2
   exit 1
 fi
-# Production-only baseline after the inline src/server.rs test module moved to
-# src/server/tests.rs; covered test code must not inflate the enforced figure.
+# Configured baseline after the large inline server test module moved out of
+# src/server.rs. Other inline test modules still contribute to this figure;
+# it is not production-only coverage. Runtime entrypoints use separate probes.
 ./scripts/with-position-test-db.sh cargo llvm-cov \
   --locked \
     --all-targets \

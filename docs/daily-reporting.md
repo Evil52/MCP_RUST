@@ -390,10 +390,11 @@ database transaction. The date argument is the completed business day; its
 snapshot identity is the following day's fixed 08:00 EKB morning cutoff, so a
 successful canary can be consumed by the same report-worker manifest contract.
 The actual completion time is retained as `source_as_of`; it is never backdated
-to the logical cutoff. To preserve the database freshness boundary, the command
-must start after 08:00 EKB and the complete atomic source set must be ready no
-later than 08:30 EKB. An early invocation fails before marketplace I/O, while a
-collection that completes too late publishes nothing.
+to the logical cutoff. Manual canaries can start at the selected cutoff and
+must publish the complete atomic source set within 24 hours after it. An early
+or expired invocation fails before marketplace I/O, while a collection that
+completes beyond the observation limit publishes nothing. This manual recovery
+window does not extend the scheduler's separate 30-minute collection window.
 A timeout, rate limit or malformed/incomplete source publishes nothing. The
 shipped Compose mode remains `disabled`, so neither command runs on a schedule.
 
@@ -522,7 +523,13 @@ but requires the disabled pilot policy and defaults to the local `healthcheck`
 command. Merely starting the profile therefore cannot contact a marketplace.
 Only `scripts/run-report-canary.sh` supplies an explicit single-account command;
 the script accepts no credential values and the collector reads only the claimed
-account's exact files after acquiring its PostgreSQL lease:
+account's exact files after acquiring its PostgreSQL lease.
+
+For runtime data, first verify the clean release checkout with
+`scripts/verify-release-images.sh report-collector ozon-egress`, then export its
+`report-collector` reference as `MCP_REPORT_COLLECTOR_IMAGE`. The canary wrapper
+does not perform release verification itself; its local-image fallback is not
+release evidence.
 
 ```text
 MCP_ACCESS_CONFIG_HOST=/absolute/path/access.json \
@@ -535,10 +542,11 @@ REPORT_COLLECTOR_CREDENTIAL_DIR_HOST=/absolute/path/report-credentials \
 ```
 
 The requested date is the business day being collected. `morning` covers that
-complete day and runs the next day from 08:00 through 08:30 EKB. `evening`
-covers the requested date from midnight through its 17:00 cutoff and runs from
-17:00 through 17:30 EKB. Outside the selected window the command fails before
-marketplace I/O.
+complete day and uses the next day's 08:00 EKB cutoff. `evening` covers the
+requested date from midnight through its 17:00 cutoff. Manual commands accept
+the interval from the selected cutoff through 24 hours afterward, inclusive;
+outside that interval they fail before marketplace I/O. Completion must also
+fit the 24-hour source observation limit.
 Run Ozon and WB sequentially. A failed, timed-out or partial source set releases
 the lease and publishes no snapshot IDs. The canary policy must stay disabled;
 the enabled policy is reserved for the separately reviewed live overlay. The

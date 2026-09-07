@@ -14,15 +14,10 @@
 
 set -euo pipefail
 
-# A LaunchAgent runs an installed copy from ~/.local/libexec, where the
-# path relative to this file no longer points at the project. The agent
-# therefore passes the project directory explicitly, exactly as the WB
-# automation runner already does.
+# Installed agents receive the pinned image and private env path directly.
+# The checkout is only a fallback for manual developer invocations; a deleted
+# staging checkout must never disable the permanent operations jobs.
 project_root="${MCP_OPS_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-if [[ ! -d "$project_root" || -L "$project_root" ]]; then
-  echo "project directory is unavailable or unsafe: $project_root" >&2
-  exit 2
-fi
 position_env="${MCP_HEALTH_POSITION_ENV:-$project_root/.position.env}"
 backup_root="${MCP_BACKUP_DIR:-$HOME/MCP_OZON-backups}"
 db_network="${MCP_HEALTH_DB_NETWORK:-mcp-ozon-position-internal}"
@@ -245,10 +240,12 @@ if [[ ! -f "$position_env" || -L "$position_env" ]]; then
   report_and_exit
 fi
 
-db_image="$(
-  awk '/^FROM postgres:/ { print $2; exit }' \
-    "$project_root/position-monitor/Dockerfile"
-)"
+db_image="${MCP_OPS_POSTGRES_IMAGE:-}"
+if [[ -z "$db_image" && -f "$project_root/position-monitor/Dockerfile" \
+  && ! -L "$project_root/position-monitor/Dockerfile" ]]; then
+  db_image="$(awk '/^FROM postgres:/ { print $2; exit }' \
+    "$project_root/position-monitor/Dockerfile")"
+fi
 if [[ ! "$db_image" =~ ^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$ ]]; then
   echo "pinned PostgreSQL image could not be resolved" >&2
   exit 2
@@ -257,13 +254,33 @@ fi
 # `default_transaction_read_only` is set on the session rather than trusted to
 # the queries below: this probe must never be able to change state, even if a
 # future edit to it is careless.
+reporting_scope='[]'
+reporting_policy="${MCP_HEALTH_REPORTING_POLICY:-}"
+reporting_registry="${MCP_HEALTH_REPORTING_REGISTRY:-}"
+reporting_resources="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "$reporting_policy" || -n "$reporting_registry" ]]; then
+  if [[ -z "$reporting_policy" || -z "$reporting_registry" ]] \
+    || [[ ! -f "$reporting_resources/reporting-health.sql" ]] \
+    || ! reporting_scope="$(python3 "$reporting_resources/reporting-health-contract.py" \
+      "$reporting_policy" "$reporting_registry")"; then
+    add_finding "reporting health policy or registry is unavailable or invalid"
+    report_and_exit
+  fi
+fi
+if [[ ",$required_services," == *,report-collector,* && "$reporting_scope" == '[]' ]]; then
+  add_finding "required report-collector has no enabled reporting health scope"
+  report_and_exit
+fi
+
 # shellcheck disable=SC2016 # The password expands inside the container, from
 # --env-file, so it never appears in this host's environment or process list.
 probe_sql() {
   "$docker_bin" run --rm --interactive \
     --network "$db_network" \
     --env-file "$position_env" \
-    --env 'PGOPTIONS=-c default_transaction_read_only=on' \
+    --env 'PGOPTIONS=-c default_transaction_read_only=on -c statement_timeout=10000 -c lock_timeout=3000' \
+    --env PGCONNECT_TIMEOUT=5 \
+    --env "MCP_HEALTH_REPORTING_SCOPE=$reporting_scope" \
     --entrypoint /bin/sh \
     "$db_image" \
     -ec '
@@ -274,13 +291,15 @@ probe_sql() {
         --username="${POSITION_DB_ADMIN_USER:-position_admin}" \
         --dbname="${POSITION_DB_NAME:-ozon_positions}" \
         --no-password --quiet --no-align --tuples-only \
+        --set reporting_accounts="$MCP_HEALTH_REPORTING_SCOPE" \
         --set ON_ERROR_STOP=1
     ' 2>/dev/null
 }
 
 probe_status=0
 probe_output="$(
-  probe_sql <<'SQL'
+  {
+    cat <<'SQL'
 SELECT 'incident|' || account_id || '|' || advert_id || '|' || incident_class
 FROM wb_automation.execution_state
 WHERE incident_class IS NOT NULL;
@@ -349,6 +368,13 @@ WHERE status='active';
 SELECT 'stalled|' || stall_kind || '|' || reference
 FROM daily_reporting.stalled_report_work;
 SQL
+    if [[ "$reporting_scope" != '[]' ]]; then
+      printf 'PREPARE reporting_health(text, timestamptz) AS\n'
+      cat "$reporting_resources/reporting-health.sql"
+      printf '\n;\n'
+      printf "EXECUTE reporting_health(:'reporting_accounts', NULL);\n"
+    fi
+  } | probe_sql
 )" || probe_status=$?
 
 if ((probe_status != 0)); then
@@ -371,6 +397,9 @@ while IFS= read -r row; do
       ;;
     stalled\|*)
       add_finding "daily report work is stalled and needs an operator: ${row#stalled|}"
+      ;;
+    reporting\|*)
+      add_finding "daily report collection requires attention: ${row#reporting|}"
       ;;
     cycle_age\|none)
       add_finding "WB robot has never recorded a cycle"
