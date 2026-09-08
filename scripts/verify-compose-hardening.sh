@@ -899,7 +899,7 @@ verify_reporting_live() {
 
   check "live reporting: collector is guarded by the explicit profile and command" "$service" \
     '.profiles == ["reporting-live"]
-     and .command == ["run-scheduler"]
+     and .command == ["run-sources"]
      and .image == "mcp-ozon-report-collector:local"'
   check "live reporting: no ingress, env file, Compose secret, or config exists" "$service" \
     '((.ports // []) | length == 0)
@@ -1812,9 +1812,9 @@ check_contains \
   "$project_dir/scripts/run-report-mail-canary.sh" \
   "run --rm --no-deps report-worker deliver-one"
 check_contains \
-  "scheduled collection: runner requires explicit canary reconciliation" \
+  "scheduled collection: runner requires explicit independent collection activation" \
   "$project_dir/scripts/start-report-collector-scheduler.sh" \
-  "--confirm-canaries-published-and-reconciled"
+  "--confirm-independent-source-collection"
 check_contains \
   "scheduled collection: runner requires immutable release images" \
   "$project_dir/scripts/start-report-collector-scheduler.sh" \
@@ -1822,7 +1822,7 @@ check_contains \
 check_contains \
   "scheduled collection: runner requires a database-backed activation preflight" \
   "$project_dir/scripts/start-report-collector-scheduler.sh" \
-  "run --rm --no-deps report-collector collection-preflight"
+  "run --rm --no-deps report-collector sources-preflight"
 check_contains \
   "scheduled collection: runner activates only collector and marketplace egress" \
   "$project_dir/scripts/start-report-collector-scheduler.sh" \
