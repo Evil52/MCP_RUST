@@ -76,7 +76,9 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
         ],
     };
     let scope = AccountScope::new(account.clone(), Marketplace::Wildberries).unwrap();
-    let now = Utc::now();
+    // Match PostgreSQL timestamp precision on hosts whose clock exposes
+    // nanoseconds; the requested cutoff must equal its persisted identity.
+    let now = chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
     let start = business_date(now)
         .pred_opt()
         .unwrap()

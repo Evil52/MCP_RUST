@@ -179,6 +179,15 @@ completion. The schema upgrade/ACL test passed on both a new and an existing sch
 The final Performance-client change was also checked for reuse across pages,
 rejection of expired leases and independent Seller credential resolution.
 
+The final pre-release coverage run executed 1,007 tests across 27 suites with
+no failures or ignored tests, including 929 library tests. It also verifies the
+actual source scheduler replay for all nine marketplace/source combinations,
+corrupt checkpoint and missing-credential isolation, persisted vendor delays,
+and fenced publication. A loopback HTTP fixture proves one guarded Seller
+attempt returns `Retry-After` without an internal retry. Coverage passed the
+unchanged gates: 95.50% functions and 95.87% lines. The PostgreSQL fixture uses
+microsecond cutoff precision consistently on macOS and Linux.
+
 Clippy with denied warnings, formatting, shell checks, reporting-health tests,
 Suite synchronization and documentation generation are part of local validation.
 This is code/test evidence; production publication, all-account freshness and

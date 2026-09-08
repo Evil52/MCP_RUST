@@ -76,25 +76,37 @@ pub async fn run_quantum(
         std::time::Duration::from_secs(100),
         collect(config, writer, &claim),
     )
-    .await;
+    .await
+    .unwrap_or_else(|_| Err(SourceFailure::from("timeout")));
+    complete_quantum(writer, &claim, outcome).await?;
+    Ok(true)
+}
+
+type SourceFacts = (CollectedFacts, Vec<CollectedAdvertisingExpenseFact>);
+
+async fn complete_quantum(
+    writer: &PostgresSnapshotWriter,
+    claim: &SourceJobClaim,
+    outcome: Result<SourceFacts, SourceFailure>,
+) -> Result<()> {
     match outcome {
-        Ok(Ok((facts, expenses))) => {
+        Ok((facts, expenses)) => {
             match writer
-                .publish_source_job(&claim, facts, expenses, env!("CARGO_PKG_VERSION"))
+                .publish_source_job(claim, facts, expenses, env!("CARGO_PKG_VERSION"))
                 .await
             {
                 Ok(id) => {
                     tracing::info!(account_id=claim.account_id(),source=?claim.source,snapshot_id=id,"independent source snapshot published");
                 }
                 Err(super::postgres_collector::PostgresCollectorError::ClaimLost) => {
-                    return Ok(true);
+                    return Ok(());
                 }
                 Err(error) => {
                     let terminal =
                         error != super::postgres_collector::PostgresCollectorError::Unavailable;
                     writer
                         .defer_source_job(
-                            &claim,
+                            claim,
                             Some(if terminal {
                                 "invalid_source_publication"
                             } else {
@@ -108,16 +120,11 @@ pub async fn run_quantum(
                 }
             }
         }
-        Ok(Err(SourceFailure {
+        Err(SourceFailure {
             code: "checkpoint_deferred",
             ..
-        })) => writer.defer_source_job(&claim, None, 1, false).await?,
-        failure => {
-            let failure = match failure {
-                Ok(Err(code)) => code,
-                Err(_) => SourceFailure::from("timeout"),
-                Ok(Ok(_)) => unreachable!(),
-            };
+        }) => writer.defer_source_job(claim, None, 1, false).await?,
+        Err(failure) => {
             let code = failure.code;
             let retry = retryable(code) && failure.retry_after.is_none_or(|s| s <= 86400);
             let delay = 65_u32
@@ -129,12 +136,12 @@ pub async fn run_quantum(
                         .min(i32::MAX as u32),
                 );
             writer
-                .defer_source_job(&claim, Some(code), delay, !retry)
+                .defer_source_job(claim, Some(code), delay, !retry)
                 .await?;
             tracing::warn!(account_id=claim.account_id(),source=?claim.source,error_class=code,retry,"source deferred; other sources remain available");
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn retryable(code: &str) -> bool {
@@ -266,3 +273,6 @@ pub async fn require_enabled(
     writer.verify_source_job_contract().await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

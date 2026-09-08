@@ -1931,6 +1931,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_attempt_returns_vendor_pause_without_retrying_or_bypassing_guards() {
+        for status in [200, 429] {
+            let response = MockResponse::new(status, r#"{"ok":true}"#).header("Retry-After", "60");
+            let (base_url, requests) = mock_server(vec![response]);
+            let client = OzonClient::new(base_url, Duration::from_secs(3), credentials()).unwrap();
+            let store = StoreId::from("ofk");
+            assert!(matches!(
+                client
+                    .post_checkpoint_page(&store, "/v1/product/import", serde_json::json!({}))
+                    .await,
+                Err(OzonError::EndpointNotAllowed(_))
+            ));
+            assert!(matches!(
+                client
+                    .post_checkpoint_page(
+                        &StoreId::from("unknown"),
+                        "/v1/rating/summary",
+                        serde_json::json!({})
+                    )
+                    .await,
+                Err(OzonError::MissingCredentials(_))
+            ));
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.post_checkpoint_page(&store, "/v1/rating/summary", serde_json::json!({})),
+            )
+            .await
+            .expect("durable owner must receive the vendor pause immediately");
+            if status == 200 {
+                assert_eq!(result.unwrap(), serde_json::json!({"ok":true}));
+            } else {
+                assert!(
+                    matches!(result, Err(OzonError::RateLimited { retry_after: Some(delay), .. }) if delay == Duration::from_secs(60))
+                );
+            }
+            assert_request_count(&requests, 1);
+        }
+    }
+
+    #[tokio::test]
     async fn oversized_error_bodies_preserve_http_classification() {
         for (status, expected_kind) in [
             (401, OzonErrorKind::Unauthorized),
