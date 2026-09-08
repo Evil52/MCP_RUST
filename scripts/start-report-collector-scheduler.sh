@@ -4,7 +4,7 @@ set -euo pipefail
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_dir"
 
-confirmation="--confirm-canaries-published-and-reconciled"
+confirmation="--confirm-independent-source-collection"
 if [[ $# -ne 1 || "$1" != "$confirmation" ]]; then
   echo "usage: $0 $confirmation" >&2
   exit 64
@@ -52,10 +52,9 @@ compose=(
   --profile reporting-live
 )
 
-# The preflight uses only the private metadata mounts and PostgreSQL proof. It
-# performs no marketplace request and fails unless every live-policy target
-# shares one successful, fully paginated four-source cutoff from the previous
-# 24 hours.
+# Preflight checks the enabled policy and migration/role contract without API
+# requests. Each source now publishes independently; full-report completeness
+# is verified separately by the existing manifest reader.
 "${compose[@]}" config --quiet
-"${compose[@]}" run --rm --no-deps report-collector collection-preflight
+"${compose[@]}" run --rm --no-deps report-collector sources-preflight
 "${compose[@]}" up --detach --wait --wait-timeout 60 ozon-egress report-collector

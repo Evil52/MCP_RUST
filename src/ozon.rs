@@ -623,6 +623,45 @@ impl OzonClient {
             .await
     }
 
+    /// One guarded read attempt for a durable external retry owner. Vendor
+    /// delays must reach PostgreSQL before the short page lease can expire.
+    pub(crate) async fn post_checkpoint_page(
+        &self,
+        store: &StoreId,
+        path: &'static str,
+        payload: Value,
+    ) -> Result<Value, OzonError> {
+        if !self.is_endpoint_allowed(path) {
+            return Err(OzonError::EndpointNotAllowed(path.to_owned()));
+        }
+        let credentials = self
+            .stores
+            .get(store)
+            .ok_or_else(|| OzonError::MissingCredentials(store.clone()))?;
+        let limiter = self
+            .rate_limiters
+            .get(store)
+            .expect("configured stores always have a rate limiter");
+        let outcome = tokio::time::timeout(
+            self.request_deadline,
+            self.send_attempt(AttemptInput {
+                limiter,
+                credentials,
+                store,
+                path,
+                payload: &payload,
+                attempt: MAX_ATTEMPTS,
+                pacing_mode: AnalyticsPacingMode::FailFast,
+            }),
+        )
+        .await
+        .map_err(|_| OzonError::DeadlineExceeded)??;
+        match outcome {
+            RequestAttempt::Complete(value) => Ok(value),
+            RequestAttempt::Retry { error, .. } => Err(error),
+        }
+    }
+
     /// Queues an Analytics page behind the per-account departure gate.
     ///
     /// This is reserved for bounded background/report pagination. Interactive
@@ -1288,6 +1327,10 @@ fn trace_response(
 
 fn elapsed_millis(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
+    parse_retry_after(headers, Utc::now()).duration()
 }
 
 #[cfg(test)]

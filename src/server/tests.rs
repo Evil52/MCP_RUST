@@ -205,6 +205,30 @@ impl ReportingReadRepository for FakeReportingRepository {
         self.complete(())
     }
 
+    fn source_snapshot<'a>(
+        &'a self,
+        account: &'a AccountScope,
+        query: crate::reporting::mcp_read::SourceSnapshotQuery,
+    ) -> ReportingReadFuture<'a, crate::reporting::mcp_read::SourceSnapshotResult> {
+        self.complete(crate::reporting::mcp_read::SourceSnapshotResult {
+            account_id: account.account_id().to_owned(),
+            marketplace: Self::marketplace(account),
+            source: query.source,
+            storage: "published_postgresql_snapshots".to_owned(),
+            state: "missing".to_owned(),
+            snapshot_id: None,
+            cutoff_at: None,
+            source_as_of: None,
+            observed_from: None,
+            period_start: None,
+            period_end: None,
+            total_rows: 0,
+            rows: vec![],
+            next_offset: None,
+            latest_collection: None,
+        })
+    }
+
     fn collection_status<'a>(
         &'a self,
         account: &'a AccountScope,
@@ -1481,6 +1505,7 @@ async fn authentication_still_precedes_tool_call_admission_control() {
 fn all_tools_have_truthful_annotations_and_descriptions() {
     const INTERNAL_REPORTING_TOOLS: &[&str] = &[
         "ofk_collection_status",
+        "ofk_source_snapshot",
         "ofk_data_completeness",
         "ofk_manager_actions",
         "ofk_marketplace_sales_refresh_status",
@@ -2119,6 +2144,11 @@ async fn reporting_tool_json_boundaries_reject_unknown_fields_before_repository_
             manager.clone(),
             "ofk_collection_status",
             json!({"unexpected": true}),
+        ),
+        (
+            manager.clone(),
+            "ofk_source_snapshot",
+            json!({"source":"prices","unexpected":true}),
         ),
         (
             manager.clone(),
@@ -5759,7 +5789,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     // The release checklist in `SECURITY.md` states this count verbatim.
     // Changing it here without updating that gate leaves the gate
     // describing a router that no longer exists.
-    assert_eq!(dev_tools.len(), 83);
+    assert_eq!(dev_tools.len(), 84);
     assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
     let seed = server();
@@ -5770,7 +5800,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
     let jwt_tools = authenticated.tool_router.list_all();
-    assert_eq!(jwt_tools.len(), 83);
+    assert_eq!(jwt_tools.len(), 84);
     assert_policy(
         jwt_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -5782,7 +5812,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
         .with_preview_features(false, true)
         .tool_router
         .list_all();
-    assert_eq!(legacy_flag_tools.len(), 83);
+    assert_eq!(legacy_flag_tools.len(), 84);
     assert_policy(
         legacy_flag_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -5796,6 +5826,7 @@ fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
         "marketplace_accounts",
         "list_members",
         "ofk_collection_status",
+        "ofk_source_snapshot",
         "ofk_data_completeness",
         "ofk_marketplace_sales_refresh_status",
         "ofk_metrics_history",
@@ -11459,6 +11490,7 @@ async fn performance_errors_are_structured_and_status_never_exposes_credentials(
         &StoreId::from("store_a"),
         DAILY_STATS_PATH,
         &crate::ozon_performance::PerformanceError::RateLimited {
+            retry_after: None,
             request_id: Some("safe/id:1".to_owned()),
         },
     );
@@ -11482,4 +11514,78 @@ async fn performance_errors_are_structured_and_status_never_exposes_credentials(
     assert!(!serialized.contains("test-performance-client"));
     assert!(!serialized.contains("test-performance-secret"));
     assert!(requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn independent_source_tool_respects_account_and_finance_access_before_reading() {
+    use crate::reporting::snapshot::SnapshotSource;
+    let repository = Arc::new(FakeReportingRepository::succeeding());
+    let manager = reporting_test_server("manager", repository.clone());
+    let input = ReportingSourceSnapshotInput {
+        account: None,
+        source: SnapshotSource::Prices,
+        snapshot_id: None,
+        limit: 100,
+        offset: 0,
+    };
+    assert_eq!(
+        manager
+            .reporting_source_snapshot(RequestIdentity::dev(), Parameters(input.clone()))
+            .await
+            .unwrap()
+            .0
+            .storage,
+        "published_postgresql_snapshots"
+    );
+    for source in [SnapshotSource::Advertising, SnapshotSource::Finance] {
+        let denied = reporting_tool_error(
+            manager
+                .reporting_source_snapshot(
+                    RequestIdentity::dev(),
+                    Parameters(ReportingSourceSnapshotInput {
+                        source,
+                        ..input.clone()
+                    }),
+                )
+                .await,
+        );
+        assert!(denied.starts_with(ROLE_ACCESS_DENIED));
+    }
+    assert!(
+        manager
+            .reporting_source_snapshot(
+                RequestIdentity::dev(),
+                Parameters(ReportingSourceSnapshotInput {
+                    account: Some("unknown_account".to_owned()),
+                    ..input.clone()
+                })
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .reporting_source_snapshot(
+                RequestIdentity::dev(),
+                Parameters(ReportingSourceSnapshotInput {
+                    offset: 1,
+                    ..input.clone()
+                })
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(repository.calls(), 1);
+    let finance = reporting_test_server("finance", repository.clone());
+    finance
+        .reporting_source_snapshot(
+            RequestIdentity::dev(),
+            Parameters(ReportingSourceSnapshotInput {
+                source: SnapshotSource::Finance,
+                ..input
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(repository.calls(), 2);
 }

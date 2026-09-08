@@ -34,7 +34,8 @@ docker build --pull --tag "$image" \
   --file "$project_root/position-monitor/Dockerfile" \
   "$project_root/position-monitor" >/dev/null
 docker volume create "$data_volume" >/dev/null
-docker run --detach --rm --name "$container" \
+# Retain a failed initialization until cleanup so migration diagnostics survive.
+docker run --detach --name "$container" \
   --volume "$data_volume:/var/lib/postgresql/data" \
   --publish 127.0.0.1::5432 \
   --env POSTGRES_DB=ozon_positions \

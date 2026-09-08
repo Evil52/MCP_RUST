@@ -534,6 +534,7 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         "list_members",
         "marketplace_accounts",
         "ofk_collection_status",
+        "ofk_source_snapshot",
         "ofk_data_completeness",
         "ofk_manager_actions",
         "ofk_marketplace_sales_refresh_status",

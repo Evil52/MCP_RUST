@@ -11,6 +11,9 @@
 //! values are rebuilt from immutable published facts with the same Rust KPI
 //! and rule code used by server-generated reports.
 
+mod source_snapshot;
+pub use source_snapshot::{SourceSnapshotQuery, SourceSnapshotResult};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -84,6 +87,14 @@ pub trait ReportingReadRepository: Send + Sync {
 
     fn probe(&self) -> ReportingReadFuture<'_, ()> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn source_snapshot<'a>(
+        &'a self,
+        _account: &'a AccountScope,
+        _query: SourceSnapshotQuery,
+    ) -> ReportingReadFuture<'a, SourceSnapshotResult> {
+        Box::pin(async { Err(ReportingReadError::Disabled) })
     }
 
     fn collection_status<'a>(
@@ -2668,6 +2679,14 @@ impl ReportingReadRepository for PostgresReportingRepository {
         })
     }
 
+    fn source_snapshot<'a>(
+        &'a self,
+        account: &'a AccountScope,
+        query: SourceSnapshotQuery,
+    ) -> ReportingReadFuture<'a, SourceSnapshotResult> {
+        Box::pin(self.source_snapshot_impl(account, query))
+    }
+
     fn collection_status<'a>(
         &'a self,
         account: &'a AccountScope,
@@ -2739,6 +2758,7 @@ const SALES_SNAPSHOT_CANDIDATES_QUERY: &str = "SELECT snapshot_id, account_id, m
      LIMIT 64";
 
 const CONTRACT_PROBES: &[&str] = &[
+    "SELECT account_id,marketplace,source,cutoff_at,status,next_attempt_at,completed_pages,error_class,first_observed_at,last_observed_at FROM daily_reporting.mcp_source_collection_jobs LIMIT 0",
     "SELECT snapshot_id, account_id, marketplace, source, cutoff_at, source_as_of, \
             period_start, period_end, status, pagination_complete, row_count, \
             collector_version, started_at, finished_at, error_class, http_status, \

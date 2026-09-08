@@ -25,7 +25,7 @@ The following properties are treated as release gates:
    are selected and before any socket is opened. Chat input cannot supply a host, HTTP method, or
    path. Redirects and ambient HTTP proxies are disabled. The separately inventoried Control MCP
    has its own narrower write invariant below; its one reviewed PATCH must never be added to an
-   Analytics client or to the 79-tool Analytics registry.
+   Analytics client or to the 84-tool Analytics registry.
 2. Production Ozon Seller egress uses 35 stable reporting/list/info paths, including the three
    finance-accrual reads promoted after canary validation. Posting lists use only
    `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list`; the superseded
@@ -295,9 +295,10 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   claims must never select an actor. Verify POST, GET and DELETE cannot use another subject's MCP
   session ID and return the same 404 as an unknown session. Saturate and time out readiness probes,
   confirm only one dependency probe runs, and confirm `/livez` plus MCP traffic remain responsive.
-- Verify the Analytics MCP production tool list contains exactly 79 stable tools, no preview tools,
+- Verify the Analytics MCP production tool list contains exactly 84 stable tools, no preview tools,
   and every tool advertises `destructiveHint=false` and the expected OAuth/noauth policy.
-  Exactly `ofk_request_ozon_sales_refresh` has `readOnlyHint=false`: it inserts or reuses one
+  `ofk_request_ozon_sales_refresh` and `ofk_request_marketplace_sales_refresh` have
+  `readOnlyHint=false`: each inserts or reuses one
   internal PostgreSQL queue row but has no marketplace egress. Every other Analytics tool has
   `readOnlyHint=true`. This count never includes Control MCP tools.
 - Verify the separate Control MCP registry contains exactly twelve tools:
@@ -312,11 +313,11 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   reconcile are non-read-only because they persist Control state. Approval must be non-read-only,
   destructive, idempotent and closed-world because it grants execution authority. Both apply tools
   must be non-read-only, destructive and idempotent; Ozon apply is also closed-world because it only
-  enqueues the durable workflow. The combined implementation inventory is 91, but no release check
+  enqueues the durable workflow. The combined implementation inventory is 96, but no release check
   may treat it as one security boundary.
 - Verify `ofk_collection_status`, `ofk_data_completeness`, `ofk_metrics_history`,
   `ofk_manager_actions`, `ofk_ozon_sales_analytics`, `ofk_ozon_sales_refresh_status`, and
-  `ofk_reports` are internal read-only reporting tools with
+  `ofk_reports` and `ofk_source_snapshot` are internal read-only reporting tools with
   `openWorldHint=false`. They must read only curated PostgreSQL views through the restricted
   reporting reader, enforce actor/account RBAC before database access, and return a stable
   unavailable result when the reporting database is not configured; they must never mutate a

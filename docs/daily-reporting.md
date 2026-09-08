@@ -398,7 +398,7 @@ window does not extend the scheduler's separate 30-minute collection window.
 A timeout, rate limit or malformed/incomplete source publishes nothing. The
 shipped Compose mode remains `disabled`, so neither command runs on a schedule.
 
-The shared collection scheduler contract is deterministic: it opens
+The legacy `collect-due` / `run-scheduler` contract is deterministic: it opens
 only the `08:00–08:30` and `17:00–17:30` Asia/Yekaterinburg completion windows,
 returns the same immutable cutoff after a restart inside that window, and
 refuses to backdate current state after the window closes. An external timer
@@ -486,14 +486,17 @@ with the same explicit files/profile:
 
 ```text
 ./scripts/start-report-collector-scheduler.sh \
-  --confirm-canaries-published-and-reconciled
+  --confirm-independent-source-collection
 ```
 
 The wrapper renders the Compose contract and runs the database-backed
-`collection-preflight` before it starts the egress proxy and collector. The
-overlay supplies `run-scheduler`; it does not enable the report worker or email
-delivery. Omitting any path, the profile, an enabled policy, a recent complete
-successful canary occurrence or a valid read-only credential directory fails closed.
+`sources-preflight` before it starts the egress proxy and collector. The
+overlay supplies `run-sources`; it does not enable the report worker or email
+delivery. The independent collector requires migration 029 and an enabled policy;
+it publishes each source separately and resumes normalized pages after pauses.
+See [the independent source contract](reporting-suite-readiness.md#independent-sources-local-implementation-not-deployed)
+for timestamps, limits, refresh status and verification. The complete-account
+canary gate above applies to the legacy commands, not `run-sources`.
 
 Create that directory with the bundled operator command rather than copying the
 whole runtime `.env`:
