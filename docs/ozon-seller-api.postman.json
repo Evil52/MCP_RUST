@@ -10060,7 +10060,31 @@
 							"options": { "raw": { "language": "json" } }
 						},
 						"url": "https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses",
-						"description": "Read-only остатки на складах WB. Runtime: wb_warehouse_stocks."
+						"description": "Read-only текущие FBW-остатки на складах WB, НЕ FBS. Runtime: wb_warehouse_stocks. Пагинация limit/offset. Исторической даты нет."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_seller_warehouses — GET /api/v3/warehouses",
+					"request": {
+						"method": "GET",
+						"url": "https://marketplace-api.wildberries.ru/api/v3/warehouses",
+						"description": "Read-only полный список складов продавца, без пагинации. FBS: deliveryType=1; другие модели доставки учитываются отдельно. Runtime: wb_seller_warehouses."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_seller_warehouse_stocks — POST /api/v3/stocks/{warehouseId}",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"chrtIds\": [{{wbChrtId}}]\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://marketplace-api.wildberries.ru/api/v3/stocks/{{wbWarehouseId}}",
+						"description": "Read-only текущие остатки одного склада продавца. Runtime: wb_seller_warehouse_stocks. Используйте sizes[].chrtID из всех страниц wb_product_cards; запрашивайте каждый FBS-склад пакетами до 1000 ID. Пропущенные строки не равны нулю. Нет даты или offset. Не подменяет исторический снимок FBS."
 					},
 					"response": []
 				},
@@ -10266,6 +10290,16 @@
 		]
 	},
 	"variable": [
+		{
+			"key": "wbWarehouseId",
+			"value": "1",
+			"type": "string"
+		},
+		{
+			"key": "wbChrtId",
+			"value": "12345678",
+			"type": "string"
+		},
 		{
 			"key": "wbApiToken",
 			"value": "",

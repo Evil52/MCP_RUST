@@ -27,11 +27,16 @@ const CONTENT_API_BASE_URL: &str = "https://content-api.wildberries.ru";
 const PRICES_API_BASE_URL: &str = "https://discounts-prices-api.wildberries.ru";
 const COMMON_API_BASE_URL: &str = "https://common-api.wildberries.ru";
 const PROMOTION_API_BASE_URL: &str = "https://advert-api.wildberries.ru";
+const MARKETPLACE_API_BASE_URL: &str = "https://marketplace-api.wildberries.ru";
 const PING_PATH: &str = "/ping";
 const SALES_FUNNEL_PATH: &str = "/api/analytics/v3/sales-funnel/products";
 const SALES_FUNNEL_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/products/history";
 const SALES_FUNNEL_GROUPED_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/grouped/history";
 const WAREHOUSE_STOCKS_PATH: &str = "/api/analytics/v1/stocks-report/wb-warehouses";
+const SELLER_WAREHOUSES_PATH: &str = "/api/v3/warehouses";
+const SELLER_STOCKS_PATH: &str = "/api/v3/stocks/{warehouseId}";
+const SELLER_INVENTORY_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_SELLER_STOCK_CHRT_IDS: usize = 1_000;
 const ORDERS_PATH: &str = "/api/v1/supplier/orders";
 const SALES_PATH: &str = "/api/v1/supplier/sales";
 const PRODUCT_CARDS_PATH: &str = "/content/v2/get/cards/list";
@@ -98,6 +103,7 @@ enum ApiHost {
     Prices,
     Common,
     Promotion,
+    Marketplace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +122,7 @@ enum RequestClass {
     PromotionMinimumBids,
     PromotionRecommendedBids,
     PromotionClusterBids,
+    SellerInventory,
 }
 
 /// Single source of truth for every request that may leave this process.
@@ -137,6 +144,20 @@ struct EndpointPolicy {
 /// [`WbClient::request`], the only place a WB request can leave the process, so
 /// adding a mutating call requires deliberately editing this list.
 const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
+    EndpointPolicy {
+        method: Method::GET,
+        path: SELLER_WAREHOUSES_PATH,
+        label: "marketplace:/api/v3/warehouses",
+        host: ApiHost::Marketplace,
+        request_class: RequestClass::SellerInventory,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: SELLER_STOCKS_PATH,
+        label: "marketplace:/api/v3/stocks/{warehouseId}",
+        host: ApiHost::Marketplace,
+        request_class: RequestClass::SellerInventory,
+    },
     EndpointPolicy {
         method: Method::GET,
         path: PING_PATH,
@@ -471,17 +492,36 @@ impl WbError {
 
 impl EndpointPolicy {
     fn for_request(method: &Method, path: &str) -> Option<&'static Self> {
-        READ_ONLY_ENDPOINT_ALLOWLIST
-            .iter()
-            .find(|policy| policy.method == *method && policy.path == path)
+        READ_ONLY_ENDPOINT_ALLOWLIST.iter().find(|policy| {
+            policy.method == *method
+                && if policy.path == SELLER_STOCKS_PATH {
+                    is_seller_stock_read_path(path)
+                } else {
+                    policy.path == path
+                }
+        })
     }
+}
+
+/// Admit only one canonical positive int64 segment. Never admit a prefix,
+/// encoded path, query, or the neighboring PUT/DELETE inventory operations.
+fn is_seller_stock_read_path(path: &str) -> bool {
+    let Some(id) = path.strip_prefix("/api/v3/stocks/") else {
+        return false;
+    };
+    !id.starts_with('0')
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && id.parse::<i64>().is_ok_and(|id| id > 0)
 }
 
 impl RequestClass {
     const fn allows_automatic_retry(self) -> bool {
         !matches!(
             self,
-            Self::StatisticsReport | Self::CommissionTariff | Self::SearchReport
+            Self::StatisticsReport
+                | Self::CommissionTariff
+                | Self::SearchReport
+                | Self::SellerInventory
         )
     }
 
@@ -507,6 +547,7 @@ struct ClientPolicy {
     promotion_minimum_bids_interval: Duration,
     promotion_recommendations_interval: Duration,
     promotion_cluster_bids_interval: Duration,
+    seller_inventory_interval: Duration,
     max_attempts: usize,
     base_retry_delay: Duration,
     max_retry_delay: Duration,
@@ -542,6 +583,7 @@ impl ClientPolicy {
             promotion_minimum_bids_interval: PROMOTION_MINIMUM_BIDS_MIN_REQUEST_INTERVAL,
             promotion_recommendations_interval: PROMOTION_RECOMMENDATIONS_MIN_REQUEST_INTERVAL,
             promotion_cluster_bids_interval: PROMOTION_CLUSTER_BIDS_MIN_REQUEST_INTERVAL,
+            seller_inventory_interval: SELLER_INVENTORY_MIN_REQUEST_INTERVAL,
             max_attempts: MAX_ATTEMPTS,
             base_retry_delay: BASE_RETRY_DELAY,
             max_retry_delay: MAX_RETRY_DELAY,
@@ -568,6 +610,7 @@ impl ClientPolicy {
             promotion_minimum_bids_interval: Duration::ZERO,
             promotion_recommendations_interval: Duration::ZERO,
             promotion_cluster_bids_interval: Duration::ZERO,
+            seller_inventory_interval: Duration::ZERO,
             max_attempts: 1,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -591,6 +634,7 @@ impl ClientPolicy {
             RequestClass::PromotionMinimumBids => self.promotion_minimum_bids_interval,
             RequestClass::PromotionRecommendedBids => self.promotion_recommendations_interval,
             RequestClass::PromotionClusterBids => self.promotion_cluster_bids_interval,
+            RequestClass::SellerInventory => self.seller_inventory_interval,
         }
     }
 }
@@ -686,6 +730,7 @@ struct TokenLimiter {
     promotion_minimum_bids: PacingGate,
     promotion_recommendations: PacingGate,
     promotion_cluster_bids: PacingGate,
+    seller_inventory: PacingGate,
 }
 
 impl TokenLimiter {
@@ -706,6 +751,7 @@ impl TokenLimiter {
             promotion_minimum_bids: PacingGate::new(),
             promotion_recommendations: PacingGate::new(),
             promotion_cluster_bids: PacingGate::new(),
+            seller_inventory: PacingGate::new(),
         }
     }
 
@@ -725,6 +771,7 @@ impl TokenLimiter {
             RequestClass::PromotionMinimumBids => &self.promotion_minimum_bids,
             RequestClass::PromotionRecommendedBids => &self.promotion_recommendations,
             RequestClass::PromotionClusterBids => &self.promotion_cluster_bids,
+            RequestClass::SellerInventory => &self.seller_inventory,
         }
     }
 
@@ -796,6 +843,7 @@ struct BaseUrls {
     prices: String,
     common: String,
     promotion: String,
+    marketplace: String,
 }
 
 impl BaseUrls {
@@ -807,6 +855,7 @@ impl BaseUrls {
             prices: PRICES_API_BASE_URL.to_owned(),
             common: COMMON_API_BASE_URL.to_owned(),
             promotion: PROMOTION_API_BASE_URL.to_owned(),
+            marketplace: MARKETPLACE_API_BASE_URL.to_owned(),
         }
     }
 
@@ -819,7 +868,8 @@ impl BaseUrls {
             content: common.clone(),
             prices: common.clone(),
             common: common.clone(),
-            promotion: common,
+            promotion: common.clone(),
+            marketplace: common,
         }
     }
 
@@ -831,6 +881,7 @@ impl BaseUrls {
             ApiHost::Prices => &self.prices,
             ApiHost::Common => &self.common,
             ApiHost::Promotion => &self.promotion,
+            ApiHost::Marketplace => &self.marketplace,
         }
     }
 }
@@ -1054,6 +1105,37 @@ impl WbClient {
             WAREHOUSE_STOCKS_PATH,
             None,
             Some(payload),
+        )
+        .await
+    }
+
+    /// Lists seller warehouses, including their upstream delivery types.
+    pub async fn seller_warehouses(&self, account: &str) -> Result<Value, WbError> {
+        self.request(account, Method::GET, SELLER_WAREHOUSES_PATH, None, None)
+            .await
+    }
+
+    /// Current inventory for one seller warehouse and an explicit bounded
+    /// batch of size IDs, not barcodes or historical stock reconstruction.
+    pub async fn seller_warehouse_stocks(
+        &self,
+        account: &str,
+        warehouse_id: u64,
+        chrt_ids: Vec<u64>,
+    ) -> Result<Value, WbError> {
+        validate_unsigned_id(warehouse_id, "warehouse_id", Some(MAX_WB_SIGNED_ID))?;
+        validate_positive_unique_ids(
+            &chrt_ids,
+            MAX_SELLER_STOCK_CHRT_IDS,
+            "chrt_ids",
+            Some(MAX_WB_SIGNED_ID),
+        )?;
+        self.request(
+            account,
+            Method::POST,
+            &format!("/api/v3/stocks/{warehouse_id}"),
+            None,
+            Some(serde_json::json!({"chrtIds": chrt_ids})),
         )
         .await
     }
@@ -1461,7 +1543,7 @@ impl WbClient {
         &self,
         account: &str,
         method: Method,
-        path: &'static str,
+        path: &str,
     ) -> Result<Value, WbError> {
         self.request(account, method, path, None, None).await
     }
@@ -1470,7 +1552,7 @@ impl WbClient {
         &self,
         account: &str,
         method: Method,
-        path: &'static str,
+        path: &str,
         query: Option<Vec<(&'static str, String)>>,
         payload: Option<Value>,
     ) -> Result<Value, WbError> {
@@ -1671,6 +1753,15 @@ impl WbClient {
             .flatten();
         let vendor_cooldown = match retry_after {
             ParsedRetryDelay::Valid(delay)
+                if context.request_class == RequestClass::SellerInventory
+                    && is_retriable(status) =>
+            {
+                // The one-attempt inventory reader must still honor a long
+                // Retry-After for sibling callers. Cap untrusted delays at a
+                // day; the generic retry budget is not this shared cooldown.
+                Some(delay.min(Duration::from_hours(24)))
+            }
+            ParsedRetryDelay::Valid(delay)
                 if is_retriable(status) && delay <= self.policy.max_retry_delay =>
             {
                 Some(delay)
@@ -1679,7 +1770,24 @@ impl WbClient {
                 None
             }
         };
-        if let Some(delay) = planned_retry.into_iter().chain(vendor_cooldown).max() {
+        let inventory_cooldown = if context.request_class == RequestClass::SellerInventory {
+            match status {
+                // WB charges ten requests for a 409 in both inventory groups.
+                StatusCode::CONFLICT => Some(self.policy.seller_inventory_interval * 10),
+                StatusCode::TOO_MANY_REQUESTS if vendor_cooldown.is_none() => {
+                    Some(Duration::from_secs(60))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(delay) = planned_retry
+            .into_iter()
+            .chain(vendor_cooldown)
+            .chain(inventory_cooldown)
+            .max()
+        {
             // A vendor-directed retry is shared by every alias using this
             // seller token and endpoint class. Extending the gate before
             // permits are released prevents sibling calls from creating a
@@ -2215,6 +2323,7 @@ fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     mod reporting_admission;
+    mod seller_inventory;
 
     use std::{
         io::{Read, Write},
@@ -2442,6 +2551,10 @@ mod tests {
         assert_eq!(urls.base_url(ApiHost::Prices), PRICES_API_BASE_URL);
         assert_eq!(urls.base_url(ApiHost::Common), COMMON_API_BASE_URL);
         assert_eq!(urls.base_url(ApiHost::Promotion), PROMOTION_API_BASE_URL);
+        assert_eq!(
+            urls.base_url(ApiHost::Marketplace),
+            MARKETPLACE_API_BASE_URL
+        );
     }
 
     #[test]
@@ -2475,6 +2588,20 @@ mod tests {
     #[test]
     fn endpoint_policy_table_matches_the_immutable_security_snapshot() {
         let expected = [
+            (
+                Method::GET,
+                SELLER_WAREHOUSES_PATH,
+                "marketplace:/api/v3/warehouses",
+                ApiHost::Marketplace,
+                RequestClass::SellerInventory,
+            ),
+            (
+                Method::POST,
+                SELLER_STOCKS_PATH,
+                "marketplace:/api/v3/stocks/{warehouseId}",
+                ApiHost::Marketplace,
+                RequestClass::SellerInventory,
+            ),
             (
                 Method::GET,
                 PING_PATH,
@@ -2663,8 +2790,13 @@ mod tests {
         for policy in READ_ONLY_ENDPOINT_ALLOWLIST {
             assert!(policy.path.starts_with('/'));
             assert!(!policy.path.contains("//"));
+            let path = if policy.path == SELLER_STOCKS_PATH {
+                "/api/v3/stocks/123"
+            } else {
+                policy.path
+            };
             assert_eq!(
-                EndpointPolicy::for_request(&policy.method, policy.path)
+                EndpointPolicy::for_request(&policy.method, path)
                     .map(|found| (found.host, found.request_class)),
                 Some((policy.host, policy.request_class))
             );
@@ -3085,6 +3217,7 @@ mod tests {
                 prices,
                 common,
                 promotion,
+                marketplace: "http://127.0.0.1:1".to_owned(),
             },
             ClientPolicy::immediate_single_attempt(Duration::from_secs(2)),
         );
@@ -3229,6 +3362,7 @@ mod tests {
                 statistics: unreachable.clone(),
                 content: unreachable.clone(),
                 prices: unreachable.clone(),
+                marketplace: unreachable.clone(),
                 common: unreachable,
                 promotion,
             },
