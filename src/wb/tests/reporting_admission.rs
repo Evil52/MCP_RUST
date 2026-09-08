@@ -17,7 +17,7 @@ async fn background_stats_reject_a_local_cooldown_beyond_the_admission_budget() 
     let started = Instant::now();
     assert_eq!(
         transport.promotion_stats(vec![1], date, date).await,
-        Err(WbReportSourceError::Upstream(WbErrorKind::RateLimited))
+        Err(WbReportSourceError::RetryAfter { seconds: 120 })
     );
     assert!(started.elapsed() < Duration::from_secs(1));
 }
@@ -183,7 +183,7 @@ async fn background_report_preserves_vendor_429_after_a_completed_chunk() {
         source
             .collect(NaiveDate::from_ymd_opt(2026, 8, 17).unwrap())
             .await,
-        Err(WbReportSourceError::Upstream(WbErrorKind::RateLimited)),
+        Err(WbReportSourceError::RetryAfter { seconds: 120 }),
         "one completed chunk must not produce partial report facts"
     );
     task.join().unwrap();

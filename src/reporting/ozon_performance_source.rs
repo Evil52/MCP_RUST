@@ -9,7 +9,8 @@
 use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc};
 
 use chrono::NaiveDate;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
@@ -21,6 +22,7 @@ use crate::{
 };
 
 use super::{
+    checkpoint::{CheckpointError, Checkpoints, checkpointed},
     ozon_adapter::{
         OzonReportParseError, parse_performance_expenses, parse_performance_sku_advertising,
     },
@@ -92,7 +94,15 @@ impl OzonPerformanceReportTransport for PerformanceClientReportTransport {
                     },
                 )
                 .await
-                .map_err(|error| OzonPerformanceReportSourceError::Upstream(error.kind()))
+                .map_err(|error| match error {
+                    crate::ozon_performance::PerformanceError::RateLimited {
+                        retry_after: Some(delay),
+                        ..
+                    } => OzonPerformanceReportSourceError::RetryAfter {
+                        seconds: super::checkpoint::delay_seconds(delay),
+                    },
+                    _ => OzonPerformanceReportSourceError::Upstream(error.kind()),
+                })
         })
     }
 
@@ -114,7 +124,15 @@ impl OzonPerformanceReportTransport for PerformanceClientReportTransport {
                     },
                 )
                 .await
-                .map_err(|error| OzonPerformanceReportSourceError::Upstream(error.kind()))
+                .map_err(|error| match error {
+                    crate::ozon_performance::PerformanceError::RateLimited {
+                        retry_after: Some(delay),
+                        ..
+                    } => OzonPerformanceReportSourceError::RetryAfter {
+                        seconds: super::checkpoint::delay_seconds(delay),
+                    },
+                    _ => OzonPerformanceReportSourceError::Upstream(error.kind()),
+                })
         })
     }
 
@@ -136,7 +154,15 @@ impl OzonPerformanceReportTransport for PerformanceClientReportTransport {
                     },
                 )
                 .await
-                .map_err(|error| OzonPerformanceReportSourceError::Upstream(error.kind()))
+                .map_err(|error| match error {
+                    crate::ozon_performance::PerformanceError::RateLimited {
+                        retry_after: Some(delay),
+                        ..
+                    } => OzonPerformanceReportSourceError::RetryAfter {
+                        seconds: super::checkpoint::delay_seconds(delay),
+                    },
+                    _ => OzonPerformanceReportSourceError::Upstream(error.kind()),
+                })
         })
     }
 }
@@ -148,6 +174,7 @@ pub struct OzonPerformanceCollectedFacts {
 }
 
 pub struct OzonPerformanceReportSource {
+    checkpoints: Checkpoints,
     transport: Arc<dyn OzonPerformanceReportTransport>,
 }
 
@@ -155,7 +182,14 @@ impl OzonPerformanceReportSource {
     pub fn new(transport: impl OzonPerformanceReportTransport + 'static) -> Self {
         Self {
             transport: Arc::new(transport),
+            checkpoints: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_checkpoints(mut self, checkpoints: Checkpoints) -> Self {
+        self.checkpoints = checkpoints;
+        self
     }
 
     pub async fn collect(
@@ -167,8 +201,17 @@ impl OzonPerformanceReportSource {
         let mut fact_keys = BTreeSet::new();
 
         for chunk in campaign_ids.chunks(CAMPAIGNS_PER_STATISTICS_REQUEST) {
-            let response = self.transport.sku_statistics(chunk.to_vec(), date).await?;
-            let rows = parse_performance_sku_advertising(&response)?;
+            let rows = checkpointed(
+                &self.checkpoints,
+                json!(["ozon_performance_sku", date, chunk]),
+                || async {
+                    parse_performance_sku_advertising(
+                        &self.transport.sku_statistics(chunk.to_vec(), date).await?,
+                    )
+                    .map_err(OzonPerformanceReportSourceError::from)
+                },
+            )
+            .await?;
             if facts.len().saturating_add(rows.len()) > MAX_ADVERTISING_FACTS {
                 return Err(OzonPerformanceReportSourceError::TooManyFacts);
             }
@@ -195,29 +238,45 @@ impl OzonPerformanceReportSource {
         let mut advertising_keys = BTreeSet::new();
         let mut expense_keys = BTreeSet::new();
         for chunk in campaign_ids.chunks(CAMPAIGNS_PER_STATISTICS_REQUEST) {
-            let response = self.transport.sku_statistics(chunk.to_vec(), date).await?;
-            for row in parse_performance_sku_advertising(&response).map_err(|error| {
-                tracing::warn!(
-                    source = "sku_statistics",
-                    parse_error = ?error,
-                    "Ozon Performance report response was rejected"
-                );
-                OzonPerformanceReportSourceError::from(error)
-            })? {
+            let rows = checkpointed(
+                &self.checkpoints,
+                json!(["ozon_performance_sku", date, chunk]),
+                || async {
+                    let response = self.transport.sku_statistics(chunk.to_vec(), date).await?;
+                    parse_performance_sku_advertising(&response).map_err(|error| {
+                        tracing::warn!(
+                            source = "sku_statistics",
+                            parse_error = ?error,
+                            "Ozon Performance report response was rejected"
+                        );
+                        OzonPerformanceReportSourceError::from(error)
+                    })
+                },
+            )
+            .await?;
+            for row in rows {
                 if !valid_advertising_row(&row, date, chunk, &mut advertising_keys) {
                     return Err(OzonPerformanceReportSourceError::InvalidResponse);
                 }
                 advertising.push(row);
             }
-            let response = self.transport.expenses(chunk.to_vec(), date).await?;
-            for row in parse_performance_expenses(&response).map_err(|error| {
-                tracing::warn!(
-                    source = "expenses",
-                    parse_error = ?error,
-                    "Ozon Performance report response was rejected"
-                );
-                OzonPerformanceReportSourceError::from(error)
-            })? {
+            let rows = checkpointed(
+                &self.checkpoints,
+                json!(["ozon_performance_expenses", date, chunk]),
+                || async {
+                    let response = self.transport.expenses(chunk.to_vec(), date).await?;
+                    parse_performance_expenses(&response).map_err(|error| {
+                        tracing::warn!(
+                            source = "expenses",
+                            parse_error = ?error,
+                            "Ozon Performance report response was rejected"
+                        );
+                        OzonPerformanceReportSourceError::from(error)
+                    })
+                },
+            )
+            .await?;
+            for row in rows {
                 if !valid_expense_row(&row, date, chunk, &mut expense_keys) {
                     return Err(OzonPerformanceReportSourceError::InvalidResponse);
                 }
@@ -247,8 +306,14 @@ impl OzonPerformanceReportSource {
         // unreachable exhaustion branch.
         let mut page = 1;
         loop {
-            let response = self.transport.campaigns(page, CAMPAIGN_PAGE_SIZE).await?;
-            let (campaigns, total) = parse_campaign_page(&response)?;
+            let (campaigns, total) = checkpointed(
+                &self.checkpoints,
+                json!(["ozon_performance_campaigns", date, page]),
+                || async {
+                    parse_campaign_page(&self.transport.campaigns(page, CAMPAIGN_PAGE_SIZE).await?)
+                },
+            )
+            .await?;
             if *expected_total.get_or_insert(total) != total {
                 return Err(OzonPerformanceReportSourceError::InconsistentPagination);
             }
@@ -299,6 +364,10 @@ fn valid_expense_row(
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum OzonPerformanceReportSourceError {
+    #[error("collection quota requires a pause")]
+    RetryAfter { seconds: u64 },
+    #[error(transparent)]
+    Checkpoint(#[from] CheckpointError),
     #[error("Ozon Performance request failed")]
     Upstream(PerformanceErrorKind),
     #[error("Ozon Performance response has an invalid shape or provenance")]
@@ -313,8 +382,20 @@ pub enum OzonPerformanceReportSourceError {
 
 impl OzonPerformanceReportSourceError {
     #[must_use]
+    pub const fn failure(&self) -> super::source_collection::SourceFailure {
+        super::source_collection::SourceFailure {
+            code: self.code(),
+            retry_after: match self {
+                Self::RetryAfter { seconds } => Some(*seconds),
+                _ => None,
+            },
+        }
+    }
+    #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
+            Self::RetryAfter { .. } => "rate_limited",
+            Self::Checkpoint(error) => error.code(),
             Self::Upstream(kind) => kind.code(),
             Self::InvalidResponse => "invalid_response",
             Self::InconsistentPagination => "inconsistent_pagination",
@@ -397,7 +478,7 @@ fn parse_campaign_page(
     Ok((campaigns, total))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct CampaignWindow {
     id: u64,
     from_date: Option<NaiveDate>,

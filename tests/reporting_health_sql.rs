@@ -55,6 +55,10 @@ async fn reporting_health_checks_cutoff_boundaries_completeness_and_failed_work(
                 requested_at timestamptz, business_date date,
                 lease_until timestamptz, error_class text
              );
+             CREATE TEMP TABLE source_collection_jobs (
+                account_id text,marketplace text,source text,cutoff_at timestamptz,
+                status text,lease_until timestamptz,next_attempt_at timestamptz,error_class text
+             );
              CREATE TEMP TABLE collection_claims (
                 id bigint, account_id text, marketplace text, status text,
                 cutoff_at timestamptz, lease_until timestamptz
@@ -177,6 +181,19 @@ async fn reporting_health_checks_cutoff_boundaries_completeness_and_failed_work(
     assert_eq!(
         findings(&client, &sql, "2026-09-07T12:30:01Z").await.len(),
         3
+    );
+    client.batch_execute("DELETE FROM ozon_sales_refresh_requests;
+        INSERT INTO source_collection_jobs VALUES
+        ('ozon_one','ozon','advertising','2026-09-07T03:00:00Z','failed',NULL,NULL,'invalid_response'),
+        ('wb_one','wildberries','stocks','2026-09-07T03:00:00Z','ready',NULL,'2026-09-07T04:00:00Z',NULL),
+        ('wb_one','wildberries','sales','2026-09-07T03:00:00Z','ready',NULL,'2026-09-07T04:25:00Z',NULL),
+        ('outside_policy','ozon','sales','2026-09-07T03:00:00Z','failed',NULL,NULL,'invalid_response');").await.unwrap();
+    assert_eq!(
+        findings(&client, &sql, "2026-09-07T04:20:00Z").await,
+        [
+            "reporting|ozon_one|ozon|source_collection_failed|advertising|invalid_response",
+            "reporting|wb_one|wildberries|source_collection_stalled|stocks",
+        ]
     );
     drop(client);
     driver.await.unwrap();

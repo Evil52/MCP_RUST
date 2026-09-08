@@ -216,6 +216,19 @@ pub fn parse_price_page(
 }
 
 pub fn parse_campaign_ids(response: &Value) -> Result<Vec<u64>, WbReportParseError> {
+    parse_campaign_ids_bounded(response, MAX_CAMPAIGNS)
+}
+
+pub(crate) fn parse_campaign_ids_for_checkpointed_collection(
+    response: &Value,
+) -> Result<Vec<u64>, WbReportParseError> {
+    parse_campaign_ids_bounded(response, 5_000)
+}
+
+fn parse_campaign_ids_bounded(
+    response: &Value,
+    limit: usize,
+) -> Result<Vec<u64>, WbReportParseError> {
     let root = object(response)?;
     let groups = array(field(root, "adverts")?)?;
     let mut ids = BTreeSet::new();
@@ -230,7 +243,7 @@ pub fn parse_campaign_ids(response: &Value) -> Result<Vec<u64>, WbReportParseErr
             let id = unsigned(field(object(advert)?, "advertId")?)?;
             ensure_positive(id)?;
             ids.insert(id);
-            if ids.len() > MAX_CAMPAIGNS {
+            if ids.len() > limit {
                 return Err(WbReportParseError::TooManyRows);
             }
         }

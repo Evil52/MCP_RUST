@@ -3,10 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use super::{
+    checkpoint::{Checkpoints, checkpointed},
     ozon_adapter::OzonReportRequest,
     ozon_source::{OzonReportSourceError, OzonReportTransport},
     postgres_collector::{CollectedFinanceFact, FinanceCategory},
@@ -27,7 +29,7 @@ pub enum OzonFinanceParseError {
     Limit,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct AccrualType {
     category: FinanceCategory,
     known: bool,
@@ -38,21 +40,32 @@ pub async fn collect_finance_facts(
     date_from: NaiveDate,
     date_to: NaiveDate,
 ) -> Result<Vec<CollectedFinanceFact>, OzonReportSourceError> {
+    collect_finance_facts_checkpointed(transport, date_from, date_to, &None).await
+}
+
+pub async fn collect_finance_facts_checkpointed(
+    transport: &dyn OzonReportTransport,
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+    checkpoints: &Checkpoints,
+) -> Result<Vec<CollectedFinanceFact>, OzonReportSourceError> {
     if date_from > date_to {
         return Err(OzonReportSourceError::InvalidSnapshotInput);
     }
-    let types_response = transport
-        .post(OzonReportRequest {
-            path: "/v1/finance/accrual/types",
-            payload: json!({}),
-        })
-        .await?;
-    let types =
-        parse_types(&types_response).map_err(|_| OzonReportSourceError::InvalidFinanceResponse)?;
+    let types = checkpointed(checkpoints, json!(["ozon_finance_types"]), || async {
+        let response = transport
+            .post(OzonReportRequest {
+                path: "/v1/finance/accrual/types",
+                payload: json!({}),
+            })
+            .await?;
+        parse_types(&response).map_err(|_| OzonReportSourceError::InvalidFinanceResponse)
+    })
+    .await?;
     let mut aggregate = BTreeMap::new();
     let mut date = date_from;
     loop {
-        collect_day(transport, date, &types, &mut aggregate).await?;
+        collect_day(transport, date, &types, &mut aggregate, checkpoints).await?;
         if date == date_to {
             break;
         }
@@ -84,18 +97,61 @@ async fn collect_day(
     date: NaiveDate,
     types: &BTreeMap<u64, AccrualType>,
     aggregate: &mut FinanceAggregate,
+    checkpoints: &Checkpoints,
 ) -> Result<(), OzonReportSourceError> {
     let mut last_id = String::new();
     let mut seen = BTreeSet::new();
     for _ in 0..MAX_PAGES_PER_DAY {
-        let response = transport
-            .post(OzonReportRequest {
+        let (facts, rows, next) = checkpointed(
+            checkpoints,
+            json!(["ozon_finance_day", date, last_id]),
+            || async {
+                let response = transport.post(OzonReportRequest {
                 path: "/v1/finance/accrual/by-day",
                 payload: json!({"date": date.format("%Y-%m-%d").to_string(), "last_id": last_id}),
-            })
-            .await?;
-        let (rows, next) = parse_page(&response, date, types, aggregate)
-            .map_err(|_| OzonReportSourceError::InvalidFinanceResponse)?;
+            }).await?;
+                let mut page = BTreeMap::new();
+                let (rows, next) = parse_page(&response, date, types, &mut page)
+                    .map_err(|_| OzonReportSourceError::InvalidFinanceResponse)?;
+                let facts = page
+                    .into_iter()
+                    .map(
+                        |(
+                            (business_date, sku, category),
+                            (amount_minor, line_count, unknown_type_count),
+                        )| {
+                            CollectedFinanceFact {
+                                business_date,
+                                sku,
+                                category,
+                                amount_minor,
+                                line_count,
+                                unknown_type_count,
+                            }
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                Ok::<_, OzonReportSourceError>((facts, rows, next))
+            },
+        )
+        .await?;
+        for fact in facts {
+            let entry = aggregate
+                .entry((fact.business_date, fact.sku, fact.category))
+                .or_default();
+            entry.0 = entry
+                .0
+                .checked_add(fact.amount_minor)
+                .ok_or(OzonReportSourceError::InvalidFinanceResponse)?;
+            entry.1 = entry
+                .1
+                .checked_add(fact.line_count)
+                .ok_or(OzonReportSourceError::InvalidFinanceResponse)?;
+            entry.2 = entry
+                .2
+                .checked_add(fact.unknown_type_count)
+                .ok_or(OzonReportSourceError::InvalidFinanceResponse)?;
+        }
         if next.is_empty() {
             return Ok(());
         }

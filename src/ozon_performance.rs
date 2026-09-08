@@ -177,7 +177,10 @@ pub enum PerformanceError {
     #[error(
         "Ozon Performance API ограничил частоту запросов (HTTP 429, request-id: {request_id:?})"
     )]
-    RateLimited { request_id: Option<String> },
+    RateLimited {
+        request_id: Option<String>,
+        retry_after: Option<Duration>,
+    },
     #[error("Ozon Performance API вернул HTTP {status} (request-id: {request_id:?})")]
     Api {
         status: StatusCode,
@@ -247,7 +250,7 @@ impl PerformanceError {
         match self {
             Self::Unauthorized { request_id }
             | Self::Forbidden { request_id }
-            | Self::RateLimited { request_id }
+            | Self::RateLimited { request_id, .. }
             | Self::Api { request_id, .. }
             | Self::InvalidJson { request_id, .. }
             | Self::ResponseTooLarge { request_id, .. } => request_id.as_deref(),
@@ -897,7 +900,11 @@ impl PerformanceClient {
         let request_id = safe_request_id(response.headers());
         let status = response.status();
         if !status.is_success() {
-            return Err(classify_status(status, request_id));
+            return Err(classify_status(
+                status,
+                request_id,
+                crate::ozon::retry_after_duration(response.headers()),
+            ));
         }
         let bytes = read_body(response, MAX_TOKEN_BODY_BYTES, request_id.clone()).await?;
         let token: TokenResponse = serde_json::from_slice(&bytes)
@@ -937,11 +944,18 @@ fn classify_transport(error: &reqwest::Error) -> PerformanceError {
     }
 }
 
-fn classify_status(status: StatusCode, request_id: Option<String>) -> PerformanceError {
+fn classify_status(
+    status: StatusCode,
+    request_id: Option<String>,
+    retry_after: Option<Duration>,
+) -> PerformanceError {
     match status {
         StatusCode::UNAUTHORIZED => PerformanceError::Unauthorized { request_id },
         StatusCode::FORBIDDEN => PerformanceError::Forbidden { request_id },
-        StatusCode::TOO_MANY_REQUESTS => PerformanceError::RateLimited { request_id },
+        StatusCode::TOO_MANY_REQUESTS => PerformanceError::RateLimited {
+            request_id,
+            retry_after,
+        },
         _ => PerformanceError::Api { status, request_id },
     }
 }
@@ -950,7 +964,11 @@ async fn decode_json(response: Response, limit: usize) -> Result<Value, Performa
     let request_id = safe_request_id(response.headers());
     let status = response.status();
     if !status.is_success() {
-        return Err(classify_status(status, request_id));
+        return Err(classify_status(
+            status,
+            request_id,
+            crate::ozon::retry_after_duration(response.headers()),
+        ));
     }
     let bytes = read_body(response, limit, request_id.clone()).await?;
     serde_json::from_slice(&bytes)
@@ -2125,6 +2143,7 @@ mod tests {
                 request_id: Some("one".to_owned()),
             },
             PerformanceError::RateLimited {
+                retry_after: None,
                 request_id: Some("one".to_owned()),
             },
             PerformanceError::Api {

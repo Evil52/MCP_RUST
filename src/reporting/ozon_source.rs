@@ -8,15 +8,17 @@
 use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use serde_json::Value;
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
     config::StoreId,
-    ozon::{OzonClient, OzonErrorKind},
+    ozon::{OzonClient, OzonError, OzonErrorKind},
 };
 
 use super::{
+    checkpoint::{CheckpointError, Checkpoints, checkpointed},
     ozon_adapter::{
         OzonReportParseError, OzonReportRequest, next_warehouse_stock_cursor, parse_price_page,
         parse_sales_page, parse_stock_page, parse_warehouse_stock_page, product_page_request,
@@ -162,6 +164,7 @@ impl<T: OzonReportTransport + ?Sized> OzonReportTransport for &T {
 /// Seller API read-only egress allowlist at request time.
 #[derive(Clone)]
 pub struct OzonClientReportTransport {
+    durable_retry: bool,
     client: OzonClient,
     store: StoreId,
 }
@@ -169,7 +172,16 @@ pub struct OzonClientReportTransport {
 impl OzonClientReportTransport {
     #[must_use]
     pub const fn new(client: OzonClient, store: StoreId) -> Self {
-        Self { client, store }
+        Self {
+            client,
+            store,
+            durable_retry: false,
+        }
+    }
+    #[must_use]
+    pub const fn with_durable_retry(mut self) -> Self {
+        self.durable_retry = true;
+        self
     }
 }
 
@@ -181,13 +193,37 @@ impl OzonReportTransport for OzonClientReportTransport {
         let path = request.path;
         Box::pin(async move {
             retry_local_overload(path, || async {
-                self.client
-                    .post_queued(&self.store, path, request.payload.clone())
-                    .await
+                let result = if self.durable_retry {
+                    self.client
+                        .post_checkpoint_page(&self.store, path, request.payload.clone())
+                        .await
+                } else {
+                    self.client
+                        .post_queued(&self.store, path, request.payload.clone())
+                        .await
+                };
+                result
                     // Keep only the stable, non-sensitive classification. In
                     // particular, never retain Ozon's error body in report
                     // collection diagnostics.
-                    .map_err(|error| error.kind())
+                    .map_err(|error| match &error {
+                        OzonError::RateLimited {
+                            retry_after,
+                            local_cooldown,
+                            ..
+                        } => (*retry_after).max(*local_cooldown).map_or(
+                            OzonReportSourceError::Upstream(OzonErrorKind::RateLimited),
+                            |delay| OzonReportSourceError::RetryAfter {
+                                seconds: super::checkpoint::delay_seconds(delay),
+                            },
+                        ),
+                        OzonError::LocalRateLimited { retry_after } => {
+                            OzonReportSourceError::RetryAfter {
+                                seconds: super::checkpoint::delay_seconds(*retry_after),
+                            }
+                        }
+                        _ => OzonReportSourceError::Upstream(error.kind()),
+                    })
             })
             .await
         })
@@ -199,19 +235,22 @@ impl OzonReportTransport for OzonClientReportTransport {
 /// Extracted from the transport so the policy is testable without saturating
 /// a real client's semaphores, which are private to `OzonClient` for good
 /// reason.
-async fn retry_local_overload<F, Fut>(
+async fn retry_local_overload<F, Fut, E>(
     path: &'static str,
     mut attempt_once: F,
 ) -> Result<Value, OzonReportSourceError>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<Value, OzonErrorKind>>,
+    Fut: Future<Output = Result<Value, E>>,
+    E: Into<OzonReportSourceError>,
 {
     let mut attempt = 1;
     loop {
-        match attempt_once().await {
+        match attempt_once().await.map_err(Into::into) {
             Ok(value) => return Ok(value),
-            Err(OzonErrorKind::Overloaded) if attempt < OVERLOAD_RETRY_ATTEMPTS => {
+            Err(OzonReportSourceError::Upstream(OzonErrorKind::Overloaded))
+                if attempt < OVERLOAD_RETRY_ATTEMPTS =>
+            {
                 tracing::debug!(
                     endpoint = path,
                     attempt,
@@ -220,7 +259,10 @@ where
                 attempt += 1;
                 tokio::time::sleep(OVERLOAD_RETRY_DELAY).await;
             }
-            Err(kind) => return Err(report_upstream_failure(path, kind)),
+            Err(OzonReportSourceError::Upstream(kind)) => {
+                return Err(report_upstream_failure(path, kind));
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -237,6 +279,7 @@ fn report_upstream_failure(path: &'static str, kind: OzonErrorKind) -> OzonRepor
 
 pub struct OzonReportSource<T> {
     transport: T,
+    checkpoints: Checkpoints,
 }
 
 /// Complete in-memory Ozon Seller input for one report cutoff.
@@ -389,12 +432,24 @@ fn snapshot_validation_error(
 
 impl<T> OzonReportSource<T> {
     pub const fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            checkpoints: None,
+        }
+    }
+    #[must_use]
+    pub fn with_checkpoints(mut self, checkpoints: Checkpoints) -> Self {
+        self.checkpoints = checkpoints;
+        self
     }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum OzonReportSourceError {
+    #[error("collection quota requires a pause")]
+    RetryAfter { seconds: u64 },
+    #[error(transparent)]
+    Checkpoint(#[from] CheckpointError),
     #[error("Ozon daily-report source request failed")]
     Upstream(OzonErrorKind),
     #[error("Ozon daily-report source request failed")]
@@ -416,10 +471,22 @@ pub enum OzonReportSourceError {
 }
 
 impl OzonReportSourceError {
+    #[must_use]
+    pub const fn failure(&self) -> super::source_collection::SourceFailure {
+        super::source_collection::SourceFailure {
+            code: self.code(),
+            retry_after: match self {
+                Self::RetryAfter { seconds } => Some(*seconds),
+                _ => None,
+            },
+        }
+    }
     /// A stable, non-sensitive diagnostic code suitable for operator logs.
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::RetryAfter { .. } => "rate_limited",
+            Self::Checkpoint(error) => error.code(),
             Self::Upstream(kind) => kind.code(),
             Self::Transport => "transport_error",
             Self::InvalidResponse => "invalid_response",
@@ -445,6 +512,20 @@ impl OzonReportSourceError {
 }
 
 impl<T: OzonReportTransport> OzonReportSource<T> {
+    pub async fn collect_finance_pages(
+        &self,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<CollectedFinanceFact>, OzonReportSourceError> {
+        super::ozon_finance_source::collect_finance_facts_checkpointed(
+            &self.transport,
+            from,
+            to,
+            &self.checkpoints,
+        )
+        .await
+    }
+
     pub async fn collect_required_seller_facts(
         &self,
         date_from: NaiveDate,
@@ -474,12 +555,19 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
     ) -> Result<Vec<CollectedSalesFact>, OzonReportSourceError> {
         let request = sales_request(date_from, date_to, offset)
             .map_err(|_| OzonReportSourceError::InvalidResponse)?;
-        let response = self.transport.post(request).await?;
-        parse_sales_page(&response).map_err(|_| {
-            let shape = sales_response_shape(&response);
-            tracing::warn!(shape, "Ozon Seller analytics response shape was rejected");
-            OzonReportSourceError::InvalidSalesResponse { shape }
-        })
+        checkpointed(
+            &self.checkpoints,
+            json!([request.path, request.payload]),
+            || async {
+                let response = self.transport.post(request).await?;
+                parse_sales_page(&response).map_err(|_| {
+                    let shape = sales_response_shape(&response);
+                    tracing::warn!(shape, "Ozon Seller analytics response shape was rejected");
+                    OzonReportSourceError::InvalidSalesResponse { shape }
+                })
+            },
+        )
+        .await
     }
 
     /// Collects offset-paginated sales rows under the client's one-request-per-
@@ -559,13 +647,31 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         for _ in 0..MAX_PRODUCT_PAGES {
             let request = warehouse_stock_page_request(path, cursor.as_deref())
                 .map_err(|_| OzonReportSourceError::InvalidResponse)?;
-            let response = self.transport.post(request).await?;
-            facts.extend(
-                parse_warehouse_stock_page(&response, scheme)
-                    .map_err(|_| OzonReportSourceError::InvalidStocksResponse)?,
-            );
-            cursor = next_warehouse_stock_cursor(&response)
-                .map_err(|_| OzonReportSourceError::InvalidStocksResponse)?;
+            let page: Option<(Vec<CollectedStockFact>, Option<String>)> = checkpointed(
+                &self.checkpoints,
+                json!([request.path, request.payload]),
+                || async {
+                    let response = match self.transport.post(request).await {
+                        Ok(value) => value,
+                        Err(OzonReportSourceError::Upstream(
+                            OzonErrorKind::Http | OzonErrorKind::NotFound,
+                        )) if scheme == "fbo" => return Ok(None),
+                        Err(error) => return Err(error),
+                    };
+                    let rows = parse_warehouse_stock_page(&response, scheme).map_err(|error| {
+                        rejected_stock_response(path, "facts", error, &response)
+                    })?;
+                    let next = next_warehouse_stock_cursor(&response).map_err(|error| {
+                        rejected_stock_response(path, "cursor", error, &response)
+                    })?;
+                    Ok::<_, OzonReportSourceError>(Some((rows, next)))
+                },
+            )
+            .await?;
+            let (rows, next) =
+                page.ok_or(OzonReportSourceError::Upstream(OzonErrorKind::NotFound))?;
+            facts.extend(rows);
+            cursor = next;
             if cursor
                 .as_ref()
                 .is_some_and(|cursor| !seen_cursors.insert(cursor.clone()))
@@ -598,7 +704,8 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         invalid_response: OzonReportSourceError,
     ) -> Result<Vec<Fact>, OzonReportSourceError>
     where
-        F: Fn(&Value) -> Result<Vec<Fact>, OzonReportParseError> + Copy,
+        F: Fn(&Value) -> Result<Vec<Fact>, OzonReportParseError> + Copy + Send + Sync,
+        Fact: Serialize + DeserializeOwned + Send,
     {
         let mut cursor = None;
         let mut seen_cursors = BTreeSet::new();
@@ -606,9 +713,20 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         for _ in 0..MAX_PRODUCT_PAGES {
             let request = product_page_request(path, cursor.as_deref())
                 .map_err(|_| OzonReportSourceError::InvalidResponse)?;
-            let response = self.transport.post(request).await?;
-            facts.extend(parse(&response).map_err(|_| invalid_response.clone())?);
-            cursor = next_cursor(&response, invalid_response.clone())?;
+            let (rows, next) = checkpointed(
+                &self.checkpoints,
+                json!([request.path, request.payload]),
+                || async {
+                    let response = self.transport.post(request).await?;
+                    Ok::<_, OzonReportSourceError>((
+                        parse(&response).map_err(|_| invalid_response.clone())?,
+                        next_cursor(&response, invalid_response.clone())?,
+                    ))
+                },
+            )
+            .await?;
+            facts.extend(rows);
+            cursor = next;
             if cursor
                 .as_ref()
                 .is_some_and(|cursor| !seen_cursors.insert(cursor.clone()))
@@ -637,6 +755,44 @@ fn next_cursor(
     product_page_request("/v4/product/info/stocks", Some(cursor))
         .map_err(|_| OzonReportSourceError::InvalidResponse)?;
     Ok(Some(cursor.to_owned()))
+}
+
+/// Stock diagnostics contain only fixed field names, JSON types and row counts.
+/// Never log upstream identifiers, cursor contents, unexpected keys or values.
+fn rejected_stock_response(
+    endpoint: &'static str,
+    phase: &'static str,
+    error: OzonReportParseError,
+    response: &Value,
+) -> OzonReportSourceError {
+    let shape = stock_response_shape(response);
+    tracing::warn!(
+        endpoint,
+        phase,
+        parse_error = ?error,
+        shape,
+        "Ozon Seller warehouse stock response was rejected"
+    );
+    OzonReportSourceError::InvalidStocksResponse
+}
+
+fn stock_response_shape(response: &Value) -> String {
+    let products = response.get("products").and_then(Value::as_array);
+    let first = products.and_then(|rows| rows.first());
+    let kind = |value: Option<&Value>| value.map_or("missing", json_kind);
+    let fields = ["sku", "warehouse_id", "present", "reserved", "free_stock"]
+        .map(|name| format!("{name}={}", kind(first.and_then(|row| row.get(name)))))
+        .join(",");
+    format!(
+        "root={},products={},rows={},first={},has_next={},cursor={},{}",
+        json_kind(response),
+        kind(response.get("products")),
+        products.map_or(0, Vec::len),
+        kind(first),
+        kind(response.get("has_next")),
+        kind(response.get("cursor")),
+        fields,
+    )
 }
 
 /// Produces a bounded, value-free structural fingerprint for a rejected sales
@@ -704,6 +860,12 @@ const fn json_kind(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+impl From<OzonErrorKind> for OzonReportSourceError {
+    fn from(kind: OzonErrorKind) -> Self {
+        Self::Upstream(kind)
     }
 }
 
@@ -1016,6 +1178,30 @@ mod tests {
         assert_eq!(
             source.sales_page(day, day, 0).await.unwrap_err().code(),
             "invalid_sales_response"
+        );
+    }
+
+    #[test]
+    fn stock_shape_fingerprint_never_includes_upstream_values_or_keys() {
+        let shape = stock_response_shape(&json!({
+            "products": [{
+                "sku": "private-sku", "warehouse_id": 987_654_321,
+                "present": -12345, "reserved": null,
+                "private-field": "private-value"
+            }],
+            "has_next": false, "cursor": "private-cursor",
+            "private-root": "private-root-value"
+        }));
+        assert_eq!(
+            shape,
+            "root=object,products=array,rows=1,first=object,has_next=bool,cursor=string,sku=string,warehouse_id=number,present=number,reserved=null,free_stock=missing"
+        );
+        assert!(!shape.contains("private"));
+        assert!(!shape.contains("987654321"));
+        assert!(!shape.contains("12345"));
+        assert_eq!(
+            stock_response_shape(&json!(null)),
+            "root=null,products=missing,rows=0,first=missing,has_next=missing,cursor=missing,sku=missing,warehouse_id=missing,present=missing,reserved=missing,free_stock=missing"
         );
     }
 
@@ -1620,6 +1806,66 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn durable_retry_returns_vendor_pause_before_page_lease_timeout() {
+        let (url, requests) = crate::test_support::mock_http(vec![(429, "{}".to_owned())]);
+        let client = OzonClient::new(
+            url,
+            std::time::Duration::from_secs(2),
+            BTreeMap::from([(
+                StoreId::from("test"),
+                StoreCredentials {
+                    client_id: "id".to_owned(),
+                    api_key: "key".to_owned(),
+                },
+            )]),
+        )
+        .unwrap();
+        let transport =
+            OzonClientReportTransport::new(client, StoreId::from("test")).with_durable_retry();
+        let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            transport.post(sales_request(date, date, 0).unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.code(), "rate_limited");
+        assert!(error.failure().retry_after.unwrap() >= 65);
+        assert_eq!(requests.try_iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn retired_stock_route_is_checkpointed_before_resuming_fallback() {
+        use crate::reporting::checkpoint::tests::{MemoryPages, journal};
+        let transport = RecordingTransport {
+            responses: Mutex::new(VecDeque::from([
+                Err(OzonReportSourceError::Upstream(OzonErrorKind::NotFound)),
+                Ok(json!({"items":[],"cursor":""})),
+            ])),
+            paths: Mutex::new(vec![]),
+        };
+        let pages = MemoryPages::default();
+        assert_eq!(
+            OzonReportSource::new(&transport)
+                .with_checkpoints(journal(&pages))
+                .collect_stock_pages()
+                .await,
+            Err(OzonReportSourceError::Checkpoint(CheckpointError::Deferred))
+        );
+        assert!(
+            OzonReportSource::new(&transport)
+                .with_checkpoints(journal(&pages))
+                .collect_stock_pages()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(transport.paths.lock().unwrap().len(), 2);
+        assert!(transport.responses.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

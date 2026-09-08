@@ -3,6 +3,9 @@
     reason = "PostgreSQL transactions borrow the supervised session guard until commit"
 )]
 
+mod source_jobs;
+pub use source_jobs::SourceJobClaim;
+
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -1013,11 +1016,19 @@ async fn persist_in_transaction(
     claim: &CollectionClaim,
     snapshot: &CollectedSnapshot,
 ) -> Result<i64, PostgresCollectorError> {
+    let snapshot_id = insert_snapshot(transaction, claim, snapshot).await?;
+    persist_snapshot_contents(transaction, snapshot_id, snapshot).await
+}
+
+async fn persist_snapshot_contents(
+    transaction: &Transaction<'_>,
+    snapshot_id: i64,
+    snapshot: &CollectedSnapshot,
+) -> Result<i64, PostgresCollectorError> {
     let payload = serde_json::to_vec(snapshot).map_err(|_| PostgresCollectorError::InvalidInput)?;
     let payload_sha256 = sha256(&payload);
     let row_count =
         i32::try_from(snapshot.facts.len()).map_err(|_| PostgresCollectorError::InvalidInput)?;
-    let snapshot_id = insert_snapshot(transaction, claim, snapshot).await?;
     insert_facts(transaction, snapshot_id, &snapshot.facts).await?;
     insert_advertising_expenses(transaction, snapshot_id, &snapshot.advertising_expenses).await?;
     let status = match snapshot.status {

@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+mod source_credentials;
+
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use tokio_postgres::{Config, config::Host};
@@ -121,6 +123,7 @@ pub struct ReportCollectorConfig {
     registry: Arc<AccessRegistry>,
     collection_plan: Vec<CollectionTarget>,
     credential_directory: Option<CredentialDirectory>,
+    performance_source_clients: std::sync::Mutex<BTreeMap<String, (PerformanceClient, StoreId)>>,
 }
 
 impl ReportCollectorConfig {
@@ -183,6 +186,7 @@ impl ReportCollectorConfig {
             registry,
             collection_plan,
             credential_directory,
+            performance_source_clients: std::sync::Mutex::default(),
         })
     }
 
@@ -918,6 +922,11 @@ mod tests {
 
     #[test]
     fn scheduled_mode_requires_enabled_policy_and_resolves_only_claimed_account() {
+        use super::super::{
+            postgres_collector::SourceJobClaim,
+            snapshot::{Marketplace, SnapshotSource},
+        };
+
         let enabled_policy = file(
             "scheduled-policy",
             r#"{"version":1,"enabled":true,"timezone":"Asia/Yekaterinburg","sender_email_env":"SENDER","audiences":[{"id":"owner","email_env":"OWNER","managers":[{"actor_id":"diana","account_ids":["ozon"]},{"actor_id":"wb","account_ids":["wb"]}]}]}"#,
@@ -974,6 +983,38 @@ mod tests {
                 .resolve_wb_scheduled(&claim("ozon", super::super::snapshot::Marketplace::Ozon))
                 .is_err()
         );
+
+        let advertising = SourceJobClaim::for_test(
+            claim("ozon", Marketplace::Ozon),
+            SnapshotSource::Advertising,
+        );
+        assert!(scheduled.source_performance(&advertising).is_ok());
+        // A new page reuses the client and its Arc-backed OAuth state. A fresh
+        // runtime must resolve credentials again; lease checks still run first.
+        fs::remove_file(credential_directory.join("PERF_SECRET")).unwrap();
+        assert!(scheduled.source_performance(&advertising).is_ok());
+        assert!(
+            config(&values)
+                .unwrap()
+                .source_performance(&advertising)
+                .is_err()
+        );
+        let expired = SourceJobClaim::for_test(
+            CollectionClaim::for_test(
+                "ozon",
+                Marketplace::Ozon,
+                Utc::now() - Duration::from_secs(1),
+            ),
+            SnapshotSource::Advertising,
+        );
+        assert!(scheduled.source_performance(&expired).is_err());
+        let sales =
+            SourceJobClaim::for_test(claim("ozon", Marketplace::Ozon), SnapshotSource::Sales);
+        assert!(
+            scheduled.source_seller(&sales).is_ok(),
+            "Seller data must not require advertising credentials"
+        );
+        assert!(scheduled.source_performance(&sales).is_err());
 
         let mut disabled_policy_values = entries();
         disabled_policy_values.push((MODE_ENV, "scheduled".to_owned()));

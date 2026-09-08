@@ -17,7 +17,7 @@ use mcp_ozon::reporting::{
     wb_source::{WbClientReportTransport, WbReportSource},
 };
 use mcp_ozon::runtime::print_runtime_version_if_requested;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 use tokio::signal;
 use tokio::time::{Duration, MissedTickBehavior, timeout};
 use tokio_util::sync::CancellationToken;
@@ -65,13 +65,39 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let config = ReportCollectorConfig::from_lookup(&mut |key| std::env::var(key).ok())?;
-    let writer = PostgresSnapshotWriter::connect(config.database_config())
-        .await
-        .context("daily report snapshot writer is unavailable")?;
+    let writer = Arc::new(
+        PostgresSnapshotWriter::connect(config.database_config())
+            .await
+            .context("daily report snapshot writer is unavailable")?,
+    );
     writer.verify_runtime_contract().await?;
     let targets = config.collection_plan();
     match command {
+        Command::SourcesPreflight | Command::SourcesTick | Command::RunSources => {
+            mcp_ozon::reporting::source_collection::require_enabled(&config, &writer).await?;
+            if command == Command::SourcesPreflight {
+                return Ok(());
+            }
+            if command == Command::SourcesTick {
+                mcp_ozon::reporting::source_collection::enqueue_recent(
+                    &config,
+                    &writer,
+                    Utc::now(),
+                )
+                .await?;
+                mcp_ozon::reporting::source_collection::run_quantum(
+                    &config,
+                    &writer,
+                    &claim_owner("source"),
+                )
+                .await?;
+                return Ok(());
+            }
+            run_independent_sources(&config, &writer).await?;
+            return Ok(());
+        }
         Command::Healthcheck => {
+            writer.verify_source_job_contract().await?;
             tracing::info!(targets = targets.len(), "report collector preflight passed");
             return Ok(());
         }
@@ -138,8 +164,46 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_independent_sources(
+    config: &ReportCollectorConfig,
+    writer: &Arc<PostgresSnapshotWriter>,
+) -> Result<()> {
+    let cancellation = CancellationToken::new();
+    let signal = cancellation.clone();
+    let task = tokio::spawn(async move {
+        shutdown_signal().await;
+        signal.cancel();
+    });
+    let owner = claim_owner("source");
+    let mut planned_at = Utc::now() - chrono::Duration::minutes(1);
+    let mut timer = tokio::time::interval(Duration::from_secs(1));
+    timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! { biased; ()=cancellation.cancelled()=>break, _=timer.tick()=>{} }
+        let now = Utc::now();
+        if now - planned_at >= chrono::Duration::seconds(60) {
+            mcp_ozon::reporting::source_collection::enqueue_recent(config, writer, now).await?;
+            planned_at = now;
+        }
+        // Cancellation drops the in-flight read; its short fenced lease can be
+        // reclaimed after restart. Saved pages are unaffected.
+        tokio::select! {
+            biased;
+            ()=cancellation.cancelled()=>break,
+            result=mcp_ozon::reporting::source_collection::run_quantum(config,writer,&owner)=>{
+                if let Err(error)=result {tracing::warn!(error=%error,"source collection quantum failed");}
+            }
+        }
+    }
+    task.abort();
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
+    SourcesPreflight,
+    SourcesTick,
+    RunSources,
     ServeDisabled,
     Healthcheck,
     CollectionPreflight,
@@ -167,6 +231,9 @@ enum Command {
 fn parse_command(arguments: &[String]) -> Result<Command> {
     match arguments {
         [] => Ok(Command::ServeDisabled),
+        [argument] if argument == "sources-preflight" => Ok(Command::SourcesPreflight),
+        [argument] if argument == "sources-tick" => Ok(Command::SourcesTick),
+        [argument] if argument == "run-sources" => Ok(Command::RunSources),
         [argument] if argument == "healthcheck" => Ok(Command::Healthcheck),
         [argument] if argument == "collection-preflight" => Ok(Command::CollectionPreflight),
         [argument] if argument == "collect-due" => Ok(Command::CollectDue),
@@ -192,7 +259,7 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         }
         _ => {
             bail!(
-                "usage: report-collector [healthcheck | collection-preflight | collect-due | refresh-once | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | wb-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | bootstrap-credentials <access.json> <policy.json> <source.env> <new-output-directory>]"
+                "usage: report-collector [healthcheck | sources-preflight | sources-tick | run-sources | collection-preflight | collect-due | refresh-once | run-scheduler | ozon-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | wb-dry-run <account-id> <YYYY-MM-DD> [morning|evening] | bootstrap-credentials <access.json> <policy.json> <source.env> <new-output-directory>]"
             )
         }
     }

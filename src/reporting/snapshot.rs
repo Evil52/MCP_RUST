@@ -24,7 +24,10 @@ pub enum Marketplace {
     Wildberries,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum SnapshotSource {
     Sales,
     Advertising,

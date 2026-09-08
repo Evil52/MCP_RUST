@@ -57,6 +57,14 @@ SELECT
     AND to_regclass('daily_reporting.price_facts') IS NOT NULL
     AND to_regclass('daily_reporting.unit_economics_inputs') IS NOT NULL
     AND to_regclass('daily_reporting.collection_claims') IS NOT NULL
+    AND to_regclass('daily_reporting.source_collection_jobs') IS NOT NULL
+    AND to_regclass('daily_reporting.source_collection_pages') IS NOT NULL
+    AND to_regclass('daily_reporting.source_collection_departures') IS NOT NULL
+    AND has_function_privilege('report_collector','daily_reporting.claim_source_collection(jsonb,text)','EXECUTE')
+    AND has_function_privilege('report_collector','daily_reporting.dispatch_source_refreshes(jsonb)','EXECUTE')
+    AND NOT has_table_privilege('report_collector','daily_reporting.source_collection_jobs','INSERT,UPDATE,DELETE')
+    AND has_table_privilege('position_reader','daily_reporting.mcp_source_collection_jobs','SELECT')
+    AND NOT has_table_privilege('position_reader','daily_reporting.source_collection_pages','SELECT')
     AND to_regclass('daily_reporting.ozon_sales_refresh_requests') IS NOT NULL
     AND to_regclass('daily_reporting.marketplace_sales_refresh_one_active_account_idx') IS NOT NULL
     AND to_regclass('daily_reporting.marketplace_sales_refresh_history_idx') IS NOT NULL
@@ -1760,7 +1768,7 @@ SELECT
         OR (
             to_regclass('mcp_runtime.schema_migrations') IS NOT NULL
             AND (
-                SELECT count(*) = 28
+                SELECT count(*) = 29
                     AND bool_and(state = 'applied')
                     AND bool_and(applied_at IS NOT NULL)
                 FROM mcp_runtime.schema_migrations
