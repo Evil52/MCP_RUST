@@ -39,9 +39,9 @@ Available tools:
 - `wb_promotion_reconcile_bid_plan` — read-back only; it never repeats a write.
 
 This is a separate twelve-tool Control registry. It is not part of the Analytics
-MCP release contract, which contains exactly 79 tools. Seventy-eight are
-read-only; `ofk_request_ozon_sales_refresh` only mutates the internal deduplicated
-snapshot-refresh queue and has no marketplace egress. In Control,
+MCP release contract, which contains exactly 86 tools. The refresh-request tools
+only mutate internal deduplicated snapshot-refresh queues and have no marketplace
+egress; the other Analytics tools are read-only. In Control,
 `prepare`, `approve`, and `apply` intentionally advertise non-read-only
 annotations because they change durable Control state. Ozon `reconcile` is a
 closed-world durable status read. The workflow executor, not the HTTP/MCP

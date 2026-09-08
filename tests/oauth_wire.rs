@@ -612,6 +612,8 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         "wb_tariff_pallets",
         "wb_tariff_returns",
         "wb_warehouse_stocks",
+        "wb_seller_warehouses",
+        "wb_seller_warehouse_stocks",
         "wb_orders",
         "wb_sales",
         "wb_stores_status",
