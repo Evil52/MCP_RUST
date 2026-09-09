@@ -72,6 +72,7 @@ jobs:
           python3 -B -m unittest discover -s tests -p test_reporting_health_contract.py
           python3 -B -m unittest discover -s tests -p test_operations_notifications.py
           python3 -B -m unittest discover -s tests -p test_recovery_bundle.py
+          python3 -B -m unittest discover -s tests -p test_marketplace_routes.py
           ./scripts/test-release-image-lock.sh
           ./scripts/test-release-evidence.sh
           ./scripts/test-merged-pr-release.sh
