@@ -1,5 +1,38 @@
 # Operational monitoring contract
 
+## PostgreSQL session contention
+
+The application's existing HTTP `/metrics` surface exports fixed, unlabelled,
+process-local measurements from `mcp-storage`; scraping them never takes the
+database mutex or performs SQL. They contain no account, statement, URL or
+credential labels. Worker processes without that HTTP surface do not become
+remotely scrapeable automatically; each `SupervisedClient` also provides a
+local `session_metrics()` snapshot for diagnostics.
+
+- `mcp_postgres_session_waiters` / `mcp_postgres_sessions_held`: current gauges.
+- `mcp_postgres_session_wait_seconds_count` / `_sum`: completed mutex waits,
+  including cancellation; the sum is in seconds.
+- `mcp_postgres_session_cancelled_waits_total`: waits dropped before acquisition.
+- `mcp_postgres_session_hold_seconds_count` / `_sum`: completed exclusive
+  ownership, including reconnect/verification while holding the mutex.
+- `mcp_postgres_session_wait_max_seconds` / `hold_max_seconds`: maxima since
+  process start, not percentiles or sliding-window values.
+
+All totals reset on process restart. Concurrent snapshots are approximate, not
+transactionally consistent. Durations use monotonic time and bounded counters;
+finished intervals are recorded on drop, so a currently stalled holder is not
+yet reflected in its duration sum. These are session/mutex metrics, not SQL
+execution timings. Summary series have count/sum only, without quantiles.
+
+Compare `rate(wait_seconds_sum[5m]) / rate(wait_seconds_count[5m])` (using the
+full metric prefix) with request latency and cancellation rate; no observations
+means unavailable, not zero. Process totals identify contention but not its
+repository. Inspect per-client snapshots and SQL plans before deciding whether
+to add a small read pool. A pool must not share Control advisory-lock or
+transaction ownership, broaden database roles or bypass concurrency budgets.
+
+## Runtime and reporting health
+
 `scripts/check-runtime-health.sh` checks the always-on deployment, backup and
 restore evidence, database-backed WB automation state, and stalled reporting
 work. Its default Compose contract contains only the always-on base services:

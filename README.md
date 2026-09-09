@@ -576,14 +576,16 @@ Ozon tools являются необязательными чтениями от
 ./scripts/local-ci.sh
 ```
 
-Скрипт проверяет форматирование, все тесты и targets/features, строгий Clippy,
-документацию без предупреждений, RustSec, лицензии/источники зависимостей и
-ноль непокрытых адресуемых source lines библиотечного ядра по строгому
-`cargo llvm-cov --fail-uncovered-lines 0`. Операционные `main.rs` и `src/bin/*`
-компилируются через отдельные `--all-targets --all-features` quality-gates, но
-честно исключены из метрики core coverage: для coverage отключается служебная
-feature `runtime-binaries`, которая управляет только наличием binary targets и
-не меняет библиотечное ядро. Нужные локальные инструменты:
+Скрипт проверяет форматирование, все workspace crates и targets/features,
+бюджет размера Rust-файлов, строгий Clippy, документацию без предупреждений,
+RustSec и лицензии/источники зависимостей. Пороги `cargo llvm-cov`:
+`--fail-under-lines 95.8 --fail-under-functions 95.5`. Это не обещание 100%
+покрытия production-кода: оставшиеся inline tests тоже входят в подсчёт.
+Coverage запускается с `--workspace --all-targets --all-features` и отдельной
+тестовой PostgreSQL. Операционные `main.rs` и `src/bin/*` исключены только
+из подсчёта покрытия; бинарники компилируются, а их контракты проверяются
+runtime probes. Feature `runtime-binaries` в этом запуске не отключается.
+Нужные локальные инструменты:
 
 ```bash
 rustup component add clippy rustfmt llvm-tools-preview
@@ -593,6 +595,19 @@ cargo install cargo-llvm-cov --version 0.8.7 --locked
 ```
 
 ## CI и защита Pull Request
+
+Границы workspace и порядок дальнейшего разделения описаны в
+[ADR 0002](docs/adr/0002-rust-workspace-boundaries.md), обязательства по SDK —
+в [ADR 0003](docs/adr/0003-vendored-rmcp.md), PostgreSQL-транспорт —
+в [ADR 0004](docs/adr/0004-postgresql-transport.md).
+Обзор технологий и рисков: [Rust stack review](docs/rust-stack-review.md).
+
+Продолжать разработку и собирать артефакт можно без push:
+после локального коммита выполните `bash scripts/build-local-artifact.sh`.
+Он собирает архив Linux-бинарников под нативную архитектуру Docker, проверяет
+их `--version` без сети и записывает SHA-256 и исходный commit/tree.
+Это [локальный артефакт](docs/local-artifacts.md), а не подтверждённый CI-релиз;
+production-проверки он не обходит.
 
 GitHub Actions запускает три workflow:
 

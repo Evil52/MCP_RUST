@@ -7,6 +7,12 @@ publish = false
 default-run = "mcp-ozon"
 autobins = false
 
+[workspace]
+members = [".", "crates/mcp-storage", "crates/mcp-marketplace-types"]
+default-members = [".", "crates/mcp-storage", "crates/mcp-marketplace-types"]
+exclude = ["vendor/rmcp"]
+resolver = "3"
+
 [features]
 default = ["runtime-binaries"]
 runtime-binaries = []
@@ -53,11 +59,14 @@ path = "src/bin/ozon-campaign-guard.rs"
 test = false
 required-features = ["runtime-binaries"]
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 unsafe_code = "forbid"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
-[lints.clippy]
+[workspace.lints.clippy]
 # Keep the full production lint policy mandatory for every developer command,
 # not only for the CI invocation.
 all = { level = "deny", priority = -1 }
@@ -76,6 +85,8 @@ todo = "deny"
 unimplemented = "deny"
 
 [dependencies]
+mcp-marketplace-types = { version = "=0.1.0", path = "crates/mcp-marketplace-types" }
+mcp-storage = { version = "=0.1.0", path = "crates/mcp-storage" }
 anyhow = "1"
 axum = "0.8"
 base64 = "0.23"

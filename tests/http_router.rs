@@ -292,6 +292,28 @@ async fn capacity_metrics_are_bounded_unlabelled_and_available_without_authentic
         assert!(body.contains("mcp_http_active_streams 0\n"));
         assert!(body.contains("mcp_http_auth_requests 0\n"));
         assert!(body.contains("mcp_http_auth_streams 0\n"));
+        for name in [
+            "mcp_postgres_session_waiters",
+            "mcp_postgres_sessions_held",
+            "mcp_postgres_session_wait_seconds_count",
+            "mcp_postgres_session_wait_seconds_sum",
+            "mcp_postgres_session_wait_max_seconds",
+            "mcp_postgres_session_cancelled_waits_total",
+            "mcp_postgres_session_hold_seconds_count",
+            "mcp_postgres_session_hold_seconds_sum",
+            "mcp_postgres_session_hold_max_seconds",
+        ] {
+            let prefix = format!("{name} ");
+            let value = body
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .expect("each fixed database metric is exported without a connection");
+            assert!(value.parse::<f64>().expect("numeric metric") >= 0.0);
+        }
+        assert!(
+            body.len() < 4096,
+            "metrics have a fixed bounded cardinality"
+        );
         assert!(
             !body.contains('{'),
             "metrics must not carry identity labels"

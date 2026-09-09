@@ -1353,9 +1353,11 @@ where
 }
 
 fn metrics_response(limits: &McpHttpLimits) -> Response {
+    let mut metrics = limits.prometheus_metrics();
+    metrics.push_str(&crate::postgres::prometheus_metrics());
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-        limits.prometheus_metrics(),
+        metrics,
     )
         .into_response()
 }

@@ -1088,6 +1088,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "mcp-marketplace-types"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mcp-ozon"
 version = "0.2.1"
 dependencies = [
@@ -1101,6 +1110,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "mcp-marketplace-types",
+ "mcp-storage",
  "reqwest",
  "rmcp",
  "rust_xlsxwriter",
@@ -1115,6 +1126,15 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mcp-storage"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tokio-postgres",
+ "tracing",
 ]
 
 [[package]]

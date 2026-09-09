@@ -18,8 +18,8 @@ use tokio::{
     time::{Instant as TokioInstant, sleep, timeout_at},
 };
 
-use crate::config::{StoreCredentials, StoreId};
 use crate::retry::RetryPolicy;
+use mcp_marketplace_types::{StoreCredentials, StoreId};
 
 const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1_048_576;
 const MAX_ERROR_BODY_BYTES: usize = 4_096;

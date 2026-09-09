@@ -33,6 +33,51 @@ async fn bounded_admin(url: &str) -> Client {
 }
 
 #[tokio::test]
+async fn session_metrics_observe_contention_and_preserve_the_live_session() {
+    let Ok(worker_url) = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL") else {
+        return;
+    };
+    let config = Config::from_str(&worker_url).unwrap();
+    let supervised = SupervisedClient::connect(&config, "postgres-metrics-integration")
+        .await
+        .unwrap();
+    let first = supervised.acquire().await.unwrap();
+    let backend_pid: i32 = first
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(supervised.session_metrics().held, 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), supervised.acquire())
+            .await
+            .is_err()
+    );
+    let blocked = supervised.session_metrics();
+    assert_eq!(blocked.waiting, 0);
+    assert_eq!(blocked.held, 1);
+    assert_eq!(blocked.cancelled_waits, 1);
+    assert_eq!(blocked.wait_count, 2);
+    assert!(blocked.wait_micros >= 20_000);
+    drop(first);
+    let released = supervised.session_metrics();
+    assert_eq!(released.held, 0);
+    assert_eq!(released.hold_count, 1);
+    assert!(released.hold_micros >= 20_000);
+    let next = supervised.acquire().await.unwrap();
+    assert_eq!(
+        next.query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        backend_pid
+    );
+    drop(next);
+    assert_eq!(supervised.session_metrics().held, 0);
+    assert_eq!(supervised.session_metrics().hold_count, 2);
+}
+
+#[tokio::test]
 async fn repositories_verify_injected_sessions_and_reject_a_bounded_wrong_role() {
     let (Ok(admin_url), Ok(collector_url), Ok(worker_url), Ok(report_collector_url)) = (
         std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),

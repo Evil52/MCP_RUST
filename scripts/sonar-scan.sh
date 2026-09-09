@@ -109,6 +109,7 @@ echo "Copying project files and Sonar reports..."
 docker cp "$project_root/Cargo.toml" "$scanner_container:/usr/src/Cargo.toml" >/dev/null
 docker cp "$project_root/Cargo.lock" "$scanner_container:/usr/src/Cargo.lock" >/dev/null
 docker cp "$project_root/sonar-project.properties" "$scanner_container:/usr/src/sonar-project.properties" >/dev/null
+docker cp "$project_root/crates" "$scanner_container:/usr/src/crates" >/dev/null
 docker cp "$project_root/src" "$scanner_container:/usr/src/src" >/dev/null
 docker cp "$project_root/tests" "$scanner_container:/usr/src/tests" >/dev/null
 docker cp "$project_root/target/sonar" "$scanner_container:/usr/src/reports" >/dev/null

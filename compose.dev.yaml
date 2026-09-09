@@ -5,6 +5,8 @@ services:
         - action: rebuild
           path: ./src
         - action: rebuild
+          path: ./crates
+        - action: rebuild
           path: ./Cargo.toml
         - action: rebuild
           path: ./Cargo.lock

@@ -19,7 +19,8 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::wb::WbCredentials;
+use mcp_marketplace_types::WbCredentials;
+pub use mcp_marketplace_types::{Marketplace, PerformanceCredentials, StoreCredentials, StoreId};
 
 pub const DEFAULT_OZON_API_BASE_URL: &str = "https://api-seller.ozon.ru";
 pub const DEFAULT_ACCESS_CONFIG_PATH: &str = "config/access.json";
@@ -64,35 +65,6 @@ impl fmt::Display for Role {
             Self::Admin => "admin",
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
-#[serde(transparent)]
-pub struct StoreId(pub String);
-
-impl StoreId {
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-}
-
-impl fmt::Display for StoreId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl From<&str> for StoreId {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum Marketplace {
-    Ozon,
-    Wildberries,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1026,28 +998,6 @@ impl RegistrySource {
     }
 }
 
-#[derive(Clone)]
-pub struct StoreCredentials {
-    pub client_id: String,
-    pub api_key: String,
-}
-
-#[derive(Clone)]
-pub struct PerformanceCredentials {
-    pub client_id: String,
-    pub client_secret: String,
-}
-
-impl fmt::Debug for PerformanceCredentials {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PerformanceCredentials")
-            .field("client_id", &"<redacted>")
-            .field("client_secret", &"<redacted>")
-            .finish()
-    }
-}
-
 fn validate_unique_performance_client_ids(
     stores: &BTreeMap<StoreId, PerformanceCredentials>,
 ) -> Result<()> {
@@ -1061,16 +1011,6 @@ fn validate_unique_performance_client_ids(
         first_by_client_id.insert(credentials.client_id.as_str(), store);
     }
     Ok(())
-}
-
-impl fmt::Debug for StoreCredentials {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("StoreCredentials")
-            .field("client_id", &"<redacted>")
-            .field("api_key", &"<redacted>")
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
