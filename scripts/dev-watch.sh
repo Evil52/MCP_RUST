@@ -22,6 +22,7 @@ export MCP_BIND="${MCP_DEV_BIND:-127.0.0.1:8789}"
 
 exec cargo watch \
   --watch src \
+  --watch crates \
   --watch Cargo.toml \
   --watch Cargo.lock \
   --watch .env \

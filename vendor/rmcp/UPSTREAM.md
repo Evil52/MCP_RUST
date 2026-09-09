@@ -48,5 +48,8 @@ sessions, allowing the application to enforce a bounded graceful shutdown.
 The upstream `build.rs` is intentionally omitted: it manages Git hook settings
 for the SDK workspace and must not mutate the parent application's repository.
 
-Keep this patch small and remove the vendored dependency after upstream `rmcp`
-ships an equivalent typed field.
+Keep this patch small. The patch inventory, upgrade checklist, upstream tracking
+gap and removal conditions are recorded in
+[ADR 0003](../../docs/adr/0003-vendored-rmcp.md).
+Removal requires equivalent behavior for every patch above (or a verified
+application-level replacement), not only the typed field.

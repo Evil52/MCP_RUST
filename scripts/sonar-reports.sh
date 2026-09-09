@@ -30,8 +30,8 @@ echo "==> Formatting"
 cargo fmt --all -- --check
 
 echo "==> Tests"
-cargo test --locked --all-targets --all-features -- --test-threads=1
-cargo test --locked --all-targets --all-features -- --list 2>/dev/null \
+cargo test --locked --workspace --all-targets --all-features -- --test-threads=1
+cargo test --locked --workspace --all-targets --all-features -- --list 2>/dev/null \
   | sed -n 's/: test$//p' > "$test_list"
 
 {
@@ -52,7 +52,7 @@ fi
 mv "$test_report_tmp" "$test_report"
 
 echo "==> Clippy"
-cargo clippy --locked --all-targets --all-features --message-format=json -- -D warnings \
+cargo clippy --locked --workspace --all-targets --all-features --message-format=json -- -D warnings \
   > "$clippy_report_tmp"
 mv "$clippy_report_tmp" "$clippy_report"
 
@@ -62,7 +62,7 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
   exit 1
 fi
 ./scripts/with-position-test-db.sh cargo llvm-cov \
-  --locked \
+  --locked --workspace \
   --all-targets \
   --all-features \
   --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|ozon-campaign-guard|position-collector|report-collector|report-worker|wb-automation))\.rs$' \

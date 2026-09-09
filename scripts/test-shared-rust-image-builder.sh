@@ -33,6 +33,11 @@ if [[ "$(grep -c 'cargo build --locked --release --bins' <<<"$baseline")" -ne 1 
   exit 1
 fi
 
+if ! grep -Fqx 'COPY crates ./crates' <<<"$baseline"; then
+  echo "the shared Rust builder must include workspace crates" >&2
+  exit 1
+fi
+
 for runtime_bin in "${runtime_bins[@]}"; do
   if ! grep -Fq "/build/target/release/$runtime_bin" <<<"$baseline"; then
     echo "the shared Rust builder does not retain $runtime_bin" >&2

@@ -84,11 +84,16 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Bound first-party Rust file growth
+        run: |
+          python3 -B scripts/check-rust-structure.py
+          python3 -B -m unittest discover -s tests -p test_rust_structure.py
+
       - name: Check OzonOFK Suite source allowlist and synchronization
         run: bash scripts/build-ozonofk-suite.sh --check
 
       - name: Run tests
-        run: cargo test --locked --all-targets --all-features -- --test-threads=1
+        run: cargo test --locked --workspace --all-targets --all-features -- --test-threads=1
 
       - name: Verify PostgreSQL repository transaction contract
         run: ./scripts/with-position-test-db.sh ./scripts/test-position-runtime.sh
@@ -96,12 +101,12 @@ jobs:
       - name: Run Clippy with pedantic warnings denied
         # Cargo.toml sets clippy::all and clippy::pedantic to deny while
         # retaining the explicit legacy-debt allowlist.
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Build documentation with warnings denied
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --no-deps --all-features
+        run: cargo doc --locked --workspace --no-deps --all-features
 
   rust-version:
     name: Rust 1.98.0
@@ -120,7 +125,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Test project Rust version
-        run: cargo +1.98.0 test --locked --all-targets --all-features -- --test-threads=1
+        run: cargo +1.98.0 test --locked --workspace --all-targets --all-features -- --test-threads=1
 
   coverage:
     name: Core library source lines
@@ -152,7 +157,7 @@ jobs:
         run: >-
           ./scripts/with-position-test-db.sh
           cargo llvm-cov
-          --locked
+          --locked --workspace
           --all-targets
           --all-features
           --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|ozon-campaign-guard|position-collector|report-collector|report-worker|wb-automation))\.rs$'

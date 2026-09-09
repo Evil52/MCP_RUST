@@ -1,0 +1,17 @@
+[package]
+name = "mcp-storage"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio-postgres = "0.7"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "test-util"] }

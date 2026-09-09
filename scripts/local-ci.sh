@@ -15,14 +15,18 @@ fi
 echo "==> Formatting"
 cargo fmt --all -- --check
 
+echo "==> Rust structure budget"
+python3 -B scripts/check-rust-structure.py
+python3 -B -m unittest discover -s tests -p test_rust_structure.py
+
 echo "==> Tests"
-cargo test --locked --all-targets --all-features -- --test-threads=1
+cargo test --locked --workspace --all-targets --all-features -- --test-threads=1
 
 echo "==> Clippy"
-cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
 echo "==> Documentation"
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --all-features
 
 echo "==> RustSec audit"
 cargo audit --deny warnings
@@ -56,7 +60,7 @@ fi
 # src/server.rs. Other inline test modules still contribute to this figure;
 # it is not production-only coverage. Runtime entrypoints use separate probes.
 ./scripts/with-position-test-db.sh cargo llvm-cov \
-  --locked \
+  --locked --workspace \
     --all-targets \
     --all-features \
     --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|ozon-campaign-guard|position-collector|report-collector|report-worker|wb-automation))\.rs$' \

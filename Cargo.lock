@@ -1101,6 +1101,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "mcp-storage",
  "reqwest",
  "rmcp",
  "rust_xlsxwriter",
@@ -1115,6 +1116,15 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "mcp-storage"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tokio-postgres",
+ "tracing",
 ]
 
 [[package]]

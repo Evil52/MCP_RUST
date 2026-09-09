@@ -8,6 +8,12 @@
 !src/
 !src/**
 
+!crates/
+!crates/mcp-storage/
+!crates/mcp-storage/Cargo.toml
+!crates/mcp-storage/src/
+!crates/mcp-storage/src/**
+
 !vendor/
 !vendor/rmcp/
 !vendor/rmcp/Cargo.toml
