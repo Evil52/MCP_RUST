@@ -39,6 +39,11 @@ lock; `org.opencontainers.image.revision` проверяется после pull
 `config/access.json` повторно запустите installer. Профиль и runtime API key
 читаются из `~/.config/tunnel-client`; секреты в репозиторий не копируются.
 
+Для прямого доступа WB/Ozon при сохранении VPN для OpenAI предусмотрены
+[проверка и отдельная настройка маршрутизации macOS](docs/marketplace-split-routing.md).
+Она устанавливается независимо от Docker-релиза и сначала требует успешной
+проверки маршрутов, HTTPS и рабочего MCP-туннеля.
+
 ## Разработка с автоматическим обновлением
 
 Один раз установите `cargo-watch --locked`, затем запустите

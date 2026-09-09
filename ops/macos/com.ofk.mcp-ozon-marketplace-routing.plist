@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ofk.mcp-ozon-marketplace-routing</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string><string>-I</string><string>-B</string>
+    <string>/Library/Application Support/MCP_OZON/marketplace-routing/marketplace_routes.py</string>
+    <string>apply</string><string>--config</string>
+    <string>/Library/Application Support/MCP_OZON/marketplace-routing/config.json</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>ExitTimeOut</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/private/var/db/mcp-ozon-marketplace-routing/agent.log</string>
+  <key>StandardErrorPath</key><string>/private/var/db/mcp-ozon-marketplace-routing/agent.error.log</string>
+</dict>
+</plist>
