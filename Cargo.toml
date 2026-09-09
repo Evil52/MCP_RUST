@@ -8,8 +8,8 @@ default-run = "mcp-ozon"
 autobins = false
 
 [workspace]
-members = [".", "crates/mcp-storage"]
-default-members = [".", "crates/mcp-storage"]
+members = [".", "crates/mcp-storage", "crates/mcp-marketplace-types"]
+default-members = [".", "crates/mcp-storage", "crates/mcp-marketplace-types"]
 exclude = ["vendor/rmcp"]
 resolver = "3"
 
@@ -85,6 +85,7 @@ todo = "deny"
 unimplemented = "deny"
 
 [dependencies]
+mcp-marketplace-types = { version = "=0.1.0", path = "crates/mcp-marketplace-types" }
 mcp-storage = { version = "=0.1.0", path = "crates/mcp-storage" }
 anyhow = "1"
 axum = "0.8"

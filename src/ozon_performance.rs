@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, SemaphorePermit};
 
-use crate::config::{PerformanceCredentials, StoreId};
+use mcp_marketplace_types::{PerformanceCredentials, StoreId};
 
 const PERFORMANCE_API_BASE_URL: &str = "https://api-performance.ozon.ru";
 const TOKEN_PATH: &str = "/api/client/token";

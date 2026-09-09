@@ -1,6 +1,6 @@
 # ADR 0002: Incremental Rust workspace boundaries
 
-- Status: accepted; first boundary implemented
+- Status: accepted; storage and marketplace value types extracted
 - Date: 2026-09-09
 - Scope: source organization, build/test coverage; no deployment change
 
@@ -13,10 +13,26 @@ Tokio, tokio-postgres and tracing, never on marketplace or control domains.
 Repositories retain their SQL, role checks and transaction ownership. This is
 not a generic storage repository crate or a pool migration.
 
-Workspace lints are inherited by both crates. Default members and explicit
+Workspace lints are inherited by all internal crates. Default members and explicit
 `--workspace` quality/coverage commands include both. Docker builders copy the
 new crate, development watchers observe it and Sonar receives its sources.
 No third-party version is upgraded by this extraction.
+
+### Second boundary: marketplace value types
+
+`mcp-marketplace-types` now owns `StoreId`, `Marketplace` and the three
+credential containers. It has no application, HTTP, database or environment
+dependency; only Serde and Schemars (plus JSON test support). Ozon clients
+depend directly on these types, no longer on the large application `config`
+module. Configuration also no longer imports credentials from the WB client.
+Existing `mcp_ozon::config` and `mcp_ozon::wb::WbCredentials` paths re-export
+the same types, preserving callers and wire contracts.
+
+Credential loading/validation, registry authorization and secret lifetime are
+unchanged. These containers redact `Debug` but do not claim zeroization or
+cryptographic storage. Tests check serialization, schema shape and redaction.
+All three crates inherit the workspace quality policy. Extraction of full
+marketplace clients, auth and reporting/control is still separate work.
 
 Within the application crate, split production responsibilities first:
 

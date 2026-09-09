@@ -4,7 +4,7 @@
     "src/auth.rs": 1911,
     "src/bin/report-collector.rs": 1127,
     "src/bin/wb-automation.rs": 2041,
-    "src/config.rs": 3448,
+    "src/config.rs": 3388,
     "src/control/automation_executor.rs": 4322,
     "src/control/automation_observer.rs": 1366,
     "src/control/automation_postgres.rs": 2624,
@@ -35,7 +35,7 @@
     "src/reporting/xlsx.rs": 1070,
     "src/server.rs": 1428,
     "src/server/tests.rs": 11599,
-    "src/wb.rs": 5181,
+    "src/wb.rs": 5167,
     "tests/http_router.rs": 1117,
     "tests/reporting_postgres_outbox.rs": 1384,
     "tests/wb_automation_postgres.rs": 1931

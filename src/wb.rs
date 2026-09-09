@@ -1,4 +1,5 @@
 mod policy;
+pub use mcp_marketplace_types::WbCredentials;
 use policy::{ApiHost, ClientPolicy, EndpointPolicy, RequestClass};
 mod validation;
 use validation::{
@@ -109,21 +110,6 @@ const MAX_LOGICAL_REQUEST_DURATION: Duration = Duration::from_secs(60);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
-
-/// API credentials whose debug representation never exposes the token.
-#[derive(Clone)]
-pub struct WbCredentials {
-    pub token: String,
-}
-
-impl fmt::Debug for WbCredentials {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("WbCredentials")
-            .field("token", &"<redacted>")
-            .finish()
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WbErrorKind {

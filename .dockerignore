@@ -13,6 +13,10 @@
 !crates/mcp-storage/Cargo.toml
 !crates/mcp-storage/src/
 !crates/mcp-storage/src/**
+!crates/mcp-marketplace-types/
+!crates/mcp-marketplace-types/Cargo.toml
+!crates/mcp-marketplace-types/src/
+!crates/mcp-marketplace-types/src/**
 
 !vendor/
 !vendor/rmcp/
