@@ -88,6 +88,7 @@ jobs:
         run: |
           python3 -B scripts/check-rust-structure.py
           python3 -B -m unittest discover -s tests -p test_rust_structure.py
+          python3 -B -m unittest discover -s tests -p test_local_artifact.py
 
       - name: Check OzonOFK Suite source allowlist and synchronization
         run: bash scripts/build-ozonofk-suite.sh --check

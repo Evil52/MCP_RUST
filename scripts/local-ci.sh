@@ -18,6 +18,7 @@ cargo fmt --all -- --check
 echo "==> Rust structure budget"
 python3 -B scripts/check-rust-structure.py
 python3 -B -m unittest discover -s tests -p test_rust_structure.py
+python3 -B -m unittest discover -s tests -p test_local_artifact.py
 
 echo "==> Tests"
 cargo test --locked --workspace --all-targets --all-features -- --test-threads=1

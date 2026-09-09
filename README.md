@@ -597,6 +597,13 @@ cargo install cargo-llvm-cov --version 0.8.7 --locked
 в [ADR 0004](docs/adr/0004-postgresql-transport.md).
 Обзор технологий и рисков: [Rust stack review](docs/rust-stack-review.md).
 
+Продолжать разработку и собирать артефакт можно без push:
+после локального коммита выполните `bash scripts/build-local-artifact.sh`.
+Он собирает архив Linux-бинарников под нативную архитектуру Docker, проверяет
+их `--version` без сети и записывает SHA-256 и исходный commit/tree.
+Это [локальный артефакт](docs/local-artifacts.md), а не подтверждённый CI-релиз;
+production-проверки он не обходит.
+
 GitHub Actions запускает три workflow:
 
 - `Rust CI`: форматирование, тесты, строгий Clippy, rustdoc, Rust 1.98.0,
