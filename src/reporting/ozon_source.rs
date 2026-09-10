@@ -57,6 +57,9 @@ const MAX_SALES_PAGES: usize = 10;
 // manual dry-run's absolute deadline bounds the total request time.
 const MAX_PRODUCT_PAGES: usize = 100;
 
+#[cfg(test)]
+mod stock_checkpoint_tests;
+
 /// Collects the three Seller sources and atomically publishes them together
 /// with a separately verified Performance SKU snapshot.
 ///
@@ -602,7 +605,7 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
     /// rejection or an explicit not-found response from that first route may
     /// fall back to the already allowlisted `/v4/product/info/stocks` source.
     /// The normalized fallback exposes fulfillment-level, not physical-
-    /// warehouse-level, inventory; its stable `fbo`/`fbs` identifiers retain
+    /// warehouse-level, inventory; its stable `FBO`/`FBS`/`RFBS` identifiers retain
     /// that provenance. Authentication, quota, server, and transport failures
     /// remain fail-closed and are never hidden by the fallback.
     pub async fn collect_stock_pages(
@@ -1836,36 +1839,6 @@ mod tests {
         assert_eq!(error.code(), "rate_limited");
         assert!(error.failure().retry_after.unwrap() >= 65);
         assert_eq!(requests.try_iter().count(), 1);
-    }
-
-    #[tokio::test]
-    async fn retired_stock_route_is_checkpointed_before_resuming_fallback() {
-        use crate::reporting::checkpoint::tests::{MemoryPages, journal};
-        let transport = RecordingTransport {
-            responses: Mutex::new(VecDeque::from([
-                Err(OzonReportSourceError::Upstream(OzonErrorKind::NotFound)),
-                Ok(json!({"items":[],"cursor":""})),
-            ])),
-            paths: Mutex::new(vec![]),
-        };
-        let pages = MemoryPages::default();
-        assert_eq!(
-            OzonReportSource::new(&transport)
-                .with_checkpoints(journal(&pages))
-                .collect_stock_pages()
-                .await,
-            Err(OzonReportSourceError::Checkpoint(CheckpointError::Deferred))
-        );
-        assert!(
-            OzonReportSource::new(&transport)
-                .with_checkpoints(journal(&pages))
-                .collect_stock_pages()
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(transport.paths.lock().unwrap().len(), 2);
-        assert!(transport.responses.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

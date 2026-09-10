@@ -25,6 +25,11 @@ use super::{
 const PAGE_SIZE: usize = 1_000;
 const PAGE_SIZE_U32: u32 = 1_000;
 const MAX_PAGES: usize = 25;
+// The funnel returns rich product metadata, unlike stock/price pages. Request
+// smaller documented limit/offset pages without raising the HTTP body budget.
+const SALES_PAGE_SIZE: usize = 250;
+const SALES_PAGE_SIZE_U32: u32 = 250;
+const MAX_SALES_PAGES: usize = MAX_PAGES * PAGE_SIZE / SALES_PAGE_SIZE;
 const CAMPAIGNS_PER_REQUEST: usize = 50;
 const PROMOTION_STATS_ADMISSION_BUDGET: Duration = Duration::from_secs(60);
 
@@ -461,7 +466,8 @@ impl WbReportSource {
         &self,
         date: NaiveDate,
     ) -> Result<Vec<CollectedSalesFact>, WbReportSourceError> {
-        self.collect_sales_pages_with_limit(date, MAX_PAGES).await
+        self.collect_sales_pages_with_limit(date, MAX_SALES_PAGES)
+            .await
     }
 
     async fn collect_sales_pages_with_limit(
@@ -471,26 +477,28 @@ impl WbReportSource {
     ) -> Result<Vec<CollectedSalesFact>, WbReportSourceError> {
         let mut facts = Vec::new();
         for page in 0..max_pages {
-            let offset = page_offset(page)?;
+            let offset = page_offset(page, SALES_PAGE_SIZE_U32)?;
             let (rows, source_rows) = checkpointed(
                 &self.checkpoints,
-                json!(["wb_sales", date, offset]),
+                // Old 1,000-row checkpoints have different page boundaries.
+                // Never replay them as a short 250-row page after an upgrade.
+                json!(["wb_sales_v2", date, SALES_PAGE_SIZE_U32, offset]),
                 || async {
                     parse_sales_page(
                         &self
                             .transport
-                            .sales_page(date, date, PAGE_SIZE_U32, offset)
+                            .sales_page(date, date, SALES_PAGE_SIZE_U32, offset)
                             .await?,
                     )
                     .map_err(|_| WbReportSourceError::InvalidSalesResponse)
                 },
             )
             .await?;
-            if rows.iter().any(|row| row.business_date != date) {
+            if source_rows > SALES_PAGE_SIZE || rows.iter().any(|row| row.business_date != date) {
                 return Err(WbReportSourceError::InvalidSalesResponse);
             }
             facts.extend(rows);
-            if source_rows < PAGE_SIZE {
+            if source_rows < SALES_PAGE_SIZE {
                 return Ok(facts);
             }
         }
@@ -509,7 +517,7 @@ impl WbReportSource {
     ) -> Result<Vec<CollectedStockFact>, WbReportSourceError> {
         let mut facts = Vec::new();
         for page in 0..max_pages {
-            let offset = page_offset(page)?;
+            let offset = page_offset(page, PAGE_SIZE_U32)?;
             let (rows, source_rows) =
                 checkpointed(&self.checkpoints, json!(["wb_stock", offset]), || async {
                     parse_stock_page(&self.transport.stock_page(PAGE_SIZE_U32, offset).await?)
@@ -539,7 +547,7 @@ impl WbReportSource {
     ) -> Result<Vec<CollectedPriceFact>, WbReportSourceError> {
         let mut facts = Vec::new();
         for page in 0..max_pages {
-            let offset = page_offset(page)?;
+            let offset = page_offset(page, PAGE_SIZE_U32)?;
             let (rows, source_rows) =
                 checkpointed(&self.checkpoints, json!(["wb_price", offset]), || async {
                     parse_price_page(&self.transport.price_page(PAGE_SIZE_U32, offset).await?)
@@ -556,16 +564,17 @@ impl WbReportSource {
     }
 }
 
-fn page_offset(page: usize) -> Result<u32, WbReportSourceError> {
+fn page_offset(page: usize, page_size: u32) -> Result<u32, WbReportSourceError> {
     u32::try_from(page)
         .ok()
-        .and_then(|page| page.checked_mul(PAGE_SIZE_U32))
+        .and_then(|page| page.checked_mul(page_size))
         .ok_or(WbReportSourceError::PaginationLimit)
 }
 
 #[cfg(test)]
 mod tests {
     mod admission;
+    mod sales;
 
     use std::{
         collections::BTreeMap,
@@ -634,59 +643,6 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    struct SalesFixtureTransport {
-        pages: Mutex<VecDeque<Value>>,
-    }
-
-    impl WbReportTransport for SalesFixtureTransport {
-        fn sales_page<'a>(
-            &'a self,
-            _start: NaiveDate,
-            _end: NaiveDate,
-            _limit: u32,
-            _offset: u32,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-            Box::pin(async {
-                self.pages
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .ok_or(WbReportSourceError::InvalidResponse)
-            })
-        }
-
-        fn stock_page<'a>(
-            &'a self,
-            _limit: u32,
-            _offset: u32,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-            Box::pin(async { Err(WbReportSourceError::InvalidResponse) })
-        }
-
-        fn price_page<'a>(
-            &'a self,
-            _limit: u32,
-            _offset: u32,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-            Box::pin(async { Err(WbReportSourceError::InvalidResponse) })
-        }
-
-        fn campaigns<'a>(
-            &'a self,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-            Box::pin(async { Err(WbReportSourceError::InvalidResponse) })
-        }
-
-        fn promotion_stats<'a>(
-            &'a self,
-            _ids: Vec<u64>,
-            _start: NaiveDate,
-            _end: NaiveDate,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-            Box::pin(async { Err(WbReportSourceError::InvalidResponse) })
-        }
     }
 
     impl FixtureTransport {
@@ -865,58 +821,6 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].sellable_units, PAGE_SIZE as u64);
         assert!(stocks.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn sales_pagination_rejects_foreign_dates_and_requires_a_terminal_page() {
-        fn sales_page(date: &str, count: usize) -> Value {
-            json!({"data":{"currency":"RUB","products": (1..=count).map(|sku| json!({
-                "product":{"nmId":sku},
-                "statistic":{"selected":{
-                    "period":{"start":date,"end":date},
-                    "orderCount":1,"orderSum":90,"cancelCount":0
-                }}
-            })).collect::<Vec<_>>()}})
-        }
-
-        let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
-        let wrong_date = WbReportSource::new(SalesFixtureTransport {
-            pages: Mutex::new(VecDeque::from([sales_page("2026-08-16", 1)])),
-        });
-        assert_eq!(
-            wrong_date.collect_sales_pages(date).await,
-            Err(WbReportSourceError::InvalidSalesResponse)
-        );
-
-        let unterminated = WbReportSource::new(SalesFixtureTransport {
-            pages: Mutex::new(VecDeque::from([sales_page("2026-08-17", PAGE_SIZE)])),
-        });
-        assert_eq!(
-            unterminated.collect_sales_pages_with_limit(date, 1).await,
-            Err(WbReportSourceError::PaginationLimit)
-        );
-
-        // The sales-only fixture deliberately refuses every unrelated route;
-        // exercising those refusals also keeps the all-target line gate exact.
-        let unrelated = SalesFixtureTransport {
-            pages: Mutex::new(VecDeque::new()),
-        };
-        assert_eq!(
-            unrelated.stock_page(1, 0).await,
-            Err(WbReportSourceError::InvalidResponse)
-        );
-        assert_eq!(
-            unrelated.price_page(1, 0).await,
-            Err(WbReportSourceError::InvalidResponse)
-        );
-        assert_eq!(
-            unrelated.campaigns().await,
-            Err(WbReportSourceError::InvalidResponse)
-        );
-        assert_eq!(
-            unrelated.promotion_stats(vec![1], date, date).await,
-            Err(WbReportSourceError::InvalidResponse)
-        );
     }
 
     #[tokio::test]
@@ -1155,6 +1059,6 @@ mod tests {
             WbReportSourceError::from(WbReportParseError::Shape),
             WbReportSourceError::InvalidResponse
         );
-        assert_eq!(page_offset(2).unwrap(), 2_000);
+        assert_eq!(page_offset(2, PAGE_SIZE_U32).unwrap(), 2_000);
     }
 }
