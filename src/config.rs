@@ -3177,9 +3177,7 @@ mod tests {
         let output = command.output().unwrap();
         assert!(
             output.status.success(),
-            "child test failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "environment child test failed: {output:?}"
         );
     }
 

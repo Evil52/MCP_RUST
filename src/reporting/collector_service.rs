@@ -725,22 +725,19 @@ mod tests {
         values.push((MODE_ENV, "ozon_dry_run".to_owned()));
         let collector = config(&values).unwrap();
         let claim = claim("ozon", super::super::snapshot::Marketplace::Ozon);
-        let result = collector.resolve_ozon_dry_run(&claim, &mut |key| {
-            Some(
-                match key {
-                    "PERF_ID" => "dedicated-control-client",
-                    "PERF_SECRET" => "performance-secret",
-                    "ID" => "seller-client",
-                    "KEY" => "seller-secret",
-                    _ => return None,
-                }
-                .to_owned(),
-            )
-        });
-        let error = match result {
-            Ok(_) => panic!("dedicated Control Performance Client-Id must be rejected"),
-            Err(error) => error.to_string(),
-        };
+        let secrets = BTreeMap::from([
+            ("PERF_ID", "dedicated-control-client"),
+            ("PERF_SECRET", "performance-secret"),
+            ("ID", "seller-client"),
+            ("KEY", "seller-secret"),
+        ]);
+        let error = collector
+            .resolve_ozon_dry_run(&claim, &mut |key| {
+                secrets.get(key).map(|value| (*value).to_owned())
+            })
+            .err()
+            .expect("dedicated Control Performance Client-Id must be rejected")
+            .to_string();
         assert!(
             error.contains("выделенный Control Performance Client-Id"),
             "{error}"
@@ -782,22 +779,19 @@ mod tests {
         values.push((MODE_ENV, "ozon_dry_run".to_owned()));
         let collector = config(&values).unwrap();
         let claim = claim("ozon", super::super::snapshot::Marketplace::Ozon);
-        let result = collector.resolve_ozon_dry_run(&claim, &mut |key| {
-            Some(
-                match key {
-                    "PERF_ID" => "cross-account-control-client",
-                    "PERF_SECRET" => "performance-secret",
-                    "ID" => "seller-client",
-                    "KEY" => "seller-secret",
-                    _ => return None,
-                }
-                .to_owned(),
-            )
-        });
-        let error = match result {
-            Ok(_) => panic!("another account's Control Performance Client-Id must be rejected"),
-            Err(error) => error.to_string(),
-        };
+        let secrets = BTreeMap::from([
+            ("PERF_ID", "cross-account-control-client"),
+            ("PERF_SECRET", "performance-secret"),
+            ("ID", "seller-client"),
+            ("KEY", "seller-secret"),
+        ]);
+        let error = collector
+            .resolve_ozon_dry_run(&claim, &mut |key| {
+                secrets.get(key).map(|value| (*value).to_owned())
+            })
+            .err()
+            .expect("another account's Control Performance Client-Id must be rejected")
+            .to_string();
         assert!(
             error.contains("выделенный Control Performance Client-Id"),
             "{error}"
