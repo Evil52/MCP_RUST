@@ -48,8 +48,24 @@ const fn session_unavailable(_: crate::postgres::PostgresUnavailable) -> OzonPla
     OzonPlanStoreError::Unavailable
 }
 
+/// A fenced transition must update exactly its one expected row. SQL errors
+/// and the separate LeaseLost boundary retain their own classifications.
+const fn require_single_update(updated: u64) -> Result<(), OzonPlanStoreError> {
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(OzonPlanStoreError::InvalidState)
+    }
+}
+
+#[cfg(test)]
+mod authorization_boundary_tests;
 #[cfg(test)]
 mod completion_tests;
+#[cfg(test)]
+mod expiry_boundary_tests;
+#[cfg(test)]
+mod guard_boundary_tests;
 #[cfg(test)]
 mod policy_approval_tests;
 #[cfg(test)]
@@ -447,9 +463,7 @@ impl OzonPlanRepository {
         ]);
         tx.execute("INSERT INTO control.ozon_campaign_plan_approvals(approval_id,plan_id,plan_digest,approver_id,reference,approved_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&approval_id,&plan_id,&expected_digest,&approver_id,&reference,&now,&expires_at]).await.map_err(postgres_unavailable)?;
         let updated = tx.execute("UPDATE control.ozon_campaign_plans SET status='approved' WHERE plan_id=$1 AND status='prepared'", &[&plan_id]).await.map_err(postgres_unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             plan_id,
@@ -528,9 +542,7 @@ impl OzonPlanRepository {
             )
             .await
             .map_err(postgres_unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             plan_id,
@@ -735,9 +747,7 @@ impl OzonPlanRepository {
             )
             .await
             .map_err(postgres_unavailable)?;
-        if started != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        require_single_update(started)?;
         let updated = tx
             .execute(
                 "UPDATE control.ozon_campaign_plans SET status=$2 \
@@ -750,9 +760,7 @@ impl OzonPlanRepository {
             )
             .await
             .map_err(postgres_unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             &plan.plan_id,
@@ -862,9 +870,7 @@ impl OzonPlanRepository {
             )
             .await
             .map_err(postgres_unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        require_single_update(updated)?;
         if target == OzonLaunchStatus::Applied {
             insert_guard(&tx, &plan, effective_campaign_id).await?;
         }
@@ -928,9 +934,7 @@ impl OzonPlanRepository {
                 )
                 .await
                 .map_err(postgres_unavailable)?;
-            if updated != 1 {
-                return Err(OzonPlanStoreError::InvalidState);
-            }
+            require_single_update(updated)?;
         }
         close_workflow_as_ambiguous(&tx, lease, error_class, readback_json.as_deref()).await?;
         insert_audit(
@@ -992,9 +996,7 @@ impl OzonPlanRepository {
             )
             .await
             .map_err(postgres_unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        require_single_update(updated)?;
         close_workflow_as_ambiguous(&tx, lease, error_class, None).await?;
         insert_audit(&tx,&plan.plan_id,&lease.owner_id,"workflow_failed",
             &serde_json::json!({"action":lease.action.as_db(),"generation":lease.generation,"error_class":error_class})).await?;
@@ -1036,9 +1038,7 @@ impl OzonPlanRepository {
             )
             .await
             .map_err(postgres_unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             &lease.plan.plan_id,
@@ -1155,9 +1155,7 @@ impl OzonPlanRepository {
             )
             .await
             .map_err(postgres_unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        require_single_update(updated)?;
         guard.status = OzonCampaignGuardStatus::Stopping;
         guard.stop_reason = Some(reason.to_owned());
         insert_audit(
@@ -1260,9 +1258,7 @@ impl OzonPlanRepository {
             )
             .await
             .map_err(postgres_unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             &guard.plan_id,
@@ -1601,11 +1597,7 @@ impl OzonPlanRepository {
             .await
             .map_err(postgres_unavailable)?;
         drop(client);
-        if updated == 1 {
-            Ok(())
-        } else {
-            Err(OzonPlanStoreError::InvalidState)
-        }
+        require_single_update(updated)
     }
 }
 
@@ -1675,9 +1667,7 @@ async fn sweep_stale_launch_request(
         )
         .await
         .map_err(postgres_unavailable)?;
-    if updated != 1 {
-        return Err(OzonPlanStoreError::InvalidState);
-    }
+    require_single_update(updated)?;
     insert_audit(
         tx,
         &plan_id,
@@ -1787,9 +1777,7 @@ async fn claim_workflow_locked(
         )
         .await
         .map_err(postgres_unavailable)?;
-    if updated != 1 {
-        return Err(OzonPlanStoreError::InvalidState);
-    }
+    require_single_update(updated)?;
     insert_audit(
         tx,
         &plan.plan_id,
@@ -2011,11 +1999,7 @@ async fn record_recovery_readback(
         )
         .await
         .map_err(postgres_unavailable)?;
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(OzonPlanStoreError::InvalidState)
-    }
+    require_single_update(updated)
 }
 
 async fn finish_workflow_lease(
@@ -2056,11 +2040,7 @@ async fn finish_workflow_lease(
         )
         .await
         .map_err(postgres_unavailable)?;
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(OzonPlanStoreError::InvalidState)
-    }
+    require_single_update(updated)
 }
 
 async fn close_workflow_as_ambiguous(
@@ -2094,11 +2074,7 @@ async fn close_workflow_as_ambiguous(
         )
         .await
         .map_err(postgres_unavailable)?;
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(OzonPlanStoreError::InvalidState)
-    }
+    require_single_update(updated)
 }
 
 async fn insert_guard(
