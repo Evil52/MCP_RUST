@@ -9,6 +9,56 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Exercise the installer's actual render/first-backup blocks without executing
+# its host installation, LaunchAgent, or production backup side effects.
+python3 - "$project_root" "$test_root" <<'PY'
+import os
+from pathlib import Path
+import plistlib
+import re
+import subprocess
+import sys
+
+project, temporary = map(Path, sys.argv[1:])
+installer = project / 'scripts/install-operations-agents.sh'
+source = installer.read_text()
+render_start = source.index('render() {')
+render_end = source.index('\n}\n', render_start) + 3
+render = source[render_start:render_end]
+first_start = source.index('echo "==> taking one backup"')
+first_end = source.index('echo "==> restoring it into a disposable database"', first_start)
+first_backup = source[first_start:first_end]
+runner_dir = temporary / 'installer-fixture'
+runner_dir.mkdir()
+capture = runner_dir / 'selected-volume'
+runner = runner_dir / 'backup-position-stack.sh'
+runner.write_text('#!/bin/bash\nset -eu\nprintf "%s" "${MCP_BACKUP_GUARD_STATE_VOLUME-UNSET}" >"$TEST_GUARD_CAPTURE"\n')
+runner.chmod(0o700)
+
+for volume in ('fixture-guard_state.1', ''):
+    environment = os.environ.copy()
+    for name in re.findall(r'\$([a-z_][a-z_0-9]*)', render + first_backup):
+        environment[name] = 'fixture-value'
+    environment.update(guard_volume=volume, libexec_dir=str(runner_dir),
+                       TEST_GUARD_CAPTURE=str(capture))
+    result = subprocess.run(['bash', '-euc', render + '\nrender "$1" "$2"',
+                             'installer-render-test', str(runner),
+                             str(project / 'ops/macos/com.ofk.mcp-ozon-backup.plist.in')],
+                            env=environment, capture_output=True, check=True)
+    rendered = plistlib.loads(result.stdout)
+    assert rendered['EnvironmentVariables']['MCP_BACKUP_GUARD_STATE_VOLUME'] == volume
+    subprocess.run(['bash', '-euc', first_backup], env=environment,
+                   capture_output=True, check=True)
+    assert capture.read_text() == volume
+
+for invalid in ('/tmp/guard', '../guard', 'guard:ro', 'guard|other', '<guard>',
+                '-guard', 'guard&other', 'guard\nother'):
+    result = subprocess.run(['bash', str(installer)], capture_output=True,
+                            env={**os.environ, 'MCP_BACKUP_GUARD_STATE_VOLUME': invalid})
+    assert result.returncode == 1
+    assert result.stderr == b'MCP_BACKUP_GUARD_STATE_VOLUME must be a Docker named volume or empty for discovery\n'
+PY
+
 # Reproduce installation from a disposable checkout, then delete that checkout.
 # All credentials, archives and command doubles below belong to this test.
 staging="$test_root/staging"

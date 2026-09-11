@@ -34,8 +34,14 @@ fi
   --env POSTGRES_USER=position_admin --env POSTGRES_DB=ozon_positions \
   "$image" >/dev/null
 ready=false
+# PostgreSQL's initdb server listens only on its Unix socket and exits before
+# the final TCP server starts. Do not initialize fixture data during that gap.
 for _attempt in $(seq 1 60); do
-  if "$docker_bin" exec "$fixture_db" pg_isready --quiet --username position_admin; then
+  if [[ "$("$docker_bin" exec \
+    --env PGPASSWORD=backup-test-only-password-with-sufficient-length "$fixture_db" \
+    psql --host 127.0.0.1 --username position_admin --dbname ozon_positions \
+    --no-password --no-psqlrc --no-align --tuples-only --set ON_ERROR_STOP=1 \
+    --command 'SELECT 1' 2>/dev/null)" == 1 ]]; then
     ready=true
     break
   fi

@@ -261,9 +261,13 @@ echo "==> starting disposable PostgreSQL ($db_image)"
   "$db_image" >/dev/null
 
 ready=false
+# initdb's temporary server accepts Unix sockets before it shuts down. Only
+# authenticated TCP SQL proves the final server is ready for a restore.
 for _attempt in $(seq 1 "$readiness_attempts"); do
-  if "$docker_bin" exec "$container" pg_isready \
-    --username "$db_owner" --dbname "$db_name" --quiet >/dev/null 2>&1; then
+  if [[ "$("$docker_bin" exec --env "PGPASSWORD=$verify_password" "$container" \
+    psql --host 127.0.0.1 --username "$db_owner" --dbname "$db_name" \
+    --no-password --no-psqlrc --no-align --tuples-only --set ON_ERROR_STOP=1 \
+    --command 'SELECT 1' 2>/dev/null)" == 1 ]]; then
     ready=true
     break
   fi

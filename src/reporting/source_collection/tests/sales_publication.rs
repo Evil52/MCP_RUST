@@ -2,6 +2,89 @@ use super::*;
 use crate::reporting::postgres_collector::CollectedSalesFact;
 
 #[tokio::test]
+async fn production_audit_sales_requires_observed_pages_and_recovers() {
+    use crate::reporting::postgres_collector::PostgresCollectorError;
+
+    let (Ok(admin_url), Ok(collector_url)) = (
+        std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),
+        std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL"),
+    ) else {
+        return;
+    };
+    let _database = DATABASE.lock().await;
+    let fixture = Fixture::new(&admin_url, &collector_url).await;
+    let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+    fixture
+        .writer
+        .enqueue_source_jobs(
+            fixture.config.collection_plan(),
+            now,
+            now - Duration::days(1),
+            now,
+        )
+        .await
+        .unwrap();
+
+    for target in fixture.config.collection_plan() {
+        fixture.select(&target.account_id, "sales", now).await;
+        let claim = fixture.claim().await;
+        // A claimed job is not observation evidence. Neither an empty input
+        // nor an admitted-but-unfinished page may publish an empty snapshot.
+        for admitted in [false, true] {
+            if admitted {
+                fixture
+                    .writer
+                    .source_checkpoints(&claim)
+                    .unwrap()
+                    .admit()
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                fixture
+                    .writer
+                    .publish_source_job(
+                        &claim,
+                        CollectedFacts::Sales(vec![]),
+                        vec![],
+                        "observation-regression"
+                    )
+                    .await,
+                Err(PostgresCollectorError::InvalidInput)
+            );
+            let row = fixture.admin.query_one(
+                "SELECT first_observed_at IS NOT NULL, last_observed_at IS NOT NULL,
+                 (SELECT count(*) FROM daily_reporting.source_snapshots WHERE account_id=$1 AND source='sales' AND cutoff_at=$2)
+                 FROM daily_reporting.source_collection_jobs WHERE account_id=$1 AND source='sales' AND cutoff_at=$2",
+                &[&target.account_id, &now]).await.unwrap();
+            assert_eq!(row.get::<_, bool>(0), admitted);
+            assert!(!row.get::<_, bool>(1));
+            assert_eq!(row.get::<_, i64>(2), 0);
+            assert_eq!(fixture.state(&claim).await, ("running".to_owned(), None, 0));
+        }
+        // Recording a genuine terminal empty page makes this same live
+        // lease publishable; a failed validation must not poison its session.
+        let (identity, page) = empty_pages(&claim).remove(0);
+        fixture.seed(&claim, identity, page).await;
+        let snapshot = fixture
+            .writer
+            .publish_source_job(
+                &claim,
+                CollectedFacts::Sales(vec![]),
+                vec![],
+                "observation-regression",
+            )
+            .await
+            .unwrap();
+        assert!(snapshot > 0);
+        assert_eq!(
+            fixture.state(&claim).await,
+            ("published".to_owned(), None, 0)
+        );
+    }
+}
+
+#[tokio::test]
 async fn sales_publication_replayed_offset_overlap_fails_closed_for_both_marketplaces() {
     let (Ok(admin_url), Ok(collector_url)) = (
         std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),

@@ -13,7 +13,7 @@
     "src/control/ozon/guard_runtime.rs": 3647,
     "src/control/ozon/guard_workflow.rs": 1971,
     "src/control/ozon/launch_workflow.rs": 2296,
-    "src/control/ozon/repository.rs": 2820,
+    "src/control/ozon/repository.rs": 2819,
     "src/control/ozon/tests.rs": 2434,
     "src/control/plan/repository.rs": 1595,
     "src/control/plan/tests.rs": 2931,
