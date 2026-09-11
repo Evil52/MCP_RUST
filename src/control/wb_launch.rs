@@ -266,37 +266,7 @@ impl Operator {
             .await?;
         parse_campaign(&source, &self.policy)?;
         let groups = self.reader.promotion_campaigns(ACCOUNT).await?;
-        let groups = groups
-            .get("adverts")
-            .and_then(Value::as_array)
-            .context("campaign listing incomplete")?;
-        let mut ids = BTreeSet::new();
-        for group in groups {
-            let status = group
-                .get("status")
-                .and_then(Value::as_i64)
-                .context("missing campaign status")?;
-            if matches!(status, -1 | 7 | 8) {
-                continue;
-            }
-            let list = group
-                .get("advert_list")
-                .and_then(Value::as_array)
-                .context("missing advert_list")?;
-            for item in list {
-                let id = item
-                    .get("advertId")
-                    .and_then(Value::as_u64)
-                    .context("invalid advertId")?;
-                if Some(id) != own_id {
-                    ids.insert(id);
-                }
-            }
-        }
-        ensure!(
-            ids.len() <= 500,
-            "campaign overlap check exceeds bounded scan"
-        );
+        let ids = nonfinished_campaign_ids(&groups, own_id)?;
         for chunk in ids.into_iter().collect::<Vec<_>>().chunks(50) {
             let response = self
                 .reader
@@ -589,6 +559,41 @@ impl Operator {
     }
 }
 
+fn nonfinished_campaign_ids(groups: &Value, own_id: Option<u64>) -> Result<BTreeSet<u64>> {
+    let groups = groups
+        .get("adverts")
+        .and_then(Value::as_array)
+        .context("campaign listing incomplete")?;
+    let mut ids = BTreeSet::new();
+    for group in groups {
+        let status = group
+            .get("status")
+            .and_then(Value::as_i64)
+            .context("missing campaign status")?;
+        if matches!(status, -1 | 7 | 8) {
+            continue;
+        }
+        let list = group
+            .get("advert_list")
+            .and_then(Value::as_array)
+            .context("missing advert_list")?;
+        for item in list {
+            let id = item
+                .get("advertId")
+                .and_then(Value::as_u64)
+                .context("invalid advertId")?;
+            if Some(id) != own_id {
+                ids.insert(id);
+            }
+        }
+    }
+    ensure!(
+        ids.len() <= 500,
+        "campaign overlap check exceeds bounded scan"
+    );
+    Ok(ids)
+}
+
 fn validate_registry(manifest: &Manifest) -> Result<String> {
     let registry = RegistrySource::new(&manifest.registry)?.load()?;
     let account = registry
@@ -621,37 +626,38 @@ fn write_error(error: WbGuardedWriteError<anyhow::Error>) -> anyhow::Error {
     }
 }
 
+enum WriteStage {
+    Create,
+    Bids,
+    Fund,
+    Start,
+}
+
 /// Explicit local CLI entry point; no generic HTTP paths or payment amounts.
 pub async fn run_wb_campaign_launch(mode: &str, manifest_path: &Path) -> Result<Value> {
-    ensure!(
-        matches!(
-            mode,
-            "preflight" | "create" | "bids" | "fund" | "start" | "reconcile"
-        ),
-        "unknown launch stage"
-    );
     // A revoked/expired writer or changed source robot must never prevent
     // reading the outcome of an already attempted money operation.
-    if mode == "reconcile" {
-        return reconcile_read_only(manifest_path).await;
-    }
+    let stage = match mode {
+        "reconcile" => return reconcile_read_only(manifest_path).await,
+        "preflight" => return Operator::load(manifest_path, false)?.preflight(None).await,
+        "create" => WriteStage::Create,
+        "bids" => WriteStage::Bids,
+        "fund" => WriteStage::Fund,
+        "start" => WriteStage::Start,
+        _ => bail!("unknown launch stage"),
+    };
     let operator = Operator::load(manifest_path, false)?;
     operator.manifest.authorize_stage(mode)?;
-    if mode == "preflight" {
-        return operator.preflight(None).await;
-    }
     let journal = Journal::open(
         &operator.manifest.journal_directory,
         &serde_json::to_value(&operator.manifest)?,
-        mode != "reconcile",
+        true,
     )?;
-    match mode {
-        "create" => operator.create(&journal).await,
-        "bids" => operator.bids(&journal).await,
-        "fund" => operator.fund(&journal).await,
-        "start" => operator.start(&journal).await,
-        "reconcile" => operator.reconcile(&journal).await,
-        _ => bail!("unknown launch stage"),
+    match stage {
+        WriteStage::Create => operator.create(&journal).await,
+        WriteStage::Bids => operator.bids(&journal).await,
+        WriteStage::Fund => operator.fund(&journal).await,
+        WriteStage::Start => operator.start(&journal).await,
     }
 }
 
