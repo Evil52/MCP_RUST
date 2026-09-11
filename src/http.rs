@@ -5,6 +5,8 @@
 //! the same guarantee: the copy drifts, and the routes that only exist in the
 //! binary — liveness/readiness and the OAuth resource metadata — go unverified.
 
+mod session;
+
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -1017,50 +1019,6 @@ fn unknown_mcp_session_response() -> Response {
     (StatusCode::NOT_FOUND, "Not Found: Session not found").into_response()
 }
 
-fn exact_mcp_session_id(headers: &HeaderMap) -> Result<Option<&str>, ()> {
-    let mut values = headers.get_all(MCP_SESSION_ID_HEADER).iter();
-    let Some(value) = values.next() else {
-        return Ok(None);
-    };
-    if values.next().is_some() {
-        return Err(());
-    }
-    value.to_str().map(Some).map_err(|_| ())
-}
-
-async fn reconcile_session_ownership(
-    owners: Option<&SessionOwners>,
-    subject: Option<&str>,
-    method: &Method,
-    incoming_session_id: Option<&str>,
-    response_status: StatusCode,
-    response_session_id: Option<&str>,
-) -> Result<(), Box<Response>> {
-    let (Some(owners), Some(subject)) = (owners, subject) else {
-        return Ok(());
-    };
-    if let Some(session_id) = incoming_session_id {
-        if (method == Method::DELETE && response_status.is_success())
-            || response_status == StatusCode::NOT_FOUND
-        {
-            owners.remove(session_id).await;
-        }
-        return Ok(());
-    }
-
-    let Some(session_id) = response_session_id else {
-        return Ok(());
-    };
-    if owners.bind_created(session_id, subject).await {
-        Ok(())
-    } else {
-        Err(Box::new(body_failure_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error: session ownership conflict",
-        )))
-    }
-}
-
 async fn limit_mcp_request_concurrency(
     State(limits): State<McpHttpLimits>,
     mut request: Request,
@@ -1107,25 +1065,16 @@ async fn limit_mcp_request_concurrency(
         drop(auth_permit);
     }
 
-    let incoming_session_id = match exact_mcp_session_id(request.headers()) {
-        Ok(value) => value.map(ToOwned::to_owned),
-        Err(()) => {
-            return body_failure_response(
-                StatusCode::BAD_REQUEST,
-                "Bad Request: invalid MCP session identifier",
-            );
-        }
-    };
-    if let (Some(owners), Some(subject), Some(session_id)) = (
-        limits.session_owners.as_ref(),
+    let incoming_session_id = match session::authorize_request(
+        &limits,
         authenticated_subject.as_deref(),
-        incoming_session_id.as_deref(),
-    ) && !owners.authorize(session_id, subject).await
+        request.headers(),
+    )
+    .await
     {
-        // Deliberately indistinguishable from an unknown/expired session: a
-        // valid token must not turn another actor's session ID into an oracle.
-        return unknown_mcp_session_response();
-    }
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
 
     let permit = if method == Method::GET {
         let Some(permit) = limits.try_enter_stream() else {
@@ -1141,22 +1090,13 @@ async fn limit_mcp_request_concurrency(
 
     if method == Method::GET {
         let response = next.run(request).await;
-        let response_session_id = match exact_mcp_session_id(response.headers()) {
-            Ok(value) => value.map(ToOwned::to_owned),
-            Err(()) => {
-                return body_failure_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Server Error: invalid session identifier",
-                );
-            }
-        };
-        if let Err(response) = reconcile_session_ownership(
-            limits.session_owners.as_ref(),
+        if let Err(response) = session::reconcile_response(
+            &limits,
             authenticated_subject.as_deref(),
             &method,
             incoming_session_id.as_deref(),
             response.status(),
-            response_session_id.as_deref(),
+            response.headers(),
         )
         .await
         {
@@ -1183,22 +1123,13 @@ async fn limit_mcp_request_concurrency(
         (request, None)
     };
     let response = next.run(request).await;
-    let response_session_id = match exact_mcp_session_id(response.headers()) {
-        Ok(value) => value.map(ToOwned::to_owned),
-        Err(()) => {
-            return body_failure_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal Server Error: invalid session identifier",
-            );
-        }
-    };
-    if let Err(response) = reconcile_session_ownership(
-        limits.session_owners.as_ref(),
+    if let Err(response) = session::reconcile_response(
+        &limits,
         authenticated_subject.as_deref(),
         &method,
         incoming_session_id.as_deref(),
         response.status(),
-        response_session_id.as_deref(),
+        response.headers(),
     )
     .await
     {
@@ -1409,6 +1340,7 @@ mod tests {
 
     use crate::config::{JwtConfig, RegistrySource};
 
+    use super::session::{exact_mcp_session_id, reconcile_session_ownership};
     use super::*;
 
     static AUTH_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -1430,11 +1362,8 @@ mod tests {
         }
 
         fn readiness(&self) -> ReadinessFuture<'_> {
-            if self.entered.fetch_add(1, Ordering::SeqCst) == 0 {
-                Box::pin(std::future::pending())
-            } else {
-                Box::pin(std::future::ready(Ok(())))
-            }
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending())
         }
     }
 
