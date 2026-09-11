@@ -1220,10 +1220,7 @@ fn pending_matches_static_guard(
         && pending.date_from.as_deref() == Some(guard.date_from.as_str())
         && pending.spend_cap_microrubles == Some(guard.spend_cap_microrubles)
         && pending.target_drr_percent == Some(guard.target_drr_percent)
-        && (static_guard.min_cpc_bid_microrubles..=static_guard.max_cpc_bid_microrubles)
-            .contains(&pending.from_microrubles)
-        && (static_guard.min_cpc_bid_microrubles..=static_guard.max_cpc_bid_microrubles)
-            .contains(&pending.to_microrubles)
+        && super::static_state::valid_static_bid_transition(pending)
 }
 
 #[allow(clippy::too_many_arguments)]
