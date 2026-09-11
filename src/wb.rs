@@ -66,6 +66,7 @@ const ACCEPTANCE_COEFFICIENTS_PATH: &str = "/api/tariffs/v1/acceptance/coefficie
 pub(crate) const PROMOTION_CAMPAIGNS_PATH: &str = "/adv/v1/promotion/count";
 pub(crate) const PROMOTION_DETAILS_PATH: &str = "/api/advert/v2/adverts";
 pub(crate) const PROMOTION_BUDGET_PATH: &str = "/adv/v1/budget";
+pub(crate) const PROMOTION_BALANCE_PATH: &str = "/adv/v1/balance";
 pub(crate) const PROMOTION_STATS_PATH: &str = "/adv/v3/fullstats";
 pub(crate) const SEARCH_PRODUCT_QUERIES_PATH: &str = "/api/v2/search-report/product/search-texts";
 pub(crate) const SEARCH_ORDERS_POSITIONS_PATH: &str = "/api/v2/search-report/product/orders";
@@ -352,6 +353,7 @@ struct TokenLimiter {
     logistics_tariffs: PacingGate,
     acceptance_tariffs: PacingGate,
     promotion_campaigns: PacingGate,
+    promotion_balance: PacingGate,
     promotion_stats: PacingGate,
     search_reports: PacingGate,
     promotion_minimum_bids: PacingGate,
@@ -373,6 +375,7 @@ impl TokenLimiter {
             logistics_tariffs: PacingGate::new(),
             acceptance_tariffs: PacingGate::new(),
             promotion_campaigns: PacingGate::new(),
+            promotion_balance: PacingGate::new(),
             promotion_stats: PacingGate::new(),
             search_reports: PacingGate::new(),
             promotion_minimum_bids: PacingGate::new(),
@@ -393,6 +396,7 @@ impl TokenLimiter {
             RequestClass::LogisticsTariff => &self.logistics_tariffs,
             RequestClass::AcceptanceTariff => &self.acceptance_tariffs,
             RequestClass::PromotionCampaign => &self.promotion_campaigns,
+            RequestClass::PromotionBalance => &self.promotion_balance,
             RequestClass::PromotionStats => &self.promotion_stats,
             RequestClass::SearchReport => &self.search_reports,
             RequestClass::PromotionMinimumBids => &self.promotion_minimum_bids,
@@ -1125,6 +1129,13 @@ impl WbClient {
         date: String,
     ) -> Result<Value, WbError> {
         self.request(account, Method::GET, path, Some(vec![("date", date)]), None)
+            .await
+    }
+
+    /// Returns account funding sources without transferring money. `balance`
+    /// is WB's type=1 mutual-settlement source, not bonuses or an external card.
+    pub async fn promotion_balance(&self, account: &str) -> Result<Value, WbError> {
+        self.request(account, Method::GET, PROMOTION_BALANCE_PATH, None, None)
             .await
     }
 
@@ -1942,6 +1953,13 @@ mod tests {
                 "promotion:/adv/v1/budget",
                 ApiHost::Promotion,
                 RequestClass::PromotionCampaign,
+            ),
+            (
+                Method::GET,
+                PROMOTION_BALANCE_PATH,
+                "promotion:/adv/v1/balance",
+                ApiHost::Promotion,
+                RequestClass::PromotionBalance,
             ),
             (
                 Method::GET,

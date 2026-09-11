@@ -237,12 +237,15 @@ impl WbAutomationObserver {
 }
 
 #[derive(Debug)]
-struct CampaignObservation {
-    status: i32,
-    bids: BTreeMap<u64, u64>,
+pub(super) struct CampaignObservation {
+    pub(super) status: i32,
+    pub(super) bids: BTreeMap<u64, u64>,
 }
 
-fn parse_campaign(response: &Value, policy: &WbAutomationPolicy) -> Result<CampaignObservation> {
+pub(super) fn parse_campaign(
+    response: &Value,
+    policy: &WbAutomationPolicy,
+) -> Result<CampaignObservation> {
     let adverts = response
         .get("adverts")
         .and_then(Value::as_array)

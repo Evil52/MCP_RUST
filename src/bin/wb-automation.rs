@@ -31,6 +31,20 @@ async fn main() -> Result<()> {
     if print_runtime_version_if_requested("wb-automation", &arguments)? {
         return Ok(());
     }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "campaign-launch")
+    {
+        ensure!(
+            arguments.len() == 3,
+            "usage: wb-automation campaign-launch preflight|create|bids|fund|start|reconcile MANIFEST.json"
+        );
+        let result =
+            mcp_ozon::control::run_wb_campaign_launch(&arguments[1], Path::new(&arguments[2]))
+                .await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     match parse_command(&arguments)? {
         Command::Observe(options) => observe_once(options).await,
         Command::ShadowPostgres(options) => shadow_postgres_once(options).await,
