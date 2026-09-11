@@ -49,7 +49,7 @@ const fn session_unavailable(_: crate::postgres::PostgresUnavailable) -> OzonPla
 }
 
 /// A fenced transition must update exactly its one expected row. SQL errors
-/// and the separate LeaseLost boundary retain their own classifications.
+/// and the separate `LeaseLost` boundary retain their own classifications.
 const fn require_single_update(updated: u64) -> Result<(), OzonPlanStoreError> {
     if updated == 1 {
         Ok(())

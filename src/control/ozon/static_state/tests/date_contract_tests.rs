@@ -59,7 +59,7 @@ fn oversized_date_input_is_invalid_and_disk_input_remains_byte_bounded() {
     let original = populated_state();
     persist_ozon_static_guard_state(&path, &original).unwrap();
     let original_bytes = fs::read(&path).unwrap();
-    let mut malformed = original.clone();
+    let mut malformed = original;
     malformed
         .pending_bid_changes
         .get_mut(&13)

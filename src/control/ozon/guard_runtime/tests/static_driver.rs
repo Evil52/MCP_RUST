@@ -240,9 +240,9 @@ async fn postgres_static_driver_lease_loss_stops_worker_and_releases_state_owner
     )
     .run(std::future::pending())
     .with_subscriber(logs.subscriber());
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+    let (result, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(3), async {
         tokio::join!(worker, terminate_owner)
-    })
+    }))
     .await
     .unwrap();
     assert!(

@@ -215,6 +215,7 @@ fn unavailable_recovery_readback_reports_the_existing_marker_without_writing() {
             );
             assert!(state.finishes.is_empty());
             assert!(state.incidents.is_empty());
+            drop(state);
         });
         assert!(log.contains("stop readback unavailable; stopping intent retained"));
         assert!(log.contains(&format!("write_started={}", write_started_at.is_some())));
