@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+mod acquire;
+#[cfg(test)]
+mod cancellation_tests;
 mod launch;
 mod state_read;
 
@@ -341,44 +344,6 @@ impl WbAutomationPostgresStore {
         valid
             .then_some(())
             .ok_or(WbAutomationPostgresError::Unavailable)
-    }
-
-    /// Acquires the same session-level campaign lock used by manual Control
-    /// transactions. `None` means another runtime or operator owns the exact
-    /// account/campaign boundary and this cycle must safely do nothing.
-    pub async fn try_acquire_campaign(
-        &self,
-        account_id: &str,
-        campaign_id: u64,
-    ) -> Result<Option<WbAutomationCampaignLease<'_>>, WbAutomationPostgresError> {
-        validate_account(account_id)?;
-        let campaign_id = to_i64(campaign_id)?;
-        let lock_key = format!("wb/{account_id}/{campaign_id}");
-        let client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| WbAutomationPostgresError::Unavailable)?;
-        let Ok(lock_row) = client
-            .query_one(
-                "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
-                &[&lock_key],
-            )
-            .await
-        else {
-            client.discard();
-            return Err(WbAutomationPostgresError::Unavailable);
-        };
-        let locked = lock_row.get::<_, bool>(0);
-        if !locked {
-            return Ok(None);
-        }
-        Ok(Some(WbAutomationCampaignLease {
-            client: Some(client),
-            account_id: account_id.to_owned(),
-            campaign_id,
-            lock_key,
-        }))
     }
 }
 
