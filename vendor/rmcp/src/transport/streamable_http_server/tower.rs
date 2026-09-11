@@ -77,6 +77,30 @@ fn session_manager_error_response<M: SessionManager>(
 pub(crate) const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 const STATELESS_STREAM_CHANNEL_CAPACITY: usize = 16;
 
+// This is an optimization for header validation, never an admission limit.
+// Unknown tools and definitions outside these budgets are not retained.
+const MAX_CACHED_TOOL_SCHEMAS: usize = 256;
+const MAX_CACHED_TOOL_NAME_BYTES: usize = 128;
+const MAX_CACHED_TOOL_SCHEMA_BYTES: usize = 64 * 1024;
+
+struct SchemaSizeBudget {
+    remaining: usize,
+}
+
+impl std::io::Write for SchemaSizeBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(|| std::io::Error::other("tool schema exceeds cache size budget"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct StreamableHttpServerConfig {
@@ -1207,9 +1231,9 @@ pub struct StreamableHttpService<S, M> {
         Arc<tokio::sync::RwLock<HashMap<SessionId, tokio::sync::watch::Sender<Option<bool>>>>>,
     >,
     /// Caches tool input schemas by name for SEP-2243 `Mcp-Param-*` validation.
-    /// Populated lazily via `get_tool` so the service factory runs at most once
-    /// per tool name. `None` value means the tool exposes no schema.
-    tool_schemas: Arc<std::sync::RwLock<HashMap<String, Option<Arc<JsonObject>>>>>,
+    /// Only known tools within fixed entry, name and schema-size budgets are
+    /// retained. Misses must not let request-controlled names accumulate.
+    tool_schemas: Arc<std::sync::RwLock<HashMap<String, Arc<JsonObject>>>>,
 }
 
 impl<S, M> Clone for StreamableHttpService<S, M> {
@@ -1466,24 +1490,42 @@ where
         Ok(self.stateless_sse_response(Some(first), receiver, request_ct))
     }
 
-    /// Returns the cached input schema for `name`, constructing a service once
-    /// per name to read its `ServerHandler::get_tool` definition. Used to
-    /// validate SEP-2243 `Mcp-Param-*` headers against the request body.
+    /// Returns the input schema for SEP-2243 `Mcp-Param-*` validation. Cache
+    /// capacity only controls retention: uncached definitions still validate.
     fn tool_schema(&self, name: &str) -> Option<Arc<JsonObject>> {
-        if let Ok(cache) = self.tool_schemas.read() {
+        let has_capacity = if let Ok(cache) = self.tool_schemas.read() {
             if let Some(schema) = cache.get(name) {
-                return schema.clone();
+                return Some(schema.clone());
             }
-        }
+            cache.len() < MAX_CACHED_TOOL_SCHEMAS
+        } else {
+            false
+        };
         let schema = self
             .get_service()
             .ok()
-            .and_then(|service| service.get_tool(name))
-            .map(|tool| tool.input_schema);
-        if let Ok(mut cache) = self.tool_schemas.write() {
-            cache.insert(name.to_owned(), schema.clone());
+            .and_then(|service| service.get_tool(name))?
+            .input_schema;
+        if has_capacity
+            && name.len() <= MAX_CACHED_TOOL_NAME_BYTES
+            && serde_json::to_writer(
+                SchemaSizeBudget {
+                    remaining: MAX_CACHED_TOOL_SCHEMA_BYTES,
+                },
+                schema.as_ref(),
+            )
+            .is_ok()
+        {
+            if let Ok(mut cache) = self.tool_schemas.write() {
+                // Other requests may have filled the cache during lookup.
+                if cache.len() < MAX_CACHED_TOOL_SCHEMAS {
+                    cache
+                        .entry(name.to_owned())
+                        .or_insert_with(|| schema.clone());
+                }
+            }
         }
-        schema
+        Some(schema)
     }
 
     /// Spawn a task that runs `serve_server_with_ct` for the given session, waits for

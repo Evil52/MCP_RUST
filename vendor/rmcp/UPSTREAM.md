@@ -45,6 +45,13 @@ the server configuration's cancellation token. Cancelling the root token now
 terminates both sessions that are still handshaking and fully initialized
 sessions, allowing the application to enforce a bounded graceful shutdown.
 
+Local modification: Streamable HTTP schema lookup never caches unknown tool
+names. Positive entries are capped at 256, with a 128-byte name and 64 KiB
+serialized-schema budget per entry. Oversized definitions and cache overflow
+still undergo the same header validation without retaining their schemas.
+The size check uses an allocation-free bounded writer; concurrent insertions
+recheck capacity under the write lock.
+
 The upstream `build.rs` is intentionally omitted: it manages Git hook settings
 for the SDK workspace and must not mutate the parent application's repository.
 

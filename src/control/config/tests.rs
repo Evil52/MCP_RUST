@@ -264,7 +264,6 @@ impl Drop for TempCredential {
 fn from(values: &BTreeMap<String, String>) -> Result<ControlAppConfig> {
     ControlAppConfig::from_lookup(|key| values.get(key).cloned())
 }
-
 #[test]
 fn defaults_are_disabled_and_do_not_request_marketplace_credentials() {
     let fixtures = Fixtures::new();
@@ -286,7 +285,6 @@ fn defaults_are_disabled_and_do_not_request_marketplace_credentials() {
             && !key.contains("API_TOKEN")
     }));
 }
-
 #[test]
 fn process_environment_loader_reads_only_the_control_namespace() {
     if std::env::var_os(CONTROL_CONFIG_ENV_CHILD).is_some() {
@@ -324,7 +322,6 @@ fn process_environment_loader_reads_only_the_control_namespace() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-
 #[test]
 fn dev_non_loopback_requires_explicit_opt_in_and_bounds_sessions() {
     let fixtures = Fixtures::new();
@@ -1488,3 +1485,6 @@ fn wb_runtime_refuses_wrong_account_token_paths_and_timeout() {
     );
     assert!(from(&missing_writer).is_err());
 }
+
+#[path = "boundary_tests.rs"]
+mod boundaries;

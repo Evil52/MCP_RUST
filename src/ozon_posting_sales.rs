@@ -152,41 +152,51 @@ impl PostingSalesAccumulator {
                 PostingScheme::Fbs => checked_add(&mut self.totals.fbs_postings, 1)?,
             }
             for product in products {
-                let product = product.as_object().ok_or(PostingSalesError::Shape)?;
-                let sku = positive_u64_field(product, "sku")?;
-                let quantity = positive_u64_field(product, "quantity")?;
-                if !self.rows.contains_key(&sku) && self.rows.len() >= MAX_AGGREGATED_SKUS {
-                    return Err(PostingSalesError::TooManyRows);
-                }
-                let row = self.rows.entry(sku).or_default();
-                let cancelled = status == "cancelled";
-                match (scheme, cancelled) {
-                    (PostingScheme::Fbo, false) => {
-                        checked_add(&mut row.fbo_non_cancelled, quantity)?;
-                        checked_add(&mut self.totals.fbo_non_cancelled_units, quantity)?;
-                    }
-                    (PostingScheme::Fbs, false) => {
-                        checked_add(&mut row.fbs_non_cancelled, quantity)?;
-                        checked_add(&mut self.totals.fbs_non_cancelled_units, quantity)?;
-                    }
-                    (PostingScheme::Fbo, true) => {
-                        checked_add(&mut row.fbo_cancelled, quantity)?;
-                        checked_add(&mut self.totals.fbo_cancelled_units, quantity)?;
-                    }
-                    (PostingScheme::Fbs, true) => {
-                        checked_add(&mut row.fbs_cancelled, quantity)?;
-                        checked_add(&mut self.totals.fbs_cancelled_units, quantity)?;
-                    }
-                }
-                let status_units = match scheme {
-                    PostingScheme::Fbo => &mut row.fbo_by_status,
-                    PostingScheme::Fbs => &mut row.fbs_by_status,
-                };
-                checked_add(status_units.entry(status.to_owned()).or_default(), quantity)?;
+                self.absorb_product(scheme, status, product)?;
             }
         }
 
         next_cursor(root)
+    }
+
+    fn absorb_product(
+        &mut self,
+        scheme: PostingScheme,
+        status: &str,
+        product: &Value,
+    ) -> Result<(), PostingSalesError> {
+        let product = product.as_object().ok_or(PostingSalesError::Shape)?;
+        let sku = positive_u64_field(product, "sku")?;
+        let quantity = positive_u64_field(product, "quantity")?;
+        if !self.rows.contains_key(&sku) && self.rows.len() >= MAX_AGGREGATED_SKUS {
+            return Err(PostingSalesError::TooManyRows);
+        }
+        let row = self.rows.entry(sku).or_default();
+        let cancelled = status == "cancelled";
+        match (scheme, cancelled) {
+            (PostingScheme::Fbo, false) => {
+                checked_add(&mut row.fbo_non_cancelled, quantity)?;
+                checked_add(&mut self.totals.fbo_non_cancelled_units, quantity)?;
+            }
+            (PostingScheme::Fbs, false) => {
+                checked_add(&mut row.fbs_non_cancelled, quantity)?;
+                checked_add(&mut self.totals.fbs_non_cancelled_units, quantity)?;
+            }
+            (PostingScheme::Fbo, true) => {
+                checked_add(&mut row.fbo_cancelled, quantity)?;
+                checked_add(&mut self.totals.fbo_cancelled_units, quantity)?;
+            }
+            (PostingScheme::Fbs, true) => {
+                checked_add(&mut row.fbs_cancelled, quantity)?;
+                checked_add(&mut self.totals.fbs_cancelled_units, quantity)?;
+            }
+        }
+        let status_units = match scheme {
+            PostingScheme::Fbo => &mut row.fbo_by_status,
+            PostingScheme::Fbs => &mut row.fbs_by_status,
+        };
+        checked_add(status_units.entry(status.to_owned()).or_default(), quantity)?;
+        Ok(())
     }
 
     pub fn finish(

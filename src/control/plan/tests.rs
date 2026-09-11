@@ -225,14 +225,9 @@ async fn prepare_error_mapper_handles_transport_errors_without_fabricating_db_st
     assert_eq!(map_prepare_insert_error(error), PlanStoreError::Unavailable);
 }
 
-async fn classify_database_failures_with_optional_test_database(
-    admin_url: Result<String, std::env::VarError>,
-) {
-    let Ok(admin_url) = admin_url else {
-        return;
-    };
+async fn classify_database_failures(admin_url: &str) {
     let _database_guard = CONTROL_DB_TEST_LOCK.lock().await;
-    let (mut admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+    let (mut admin, connection) = tokio_postgres::connect(admin_url, tokio_postgres::NoTls)
         .await
         .unwrap();
     let connection_task = tokio::spawn(connection);
@@ -307,13 +302,11 @@ async fn classify_database_failures_with_optional_test_database(
 }
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run through scripts/with-position-test-db.sh"]
 async fn prepare_error_mapper_classifies_database_failures() {
-    classify_database_failures_with_optional_test_database(std::env::var(
-        "POSITION_REPOSITORY_TEST_ADMIN_URL",
-    ))
-    .await;
-    classify_database_failures_with_optional_test_database(Err(std::env::VarError::NotPresent))
-        .await;
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
+        .expect("disposable fixture provides the admin URL");
+    classify_database_failures(&admin_url).await;
 }
 
 #[test]
@@ -500,24 +493,18 @@ async fn create_applying_fixture_plan(
     plan
 }
 
-async fn run_repository_scenarios_with_optional_test_database(
-    database_url: Result<String, std::env::VarError>,
-    admin_url: Result<String, std::env::VarError>,
-) {
-    let (Ok(database_url), Ok(admin_url)) = (database_url, admin_url) else {
-        return;
-    };
+async fn run_repository_scenarios(database_url: &str, admin_url: &str) {
     let _database_guard = CONTROL_DB_TEST_LOCK.lock().await;
-    let config = validate_control_database_url(&database_url).unwrap();
+    let config = validate_control_database_url(database_url).unwrap();
     let repository = WbPlanRepository::connect(&config).await.unwrap();
     repository.verify_runtime_contract().await.unwrap();
     repository.probe().await.unwrap();
-    let (mut admin, admin_connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+    let (mut admin, admin_connection) = tokio_postgres::connect(admin_url, tokio_postgres::NoTls)
         .await
         .unwrap();
     let admin_connection_task = tokio::spawn(admin_connection);
     let (preconnected_client, preconnected_connection) =
-        tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        tokio_postgres::connect(database_url, tokio_postgres::NoTls)
             .await
             .unwrap();
     let preconnected_connection_task = tokio::spawn(preconnected_connection);
@@ -529,7 +516,7 @@ async fn run_repository_scenarios_with_optional_test_database(
     drop(preconnected_repository);
     preconnected_connection_task.await.unwrap().unwrap();
     let (direct_writer, direct_writer_connection) =
-        tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        tokio_postgres::connect(database_url, tokio_postgres::NoTls)
             .await
             .unwrap();
     let direct_writer_connection_task = tokio::spawn(direct_writer_connection);
@@ -2777,17 +2764,13 @@ async fn run_repository_scenarios_with_optional_test_database(
 }
 
 #[tokio::test]
-async fn repository_enforces_approval_gates_incidents_and_quotas_when_test_database_is_available() {
-    Box::pin(run_repository_scenarios_with_optional_test_database(
-        std::env::var("WB_CONTROL_TEST_DATABASE_URL"),
-        std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),
-    ))
-    .await;
-    Box::pin(run_repository_scenarios_with_optional_test_database(
-        Err(std::env::VarError::NotPresent),
-        Err(std::env::VarError::NotPresent),
-    ))
-    .await;
+#[ignore = "requires disposable PostgreSQL; run through scripts/with-position-test-db.sh"]
+async fn repository_enforces_approval_gates_incidents_and_quotas() {
+    let database_url = std::env::var("WB_CONTROL_TEST_DATABASE_URL")
+        .expect("disposable fixture provides the WB Control URL");
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
+        .expect("disposable fixture provides the admin URL");
+    Box::pin(run_repository_scenarios(&database_url, &admin_url)).await;
 }
 
 /// Every repository entry point must report `Unavailable` — never a fabricated
@@ -2797,25 +2780,18 @@ async fn repository_enforces_approval_gates_incidents_and_quotas_when_test_datab
 /// severed socket looks like to this code. These are the error arms that the
 /// happy-path scenarios never exercise.
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run through scripts/with-position-test-db.sh"]
 async fn every_repository_entry_point_fails_closed_when_the_database_is_gone() {
-    verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(Err(
-        std::env::VarError::NotPresent,
-    ))
-    .await;
-    verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(std::env::var(
-        "WB_CONTROL_TEST_DATABASE_URL",
-    ))
-    .await;
+    let database_url = std::env::var("WB_CONTROL_TEST_DATABASE_URL")
+        .expect("disposable fixture provides the WB Control URL");
+    verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(&database_url).await;
 }
 
 async fn verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(
-    database_url: Result<String, std::env::VarError>,
+    database_url: &str,
 ) {
-    let Ok(database_url) = database_url else {
-        return;
-    };
     let _database_guard = CONTROL_DB_TEST_LOCK.lock().await;
-    let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
         .unwrap();
     let connection_task = tokio::spawn(connection);

@@ -65,38 +65,17 @@ impl Drop for PendingDispatch {
     }
 }
 
-fn complete_tool_result(response: &CallToolResponse) -> &CallToolResult {
-    match response {
-        CallToolResponse::Complete(result) => result,
-        _ => panic!("expected a complete tool response"),
-    }
-}
-
-#[test]
-#[should_panic(expected = "expected a complete tool response")]
-fn complete_tool_result_rejects_non_terminal_responses() {
-    let response = rmcp::model::InputRequiredResult::from_request_state("test").into();
-    complete_tool_result(&response);
-}
+mod production_paths;
 
 fn assert_control_failure(response: &CallToolResponse, expected_kind: &str) {
-    let result = complete_tool_result(response);
-    assert_eq!(result.is_error, Some(true));
-    assert_eq!(
-        result
-            .structured_content
-            .as_ref()
-            .and_then(|value| value.get("error_code"))
-            .and_then(Value::as_str),
-        Some(MCP_TOOL_FAILURE)
-    );
-    assert_eq!(
-        result
-            .structured_content
-            .as_ref()
-            .and_then(|value| value.get("kind"))
-            .and_then(Value::as_str),
-        Some(expected_kind)
+    assert!(
+        matches!(response, CallToolResponse::Complete(result)
+        if result.is_error == Some(true)
+        && result.structured_content.as_ref().is_some_and(|value|
+            value.get("error_code").and_then(Value::as_str) == Some(MCP_TOOL_FAILURE)
+            && value.get("kind").and_then(Value::as_str) == Some(expected_kind)
+        )),
+        "expected complete {expected_kind} failure, received {response:?}"
     );
 }
 
@@ -199,6 +178,66 @@ impl FakeReportingRepository {
             ReportingMarketplace::Ozon => ReadMarketplace::Ozon,
             ReportingMarketplace::Wildberries => ReadMarketplace::Wildberries,
         }
+    }
+}
+
+fn weekly_sales_fixture(
+    account: &AccountScope,
+    query: SalesAnalyticsQuery,
+) -> SalesAnalyticsResult {
+    let incomplete = account.account_id() == "account_b"
+        || account.marketplace() == ReportingMarketplace::Wildberries;
+    let mut coverage = Vec::with_capacity(7);
+    let mut rows = Vec::with_capacity(7);
+    let mut date = query.date_from;
+    loop {
+        let missing = incomplete && date == query.date_to;
+        coverage.push(SalesDateCoverage {
+            business_date: date.to_string(),
+            state: if missing {
+                SalesDateCoverageState::Unavailable
+            } else {
+                SalesDateCoverageState::Complete
+            },
+            served: !missing,
+            cutoff_at: (!missing).then(|| "2026-08-31T03:00:00Z".to_owned()),
+            source_as_of: (!missing).then(|| "2026-08-31T02:59:00Z".to_owned()),
+            period_end: (!missing).then(|| "2026-08-31T19:00:00Z".to_owned()),
+        });
+        if !missing {
+            rows.push(SalesAnalyticsRow {
+                business_date: Some(date.to_string()),
+                sku: None,
+                ordered_units: 2,
+                operational_gmv_minor: 1_000,
+                currency: "RUB".to_owned(),
+            });
+        }
+        if date == query.date_to {
+            break;
+        }
+        date = date.succ_opt().expect("bounded test date");
+    }
+    let total_rows = rows.len() as u64;
+    SalesAnalyticsResult {
+        account_id: account.account_id().to_owned(),
+        marketplace: FakeReportingRepository::marketplace(account),
+        date_from: query.date_from.to_string(),
+        date_to: query.date_to.to_string(),
+        state: if incomplete {
+            DataState::Partial
+        } else {
+            DataState::Complete
+        },
+        source: "published_postgresql_snapshots".to_owned(),
+        group_by: query.group_by,
+        sort_by: query.sort_by,
+        direction: query.direction,
+        limit: query.limit,
+        offset: query.offset,
+        total_rows,
+        rows,
+        coverage,
     }
 }
 
@@ -337,60 +376,7 @@ impl ReportingReadRepository for FakeReportingRepository {
             .num_days()
             == 6
         {
-            let incomplete = account.account_id() == "account_b"
-                || account.marketplace() == ReportingMarketplace::Wildberries;
-            let mut coverage = Vec::with_capacity(7);
-            let mut rows = Vec::with_capacity(7);
-            let mut date = query.date_from;
-            loop {
-                let missing = incomplete && date == query.date_to;
-                coverage.push(SalesDateCoverage {
-                    business_date: date.to_string(),
-                    state: if missing {
-                        SalesDateCoverageState::Unavailable
-                    } else {
-                        SalesDateCoverageState::Complete
-                    },
-                    served: !missing,
-                    cutoff_at: (!missing).then(|| "2026-08-31T03:00:00Z".to_owned()),
-                    source_as_of: (!missing).then(|| "2026-08-31T02:59:00Z".to_owned()),
-                    period_end: (!missing).then(|| "2026-08-31T19:00:00Z".to_owned()),
-                });
-                if !missing {
-                    rows.push(SalesAnalyticsRow {
-                        business_date: Some(date.to_string()),
-                        sku: None,
-                        ordered_units: 2,
-                        operational_gmv_minor: 1_000,
-                        currency: "RUB".to_owned(),
-                    });
-                }
-                if date == query.date_to {
-                    break;
-                }
-                date = date.succ_opt().expect("bounded test date");
-            }
-            let total_rows = rows.len() as u64;
-            return self.complete(SalesAnalyticsResult {
-                account_id: account.account_id().to_owned(),
-                marketplace: Self::marketplace(account),
-                date_from: query.date_from.to_string(),
-                date_to: query.date_to.to_string(),
-                state: if incomplete {
-                    DataState::Partial
-                } else {
-                    DataState::Complete
-                },
-                source: "published_postgresql_snapshots".to_owned(),
-                group_by: query.group_by,
-                sort_by: query.sort_by,
-                direction: query.direction,
-                limit: query.limit,
-                offset: query.offset,
-                total_rows,
-                rows,
-                coverage,
-            });
+            return self.complete(weekly_sales_fixture(account, query));
         }
         self.complete(SalesAnalyticsResult {
             account_id: account.account_id().to_owned(),
@@ -1291,7 +1277,9 @@ async fn tool_call_limit_is_shared_across_clones_and_simulated_sessions() {
     release.add_permits(MAX_IN_FLIGHT_TOOL_CALLS);
     for task in active {
         let response = task.await.expect("admitted task must not panic");
-        assert_eq!(complete_tool_result(&response).is_error, Some(false));
+        assert!(
+            matches!(response, CallToolResponse::Complete(result) if result.is_error == Some(false))
+        );
     }
     assert_eq!(
         server.tool_call_slots.available_permits(),

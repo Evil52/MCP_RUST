@@ -27,9 +27,6 @@ pub use automation_observer::{
     WbAutomationObserver, WbAutomationSnapshot, WbAutomationStateView,
     persist_wb_automation_snapshot,
 };
-#[cfg(coverage)]
-#[doc(hidden)]
-pub use automation_postgres::exercise_coverage_only_database_mappings;
 pub use automation_postgres::{
     WbAutomationActionReservation, WbAutomationCampaignLease, WbAutomationDatabaseState,
     WbAutomationDurableAction, WbAutomationDurableActionKind, WbAutomationDurableActionStatus,

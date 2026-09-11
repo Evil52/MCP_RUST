@@ -42,7 +42,7 @@ pub const MAX_STATEMENT_TIMEOUT_MILLIS: i64 = 120_000;
 /// Ceiling accepted for the server-applied `idle_in_transaction_session_timeout`.
 pub const MAX_IDLE_IN_TRANSACTION_MILLIS: i64 = 120_000;
 
-/// TCP-level connection establishment budget.
+/// Budget for TCP establishment and the complete PostgreSQL startup/auth exchange.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Keepalive probing detects a peer that vanished without a FIN, which is the
@@ -105,15 +105,21 @@ pub struct SupervisedClient {
 }
 
 impl SupervisedClient {
-    /// Connects, verifies server-side session bounds, and supervises the driver.
+    /// Applies transport bounds, verifies server-side bounds, and supervises the driver.
+    ///
+    /// Retains the hardened configuration for every replacement session. The
+    /// caller's configuration and role-owned statement/transaction bounds are
+    /// left unchanged.
     pub async fn connect(
         config: &Config,
         component: &'static str,
     ) -> Result<Self, PostgresUnavailable> {
-        let client = connect_supervised(config, component).await?;
+        let mut config = config.clone();
+        harden(&mut config, component);
+        let client = connect_supervised(&config, component).await?;
         Ok(Self {
             component,
-            config: Some(config.clone()),
+            config: Some(config),
             metrics: SessionMetrics::default(),
             slot: Mutex::new(ConnectionSlot {
                 client: Some(client),
@@ -166,7 +172,13 @@ impl SupervisedClient {
             // Reserve the cooldown before attempting, so a failed attempt
             // paces the next one even though this guard is released early.
             slot.next_attempt_at = now + RECONNECT_COOLDOWN;
-            slot.client = Some(connect_supervised(config, self.component).await?);
+            let connected = connect_supervised(config, self.component).await;
+            if connected.is_err() {
+                // A slow failure can consume the initial reservation. Leave
+                // a full cooldown for callers waiting behind this attempt.
+                slot.next_attempt_at = Instant::now() + RECONNECT_COOLDOWN;
+            }
+            slot.client = Some(connected?);
             tracing::info!(
                 component = self.component,
                 "PostgreSQL session re-established"
@@ -251,10 +263,16 @@ async fn connect_supervised(
     config: &Config,
     component: &'static str,
 ) -> Result<Client, PostgresUnavailable> {
-    let (client, connection) = config
-        .connect(NoTls)
-        .await
-        .map_err(|_| PostgresUnavailable)?;
+    // Config::connect_timeout only bounds opening each socket. A TCP peer can
+    // accept it and then stall forever during PostgreSQL startup or auth, so
+    // bound the whole exchange before publishing or spawning its driver.
+    // This cold-path handshake is large; keep it off every caller's future
+    // stack while retaining cancellation of the owned connection attempt.
+    let (client, connection) =
+        tokio::time::timeout(CONNECT_TIMEOUT, Box::pin(config.connect(NoTls)))
+            .await
+            .map_err(|_| PostgresUnavailable)?
+            .map_err(|_| PostgresUnavailable)?;
     // Supervised rather than detached: the driver future owns the socket, and
     // its termination is the only place the reason for a lost session exists.
     std::mem::drop(tokio::spawn(async move {
@@ -312,6 +330,206 @@ impl ClientGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot, task::JoinHandle};
+
+    async fn stalled_postgres_peer() -> (Config, oneshot::Receiver<Vec<u8>>, JoinHandle<()>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("the loopback listener binds");
+        let mut config = Config::new();
+        config
+            .host("127.0.0.1")
+            .port(
+                listener
+                    .local_addr()
+                    .expect("listener has an address")
+                    .port(),
+            )
+            .user("startup-test")
+            .ssl_mode(tokio_postgres::config::SslMode::Disable);
+        let (started, startup_received) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("client connects");
+            let mut header = [0_u8; 8];
+            socket
+                .read_exact(&mut header)
+                .await
+                .expect("startup arrives");
+            assert_eq!(&header[4..], &196_608_u32.to_be_bytes());
+            let length = u32::from_be_bytes(header[..4].try_into().expect("length has four bytes"));
+            assert!((8..=1024).contains(&length));
+            let mut startup = vec![0; usize::try_from(length).expect("length fits usize") - 8];
+            socket
+                .read_exact(&mut startup)
+                .await
+                .expect("startup parameters arrive");
+            started.send(startup).expect("test waits for startup");
+            // Keep the TCP connection alive but never answer the startup
+            // packet. A cancelled connect must close the socket itself.
+            let mut buffer = [0_u8; 1024];
+            assert_eq!(
+                socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("socket closes cleanly"),
+                0,
+                "cancelled startup must close without sending more protocol bytes"
+            );
+        });
+        (config, startup_received, peer)
+    }
+
+    async fn wait_for_startup(startup_received: oneshot::Receiver<Vec<u8>>) -> Vec<u8> {
+        let startup = tokio::time::timeout(Duration::from_secs(2), startup_received)
+            .await
+            .expect("loopback startup completes promptly")
+            .expect("the peer received startup");
+        // Pause only after real I/O has completed, so Tokio cannot advance
+        // the deadline while the OS is still establishing the socket.
+        tokio::time::pause();
+        startup
+    }
+
+    async fn assert_peer_closed(peer: JoinHandle<()>) {
+        // Real I/O must be allowed to make progress before a test timer fires.
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(2), peer)
+            .await
+            .expect("dropping the connect closes the peer socket")
+            .expect("the peer task completes");
+    }
+
+    #[tokio::test]
+    async fn connect_hardens_its_own_config_and_preserves_role_options() {
+        const OPTIONS: &str =
+            "-c statement_timeout=9000 -c idle_in_transaction_session_timeout=9000";
+        let (mut config, startup_received, peer) = stalled_postgres_peer().await;
+        config
+            .application_name("spoofed")
+            .keepalives(false)
+            .options(OPTIONS);
+        assert_eq!(config.get_connect_timeout(), None);
+        let caller_config = std::sync::Arc::new(config);
+        let config = caller_config.clone();
+        let connect = tokio::spawn(async move {
+            SupervisedClient::connect(&config, "mcp-ozon-wb-automation").await
+        });
+        let startup = wait_for_startup(startup_received).await;
+        let application_name = b"application_name\0mcp-ozon-wb-automation\0";
+        assert!(
+            startup
+                .windows(application_name.len())
+                .any(|part| part == application_name)
+        );
+        let options = format!("options\0{OPTIONS}\0");
+        assert!(
+            startup
+                .windows(options.len())
+                .any(|part| part == options.as_bytes())
+        );
+        assert_eq!(caller_config.get_application_name(), Some("spoofed"));
+        assert_eq!(caller_config.get_connect_timeout(), None);
+        assert!(!caller_config.get_keepalives());
+        assert_eq!(caller_config.get_options(), Some(OPTIONS));
+        tokio::time::advance(CONNECT_TIMEOUT).await;
+        assert_eq!(
+            connect
+                .await
+                .expect("hardened startup task completes")
+                .err(),
+            Some(PostgresUnavailable),
+            "a caller without a connect timeout still receives a bounded connection"
+        );
+        assert_peer_closed(peer).await;
+    }
+
+    #[tokio::test]
+    async fn startup_is_bounded_after_the_tcp_connection_succeeds() {
+        let (config, startup_received, peer) = stalled_postgres_peer().await;
+        let connect = tokio::spawn(async move { SupervisedClient::connect(&config, "test").await });
+        wait_for_startup(startup_received).await;
+        tokio::time::advance(CONNECT_TIMEOUT).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), connect)
+                .await
+                .expect("startup has its own deadline")
+                .expect("connect task completes")
+                .err(),
+            Some(PostgresUnavailable)
+        );
+        assert_peer_closed(peer).await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_reconnect_releases_the_mutex_and_preserves_a_full_cooldown() {
+        let (config, startup_received, peer) = stalled_postgres_peer().await;
+        let supervised = std::sync::Arc::new(SupervisedClient {
+            component: "test",
+            config: Some(config),
+            metrics: SessionMetrics::default(),
+            slot: Mutex::new(ConnectionSlot {
+                client: None,
+                next_attempt_at: Instant::now(),
+            }),
+        });
+        let reconnect = {
+            let supervised = supervised.clone();
+            tokio::spawn(async move { supervised.acquire().await.err() })
+        };
+        wait_for_startup(startup_received).await;
+        tokio::time::advance(CONNECT_TIMEOUT).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1), reconnect)
+                .await
+                .expect("reconnect startup has a deadline")
+                .expect("reconnect task completes"),
+            Some(PostgresUnavailable)
+        );
+        let reserved = tokio::time::timeout(Duration::from_millis(1), supervised.slot.lock())
+            .await
+            .expect("the timed out reconnect releases the mutex")
+            .next_attempt_at;
+        assert_eq!(reserved, Instant::now() + RECONNECT_COOLDOWN);
+        assert_eq!(supervised.acquire().await.err(), Some(PostgresUnavailable));
+        assert_eq!(supervised.slot.lock().await.next_attempt_at, reserved);
+        assert_eq!(supervised.session_metrics().held, 0);
+        assert_peer_closed(peer).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_reconnect_closes_the_socket_and_keeps_its_cooldown() {
+        let (config, startup_received, peer) = stalled_postgres_peer().await;
+        let supervised = std::sync::Arc::new(SupervisedClient {
+            component: "test",
+            config: Some(config),
+            metrics: SessionMetrics::default(),
+            slot: Mutex::new(ConnectionSlot {
+                client: None,
+                next_attempt_at: Instant::now(),
+            }),
+        });
+        let reconnect = {
+            let supervised = supervised.clone();
+            tokio::spawn(async move { supervised.acquire().await.err() })
+        };
+        wait_for_startup(startup_received).await;
+        reconnect.abort();
+        assert!(
+            reconnect
+                .await
+                .expect_err("reconnect was cancelled")
+                .is_cancelled()
+        );
+        let reserved = tokio::time::timeout(Duration::from_millis(1), supervised.slot.lock())
+            .await
+            .expect("cancelling reconnect releases the mutex")
+            .next_attempt_at;
+        assert!(reserved > Instant::now());
+        assert_eq!(supervised.acquire().await.err(), Some(PostgresUnavailable));
+        assert_eq!(supervised.slot.lock().await.next_attempt_at, reserved);
+        assert_eq!(supervised.session_metrics().held, 0);
+        assert_peer_closed(peer).await;
+    }
 
     #[tokio::test(start_paused = true)]
     async fn cancelling_an_actual_acquire_records_the_wait_without_leaking_a_gauge() {

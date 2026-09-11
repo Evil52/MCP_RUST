@@ -76,27 +76,7 @@ pub(super) fn load_ozon_runtime(
     })?;
     crate::postgres::harden(&mut database, database_application_name);
     if identity == OzonRuntimeIdentity::Planner {
-        if parse_strict_bool(
-            &value_or(lookup, "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED", "false"),
-            "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED",
-        )? {
-            bail!("credentialless Ozon planner cannot arm marketplace writes");
-        }
-        for forbidden in [
-            "CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_ID_FILE",
-            "CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_SECRET_FILE",
-            "CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL",
-            "CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE",
-            "CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE",
-            "CONTROL_MCP_OZON_PROXY",
-            "CONTROL_MCP_OZON_TIMEOUT_SECONDS",
-        ] {
-            if lookup(forbidden).is_some() {
-                bail!(
-                    "credentialless Ozon planner запрещает marketplace credential/egress setting {forbidden}"
-                );
-            }
-        }
+        validate_credentialless_planner(lookup)?;
         return Ok(Some(ControlOzonRuntimeConfig {
             account_id,
             database,
@@ -161,6 +141,31 @@ pub(super) fn load_ozon_runtime(
     }))
 }
 
+fn validate_credentialless_planner(lookup: &mut dyn FnMut(&str) -> Option<String>) -> Result<()> {
+    if parse_strict_bool(
+        &value_or(lookup, "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED", "false"),
+        "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED",
+    )? {
+        bail!("credentialless Ozon planner cannot arm marketplace writes");
+    }
+    for forbidden in [
+        "CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_ID_FILE",
+        "CONTROL_MCP_OZON_PLANNER_PERFORMANCE_CLIENT_SECRET_FILE",
+        "CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL",
+        "CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE",
+        "CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE",
+        "CONTROL_MCP_OZON_PROXY",
+        "CONTROL_MCP_OZON_TIMEOUT_SECONDS",
+    ] {
+        if lookup(forbidden).is_some() {
+            bail!(
+                "credentialless Ozon planner запрещает marketplace credential/egress setting {forbidden}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_ozon_database_url(value: &str, expected_role: &str) -> Result<PostgresConfig> {
     if value.is_empty() || value.trim() != value {
         bail!("Ozon Control database URL должен быть непустым без whitespace");
@@ -185,4 +190,21 @@ fn required_nonempty(lookup: &mut dyn FnMut(&str) -> Option<String>, key: &str) 
     lookup(key)
         .filter(|value| !value.is_empty() && value.trim() == value)
         .with_context(|| format!("{key} обязателен для Ozon Control runtime"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_ozon_database_url;
+
+    #[test]
+    fn database_identity_parser_rejects_empty_and_padded_input() {
+        for value in ["", " ", " postgresql://host/db", "postgresql://host/db "] {
+            assert!(
+                validate_ozon_database_url(value, "ozon_control_planner")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("без whitespace")
+            );
+        }
+    }
 }

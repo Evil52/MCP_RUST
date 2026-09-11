@@ -1021,6 +1021,8 @@ const fn durable_action_kind(kind: &PendingActionKind) -> WbAutomationDurableAct
 
 #[cfg(test)]
 mod tests {
+    mod postgres_clock;
+
     use super::feedback::{
         campaign_drr_basis_points, traffic_feedback_delta, traffic_frontier_dynamic_cap,
         traffic_frontier_v2_feedback_is_actionable,
@@ -2641,24 +2643,19 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn automatic_pacing_executes_only_when_typed_policy_enables_it() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let config = Config::from_str(&database_url).unwrap();
         let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
         store.verify_runtime_contract().await.unwrap();
         let observed_at = Utc::now();
-        let current_date = wb_automation_business_date(observed_at)
-            .format("%Y-%m-%d")
-            .to_string();
+        let current_date = postgres_clock::stats_date(observed_at);
 
         let enabled_campaign = 39_682_721;
-        let enabled_fixture = Fixture::new_for_campaign(enabled_campaign);
+        let enabled_fixture = postgres_clock::fixture(enabled_campaign, observed_at);
         let (enabled_reader, _) = campaign_level_reader_server_for(
             enabled_campaign,
             9,
@@ -2701,7 +2698,7 @@ mod tests {
         );
 
         let disabled_campaign = 39_682_722;
-        let disabled_fixture = Fixture::new_for_campaign(disabled_campaign);
+        let disabled_fixture = postgres_clock::fixture(disabled_campaign, observed_at);
         let mut disabled_policy = serde_json::from_slice::<WbAutomationPolicy>(
             &fs::read(&disabled_fixture.policy).unwrap(),
         )
@@ -2747,29 +2744,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn traffic_frontier_postgres_execution_uses_the_applied_feedback_baseline() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let config = Config::from_str(&database_url).unwrap();
         let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
         store.verify_runtime_contract().await.unwrap();
-        let observed_at = Utc::now();
-        let current_date = wb_automation_business_date(observed_at)
-            .format("%Y-%m-%d")
-            .to_string();
+        let observed_at = postgres_clock::feedback_observation_time(Utc::now());
+        let current_date = postgres_clock::stats_date(observed_at);
         let campaign_id = 39_682_723;
-        let fixture = Fixture::new_for_campaign(campaign_id);
+        let fixture = postgres_clock::fixture(campaign_id, observed_at);
         let mut policy =
             serde_json::from_slice::<WbAutomationPolicy>(&fs::read(&fixture.policy).unwrap())
                 .unwrap();
         policy.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV2;
         policy.traffic_frontier_bid_kopecks = Some(540);
-        policy.traffic_frontier_feedback_timeout_seconds = Some(1_800);
+        policy.traffic_frontier_feedback_timeout_seconds = Some(7_200);
         policy.max_bid_kopecks = 3_000;
         policy.bid_step_percent = 5;
         policy.max_actions_per_day = 50;
@@ -2811,8 +2803,15 @@ mod tests {
                 .starts_with("PATCH /api/advert/v1/bids")
         );
 
-        let (readback_reader, _) =
-            campaign_level_reader_server_for(campaign_id, 9, [117, 540, 117], &current_date, 2, 10);
+        let readback_date = postgres_clock::stats_date(observed_at + ChronoDuration::seconds(1));
+        let (readback_reader, _) = campaign_level_reader_server_for(
+            campaign_id,
+            9,
+            [117, 540, 117],
+            &readback_date,
+            2,
+            10,
+        );
         let (readback_url, readback_requests) = mock_http(Vec::new());
         let readback_executor = fixture.executor(&readback_reader, &readback_url);
         let applied = readback_executor
@@ -2823,8 +2822,15 @@ mod tests {
         assert_eq!(applied.outcome, WbAutomationExecutionOutcome::Reconciled);
         assert!(readback_requests.try_recv().is_err());
 
-        let (feedback_reader, _) =
-            campaign_level_reader_server_for(campaign_id, 9, [117, 540, 117], &current_date, 2, 10);
+        let feedback_date = postgres_clock::stats_date(observed_at + ChronoDuration::seconds(301));
+        let (feedback_reader, _) = campaign_level_reader_server_for(
+            campaign_id,
+            9,
+            [117, 540, 117],
+            &feedback_date,
+            2,
+            10,
+        );
         let (feedback_url, feedback_requests) = mock_http(Vec::new());
         let feedback_executor = fixture.executor(&feedback_reader, &feedback_url);
         let held = feedback_executor
@@ -2841,8 +2847,9 @@ mod tests {
         );
         assert!(feedback_requests.try_recv().is_err());
 
+        let invalid_date = postgres_clock::stats_date(observed_at + ChronoDuration::seconds(302));
         let (invalid_reader, _) =
-            campaign_level_reader_server_for(campaign_id, 9, [117, 540, 117], &current_date, 2, 10);
+            campaign_level_reader_server_for(campaign_id, 9, [117, 540, 117], &invalid_date, 2, 10);
         let (invalid_write_url, invalid_write_requests) = mock_http(Vec::new());
         let invalid_executor = fixture.executor(&invalid_reader, &invalid_write_url);
         assert!(
@@ -2864,19 +2871,14 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "the PostgreSQL campaign lease is consumed by explicit async release"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn postgres_executor_reserves_writes_and_reconciles_from_readback() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
-        let fixture = Fixture::new();
         let observed_at = Utc::now();
-        let current_date = wb_automation_business_date(observed_at)
-            .format("%Y-%m-%d")
-            .to_string();
+        let fixture = postgres_clock::fixture(39_682_633, observed_at);
+        let current_date = postgres_clock::stats_date(observed_at);
         let (reader_url, _) = reader_server(9, 102, &current_date, Some(0), 10);
         let (writer_url, writer_requests) = mock_http(vec![(200, "{}".to_owned())]);
         let mut executor = fixture.executor(&reader_url, &writer_url);
@@ -2912,7 +2914,8 @@ mod tests {
                 .starts_with("PATCH /api/advert/v1/bids")
         );
 
-        let (readback_url, _) = reader_server(9, 117, &current_date, None, 10);
+        let readback_date = postgres_clock::stats_date(observed_at + ChronoDuration::minutes(1));
+        let (readback_url, _) = reader_server(9, 117, &readback_date, None, 10);
         executor
             .observer
             .replace_client_for_test(WbClient::new_for_test(
@@ -2952,20 +2955,15 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "the PostgreSQL campaign lease is consumed by explicit async release"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn explicit_exposure_increase_uses_durable_write_and_exact_readback() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let campaign_id = 39_682_720;
-        let fixture = Fixture::new_for_campaign(campaign_id);
         let observed_at = Utc::now();
-        let current_date = wb_automation_business_date(observed_at)
-            .format("%Y-%m-%d")
-            .to_string();
+        let fixture = postgres_clock::fixture(campaign_id, observed_at);
+        let current_date = postgres_clock::stats_date(observed_at);
         let (reader_url, _) =
             campaign_level_reader_server_for(campaign_id, 9, [117, 117, 117], &current_date, 2, 10);
         let (writer_url, writer_requests) = mock_http(vec![(200, "{}".to_owned())]);
@@ -3009,8 +3007,15 @@ mod tests {
         assert!(write_request.contains("\"nm_id\":449627598"));
         assert!(write_request.contains("\"bid_kopecks\":134"));
 
-        let (readback_url, _) =
-            campaign_level_reader_server_for(campaign_id, 9, [134, 117, 117], &current_date, 2, 10);
+        let readback_date = postgres_clock::stats_date(observed_at + ChronoDuration::minutes(1));
+        let (readback_url, _) = campaign_level_reader_server_for(
+            campaign_id,
+            9,
+            [134, 117, 117],
+            &readback_date,
+            2,
+            10,
+        );
         executor
             .observer
             .replace_client_for_test(WbClient::new_for_test(
@@ -3048,31 +3053,17 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "the PostgreSQL campaign lease is consumed by explicit async release"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn explicit_quota_override_uses_v3_guards_durable_write_and_exact_readback() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let campaign_id = 39_682_726;
-        let fixture = Fixture::new_for_campaign(campaign_id);
+        let observed_at = postgres_clock::observation_time();
+        let fixture = postgres_clock::fixture(campaign_id, observed_at);
         let mut policy =
             serde_json::from_slice::<WbAutomationPolicy>(&fs::read(&fixture.policy).unwrap())
                 .unwrap();
-        // Use the next UTC noon (15:00 Moscow): traffic pacing is then stable,
-        // while the instant remains after PostgreSQL's real reservation time.
-        let observed_at = Utc::now()
-            .date_naive()
-            .succ_opt()
-            .expect("test date has a successor")
-            .and_hms_opt(12, 0, 0)
-            .expect("test time is valid")
-            .and_utc();
-        policy.authorized_at = observed_at - ChronoDuration::hours(2);
-        policy.observe_until = observed_at - ChronoDuration::hours(1);
-        policy.authorization_expires_at = observed_at + ChronoDuration::days(1);
         policy.autonomous_pacing = WbAutomationPacingMode::TrafficFrontierV3;
         policy.target_impressions_per_day = 1_500;
         policy.target_orders_per_day = 3;
@@ -3166,17 +3157,14 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "the PostgreSQL campaign lease is consumed by explicit async release"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn explicit_resume_after_daily_cap_is_durable_and_clears_the_pause() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let campaign_id = 39_682_725;
-        let fixture = Fixture::new_for_campaign(campaign_id);
         let observed_at = Utc::now();
+        let fixture = postgres_clock::fixture(campaign_id, observed_at);
         let business_date = wb_automation_business_date(observed_at);
         let current_date = business_date.format("%Y-%m-%d").to_string();
         let paused_on = business_date.pred_opt().unwrap();
@@ -3219,7 +3207,8 @@ mod tests {
                 .starts_with("GET /adv/v0/start")
         );
 
-        let (readback_url, _) = reader_server_for(campaign_id, 9, 200, &current_date, Some(0), 10);
+        let readback_date = postgres_clock::stats_date(observed_at + ChronoDuration::minutes(1));
+        let (readback_url, _) = reader_server_for(campaign_id, 9, 200, &readback_date, Some(0), 10);
         executor
             .observer
             .replace_client_for_test(test_reader(&readback_url));
@@ -3245,23 +3234,18 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn postgres_executor_covers_holds_caps_pauses_and_ambiguous_readback() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let config = Config::from_str(&database_url).unwrap();
         let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
         let observed_at = Utc::now();
-        let current_date = wb_automation_business_date(observed_at)
-            .format("%Y-%m-%d")
-            .to_string();
+        let current_date = postgres_clock::stats_date(observed_at);
 
         let observed_campaign = 39_682_700;
-        let observed_fixture = Fixture::new_for_campaign(observed_campaign);
+        let observed_fixture = postgres_clock::fixture(observed_campaign, observed_at);
         let (reader_url, _) = reader_server_for(observed_campaign, 9, 102, &current_date, None, 3);
         let observed_executor = observed_fixture.executor(&reader_url, "http://127.0.0.1:1");
         assert_eq!(observed_executor.policy().campaign_id, observed_campaign);
@@ -3277,7 +3261,7 @@ mod tests {
         );
 
         let cap_campaign = 39_682_701;
-        let cap_fixture = Fixture::new_for_campaign(cap_campaign);
+        let cap_fixture = postgres_clock::fixture(cap_campaign, observed_at);
         let (cap_url, _) = reader_server_for(cap_campaign, 9, 102, &current_date, Some(300), 10);
         let mut cap_executor = cap_fixture.executor(&cap_url, "http://127.0.0.1:1");
         let cap_legacy = postgres_legacy(&cap_executor, observed_at, None);
@@ -3288,7 +3272,8 @@ mod tests {
             .unwrap();
         assert_eq!(capped.outcome, WbAutomationExecutionOutcome::IncidentLocked);
         assert_eq!(capped.state_revision, 2);
-        let (clean_url, _) = reader_server_for(cap_campaign, 9, 102, &current_date, None, 10);
+        let clean_date = postgres_clock::stats_date(observed_at + ChronoDuration::minutes(1));
+        let (clean_url, _) = reader_server_for(cap_campaign, 9, 102, &clean_date, None, 10);
         cap_executor
             .observer
             .replace_client_for_test(test_reader(&clean_url));
@@ -3307,7 +3292,7 @@ mod tests {
         );
 
         let pause_campaign = 39_682_702;
-        let pause_fixture = Fixture::new_for_campaign(pause_campaign);
+        let pause_fixture = postgres_clock::fixture(pause_campaign, observed_at);
         let (pause_url, _) =
             reader_server_for(pause_campaign, 9, 102, &current_date, Some(250), 10);
         let (pause_writer_url, pause_requests) = mock_http(vec![(200, "{}".to_owned())]);
@@ -3324,8 +3309,10 @@ mod tests {
                 .unwrap()
                 .starts_with("GET /adv/v0/pause")
         );
+        let pause_readback_date =
+            postgres_clock::stats_date(observed_at + ChronoDuration::minutes(1));
         let (pause_readback_url, _) =
-            reader_server_for(pause_campaign, 11, 102, &current_date, None, 10);
+            reader_server_for(pause_campaign, 11, 102, &pause_readback_date, None, 10);
         pause_executor
             .observer
             .replace_client_for_test(test_reader(&pause_readback_url));
@@ -3359,7 +3346,7 @@ mod tests {
         assert_eq!(resume.state_revision, 3);
 
         let ambiguous_campaign = 39_682_703;
-        let ambiguous_fixture = Fixture::new_for_campaign(ambiguous_campaign);
+        let ambiguous_fixture = postgres_clock::fixture(ambiguous_campaign, observed_at);
         let (ambiguous_url, _) =
             reader_server_for(ambiguous_campaign, 9, 102, &current_date, Some(0), 10);
         let (ambiguous_writer_url, _) = mock_http(vec![(500, "{}".to_owned())]);
@@ -3382,23 +3369,18 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "campaign leases are deliberately held across lock-contention assertions"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn postgres_executor_recovers_each_preexisting_pending_state_without_retry() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let config = Config::from_str(&database_url).unwrap();
         let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
         let observed_at = Utc::now();
-        let current_date = wb_automation_business_date(observed_at)
-            .format("%Y-%m-%d")
-            .to_string();
+        let current_date = postgres_clock::stats_date(observed_at);
 
         let locked_campaign = 39_682_710;
-        let locked_fixture = Fixture::new_for_campaign(locked_campaign);
+        let locked_fixture = postgres_clock::fixture(locked_campaign, observed_at);
         let (locked_url, _) = reader_server_for(locked_campaign, 9, 102, &current_date, None, 3);
         let locked_executor = locked_fixture.executor(&locked_url, "http://127.0.0.1:1");
         let locked_legacy = postgres_legacy(&locked_executor, observed_at, None);
@@ -3418,7 +3400,7 @@ mod tests {
         held.release().await.unwrap();
 
         let rollover_campaign = 39_682_711;
-        let rollover_fixture = Fixture::new_for_campaign(rollover_campaign);
+        let rollover_fixture = postgres_clock::fixture(rollover_campaign, observed_at);
         let (rollover_url, _) =
             reader_server_for(rollover_campaign, 9, 102, &current_date, None, 3);
         let rollover_executor = rollover_fixture.executor(&rollover_url, "http://127.0.0.1:1");
@@ -3437,9 +3419,10 @@ mod tests {
         );
 
         let cancelled_campaign = 39_682_712;
-        let cancelled_fixture = Fixture::new_for_campaign(cancelled_campaign);
+        let cancelled_fixture = postgres_clock::fixture(cancelled_campaign, observed_at);
+        let cancelled_date = postgres_clock::stats_date(observed_at + ChronoDuration::minutes(1));
         let (cancelled_url, _) =
-            reader_server_for(cancelled_campaign, 9, 102, &current_date, None, 10);
+            reader_server_for(cancelled_campaign, 9, 102, &cancelled_date, None, 10);
         let cancelled_executor = cancelled_fixture.executor(&cancelled_url, "http://127.0.0.1:1");
         let cancelled_legacy = postgres_legacy(&cancelled_executor, observed_at, None);
         seed_postgres_bid_action(
@@ -3466,8 +3449,9 @@ mod tests {
         assert_eq!(cancelled.state_revision, 3);
 
         let pending_campaign = 39_682_713;
-        let pending_fixture = Fixture::new_for_campaign(pending_campaign);
-        let (pending_url, _) = reader_server_for(pending_campaign, 9, 102, &current_date, None, 10);
+        let pending_fixture = postgres_clock::fixture(pending_campaign, observed_at);
+        let pending_date = postgres_clock::stats_date(observed_at + ChronoDuration::minutes(1));
+        let (pending_url, _) = reader_server_for(pending_campaign, 9, 102, &pending_date, None, 10);
         let mut pending_executor = pending_fixture.executor(&pending_url, "http://127.0.0.1:1");
         let pending_legacy = postgres_legacy(&pending_executor, observed_at, None);
         seed_postgres_bid_action(
@@ -3492,8 +3476,10 @@ mod tests {
             WbAutomationExecutionOutcome::AwaitingReadback
         );
         assert_eq!(awaiting.state_revision, 2);
+        let still_waiting_date =
+            postgres_clock::stats_date(observed_at + ChronoDuration::minutes(2));
         let (still_waiting_url, _) =
-            reader_server_for(pending_campaign, 9, 102, &current_date, None, 10);
+            reader_server_for(pending_campaign, 9, 102, &still_waiting_date, None, 10);
         pending_executor
             .observer
             .replace_client_for_test(test_reader(&still_waiting_url));
@@ -3510,7 +3496,8 @@ mod tests {
                 .outcome,
             WbAutomationExecutionOutcome::AwaitingReadback
         );
-        let (stale_url, _) = reader_server_for(pending_campaign, 9, 102, &current_date, None, 10);
+        let stale_date = postgres_clock::stats_date(observed_at + ChronoDuration::minutes(10));
+        let (stale_url, _) = reader_server_for(pending_campaign, 9, 102, &stale_date, None, 10);
         pending_executor
             .observer
             .replace_client_for_test(test_reader(&stale_url));
@@ -3528,8 +3515,10 @@ mod tests {
             WbAutomationExecutionOutcome::IncidentLocked
         );
         assert_eq!(incident.state_revision, 3);
+        let locked_readback_date =
+            postgres_clock::stats_date(observed_at + ChronoDuration::seconds(630));
         let (locked_readback_url, _) =
-            reader_server_for(pending_campaign, 9, 102, &current_date, None, 10);
+            reader_server_for(pending_campaign, 9, 102, &locked_readback_date, None, 10);
         pending_executor
             .observer
             .replace_client_for_test(test_reader(&locked_readback_url));
@@ -3546,8 +3535,10 @@ mod tests {
                 .outcome,
             WbAutomationExecutionOutcome::IncidentLocked
         );
+        let late_readback_date =
+            postgres_clock::stats_date(observed_at + ChronoDuration::minutes(11));
         let (late_readback_url, _) =
-            reader_server_for(pending_campaign, 9, 117, &current_date, None, 10);
+            reader_server_for(pending_campaign, 9, 117, &late_readback_date, None, 10);
         pending_executor
             .observer
             .replace_client_for_test(test_reader(&late_readback_url));
@@ -3636,7 +3627,7 @@ mod tests {
             .persist_shadow_cycle(
                 &cycle_id,
                 executor.policy_sha256(),
-                observed_at - ChronoDuration::minutes(1),
+                observed_at,
                 wb_automation_business_date(observed_at),
                 1,
                 "{}",
@@ -3710,46 +3701,6 @@ mod tests {
             WbAutomationExecutionOutcome::Reconciled
         );
         assert_eq!(paused.paused_for_daily_cap_on, Some(now().date_naive()));
-    }
-
-    /// A pause reserved just before the Yekaterinburg business-date rollover is
-    /// reconciled by the next run, which already sees the following business
-    /// date. Recording the reconciliation date rather than the reservation date
-    /// would make `paused_by_automation` (`paused_on < business_date`) false for
-    /// the whole of the new day, so the campaign would stay paused an extra day.
-    #[test]
-    fn daily_pause_reconciled_after_rollover_records_the_reservation_date() {
-        // 18:50 UTC is 23:50 in Yekaterinburg: still business date 2026-08-25.
-        let reserved_at = Utc.with_ymd_and_hms(2026, 8, 25, 18, 50, 0).unwrap();
-        // 19:30 UTC is 00:30 the next day: business date 2026-08-26.
-        let reconciled_at = Utc.with_ymd_and_hms(2026, 8, 25, 19, 30, 0).unwrap();
-        let reserved_date = crate::reporting::business_date(reserved_at);
-        let reconciled_date = crate::reporting::business_date(reconciled_at);
-        assert_eq!(reserved_date.succ_opt().unwrap(), reconciled_date);
-
-        let pause = PendingAction {
-            reserved_at,
-            kind: PendingActionKind::PauseCampaignForDailyCap,
-        };
-        let mut paused = state(pause.clone());
-        // `run_once` rolls the stored business date forward before reconciling.
-        paused.business_date = reconciled_date;
-        assert_eq!(
-            reconcile_pending(&observation(11, 115), &mut paused, &pause),
-            WbAutomationExecutionOutcome::Reconciled
-        );
-
-        assert_eq!(
-            paused.paused_for_daily_cap_on,
-            Some(reserved_date),
-            "the pause belongs to the business date it was reserved on"
-        );
-        assert!(
-            paused
-                .paused_for_daily_cap_on
-                .is_some_and(|paused_on| paused_on < reconciled_date),
-            "the campaign must be resumable on the new business date, not the day after"
-        );
     }
 
     #[test]

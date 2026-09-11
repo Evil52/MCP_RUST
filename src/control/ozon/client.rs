@@ -171,27 +171,12 @@ impl OzonAdsWriteClient {
         credentials: PerformanceCredentials,
         proxy_url: &str,
     ) -> Result<Self> {
-        if timeout.is_zero() || timeout > Duration::from_secs(30) {
-            bail!("CONTROL_MCP_OZON_TIMEOUT_SECONDS должен задавать 1..=30 секунд");
-        }
-        validate_credentials(&credentials)?;
-        let proxy = Proxy::https(proxy_url).context("неверный CONTROL_MCP_OZON_PROXY")?;
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .https_only(true)
-            .connect_timeout(timeout.min(Duration::from_secs(5)))
-            .timeout(timeout)
-            .proxy(proxy)
-            .build()
-            .context("не удалось создать изолированный Ozon Performance write client")?;
-        Ok(Self::from_parts(
-            http,
-            PERFORMANCE_BASE_URL,
+        Self::new_with_pacer(
+            timeout,
             credentials,
+            proxy_url,
             PerformanceRequestPacer::new(),
-            MIN_WRITE_INTERVAL,
-        ))
+        )
     }
 
     /// Builds a write client sharing the exact `Client-Id` pacing boundary
@@ -207,12 +192,8 @@ impl OzonAdsWriteClient {
         }
         validate_credentials(&credentials)?;
         let proxy = Proxy::https(proxy_url).context("неверный CONTROL_MCP_OZON_PROXY")?;
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
+        let http = write_http_builder(timeout)
             .https_only(true)
-            .connect_timeout(timeout.min(Duration::from_secs(5)))
-            .timeout(timeout)
             .proxy(proxy)
             .build()
             .context("не удалось создать изолированный Ozon Performance write client")?;
@@ -231,10 +212,7 @@ impl OzonAdsWriteClient {
         credentials: PerformanceCredentials,
         timeout: Duration,
     ) -> Self {
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .timeout(timeout)
+        let http = write_http_builder(timeout)
             .build()
             .expect("test Ozon write client");
         Self::from_parts(
@@ -253,10 +231,7 @@ impl OzonAdsWriteClient {
         timeout: Duration,
         minimum_interval: Duration,
     ) -> Self {
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .timeout(timeout)
+        let http = write_http_builder(timeout)
             .build()
             .expect("test Ozon write client");
         Self::from_parts(
@@ -483,9 +458,8 @@ impl OzonAdsWriteClient {
             .map_err(|error| match error {
                 // The token exchange happens before the guarded mutation and
                 // therefore cannot make the marketplace write ambiguous.
-                OzonWriteError::ResponseTooLarge => OzonWriteError::TokenResponseTooLarge,
-                OzonWriteError::AmbiguousTransport => OzonWriteError::TokenTransport,
-                other => other,
+                ResponseBodyError::TooLarge => OzonWriteError::TokenResponseTooLarge,
+                ResponseBodyError::Transport => OzonWriteError::TokenTransport,
             })?;
         let token: TokenResponse =
             serde_json::from_slice(&bytes).map_err(|_| OzonWriteError::InvalidToken)?;
@@ -605,24 +579,34 @@ async fn decode_write_response(response: Response) -> Result<Vec<u8>, OzonWriteE
     if !status.is_success() {
         return Err(classify_status(status));
     }
-    read_bounded(response, MAX_RESPONSE_BYTES).await
+    read_bounded(response, MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|error| match error {
+            ResponseBodyError::TooLarge => OzonWriteError::ResponseTooLarge,
+            ResponseBodyError::Transport => OzonWriteError::AmbiguousTransport,
+        })
 }
 
-async fn read_bounded(mut response: Response, limit: usize) -> Result<Vec<u8>, OzonWriteError> {
+enum ResponseBodyError {
+    TooLarge,
+    Transport,
+}
+
+async fn read_bounded(mut response: Response, limit: usize) -> Result<Vec<u8>, ResponseBodyError> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(OzonWriteError::ResponseTooLarge);
+        return Err(ResponseBodyError::TooLarge);
     }
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| OzonWriteError::AmbiguousTransport)?
+        .map_err(|_| ResponseBodyError::Transport)?
     {
         if body.len().saturating_add(chunk.len()) > limit {
-            return Err(OzonWriteError::ResponseTooLarge);
+            return Err(ResponseBodyError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -649,3 +633,20 @@ struct TokenResponse {
     token_type: String,
     expires_in: u64,
 }
+
+// A fresh durable permit authorizes one transport attempt, including HTTP/2
+// REFUSED_STREAM and GOAWAY responses that reqwest otherwise retries itself.
+fn write_http_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .connect_timeout(timeout.min(Duration::from_secs(5)))
+        .timeout(timeout)
+}
+
+#[cfg(test)]
+mod retry_tests;
+
+#[cfg(test)]
+mod response_tests;

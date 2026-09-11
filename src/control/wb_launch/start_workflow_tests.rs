@@ -75,7 +75,7 @@ async fn guarded_start_requires_two_cycles_and_verifies_status_after_one_write()
         })
         .await
         .unwrap();
-    assert!(!lease.verify_launch_cycles(digest, now).await.unwrap());
+    assert!(!lease.verify_launch_cycles(digest).await.unwrap());
     for (index, at) in [(0, now - chrono::Duration::minutes(5)), (1, now)] {
         let key = journal::digest(format!("{}-{index}", fixture.root.display()).as_bytes());
         lease
@@ -91,25 +91,8 @@ async fn guarded_start_requires_two_cycles_and_verifies_status_after_one_write()
             .await
             .unwrap();
     }
-    assert!(lease.verify_launch_cycles(digest, now).await.unwrap());
-    assert!(
-        !lease
-            .verify_launch_cycles(&"a".repeat(64), now)
-            .await
-            .unwrap()
-    );
-    assert!(
-        !lease
-            .verify_launch_cycles(digest, now + chrono::Duration::minutes(2))
-            .await
-            .unwrap()
-    );
-    assert!(
-        !lease
-            .verify_launch_cycles(digest, now - chrono::Duration::seconds(1))
-            .await
-            .unwrap()
-    );
+    assert!(lease.verify_launch_cycles(digest).await.unwrap());
+    assert!(!lease.verify_launch_cycles(&"a".repeat(64)).await.unwrap());
     lease.release().await.unwrap();
     let journal = fixture.journal();
     journal
@@ -136,4 +119,120 @@ async fn guarded_start_requires_two_cycles_and_verifies_status_after_one_write()
             .count(),
         1
     );
+}
+
+#[tokio::test]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "release consumes the lease before the operator acquires it again"
+)]
+async fn installed_robot_revocation_during_final_read_prevents_start_and_attempt() {
+    const REVOKED_ID: u64 = ID + 1;
+    let Ok(url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
+        return;
+    };
+    let config: tokio_postgres::Config = url.parse().unwrap();
+    let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+    store.verify_runtime_contract().await.unwrap();
+    let fixture = Fixture::new(LaunchScope::FundAndStart);
+    let now = Utc::now();
+    let date = wb_automation_business_date(now);
+    let prior = date.pred_opt().unwrap();
+    let campaign = details(REVOKED_ID, NAME, &NMS, 11, 922);
+    let responses = vec![
+        (200, campaign.clone()),
+        (200, minimums()),
+        (200, json!({"total":1000})),
+        (
+            200,
+            json!([{"advertId":REVOKED_ID,"stats":[
+                {"date":prior.to_string(),"nm_id":NMS[0],"views":0,"clicks":0,"sum":0,"orders":0,"sumPrice":0},
+                {"date":date.to_string(),"nm_id":NMS[0],"views":0,"clicks":0,"sum":0,"orders":0,"sumPrice":0}
+            ]}]),
+        ),
+        (
+            200,
+            json!({"data":{"items":NMS.iter().map(|nm|json!({"nmId":nm,"warehouseId":1,"quantity":25})).collect::<Vec<_>>()}}),
+        ),
+        (200, campaign),
+    ];
+    let robot_path = fixture.manifest.robot_policy.clone();
+    let (operator, receiver) = fixture.operator_with_hook(responses, move |index| {
+        if index == 5 {
+            let mut revoked: WbAutomationPolicy = read_policy_json(&robot_path).unwrap();
+            revoked.write_enabled = false;
+            private_json(&robot_path, &serde_json::to_value(revoked).unwrap());
+        }
+    });
+    let policy = operator.target_policy(REVOKED_ID);
+    private_json(
+        &fixture.manifest.robot_policy,
+        &serde_json::to_value(&policy).unwrap(),
+    );
+    let mut observer = WbAutomationObserver::from_files(
+        &fixture.manifest.robot_policy,
+        &fixture.manifest.registry,
+        &fixture.manifest.reader_token,
+        true,
+        Duration::from_secs(2),
+        None,
+    )
+    .unwrap();
+    observer.replace_client_for_test(operator.reader.clone());
+    let digest = observer.policy_sha256();
+    let mut lease = store
+        .try_acquire_campaign(ACCOUNT, REVOKED_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    lease
+        .initialize_from_legacy(&WbAutomationLegacyStateSeed {
+            policy_digest: digest.to_owned(),
+            business_date: date,
+            actions_today: 0,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: journal::digest(fixture.root.to_string_lossy().as_bytes()),
+        })
+        .await
+        .unwrap();
+    for (index, at) in [(0, now - chrono::Duration::minutes(5)), (1, now)] {
+        let key = journal::digest(format!("{}-{index}", fixture.root.display()).as_bytes());
+        lease
+            .persist_shadow_cycle(
+                &key,
+                digest,
+                at,
+                wb_automation_business_date(at),
+                1,
+                "{}",
+                "{}",
+            )
+            .await
+            .unwrap();
+    }
+    lease.release().await.unwrap();
+    let journal = fixture.journal();
+    journal
+        .receipt("create", &json!({"campaign_id":REVOKED_ID}))
+        .unwrap();
+    journal
+        .receipt("fund", &json!({"transferred_rubles":1000}))
+        .unwrap();
+
+    let error = operator
+        .execute_start(&journal, REVOKED_ID, &policy, &observer, &store)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("robot policy changed"));
+    assert!(!journal.attempted("start"));
+    assert!(!journal.has_receipt("start"));
+    let sent = requests(&receiver, 6);
+    assert!(sent[5].starts_with("GET /api/advert/v2/adverts?"));
+    assert!(
+        sent.iter()
+            .all(|request| !request.contains("/adv/v0/start"))
+    );
+    assert!(receiver.try_recv().is_err());
 }

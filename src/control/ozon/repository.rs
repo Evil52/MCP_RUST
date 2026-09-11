@@ -1,3 +1,5 @@
+mod completion;
+
 use std::{future::Future, sync::Arc};
 
 use chrono::{DateTime, Duration, Utc};
@@ -35,6 +37,48 @@ const PLAN_SELECT: &str = "SELECT p.plan_id,p.plan_digest,p.actor_id,p.account_i
  control.ozon_campaign_plan_approvals a ON a.plan_id=p.plan_id JOIN \
  control.ozon_campaign_launch_workflows workflow ON workflow.plan_id=p.plan_id";
 
+// Persistence errors never cross the Control boundary with SQL, credentials,
+// or server diagnostics. Domain validation and uniqueness keep their separate
+// InvalidPlan/SkuLocked classification at the call sites.
+fn postgres_unavailable(_: tokio_postgres::Error) -> OzonPlanStoreError {
+    OzonPlanStoreError::Unavailable
+}
+
+const fn session_unavailable(_: crate::postgres::PostgresUnavailable) -> OzonPlanStoreError {
+    OzonPlanStoreError::Unavailable
+}
+
+/// A fenced transition must update exactly its one expected row. SQL errors
+/// and the separate `LeaseLost` boundary retain their own classifications.
+const fn require_single_update(updated: u64) -> Result<(), OzonPlanStoreError> {
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(OzonPlanStoreError::InvalidState)
+    }
+}
+
+#[cfg(test)]
+mod authorization_boundary_tests;
+#[cfg(test)]
+mod completion_tests;
+#[cfg(test)]
+mod expiry_boundary_tests;
+#[cfg(test)]
+mod guard_boundary_tests;
+#[cfg(test)]
+mod launch_boundary_tests;
+#[cfg(test)]
+mod policy_approval_tests;
+#[cfg(test)]
+mod release_tests;
+
+#[derive(Clone, Copy)]
+enum GuardStopOutcome<'a> {
+    Stopped,
+    Incident(&'a str),
+}
+
 #[derive(Clone)]
 pub struct OzonPlanRepository {
     client: Arc<SupervisedClient>,
@@ -44,7 +88,7 @@ impl OzonPlanRepository {
     pub async fn connect(config: &Config) -> Result<Self, OzonPlanStoreError> {
         let client = SupervisedClient::connect(config, COMPONENT)
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(session_unavailable)?;
         Ok(Self {
             client: Arc::new(client),
         })
@@ -58,16 +102,12 @@ impl OzonPlanRepository {
         self.client
             .verify_session_bounds()
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(session_unavailable)?;
+        let client = self.client.acquire().await.map_err(session_unavailable)?;
         let row = client
             .query_one(VERIFY_RUNTIME_CONTRACT_SQL, &[])
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
         drop(client);
         row.get::<_, bool>(0)
             .then_some(())
@@ -88,20 +128,13 @@ impl OzonPlanRepository {
         if schema_version == 0 || policy_revision == 0 {
             return Err(OzonPlanStoreError::InvalidPlan);
         }
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         lock_policy(&tx).await?;
         if let Some(row) = tx
             .query_opt("SELECT schema_version,policy_revision,policy_digest FROM control.ozon_policy_revisions ORDER BY policy_revision DESC LIMIT 1", &[])
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?
+            .map_err(postgres_unavailable)?
         {
             let current_revision: i64 = row.get(1);
             if policy_revision < current_revision {
@@ -109,7 +142,7 @@ impl OzonPlanRepository {
             }
             if policy_revision == current_revision {
                 return if row.get::<_, i32>(0) == schema_version && row.get::<_, &str>(2) == policy_digest {
-                    tx.commit().await.map_err(|_| OzonPlanStoreError::Unavailable)?;
+                    tx.commit().await.map_err(postgres_unavailable)?;
                     Ok(())
                 } else {
                     Err(OzonPlanStoreError::PolicyChanged)
@@ -125,10 +158,7 @@ impl OzonPlanRepository {
         {
             return Err(map_policy_insert(&error));
         }
-        let committed = tx
-            .commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable);
+        let committed = tx.commit().await.map_err(postgres_unavailable);
         drop(client);
         committed
     }
@@ -172,15 +202,8 @@ impl OzonPlanRepository {
         let sku = i64::try_from(intent.sku).map_err(|_| OzonPlanStoreError::InvalidPlan)?;
         let campaign_id =
             i64::try_from(intent.campaign_id).map_err(|_| OzonPlanStoreError::InvalidPlan)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         if expected_prior_event_id.is_none() {
             return Err(OzonPlanStoreError::InvalidState);
         }
@@ -210,7 +233,7 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?
+            .map_err(postgres_unavailable)?
             .get::<_, i64>(0);
         let audit_event_id =
             u64::try_from(audit_event_id).map_err(|_| OzonPlanStoreError::Unavailable)?;
@@ -219,9 +242,7 @@ impl OzonPlanRepository {
         // fails, the transaction rolls back. A lost COMMIT acknowledgement is
         // conservatively represented by the already-written local marker.
         persist_marker(audit_event_id).await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(())
     }
@@ -256,15 +277,8 @@ impl OzonPlanRepository {
             i32::try_from(schema_version).map_err(|_| OzonPlanStoreError::InvalidPlan)?;
         let policy_revision =
             i64::try_from(policy_revision).map_err(|_| OzonPlanStoreError::InvalidPlan)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         lock_static_guard_audit_cursor(&tx, account_id, expected_prior_event_id).await?;
         require_policy(&tx, schema_version, policy_revision, policy_digest).await?;
         let audit_event_id = tx
@@ -286,14 +300,12 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?
+            .map_err(postgres_unavailable)?
             .get::<_, i64>(0);
         let audit_event_id =
             u64::try_from(audit_event_id).map_err(|_| OzonPlanStoreError::Unavailable)?;
         persist_cursor(audit_event_id).await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(())
     }
@@ -303,11 +315,7 @@ impl OzonPlanRepository {
         account_id: &str,
     ) -> Result<Option<u64>, OzonPlanStoreError> {
         validate_identity(account_id)?;
-        let client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let client = self.client.acquire().await.map_err(session_unavailable)?;
         let event_id = client
             .query_one(
                 "SELECT max(event_id) \
@@ -316,7 +324,7 @@ impl OzonPlanRepository {
                 &[&account_id],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?
+            .map_err(postgres_unavailable)?
             .get::<_, Option<i64>>(0);
         drop(client);
         event_id
@@ -336,15 +344,8 @@ impl OzonPlanRepository {
             .map_err(|_| OzonPlanStoreError::InvalidPlan)?;
         let policy_revision =
             i64::try_from(manifest.policy_revision).map_err(|_| OzonPlanStoreError::InvalidPlan)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         require_policy(
             &tx,
             schema_version,
@@ -381,9 +382,7 @@ impl OzonPlanRepository {
         .await
         .map_err(|error| map_plan_insert(&error))?;
         insert_audit(&tx, &plan_id, &manifest.actor_id, "prepared", &serde_json::json!({"plan_digest":plan_digest,"manifest_digest":manifest.manifest_digest})).await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         self.load(&plan_id).await
     }
@@ -393,16 +392,12 @@ impl OzonPlanRepository {
         plan_id: &str,
     ) -> Result<OzonCampaignPlan, OzonPlanStoreError> {
         validate_digest(plan_id)?;
-        let client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let client = self.client.acquire().await.map_err(session_unavailable)?;
         let query = format!("{PLAN_SELECT} WHERE p.plan_id=$1");
         let row = client
             .query_opt(&query, &[&plan_id])
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?
+            .map_err(postgres_unavailable)?
             .ok_or(OzonPlanStoreError::NotFound)?;
         drop(client);
         plan_from_row(&row)
@@ -419,20 +414,13 @@ impl OzonPlanRepository {
         validate_digest(expected_digest)?;
         validate_identity(approver_id)?;
         validate_reference(reference)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let query = format!("{PLAN_SELECT} WHERE p.plan_id=$1 FOR UPDATE OF p");
         let row = tx
             .query_opt(&query, &[&plan_id])
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?
+            .map_err(postgres_unavailable)?
             .ok_or(OzonPlanStoreError::NotFound)?;
         let plan = plan_from_row(&row)?;
         if plan.plan_digest != expected_digest {
@@ -451,9 +439,7 @@ impl OzonPlanRepository {
         let now = database_now(&tx).await?;
         if plan.expires_at <= now {
             expire(&tx, plan_id, now).await?;
-            tx.commit()
-                .await
-                .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            tx.commit().await.map_err(postgres_unavailable)?;
             return Err(OzonPlanStoreError::Expired);
         }
         if plan.status == OzonLaunchStatus::Approved {
@@ -482,11 +468,9 @@ impl OzonPlanRepository {
             reference.as_bytes(),
             &now.timestamp_micros().to_be_bytes(),
         ]);
-        tx.execute("INSERT INTO control.ozon_campaign_plan_approvals(approval_id,plan_id,plan_digest,approver_id,reference,approved_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&approval_id,&plan_id,&expected_digest,&approver_id,&reference,&now,&expires_at]).await.map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let updated = tx.execute("UPDATE control.ozon_campaign_plans SET status='approved' WHERE plan_id=$1 AND status='prepared'", &[&plan_id]).await.map_err(|_| OzonPlanStoreError::Unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+        tx.execute("INSERT INTO control.ozon_campaign_plan_approvals(approval_id,plan_id,plan_digest,approver_id,reference,approved_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)", &[&approval_id,&plan_id,&expected_digest,&approver_id,&reference,&now,&expires_at]).await.map_err(postgres_unavailable)?;
+        let updated = tx.execute("UPDATE control.ozon_campaign_plans SET status='approved' WHERE plan_id=$1 AND status='prepared'", &[&plan_id]).await.map_err(postgres_unavailable)?;
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             plan_id,
@@ -495,9 +479,7 @@ impl OzonPlanRepository {
             &serde_json::json!({"approval_id":approval_id,"plan_digest":expected_digest}),
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         self.load(plan_id).await
     }
@@ -514,15 +496,8 @@ impl OzonPlanRepository {
         validate_digest(plan_id)?;
         validate_identity(actor_id)?;
         validate_digest(expected_digest)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let plan = load_plan_for_update(&tx, plan_id).await?;
         if plan.actor_id != actor_id || plan.plan_digest != expected_digest {
             return Err(OzonPlanStoreError::InvalidState);
@@ -535,16 +510,14 @@ impl OzonPlanRepository {
                 &[&plan_id],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
         let requested_at: Option<DateTime<Utc>> = row.get(0);
         let requested_by: Option<String> = row.get(1);
         if requested_at.is_some() {
             if requested_by.as_deref() != Some(actor_id) {
                 return Err(OzonPlanStoreError::InvalidState);
             }
-            tx.commit()
-                .await
-                .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            tx.commit().await.map_err(postgres_unavailable)?;
             drop(client);
             return self.load(plan_id).await;
         }
@@ -575,10 +548,8 @@ impl OzonPlanRepository {
                 &[&plan_id, &now, &actor_id],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+            .map_err(postgres_unavailable)?;
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             plan_id,
@@ -587,9 +558,7 @@ impl OzonPlanRepository {
             &serde_json::json!({"plan_digest":expected_digest}),
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         self.load(plan_id).await
     }
@@ -603,15 +572,8 @@ impl OzonPlanRepository {
     ) -> Result<Option<OzonLaunchLease>, OzonPlanStoreError> {
         validate_identity(account_id)?;
         validate_identity(worker_id)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         sweep_stale_launch_request(&tx, account_id, worker_id).await?;
         let candidate = tx
             .query_opt(
@@ -652,11 +614,9 @@ impl OzonPlanRepository {
                 &[&account_id],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
         let Some(candidate) = candidate else {
-            tx.commit()
-                .await
-                .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            tx.commit().await.map_err(postgres_unavailable)?;
             return Ok(None);
         };
         let plan_id: String = candidate.get(0);
@@ -665,9 +625,7 @@ impl OzonPlanRepository {
         if lease.mode != OzonLaunchClaimMode::Execute {
             return Err(OzonPlanStoreError::Unavailable);
         }
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(Some(lease))
     }
@@ -682,15 +640,8 @@ impl OzonPlanRepository {
     ) -> Result<Option<OzonLaunchLease>, OzonPlanStoreError> {
         validate_identity(account_id)?;
         validate_identity(worker_id)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let candidate = tx
             .query_opt(
                 "SELECT p.plan_id FROM control.ozon_campaign_plans p \
@@ -707,11 +658,9 @@ impl OzonPlanRepository {
                 &[&account_id],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
         let Some(candidate) = candidate else {
-            tx.commit()
-                .await
-                .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            tx.commit().await.map_err(postgres_unavailable)?;
             return Ok(None);
         };
         let plan_id: String = candidate.get(0);
@@ -720,9 +669,7 @@ impl OzonPlanRepository {
         if lease.mode != OzonLaunchClaimMode::Reconcile {
             return Err(OzonPlanStoreError::Unavailable);
         }
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(Some(lease))
     }
@@ -742,15 +689,8 @@ impl OzonPlanRepository {
         if lease.mode != OzonLaunchClaimMode::Execute {
             return Err(OzonPlanStoreError::InvalidState);
         }
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let plan = load_plan_for_update(&tx, &lease.plan.plan_id).await?;
         require_lease(&tx, lease).await?;
         if plan.actor_id != lease.plan.actor_id
@@ -812,10 +752,8 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        if started != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+            .map_err(postgres_unavailable)?;
+        require_single_update(started)?;
         let updated = tx
             .execute(
                 "UPDATE control.ozon_campaign_plans SET status=$2 \
@@ -827,10 +765,8 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+            .map_err(postgres_unavailable)?;
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             &plan.plan_id,
@@ -846,9 +782,7 @@ impl OzonPlanRepository {
         // from an applied marker. Tell the caller before the await so it never
         // classifies that boundary as definitely not started.
         on_commit_attempted();
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(())
     }
@@ -887,54 +821,10 @@ impl OzonPlanRepository {
         readback: Option<&Value>,
         force_applied: bool,
     ) -> Result<OzonCampaignPlan, OzonPlanStoreError> {
-        validate_launch_lease(lease)?;
-        if lease.mode == OzonLaunchClaimMode::Reconcile && readback.is_none() {
-            return Err(OzonPlanStoreError::InvalidPlan);
-        }
-        let effective_campaign_id = campaign_id.or(lease.plan.campaign_id);
-        if lease.action == OzonLaunchAction::CreateCampaign && effective_campaign_id.is_none() {
-            return Err(OzonPlanStoreError::InvalidPlan);
-        }
-        if let (Some(expected), Some(actual)) = (lease.plan.campaign_id, campaign_id)
-            && expected != actual
-        {
-            return Err(OzonPlanStoreError::InvalidPlan);
-        }
-        if !force_applied {
-            let campaign_id = effective_campaign_id.ok_or(OzonPlanStoreError::InvalidPlan)?;
-            let exact = match lease.action {
-                OzonLaunchAction::CreateCampaign | OzonLaunchAction::AddProducts => {
-                    stage_readback_is_exact(
-                        readback.ok_or(OzonPlanStoreError::InvalidPlan)?,
-                        lease.action,
-                        &lease.plan,
-                        campaign_id,
-                    )
-                }
-                OzonLaunchAction::ActivateCampaign => exact_running_readback(
-                    readback.ok_or(OzonPlanStoreError::InvalidPlan)?,
-                    campaign_id,
-                    &lease.plan,
-                ),
-            };
-            if !exact {
-                return Err(OzonPlanStoreError::InvalidPlan);
-            }
-        }
-        let target = if force_applied {
-            OzonLaunchStatus::Applied
-        } else {
-            lease.action.completed_status()
-        };
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let (effective_campaign_id, target) =
+            completion::validate_completion(lease, campaign_id, readback, force_applied)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let plan = load_plan_for_update(&tx, &lease.plan.plan_id).await?;
         require_lease(&tx, lease).await?;
         if lease.action == OzonLaunchAction::CreateCampaign {
@@ -985,10 +875,8 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+            .map_err(postgres_unavailable)?;
+        require_single_update(updated)?;
         if target == OzonLaunchStatus::Applied {
             insert_guard(&tx, &plan, effective_campaign_id).await?;
         }
@@ -1006,9 +894,7 @@ impl OzonPlanRepository {
             }),
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         self.load(&plan.plan_id).await
     }
@@ -1022,15 +908,8 @@ impl OzonPlanRepository {
     ) -> Result<OzonCampaignPlan, OzonPlanStoreError> {
         validate_launch_lease(lease)?;
         validate_error_class(error_class)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let plan = load_plan_for_update(&tx, &lease.plan.plan_id).await?;
         require_lease(&tx, lease).await?;
         let readback_json = readback
@@ -1060,10 +939,8 @@ impl OzonPlanRepository {
                     ],
                 )
                 .await
-                .map_err(|_| OzonPlanStoreError::Unavailable)?;
-            if updated != 1 {
-                return Err(OzonPlanStoreError::InvalidState);
-            }
+                .map_err(postgres_unavailable)?;
+            require_single_update(updated)?;
         }
         close_workflow_as_ambiguous(&tx, lease, error_class, readback_json.as_deref()).await?;
         insert_audit(
@@ -1073,9 +950,7 @@ impl OzonPlanRepository {
             "workflow_ambiguous",
             &serde_json::json!({"action":lease.action.as_db(),"generation":lease.generation,"error_class":error_class}),
         ).await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         self.load(&plan.plan_id).await
     }
@@ -1094,15 +969,8 @@ impl OzonPlanRepository {
             return Err(OzonPlanStoreError::InvalidState);
         }
         validate_error_class(error_class)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let plan = load_plan_for_update(&tx, &lease.plan.plan_id).await?;
         require_lease(&tx, lease).await?;
         let expected_error_class = match lease.action {
@@ -1133,22 +1001,19 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+            .map_err(postgres_unavailable)?;
+        require_single_update(updated)?;
         close_workflow_as_ambiguous(&tx, lease, error_class, None).await?;
         insert_audit(&tx,&plan.plan_id,&lease.owner_id,"workflow_failed",
             &serde_json::json!({"action":lease.action.as_db(),"generation":lease.generation,"error_class":error_class})).await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         self.load(&plan.plan_id).await
     }
 
-    /// Relinquishes a lease. If the write boundary was crossed, the persisted
-    /// plan status ensures the next owner receives reconciliation-only work.
+    /// Relinquishes a lease before its write boundary. The database refuses
+    /// release after a write marker; that lease must expire or be reconciled,
+    /// preserving the durable evidence that forbids another marketplace write.
     pub(in crate::control) async fn release_launch_lease(
         &self,
         lease: &OzonLaunchLease,
@@ -1156,15 +1021,8 @@ impl OzonPlanRepository {
     ) -> Result<(), OzonPlanStoreError> {
         validate_launch_lease(lease)?;
         validate_error_class(error_class)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let generation =
             i64::try_from(lease.generation).map_err(|_| OzonPlanStoreError::InvalidPlan)?;
         let updated = tx
@@ -1185,10 +1043,8 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+            .map_err(postgres_unavailable)?;
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             &lease.plan.plan_id,
@@ -1201,9 +1057,7 @@ impl OzonPlanRepository {
             }),
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(())
     }
@@ -1214,11 +1068,7 @@ impl OzonPlanRepository {
         account_id: &str,
     ) -> Result<Vec<OzonCampaignGuard>, OzonPlanStoreError> {
         validate_identity(account_id)?;
-        let client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let client = self.client.acquire().await.map_err(session_unavailable)?;
         let rows = client
             .query(
                 "SELECT plan_id,account_id,sku,campaign_id,date_from, \
@@ -1228,7 +1078,7 @@ impl OzonPlanRepository {
                 &[&account_id],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
         drop(client);
         rows.iter().map(guard_from_row).collect()
     }
@@ -1253,15 +1103,8 @@ impl OzonPlanRepository {
         validate_error_class(reason)?;
         validate_identity(worker_id)?;
         validate_guard_metrics_pair(spend_minor, revenue_minor)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let campaign_id_i64 = i64::try_from(expected_guard.campaign_id)
             .map_err(|_| OzonPlanStoreError::InvalidPlan)?;
         let row = tx
@@ -1278,7 +1121,7 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?
+            .map_err(postgres_unavailable)?
             .ok_or(OzonPlanStoreError::InvalidState)?;
         let mut guard = guard_from_row(&row)?;
         if &guard != expected_guard {
@@ -1317,10 +1160,8 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+            .map_err(postgres_unavailable)?;
+        require_single_update(updated)?;
         guard.status = OzonCampaignGuardStatus::Stopping;
         guard.stop_reason = Some(reason.to_owned());
         insert_audit(
@@ -1335,9 +1176,7 @@ impl OzonPlanRepository {
             }),
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(OzonGuardStopLease {
             guard,
@@ -1362,15 +1201,8 @@ impl OzonPlanRepository {
     ) -> Result<Option<OzonGuardStopLease>, OzonPlanStoreError> {
         validate_identity(account_id)?;
         validate_identity(worker_id)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let row = tx
             .query_opt(
                 "SELECT plan_id,account_id,sku,campaign_id,date_from, \
@@ -1383,11 +1215,9 @@ impl OzonPlanRepository {
                 &[&account_id],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
         let Some(row) = row else {
-            tx.commit()
-                .await
-                .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            tx.commit().await.map_err(postgres_unavailable)?;
             return Ok(None);
         };
         let reason: String = row.get(7);
@@ -1433,10 +1263,8 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        if updated != 1 {
-            return Err(OzonPlanStoreError::InvalidState);
-        }
+            .map_err(postgres_unavailable)?;
+        require_single_update(updated)?;
         insert_audit(
             &tx,
             &guard.plan_id,
@@ -1449,9 +1277,7 @@ impl OzonPlanRepository {
             }),
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(Some(OzonGuardStopLease {
             guard,
@@ -1472,7 +1298,7 @@ impl OzonPlanRepository {
         spend_minor: Option<u64>,
         revenue_minor: Option<u64>,
     ) -> Result<(), OzonPlanStoreError> {
-        self.finish_guard_lease(lease, "stopped", None, spend_minor, revenue_minor)
+        self.finish_guard_lease(lease, GuardStopOutcome::Stopped, spend_minor, revenue_minor)
             .await
     }
 
@@ -1486,15 +1312,8 @@ impl OzonPlanRepository {
         if lease.write_started_at.is_some() {
             return Err(OzonPlanStoreError::InvalidState);
         }
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let plan_policy = tx
             .query_opt(
                 "SELECT schema_version,policy_revision,policy_digest \
@@ -1510,7 +1329,7 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?
+            .map_err(postgres_unavailable)?
             .ok_or(OzonPlanStoreError::InvalidState)?;
         require_policy(
             &tx,
@@ -1553,7 +1372,7 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
         if updated != 1 {
             return Err(OzonPlanStoreError::LeaseLost);
         }
@@ -1565,9 +1384,7 @@ impl OzonPlanRepository {
             &serde_json::json!({"generation": lease.generation}),
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(())
     }
@@ -1581,15 +1398,8 @@ impl OzonPlanRepository {
         observation: OzonGuardStopReadback,
     ) -> Result<(), OzonPlanStoreError> {
         validate_guard_stop_lease(lease)?;
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         require_guard_stop_lease(&tx, lease).await?;
         insert_audit(
             &tx,
@@ -1599,9 +1409,7 @@ impl OzonPlanRepository {
             &serde_json::json!({"generation": lease.generation}),
         )
         .await?;
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         Ok(())
     }
@@ -1616,8 +1424,7 @@ impl OzonPlanRepository {
         validate_error_class(error_class)?;
         self.finish_guard_lease(
             lease,
-            "incident",
-            Some(error_class),
+            GuardStopOutcome::Incident(error_class),
             spend_minor,
             revenue_minor,
         )
@@ -1627,31 +1434,24 @@ impl OzonPlanRepository {
     async fn finish_guard_lease(
         &self,
         lease: &OzonGuardStopLease,
-        status: &str,
-        incident_error_class: Option<&str>,
+        outcome: GuardStopOutcome<'_>,
         spend_minor: Option<u64>,
         revenue_minor: Option<u64>,
     ) -> Result<(), OzonPlanStoreError> {
         validate_guard_stop_lease(lease)?;
-        if let Some(error_class) = incident_error_class {
-            validate_error_class(error_class)?;
-        }
-        if (status == "incident") != incident_error_class.is_some() {
-            return Err(OzonPlanStoreError::InvalidPlan);
-        }
+        let (status, incident_error_class, event_type) = match outcome {
+            GuardStopOutcome::Stopped => ("stopped", None, "guard_stop_stopped"),
+            GuardStopOutcome::Incident(error_class) => {
+                validate_error_class(error_class)?;
+                ("incident", Some(error_class), "guard_stop_incident")
+            }
+        };
         validate_guard_metrics_pair(spend_minor, revenue_minor)?;
         if spend_minor != lease.spend_minor || revenue_minor != lease.revenue_minor {
             return Err(OzonPlanStoreError::InvalidState);
         }
-        let mut client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let mut client = self.client.acquire().await.map_err(session_unavailable)?;
+        let tx = client.transaction().await.map_err(postgres_unavailable)?;
         let generation =
             i64::try_from(lease.generation).map_err(|_| OzonPlanStoreError::InvalidPlan)?;
         let campaign_id =
@@ -1694,17 +1494,13 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
         if updated == 1 {
             insert_audit(
                 &tx,
                 &lease.guard.plan_id,
                 &lease.owner_id,
-                if status == "stopped" {
-                    "guard_stop_stopped"
-                } else {
-                    "guard_stop_incident"
-                },
+                event_type,
                 &serde_json::json!({
                     "generation": lease.generation,
                     "stop_reason": lease.stop_reason,
@@ -1713,9 +1509,7 @@ impl OzonPlanRepository {
                 }),
             )
             .await?;
-            tx.commit()
-                .await
-                .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            tx.commit().await.map_err(postgres_unavailable)?;
             drop(client);
             return Ok(());
         }
@@ -1751,11 +1545,9 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?
+            .map_err(postgres_unavailable)?
             .get(0);
-        tx.commit()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        tx.commit().await.map_err(postgres_unavailable)?;
         drop(client);
         if exact {
             Ok(())
@@ -1778,11 +1570,7 @@ impl OzonPlanRepository {
         {
             return Err(OzonPlanStoreError::InvalidPlan);
         }
-        let client = self
-            .client
-            .acquire()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        let client = self.client.acquire().await.map_err(session_unavailable)?;
         let updated = client
             .execute(
                 "UPDATE control.ozon_campaign_guards \
@@ -1808,13 +1596,9 @@ impl OzonPlanRepository {
                 ],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
         drop(client);
-        if updated == 1 {
-            Ok(())
-        } else {
-            Err(OzonPlanStoreError::InvalidState)
-        }
+        require_single_update(updated)
     }
 }
 
@@ -1826,7 +1610,7 @@ async fn load_plan_for_update(
     let row = tx
         .query_opt(&query, &[&plan_id])
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?
+        .map_err(postgres_unavailable)?
         .ok_or(OzonPlanStoreError::NotFound)?;
     plan_from_row(&row)
 }
@@ -1864,7 +1648,7 @@ async fn sweep_stale_launch_request(
             &[&account_id],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        .map_err(postgres_unavailable)?;
     let Some(stale) = stale else {
         return Ok(());
     };
@@ -1883,10 +1667,8 @@ async fn sweep_stale_launch_request(
             &[&plan_id, &target.as_db(), &error_class, &status.as_db()],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
-    if updated != 1 {
-        return Err(OzonPlanStoreError::InvalidState);
-    }
+        .map_err(postgres_unavailable)?;
+    require_single_update(updated)?;
     insert_audit(
         tx,
         &plan_id,
@@ -1914,7 +1696,7 @@ async fn claim_workflow_locked(
             &[&plan.plan_id],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        .map_err(postgres_unavailable)?;
     let action = OzonLaunchAction::from_db(row.get(0))?;
     let current_generation: i64 = row.get(1);
     let lease_expires_at: Option<DateTime<Utc>> = row.get(2);
@@ -1951,7 +1733,7 @@ async fn claim_workflow_locked(
                 &[&plan.plan_id, &plan.account_id, &sku],
             )
             .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)?;
+            .map_err(postgres_unavailable)?;
             let reservation_matches: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM control.ozon_campaign_action_reservations \
@@ -1959,7 +1741,7 @@ async fn claim_workflow_locked(
                     &[&plan.plan_id, &plan.account_id, &sku],
                 )
                 .await
-                .map_err(|_| OzonPlanStoreError::Unavailable)?
+                .map_err(postgres_unavailable)?
                 .get(0);
             if !reservation_matches {
                 return Err(OzonPlanStoreError::InvalidState);
@@ -1995,10 +1777,8 @@ async fn claim_workflow_locked(
             ],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
-    if updated != 1 {
-        return Err(OzonPlanStoreError::InvalidState);
-    }
+        .map_err(postgres_unavailable)?;
+    require_single_update(updated)?;
     insert_audit(
         tx,
         &plan.plan_id,
@@ -2045,7 +1825,7 @@ async fn require_active_approval(
             &[&plan.plan_id, &plan.plan_digest],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?
+        .map_err(postgres_unavailable)?
         .get(0);
     active
         .then_some(())
@@ -2063,7 +1843,7 @@ async fn require_matching_approval(
             &[&plan.plan_id, &plan.plan_digest],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?
+        .map_err(postgres_unavailable)?
         .get(0);
     matching
         .then_some(())
@@ -2117,7 +1897,7 @@ async fn require_lease(
             ],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?
+        .map_err(postgres_unavailable)?
         .get(0);
     active.then_some(()).ok_or(OzonPlanStoreError::InvalidState)
 }
@@ -2146,7 +1926,7 @@ async fn require_create_identity_preflight(
             &[&plan.plan_id, &expected],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?
+        .map_err(postgres_unavailable)?
         .get(0);
     exact.then_some(()).ok_or(OzonPlanStoreError::InvalidPlan)
 }
@@ -2190,7 +1970,7 @@ async fn require_guard_stop_lease(
             ],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?
+        .map_err(postgres_unavailable)?
         .get(0);
     active.then_some(()).ok_or(OzonPlanStoreError::LeaseLost)
 }
@@ -2219,12 +1999,8 @@ async fn record_recovery_readback(
             ],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(OzonPlanStoreError::InvalidState)
-    }
+        .map_err(postgres_unavailable)?;
+    require_single_update(updated)
 }
 
 async fn finish_workflow_lease(
@@ -2264,12 +2040,8 @@ async fn finish_workflow_lease(
             ],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(OzonPlanStoreError::InvalidState)
-    }
+        .map_err(postgres_unavailable)?;
+    require_single_update(updated)
 }
 
 async fn close_workflow_as_ambiguous(
@@ -2302,12 +2074,8 @@ async fn close_workflow_as_ambiguous(
             ],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
-    if updated == 1 {
-        Ok(())
-    } else {
-        Err(OzonPlanStoreError::InvalidState)
-    }
+        .map_err(postgres_unavailable)?;
+    require_single_update(updated)
 }
 
 async fn insert_guard(
@@ -2337,7 +2105,7 @@ async fn insert_guard(
         ],
     )
     .await
-    .map_err(|_| OzonPlanStoreError::Unavailable)?;
+    .map_err(postgres_unavailable)?;
     let stored = tx
         .query_one(
             "SELECT account_id,sku,campaign_id,date_from,spend_cap_microrubles, \
@@ -2346,7 +2114,7 @@ async fn insert_guard(
             &[&plan.plan_id],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        .map_err(postgres_unavailable)?;
     if stored.get::<_, &str>(0) != plan.account_id
         || stored.get::<_, i64>(1) != sku
         || stored.get::<_, i64>(2) != campaign_id
@@ -2358,42 +2126,6 @@ async fn insert_guard(
         return Err(OzonPlanStoreError::InvalidState);
     }
     Ok(())
-}
-
-fn stage_readback_is_exact(
-    readback: &Value,
-    action: OzonLaunchAction,
-    plan: &OzonCampaignPlan,
-    campaign_id: u64,
-) -> bool {
-    if json_u64(readback.get("campaign_id")) != Some(campaign_id)
-        || readback.get("action").and_then(Value::as_str) != Some(action.as_db())
-        || readback.get("verified").and_then(Value::as_bool) != Some(true)
-        || readback.get("title").and_then(Value::as_str)
-            != Some(plan.manifest.create_request.title.as_str())
-    {
-        return false;
-    }
-    match action {
-        OzonLaunchAction::CreateCampaign => readback
-            .get("state")
-            .and_then(Value::as_str)
-            .is_some_and(is_supported_non_running_state),
-        OzonLaunchAction::AddProducts => {
-            json_u64(readback.get("sku")) == Some(plan.sku)
-                && json_u64(readback.get("bid_microrubles"))
-                    == Some(plan.manifest.spec.initial_cpc_bid_microrubles)
-        }
-        // Activation is committed only by the stricter running-readback path.
-        OzonLaunchAction::ActivateCampaign => false,
-    }
-}
-
-fn is_supported_non_running_state(state: &str) -> bool {
-    matches!(
-        state,
-        "CAMPAIGN_STATE_STOPPED" | "CAMPAIGN_STATE_INACTIVE" | "CAMPAIGN_STATE_PLANNED"
-    )
 }
 
 fn exact_running_readback(readback: &Value, campaign_id: u64, plan: &OzonCampaignPlan) -> bool {
@@ -2644,7 +2376,7 @@ async fn lock_static_guard_audit_cursor(
         &[&account_id],
     )
     .await
-    .map_err(|_| OzonPlanStoreError::Unavailable)?;
+    .map_err(postgres_unavailable)?;
     let actual_prior_event_id = tx
         .query_one(
             "SELECT max(event_id) FROM control.ozon_static_guard_audit_events \
@@ -2652,7 +2384,7 @@ async fn lock_static_guard_audit_cursor(
             &[&account_id],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?
+        .map_err(postgres_unavailable)?
         .get::<_, Option<i64>>(0);
     if actual_prior_event_id == expected_prior_event_id {
         Ok(())
@@ -2701,7 +2433,7 @@ async fn require_gates(
             &[&account, &sku],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        .map_err(postgres_unavailable)?;
     if active.get::<_, bool>(0) {
         Ok(())
     } else {
@@ -2742,7 +2474,7 @@ async fn expire_stale_open_plans_for_sku(
             &[&account, &sku],
         )
         .await
-        .map_err(|_| OzonPlanStoreError::Unavailable)?;
+        .map_err(postgres_unavailable)?;
     for row in rows {
         let plan_id: String = row.get(0);
         insert_audit(
@@ -2798,22 +2530,7 @@ pub(super) fn map_plan_insert(error: &tokio_postgres::Error) -> OzonPlanStoreErr
 }
 
 #[cfg(test)]
-mod readiness_tests;
+mod lease_budget_tests;
 
 #[cfg(test)]
-mod lease_budget_tests {
-    use super::{GUARD_STOP_LEASE_TTL, WORKFLOW_LEASE_TTL};
-    use chrono::Duration;
-
-    #[test]
-    fn five_minute_leases_cover_composed_vendor_io_with_margin() {
-        // Launch: OAuth + bounded final preflight + both pacing bounds + mutation + bounded readback.
-        let launch_worst_case = Duration::seconds(30 + 60 + 2 + 30 + 2 + 60);
-        // Guard: metrics/campaign pre-read + OAuth + mutation + readback + cross-client pacing.
-        let guard_worst_case = Duration::seconds(4 * 30 + 2 * 2);
-        let safety_margin = Duration::seconds(60);
-
-        assert!(launch_worst_case + safety_margin < WORKFLOW_LEASE_TTL);
-        assert!(guard_worst_case + safety_margin < GUARD_STOP_LEASE_TTL);
-    }
-}
+mod readiness_tests;
