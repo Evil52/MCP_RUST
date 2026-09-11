@@ -144,7 +144,10 @@ async fn child_run(mode: &str) {
             INITIALIZE_STATIC_STATE_COMMAND.to_owned(),
             INITIALIZE_STATIC_STATE_CONFIRMATION.to_owned(),
         ],
-        "health" | "health_without_state" => vec![HEALTHCHECK_COMMAND.to_owned()],
+        "health" | "health_without_state" | "health_mismatch" => {
+            vec![HEALTHCHECK_COMMAND.to_owned()]
+        }
+        "audit_without_config" => vec![AUDIT_COMMAND.to_owned()],
         "invalid_command" => vec!["invalid".to_owned()],
         _ => vec![],
     };
@@ -158,18 +161,20 @@ async fn child_run(mode: &str) {
     } else {
         run_ozon_campaign_guard(&arguments).await
     };
-    match mode {
-        "initialize" | "health" | "serve" => result.unwrap(),
-        "health_without_state" => assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("requires state file")
-        ),
-        "invalid_command" => assert!(result.unwrap_err().to_string().starts_with("usage:")),
-        "unarmed" => assert!(result.unwrap_err().to_string().contains("armed writer")),
-        "runtime_missing" => assert!(result.unwrap_err().to_string().contains("Ozon runtime")),
-        _ => assert!(result.is_err()),
+    let expected_error = match mode {
+        "health_without_state" => Some("requires state file"),
+        "health_mismatch" => Some("audit continuity failed"),
+        "audit_without_config" => Some("requires static guard config"),
+        "disabled_policy" => Some("enabled policy"),
+        "invalid_command" => Some("usage:"),
+        "unarmed" => Some("armed writer"),
+        "runtime_missing" => Some("Ozon runtime"),
+        _ => None,
+    };
+    if let Some(expected) = expected_error {
+        assert!(result.unwrap_err().to_string().contains(expected));
+    } else {
+        result.unwrap();
     }
 }
 
@@ -223,6 +228,11 @@ async fn subprocess_bootstrap_initializes_checks_and_serves_without_marketplace_
                 .unwrap();
         assert!(fixture_lease_is_held(&database, &fixture.fingerprint).await);
         run_child("health", &environment).await;
+        let mut stale_state = state.clone();
+        stale_state.last_static_audit_event_id = state.last_static_audit_event_id.map(|id| id + 1);
+        persist_static_state(&fixture.state_path, &stale_state).unwrap();
+        run_child("health_mismatch", &environment).await;
+        persist_static_state(&fixture.state_path, &state).unwrap();
         environment.remove(STATIC_STATE_FILE_ENV);
         run_child("health_without_state", &environment).await;
         drop(executor_lease);
@@ -236,6 +246,14 @@ async fn subprocess_bootstrap_initializes_checks_and_serves_without_marketplace_
         .await
         .unwrap();
         environment.remove(STATIC_GUARDS_FILE_ENV);
+        run_child("audit_without_config", &environment).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture_lease_is_held(&database, &fixture.fingerprint).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         run_child("serve", &environment).await;
         for mode in ["invalid_command", "unarmed", "runtime_missing"] {
             let mut values = environment.clone();
@@ -250,6 +268,12 @@ async fn subprocess_bootstrap_initializes_checks_and_serves_without_marketplace_
             }
             run_child(mode, &values).await;
         }
+        let policy_path = fixture.authorization.path.join("policy.json");
+        let mut policy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+        policy["mode"] = "plan_only".into();
+        fs::write(policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+        run_child("disabled_policy", &environment).await;
         assert_eq!(
             proxy.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -260,6 +284,20 @@ async fn subprocess_bootstrap_initializes_checks_and_serves_without_marketplace_
             Err(crate::control::ozon::executor_lease::OzonExecutorLeaseError::NotHeld),
         );
     }
+}
+
+#[test]
+fn explicit_reconcile_command_requires_its_exact_confirmation() {
+    assert_eq!(
+        parse_command(&[
+            RECONCILE_COMMAND.to_owned(),
+            RECONCILE_CONFIRMATION.to_owned()
+        ])
+        .unwrap(),
+        Command::ReconcileStaticOnce,
+    );
+    assert!(parse_command(&[RECONCILE_COMMAND.to_owned()]).is_err());
+    assert!(parse_command(&[RECONCILE_COMMAND.to_owned(), "--confirm".to_owned()]).is_err());
 }
 
 #[test]
