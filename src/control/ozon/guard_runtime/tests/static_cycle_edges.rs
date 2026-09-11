@@ -216,3 +216,71 @@ async fn postgres_static_cycle_rolls_back_failed_bid_marker_before_any_put() {
     );
     assert_eq!(requests.try_iter().count(), 0);
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL roles"]
+async fn postgres_static_cycle_rejects_clock_rollback_before_any_bid_write() {
+    let _lock = CONTROL_DB_TEST_LOCK.lock().await;
+    let database = Database::connect()
+        .await
+        .expect("isolated PostgreSQL roles are configured");
+    let fixture = dynamic_fixture();
+    let dynamic = load_static_guards(&fixture.config_path, "account")
+        .unwrap()
+        .0
+        .dynamic_bid_control
+        .unwrap();
+    let cycle_time = observed_at() + chrono::Duration::minutes(30);
+    let mut persisted = fixture.initialize(&database).await;
+    persisted
+        .last_bid_change_at
+        .insert(21, cycle_time + chrono::Duration::seconds(1));
+    persist_static_state(&fixture.state_path, &persisted).unwrap();
+    let original_bytes = fs::read(&fixture.state_path).unwrap();
+    let mut state = load_static_state(&fixture.state_path).unwrap();
+    // Use a distinct publication slot from other cycle fixtures while keeping
+    // this position five minutes old at the simulated rolled-back wall clock.
+    publish_position(&database, &dynamic.position_region_name, observed_at()).await;
+    let position = OzonBidPositionReader::connect(
+        &std::env::var("POSITION_REPOSITORY_TEST_READER_URL").unwrap(),
+    )
+    .await
+    .unwrap();
+    position.verify_runtime_contract().await.unwrap();
+    let (reader, reads) = mock_reader(vec![
+        (200, campaign("CAMPAIGN_STATE_RUNNING")),
+        (200, metrics("1.00", "100.00")),
+        (200, product(7_000_000)),
+    ]);
+    let (writer, requests) = mock_writer(vec![]);
+    let error = guard_once_static(
+        std::slice::from_ref(&fixture.guard),
+        &mut state,
+        &fixture.state_path,
+        &reader,
+        &writer,
+        &fixture.store,
+        fixture.write_authorization(&database),
+        Some(&dynamic),
+        Some(&position),
+        cycle_time,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::control::ozon::pacing::OzonBidPacingError>(),
+        Some(&crate::control::ozon::pacing::OzonBidPacingError::InvalidObservation)
+    );
+    assert_eq!(reads.try_iter().count(), 4);
+    assert_eq!(requests.try_iter().count(), 0);
+    assert_eq!(state, persisted);
+    assert_eq!(fs::read(&fixture.state_path).unwrap(), original_bytes);
+    assert_eq!(
+        database
+            .executor
+            .latest_static_guard_audit_event_id("account")
+            .await
+            .unwrap(),
+        state.last_static_audit_event_id
+    );
+}
