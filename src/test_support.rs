@@ -1,3 +1,5 @@
+pub(crate) mod http2;
+
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},

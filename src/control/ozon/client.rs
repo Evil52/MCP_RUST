@@ -171,27 +171,12 @@ impl OzonAdsWriteClient {
         credentials: PerformanceCredentials,
         proxy_url: &str,
     ) -> Result<Self> {
-        if timeout.is_zero() || timeout > Duration::from_secs(30) {
-            bail!("CONTROL_MCP_OZON_TIMEOUT_SECONDS должен задавать 1..=30 секунд");
-        }
-        validate_credentials(&credentials)?;
-        let proxy = Proxy::https(proxy_url).context("неверный CONTROL_MCP_OZON_PROXY")?;
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .https_only(true)
-            .connect_timeout(timeout.min(Duration::from_secs(5)))
-            .timeout(timeout)
-            .proxy(proxy)
-            .build()
-            .context("не удалось создать изолированный Ozon Performance write client")?;
-        Ok(Self::from_parts(
-            http,
-            PERFORMANCE_BASE_URL,
+        Self::new_with_pacer(
+            timeout,
             credentials,
+            proxy_url,
             PerformanceRequestPacer::new(),
-            MIN_WRITE_INTERVAL,
-        ))
+        )
     }
 
     /// Builds a write client sharing the exact `Client-Id` pacing boundary
@@ -207,12 +192,8 @@ impl OzonAdsWriteClient {
         }
         validate_credentials(&credentials)?;
         let proxy = Proxy::https(proxy_url).context("неверный CONTROL_MCP_OZON_PROXY")?;
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
+        let http = write_http_builder(timeout)
             .https_only(true)
-            .connect_timeout(timeout.min(Duration::from_secs(5)))
-            .timeout(timeout)
             .proxy(proxy)
             .build()
             .context("не удалось создать изолированный Ozon Performance write client")?;
@@ -231,10 +212,7 @@ impl OzonAdsWriteClient {
         credentials: PerformanceCredentials,
         timeout: Duration,
     ) -> Self {
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .timeout(timeout)
+        let http = write_http_builder(timeout)
             .build()
             .expect("test Ozon write client");
         Self::from_parts(
@@ -253,10 +231,7 @@ impl OzonAdsWriteClient {
         timeout: Duration,
         minimum_interval: Duration,
     ) -> Self {
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .timeout(timeout)
+        let http = write_http_builder(timeout)
             .build()
             .expect("test Ozon write client");
         Self::from_parts(
@@ -649,3 +624,17 @@ struct TokenResponse {
     token_type: String,
     expires_in: u64,
 }
+
+// A fresh durable permit authorizes one transport attempt, including HTTP/2
+// REFUSED_STREAM and GOAWAY responses that reqwest otherwise retries itself.
+fn write_http_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .connect_timeout(timeout.min(Duration::from_secs(5)))
+        .timeout(timeout)
+}
+
+#[cfg(test)]
+mod retry_tests;
