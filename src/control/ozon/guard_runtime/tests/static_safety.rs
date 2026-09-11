@@ -7,7 +7,7 @@ use crate::control::{
 use tracing::instrument::WithSubscriber as _;
 
 #[derive(Clone, Default)]
-struct GuardLogs(Arc<Mutex<Vec<u8>>>);
+pub(super) struct GuardLogs(Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for GuardLogs {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -20,7 +20,7 @@ impl std::io::Write for GuardLogs {
 }
 
 impl GuardLogs {
-    fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+    pub(super) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
         let output = self.clone();
         tracing_subscriber::fmt()
             .without_time()
@@ -29,7 +29,7 @@ impl GuardLogs {
             .with_writer(move || output.clone())
             .finish()
     }
-    fn contains(&self, message: &str) -> bool {
+    pub(super) fn contains(&self, message: &str) -> bool {
         String::from_utf8_lossy(&self.0.lock().unwrap()).contains(message)
     }
 }

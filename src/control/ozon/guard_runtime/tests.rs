@@ -232,3 +232,5 @@ mod durable_adapter;
 mod static_safety;
 
 mod static_reconciliation;
+
+mod static_driver;

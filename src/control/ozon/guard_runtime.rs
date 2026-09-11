@@ -62,6 +62,7 @@ use super::{
 
 mod startup;
 mod static_cycle;
+mod static_runtime;
 use startup::{record_static_cycle_result, verify_executor_health};
 use static_cycle::guard_once_static;
 
@@ -349,7 +350,7 @@ where
         let state_path = env::var_os(STATIC_STATE_FILE_ENV)
             .map(PathBuf::from)
             .context("static Ozon guard требует state file")?;
-        let _state_lease = OzonStaticGuardStateLease::acquire(&state_path)?;
+        let state_lease = OzonStaticGuardStateLease::acquire(&state_path)?;
         let (static_guard_config, static_guard_config_digest) =
             load_static_guards(Path::new(&static_guards_path), &runtime.account_id)?;
         let write_authorization = StaticGuardWriteAuthorization {
@@ -363,157 +364,18 @@ where
             worker_id: &worker_id,
             config_digest: &static_guard_config_digest,
         };
-        validate_ozon_static_guard_policy(&static_guard_config, &config.policy)?;
-        let static_guards = static_guard_config.guards;
-        let dynamic_bid_control = static_guard_config.dynamic_bid_control;
-        let mut state = load_static_state(&state_path)?;
-        let allowed_campaign_ids = static_guards
-            .iter()
-            .map(|guard| guard.guard.campaign_id)
-            .collect::<BTreeSet<_>>();
-        validate_ozon_static_guard_state_scope(&state, &allowed_campaign_ids)?;
-        let latest_static_audit_event_id = plans
-            .latest_static_guard_audit_event_id(&runtime.account_id)
-            .await?;
-        match validate_static_command_audit_continuity(
+        return static_runtime::StaticGuardRuntime {
             command,
-            &state,
-            latest_static_audit_event_id,
-        )? {
-            StaticAuditContinuity::InitializeState => {
-                let initialization = plans.initialize_static_guard_state(
-                    config.policy.version,
-                    config.policy.revision,
-                    config.policy.digest(),
-                    &runtime.account_id,
-                    &static_guard_config_digest,
-                    &worker_id,
-                    state.last_static_audit_event_id,
-                    |event_id| {
-                        let state = &mut state;
-                        async move {
-                            persist_static_initialization_cursor(state, &state_path, event_id)
-                                .map_err(|_| OzonPlanStoreError::Unavailable)
-                        }
-                    },
-                );
-                tokio::select! {
-                    result = initialization => result?,
-                    () = executor_lease.lost() => bail!("Ozon executor lease connection was lost"),
-                }
-                tracing::info!(
-                    account_id = %runtime.account_id,
-                    audit_event_id = ?state.last_static_audit_event_id,
-                    "static Ozon guard state genesis recorded"
-                );
-                return Ok(());
-            }
-            StaticAuditContinuity::ReadOnlyAudit => {
-                tracing::warn!(
-                    local_event_id = ?state.last_static_audit_event_id,
-                    database_event_id = ?latest_static_audit_event_id,
-                    "static state audit watermark mismatch; running read-only audit only"
-                );
-                tokio::select! {
-                    result = audit_static_campaigns(&static_guards, &reader, &marketplace.store_id) => result?,
-                    () = executor_lease.lost() => bail!("Ozon executor lease connection was lost"),
-                }
-                return Ok(());
-            }
-            StaticAuditContinuity::Matched => {}
+            state_lease,
+            state_path: &state_path,
+            config: static_guard_config,
+            reader: &reader,
+            writer: &writer,
+            write_authorization,
+            executor_lease: &executor_lease,
         }
-        let position_reader = if dynamic_bid_control.is_some() {
-            let database_url = env::var(POSITION_DATABASE_URL_ENV)
-                .context("dynamic Ozon bid control requires position database")?;
-            let reader = Arc::new(OzonBidPositionReader::connect(&database_url).await?);
-            reader.verify_runtime_contract().await?;
-            Some(reader)
-        } else {
-            None
-        };
-        tokio::select! {
-            result = recover_pending_static_campaign_mutations(
-                &mut state,
-                &state_path,
-                reader.as_ref(),
-                writer.as_ref(),
-                &marketplace.store_id,
-                &static_guards,
-                write_authorization,
-            ) => result?,
-            () = executor_lease.lost() => bail!("Ozon executor lease connection was lost"),
-        }
-        tokio::select! {
-            result = recover_pending_static_bids(
-                &mut state,
-                &state_path,
-                reader.as_ref(),
-                &marketplace.store_id,
-                &static_guards,
-            ) => result?,
-            () = executor_lease.lost() => bail!("Ozon executor lease connection was lost"),
-        }
-        tracing::info!(
-            account_id=%runtime.account_id,
-            guards=static_guards.len(),
-            dynamic_bid_control=dynamic_bid_control.is_some(),
-            "static Ozon campaign guard armed"
-        );
-        if command == Command::AuditStaticOnce {
-            tokio::select! {
-                result = audit_static_campaigns(&static_guards, &reader, &marketplace.store_id) => result?,
-                () = executor_lease.lost() => bail!("Ozon executor lease connection was lost"),
-            }
-            return Ok(());
-        }
-        if command == Command::ReconcileStaticOnce {
-            tokio::select! {
-                result = reconcile_static_campaigns(
-                    &static_guards,
-                    &mut state,
-                    &state_path,
-                    &reader,
-                    &writer,
-                    &marketplace.store_id,
-                    write_authorization,
-                ) => result?,
-                () = executor_lease.lost() => bail!("Ozon executor lease connection was lost"),
-            }
-            return Ok(());
-        }
-        let mut consecutive_cycle_failures = 0_usize;
-        loop {
-            let cycle = guard_once_static(
-                &static_guards,
-                &mut state,
-                &state_path,
-                &reader,
-                &writer,
-                &marketplace.store_id,
-                write_authorization,
-                dynamic_bid_control.as_ref(),
-                position_reader.as_deref(),
-                Utc::now(),
-            );
-            tokio::select! {
-                result = cycle => record_static_cycle_result(
-                    result,
-                    &mut consecutive_cycle_failures,
-                )?,
-                () = &mut shutdown => break,
-                () = executor_lease.lost() => {
-                    bail!("Ozon executor lease connection was lost");
-                }
-            }
-            tokio::select! {
-                () = tokio::time::sleep(GUARD_POLL_INTERVAL) => {}
-                () = &mut shutdown => break,
-                () = executor_lease.lost() => {
-                    bail!("Ozon executor lease connection was lost");
-                }
-            }
-        }
-        return Ok(());
+        .run(&mut shutdown)
+        .await;
     }
 
     if command != Command::Serve {
