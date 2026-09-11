@@ -199,7 +199,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancelled_waits_and_released_sessions_do_not_leave_stuck_gauges() {
-        let metrics = SessionMetrics::default();
+        let metrics = SessionMetrics::new();
         let first = SessionWait::new(&metrics);
         let cancelled = SessionWait::new(&metrics);
         assert_eq!(metrics.snapshot().waiting, 2);

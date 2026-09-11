@@ -367,12 +367,14 @@ mod tests {
             // Keep the TCP connection alive but never answer the startup
             // packet. A cancelled connect must close the socket itself.
             let mut buffer = [0_u8; 1024];
-            while socket
-                .read(&mut buffer)
-                .await
-                .expect("socket closes cleanly")
-                != 0
-            {}
+            assert_eq!(
+                socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("socket closes cleanly"),
+                0,
+                "cancelled startup must close without sending more protocol bytes"
+            );
         });
         (config, startup_received, peer)
     }
