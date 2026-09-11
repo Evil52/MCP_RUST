@@ -186,3 +186,38 @@ fn guard_planning_rejects_invalid_limits_and_reversed_date_windows() {
         Err(OzonGuardTelemetryError::InvalidDateWindow)
     );
 }
+
+#[test]
+fn unavailable_recovery_readback_reports_the_existing_marker_without_writing() {
+    for write_started_at in [None, Some(DateTime::UNIX_EPOCH)] {
+        let log = with_logs(async {
+            let repository = FakeRepository::default();
+            let pending = OzonGuardStopLease {
+                write_started_at,
+                ..lease(durable_guard(42), "telemetry_unavailable", None)
+            };
+            repository.0.lock().unwrap().recoveries.push_back(pending);
+            let reader = FakeReader::default();
+            reader
+                .running
+                .lock()
+                .unwrap()
+                .push_back(Err(OzonGuardReadFailure::CampaignState));
+            let writer = FakeWriter::default();
+            production_cycle(&repository, &reader, &writer)
+                .await
+                .unwrap();
+            assert!(writer.calls.lock().unwrap().is_empty());
+            let state = repository.0.lock().unwrap();
+            assert_eq!(
+                state.readbacks,
+                vec![(42, OzonGuardStopReadback::Unavailable)]
+            );
+            assert!(state.finishes.is_empty());
+            assert!(state.incidents.is_empty());
+        });
+        assert!(log.contains("stop readback unavailable; stopping intent retained"));
+        assert!(log.contains(&format!("write_started={}", write_started_at.is_some())));
+        assert!(log.contains("recovery_read_failures=1"));
+    }
+}
