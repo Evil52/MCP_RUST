@@ -3,6 +3,11 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Keep verification artifacts separate from shared worktree build caches.
+export CARGO_TARGET_DIR="$project_root/target/verification/cargo"
+export CARGO_BUILD_BUILD_DIR="$CARGO_TARGET_DIR"
+export CARGO_LLVM_COV_TARGET_DIR="$project_root/target/verification/coverage"
+export CARGO_LLVM_COV_BUILD_DIR="$CARGO_LLVM_COV_TARGET_DIR"
 cd "$project_root"
 
 readonly required_rust_version="1.98.0"
@@ -19,6 +24,7 @@ echo "==> Rust structure budget"
 python3 -B scripts/check-rust-structure.py
 python3 -B -m unittest discover -s tests -p test_rust_structure.py
 python3 -B -m unittest discover -s tests -p test_local_artifact.py
+python3 -B -m unittest discover -s tests -p test_verification_targets.py
 
 echo "==> Tests"
 cargo test --locked --workspace --all-targets --all-features -- --test-threads=1

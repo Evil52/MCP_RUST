@@ -3,6 +3,11 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Keep verification artifacts separate from shared worktree build caches.
+export CARGO_TARGET_DIR="$project_root/target/verification/cargo"
+export CARGO_BUILD_BUILD_DIR="$CARGO_TARGET_DIR"
+export CARGO_LLVM_COV_TARGET_DIR="$project_root/target/verification/coverage"
+export CARGO_LLVM_COV_BUILD_DIR="$CARGO_LLVM_COV_TARGET_DIR"
 report_dir="$project_root/target/sonar"
 test_report="$report_dir/test-executions.xml"
 test_output="$report_dir/test-output.txt"
