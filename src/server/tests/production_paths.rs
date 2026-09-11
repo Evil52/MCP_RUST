@@ -9,6 +9,26 @@ fn posting_sales_context_accepts_an_explicit_authorized_store() {
     );
 }
 
+#[test]
+fn posting_sales_context_rejects_blank_and_oversized_store_selectors() {
+    let server = server();
+    for (store, expected) in [
+        (" ".to_owned(), "store не может быть пустым".to_owned()),
+        (
+            "x".repeat(MAX_STORE_SELECTOR_CHARS + 1),
+            format!("store не может быть длиннее {MAX_STORE_SELECTOR_CHARS} символов"),
+        ),
+    ] {
+        let error = server
+            .posting_sales_context(
+                &RequestIdentity::dev(),
+                Some(&StoreId::from(store.as_str())),
+            )
+            .expect_err("an invalid explicit selector must be rejected");
+        assert_eq!(error, expected);
+    }
+}
+
 #[tokio::test]
 async fn weekly_ranking_rejects_registry_identifiers_outside_reporting_scope() {
     let repository = Arc::new(FakeReportingRepository::succeeding());
