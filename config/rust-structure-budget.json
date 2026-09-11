@@ -22,7 +22,6 @@
     "src/http.rs": 2471,
     "src/ozon_performance.rs": 2407,
     "src/ozon.rs": 3724,
-    "src/reporting/collector_service.rs": 1075,
     "src/reporting/gmail_outbox.rs": 1283,
     "src/reporting/mcp_read.rs": 3364,
     "src/reporting/ozon_adapter.rs": 1363,
