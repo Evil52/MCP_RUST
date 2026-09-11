@@ -2641,13 +2641,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn automatic_pacing_executes_only_when_typed_policy_enables_it() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let config = Config::from_str(&database_url).unwrap();
         let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
@@ -2747,13 +2744,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn traffic_frontier_postgres_execution_uses_the_applied_feedback_baseline() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let config = Config::from_str(&database_url).unwrap();
         let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
@@ -2864,13 +2858,10 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "the PostgreSQL campaign lease is consumed by explicit async release"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn postgres_executor_reserves_writes_and_reconciles_from_readback() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let fixture = Fixture::new();
         let observed_at = Utc::now();
@@ -2952,13 +2943,10 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "the PostgreSQL campaign lease is consumed by explicit async release"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn explicit_exposure_increase_uses_durable_write_and_exact_readback() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let campaign_id = 39_682_720;
         let fixture = Fixture::new_for_campaign(campaign_id);
@@ -3048,13 +3036,10 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "the PostgreSQL campaign lease is consumed by explicit async release"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn explicit_quota_override_uses_v3_guards_durable_write_and_exact_readback() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let campaign_id = 39_682_726;
         let fixture = Fixture::new_for_campaign(campaign_id);
@@ -3166,13 +3151,10 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "the PostgreSQL campaign lease is consumed by explicit async release"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn explicit_resume_after_daily_cap_is_durable_and_clears_the_pause() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let campaign_id = 39_682_725;
         let fixture = Fixture::new_for_campaign(campaign_id);
@@ -3245,13 +3227,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn postgres_executor_covers_holds_caps_pauses_and_ambiguous_readback() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let config = Config::from_str(&database_url).unwrap();
         let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
@@ -3382,13 +3361,10 @@ mod tests {
         clippy::significant_drop_tightening,
         reason = "campaign leases are deliberately held across lock-contention assertions"
     )]
+    #[ignore = "requires disposable WB automation PostgreSQL role"]
     async fn postgres_executor_recovers_each_preexisting_pending_state_without_retry() {
-        #[cfg(coverage)]
-        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").unwrap();
-        #[cfg(not(coverage))]
-        let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the WB automation role");
         let _serial = POSTGRES_EXECUTOR_TEST_LOCK.lock().await;
         let config = Config::from_str(&database_url).unwrap();
         let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
