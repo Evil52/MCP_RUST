@@ -37,34 +37,39 @@ fn overlap_scan_uses_complete_bounded_nonfinished_campaign_ids() {
     );
 }
 
+fn receipt_failure_responses(fixture: &Fixture, stage: &str) -> Vec<(u16, Value)> {
+    let mut responses = if stage == "bids" {
+        vec![
+            (200, target(4, 500)),
+            (200, json!({"total":0})),
+            (200, minimums()),
+            (200, target(4, 500)),
+            (200, json!({"total":0})),
+            (200, json!({})),
+            (200, target(4, 922)),
+        ]
+    } else {
+        preflight(fixture)
+    };
+    if stage == "fund" {
+        responses.extend([
+            (200, minimums()),
+            (200, target(11, 922)),
+            (200, json!({"total":0})),
+            (200, json!({"balance":1000})),
+            (200, json!({"total":1000})),
+            (200, json!({"total":1000})),
+            (200, target(11, 922)),
+        ]);
+    }
+    responses
+}
+
 #[tokio::test]
 async fn receipt_persistence_failure_never_repeats_a_completed_marketplace_write() {
     for stage in ["bids", "fund"] {
         let fixture = Fixture::new(LaunchScope::FundAndStart);
-        let mut responses = if stage == "bids" {
-            vec![
-                (200, target(4, 500)),
-                (200, json!({"total":0})),
-                (200, minimums()),
-                (200, target(4, 500)),
-                (200, json!({"total":0})),
-                (200, json!({})),
-                (200, target(4, 922)),
-            ]
-        } else {
-            preflight(&fixture)
-        };
-        if stage == "fund" {
-            responses.extend([
-                (200, minimums()),
-                (200, target(11, 922)),
-                (200, json!({"total":0})),
-                (200, json!({"balance":1000})),
-                (200, json!({"total":1000})),
-                (200, json!({"total":1000})),
-                (200, target(11, 922)),
-            ]);
-        }
+        let responses = receipt_failure_responses(&fixture, stage);
         let count = responses.len();
         let receipt_path = fixture
             .root
@@ -175,6 +180,30 @@ async fn read_only_cli_reconcile_loads_only_the_reader_for_a_confirmed_id() {
 }
 
 #[tokio::test]
+async fn read_only_reconcile_rejects_an_invalid_proxy_before_any_request() {
+    let mut fixture = Fixture::new(LaunchScope::CreateOnly);
+    fixture.manifest.reader_proxy = "http://[".to_owned();
+    private_json(
+        &fixture.path,
+        &serde_json::to_value(&fixture.manifest).unwrap(),
+    );
+    let journal = fixture.journal();
+    journal
+        .receipt("create", &json!({"campaign_id":ID}))
+        .unwrap();
+    drop(journal);
+    let error = run_wb_campaign_launch("reconcile", &fixture.path)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_builder)
+    );
+    assert_eq!(fixture.journal().maybe_campaign_id().unwrap(), Some(ID));
+}
+
+#[tokio::test]
 async fn cli_preflight_fails_at_its_explicit_local_proxy_without_journaling() {
     let fixture = Fixture::new(LaunchScope::CreateOnly);
     assert!(
@@ -185,48 +214,57 @@ async fn cli_preflight_fails_at_its_explicit_local_proxy_without_journaling() {
     assert!(!fixture.root.join("ofk_region_wb-Nexus").exists());
 }
 
+async fn assert_start_bootstrap_refuses_unready_dependencies(mode: &str) {
+    let fixture = Fixture::new(LaunchScope::FundAndStart);
+    let (operator, receiver) = fixture.operator(vec![(200, target(11, 922))]);
+    let mut policy = operator.target_policy(ID);
+    if mode == "policy-drift" {
+        policy.campaign_name = "changed".to_owned();
+    }
+    private_json(
+        &fixture.manifest.robot_policy,
+        &serde_json::to_value(policy).unwrap(),
+    );
+    let journal = fixture.journal();
+    journal
+        .receipt("create", &json!({"campaign_id":ID}))
+        .unwrap();
+    journal.receipt("fund", &json!({})).unwrap();
+    if mode == "missing-reader" {
+        fs::remove_file(&fixture.manifest.reader_token).unwrap();
+    }
+    let error = operator.start(&journal).await.unwrap_err();
+    match mode {
+        "policy-drift" => assert!(error.to_string().contains("differs from reviewed copy")),
+        "missing-reader" => assert!(error.to_string().contains("WB_AUTOMATION_READ_TOKEN_FILE")),
+        "missing-db" => assert!(error.to_string().contains("PostgreSQL is required")),
+        "invalid-db" => assert!(error.to_string().contains("invalid automation database")),
+        _ => {
+            assert_eq!(mode, "valid-db");
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::wb::WbError>()
+                    .map(crate::wb::WbError::kind),
+                Some(crate::wb::WbErrorKind::Network),
+                "valid startup reaches only the explicit loopback proxy after its database checks"
+            );
+        }
+    }
+    assert!(!journal.attempted("start"));
+    assert!(requests(&receiver, 1)[0].starts_with("GET /api/advert/v2/adverts?"));
+}
+
 #[tokio::test]
 async fn startup_bootstrap_requires_policy_and_database_before_any_write() {
     const CHILD: &str = "WB_START_BOOTSTRAP_BOUNDARY_CHILD";
     if let Ok(mode) = std::env::var(CHILD) {
-        let fixture = Fixture::new(LaunchScope::FundAndStart);
-        let (operator, receiver) = fixture.operator(vec![(200, target(11, 922))]);
-        let mut policy = operator.target_policy(ID);
-        if mode == "policy-drift" {
-            policy.campaign_name = "changed".to_owned();
-        }
-        private_json(
-            &fixture.manifest.robot_policy,
-            &serde_json::to_value(policy).unwrap(),
-        );
-        let journal = fixture.journal();
-        journal
-            .receipt("create", &json!({"campaign_id":ID}))
-            .unwrap();
-        journal.receipt("fund", &json!({})).unwrap();
-        let error = operator.start(&journal).await.unwrap_err();
-        match mode.as_str() {
-            "policy-drift" => assert!(error.to_string().contains("differs from reviewed copy")),
-            "missing-db" => assert!(error.to_string().contains("PostgreSQL is required")),
-            "invalid-db" => assert!(error.to_string().contains("invalid automation database")),
-            _ => {
-                assert_eq!(mode, "valid-db");
-                assert_eq!(
-                    error
-                        .downcast_ref::<crate::wb::WbError>()
-                        .map(crate::wb::WbError::kind),
-                    Some(crate::wb::WbErrorKind::Network),
-                    "valid startup reaches only the explicit loopback proxy after its database checks"
-                );
-            }
-        }
-        assert!(!journal.attempted("start"));
-        assert!(requests(&receiver, 1)[0].starts_with("GET /api/advert/v2/adverts?"));
+        assert_start_bootstrap_refuses_unready_dependencies(&mode).await;
         return;
     }
     let database_url = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL").ok();
     for (mode, url) in [
         ("policy-drift", None),
+        ("missing-reader", None),
         ("missing-db", None),
         ("invalid-db", Some("invalid database url".to_owned())),
     ]
