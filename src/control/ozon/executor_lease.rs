@@ -10,7 +10,7 @@ use tokio_postgres::{Client, Config, NoTls};
 
 use thiserror::Error;
 
-use crate::postgres::harden;
+use crate::postgres::{CONNECT_TIMEOUT, harden};
 
 const EXECUTOR_ROLE: &str = "ozon_control_executor";
 const LOCK_NAMESPACE: &str = "mcp-ozon/executor-identity/v1";
@@ -66,58 +66,51 @@ impl OzonExecutorLease {
         validate_fingerprint(executor_client_id_sha256)?;
         let mut database = database.clone();
         harden(&mut database, "mcp-ozon-control-executor-lease");
-        let (client, connection) = database
-            .connect(NoTls)
-            .await
-            .map_err(|_| OzonExecutorLeaseError::Unavailable)?;
+        let (client, connection) =
+            tokio::time::timeout(CONNECT_TIMEOUT, Box::pin(database.connect(NoTls)))
+                .await
+                .map_err(|_| OzonExecutorLeaseError::Unavailable)?
+                .map_err(|_| OzonExecutorLeaseError::Unavailable)?;
         let (lost_sender, lost) = watch::channel(false);
         let connection_task = tokio::spawn(async move {
             let _ = connection.await;
             let _ = lost_sender.send(true);
         });
+        // Cancellation while PostgreSQL executes the lock query leaves its
+        // result unknown. Arm Drop before that await so it closes the session.
+        let lease = Self {
+            client,
+            connection_task,
+            lost,
+        };
         let lock_identity = format!("{LOCK_NAMESPACE}/{executor_client_id_sha256}");
-        let Ok(row) = client
+        let row = lease
+            .client
             .query_one(
                 "SELECT current_user::text, \
                  pg_try_advisory_lock(hashtextextended($1::text, 0))",
                 &[&lock_identity],
             )
             .await
-        else {
-            drop(client);
-            connection_task.abort();
-            return Err(OzonExecutorLeaseError::Unavailable);
-        };
+            .map_err(|_| OzonExecutorLeaseError::Unavailable)?;
         let role: String = row.get(0);
         let acquired: bool = row.get(1);
         if role != EXECUTOR_ROLE {
-            drop(client);
-            connection_task.abort();
             return Err(OzonExecutorLeaseError::InvalidRole);
         }
         if !acquired {
-            drop(client);
-            connection_task.abort();
             return Err(OzonExecutorLeaseError::Busy);
         }
-        Ok(Self {
-            client,
-            connection_task,
-            lost,
-        })
+        Ok(lease)
     }
 
     /// Completes only if the database session (and therefore its lock) dies.
     pub async fn lost(&self) {
         let mut signal = self.lost.clone();
-        if self.client.is_closed() || *signal.borrow() {
+        if self.client.is_closed() {
             return;
         }
-        while signal.changed().await.is_ok() {
-            if *signal.borrow_and_update() {
-                return;
-            }
-        }
+        let _ = signal.wait_for(|lost| *lost).await;
     }
 }
 
@@ -138,6 +131,9 @@ fn validate_fingerprint(value: &str) -> Result<(), OzonExecutorLeaseError> {
         Err(OzonExecutorLeaseError::InvalidFingerprint)
     }
 }
+
+#[cfg(test)]
+mod failure_tests;
 
 #[cfg(test)]
 mod tests {
