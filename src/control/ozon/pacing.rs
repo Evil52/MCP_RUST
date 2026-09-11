@@ -172,10 +172,11 @@ fn position_bid_adjustment(
     let age = observation
         .observed_at
         .signed_duration_since(position.observed_at);
-    let max_age = Duration::seconds(
+    let max_age = Duration::try_seconds(
         i64::try_from(policy.max_position_age_seconds)
             .map_err(|_| OzonBidPacingError::InvalidPolicy)?,
-    );
+    )
+    .ok_or(OzonBidPacingError::InvalidPolicy)?;
     if age < Duration::zero() || age > max_age {
         return Ok(OzonBidPacingAdjustment::Hold(
             OzonBidPacingHoldReason::PositionStale,
@@ -255,9 +256,10 @@ fn cooldown_active(
     if age < Duration::zero() {
         return Err(OzonBidPacingError::InvalidObservation);
     }
-    let cooldown = Duration::seconds(
+    let cooldown = Duration::try_seconds(
         i64::try_from(policy.cooldown_seconds).map_err(|_| OzonBidPacingError::InvalidPolicy)?,
-    );
+    )
+    .ok_or(OzonBidPacingError::InvalidPolicy)?;
     Ok(age < cooldown)
 }
 
@@ -505,6 +507,79 @@ mod tests {
         assert_eq!(
             evaluate_ozon_bid_pacing(policy(), future_change),
             Err(OzonBidPacingError::InvalidObservation)
+        );
+    }
+
+    #[test]
+    fn unrepresentable_position_age_returns_invalid_policy_without_panicking() {
+        for seconds in [
+            u64::try_from(i64::MAX).unwrap(),
+            u64::try_from(Duration::MAX.num_seconds()).unwrap() + 1,
+            u64::MAX,
+        ] {
+            let oversized = OzonBidPacingPolicy {
+                max_position_age_seconds: seconds,
+                ..policy()
+            };
+            assert_eq!(
+                evaluate_ozon_bid_pacing(oversized, observation()),
+                Err(OzonBidPacingError::InvalidPolicy)
+            );
+            assert_eq!(
+                evaluate_ozon_bid_increase_after_guard(oversized, observation()),
+                Err(OzonBidPacingError::InvalidPolicy)
+            );
+        }
+    }
+
+    #[test]
+    fn unrepresentable_cooldown_returns_invalid_policy_without_panicking() {
+        let high_drr = OzonBidPacingObservation {
+            current_bid_microrubles: 9_000_000,
+            spend_minor: 15_001,
+            last_bid_change_at: Some(observation().observed_at - Duration::minutes(1)),
+            ..observation()
+        };
+        for seconds in [
+            u64::try_from(i64::MAX).unwrap(),
+            u64::try_from(Duration::MAX.num_seconds()).unwrap() + 1,
+            u64::MAX,
+        ] {
+            let oversized = OzonBidPacingPolicy {
+                cooldown_seconds: seconds,
+                max_position_age_seconds: seconds,
+                ..policy()
+            };
+            assert_eq!(
+                evaluate_ozon_bid_pacing(oversized, high_drr),
+                Err(OzonBidPacingError::InvalidPolicy)
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_representable_duration_preserves_bid_and_cooldown_decisions() {
+        let maximum = OzonBidPacingPolicy {
+            cooldown_seconds: u64::try_from(Duration::MAX.num_seconds()).unwrap(),
+            max_position_age_seconds: u64::try_from(Duration::MAX.num_seconds()).unwrap(),
+            ..policy()
+        };
+        assert_eq!(
+            evaluate_ozon_bid_increase_after_guard(maximum, observation()),
+            Ok(OzonBidPacingAdjustment::ChangeBid {
+                from_microrubles: 7_000_000,
+                to_microrubles: 8_000_000,
+            })
+        );
+        let high_drr = OzonBidPacingObservation {
+            current_bid_microrubles: 9_000_000,
+            spend_minor: 15_001,
+            last_bid_change_at: Some(observation().observed_at - Duration::minutes(1)),
+            ..observation()
+        };
+        assert_eq!(
+            evaluate_ozon_bid_pacing(maximum, high_drr),
+            Ok(OzonBidPacingAction::Hold(OzonBidPacingHoldReason::Cooldown))
         );
     }
 }
