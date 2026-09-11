@@ -31,6 +31,9 @@ const PRODUCT_PAGE_ROWS: usize = 100;
 const MAX_CURSOR_BYTES: usize = 4_096;
 const MAX_CAMPAIGN_TITLE_BYTES: usize = 512;
 
+#[cfg(test)]
+mod stock_tests;
+
 /// One campaign-day aggregate from the verified Ozon Performance daily
 /// statistics response.
 ///
@@ -265,7 +268,7 @@ pub fn next_warehouse_stock_cursor(
 /// Ozon reports inventory by fulfillment type in the verified envelope. The
 /// daily-report storage calls this dimension `warehouse_id`; using the type as
 /// its stable value prevents a made-up warehouse split and lets report-level
-/// stock sum FBO/FBS rows correctly.
+/// stock sum FBO/FBS/rFBS rows correctly without merging their provenance.
 pub fn parse_stock_page(response: &Value) -> Result<Vec<CollectedStockFact>, OzonReportParseError> {
     let items = array_field(response, "items")?;
     if items.len() > PRODUCT_PAGE_ROWS {
@@ -574,12 +577,15 @@ fn parse_count(value: &Value) -> Result<u64, OzonReportParseError> {
 fn parse_warehouse_kind(value: &Value) -> Result<String, OzonReportParseError> {
     let value = value.as_str().ok_or(OzonReportParseError::Value)?;
     // `/v4/product/info/stocks` currently returns lowercase fulfillment types
-    // (`fbo` / `fbs`), while earlier verified fixtures used uppercase values.
+    // (`fbo` / `fbs` / `rfbs`), while earlier verified fixtures used uppercase values.
     // The API meaning is identical, so persist one canonical identifier rather
     // than treating a casing-only upstream change as a new warehouse kind.
     match value {
         "fbo" | "FBO" => Ok("FBO".to_owned()),
         "fbs" | "FBS" => Ok("FBS".to_owned()),
+        // Verified in bounded Seller API reads on 2026-09-10. rFBS is a
+        // distinct fulfillment scheme, not an alias for seller-fulfilled FBS.
+        "rfbs" | "RFBS" => Ok("RFBS".to_owned()),
         _ => Err(OzonReportParseError::Value),
     }
 }
@@ -989,16 +995,6 @@ mod tests {
         .unwrap();
         assert_eq!(fbs[0].warehouse_id, "fbs:88");
         assert_eq!(fbs[0].sellable_units, 6);
-    }
-
-    #[test]
-    fn stock_fulfillment_type_is_case_normalized() {
-        let stocks = parse_stock_page(&json!({"items": [{
-            "product_id": 123,
-            "stocks": [{"type": "fbs", "present": 7}]
-        }]}))
-        .unwrap();
-        assert_eq!(stocks[0].warehouse_id, "FBS");
     }
 
     #[test]

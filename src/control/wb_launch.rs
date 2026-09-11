@@ -25,6 +25,7 @@ use std::{
     time::Duration,
 };
 
+mod categories;
 mod journal;
 mod start;
 #[cfg(test)]
@@ -250,6 +251,7 @@ impl Operator {
 
     async fn preflight(&self, own_id: Option<u64>) -> Result<Value> {
         self.fresh_authorization()?;
+        let subject_id = self.verify_category().await?;
         let source = self
             .reader
             .promotion_campaign_details(ACCOUNT, vec![SOURCE], vec![], None)
@@ -367,6 +369,7 @@ impl Operator {
             json!({"checked_at":Utc::now(),"account_id":ACCOUNT,"campaign_name":NAME,
             "cash_balance_rubles":balance,"scope":self.manifest.scope,
             "authorized_funding_rubles":self.manifest.budget_rubles,
+            "subject_id":subject_id,
             "bids_kopecks":self.manifest.bids_kopecks,"wb_stock":totals,
             "source_policy_sha256":self.manifest.source_policy_sha256,
             "daily_cap_rubles":500,"pause_threshold_rubles":450,"target_drr_percent":15,
@@ -489,7 +492,15 @@ impl Operator {
         self.writer
             .change_bids_with_permit(id, &changes, || async {
                 self.fresh_authorization()?;
-                self.inactive(id, false).await?;
+                let current = self.inactive(id, false).await?;
+                ensure!(
+                    current.bids == before.bids,
+                    "bids changed while waiting; no write attempted"
+                );
+                ensure!(
+                    self.budget(id).await? == 0,
+                    "campaign funded while waiting; no initial bid write permitted"
+                );
                 journal.attempt("bids", &json!({"campaign_id":id,"changes":changes}))
             })
             .await

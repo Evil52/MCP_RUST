@@ -1,3 +1,4 @@
+mod operator_reads;
 mod policy;
 pub use mcp_marketplace_types::WbCredentials;
 use policy::{ApiHost, ClientPolicy, EndpointPolicy, RequestClass};
@@ -1130,30 +1131,6 @@ impl WbClient {
     ) -> Result<Value, WbError> {
         self.request(account, Method::GET, path, Some(vec![("date", date)]), None)
             .await
-    }
-
-    /// Returns account funding sources without transferring money. `balance`
-    /// is WB's type=1 mutual-settlement source, not bonuses or an external card.
-    pub async fn promotion_balance(&self, account: &str) -> Result<Value, WbError> {
-        self.request(account, Method::GET, PROMOTION_BALANCE_PATH, None, None)
-            .await
-    }
-
-    /// Returns the remaining budget for exactly one promotion campaign.
-    pub async fn promotion_campaign_budget(
-        &self,
-        account: &str,
-        advert_id: u64,
-    ) -> Result<Value, WbError> {
-        validate_positive_unique_ids(&[advert_id], 1, "advert_id", Some(MAX_WB_SIGNED_ID))?;
-        self.request(
-            account,
-            Method::GET,
-            PROMOTION_BUDGET_PATH,
-            Some(vec![("id", advert_id.to_string())]),
-            None,
-        )
-        .await
     }
 
     async fn statistics_report(

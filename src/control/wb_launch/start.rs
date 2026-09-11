@@ -21,6 +21,7 @@ impl Operator {
         let id = journal.campaign_id()?;
         journal.assert_not_attempted("start")?;
         journal.require_receipt("fund")?;
+        validate_start_status(self.inactive(id, true).await?.status)?;
         let policy: WbAutomationPolicy = read_policy_json(&self.manifest.robot_policy)?;
         ensure!(
             policy == self.target_policy(id),
@@ -93,6 +94,14 @@ impl Operator {
     }
 }
 
+fn validate_start_status(status: i32) -> Result<()> {
+    ensure!(
+        status == 11,
+        "guarded startup needs verified spend evidence: WB fullstats supports statuses 7/9/11, not a new status-4 campaign; a separately reviewed first-launch protocol is required, no write attempted"
+    );
+    Ok(())
+}
+
 fn validate_initial_observation(
     observation: &WbAutomationObservation,
     policy: &WbAutomationPolicy,
@@ -138,6 +147,14 @@ fn validate_initial_observation(
 mod tests {
     use super::*;
     use crate::control::WbAutomationSkuObservation;
+
+    #[test]
+    fn new_campaign_never_attempts_unsupported_stats_or_start() {
+        assert!(validate_start_status(11).is_ok());
+        for status in [4, 7, 9, -1] {
+            assert!(validate_start_status(status).is_err());
+        }
+    }
 
     fn fixture() -> (WbAutomationObservation, WbAutomationPolicy) {
         let (_, mut policy) = super::super::tests::fixture();
