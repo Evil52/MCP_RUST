@@ -44,7 +44,7 @@ fn postgres_unavailable(_: tokio_postgres::Error) -> OzonPlanStoreError {
     OzonPlanStoreError::Unavailable
 }
 
-fn session_unavailable(_: crate::postgres::PostgresUnavailable) -> OzonPlanStoreError {
+const fn session_unavailable(_: crate::postgres::PostgresUnavailable) -> OzonPlanStoreError {
     OzonPlanStoreError::Unavailable
 }
 
