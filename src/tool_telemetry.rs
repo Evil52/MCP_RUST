@@ -429,6 +429,7 @@ fn parse_outcome(value: &str) -> Result<ToolCallLogOutcome, ToolTelemetryError> 
 
 #[cfg(test)]
 mod tests {
+    mod contract;
     use super::*;
 
     #[tokio::test]
