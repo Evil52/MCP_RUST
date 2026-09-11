@@ -20,7 +20,7 @@
     "src/control/server/tests.rs": 3014,
     "src/control/wb/tests.rs": 1326,
     "src/http.rs": 2582,
-    "src/ozon_performance.rs": 2427,
+    "src/ozon_performance.rs": 2407,
     "src/ozon.rs": 3751,
     "src/reporting/collector_service.rs": 1083,
     "src/reporting/gmail_outbox.rs": 1286,
