@@ -189,17 +189,3 @@ async fn posting_sales_fallback_rejects_repeated_cursors_and_page_exhaustion() {
         assert_eq!(requests.try_iter().count(), count);
     }
 }
-
-pub(super) fn complete_tool_result(response: &CallToolResponse) -> &CallToolResult {
-    match response {
-        CallToolResponse::Complete(result) => result,
-        _ => panic!("expected a complete tool response"),
-    }
-}
-
-#[test]
-#[should_panic(expected = "expected a complete tool response")]
-fn complete_tool_result_rejects_non_terminal_responses() {
-    let response = rmcp::model::InputRequiredResult::from_request_state("test").into();
-    complete_tool_result(&response);
-}

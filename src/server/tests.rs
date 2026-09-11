@@ -66,26 +66,16 @@ impl Drop for PendingDispatch {
 }
 
 mod production_paths;
-use production_paths::complete_tool_result;
 
 fn assert_control_failure(response: &CallToolResponse, expected_kind: &str) {
-    let result = complete_tool_result(response);
-    assert_eq!(result.is_error, Some(true));
-    assert_eq!(
-        result
-            .structured_content
-            .as_ref()
-            .and_then(|value| value.get("error_code"))
-            .and_then(Value::as_str),
-        Some(MCP_TOOL_FAILURE)
-    );
-    assert_eq!(
-        result
-            .structured_content
-            .as_ref()
-            .and_then(|value| value.get("kind"))
-            .and_then(Value::as_str),
-        Some(expected_kind)
+    assert!(
+        matches!(response, CallToolResponse::Complete(result)
+        if result.is_error == Some(true)
+        && result.structured_content.as_ref().is_some_and(|value|
+            value.get("error_code").and_then(Value::as_str) == Some(MCP_TOOL_FAILURE)
+            && value.get("kind").and_then(Value::as_str) == Some(expected_kind)
+        )),
+        "expected complete {expected_kind} failure, received {response:?}"
     );
 }
 
@@ -1287,7 +1277,9 @@ async fn tool_call_limit_is_shared_across_clones_and_simulated_sessions() {
     release.add_permits(MAX_IN_FLIGHT_TOOL_CALLS);
     for task in active {
         let response = task.await.expect("admitted task must not panic");
-        assert_eq!(complete_tool_result(&response).is_error, Some(false));
+        assert!(
+            matches!(response, CallToolResponse::Complete(result) if result.is_error == Some(false))
+        );
     }
     assert_eq!(
         server.tool_call_slots.available_permits(),

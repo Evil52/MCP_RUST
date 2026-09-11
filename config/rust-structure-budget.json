@@ -34,7 +34,7 @@
     "src/reporting/wb_source.rs": 1064,
     "src/reporting/xlsx.rs": 1070,
     "src/server.rs": 1424,
-    "src/server/tests.rs": 11595,
+    "src/server/tests.rs": 11587,
     "src/wb.rs": 5162,
     "tests/http_router.rs": 1117,
     "tests/reporting_postgres_outbox.rs": 1384,
