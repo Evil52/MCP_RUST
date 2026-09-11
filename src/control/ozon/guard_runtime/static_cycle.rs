@@ -1,7 +1,7 @@
 use super::super::pacing::{OzonBidPacingAdjustment, evaluate_ozon_bid_increase_after_guard};
 use super::{
     OzonAdsWriteClient, OzonBidPacingObservation, OzonBidPacingPolicy, OzonBidPositionReader,
-    OzonGuardMetrics, OzonStaticCampaignGuard, OzonStaticDynamicBidControl,
+    OzonCampaignGuard, OzonGuardMetrics, OzonStaticCampaignGuard, OzonStaticDynamicBidControl,
     OzonStaticGuardFirstStep, PerformanceClient, StaticGuardState, StaticGuardWriteAuthorization,
     StoreId, campaign_product_snapshot, change_static_campaign_bid, guard_campaign_static,
     plan_static_guard_first_step, reconcile_pending_static_bid, recover_pending_static_bids,
@@ -231,22 +231,7 @@ impl StaticGuardCycle<'_> {
                 .await;
         }
 
-        if let Err(error) = guard_campaign_static(
-            state,
-            state_path,
-            reader,
-            writer,
-            store,
-            write_authorization,
-            static_guard,
-            Some(spend_minor),
-            Some(revenue_minor),
-            None,
-        )
-        .await
-        {
-            tracing::error!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"static Ozon guard item failed");
-        }
+        trace_static_guard_observation(guard, Some(spend_minor), Some(revenue_minor));
         Ok(())
     }
 
@@ -415,4 +400,18 @@ impl StaticGuardCycle<'_> {
         }
         Ok(())
     }
+}
+
+pub(super) fn trace_static_guard_observation(
+    guard: &OzonCampaignGuard,
+    spend_minor: Option<u64>,
+    revenue_minor: Option<u64>,
+) {
+    tracing::info!(
+        campaign_id = guard.campaign_id,
+        sku = guard.sku,
+        ?spend_minor,
+        ?revenue_minor,
+        "static Ozon guard observation"
+    );
 }

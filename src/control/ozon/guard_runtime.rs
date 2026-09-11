@@ -64,7 +64,7 @@ mod startup;
 mod static_cycle;
 mod static_runtime;
 use startup::{record_static_cycle_result, verify_executor_health};
-use static_cycle::guard_once_static;
+use static_cycle::{guard_once_static, trace_static_guard_observation};
 
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const GUARD_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -1705,13 +1705,7 @@ where
 {
     let guard = &static_guard.guard;
     let Some(stop_reason) = stop_reason else {
-        tracing::info!(
-            campaign_id = guard.campaign_id,
-            sku = guard.sku,
-            ?spend_minor,
-            ?revenue_minor,
-            "static Ozon guard observation"
-        );
+        trace_static_guard_observation(guard, spend_minor, revenue_minor);
         return Ok(());
     };
     if state

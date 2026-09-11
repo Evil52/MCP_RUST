@@ -1,8 +1,9 @@
-use super::{static_adapter_fixture::*, *};
+use super::{static_adapter_fixture::*, static_safety::GuardLogs, *};
 use crate::control::{
     ozon::launch_workflow::tests::adapter_fixture::{Database, TOKEN, mock_reader, mock_writer},
     plan::CONTROL_DB_TEST_LOCK,
 };
+use tracing::instrument::WithSubscriber as _;
 
 #[tokio::test]
 async fn postgres_static_bid_adapter_journals_before_one_put_and_reconciles_exact_readback() {
@@ -58,6 +59,7 @@ async fn assert_static_bid_case(database: &Database, fixture: &StaticFixture, ca
         ));
     }
     let (writer, requests) = mock_writer(responses);
+    let logs = GuardLogs::default();
     let result = change_static_campaign_bid(
         &mut state,
         &fixture.state_path,
@@ -70,6 +72,7 @@ async fn assert_static_bid_case(database: &Database, fixture: &StaticFixture, ca
         8_000_000,
         observed_at(),
     )
+    .with_subscriber(logs.subscriber())
     .await;
     assert_eq!(
         result.is_ok(),
@@ -83,6 +86,10 @@ async fn assert_static_bid_case(database: &Database, fixture: &StaticFixture, ca
         assert!(state.last_static_audit_event_id > marker);
         assert_eq!(reads.try_iter().count(), 2);
         if result.is_ok() {
+            assert!(logs.contains(&format!(
+                "write_reported_error={}",
+                case == "ambiguous_applied"
+            )));
             assert!(state.pending_bid_changes.is_empty());
             assert_eq!(state.last_bid_change_at.get(&21), Some(&observed_at()));
         } else {

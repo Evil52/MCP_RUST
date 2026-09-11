@@ -34,7 +34,7 @@ impl GuardLogs {
     }
 }
 
-fn dynamic_control_value() -> serde_json::Value {
+pub(super) fn dynamic_control_value() -> serde_json::Value {
     serde_json::json!({
         "position_store_id":"account", "position_region_name":"runtime fixture region",
         "bid_step_microrubles":1_000_000, "target_position":10,
@@ -42,7 +42,7 @@ fn dynamic_control_value() -> serde_json::Value {
     })
 }
 
-fn dynamic_control() -> OzonStaticDynamicBidControl {
+pub(super) fn dynamic_control() -> OzonStaticDynamicBidControl {
     serde_json::from_value(dynamic_control_value()).unwrap()
 }
 
@@ -153,17 +153,18 @@ async fn postgres_static_financial_stops_precede_optional_reads_and_bid_changes(
             (StopCase::Product, false),
             (StopCase::Spend, true),
             (StopCase::Drr, true),
+            (StopCase::Telemetry, true),
+            (StopCase::Product, true),
         ] {
             assert_stop_case(&database, &fixture, case, revoked).await;
         }
     }
 }
 
-async fn publish_position(database: &Database) {
-    let slot: DateTime<Utc> = "2026-09-01T11:30:00Z".parse().unwrap();
-    let measured = observed_at() - chrono::Duration::minutes(5);
+pub(super) async fn publish_position(database: &Database, region: &str, slot: DateTime<Utc>) {
+    let measured = slot + chrono::Duration::minutes(25);
     let monitor:i64=database.admin.query_one(
-        "INSERT INTO search_position.monitors(store_id,product_id,search_phrase,region_code,region_name,interval_minutes,max_position,active) VALUES('account','1001','runtime fixture query','fixture','runtime fixture region',30,100,true) RETURNING id", &[],
+        "INSERT INTO search_position.monitors(store_id,product_id,search_phrase,region_code,region_name,interval_minutes,max_position,active) VALUES('account','1001','runtime fixture query',$1,$1,30,100,true) RETURNING id", &[&region],
     ).await.unwrap().get(0);
     let run:i64=database.admin.query_one(
         "INSERT INTO search_position.collection_runs(source,scheduled_for,started_at,status,monitors_planned,queries_planned,collector_version,payload_digest) VALUES('ozon_public_search',$1,$2,'running',1,1,'runtime-adapter-test',repeat('f',64)) RETURNING id", &[&slot,&measured],
@@ -177,16 +178,30 @@ async fn postgres_static_dynamic_bid_uses_published_position_and_exact_put_readb
     let _lock = CONTROL_DB_TEST_LOCK.lock().await;
     if let Some(database) = Database::connect().await {
         let mut fixture = StaticFixture::new();
-        let dynamic = dynamic_control();
+        let mut dynamic = dynamic_control();
+        dynamic.position_region_name = fixture
+            .authorization
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let mut config: serde_json::Value =
             serde_json::from_slice(&fs::read(&fixture.config_path).unwrap()).unwrap();
         config["dynamic_bid_control"] = dynamic_control_value();
+        config["dynamic_bid_control"]["position_region_name"] =
+            dynamic.position_region_name.clone().into();
         fs::write(&fixture.config_path, serde_json::to_vec(&config).unwrap()).unwrap();
         fixture.digest = load_static_guards(&fixture.config_path, "account")
             .unwrap()
             .1;
         let mut state = fixture.initialize(&database).await;
-        publish_position(&database).await;
+        publish_position(
+            &database,
+            &dynamic.position_region_name,
+            observed_at() - chrono::Duration::minutes(30),
+        )
+        .await;
         let position_reader = OzonBidPositionReader::connect(
             &std::env::var("POSITION_REPOSITORY_TEST_READER_URL").unwrap(),
         )
