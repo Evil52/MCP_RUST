@@ -951,4 +951,6 @@ mod tests {
             Err(OzonStaticGuardStateError::UnsafeFile)
         ));
     }
+
+    mod io_tests;
 }
