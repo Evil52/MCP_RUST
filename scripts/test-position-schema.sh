@@ -810,6 +810,9 @@ fi
   DELETE FROM mcp_runtime.schema_migrations
   WHERE migration_id = '022_wb_automation_explicit_resume.sql';
 " >/dev/null
+expect_exact_validation_failure \
+  "healthcheck rejects a missing migration replaced by an unknown id" "" \
+  docker exec "$container" /usr/local/bin/position-db-healthcheck
 expect_failure_containing \
   "unknown migration rollback" \
   "database contains migrations unknown to this binary" \
@@ -827,6 +830,9 @@ fi
   DELETE FROM mcp_runtime.schema_migrations
   WHERE migration_id = '999_future.sql'
 " >/dev/null
+expect_exact_validation_failure \
+  "healthcheck rejects a missing required migration" "" \
+  docker exec "$container" /usr/local/bin/position-db-healthcheck
 docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
 original_migration_checksum="$({ "${admin_psql[@]}" --tuples-only --no-align \
   --command "SELECT sha256 FROM mcp_runtime.schema_migrations
@@ -836,6 +842,9 @@ original_migration_checksum="$({ "${admin_psql[@]}" --tuples-only --no-align \
   SET sha256 = repeat('0', 64)
   WHERE migration_id = '001_schema.sql'
 " >/dev/null
+expect_exact_validation_failure \
+  "healthcheck rejects migration checksum drift" "" \
+  docker exec "$container" /usr/local/bin/position-db-healthcheck
 expect_failure_containing \
   "migration checksum drift" \
   "migration ledger mismatch" \
@@ -845,6 +854,46 @@ expect_failure_containing \
   SET sha256 = '$original_migration_checksum'
   WHERE migration_id = '001_schema.sql'
 " >/dev/null
+"${admin_psql[@]}" --command "
+  UPDATE mcp_runtime.schema_migrations
+  SET state = 'applying', applied_at = NULL
+  WHERE migration_id = '001_schema.sql'
+" >/dev/null
+expect_exact_validation_failure \
+  "healthcheck rejects an interrupted migration" "" \
+  docker exec "$container" /usr/local/bin/position-db-healthcheck
+"${admin_psql[@]}" --command "
+  UPDATE mcp_runtime.schema_migrations
+  SET state = 'applied', applied_at = clock_timestamp()
+  WHERE migration_id = '001_schema.sql';
+  ALTER TABLE mcp_runtime.schema_migrations RENAME TO hidden_schema_migrations;
+" >/dev/null
+expect_exact_validation_failure \
+  "healthcheck rejects a missing migration ledger" "" \
+  docker exec "$container" /usr/local/bin/position-db-healthcheck
+"${admin_psql[@]}" --command '
+  ALTER TABLE mcp_runtime.hidden_schema_migrations RENAME TO schema_migrations
+' >/dev/null
+docker exec "$container" /usr/local/bin/position-db-healthcheck
+
+# A newly shipped file must affect health immediately without editing a count;
+# after it is applied, the enlarged catalog must be healthy again. This fixture
+# changes only this disposable schema-test container.
+docker exec --user root "$container" sh -c \
+  "printf 'SELECT 1;\\n' > /opt/mcp-ozon/migrations/998_readiness_catalog_probe.sql"
+expect_exact_validation_failure \
+  "healthcheck detects a newly packaged unapplied migration" "" \
+  docker exec "$container" /usr/local/bin/position-db-healthcheck
+docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
+docker exec "$container" /usr/local/bin/position-db-healthcheck
+"${admin_psql[@]}" --command "
+  DELETE FROM mcp_runtime.schema_migrations
+  WHERE migration_id = '998_readiness_catalog_probe.sql'
+" >/dev/null
+docker exec --user root "$container" \
+  rm /opt/mcp-ozon/migrations/998_readiness_catalog_probe.sql
+docker exec "$container" /usr/local/bin/position-db-healthcheck
+
 assert_control_schema_contract \
   "fresh database" \
   "${admin_psql[@]}"

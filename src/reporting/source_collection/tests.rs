@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, str::FromStr};
 use tokio_postgres::{Client, Config, NoTls};
 
+mod sales_publication;
+
 static DATABASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]

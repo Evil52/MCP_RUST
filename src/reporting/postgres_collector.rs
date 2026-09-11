@@ -3,6 +3,7 @@
     reason = "PostgreSQL transactions borrow the supervised session guard until commit"
 )]
 
+mod sales_validation;
 mod source_jobs;
 pub use source_jobs::SourceJobClaim;
 
@@ -186,18 +187,12 @@ impl CollectedSnapshot {
         collector_version: String,
         facts: CollectedFacts,
     ) -> Result<Self, PostgresCollectorError> {
-        let row_count =
-            u32::try_from(facts.len()).map_err(|_| PostgresCollectorError::InvalidInput)?;
-        if facts.len() > MAX_FACT_ROWS
-            || collector_version.is_empty()
-            || collector_version.len() > MAX_COLLECTOR_VERSION_BYTES
-            || !collector_version
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-            || (status == SnapshotStatus::Succeeded && !pagination_complete)
-        {
-            return Err(PostgresCollectorError::InvalidInput);
-        }
+        let row_count = sales_validation::validate_metadata(
+            &facts,
+            &collector_version,
+            status,
+            pagination_complete,
+        )?;
         SnapshotDescriptor::new(
             1,
             account_id.clone(),
@@ -211,7 +206,7 @@ impl CollectedSnapshot {
             pagination_complete,
             status,
         )
-        .map_err(|_| PostgresCollectorError::InvalidInput)?;
+        .map_err(|error| sales_validation::reject_descriptor(facts.source(), error))?;
         validate_facts(&facts)?;
         Ok(Self {
             account_id,
@@ -1428,17 +1423,7 @@ fn collect_optional_i64(
 
 fn validate_facts(facts: &CollectedFacts) -> Result<(), PostgresCollectorError> {
     match facts {
-        CollectedFacts::Sales(facts) => ensure_unique(
-            facts,
-            |fact| (fact.business_date, fact.sku),
-            |fact| {
-                fact.sku > 0
-                    && fits_i32(fact.ordered_units)
-                    && fits_i64(fact.operational_gmv_minor)
-                    && fact.cancelled_units.is_none_or(fits_i32)
-                    && fact.returned_units.is_none_or(fits_i32)
-            },
-        ),
+        CollectedFacts::Sales(facts) => sales_validation::validate(facts),
         CollectedFacts::Advertising(facts) => ensure_unique(
             facts,
             |fact| (fact.business_date, fact.campaign_id, fact.sku),

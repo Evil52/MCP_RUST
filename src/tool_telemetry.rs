@@ -127,13 +127,10 @@ impl ToolTelemetryService {
     }
 
     pub async fn probe(&self) -> Result<(), ToolTelemetryError> {
-        let Some(client) = &self.client else {
+        if self.client.is_none() {
             return Ok(());
-        };
-        client
-            .probe()
-            .await
-            .map_err(|_| ToolTelemetryError::Unavailable)
+        }
+        self.verify_runtime_contract().await
     }
 
     pub async fn begin(
