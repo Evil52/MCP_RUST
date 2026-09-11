@@ -413,7 +413,6 @@ fn test_performance_client(
     );
     (client, requests)
 }
-
 #[tokio::test]
 async fn ozon_read_helpers_reject_ambiguous_campaign_and_product_shapes() {
     let store = StoreId::from("store_one");
@@ -1152,7 +1151,6 @@ async fn initialize(router: &Router) -> String {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     session_id
 }
-
 #[tokio::test]
 async fn disabled_status_and_explicit_scope_are_truthful() {
     let fixtures = Fixtures::new(true);
@@ -1184,7 +1182,6 @@ async fn disabled_status_and_explicit_scope_are_truthful() {
     assert_eq!(scope.targets[0].campaign_id, 42);
     assert_eq!(scope.targets[0].skus, [1001]);
 }
-
 #[tokio::test]
 async fn admin_has_no_implicit_control_scope() {
     let fixtures = Fixtures::new(false);
@@ -3012,3 +3009,6 @@ async fn control_http_wire_lists_exact_inventory_and_propagates_request_identity
     assert_eq!(result["write_executor_configured"], false);
     assert_eq!(result["runtime_gates_required"], true);
 }
+
+#[path = "ozon_lifecycle_tests.rs"]
+mod ozon_lifecycle;
