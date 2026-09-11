@@ -225,3 +225,6 @@ mod regression_mutations;
 mod static_adapter_fixture;
 mod static_authorization;
 mod static_writes;
+
+mod bootstrap;
+mod durable_adapter;

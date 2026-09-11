@@ -201,10 +201,10 @@ impl Database {
         })
     }
 
-    pub(in crate::control::ozon) async fn prepare(
+    pub(in crate::control::ozon) async fn prepare_plan(
         &self,
         authorization: &AuthorizationFixture,
-    ) -> OzonLaunchLease {
+    ) -> OzonCampaignPlan {
         self.admin.batch_execute("TRUNCATE control.ozon_static_guard_audit_events, control.ozon_campaign_audit_events, control.ozon_campaign_guards, control.ozon_campaign_action_reservations, control.ozon_campaign_plan_approvals, control.ozon_campaign_launch_workflows, control.ozon_campaign_plans, control.ozon_runtime_gates, control.ozon_policy_revisions RESTART IDENTITY CASCADE").await.unwrap();
         self.planner
             .register_policy(1, 7, authorization.policy.digest())
@@ -217,11 +217,17 @@ impl Database {
         ] {
             self.admin.execute("INSERT INTO control.ozon_runtime_gates(gate_key,scope_kind,account_id,sku,enabled,lease_expires_at,revision,reason,updated_by,updated_at) VALUES($1,$2,$3,$4,true,clock_timestamp()+interval '10 minutes',1,'test','test',clock_timestamp())", &[&key, &scope, &account, &sku]).await.unwrap();
         }
-        let plan = self
-            .planner
+        self.planner
             .create(&authorization.manifest())
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    pub(in crate::control::ozon) async fn prepare(
+        &self,
+        authorization: &AuthorizationFixture,
+    ) -> OzonLaunchLease {
+        let plan = self.prepare_plan(authorization).await;
         self.planner
             .approve(&plan.plan_id, "approver", &plan.plan_digest, "adapter/test")
             .await
@@ -234,6 +240,66 @@ impl Database {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    pub(in crate::control::ozon) async fn applied_guard(
+        &self,
+        authorization: &AuthorizationFixture,
+    ) -> crate::control::ozon::model::OzonCampaignGuard {
+        let mut lease = self.prepare(authorization).await;
+        for (action, state, status) in [
+            (
+                OzonLaunchAction::CreateCampaign,
+                "CAMPAIGN_STATE_INACTIVE",
+                OzonLaunchStatus::Created,
+            ),
+            (
+                OzonLaunchAction::AddProducts,
+                "CAMPAIGN_STATE_STOPPED",
+                OzonLaunchStatus::ProductsAdded,
+            ),
+            (
+                OzonLaunchAction::ActivateCampaign,
+                "CAMPAIGN_STATE_RUNNING",
+                OzonLaunchStatus::Applied,
+            ),
+        ] {
+            assert_eq!(lease.action, action);
+            let identity = (action == OzonLaunchAction::CreateCampaign)
+                .then(|| create_identity_preflight_digest_for(&lease.plan));
+            self.executor
+                .start_launch_write(&lease, identity.as_deref(), || {})
+                .await
+                .unwrap();
+            let readback = serde_json::json!({
+                "campaign_id":42,"title":lease.plan.manifest.create_request.title,
+                "state":state,"sku":1001,"bid_microrubles":7_000_000,
+                "action":action.as_db(),"verified":true
+            });
+            let completed = self
+                .executor
+                .complete_launch_action(&lease, Some(42), Some(&readback))
+                .await
+                .unwrap();
+            assert_eq!(completed.status, status);
+            if status != OzonLaunchStatus::Applied {
+                lease = self
+                    .executor
+                    .claim_next_launch_action("account", "worker")
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+        let mut guards =
+            crate::control::ozon::guard_workflow::OzonGuardRepositoryPort::active_guards(
+                self.executor.as_ref(),
+                "account",
+            )
+            .await
+            .unwrap();
+        assert_eq!(guards.len(), 1);
+        guards.pop().unwrap()
     }
 
     pub(in crate::control::ozon) fn io(

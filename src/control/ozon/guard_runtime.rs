@@ -60,7 +60,9 @@ use super::{
     model::{OzonGuardStopLease, OzonGuardStopReadback, OzonPlanStoreError},
 };
 
+mod startup;
 mod static_cycle;
+use startup::{record_static_cycle_result, verify_executor_health};
 use static_cycle::guard_once_static;
 
 const LAUNCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -270,6 +272,14 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
 /// Runs the Ozon campaign guard process after the binary has handled its
 /// side-effect-free release identity probe.
 pub async fn run_ozon_campaign_guard(arguments: &[String]) -> Result<()> {
+    run_ozon_campaign_guard_with_shutdown(arguments, shutdown_signal()).await
+}
+
+async fn run_ozon_campaign_guard_with_shutdown<S>(arguments: &[String], shutdown: S) -> Result<()>
+where
+    S: Future<Output = ()>,
+{
+    tokio::pin!(shutdown);
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -486,34 +496,18 @@ pub async fn run_ozon_campaign_guard(arguments: &[String]) -> Result<()> {
                 Utc::now(),
             );
             tokio::select! {
-                result = cycle => {
-                    match result {
-                        Ok(()) => consecutive_cycle_failures = 0,
-                        Err(error) => {
-                            let failure_limit_reached = record_cycle_outcome(
-                                &mut consecutive_cycle_failures,
-                                false,
-                            );
-                            tracing::error!(
-                                %error,
-                                consecutive_cycle_failures,
-                                failure_limit = MAX_CONSECUTIVE_WORKFLOW_FAILURES,
-                                "static Ozon guard cycle failed"
-                            );
-                            if failure_limit_reached {
-                                bail!("static Ozon guard exceeded its consecutive cycle failure limit");
-                            }
-                        }
-                    }
-                }
-                () = shutdown_signal() => break,
+                result = cycle => record_static_cycle_result(
+                    result,
+                    &mut consecutive_cycle_failures,
+                )?,
+                () = &mut shutdown => break,
                 () = executor_lease.lost() => {
                     bail!("Ozon executor lease connection was lost");
                 }
             }
             tokio::select! {
                 () = tokio::time::sleep(GUARD_POLL_INTERVAL) => {}
-                () = shutdown_signal() => break,
+                () = &mut shutdown => break,
                 () = executor_lease.lost() => {
                     bail!("Ozon executor lease connection was lost");
                 }
@@ -569,52 +563,13 @@ pub async fn run_ozon_campaign_guard(arguments: &[String]) -> Result<()> {
             &tasks,
             LAUNCH_POLL_INTERVAL,
             GUARD_POLL_INTERVAL,
-            shutdown_signal(),
+            &mut shutdown,
         ) => {
             if let Err(failure) = result {
                 bail!("durable Ozon {failure:?} workflow exceeded its consecutive failure limit");
             }
         }
         () = executor_lease.lost() => bail!("Ozon executor lease connection was lost"),
-    }
-    Ok(())
-}
-
-async fn verify_executor_health(
-    database: &tokio_postgres::Config,
-    account_id: &str,
-    policy: &ControlPolicy,
-    executor_fingerprint: &str,
-) -> Result<()> {
-    OzonExecutorLease::verify_held(database, executor_fingerprint)
-        .await
-        .context("Ozon executor identity lease is not held")?;
-    let plans = OzonPlanRepository::connect(database).await?;
-    plans.verify_runtime_contract().await?;
-    if let Some(static_guards_path) = env::var_os(STATIC_GUARDS_FILE_ENV) {
-        let state_path = env::var_os(STATIC_STATE_FILE_ENV)
-            .map(PathBuf::from)
-            .context("static Ozon guard healthcheck requires state file")?;
-        let (static_guard_config, static_guard_config_digest) =
-            load_static_guards(Path::new(&static_guards_path), account_id)?;
-        validate_ozon_static_guard_policy(&static_guard_config, policy)?;
-        let state = load_static_state(&state_path)?;
-        let allowed_campaign_ids = static_guard_config
-            .guards
-            .iter()
-            .map(|guard| guard.guard.campaign_id)
-            .collect::<BTreeSet<_>>();
-        validate_ozon_static_guard_state_scope(&state, &allowed_campaign_ids)?;
-        let latest_static_audit_event_id =
-            plans.latest_static_guard_audit_event_id(account_id).await?;
-        validate_static_audit_continuity(&state, latest_static_audit_event_id).with_context(
-            || {
-                format!(
-                    "static state audit continuity failed for config {static_guard_config_digest}"
-                )
-            },
-        )?;
-        validate_static_state_health(&state, Utc::now())?;
     }
     Ok(())
 }
