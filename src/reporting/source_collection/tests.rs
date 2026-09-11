@@ -305,6 +305,27 @@ async fn scheduler_replays_all_sources_and_isolates_corrupt_pages_and_credential
     let _database = DATABASE.lock().await;
     let fixture = Fixture::new(&admin_url, &collector_url).await;
     let disabled = Fixture::config(&fixture.root, &collector_url, "disabled");
+    let wb = fixture
+        .config
+        .collection_plan()
+        .iter()
+        .find(|target| target.marketplace == Marketplace::Wildberries)
+        .unwrap();
+    let unsupported = SourceJobClaim::for_test(
+        crate::reporting::postgres_collector::CollectionClaim::for_test(
+            &wb.account_id,
+            Marketplace::Wildberries,
+            Utc::now() + Duration::minutes(1),
+        ),
+        SnapshotSource::Finance,
+    );
+    let failure = collect(&disabled, &fixture.writer, &unsupported)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure.code, "source_invalid",
+        "unsupported sources must be rejected before credential lookup"
+    );
     assert!(require_enabled(&disabled, &fixture.writer).await.is_err());
     require_enabled(&fixture.config, &fixture.writer)
         .await
