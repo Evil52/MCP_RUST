@@ -1044,6 +1044,8 @@ migration_admin_psql=(
   --file /opt/mcp-ozon/migrations/028_reporting_outbox_candidates.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /opt/mcp-ozon/migrations/029_independent_source_collection.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/030_ozon_reconciled_launch_completion.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \

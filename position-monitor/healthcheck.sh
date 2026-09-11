@@ -1768,7 +1768,7 @@ SELECT
         OR (
             to_regclass('mcp_runtime.schema_migrations') IS NOT NULL
             AND (
-                SELECT count(*) = 29
+                SELECT count(*) = 30
                     AND bool_and(state = 'applied')
                     AND bool_and(applied_at IS NOT NULL)
                 FROM mcp_runtime.schema_migrations
