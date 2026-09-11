@@ -166,6 +166,7 @@ jobs:
           --show-missing-lines
           --fail-under-functions 95.5
           --fail-under-lines 95.8
+          -- --test-threads=1
 
   dependency-security:
     name: Dependency security

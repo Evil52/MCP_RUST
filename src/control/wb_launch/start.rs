@@ -12,10 +12,6 @@ use serde_json::{Value, json};
 use std::str::FromStr;
 
 impl Operator {
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "campaign lease intentionally spans WB write and independent readback"
-    )]
     pub(super) async fn start(&self, journal: &Journal) -> Result<Value> {
         self.manifest.authorize_stage("start")?;
         let id = journal.campaign_id()?;
@@ -41,6 +37,31 @@ impl Operator {
             .map_err(|_| anyhow::anyhow!("invalid automation database configuration"))?;
         let store = WbAutomationPostgresStore::connect(&config).await?;
         store.verify_runtime_contract().await?;
+        self.execute_start(journal, id, &policy, &observer, &store)
+            .await
+    }
+
+    /// Dependencies are explicit so the entire guarded write/readback can be
+    /// exercised against an isolated test database and mock WB transport.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "campaign lease intentionally spans WB write and independent readback"
+    )]
+    pub(super) async fn execute_start(
+        &self,
+        journal: &Journal,
+        id: u64,
+        policy: &WbAutomationPolicy,
+        observer: &WbAutomationObserver,
+        store: &WbAutomationPostgresStore,
+    ) -> Result<Value> {
+        self.manifest.authorize_stage("start")?;
+        journal.assert_not_attempted("start")?;
+        journal.require_receipt("fund")?;
+        ensure!(
+            journal.campaign_id()? == id && *policy == self.target_policy(id),
+            "startup scope drifted"
+        );
         let lease = store
             .try_acquire_campaign(ACCOUNT, id)
             .await?
@@ -49,7 +70,7 @@ impl Operator {
             .start_campaign_with_permit(id, || async {
                 self.fresh_authorization()?;
                 ensure!(
-                    read_policy_json::<WbAutomationPolicy>(&self.manifest.robot_policy)? == policy,
+                    read_policy_json::<WbAutomationPolicy>(&self.manifest.robot_policy)? == *policy,
                     "robot policy changed while waiting for write slot"
                 );
                 ensure!(
@@ -74,10 +95,10 @@ impl Operator {
                 let snapshot = observer
                     .observe(Utc::now(), WbAutomationStateView::default())
                     .await?;
-                validate_initial_observation(&snapshot.observation, &policy)?;
+                validate_initial_observation(&snapshot.observation, policy)?;
                 self.inactive(id, true).await?;
                 self.fresh_authorization()?;
-                validate_initial_observation(&snapshot.observation, &policy)?;
+                validate_initial_observation(&snapshot.observation, policy)?;
                 journal.attempt("start", &json!({"campaign_id":id,"snapshot":snapshot}))
             })
             .await

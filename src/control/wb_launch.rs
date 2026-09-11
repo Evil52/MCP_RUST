@@ -30,6 +30,8 @@ mod journal;
 mod start;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod workflow_tests;
 use journal::{Journal, read_policy_json, read_private_json};
 
 const ACCOUNT: &str = "ofk_region_wb";
@@ -672,6 +674,19 @@ async fn reconcile_read_only(manifest_path: &Path) -> Result<Value> {
         BTreeMap::from([(ACCOUNT.to_owned(), WbCredentials { token })]),
         &manifest.reader_proxy,
     )?;
+    reconcile_campaign(&manifest, &reader, &journal, id).await
+}
+
+async fn reconcile_campaign(
+    manifest: &Manifest,
+    reader: &WbClient,
+    journal: &Journal,
+    id: u64,
+) -> Result<Value> {
+    ensure!(
+        manifest.account_id == ACCOUNT && manifest.campaign_name == NAME,
+        "readback scope mismatch"
+    );
     let response = reader
         .promotion_campaign_details(ACCOUNT, vec![id], vec![], None)
         .await?;

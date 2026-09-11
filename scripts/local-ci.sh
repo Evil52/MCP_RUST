@@ -60,6 +60,8 @@ fi
 # Configured baseline after the large inline server test module moved out of
 # src/server.rs. Other inline test modules still contribute to this figure;
 # it is not production-only coverage. Runtime entrypoints use separate probes.
+# Match the ordinary test run: fixtures share connection-limited DB roles.
+# Individual concurrency tests still exercise their own parallel tasks.
 ./scripts/with-position-test-db.sh cargo llvm-cov \
   --locked --workspace \
     --all-targets \
@@ -67,6 +69,7 @@ fi
     --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|ozon-campaign-guard|position-collector|report-collector|report-worker|wb-automation))\.rs$' \
     --show-missing-lines \
     --fail-under-functions 95.5 \
-    --fail-under-lines 95.8
+    --fail-under-lines 95.8 \
+    -- --test-threads=1
 
 echo "Local CI passed."
