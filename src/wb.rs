@@ -1,3 +1,4 @@
+mod operator_reads;
 mod policy;
 pub use mcp_marketplace_types::WbCredentials;
 use policy::{ApiHost, ClientPolicy, EndpointPolicy, RequestClass};
@@ -66,6 +67,7 @@ const ACCEPTANCE_COEFFICIENTS_PATH: &str = "/api/tariffs/v1/acceptance/coefficie
 pub(crate) const PROMOTION_CAMPAIGNS_PATH: &str = "/adv/v1/promotion/count";
 pub(crate) const PROMOTION_DETAILS_PATH: &str = "/api/advert/v2/adverts";
 pub(crate) const PROMOTION_BUDGET_PATH: &str = "/adv/v1/budget";
+pub(crate) const PROMOTION_BALANCE_PATH: &str = "/adv/v1/balance";
 pub(crate) const PROMOTION_STATS_PATH: &str = "/adv/v3/fullstats";
 pub(crate) const SEARCH_PRODUCT_QUERIES_PATH: &str = "/api/v2/search-report/product/search-texts";
 pub(crate) const SEARCH_ORDERS_POSITIONS_PATH: &str = "/api/v2/search-report/product/orders";
@@ -352,6 +354,7 @@ struct TokenLimiter {
     logistics_tariffs: PacingGate,
     acceptance_tariffs: PacingGate,
     promotion_campaigns: PacingGate,
+    promotion_balance: PacingGate,
     promotion_stats: PacingGate,
     search_reports: PacingGate,
     promotion_minimum_bids: PacingGate,
@@ -373,6 +376,7 @@ impl TokenLimiter {
             logistics_tariffs: PacingGate::new(),
             acceptance_tariffs: PacingGate::new(),
             promotion_campaigns: PacingGate::new(),
+            promotion_balance: PacingGate::new(),
             promotion_stats: PacingGate::new(),
             search_reports: PacingGate::new(),
             promotion_minimum_bids: PacingGate::new(),
@@ -393,6 +397,7 @@ impl TokenLimiter {
             RequestClass::LogisticsTariff => &self.logistics_tariffs,
             RequestClass::AcceptanceTariff => &self.acceptance_tariffs,
             RequestClass::PromotionCampaign => &self.promotion_campaigns,
+            RequestClass::PromotionBalance => &self.promotion_balance,
             RequestClass::PromotionStats => &self.promotion_stats,
             RequestClass::SearchReport => &self.search_reports,
             RequestClass::PromotionMinimumBids => &self.promotion_minimum_bids,
@@ -1126,23 +1131,6 @@ impl WbClient {
     ) -> Result<Value, WbError> {
         self.request(account, Method::GET, path, Some(vec![("date", date)]), None)
             .await
-    }
-
-    /// Returns the remaining budget for exactly one promotion campaign.
-    pub async fn promotion_campaign_budget(
-        &self,
-        account: &str,
-        advert_id: u64,
-    ) -> Result<Value, WbError> {
-        validate_positive_unique_ids(&[advert_id], 1, "advert_id", Some(MAX_WB_SIGNED_ID))?;
-        self.request(
-            account,
-            Method::GET,
-            PROMOTION_BUDGET_PATH,
-            Some(vec![("id", advert_id.to_string())]),
-            None,
-        )
-        .await
     }
 
     async fn statistics_report(
@@ -1942,6 +1930,13 @@ mod tests {
                 "promotion:/adv/v1/budget",
                 ApiHost::Promotion,
                 RequestClass::PromotionCampaign,
+            ),
+            (
+                Method::GET,
+                PROMOTION_BALANCE_PATH,
+                "promotion:/adv/v1/balance",
+                ApiHost::Promotion,
+                RequestClass::PromotionBalance,
             ),
             (
                 Method::GET,

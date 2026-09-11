@@ -19,13 +19,10 @@ use super::{
 
 const WB_PROMOTION_BASE_URL: &str = "https://advert-api.wildberries.ru";
 const CHANGE_BIDS_PATH: &str = "/api/advert/v1/bids";
-#[allow(
-    dead_code,
-    reason = "wired only after the durable campaign-create plan repository lands"
-)]
 const CREATE_CAMPAIGN_PATH: &str = "/adv/v2/seacat/save-ad";
 const PAUSE_CAMPAIGN_PATH: &str = "/adv/v0/pause";
 const START_CAMPAIGN_PATH: &str = "/adv/v0/start";
+const DEPOSIT_BUDGET_PATH: &str = "/adv/v1/budget/deposit";
 const MAX_WRITE_RESPONSE_BYTES: usize = 1_048_576;
 pub(super) const MAX_ERROR_RESPONSE_BYTES: usize = 4_096;
 pub(super) const MAX_REQUEST_ID_BYTES: usize = 128;
@@ -108,6 +105,7 @@ pub struct WbBidWriteClient {
     timeout: Duration,
     pacer: Arc<WritePacer>,
     create_pacer: Arc<WritePacer>,
+    deposit_pacer: Arc<WritePacer>,
 }
 
 impl fmt::Debug for WbBidWriteClient {
@@ -192,6 +190,11 @@ impl WbBidWriteClient {
             } else {
                 MIN_CREATE_INTERVAL
             })),
+            deposit_pacer: Arc::new(WritePacer::new(if minimum_write_interval.is_zero() {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(1)
+            })),
         })
     }
 
@@ -262,12 +265,71 @@ impl WbBidWriteClient {
             .await
     }
 
+    /// A single, exact 1,000 RUB type=1 transfer. No configurable source,
+    /// cashback, auto-top-up or retry. The operator must durably claim the
+    /// attempt inside the permit before any request bytes can be sent.
+    pub(in crate::control) async fn deposit_once_with_permit<E, F, Fut>(
+        &self,
+        advert_id: u64,
+        permit: F,
+    ) -> Result<u64, WbGuardedWriteError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        validate_advert_id(advert_id).map_err(WbGuardedWriteError::Write)?;
+        self.deposit_pacer
+            .run_guarded(
+                || async { permit().await.map_err(WbGuardedWriteError::Permit) },
+                || async {
+                    self.deposit_once(advert_id)
+                        .await
+                        .map_err(WbGuardedWriteError::Write)
+                },
+            )
+            .await
+    }
+
+    async fn deposit_once(&self, advert_id: u64) -> Result<u64, WbWriteError> {
+        let send = self
+            .http
+            .post(format!("{}{}", self.base_url, DEPOSIT_BUDGET_PATH))
+            .header(AUTHORIZATION, self.authorization.clone())
+            .query(&[("id", advert_id)])
+            .json(&serde_json::json!({"sum": 1000, "type": 1, "return": true}))
+            .send();
+        let response = timeout(self.timeout, send)
+            .await
+            .map_err(|_| WbWriteError::Ambiguous {
+                reason: "timeout",
+                request_id: None,
+            })?
+            .map_err(|_| WbWriteError::Ambiguous {
+                reason: "network_error",
+                request_id: None,
+            })?;
+        let status = response.status();
+        let request_id = response_request_id(&response);
+        let bytes = read_bounded(response, MAX_ERROR_RESPONSE_BYTES)
+            .await
+            .map_err(|reason| WbWriteError::Ambiguous {
+                reason,
+                request_id: request_id.clone(),
+            })?;
+        if status != StatusCode::OK {
+            return Err(WbWriteError::HttpStatus { status, request_id });
+        }
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| value.get("total").and_then(Value::as_u64))
+            .ok_or(WbWriteError::Ambiguous {
+                reason: "invalid_deposit_total",
+                request_id,
+            })
+    }
+
     /// Creates one ready-to-start campaign with exactly one HTTP attempt.
     /// The caller must persist an execute-once claim before granting `permit`.
-    #[allow(
-        dead_code,
-        reason = "writer primitive remains unreachable until durable prepare/approve/apply wiring"
-    )]
     pub(in crate::control) async fn create_campaign_with_permit<E, F, Fut>(
         &self,
         request: &WbCreateCampaignRequest,
@@ -371,10 +433,6 @@ impl WbBidWriteClient {
         Err(WbWriteError::HttpStatus { status, request_id })
     }
 
-    #[allow(
-        dead_code,
-        reason = "called only by the guarded campaign-create primitive"
-    )]
     async fn create_campaign_once(
         &self,
         request: &WbCreateCampaignRequest,
@@ -520,10 +578,6 @@ pub(super) fn validate_write_request(
     Ok(())
 }
 
-#[allow(
-    dead_code,
-    reason = "called only by the guarded campaign-create primitive"
-)]
 pub(super) fn validate_create_campaign_request(
     request: &WbCreateCampaignRequest,
 ) -> Result<(), WbWriteError> {

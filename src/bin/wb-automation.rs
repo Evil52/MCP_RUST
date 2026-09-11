@@ -16,7 +16,6 @@ use mcp_ozon::control::{
     WbAutomationPostgresStore, WbAutomationStateView, persist_wb_automation_snapshot,
     wb_automation_business_date,
 };
-use mcp_ozon::runtime::print_runtime_version_if_requested;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio_postgres::Config;
@@ -25,50 +24,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_LEGACY_STATE_BYTES: u64 = 256 * 1024;
 const DATABASE_URL_ENV: &str = "WB_AUTOMATION_DATABASE_URL";
 
+#[path = "wb_automation/entry.rs"]
+mod entry;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
-    if print_runtime_version_if_requested("wb-automation", &arguments)? {
-        return Ok(());
-    }
-    match parse_command(&arguments)? {
-        Command::Observe(options) => observe_once(options).await,
-        Command::ShadowPostgres(options) => shadow_postgres_once(options).await,
-        Command::ActivateProtectiveLivePostgres(options) => {
-            activate_protective_live_postgres(options).await
-        }
-        Command::ActivateBidWritesPostgres(options) => activate_bid_writes_postgres(options).await,
-        Command::ActivateBoundedPacingPostgres(options) => {
-            activate_bounded_pacing_postgres(options).await
-        }
-        Command::ActivateTrafficFrontierV2Postgres(options) => {
-            activate_traffic_frontier_v2_postgres(options).await
-        }
-        Command::ActivateTrafficFrontierV3Postgres(options) => {
-            activate_traffic_frontier_v3_postgres(options).await
-        }
-        Command::ActivateTrafficFrontierV4Postgres(options) => {
-            activate_traffic_frontier_v4_postgres(options).await
-        }
-        Command::RaiseTrafficFrontierLimitsPostgres(options) => {
-            raise_traffic_frontier_limits_postgres(options).await
-        }
-        Command::TightenTrafficFrontierCorridorPostgres(options) => {
-            tighten_traffic_frontier_corridor_postgres(options).await
-        }
-        Command::ExecutePostgres(options) => execute_postgres_once(options).await,
-        Command::ExplicitExposureIncreasePostgres(options) => {
-            explicit_exposure_increase_postgres_once(options).await
-        }
-        Command::ExplicitQuotaOverridePostgres(options) => {
-            explicit_quota_override_postgres_once(options).await
-        }
-        Command::ExplicitResumeAfterDailyCapPostgres(options) => {
-            explicit_resume_after_daily_cap_postgres_once(options).await
-        }
-        Command::Execute(options) => execute_once(options).await,
-        Command::Auto(options) => auto_once(options).await,
-    }
+    entry::run().await
 }
 
 async fn activate_protective_live_postgres(options: ActivatePolicyOptions) -> Result<()> {

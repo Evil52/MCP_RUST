@@ -116,14 +116,14 @@ pub(super) enum WbGuardedWriteError<E> {
 
 #[derive(Error, Debug)]
 pub(super) enum WbWriteError {
-    #[error("некорректный WB bid write request: {0}")]
+    #[error("некорректный WB write request: {0}")]
     InvalidRequest(&'static str),
-    #[error("WB вернул HTTP {status} после отправки bid write (request-id: {request_id:?})")]
+    #[error("WB вернул HTTP {status} после отправки write (request-id: {request_id:?})")]
     HttpStatus {
         status: StatusCode,
         request_id: Option<String>,
     },
-    #[error("результат WB bid write неоднозначен ({reason}, request-id: {request_id:?})")]
+    #[error("результат WB write неоднозначен ({reason}, request-id: {request_id:?})")]
     Ambiguous {
         reason: &'static str,
         request_id: Option<String>,

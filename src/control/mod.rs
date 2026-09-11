@@ -8,6 +8,9 @@ mod plan;
 mod policy;
 mod server;
 mod wb;
+mod wb_launch;
+
+pub use wb_launch::run_wb_campaign_launch;
 
 pub use automation::{
     WbAutomationAction, WbAutomationBidChange, WbAutomationBidReason, WbAutomationCampaignMetrics,

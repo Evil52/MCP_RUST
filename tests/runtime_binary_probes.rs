@@ -78,6 +78,25 @@ runtime_probe!(
 );
 
 #[test]
+fn campaign_launch_cli_rejects_incomplete_and_unknown_commands_without_credentials() {
+    for args in [
+        vec!["campaign-launch"],
+        vec!["campaign-launch", "unknown", "/nonexistent/nexus.json"],
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_wb-automation"));
+        command.args(args).env_clear();
+        if let Some(profile_file) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile_file);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("usage:") || error.contains("unknown launch stage"));
+    }
+}
+
+#[test]
 fn every_manifest_binary_has_an_explicit_probe() {
     assert!(
         include_str!("../Cargo.toml")
