@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Write},
+    io::Write,
     net::TcpListener,
     sync::{
         Arc, Mutex,
@@ -2392,35 +2392,8 @@ fn mock_http(responses: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<Stri
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            loop {
-                let read = stream.read(&mut buffer).unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-                let Some(headers_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
-                else {
-                    continue;
-                };
-                let header_text = String::from_utf8_lossy(&request[..headers_end + 4]);
-                let content_length = header_text
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length: ")
-                            .and_then(|value| value.parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                if request.len() >= headers_end + 4 + content_length {
-                    break;
-                }
-            }
-            captured_clone
-                .lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(&request).to_string());
+            let request = crate::test_support::read_request(&stream);
+            captured_clone.lock().unwrap().push(request);
             let reason = if status == 200 { "OK" } else { "ERROR" };
             write!(
                 stream,

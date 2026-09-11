@@ -1,4 +1,4 @@
-pub(crate) mod http2;
+pub mod http2;
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -48,7 +48,7 @@ pub(crate) fn mock_http_with_hook(
     (format!("http://{address}"), receiver)
 }
 
-fn read_request(stream: &TcpStream) -> String {
+pub fn read_request(stream: &TcpStream) -> String {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request = Vec::new();
     let mut content_length = 0;

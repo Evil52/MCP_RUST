@@ -1,10 +1,8 @@
 //! Minimal loopback HTTP/2 peer for guarded-write retry regression tests.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use tokio::{
@@ -15,7 +13,7 @@ use tokio::{
 };
 
 #[derive(Clone, Copy)]
-pub(crate) enum ProtocolNack {
+pub enum ProtocolNack {
     RefusedStream,
     GoAway,
 }
@@ -64,30 +62,8 @@ async fn serve_nacks(mut socket: TcpStream, nack: ProtocolNack, attempts: Arc<At
                 assert_ne!(stream, 0);
                 assert_eq!(header[4] & 4, 4, "request headers fit one frame");
                 attempts.fetch_add(1, Ordering::SeqCst);
-                match nack {
-                    ProtocolNack::RefusedStream => {
-                        // RST_STREAM with REFUSED_STREAM (0x7).
-                        write_frame(&mut socket, 3, 0, stream, &7_u32.to_be_bytes()).await;
-                    }
-                    ProtocolNack::GoAway => {
-                        // NO_ERROR with last processed stream 0 explicitly
-                        // excludes this request, allowing a default retry.
-                        write_frame(&mut socket, 7, 0, 0, &[0; 8]).await;
-                        socket
-                            .shutdown()
-                            .await
-                            .expect("flush GOAWAY before closing");
-                        // Drain in-flight DATA so an unread request body
-                        // cannot turn the close into a TCP reset that masks
-                        // the GOAWAY error we intend to exercise.
-                        let mut buffer = [0_u8; 1024];
-                        while let Ok(read) = socket.read(&mut buffer).await {
-                            if read == 0 {
-                                break;
-                            }
-                        }
-                        return;
-                    }
+                if reject_request(&mut socket, nack, stream).await {
+                    return;
                 }
             }
             4 if header[4] & 1 == 0 => write_frame(&mut socket, 4, 1, 0, &[]).await,
@@ -98,15 +74,40 @@ async fn serve_nacks(mut socket: TcpStream, nack: ProtocolNack, attempts: Arc<At
     }
 }
 
-pub(crate) struct NackPeer {
-    pub(crate) base_url: String,
+async fn reject_request(socket: &mut TcpStream, nack: ProtocolNack, stream: u32) -> bool {
+    match nack {
+        ProtocolNack::RefusedStream => {
+            write_frame(socket, 3, 0, stream, &7_u32.to_be_bytes()).await;
+            false
+        }
+        ProtocolNack::GoAway => {
+            // Last processed stream zero excludes this request. Drain DATA
+            // after the half-close so a TCP reset cannot mask the GOAWAY.
+            write_frame(socket, 7, 0, 0, &[0; 8]).await;
+            socket
+                .shutdown()
+                .await
+                .expect("flush GOAWAY before closing");
+            let mut buffer = [0_u8; 1024];
+            while let Ok(read) = socket.read(&mut buffer).await {
+                if read == 0 {
+                    break;
+                }
+            }
+            true
+        }
+    }
+}
+
+pub struct NackPeer {
+    pub base_url: String,
     attempts: Arc<AtomicUsize>,
     shutdown: oneshot::Sender<()>,
     server: tokio::task::JoinHandle<()>,
 }
 
 impl NackPeer {
-    pub(crate) async fn start(nack: ProtocolNack) -> Self {
+    pub async fn start(nack: ProtocolNack) -> Self {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("loopback listener");
@@ -146,7 +147,7 @@ impl NackPeer {
         }
     }
 
-    pub(crate) async fn finish(self) -> usize {
+    pub async fn finish(self) -> usize {
         self.shutdown.send(()).expect("server is listening");
         self.server.await.expect("server completes");
         self.attempts.load(Ordering::SeqCst)
