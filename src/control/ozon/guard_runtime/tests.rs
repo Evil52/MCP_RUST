@@ -228,3 +228,5 @@ mod static_writes;
 
 mod bootstrap;
 mod durable_adapter;
+
+mod static_safety;

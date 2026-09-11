@@ -1,11 +1,12 @@
+use super::super::pacing::{OzonBidPacingAdjustment, evaluate_ozon_bid_increase_after_guard};
 use super::{
-    OzonAdsWriteClient, OzonBidPacingAction, OzonBidPacingObservation, OzonBidPacingPolicy,
-    OzonBidPositionReader, OzonGuardMetrics, OzonStaticCampaignGuard, OzonStaticDynamicBidControl,
+    OzonAdsWriteClient, OzonBidPacingObservation, OzonBidPacingPolicy, OzonBidPositionReader,
+    OzonGuardMetrics, OzonStaticCampaignGuard, OzonStaticDynamicBidControl,
     OzonStaticGuardFirstStep, PerformanceClient, StaticGuardState, StaticGuardWriteAuthorization,
-    StoreId, campaign_product_snapshot, change_static_campaign_bid, evaluate_ozon_bid_pacing,
-    guard_campaign_static, plan_static_guard_first_step, reconcile_pending_static_bid,
-    recover_pending_static_bids, recover_pending_static_campaign_mutations,
-    running_static_campaigns, static_guard_metrics, validate_ozon_campaign_product_guard,
+    StoreId, campaign_product_snapshot, change_static_campaign_bid, guard_campaign_static,
+    plan_static_guard_first_step, reconcile_pending_static_bid, recover_pending_static_bids,
+    recover_pending_static_campaign_mutations, running_static_campaigns, static_guard_metrics,
+    validate_ozon_campaign_product_guard,
 };
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
@@ -359,7 +360,7 @@ impl StaticGuardCycle<'_> {
                 .flatten(),
             None => None,
         };
-        let action = evaluate_ozon_bid_pacing(
+        let action = evaluate_ozon_bid_increase_after_guard(
             OzonBidPacingPolicy {
                 min_bid_microrubles: static_guard.min_cpc_bid_microrubles,
                 max_bid_microrubles: static_guard.max_cpc_bid_microrubles,
@@ -380,7 +381,7 @@ impl StaticGuardCycle<'_> {
             },
         )?;
         match action {
-            OzonBidPacingAction::Hold(reason) => {
+            OzonBidPacingAdjustment::Hold(reason) => {
                 tracing::info!(
                     campaign_id = guard.campaign_id,
                     sku = guard.sku,
@@ -390,7 +391,7 @@ impl StaticGuardCycle<'_> {
                     "dynamic Ozon bid hold"
                 );
             }
-            OzonBidPacingAction::ChangeBid {
+            OzonBidPacingAdjustment::ChangeBid {
                 from_microrubles,
                 to_microrubles,
             } => {
@@ -410,25 +411,6 @@ impl StaticGuardCycle<'_> {
                 {
                     tracing::error!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"dynamic Ozon bid change failed");
                 }
-            }
-            OzonBidPacingAction::Pause(reason) => {
-                if let Err(error) = guard_campaign_static(
-                    state,
-                    state_path,
-                    reader,
-                    writer,
-                    store,
-                    write_authorization,
-                    static_guard,
-                    Some(spend_minor),
-                    Some(revenue_minor),
-                    Some(reason.as_str()),
-                )
-                .await
-                {
-                    tracing::error!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"dynamic Ozon campaign pause failed");
-                }
-                tokio::time::sleep(Duration::from_secs(7)).await;
             }
         }
         Ok(())

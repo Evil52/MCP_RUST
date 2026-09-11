@@ -16,76 +16,87 @@ async fn postgres_static_bid_adapter_journals_before_one_put_and_reconciles_exac
             "mismatched",
             "revoked",
         ] {
-            let mut state = fixture.initialize(&database).await;
-            let marker = state.last_static_audit_event_id;
-            if case == "revoked" {
-                database.admin.execute("UPDATE control.ozon_runtime_gates SET enabled=false WHERE gate_key='global'",&[]).await.unwrap();
-            }
-            let (reader, reads) = mock_reader(if case == "revoked" {
-                vec![]
-            } else {
-                vec![(
-                    200,
-                    product(if matches!(case, "success" | "ambiguous_applied") {
-                        8_000_000
-                    } else {
-                        7_000_000
-                    }),
-                )]
-            });
-            let mut responses = vec![(200, TOKEN.to_owned())];
-            if case != "revoked" {
-                responses.push((
-                    if case.starts_with("ambiguous") {
-                        400
-                    } else {
-                        200
-                    },
-                    "{}".to_owned(),
-                ));
-            }
-            let (writer, requests) = mock_writer(responses);
-            let result = change_static_campaign_bid(
-                &mut state,
-                &fixture.state_path,
-                &reader,
-                &writer,
-                &fixture.store,
-                fixture.write_authorization(&database),
-                &fixture.guard,
-                7_000_000,
-                8_000_000,
-                observed_at(),
-            )
-            .await;
-            assert_eq!(
-                result.is_ok(),
-                matches!(case, "success" | "ambiguous_applied")
-            );
-            if case == "revoked" {
-                assert_eq!(state.last_static_audit_event_id, marker);
-                assert!(state.pending_bid_changes.is_empty());
-                assert_eq!(reads.try_iter().count(), 0);
-            } else {
-                assert!(state.last_static_audit_event_id > marker);
-                assert_eq!(reads.try_iter().count(), 2);
-                if result.is_ok() {
-                    assert!(state.pending_bid_changes.is_empty());
-                    assert_eq!(state.last_bid_change_at.get(&21), Some(&observed_at()));
-                } else {
-                    assert_eq!(
-                        state.incidents.get(&21).unwrap().error_class,
-                        "bid_write_unconfirmed"
-                    );
-                }
-            }
-            assert_eq!(load_static_state(&fixture.state_path).unwrap(), state);
-            let requests = requests.try_iter().collect::<Vec<_>>();
-            assert_eq!(requests.len(), if case == "revoked" { 1 } else { 2 });
-            if requests.len() == 2 {
-                assert!(requests[1].starts_with("PUT /api/client/campaign/21/products "));
-            }
+            assert_static_bid_case(&database, &fixture, case).await;
         }
+    }
+}
+
+async fn assert_static_bid_case(database: &Database, fixture: &StaticFixture, case: &str) {
+    let mut state = fixture.initialize(database).await;
+    let marker = state.last_static_audit_event_id;
+    if case == "revoked" {
+        database
+            .admin
+            .execute(
+                "UPDATE control.ozon_runtime_gates SET enabled=false WHERE gate_key='global'",
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+    let (reader, reads) = mock_reader(if case == "revoked" {
+        vec![]
+    } else {
+        vec![(
+            200,
+            product(if matches!(case, "success" | "ambiguous_applied") {
+                8_000_000
+            } else {
+                7_000_000
+            }),
+        )]
+    });
+    let mut responses = vec![(200, TOKEN.to_owned())];
+    if case != "revoked" {
+        responses.push((
+            if case.starts_with("ambiguous") {
+                400
+            } else {
+                200
+            },
+            "{}".to_owned(),
+        ));
+    }
+    let (writer, requests) = mock_writer(responses);
+    let result = change_static_campaign_bid(
+        &mut state,
+        &fixture.state_path,
+        &reader,
+        &writer,
+        &fixture.store,
+        fixture.write_authorization(database),
+        &fixture.guard,
+        7_000_000,
+        8_000_000,
+        observed_at(),
+    )
+    .await;
+    assert_eq!(
+        result.is_ok(),
+        matches!(case, "success" | "ambiguous_applied")
+    );
+    if case == "revoked" {
+        assert_eq!(state.last_static_audit_event_id, marker);
+        assert!(state.pending_bid_changes.is_empty());
+        assert_eq!(reads.try_iter().count(), 0);
+    } else {
+        assert!(state.last_static_audit_event_id > marker);
+        assert_eq!(reads.try_iter().count(), 2);
+        if result.is_ok() {
+            assert!(state.pending_bid_changes.is_empty());
+            assert_eq!(state.last_bid_change_at.get(&21), Some(&observed_at()));
+        } else {
+            assert_eq!(
+                state.incidents.get(&21).unwrap().error_class,
+                "bid_write_unconfirmed"
+            );
+        }
+    }
+    assert_eq!(load_static_state(&fixture.state_path).unwrap(), state);
+    let requests = requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(requests.len(), if case == "revoked" { 1 } else { 2 });
+    if requests.len() == 2 {
+        assert!(requests[1].starts_with("PUT /api/client/campaign/21/products "));
     }
 }
 

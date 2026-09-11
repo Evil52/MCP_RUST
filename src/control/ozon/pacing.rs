@@ -41,6 +41,31 @@ pub enum OzonBidPacingAction {
     Pause(OzonBidPacingPauseReason),
 }
 
+/// Optional bid adjustment after the caller has enforced its financial guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OzonBidPacingAdjustment {
+    Hold(OzonBidPacingHoldReason),
+    ChangeBid {
+        from_microrubles: u64,
+        to_microrubles: u64,
+    },
+}
+
+impl From<OzonBidPacingAdjustment> for OzonBidPacingAction {
+    fn from(adjustment: OzonBidPacingAdjustment) -> Self {
+        match adjustment {
+            OzonBidPacingAdjustment::Hold(reason) => Self::Hold(reason),
+            OzonBidPacingAdjustment::ChangeBid {
+                from_microrubles,
+                to_microrubles,
+            } => Self::ChangeBid {
+                from_microrubles,
+                to_microrubles,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OzonBidPacingHoldReason {
     Cooldown,
@@ -91,12 +116,7 @@ pub fn evaluate_ozon_bid_pacing(
     policy: OzonBidPacingPolicy,
     observation: OzonBidPacingObservation,
 ) -> Result<OzonBidPacingAction, OzonBidPacingError> {
-    validate_policy(policy)?;
-    if !(policy.min_bid_microrubles..=policy.max_bid_microrubles)
-        .contains(&observation.current_bid_microrubles)
-    {
-        return Err(OzonBidPacingError::InvalidObservation);
-    }
+    validate_inputs(policy, observation)?;
 
     let spend_cap_minor = policy.spend_cap_microrubles / 10_000;
     if observation.spend_minor >= spend_cap_minor {
@@ -127,8 +147,25 @@ pub fn evaluate_ozon_bid_pacing(
         });
     }
 
+    position_bid_adjustment(policy, observation).map(Into::into)
+}
+
+/// Computes an optional upward position adjustment. Static guard callers use
+/// this only after the mandatory spend/DRR check, which has stop precedence.
+pub(super) fn evaluate_ozon_bid_increase_after_guard(
+    policy: OzonBidPacingPolicy,
+    observation: OzonBidPacingObservation,
+) -> Result<OzonBidPacingAdjustment, OzonBidPacingError> {
+    validate_inputs(policy, observation)?;
+    position_bid_adjustment(policy, observation)
+}
+
+fn position_bid_adjustment(
+    policy: OzonBidPacingPolicy,
+    observation: OzonBidPacingObservation,
+) -> Result<OzonBidPacingAdjustment, OzonBidPacingError> {
     let Some(position) = observation.position else {
-        return Ok(OzonBidPacingAction::Hold(
+        return Ok(OzonBidPacingAdjustment::Hold(
             OzonBidPacingHoldReason::PositionUnavailable,
         ));
     };
@@ -140,24 +177,26 @@ pub fn evaluate_ozon_bid_pacing(
             .map_err(|_| OzonBidPacingError::InvalidPolicy)?,
     );
     if age < Duration::zero() || age > max_age {
-        return Ok(OzonBidPacingAction::Hold(
+        return Ok(OzonBidPacingAdjustment::Hold(
             OzonBidPacingHoldReason::PositionStale,
         ));
     }
     if position.position <= policy.target_position {
-        return Ok(OzonBidPacingAction::Hold(
+        return Ok(OzonBidPacingAdjustment::Hold(
             OzonBidPacingHoldReason::TargetPositionReached,
         ));
     }
     if observation.current_bid_microrubles == policy.max_bid_microrubles {
-        return Ok(OzonBidPacingAction::Hold(
+        return Ok(OzonBidPacingAdjustment::Hold(
             OzonBidPacingHoldReason::BidCeilingReached,
         ));
     }
     if cooldown_active(policy, observation)? {
-        return Ok(OzonBidPacingAction::Hold(OzonBidPacingHoldReason::Cooldown));
+        return Ok(OzonBidPacingAdjustment::Hold(
+            OzonBidPacingHoldReason::Cooldown,
+        ));
     }
-    Ok(OzonBidPacingAction::ChangeBid {
+    Ok(OzonBidPacingAdjustment::ChangeBid {
         from_microrubles: observation.current_bid_microrubles,
         to_microrubles: observation
             .current_bid_microrubles
@@ -165,6 +204,19 @@ pub fn evaluate_ozon_bid_pacing(
             .ok_or(OzonBidPacingError::InvalidObservation)?
             .min(policy.max_bid_microrubles),
     })
+}
+
+fn validate_inputs(
+    policy: OzonBidPacingPolicy,
+    observation: OzonBidPacingObservation,
+) -> Result<(), OzonBidPacingError> {
+    validate_policy(policy)?;
+    if !(policy.min_bid_microrubles..=policy.max_bid_microrubles)
+        .contains(&observation.current_bid_microrubles)
+    {
+        return Err(OzonBidPacingError::InvalidObservation);
+    }
+    Ok(())
 }
 
 fn validate_policy(policy: OzonBidPacingPolicy) -> Result<(), OzonBidPacingError> {
