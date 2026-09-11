@@ -528,6 +528,37 @@ async fn retry_policy_preserves_vendor_delays_and_fences_publication() {
     );
     fixture.select(account, "stocks", now).await;
     let claim = fixture.claim().await;
+    for (identity, page) in empty_pages(&claim) {
+        fixture.seed(&claim, identity, page).await;
+    }
+    fixture
+        .admin
+        .batch_execute("REVOKE INSERT ON daily_reporting.source_snapshots FROM report_collector")
+        .await
+        .unwrap();
+    let publication = complete_quantum(
+        &fixture.writer,
+        &claim,
+        Ok((CollectedFacts::Stocks(vec![]), vec![])),
+    )
+    .await;
+    fixture
+        .admin
+        .batch_execute("GRANT INSERT ON daily_reporting.source_snapshots TO report_collector")
+        .await
+        .unwrap();
+    publication.unwrap();
+    assert_eq!(
+        fixture.state(&claim).await,
+        (
+            "ready".to_owned(),
+            Some("database_unavailable".to_owned()),
+            1
+        ),
+        "publication outages must retain a retryable source job"
+    );
+    fixture.select(account, "stocks", now).await;
+    let claim = fixture.claim().await;
     fixture
         .writer
         .defer_source_job(&claim, None, 1, false)

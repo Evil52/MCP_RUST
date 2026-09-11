@@ -128,6 +128,14 @@ async fn cancelled_or_late_local_wait_never_starts_another_request() {
 
 #[tokio::test(start_paused = true)]
 async fn local_admission_never_retries_or_overwrites_an_admitted_vendor_failure() {
+    use tracing::instrument::WithSubscriber as _;
+    let log_path = std::env::temp_dir().join(format!("wb-admission-{}.log", std::process::id()));
+    let subscriber = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(Arc::new(std::fs::File::create(&log_path).unwrap()))
+            .finish(),
+    );
     let started = Instant::now();
     let mut attempts = 0;
     let error = wait_for_local_admission(started + Duration::from_secs(60), || {
@@ -149,8 +157,20 @@ async fn local_admission_never_retries_or_overwrites_an_admitted_vendor_failure(
             }
         }
     })
+    .with_subscriber(subscriber.clone())
     .await
     .unwrap_err();
+    let classified =
+        tracing::dispatcher::with_default(&subscriber, || promotion_stats_failure(&error));
+    let captured = std::fs::read_to_string(&log_path).unwrap();
+    std::fs::remove_file(log_path).unwrap();
+    assert_eq!(classified, WbReportSourceError::RetryAfter { seconds: 120 });
+    assert!(captured.contains("local_wait") && captured.contains("retry_after_ms=20000"));
+    assert!(
+        captured.contains("vendor_rate_limited")
+            && captured.contains("error_code=\"rate_limited\"")
+    );
+    assert!(!captured.contains("fixture-request"));
     assert_eq!(attempts, 2);
     assert_eq!(started.elapsed(), Duration::from_secs(65));
     assert!(matches!(
