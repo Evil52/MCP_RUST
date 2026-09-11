@@ -1585,23 +1585,17 @@ fn plan_projection_authorization_and_error_classes_are_exhaustive() {
     );
 }
 
-async fn run_wb_runtime_happy_path(
-    database_url: Result<String, std::env::VarError>,
-    admin_url: Result<String, std::env::VarError>,
-) {
+async fn run_wb_runtime_happy_path(database_url: &str, admin_url: &str) {
     enum Revocation {
         MissingFile,
         MissingActor,
         RevokedAccess,
     }
 
-    let (Ok(database_url), Ok(admin_url)) = (database_url, admin_url) else {
-        return;
-    };
     let _database_guard = CONTROL_DB_TEST_LOCK.lock().await;
-    let config = crate::control::plan::validate_control_database_url(&database_url).unwrap();
+    let config = crate::control::plan::validate_control_database_url(database_url).unwrap();
     let plans = Arc::new(WbPlanRepository::connect(&config).await.unwrap());
-    let (admin, admin_connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+    let (admin, admin_connection) = tokio_postgres::connect(admin_url, tokio_postgres::NoTls)
         .await
         .unwrap();
     let admin_connection_task = tokio::spawn(admin_connection);
@@ -2443,17 +2437,13 @@ async fn run_wb_runtime_happy_path(
 }
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run through scripts/with-position-test-db.sh"]
 async fn wb_runtime_happy_path_is_durable_and_uses_exact_http_calls() {
-    Box::pin(run_wb_runtime_happy_path(
-        Err(std::env::VarError::NotPresent),
-        Err(std::env::VarError::NotPresent),
-    ))
-    .await;
-    Box::pin(run_wb_runtime_happy_path(
-        std::env::var("WB_CONTROL_TEST_DATABASE_URL"),
-        std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),
-    ))
-    .await;
+    let database_url = std::env::var("WB_CONTROL_TEST_DATABASE_URL")
+        .expect("disposable fixture provides the WB Control URL");
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
+        .expect("disposable fixture provides the admin URL");
+    Box::pin(run_wb_runtime_happy_path(&database_url, &admin_url)).await;
 }
 
 #[test]

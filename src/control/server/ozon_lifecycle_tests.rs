@@ -103,12 +103,9 @@ fn assert_ozon_authorization_boundaries(
     assert!(authorize_ozon_plan_approval(policy, &changed, approver, plan).is_err());
 }
 
-async fn run_ozon_server_lifecycle(urls: Option<(String, String)>) {
-    let Some((planner_url, admin_url)) = urls else {
-        return;
-    };
+async fn run_ozon_server_lifecycle(planner_url: &str, admin_url: &str) {
     let _database_guard = CONTROL_DB_TEST_LOCK.lock().await;
-    let (admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+    let (admin, connection) = tokio_postgres::connect(admin_url, tokio_postgres::NoTls)
         .await
         .unwrap();
     let admin_task = tokio::spawn(connection);
@@ -304,12 +301,11 @@ async fn run_ozon_server_lifecycle(urls: Option<(String, String)>) {
 }
 
 #[tokio::test]
+#[ignore = "requires disposable PostgreSQL; run through scripts/with-position-test-db.sh"]
 async fn ozon_control_prepares_approves_and_queues_without_marketplace_credentials() {
-    Box::pin(run_ozon_server_lifecycle(None)).await;
-    Box::pin(run_ozon_server_lifecycle(
-        std::env::var("OZON_CONTROL_TEST_DATABASE_URL")
-            .ok()
-            .zip(std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL").ok()),
-    ))
-    .await;
+    let planner_url = std::env::var("OZON_CONTROL_TEST_DATABASE_URL")
+        .expect("disposable fixture provides the Ozon planner URL");
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
+        .expect("disposable fixture provides the admin URL");
+    Box::pin(run_ozon_server_lifecycle(&planner_url, &admin_url)).await;
 }
