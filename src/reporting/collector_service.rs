@@ -735,8 +735,7 @@ mod tests {
             .resolve_ozon_dry_run(&claim, &mut |key| {
                 secrets.get(key).map(|value| (*value).to_owned())
             })
-            .err()
-            .expect("dedicated Control Performance Client-Id must be rejected")
+            .expect_err("dedicated Control Performance Client-Id must be rejected")
             .to_string();
         assert!(
             error.contains("выделенный Control Performance Client-Id"),
@@ -789,8 +788,7 @@ mod tests {
             .resolve_ozon_dry_run(&claim, &mut |key| {
                 secrets.get(key).map(|value| (*value).to_owned())
             })
-            .err()
-            .expect("another account's Control Performance Client-Id must be rejected")
+            .expect_err("another account's Control Performance Client-Id must be rejected")
             .to_string();
         assert!(
             error.contains("выделенный Control Performance Client-Id"),

@@ -2784,8 +2784,7 @@ async fn repository_enforces_approval_gates_incidents_and_quotas() {
 async fn every_repository_entry_point_fails_closed_when_the_database_is_gone() {
     let database_url = std::env::var("WB_CONTROL_TEST_DATABASE_URL")
         .expect("disposable fixture provides the WB Control URL");
-    verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(&database_url)
-        .await;
+    verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(&database_url).await;
 }
 
 async fn verify_every_repository_entry_point_fails_closed_when_the_database_is_gone(
