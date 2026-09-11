@@ -94,13 +94,10 @@ impl WbPlanRepository {
         }
     }
 
-    /// Confirms that the process-owned supervised database session can still
-    /// complete a round trip. It performs no marketplace request or write.
+    /// Revalidates the required schema, guards and least-privilege role on the
+    /// process-owned session. It performs no marketplace request or write.
     pub async fn probe(&self) -> Result<(), PlanStoreError> {
-        self.client
-            .probe()
-            .await
-            .map_err(|_| PlanStoreError::Unavailable)
+        self.verify_runtime_contract().await
     }
 
     /// Registers the next immutable policy identity. Re-registering the exact

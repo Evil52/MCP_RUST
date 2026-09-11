@@ -28,11 +28,15 @@ cat >"$test_root/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
-  info | volume | network) exit 0 ;;
+  info | volume | network | rm) exit 0 ;;
+  logs) printf 'locked\n' ;;
+  inspect) printf 'true|test-started-at\n' ;;
   ps) printf 'running|Up 1 minute (healthy)\n' ;;
   container) printf 'running|healthy\n' ;;
   run)
     case "$*" in
+      *--detach*) printf 'test-lease-container\n' ;;
+      *'cat /guard-state/state.json'*) printf '{"last_static_audit_event_id":1}\n' ;;
       *pg_dump*) head -c 4096 /dev/zero ;;
       *tar*) printf 'synthetic artifact archive' ;;
       *) cat >"${TEST_OPS_SQL_CAPTURE:-/dev/null}"; printf 'cycle_age|0\n' ;;
@@ -69,6 +73,7 @@ env \
   MCP_BACKUP_POSITION_ENV="$test_root/position.env" \
   MCP_BACKUP_AGE_RECIPIENTS_FILE="$test_root/recipients" \
   MCP_BACKUP_DIR="$test_root/backups" \
+  MCP_BACKUP_GUARD_STATE_VOLUME=test-guard-state \
   MCP_BACKUP_OFFSITE_COMMAND='' \
   MCP_BACKUP_ALLOW_LOCAL_ONLY=true \
   bash "$installed/backup-position-stack.sh" >"$test_root/backup.log"
@@ -78,6 +83,7 @@ jq --exit-status --arg image "$db_image" \
   '.postgres_image == $image and .archives["position-db.dump.age"].bytes == 4096' \
   "$backup/manifest.json" >/dev/null
 test -s "$backup/report-artifacts.tar.age"
+test -s "$backup/ozon-guard-state.tar.age"
 test -f "$backup/local-only-risk-accepted.json"
 : >"$backup/restore-verified.json"
 : >"$test_root/ready"

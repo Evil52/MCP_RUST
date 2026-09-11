@@ -346,6 +346,21 @@ docker compose --env-file .position.env -f compose.position.yaml exec -T positio
   migrate-position-db
 ```
 
+The authenticated database healthcheck compares the exact migration ids and
+SHA-256 checksums against the SQL files packaged in its image. Missing, extra,
+changed or still `applying` entries fail readiness; the expected set is never a
+hardcoded count. A missing or empty packaged migration catalog also fails closed.
+
+The MCP `/readyz` and `/health` endpoints revalidate the configured repositories'
+schema and role contracts on their existing sessions, including preparation of
+the reporting queries required by the binary. They return 503 if a required
+view, column, function, guard or privilege disappears after startup; `/livez`
+remains independent. The existing readiness concurrency gate and deadline bound
+these probes. Intentional disabled/no-database configurations remain ready.
+Application roles do not gain access to the admin-only migration ledger: exact
+ledger validation belongs to the database healthcheck, while HTTP readiness
+validates the schema actually consumed by each configured application service.
+
 The migrator preserves the required order between migration `018` and `019`
 and never retries a migration left in `applying`: restore or reconcile that
 state explicitly instead of guessing whether a one-shot transaction committed.

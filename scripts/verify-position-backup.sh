@@ -3,7 +3,7 @@
 # usable. A backup that has never been restored is not a backup, so this is
 # the half of the recovery story that is worth automating.
 #
-# Three things are checked, in increasing order of what they would have cost
+# Four things are checked, in increasing order of what they would have cost
 # to discover during a real incident:
 #
 #   1. The ciphertext still matches the SHA-256 recorded when it was written,
@@ -13,6 +13,8 @@
 #   3. Every `artifact_object_key` the restored database references is present
 #      in the artifact archive captured alongside it. This is the cross-store
 #      consistency that two independently restored volumes silently lose.
+#   4. Version 3 restores durable Ozon guard state and matches its audit cursor
+#      to the restored database. Legacy versions cannot prove guard recovery.
 #
 # Nothing here touches the live stack: the disposable container has no network
 # and its volume is removed on exit.
@@ -71,7 +73,7 @@ case "$manifest_version" in
     artifact_archive="$backup_dir/report-artifacts.tar.enc"
     key_file="$passphrase_file"
     ;;
-  2)
+  2 | 3)
     database_archive="$backup_dir/position-db.dump.age"
     artifact_archive="$backup_dir/report-artifacts.tar.age"
     key_file="$identity_file"
@@ -82,7 +84,17 @@ case "$manifest_version" in
     ;;
 esac
 
-for path in "$database_archive" "$artifact_archive" "$key_file"; do
+restore_inputs=("$database_archive" "$artifact_archive" "$key_file")
+guard_archive=''
+if [[ "$manifest_version" == 3 ]]; then
+  guard_archive="$backup_dir/ozon-guard-state.tar.age"
+  restore_inputs+=("$guard_archive")
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to validate the guard state archive" >&2
+    exit 1
+  fi
+fi
+for path in "${restore_inputs[@]}"; do
   if [[ ! -f "$path" || -L "$path" ]]; then
     echo "required restore input is unavailable or unsafe: $path" >&2
     exit 1
@@ -126,10 +138,10 @@ case "$manifest_version" in
     expected_db_sha="$(jq -r '.archives["position-db.dump.enc"].sha256' "$manifest")"
     expected_artifact_sha="$(jq -r '.archives["report-artifacts.tar.enc"].sha256' "$manifest")"
     ;;
-  2)
+  2 | 3)
     for command in age age-keygen; do
       if ! command -v "$command" >/dev/null 2>&1; then
-        echo "$command is required to restore backup format v2" >&2
+        echo "$command is required to restore authenticated backup formats" >&2
         exit 1
       fi
     done
@@ -167,7 +179,7 @@ if [[ "$actual_artifact_sha" != "$expected_artifact_sha" ]]; then
   echo "artifact archive does not match its recorded SHA-256" >&2
   exit 1
 fi
-if [[ "$manifest_version" == 2 ]]; then
+if [[ "$manifest_version" != 1 ]]; then
   actual_recipients_sha="$(
     age-keygen -y "$identity_file" | "${sha256[@]}" | awk '{ print $1 }'
   )"
@@ -175,6 +187,28 @@ if [[ "$manifest_version" == 2 ]]; then
     echo "backup age identity does not match the manifest recipient" >&2
     exit 1
   fi
+fi
+
+guard_verified=false
+archive_identity="$actual_db_sha:$actual_artifact_sha"
+if [[ "$manifest_version" == 3 ]]; then
+  if ! jq -e '
+    .capture_order == ["position-db", "ozon-guard-state", "report-artifacts"]
+    and (.archives | keys) == ["ozon-guard-state.tar.age", "position-db.dump.age", "report-artifacts.tar.age"]
+    and .guard_state == {file: "state.json", consistency: "exclusive-state-lease", root_mode: "700", uid: 10001, gid: 10001}
+    and (.archives["ozon-guard-state.tar.age"].sha256 | test("^[0-9a-f]{64}$"))
+  ' "$manifest" >/dev/null; then
+    echo "backup manifest does not describe a restorable guard state archive" >&2
+    exit 1
+  fi
+  actual_guard_sha="$("${sha256[@]}" "$guard_archive" | awk '{ print $1 }')"
+  if [[ "$actual_guard_sha" != "$(jq -r '.archives["ozon-guard-state.tar.age"].sha256' "$manifest")" ]]; then
+    echo "guard archive does not match its recorded SHA-256" >&2
+    exit 1
+  fi
+  archive_identity="$archive_identity:$actual_guard_sha"
+else
+  echo "legacy backup: guard state is absent; verification covers only database and report artifacts" >&2
 fi
 
 if ! command -v openssl >/dev/null 2>&1; then
@@ -188,12 +222,17 @@ fi
 verify_password="$(openssl rand -hex 24)"
 container="mcp-ozon-backup-verify-$$"
 volume="mcp-ozon-backup-verify-$$"
+guard_verify_volume="mcp-ozon-guard-backup-verify-$$"
+guard_verify_volume_created=false
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/mcp-ozon-verify.XXXXXX")"
 
 # shellcheck disable=SC2317,SC2329 # Called indirectly by the EXIT trap.
 cleanup() {
   "$docker_bin" rm -f "$container" >/dev/null 2>&1 || true
   "$docker_bin" volume rm "$volume" >/dev/null 2>&1 || true
+  if [[ "$guard_verify_volume_created" == true ]]; then
+    "$docker_bin" volume rm "$guard_verify_volume" >/dev/null 2>&1 || true
+  fi
   rm -rf "$work_dir"
 }
 trap cleanup EXIT
@@ -359,12 +398,78 @@ else
   echo "    $referenced_count referenced artifact keys all present"
 fi
 
+if [[ "$manifest_version" == 3 ]]; then
+  echo "==> restoring and cross-checking Ozon guard state"
+  decrypt "$guard_archive" >"$work_dir/ozon-guard-state.tar"
+  # Validate before tar extraction: exactly one bounded, private regular file;
+  # never symlinks, hardlinks, traversal, or unexpected archive members.
+  guard_identity="$(python3 - "$work_dir/ozon-guard-state.tar" <<'PYGUARD'
+import hashlib
+import json
+import sys
+import tarfile
+
+try:
+    with tarfile.open(sys.argv[1], mode="r:") as archive:
+        members = archive.getmembers()
+        if len(members) != 1:
+            raise ValueError()
+        member = members[0]
+        if (member.name != "state.json" or not member.isfile()
+                or member.mode != 0o600 or member.uid != 10001 or member.gid != 10001
+                or not 0 < member.size <= 262144):
+            raise ValueError()
+        state_bytes = archive.extractfile(member).read()
+        state = json.loads(state_bytes)
+        cursor = state.get("last_static_audit_event_id")
+        if type(cursor) is not int or not 0 < cursor <= 9007199254740991:
+            raise ValueError()
+        print(str(cursor) + ":" + hashlib.sha256(state_bytes).hexdigest())
+except (OSError, ValueError, TypeError, AttributeError, tarfile.TarError):
+    sys.exit("guard archive is unsafe or has no initialized audit cursor")
+PYGUARD
+)"
+  guard_cursor="${guard_identity%%:*}"
+  expected_state_sha="${guard_identity#*:}"
+  guard_verify_volume_created=true
+  "$docker_bin" volume create "$guard_verify_volume" >/dev/null
+  # shellcheck disable=SC2016 # Verify file metadata inside the disposable volume.
+  "$docker_bin" run --rm --interactive --network none --user 0:0 \
+    --volume "$guard_verify_volume:/guard-state" --entrypoint /bin/sh "$db_image" \
+    -ec '
+      chown 10001:10001 /guard-state
+      chmod 700 /guard-state
+      tar --extract --file - --directory /guard-state
+      test "$(stat -c %a /guard-state/state.json)" = 600
+      test "$(stat -c %u:%g /guard-state/state.json)" = 10001:10001
+      cat /guard-state/state.json
+    ' <"$work_dir/ozon-guard-state.tar" >"$work_dir/restored-guard-state.json"
+  restored_state_sha="$("${sha256[@]}" "$work_dir/restored-guard-state.json" | awk '{ print $1 }')"
+  cursor_matches="$(psql_quiet <<SQL
+SELECT count(*) = 1
+FROM control.ozon_static_guard_audit_events e
+WHERE e.event_id = $guard_cursor
+  AND e.event_id = (SELECT max(a.event_id)
+                   FROM control.ozon_static_guard_audit_events a
+                   WHERE a.account_id = e.account_id)
+  AND (SELECT count(DISTINCT account_id)
+       FROM control.ozon_static_guard_audit_events) = 1;
+SQL
+)"
+  if [[ "$restored_state_sha" != "$expected_state_sha" || "$cursor_matches" != t ]]; then
+    echo "restored guard state does not match the database audit cursor" >&2
+    exit 1
+  fi
+  guard_verified=true
+fi
+
 verification_marker="$backup_dir/restore-verified.json"
 temporary_marker="$backup_dir/.restore-verified.$$.tmp"
 jq -n \
   --arg verified_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-  --arg manifest_sha256 "$actual_db_sha:$actual_artifact_sha" \
-  '{schema_version: 1, verified_at: $verified_at, archive_identity: $manifest_sha256}' \
+  --arg manifest_sha256 "$archive_identity" \
+  --argjson guard_state_verified "$guard_verified" \
+  '{schema_version: 1, verified_at: $verified_at, archive_identity: $manifest_sha256, guard_state_verified: $guard_state_verified}' \
   >"$temporary_marker"
 chmod 600 "$temporary_marker"
 mv -f "$temporary_marker" "$verification_marker"

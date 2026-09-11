@@ -204,14 +204,24 @@ def validate_release(record, contents):
             "runtime image is not bound to the packaged release")
     if "data_backup_manifest" in contents:
         backup = decode_json(contents["data_backup_manifest"])
-        require(isinstance(backup, dict) and backup.get("manifest_version") == 2
-                and backup.get("capture_order") == ["position-db", "report-artifacts"]
+        require(isinstance(backup, dict) and backup.get("manifest_version") in (2, 3),
+                "data backup manifest version is unsupported")
+        expected_order = ["position-db", "report-artifacts"]
+        expected_archives = {"position-db.dump.age", "report-artifacts.tar.age"}
+        if backup["manifest_version"] == 3:
+            expected_order.insert(1, "ozon-guard-state")
+            expected_archives.add("ozon-guard-state.tar.age")
+            require(backup.get("guard_state") == {
+                "file": "state.json", "consistency": "exclusive-state-lease",
+                "root_mode": "700", "uid": 10001, "gid": 10001,
+            }, "data backup manifest is missing the guard consistency contract")
+        require(backup.get("capture_order") == expected_order
                 and isinstance(backup.get("encryption"), dict)
                 and backup["encryption"].get("format") == "age"
                 and backup["encryption"].get("specification") == "v1"
                 and isinstance(backup.get("archives"), dict)
-                and set(backup["archives"]) == {"position-db.dump.age", "report-artifacts.tar.age"},
-                "data backup manifest must describe the authenticated age backup pair")
+                and set(backup["archives"]) == expected_archives,
+                "data backup manifest must describe the complete authenticated age backup")
         for item in backup["archives"].values():
             require(isinstance(item, dict) and isinstance(item.get("sha256"), str)
                     and HASH.fullmatch(item["sha256"]) and type(item.get("bytes")) is int

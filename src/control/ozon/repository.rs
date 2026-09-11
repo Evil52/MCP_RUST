@@ -51,10 +51,7 @@ impl OzonPlanRepository {
     }
 
     pub async fn probe(&self) -> Result<(), OzonPlanStoreError> {
-        self.client
-            .probe()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)
+        self.verify_runtime_contract().await
     }
 
     pub async fn verify_runtime_contract(&self) -> Result<(), OzonPlanStoreError> {

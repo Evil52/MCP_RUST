@@ -542,7 +542,7 @@ async fn run_repository_scenarios_with_optional_test_database(
         )
         .await
         .unwrap();
-    let disabled_trigger_contract = repository.verify_runtime_contract().await;
+    let disabled_trigger_contract = repository.probe().await;
     admin
         .execute(
             "ALTER TABLE control.wb_prepare_reservations \
@@ -555,7 +555,7 @@ async fn run_repository_scenarios_with_optional_test_database(
         disabled_trigger_contract,
         Err(PlanStoreError::Unavailable)
     ));
-    repository.verify_runtime_contract().await.unwrap();
+    repository.probe().await.unwrap();
     admin
         .execute("ALTER ROLE control_writer CONNECTION LIMIT 5", &[])
         .await
