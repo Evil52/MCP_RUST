@@ -49,6 +49,10 @@ const fn session_unavailable(_: crate::postgres::PostgresUnavailable) -> OzonPla
 }
 
 #[cfg(test)]
+mod completion_tests;
+#[cfg(test)]
+mod policy_approval_tests;
+#[cfg(test)]
 mod release_tests;
 
 #[derive(Clone)]
@@ -2145,42 +2149,6 @@ async fn insert_guard(
         return Err(OzonPlanStoreError::InvalidState);
     }
     Ok(())
-}
-
-fn stage_readback_is_exact(
-    readback: &Value,
-    action: OzonLaunchAction,
-    plan: &OzonCampaignPlan,
-    campaign_id: u64,
-) -> bool {
-    if json_u64(readback.get("campaign_id")) != Some(campaign_id)
-        || readback.get("action").and_then(Value::as_str) != Some(action.as_db())
-        || readback.get("verified").and_then(Value::as_bool) != Some(true)
-        || readback.get("title").and_then(Value::as_str)
-            != Some(plan.manifest.create_request.title.as_str())
-    {
-        return false;
-    }
-    match action {
-        OzonLaunchAction::CreateCampaign => readback
-            .get("state")
-            .and_then(Value::as_str)
-            .is_some_and(is_supported_non_running_state),
-        OzonLaunchAction::AddProducts => {
-            json_u64(readback.get("sku")) == Some(plan.sku)
-                && json_u64(readback.get("bid_microrubles"))
-                    == Some(plan.manifest.spec.initial_cpc_bid_microrubles)
-        }
-        // Activation is committed only by the stricter running-readback path.
-        OzonLaunchAction::ActivateCampaign => false,
-    }
-}
-
-fn is_supported_non_running_state(state: &str) -> bool {
-    matches!(
-        state,
-        "CAMPAIGN_STATE_STOPPED" | "CAMPAIGN_STATE_INACTIVE" | "CAMPAIGN_STATE_PLANNED"
-    )
 }
 
 fn exact_running_readback(readback: &Value, campaign_id: u64, plan: &OzonCampaignPlan) -> bool {
