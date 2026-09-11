@@ -266,10 +266,13 @@ async fn connect_supervised(
     // Config::connect_timeout only bounds opening each socket. A TCP peer can
     // accept it and then stall forever during PostgreSQL startup or auth, so
     // bound the whole exchange before publishing or spawning its driver.
-    let (client, connection) = tokio::time::timeout(CONNECT_TIMEOUT, config.connect(NoTls))
-        .await
-        .map_err(|_| PostgresUnavailable)?
-        .map_err(|_| PostgresUnavailable)?;
+    // This cold-path handshake is large; keep it off every caller's future
+    // stack while retaining cancellation of the owned connection attempt.
+    let (client, connection) =
+        tokio::time::timeout(CONNECT_TIMEOUT, Box::pin(config.connect(NoTls)))
+            .await
+            .map_err(|_| PostgresUnavailable)?
+            .map_err(|_| PostgresUnavailable)?;
     // Supervised rather than detached: the driver future owns the socket, and
     // its termination is the only place the reason for a lost session exists.
     std::mem::drop(tokio::spawn(async move {
