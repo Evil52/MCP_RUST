@@ -366,6 +366,7 @@ where
         };
         return static_runtime::StaticGuardRuntime {
             command,
+            poll_interval: GUARD_POLL_INTERVAL,
             state_lease,
             state_path: &state_path,
             config: static_guard_config,
@@ -1939,17 +1940,12 @@ struct PerformanceGuardWriter<'a> {
 
 const fn classify_guard_stop_write_failure(
     error: &OzonGuardedWriteError<OzonPlanStoreError>,
-    marker_attempted: bool,
     write_started: bool,
 ) -> OzonGuardWriteFailure {
     match error {
-        OzonGuardedWriteError::Permit(_) => {
-            if marker_attempted {
-                OzonGuardWriteFailure::MarkerUncertain
-            } else {
-                OzonGuardWriteFailure::Permit
-            }
-        }
+        // The client creates Permit only from the callback's returned error;
+        // this callback invokes the durable marker before returning any error.
+        OzonGuardedWriteError::Permit(_) => OzonGuardWriteFailure::MarkerUncertain,
         OzonGuardedWriteError::Write(_) if !write_started => OzonGuardWriteFailure::Permit,
         // Once the durable mutation boundary has been crossed, no provider
         // response (including a 4xx) proves that the campaign state did not
@@ -1963,15 +1959,12 @@ impl OzonGuardWriterPort for PerformanceGuardWriter<'_> {
         &self,
         lease: &OzonGuardStopLease,
     ) -> Result<(), OzonGuardWriteFailure> {
-        let marker_attempted = AtomicBool::new(false);
         let write_started = AtomicBool::new(false);
         let result = self
             .client
             .deactivate_campaign_with_permit(lease.guard.campaign_id, || {
                 let write_started = &write_started;
-                let marker_attempted = &marker_attempted;
                 async move {
-                    marker_attempted.store(true, Ordering::Release);
                     self.repository.start_guard_stop_write(lease).await?;
                     write_started.store(true, Ordering::Release);
                     Ok::<(), OzonPlanStoreError>(())
@@ -1979,11 +1972,7 @@ impl OzonGuardWriterPort for PerformanceGuardWriter<'_> {
             })
             .await;
         result.map_err(|error| {
-            classify_guard_stop_write_failure(
-                &error,
-                marker_attempted.load(Ordering::Acquire),
-                write_started.load(Ordering::Acquire),
-            )
+            classify_guard_stop_write_failure(&error, write_started.load(Ordering::Acquire))
         })
     }
 }

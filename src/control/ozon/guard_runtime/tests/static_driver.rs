@@ -15,6 +15,7 @@ pub(super) fn runtime<'a>(
 ) -> super::super::static_runtime::StaticGuardRuntime<'a> {
     super::super::static_runtime::StaticGuardRuntime {
         command,
+        poll_interval: GUARD_POLL_INTERVAL,
         state_lease: OzonStaticGuardStateLease::acquire(&fixture.state_path).unwrap(),
         state_path: &fixture.state_path,
         config: load_static_guards(&fixture.config_path, "account")

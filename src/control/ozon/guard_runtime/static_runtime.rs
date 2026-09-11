@@ -1,22 +1,22 @@
 use super::{
-    Command, GUARD_POLL_INTERVAL, OzonAdsWriteClient, OzonBidPositionReader, OzonExecutorLease,
-    OzonPlanStoreError, OzonStaticGuardConfig, OzonStaticGuardStateLease,
-    POSITION_DATABASE_URL_ENV, PerformanceClient, StaticAuditContinuity,
-    StaticGuardWriteAuthorization, audit_static_campaigns, guard_once_static, load_static_state,
-    persist_static_initialization_cursor, reconcile_static_campaigns, record_static_cycle_result,
-    recover_pending_static_bids, recover_pending_static_campaign_mutations,
-    validate_ozon_static_guard_policy, validate_ozon_static_guard_state_scope,
-    validate_static_command_audit_continuity,
+    Command, OzonAdsWriteClient, OzonBidPositionReader, OzonExecutorLease, OzonPlanStoreError,
+    OzonStaticGuardConfig, OzonStaticGuardStateLease, POSITION_DATABASE_URL_ENV, PerformanceClient,
+    StaticAuditContinuity, StaticGuardWriteAuthorization, audit_static_campaigns,
+    guard_once_static, load_static_state, persist_static_initialization_cursor,
+    reconcile_static_campaigns, record_static_cycle_result, recover_pending_static_bids,
+    recover_pending_static_campaign_mutations, validate_ozon_static_guard_policy,
+    validate_ozon_static_guard_state_scope, validate_static_command_audit_continuity,
 };
 use anyhow::{Context as _, Result, bail};
 use chrono::Utc;
-use std::{collections::BTreeSet, env, future::Future, path::Path, sync::Arc};
+use std::{collections::BTreeSet, env, future::Future, path::Path, sync::Arc, time::Duration};
 
 /// Static command execution after bootstrap has validated identity and acquired
 /// both executor ownership and the private state-file lease. Supplying clients
 /// here separates construction from command semantics without changing either.
 pub(super) struct StaticGuardRuntime<'a> {
     pub(super) command: Command,
+    pub(super) poll_interval: Duration,
     pub(super) state_lease: OzonStaticGuardStateLease,
     pub(super) state_path: &'a Path,
     pub(super) config: OzonStaticGuardConfig,
@@ -31,6 +31,7 @@ impl StaticGuardRuntime<'_> {
         tokio::pin!(shutdown);
         let Self {
             command,
+            poll_interval,
             state_lease: _state_lease,
             state_path,
             config: static_guard_config,
@@ -183,7 +184,7 @@ impl StaticGuardRuntime<'_> {
                 }
             }
             tokio::select! {
-                () = tokio::time::sleep(GUARD_POLL_INTERVAL) => {}
+                () = tokio::time::sleep(poll_interval) => {}
                 () = &mut shutdown => break,
                 () = executor_lease.lost() => {
                     bail!("Ozon executor lease connection was lost");

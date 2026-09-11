@@ -276,7 +276,7 @@ fn provider_4xx_after_durable_stop_marker_is_ambiguous_until_readback() {
     });
 
     assert_eq!(
-        classify_guard_stop_write_failure(&error, true, true),
+        classify_guard_stop_write_failure(&error, true),
         OzonGuardWriteFailure::Ambiguous
     );
 }

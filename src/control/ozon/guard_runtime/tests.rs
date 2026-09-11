@@ -73,10 +73,12 @@ impl OzonWorkflowTasks for FailingWorkflowTasks {
 
 #[derive(Default)]
 struct FakeStaticStopIo {
+    omit_marker: bool,
     writes: Mutex<VecDeque<Result<(), String>>>,
     activations: Mutex<VecDeque<Result<(), String>>>,
     pre_marker_failures: Mutex<VecDeque<String>>,
     readbacks: Mutex<VecDeque<Result<bool, String>>>,
+    before_readback: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     write_calls: AtomicUsize,
     activation_calls: AtomicUsize,
     read_calls: AtomicUsize,
@@ -94,6 +96,9 @@ impl OzonStaticCampaignIo for FakeStaticStopIo {
         P: FnOnce(u64) -> MarkerFuture,
         MarkerFuture: Future<Output = Result<(), String>>,
     {
+        if self.omit_marker {
+            return Ok(());
+        }
         let pre_marker_failure = self.pre_marker_failures.lock().unwrap().pop_front();
         if let Some(error) = pre_marker_failure {
             return Err(error);
@@ -118,6 +123,9 @@ impl OzonStaticCampaignIo for FakeStaticStopIo {
         P: FnOnce(u64) -> MarkerFuture,
         MarkerFuture: Future<Output = Result<(), String>>,
     {
+        if self.omit_marker {
+            return Ok(());
+        }
         let pre_marker_failure = self.pre_marker_failures.lock().unwrap().pop_front();
         if let Some(error) = pre_marker_failure {
             return Err(error);
@@ -134,6 +142,10 @@ impl OzonStaticCampaignIo for FakeStaticStopIo {
 
     async fn campaign_is_running(&self, _campaign_id: u64) -> Result<bool, String> {
         self.read_calls.fetch_add(1, Ordering::Relaxed);
+        let before_readback = self.before_readback.lock().unwrap().take();
+        if let Some(before_readback) = before_readback {
+            before_readback();
+        }
         self.readbacks
             .lock()
             .unwrap()
@@ -233,7 +245,10 @@ mod static_safety;
 
 mod static_reconciliation;
 
+mod adapter_boundary_failures;
 mod mutation_boundaries;
+mod persistence_failures;
+mod runtime_failures;
 mod static_driver;
 mod unix_shutdown;
 

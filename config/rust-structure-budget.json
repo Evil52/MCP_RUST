@@ -10,7 +10,7 @@
     "src/control/automation_postgres.rs": 2494,
     "src/control/automation.rs": 1792,
     "src/control/config/tests.rs": 1490,
-    "src/control/ozon/guard_runtime.rs": 2080,
+    "src/control/ozon/guard_runtime.rs": 2069,
     "src/control/ozon/guard_workflow.rs": 1671,
     "src/control/ozon/launch_workflow.rs": 1527,
     "src/control/ozon/repository.rs": 2535,

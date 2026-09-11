@@ -4,7 +4,7 @@ use super::{
     OzonCampaignGuard, OzonGuardMetrics, OzonStaticCampaignGuard, OzonStaticDynamicBidControl,
     OzonStaticGuardFirstStep, PerformanceClient, StaticGuardState, StaticGuardWriteAuthorization,
     StoreId, campaign_product_snapshot, change_static_campaign_bid, guard_campaign_static,
-    plan_static_guard_first_step, reconcile_pending_static_bid, recover_pending_static_bids,
+    plan_static_guard_first_step, recover_pending_static_bids,
     recover_pending_static_campaign_mutations, running_static_campaigns, static_guard_metrics,
     validate_ozon_campaign_product_guard,
 };
@@ -212,11 +212,6 @@ impl StaticGuardCycle<'_> {
         else {
             return Ok(());
         };
-
-        reconcile_pending_static_bid(state, state_path, static_guard, current_bid_microrubles)?;
-        if state.incident_campaign_ids.contains(&guard.campaign_id) {
-            return Ok(());
-        }
 
         if let Some(dynamic) = self.dynamic_bid_control {
             return self
