@@ -98,6 +98,18 @@ impl Manifest {
         Ok(())
     }
 
+    fn target_policy(&self, source: &WbAutomationPolicy, id: u64) -> WbAutomationPolicy {
+        let mut policy = source.clone();
+        policy.campaign_id = id;
+        NAME.clone_into(&mut policy.campaign_name);
+        policy.nm_ids = NMS.to_vec();
+        policy.authorized_by_actor_id.clone_from(&self.actor_id);
+        policy
+            .authorization_reference
+            .clone_from(&self.authorization_reference);
+        policy
+    }
+
     fn validate(
         &self,
         policy: &WbAutomationPolicy,
@@ -147,6 +159,10 @@ impl Manifest {
             journal::digest(&serde_json::to_vec(policy)?) == self.source_policy_sha256,
             "source policy changed since review"
         );
+        // The campaign ID is not known before create. Validate every derived
+        // field with an already valid ID before allowing the first WB write.
+        super::validate_wb_automation_policy(&self.target_policy(policy, SOURCE))
+            .context("derived target robot policy is invalid")?;
         ensure!(
             !self.reader_proxy.is_empty() && !self.writer_proxy.is_empty(),
             "dedicated egress proxies are mandatory"
@@ -214,17 +230,7 @@ impl Operator {
     }
 
     fn target_policy(&self, id: u64) -> WbAutomationPolicy {
-        let mut policy = self.policy.clone();
-        policy.campaign_id = id;
-        NAME.clone_into(&mut policy.campaign_name);
-        policy.nm_ids = NMS.to_vec();
-        policy
-            .authorized_by_actor_id
-            .clone_from(&self.manifest.actor_id);
-        policy
-            .authorization_reference
-            .clone_from(&self.manifest.authorization_reference);
-        policy
+        self.manifest.target_policy(&self.policy, id)
     }
 
     async fn details(&self, id: u64) -> Result<CampaignObservation> {

@@ -2,6 +2,25 @@ use super::*;
 use crate::test_support::mock_http_with_hook;
 
 #[tokio::test]
+async fn invalid_target_authorization_is_rejected_before_journaling_create() {
+    let mut fixture = Fixture::new(LaunchScope::FundAndStart);
+    fixture.manifest.authorization_reference = "user approved Nexus".to_owned();
+    private_json(
+        &fixture.path,
+        &serde_json::to_value(&fixture.manifest).unwrap(),
+    );
+    let error = run_wb_campaign_launch("create", &fixture.path)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("derived target robot policy is invalid")
+    );
+    assert!(!fixture.root.join("ofk_region_wb-Nexus").exists());
+}
+
+#[tokio::test]
 async fn revoked_authorization_during_final_read_prevents_attempt_and_patch() {
     let fixture = Fixture::new(LaunchScope::CreateOnly);
     let path = fixture.path.clone();
