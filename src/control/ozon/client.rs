@@ -458,9 +458,8 @@ impl OzonAdsWriteClient {
             .map_err(|error| match error {
                 // The token exchange happens before the guarded mutation and
                 // therefore cannot make the marketplace write ambiguous.
-                OzonWriteError::ResponseTooLarge => OzonWriteError::TokenResponseTooLarge,
-                OzonWriteError::AmbiguousTransport => OzonWriteError::TokenTransport,
-                other => other,
+                ResponseBodyError::TooLarge => OzonWriteError::TokenResponseTooLarge,
+                ResponseBodyError::Transport => OzonWriteError::TokenTransport,
             })?;
         let token: TokenResponse =
             serde_json::from_slice(&bytes).map_err(|_| OzonWriteError::InvalidToken)?;
@@ -580,24 +579,34 @@ async fn decode_write_response(response: Response) -> Result<Vec<u8>, OzonWriteE
     if !status.is_success() {
         return Err(classify_status(status));
     }
-    read_bounded(response, MAX_RESPONSE_BYTES).await
+    read_bounded(response, MAX_RESPONSE_BYTES)
+        .await
+        .map_err(|error| match error {
+            ResponseBodyError::TooLarge => OzonWriteError::ResponseTooLarge,
+            ResponseBodyError::Transport => OzonWriteError::AmbiguousTransport,
+        })
 }
 
-async fn read_bounded(mut response: Response, limit: usize) -> Result<Vec<u8>, OzonWriteError> {
+enum ResponseBodyError {
+    TooLarge,
+    Transport,
+}
+
+async fn read_bounded(mut response: Response, limit: usize) -> Result<Vec<u8>, ResponseBodyError> {
     if response
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(OzonWriteError::ResponseTooLarge);
+        return Err(ResponseBodyError::TooLarge);
     }
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|_| OzonWriteError::AmbiguousTransport)?
+        .map_err(|_| ResponseBodyError::Transport)?
     {
         if body.len().saturating_add(chunk.len()) > limit {
-            return Err(OzonWriteError::ResponseTooLarge);
+            return Err(ResponseBodyError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -638,3 +647,6 @@ fn write_http_builder(timeout: Duration) -> reqwest::ClientBuilder {
 
 #[cfg(test)]
 mod retry_tests;
+
+#[cfg(test)]
+mod response_tests;
