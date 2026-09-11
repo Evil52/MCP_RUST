@@ -431,13 +431,14 @@ mod tests {
         assert_eq!(caller_config.get_connect_timeout(), None);
         assert!(!caller_config.get_keepalives());
         assert_eq!(caller_config.get_options(), Some(OPTIONS));
-        connect.abort();
-        assert!(
+        tokio::time::advance(CONNECT_TIMEOUT).await;
+        assert_eq!(
             connect
                 .await
-                .err()
-                .expect("connect was cancelled")
-                .is_cancelled()
+                .expect("hardened startup task completes")
+                .err(),
+            Some(PostgresUnavailable),
+            "a caller without a connect timeout still receives a bounded connection"
         );
         assert_peer_closed(peer).await;
     }
