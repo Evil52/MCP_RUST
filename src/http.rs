@@ -1040,30 +1040,10 @@ async fn limit_mcp_request_concurrency(
         return Response::from_parts(parts, Body::new(body));
     }
 
-    // The MCP authorization specification requires the access token on every
-    // HTTP request. Authenticate before body polling or session lookup and
-    // carry the exact registry snapshot used for OIDC mapping into the request
-    // so downstream RBAC cannot observe a different reload. A dedicated gate
-    // bounds JWT/JWKS futures without letting unauthenticated work occupy the
-    // subsequent MCP execution/stream budget.
-    let mut authenticated_subject = None;
-    if let Some(authenticator) = &limits.authenticator {
-        let Some(auth_permit) = limits.try_enter_auth(&method) else {
-            return capacity_exhausted_response("MCP authentication capacity exhausted");
-        };
-        match authenticator
-            .authenticate_with_registry(request.headers())
-            .await
-        {
-            Ok(access) => {
-                authenticated_subject = Some(access.subject.clone());
-                request.extensions_mut().insert(access.actor);
-                request.extensions_mut().insert(access.registry);
-            }
-            Err(failure) => return authentication_failure_response(authenticator, failure),
-        }
-        drop(auth_permit);
-    }
+    let authenticated_subject = match session::authenticate_request(&limits, &mut request).await {
+        Ok(subject) => subject,
+        Err(response) => return *response,
+    };
 
     let incoming_session_id = match session::authorize_request(
         &limits,

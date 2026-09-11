@@ -1,7 +1,48 @@
 use super::{
-    HeaderMap, MCP_SESSION_ID_HEADER, McpHttpLimits, Method, Response, SessionOwners, StatusCode,
-    body_failure_response, unknown_mcp_session_response,
+    HeaderMap, MCP_SESSION_ID_HEADER, McpHttpLimits, Method, Request, Response, SessionOwners,
+    StatusCode, authentication_failure_response, body_failure_response,
+    capacity_exhausted_response, unknown_mcp_session_response,
 };
+
+pub(super) async fn authenticate_request(
+    limits: &McpHttpLimits,
+    request: &mut Request,
+) -> Result<Option<String>, Box<Response>> {
+    // The MCP authorization specification requires the access token on every
+    // HTTP request. Authenticate before body polling or session lookup and
+    // carry the exact registry snapshot used for OIDC mapping into the request
+    // so downstream RBAC cannot observe a different reload. A dedicated gate
+    // bounds JWT/JWKS futures without letting unauthenticated work occupy the
+    // subsequent MCP execution/stream budget.
+    let mut authenticated_subject = None;
+    let method = request.method().clone();
+    if let Some(authenticator) = &limits.authenticator {
+        let Some(auth_permit) = limits.try_enter_auth(&method) else {
+            return Err(Box::new(capacity_exhausted_response(
+                "MCP authentication capacity exhausted",
+            )));
+        };
+        match authenticator
+            .authenticate_with_registry(request.headers())
+            .await
+        {
+            Ok(access) => {
+                authenticated_subject = Some(access.subject.clone());
+                request.extensions_mut().insert(access.actor);
+                request.extensions_mut().insert(access.registry);
+            }
+            Err(failure) => {
+                return Err(Box::new(authentication_failure_response(
+                    authenticator,
+                    failure,
+                )));
+            }
+        }
+        drop(auth_permit);
+    }
+
+    Ok(authenticated_subject)
+}
 
 pub(super) async fn authorize_request(
     limits: &McpHttpLimits,
@@ -159,6 +200,20 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert!(owners.authorize(&id, "alice").await);
+        reconcile_response(
+            &limits,
+            Some("alice"),
+            &Method::GET,
+            Some(&id),
+            StatusCode::OK,
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            owners.authorize(&id, "alice").await,
+            "successful requests must retain session ownership"
+        );
         let expired = Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::empty())
@@ -215,5 +270,38 @@ mod tests {
             let response = router.oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_request_session_is_rejected_before_tool_dispatch() {
+        use axum::http::Request as HttpRequest;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt as _;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let router = Router::new()
+            .fallback(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::OK }
+            })
+            .layer(middleware::from_fn_with_state(
+                McpHttpLimits::for_test(2, 2, 2, Duration::from_secs(1)),
+                limit_mcp_request_concurrency,
+            ));
+        let request = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .header(MCP_SESSION_ID_HEADER, "first")
+            .header(MCP_SESSION_ID_HEADER, "second")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
