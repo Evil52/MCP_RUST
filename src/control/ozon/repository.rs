@@ -67,9 +67,17 @@ mod expiry_boundary_tests;
 #[cfg(test)]
 mod guard_boundary_tests;
 #[cfg(test)]
+mod launch_boundary_tests;
+#[cfg(test)]
 mod policy_approval_tests;
 #[cfg(test)]
 mod release_tests;
+
+#[derive(Clone, Copy)]
+enum GuardStopOutcome<'a> {
+    Stopped,
+    Incident(&'a str),
+}
 
 #[derive(Clone)]
 pub struct OzonPlanRepository {
@@ -1292,7 +1300,7 @@ impl OzonPlanRepository {
         spend_minor: Option<u64>,
         revenue_minor: Option<u64>,
     ) -> Result<(), OzonPlanStoreError> {
-        self.finish_guard_lease(lease, "stopped", None, spend_minor, revenue_minor)
+        self.finish_guard_lease(lease, GuardStopOutcome::Stopped, spend_minor, revenue_minor)
             .await
     }
 
@@ -1418,8 +1426,7 @@ impl OzonPlanRepository {
         validate_error_class(error_class)?;
         self.finish_guard_lease(
             lease,
-            "incident",
-            Some(error_class),
+            GuardStopOutcome::Incident(error_class),
             spend_minor,
             revenue_minor,
         )
@@ -1429,18 +1436,18 @@ impl OzonPlanRepository {
     async fn finish_guard_lease(
         &self,
         lease: &OzonGuardStopLease,
-        status: &str,
-        incident_error_class: Option<&str>,
+        outcome: GuardStopOutcome<'_>,
         spend_minor: Option<u64>,
         revenue_minor: Option<u64>,
     ) -> Result<(), OzonPlanStoreError> {
         validate_guard_stop_lease(lease)?;
-        if let Some(error_class) = incident_error_class {
-            validate_error_class(error_class)?;
-        }
-        if (status == "incident") != incident_error_class.is_some() {
-            return Err(OzonPlanStoreError::InvalidPlan);
-        }
+        let (status, incident_error_class, event_type) = match outcome {
+            GuardStopOutcome::Stopped => ("stopped", None, "guard_stop_stopped"),
+            GuardStopOutcome::Incident(error_class) => {
+                validate_error_class(error_class)?;
+                ("incident", Some(error_class), "guard_stop_incident")
+            }
+        };
         validate_guard_metrics_pair(spend_minor, revenue_minor)?;
         if spend_minor != lease.spend_minor || revenue_minor != lease.revenue_minor {
             return Err(OzonPlanStoreError::InvalidState);
@@ -1495,11 +1502,7 @@ impl OzonPlanRepository {
                 &tx,
                 &lease.guard.plan_id,
                 &lease.owner_id,
-                if status == "stopped" {
-                    "guard_stop_stopped"
-                } else {
-                    "guard_stop_incident"
-                },
+                event_type,
                 &serde_json::json!({
                     "generation": lease.generation,
                     "stop_reason": lease.stop_reason,
@@ -2529,21 +2532,4 @@ pub(super) fn map_plan_insert(error: &tokio_postgres::Error) -> OzonPlanStoreErr
 }
 
 #[cfg(test)]
-mod lease_budget_tests {
-    use super::{GUARD_STOP_LEASE_TTL, WORKFLOW_LEASE_TTL};
-    use chrono::Duration;
-
-    #[test]
-    fn five_minute_leases_cover_composed_vendor_io_with_margin() {
-        // Launch: OAuth + bounded final preflight + both pacing boundaries +
-        // one mutation + an overall-bounded readback.
-        let launch_worst_case = Duration::seconds(30 + 60 + 2 + 30 + 2 + 60);
-        // Guard: metrics/campaign pre-read, OAuth, mutation and final readback,
-        // plus both cross-client pacing boundaries.
-        let guard_worst_case = Duration::seconds(4 * 30 + 2 * 2);
-        let safety_margin = Duration::seconds(60);
-
-        assert!(launch_worst_case + safety_margin < WORKFLOW_LEASE_TTL);
-        assert!(guard_worst_case + safety_margin < GUARD_STOP_LEASE_TTL);
-    }
-}
+mod lease_budget_tests;
