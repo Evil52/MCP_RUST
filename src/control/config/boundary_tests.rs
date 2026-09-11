@@ -59,6 +59,20 @@ fn planner_refuses_an_explicit_marketplace_write_gate() {
     let id = TempCredential::new("planner-boundary-id", "planner-client");
     let secret = TempCredential::new("planner-boundary-secret", "runtime-secret");
     let mut values = ozon_runtime_values(&fixtures, &id, &secret);
+    let config = from(&values).unwrap();
+    values.insert(
+        "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED".to_owned(),
+        "yes".to_owned(),
+    );
+    let error = load_ozon_runtime(
+        &mut |key| values.get(key).cloned(),
+        &config.auth,
+        &config.policy,
+        &config.registry.load().unwrap(),
+        OzonRuntimeIdentity::Planner,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("строго true или false"));
     values.insert(
         "CONTROL_MCP_MARKETPLACE_WRITES_ENABLED".to_owned(),
         "true".to_owned(),
