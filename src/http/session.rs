@@ -299,9 +299,22 @@ mod tests {
             .body(Body::from("{}"))
             .unwrap();
         assert_eq!(
-            router.oneshot(request).await.unwrap().status(),
+            router.clone().oneshot(request).await.unwrap().status(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let valid = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header("host", "localhost")
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            router.oneshot(valid).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

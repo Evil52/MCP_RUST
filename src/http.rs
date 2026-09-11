@@ -1056,16 +1056,13 @@ async fn limit_mcp_request_concurrency(
         Err(response) => return *response,
     };
 
-    let permit = if method == Method::GET {
-        let Some(permit) = limits.try_enter_stream() else {
-            return capacity_exhausted_response("MCP stream capacity exhausted");
-        };
-        permit
+    let (permit, exhausted_message) = if method == Method::GET {
+        (limits.try_enter_stream(), "MCP stream capacity exhausted")
     } else {
-        let Some(permit) = limits.try_enter_request() else {
-            return capacity_exhausted_response("MCP request capacity exhausted");
-        };
-        permit
+        (limits.try_enter_request(), "MCP request capacity exhausted")
+    };
+    let Some(permit) = permit else {
+        return capacity_exhausted_response(exhausted_message);
     };
 
     if method == Method::GET {
@@ -1299,6 +1296,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    mod body_admission;
+
     use std::{
         convert::Infallible,
         sync::{
@@ -1596,42 +1595,6 @@ mod tests {
         );
     }
 
-    struct OversizedHintBody;
-
-    impl HttpBody for OversizedHintBody {
-        type Data = Bytes;
-        type Error = Infallible;
-
-        fn poll_frame(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            panic!("an already oversized size hint must be rejected before polling")
-        }
-
-        fn size_hint(&self) -> SizeHint {
-            SizeHint::with_exact((MCP_REQUEST_BODY_LIMIT_BYTES + 1) as u64)
-        }
-    }
-
-    struct OversizedFrameBody;
-
-    impl HttpBody for OversizedFrameBody {
-        type Data = Bytes;
-        type Error = Infallible;
-
-        fn poll_frame(
-            self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![
-                0;
-                MCP_REQUEST_BODY_LIMIT_BYTES
-                    + 1
-            ])))))
-        }
-    }
-
     struct FailingBody;
 
     impl HttpBody for FailingBody {
@@ -1644,10 +1607,6 @@ mod tests {
         ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
             Poll::Ready(Some(Err(std::io::Error::other("test body failure"))))
         }
-    }
-
-    struct TrailersBody {
-        emitted: bool,
     }
 
     fn test_authenticator() -> JwtAuthenticator {
@@ -1686,22 +1645,6 @@ mod tests {
             registry,
         )
         .expect("test authenticator builds")
-    }
-
-    impl HttpBody for TrailersBody {
-        type Data = Bytes;
-        type Error = Infallible;
-
-        fn poll_frame(
-            mut self: Pin<&mut Self>,
-            _context: &mut Context<'_>,
-        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-            if self.emitted {
-                return Poll::Ready(None);
-            }
-            self.emitted = true;
-            Poll::Ready(Some(Ok(Frame::trailers(axum::http::HeaderMap::new()))))
-        }
     }
 
     fn middleware_test_router(limits: McpHttpLimits, reached: Arc<AtomicUsize>) -> Router {
@@ -2190,40 +2133,6 @@ mod tests {
                 .expect("fixed authentication body is readable");
             assert_eq!(body.as_ref(), failure.public_message().as_bytes());
         }
-    }
-
-    #[tokio::test]
-    async fn bounded_body_reader_ignores_non_data_frames() {
-        let body = Body::new(TrailersBody { emitted: false });
-        let bytes = read_bounded_mcp_body(body)
-            .await
-            .ok()
-            .expect("trailers are not a transport failure");
-        assert!(bytes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn bounded_body_reader_rejects_an_oversized_lower_hint_before_polling() {
-        let error = read_bounded_mcp_body(Body::new(OversizedHintBody))
-            .await
-            .expect_err("an oversized lower bound cannot fit the request budget");
-        assert!(matches!(error, McpBodyReadFailure::TooLarge));
-    }
-
-    #[tokio::test]
-    async fn bounded_body_reader_rejects_a_frame_that_exhausts_the_remaining_budget() {
-        let error = read_bounded_mcp_body(Body::new(OversizedFrameBody))
-            .await
-            .expect_err("an oversized frame cannot fit the request budget");
-        assert!(matches!(error, McpBodyReadFailure::TooLarge));
-    }
-
-    #[test]
-    #[should_panic(expected = "an already oversized size hint must be rejected before polling")]
-    fn oversized_hint_body_guard_panics_if_polled() {
-        let mut body = OversizedHintBody;
-        let mut context = Context::from_waker(std::task::Waker::noop());
-        let _ = Pin::new(&mut body).poll_frame(&mut context);
     }
 
     #[test]
