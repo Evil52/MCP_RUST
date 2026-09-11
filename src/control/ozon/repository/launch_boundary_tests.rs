@@ -133,6 +133,22 @@ async fn each_prewrite_conflict_is_bound_to_its_stage_and_existing_campaign() {
                     .err(),
                 Some(OzonPlanStoreError::InvalidState)
             );
+            let forged_recovery = OzonLaunchLease {
+                mode: OzonLaunchClaimMode::Reconcile,
+                ..lease.clone()
+            };
+            assert_eq!(
+                database
+                    .executor
+                    .complete_launch_action(
+                        &forged_recovery,
+                        Some(42),
+                        Some(&stage_readback(&forged_recovery)),
+                    )
+                    .await
+                    .err(),
+                Some(OzonPlanStoreError::InvalidState)
+            );
             let called = AtomicBool::new(false);
             assert_eq!(
                 database
@@ -153,6 +169,23 @@ async fn each_prewrite_conflict_is_bound_to_its_stage_and_existing_campaign() {
         assert_eq!(failed.status, OzonLaunchStatus::Failed);
         assert_eq!(failed.campaign_id, lease.plan.campaign_id);
         assert_eq!(failed.last_error_class.as_deref(), Some(reason));
+        assert_eq!(
+            database
+                .planner
+                .approve(
+                    &failed.plan_id,
+                    "approver",
+                    &failed.plan_digest,
+                    "boundary/reapprove-terminal",
+                )
+                .await
+                .err(),
+            Some(OzonPlanStoreError::InvalidState)
+        );
+        let after = database.planner.load(&failed.plan_id).await.unwrap();
+        assert_eq!(after.status, OzonLaunchStatus::Failed);
+        assert_eq!(after.approval, failed.approval);
+        assert_eq!(after.workflow_generation, failed.workflow_generation);
         assert!(
             database
                 .executor

@@ -2,6 +2,41 @@ use super::*;
 use crate::control::ozon::launch_workflow::tests::adapter_fixture::AuthorizationFixture;
 
 #[test]
+fn workflow_claim_modes_follow_the_exact_stage_transition_table() {
+    use OzonLaunchClaimMode::{Execute, Reconcile};
+    use OzonLaunchStatus::{
+        Activating, AddingProducts, Ambiguous, Applied, Approved, Created, Creating, Expired,
+        Failed, Prepared, ProductsAdded,
+    };
+    let actions = [
+        OzonLaunchAction::CreateCampaign,
+        OzonLaunchAction::AddProducts,
+        OzonLaunchAction::ActivateCampaign,
+    ];
+    for (status, expected) in [
+        (Prepared, [None, None, None]),
+        (Approved, [Some(Execute), None, None]),
+        (Creating, [Some(Reconcile), None, None]),
+        (Created, [None, Some(Execute), None]),
+        (AddingProducts, [None, Some(Reconcile), None]),
+        (ProductsAdded, [None, None, Some(Execute)]),
+        (Activating, [None, None, Some(Reconcile)]),
+        (Ambiguous, [Some(Reconcile); 3]),
+        (Applied, [None, None, None]),
+        (Failed, [None, None, None]),
+        (Expired, [None, None, None]),
+    ] {
+        for (action, mode) in actions.into_iter().zip(expected) {
+            assert_eq!(
+                workflow_claim_mode(status, action),
+                mode.ok_or(OzonPlanStoreError::Unavailable),
+                "{status:?}/{action:?}",
+            );
+        }
+    }
+}
+
+#[test]
 fn completion_requires_correlated_campaign_and_readback_evidence() {
     let authorization = AuthorizationFixture::new();
     let mut lease = OzonLaunchLease {
