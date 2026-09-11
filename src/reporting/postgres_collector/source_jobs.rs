@@ -237,7 +237,10 @@ impl PostgresSnapshotWriter {
         version: &str,
     ) -> Result<i64, PostgresCollectorError> {
         if facts.source() != claim.source {
-            return Err(PostgresCollectorError::InvalidInput);
+            return Err(super::sales_validation::reject_metadata(
+                claim.source,
+                "source_mismatch",
+            ));
         }
         let mut client = self
             .client
@@ -257,12 +260,12 @@ impl PostgresSnapshotWriter {
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?
             .ok_or(PostgresCollectorError::ClaimLost)?;
-        let first: DateTime<Utc> = row
-            .get::<_, Option<_>>(0)
-            .ok_or(PostgresCollectorError::InvalidInput)?;
-        let observed: DateTime<Utc> = row
-            .get::<_, Option<_>>(1)
-            .ok_or(PostgresCollectorError::InvalidInput)?;
+        let first: DateTime<Utc> = row.get::<_, Option<_>>(0).ok_or_else(|| {
+            super::sales_validation::reject_metadata(claim.source, "missing_first_observation")
+        })?;
+        let observed: DateTime<Utc> = row.get::<_, Option<_>>(1).ok_or_else(|| {
+            super::sales_validation::reject_metadata(claim.source, "missing_last_observation")
+        })?;
         let period = matches!(
             claim.source,
             SnapshotSource::Sales | SnapshotSource::Advertising | SnapshotSource::Finance

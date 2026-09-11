@@ -214,9 +214,7 @@ impl ReportingReader {
         self.repository.enabled()
     }
 
-    /// Probes the configured repository without exposing connection details.
-    /// The intentional no-database mode is ready; a configured PostgreSQL
-    /// reader must complete a round trip through its supervised session.
+    /// Revalidates a configured repository's schema, query and role contracts.
     pub async fn probe(&self) -> Result<(), ReportingReadError> {
         self.repository.probe().await
     }
@@ -594,6 +592,8 @@ impl PostgresReportingRepository {
                     AND current_setting('transaction_read_only')::boolean \
                     AND has_schema_privilege(current_user, 'daily_reporting', 'USAGE') \
                     AND NOT has_schema_privilege(current_user, 'daily_reporting', 'CREATE') \
+                    AND has_table_privilege(current_user, \
+                        'daily_reporting.mcp_source_collection_jobs', 'SELECT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.mcp_collection_status', 'SELECT') \
                     AND has_table_privilege(current_user, \
@@ -1313,12 +1313,7 @@ impl ReportingReadRepository for PostgresReportingRepository {
     }
 
     fn probe(&self) -> ReportingReadFuture<'_, ()> {
-        Box::pin(async move {
-            self.client
-                .probe()
-                .await
-                .map_err(|_| ReportingReadError::Unavailable)
-        })
+        Box::pin(self.verify_runtime_contract())
     }
 
     fn source_snapshot<'a>(
@@ -1670,6 +1665,9 @@ fn validate_reader_database(config: &Config) -> Result<(), ReportingReadError> {
         Err(ReportingReadError::InvalidRequest)
     }
 }
+
+#[cfg(test)]
+mod readiness_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2385,6 +2383,7 @@ mod tests {
     async fn absent_configuration_is_the_explicit_disabled_mode() {
         let reader = ReportingReader::connect_optional(None).await.unwrap();
         assert!(!reader.is_enabled());
+        assert_eq!(reader.probe().await, Ok(()));
         assert_eq!(
             format!("{reader:?}"),
             "ReportingReader { enabled: false, .. }"

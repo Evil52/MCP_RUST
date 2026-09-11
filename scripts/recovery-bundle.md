@@ -1,7 +1,7 @@
 # Offline Mac recovery bundle
 
 `recovery-bundle.py` packages an explicit set of configuration files alongside
-the existing database/artifact backup. It does not discover files, read Docker
+the existing database/artifact/guard-state backup. It does not discover files, read Docker
 state, contact a service, install anything, execute archived scripts, or send a
 backup offsite. Python 3.10+ and native `age` are required on macOS/Linux.
 
@@ -58,10 +58,19 @@ All hook dependencies must fit these explicit slots; unsupported providers
 require a reviewed extension, not a recursive directory inclusion.
 
 Use `data_backup_manifest` for the existing backup directory's `manifest.json`.
-Its two age archive hashes are then covered by the authenticated configuration
-bundle. It does not read/verify the data archives: run `verify-position-backup.sh`
+Its age archive hashes are then covered by the authenticated configuration
+bundle: the v2 database/artifact pair, or the complete v3 set including
+`ozon-guard-state.tar.age` and its exclusive-lease consistency contract.
+An incomplete v3 manifest is refused. Legacy v2 has no guard recovery coverage.
+It does not read/verify the data archives: run `verify-position-backup.sh`
 separately. A future offsite hook should transfer the complete backup directory,
 including `recovery.tar.age`, as one unit.
+
+Guarded capture requires an operator maintenance window: the running guard owns
+its state lease for its whole lifetime, so backup fails before dumping while
+that lease is busy. It never stops the executor. See
+[`docs/disaster-recovery.md`](../docs/disaster-recovery.md) for state volume
+discovery, the single-account limit, legacy behavior and required runtime checks.
 
 Secret inputs, recipient/identity files, and the input manifest require mode 600.
 Scripts and public metadata can retain mode 600/644/700/755. Registries may be

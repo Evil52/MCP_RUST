@@ -11,6 +11,23 @@ case "$require_migration_ledger" in
   *) exit 1 ;;
 esac
 
+# Compare the ledger with the files shipped in this image. A count alone can
+# stay green when a missing migration is replaced by an unexpected one, or
+# when a recorded checksum no longer matches the image.
+expected_migrations=""
+for path in /opt/mcp-ozon/migrations/*.sql; do
+  [ -f "$path" ] && [ ! -L "$path" ] || exit 1
+  migration_id="${path##*/}"
+  printf '%s' "$migration_id" | grep -Eq '^[0-9]{3}_[a-z0-9_]+[.]sql$' || exit 1
+  checksum="$(sha256sum "$path" | awk '{ print $1 }')"
+  printf '%s' "$checksum" | grep -Eq '^[0-9a-f]{64}$' || exit 1
+  if [ -n "$expected_migrations" ]; then
+    expected_migrations="$expected_migrations,"
+  fi
+  expected_migrations="$expected_migrations('$migration_id','$checksum')"
+done
+[ -n "$expected_migrations" ] || exit 1
+
 healthy="$({
   PGPASSWORD="$POSTGRES_PASSWORD" psql \
     --host=127.0.0.1 \
@@ -20,6 +37,7 @@ healthy="$({
     --no-align \
     --tuples-only \
     --set=ON_ERROR_STOP=1 \
+    --set=expected_migrations="$expected_migrations" \
     --set=require_migration_ledger="$require_migration_ledger" <<'SQL'
 SELECT
     to_regclass('search_position.monitors') IS NOT NULL
@@ -1767,11 +1785,16 @@ SELECT
         :'require_migration_ledger' = 'false'
         OR (
             to_regclass('mcp_runtime.schema_migrations') IS NOT NULL
-            AND (
-                SELECT count(*) = 29
-                    AND bool_and(state = 'applied')
-                    AND bool_and(applied_at IS NOT NULL)
-                FROM mcp_runtime.schema_migrations
+            AND NOT EXISTS (
+                SELECT 1
+                FROM (VALUES :expected_migrations) AS expected(migration_id, sha256)
+                FULL OUTER JOIN mcp_runtime.schema_migrations AS recorded
+                    USING (migration_id)
+                WHERE expected.migration_id IS NULL
+                    OR recorded.migration_id IS NULL
+                    OR recorded.sha256::text IS DISTINCT FROM expected.sha256
+                    OR recorded.state IS DISTINCT FROM 'applied'
+                    OR recorded.applied_at IS NULL
             )
         )
     );

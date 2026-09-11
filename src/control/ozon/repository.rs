@@ -51,10 +51,7 @@ impl OzonPlanRepository {
     }
 
     pub async fn probe(&self) -> Result<(), OzonPlanStoreError> {
-        self.client
-            .probe()
-            .await
-            .map_err(|_| OzonPlanStoreError::Unavailable)
+        self.verify_runtime_contract().await
     }
 
     pub async fn verify_runtime_contract(&self) -> Result<(), OzonPlanStoreError> {
@@ -136,9 +133,8 @@ impl OzonPlanRepository {
         committed
     }
 
-    /// Holds the latest policy revision and all three account/SKU gate rows
-    /// through a local static-state mutation marker. The caller must perform
-    /// the provider request immediately after this permit returns.
+    /// Holds the latest policy revision and three account/SKU gate rows through a local
+    /// mutation marker. The caller must issue the provider request immediately after return.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) async fn authorize_static_guard_write<F, Fut>(
         &self,
@@ -598,9 +594,8 @@ impl OzonPlanRepository {
         self.load(plan_id).await
     }
 
-    /// Claims the next explicitly requested executable action for one runtime
-    /// account. It never returns an uncertain action; those are exclusively
-    /// handled by `claim_launch_recovery`.
+    /// Claims the next explicitly requested executable action for one runtime account.
+    /// Uncertain actions are exclusively handled by `claim_launch_recovery`.
     pub(in crate::control) async fn claim_next_launch_action(
         &self,
         account_id: &str,
@@ -2803,17 +2798,18 @@ pub(super) fn map_plan_insert(error: &tokio_postgres::Error) -> OzonPlanStoreErr
 }
 
 #[cfg(test)]
+mod readiness_tests;
+
+#[cfg(test)]
 mod lease_budget_tests {
     use super::{GUARD_STOP_LEASE_TTL, WORKFLOW_LEASE_TTL};
     use chrono::Duration;
 
     #[test]
     fn five_minute_leases_cover_composed_vendor_io_with_margin() {
-        // Launch: OAuth + bounded final preflight + both pacing boundaries +
-        // one mutation + an overall-bounded readback.
+        // Launch: OAuth + bounded final preflight + both pacing bounds + mutation + bounded readback.
         let launch_worst_case = Duration::seconds(30 + 60 + 2 + 30 + 2 + 60);
-        // Guard: metrics/campaign pre-read, OAuth, mutation and final readback,
-        // plus both cross-client pacing boundaries.
+        // Guard: metrics/campaign pre-read + OAuth + mutation + readback + cross-client pacing.
         let guard_worst_case = Duration::seconds(4 * 30 + 2 * 2);
         let safety_margin = Duration::seconds(60);
 

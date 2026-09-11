@@ -15,6 +15,7 @@ runtime_dir="${MCP_RUNTIME_DIR:-$HOME/.local/share/mcp-ozon-runtime}"
 recipients_file="${MCP_BACKUP_AGE_RECIPIENTS_FILE:-$runtime_dir/backup-age-recipients.txt}"
 identity_file="${MCP_BACKUP_AGE_IDENTITY_FILE:-$runtime_dir/backup-age-identity.txt}"
 backup_dir="${MCP_BACKUP_DIR:-$HOME/MCP_OZON-backups}"
+guard_volume="${MCP_BACKUP_GUARD_STATE_VOLUME:-}"
 notify_command="${MCP_HEALTH_NOTIFY_COMMAND:-}"
 heartbeat_command="${MCP_HEALTH_HEARTBEAT_COMMAND:-}"
 hook_timeout="${MCP_HEALTH_HOOK_TIMEOUT_SECONDS:-10}"
@@ -43,6 +44,13 @@ health_template="$project_root/ops/macos/com.ofk.mcp-ozon-health.plist.in"
 restore_template="$project_root/ops/macos/com.ofk.mcp-ozon-restore-verify.plist.in"
 
 umask 077
+
+# Empty retains automatic discovery. An explicit Docker named volume must also
+# be safe to substitute into the XML plist and the sed replacement expression.
+if [[ -n "$guard_volume" && ! "$guard_volume" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+  echo "MCP_BACKUP_GUARD_STATE_VOLUME must be a Docker named volume or empty for discovery" >&2
+  exit 1
+fi
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "operations LaunchAgent installer supports only macOS" >&2
@@ -205,6 +213,7 @@ render() {
     -e "s|__POSTGRES_IMAGE__|$db_image|g" \
     -e "s|__POSITION_ENV__|$position_env_target|g" \
     -e "s|__BACKUP_DIR__|$backup_dir|g" \
+    -e "s|__GUARD_STATE_VOLUME__|$guard_volume|g" \
     -e "s|__AGE_RECIPIENTS_FILE__|$recipients_file|g" \
     -e "s|__AGE_IDENTITY_FILE__|$identity_file|g" \
     -e "s|__NOTIFY_COMMAND__|$notify_command|g" \
@@ -247,6 +256,7 @@ MCP_OPS_POSTGRES_IMAGE="$db_image" \
 MCP_BACKUP_POSITION_ENV="$position_env_target" \
 MCP_BACKUP_AGE_RECIPIENTS_FILE="$recipients_file" \
 MCP_BACKUP_DIR="$backup_dir" \
+MCP_BACKUP_GUARD_STATE_VOLUME="$guard_volume" \
 MCP_BACKUP_OFFSITE_COMMAND="$offsite_command" \
 MCP_BACKUP_ALLOW_LOCAL_ONLY="$allow_local_only" \
   "$libexec_dir/backup-position-stack.sh"

@@ -9,6 +9,56 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Exercise the installer's actual render/first-backup blocks without executing
+# its host installation, LaunchAgent, or production backup side effects.
+python3 - "$project_root" "$test_root" <<'PY'
+import os
+from pathlib import Path
+import plistlib
+import re
+import subprocess
+import sys
+
+project, temporary = map(Path, sys.argv[1:])
+installer = project / 'scripts/install-operations-agents.sh'
+source = installer.read_text()
+render_start = source.index('render() {')
+render_end = source.index('\n}\n', render_start) + 3
+render = source[render_start:render_end]
+first_start = source.index('echo "==> taking one backup"')
+first_end = source.index('echo "==> restoring it into a disposable database"', first_start)
+first_backup = source[first_start:first_end]
+runner_dir = temporary / 'installer-fixture'
+runner_dir.mkdir()
+capture = runner_dir / 'selected-volume'
+runner = runner_dir / 'backup-position-stack.sh'
+runner.write_text('#!/bin/bash\nset -eu\nprintf "%s" "${MCP_BACKUP_GUARD_STATE_VOLUME-UNSET}" >"$TEST_GUARD_CAPTURE"\n')
+runner.chmod(0o700)
+
+for volume in ('fixture-guard_state.1', ''):
+    environment = os.environ.copy()
+    for name in re.findall(r'\$([a-z_][a-z_0-9]*)', render + first_backup):
+        environment[name] = 'fixture-value'
+    environment.update(guard_volume=volume, libexec_dir=str(runner_dir),
+                       TEST_GUARD_CAPTURE=str(capture))
+    result = subprocess.run(['bash', '-euc', render + '\nrender "$1" "$2"',
+                             'installer-render-test', str(runner),
+                             str(project / 'ops/macos/com.ofk.mcp-ozon-backup.plist.in')],
+                            env=environment, capture_output=True, check=True)
+    rendered = plistlib.loads(result.stdout)
+    assert rendered['EnvironmentVariables']['MCP_BACKUP_GUARD_STATE_VOLUME'] == volume
+    subprocess.run(['bash', '-euc', first_backup], env=environment,
+                   capture_output=True, check=True)
+    assert capture.read_text() == volume
+
+for invalid in ('/tmp/guard', '../guard', 'guard:ro', 'guard|other', '<guard>',
+                '-guard', 'guard&other', 'guard\nother'):
+    result = subprocess.run(['bash', str(installer)], capture_output=True,
+                            env={**os.environ, 'MCP_BACKUP_GUARD_STATE_VOLUME': invalid})
+    assert result.returncode == 1
+    assert result.stderr == b'MCP_BACKUP_GUARD_STATE_VOLUME must be a Docker named volume or empty for discovery\n'
+PY
+
 # Reproduce installation from a disposable checkout, then delete that checkout.
 # All credentials, archives and command doubles below belong to this test.
 staging="$test_root/staging"
@@ -28,11 +78,15 @@ cat >"$test_root/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
-  info | volume | network) exit 0 ;;
+  info | volume | network | rm) exit 0 ;;
+  logs) printf 'locked\n' ;;
+  inspect) printf 'true|test-started-at\n' ;;
   ps) printf 'running|Up 1 minute (healthy)\n' ;;
   container) printf 'running|healthy\n' ;;
   run)
     case "$*" in
+      *--detach*) printf 'test-lease-container\n' ;;
+      *'cat /guard-state/state.json'*) printf '{"last_static_audit_event_id":1}\n' ;;
       *pg_dump*) head -c 4096 /dev/zero ;;
       *tar*) printf 'synthetic artifact archive' ;;
       *) cat >"${TEST_OPS_SQL_CAPTURE:-/dev/null}"; printf 'cycle_age|0\n' ;;
@@ -69,6 +123,7 @@ env \
   MCP_BACKUP_POSITION_ENV="$test_root/position.env" \
   MCP_BACKUP_AGE_RECIPIENTS_FILE="$test_root/recipients" \
   MCP_BACKUP_DIR="$test_root/backups" \
+  MCP_BACKUP_GUARD_STATE_VOLUME=test-guard-state \
   MCP_BACKUP_OFFSITE_COMMAND='' \
   MCP_BACKUP_ALLOW_LOCAL_ONLY=true \
   bash "$installed/backup-position-stack.sh" >"$test_root/backup.log"
@@ -78,6 +133,7 @@ jq --exit-status --arg image "$db_image" \
   '.postgres_image == $image and .archives["position-db.dump.age"].bytes == 4096' \
   "$backup/manifest.json" >/dev/null
 test -s "$backup/report-artifacts.tar.age"
+test -s "$backup/ozon-guard-state.tar.age"
 test -f "$backup/local-only-risk-accepted.json"
 : >"$backup/restore-verified.json"
 : >"$test_root/ready"

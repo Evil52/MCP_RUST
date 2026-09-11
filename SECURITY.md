@@ -248,14 +248,21 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   reports incident classes, unresolved marketplace actions, stalled report work, an unhealthy or
   absent data plane, and a stale backup. Without it installed, none of those states reach anyone.
 - Backups are operator-scheduled rather than intrinsic. `scripts/backup-position-stack.sh` captures
-  the database and the artifact volume as one recovery point and
+  the database, artifact volume and configured static Ozon guard state as one recovery point and
   `scripts/verify-position-backup.sh` proves the result by restoring it, but both depend on the
   age identity from `scripts/bootstrap-backup-age-key.sh` being held somewhere other than the host
   being protected. New age v1 archives are authenticated. Legacy manifest-version-1 AES-256-CBC
   backups remain readable, but their recorded SHA-256 only detects accidental corruption, not an
   attacker who can rewrite an archive and its manifest together.
-- The static Ozon guard state volume is not part of that database/artifact backup. Back it up and
-  restore it from the same recovery point as PostgreSQL. Each local snapshot carries the exact
+- Version 3 backups include the static Ozon guard's durable `state.json`. Capture holds the same
+  exclusive local lease as the executor and brackets the database dump with audit-cursor checks;
+  a running guard therefore requires an operator maintenance window, never an automatic stop.
+  Restore verification extracts into a disposable volume, checks exact bytes/permissions and the
+  account-wide database cursor. Only one guard account is supported; multiple-account audit
+  histories fail closed. Base deployments may still create version 2 only when no guard volume
+  is discovered and no static audit history exists. Legacy v1/v2 verification explicitly does not
+  establish guard-state recovery. Restore state and PostgreSQL from the same v3 recovery point.
+  Each local snapshot carries the exact
   account-wide append-only static-write audit high-water mark, so a missing, older, or independently
   restored volume blocks the executor before recovery or a provider write. A fresh or legacy
   deployment must explicitly establish its genesis with

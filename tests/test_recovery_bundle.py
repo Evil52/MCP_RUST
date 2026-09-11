@@ -288,6 +288,33 @@ class RecoveryBundleTests(unittest.TestCase):
         with self.assertRaises(BUNDLE.Refused):
             BUNDLE.build_plaintext(self.record)
 
+    def test_guard_data_manifest_requires_the_complete_consistent_v3_set(self):
+        backup = {"manifest_version": 3,
+                  "capture_order": ["position-db", "ozon-guard-state", "report-artifacts"],
+                  "guard_state": {"file": "state.json", "consistency": "exclusive-state-lease",
+                                  "root_mode": "700", "uid": 10001, "gid": 10001},
+                  "encryption": {"format": "age", "specification": "v1"},
+                  "archives": {name: {"sha256": "d" * 64, "bytes": 1024} for name in (
+                      "position-db.dump.age", "ozon-guard-state.tar.age", "report-artifacts.tar.age")}}
+        file = self.write("data-backup-manifest.json", BUNDLE.json_bytes(backup))
+        self.record["files"]["data_backup_manifest"] = str(file)
+        plaintext, manifest = BUNDLE.build_plaintext(self.record)
+        parsed, contents = BUNDLE.parse_plaintext(plaintext)
+        self.assertEqual(BUNDLE.decode_json(contents["data_backup_manifest"]), backup)
+        self.assertEqual(parsed, manifest)
+        self.assertFalse(BUNDLE.summary(parsed, "verified")["data_backup_archives_verified"])
+        for field in ("guard_state", "capture_order", "archives"):
+            invalid = copy.deepcopy(backup)
+            if field == "guard_state":
+                invalid[field]["consistency"] = "independent-copy"
+            elif field == "capture_order":
+                invalid[field].remove("ozon-guard-state")
+            else:
+                del invalid[field]["ozon-guard-state.tar.age"]
+            file.write_bytes(BUNDLE.json_bytes(invalid))
+            with self.subTest(field=field), self.assertRaises(BUNDLE.Refused):
+                BUNDLE.build_plaintext(self.record)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
