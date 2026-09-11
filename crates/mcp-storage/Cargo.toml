@@ -14,4 +14,4 @@ tokio-postgres = "0.7"
 tracing = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "test-util"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "test-util"] }
