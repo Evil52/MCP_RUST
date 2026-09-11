@@ -132,12 +132,16 @@ impl NackPeer {
                     _ = &mut shutdown_received => break,
                 }
             }
-            connections.abort_all();
-            while let Some(result) = connections.join_next().await {
-                if let Err(error) = result {
-                    assert!(error.is_cancelled(), "protocol peer failed: {error}");
+            // The caller drops its client before finishing the fixture.
+            // Require the real protocol connections to close, rather than
+            // cancelling them and concealing a leaked client connection.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Some(result) = connections.join_next().await {
+                    result.expect("protocol connection closes after client drop");
                 }
-            }
+            })
+            .await
+            .expect("client retained a protocol connection after drop");
         });
         Self {
             base_url,

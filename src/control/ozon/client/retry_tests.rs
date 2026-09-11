@@ -39,6 +39,7 @@ async fn assert_single_attempt(nack: ProtocolNack) {
         ))
     ));
     assert_eq!(permits.load(Ordering::SeqCst), 1);
+    drop(client);
     assert_eq!(peer.finish().await, 1);
 }
 

@@ -49,6 +49,7 @@ async fn assert_attempts(nack: ProtocolNack, use_write_policy: bool, expected_at
         }))
     ));
     assert_eq!(permits.load(Ordering::SeqCst), 1);
+    drop(client);
     assert_eq!(peer.finish().await, expected_attempts);
 }
 
