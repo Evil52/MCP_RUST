@@ -1,5 +1,78 @@
 use super::*;
 
+#[test]
+fn posting_sales_context_accepts_an_explicit_authorized_store() {
+    let store = StoreId::from("store_a");
+    assert_eq!(
+        server().posting_sales_context(&RequestIdentity::dev(), Some(&store)),
+        Ok(store)
+    );
+}
+
+#[tokio::test]
+async fn weekly_ranking_rejects_registry_identifiers_outside_reporting_scope() {
+    let repository = Arc::new(FakeReportingRepository::succeeding());
+    let server = reporting_edge_test_server("admin", repository.clone());
+    let error = reporting_tool_error(
+        server
+            .reporting_weekly_marketplace_ranking(
+                RequestIdentity::dev(),
+                Parameters(ReportingWeeklyMarketplaceRankingInput {
+                    date_from: Some("2026-08-24".to_owned()),
+                    date_to: Some("2026-08-30".to_owned()),
+                }),
+            )
+            .await,
+    );
+    assert!(error.starts_with(REPORTING_INVALID_REQUEST));
+    assert_eq!(repository.calls(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable PostgreSQL fixture"]
+async fn completed_tool_result_survives_terminal_telemetry_permission_loss() {
+    use tracing::instrument::WithSubscriber as _;
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL").unwrap();
+    let writer_url = std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL").unwrap();
+    let (admin, connection) = tokio_postgres::connect(&admin_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let driver = tokio::spawn(connection);
+    let telemetry = ToolTelemetryService::connect_optional(Some(&writer_url))
+        .await
+        .unwrap();
+    let server = server().with_tool_telemetry(telemetry);
+    let (transport, _remote) = tokio::io::duplex(1024);
+    let running =
+        rmcp::service::serve_directly::<RoleServer, _, _, _, _>(server.clone(), transport, None);
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer = ToolNameLogWriter(Arc::clone(&logs));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    admin.batch_execute("REVOKE EXECUTE ON FUNCTION daily_reporting.finish_mcp_tool_call(bigint,text,integer,text) FROM report_refresh_requester").await.unwrap();
+    let request =
+        serde_json::from_value(json!({"name":"marketplace_accounts","arguments":{}})).unwrap();
+    let context = RequestContext::new(rmcp::model::RequestId::Number(1), running.peer().clone());
+    let result = server
+        .call_tool(request, context)
+        .with_subscriber(subscriber)
+        .await;
+    admin.batch_execute("GRANT EXECUTE ON FUNCTION daily_reporting.finish_mcp_tool_call(bigint,text,integer,text) TO report_refresh_requester").await.unwrap();
+    assert!(
+        matches!(result, Ok(CallToolResponse::Complete(result)) if result.is_error != Some(true))
+    );
+    let captured = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(captured.contains("tool call finished but terminal telemetry could not be recorded"));
+    assert!(captured.contains("marketplace_accounts"));
+    assert!(!captured.contains(&writer_url));
+    let _ = running.cancel().await;
+    drop(server);
+    drop(admin);
+    driver.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn readiness_reports_configured_telemetry_connection_loss() {
     use tracing::instrument::WithSubscriber as _;
