@@ -116,6 +116,59 @@ async fn postgres_static_driver_audits_matching_and_discontinuous_state_without_
 
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL roles"]
+async fn postgres_static_driver_refuses_discontinuous_serve_before_http_and_releases_file_lease() {
+    let _lock = CONTROL_DB_TEST_LOCK.lock().await;
+    let database = Database::connect()
+        .await
+        .expect("isolated PostgreSQL roles are configured");
+    let fixture = StaticFixture::new();
+    let mut state = fixture.initialize(&database).await;
+    let database_cursor = state
+        .last_static_audit_event_id
+        .expect("initialization persists a real audit sentinel");
+    state.last_static_audit_event_id = Some(database_cursor + 1);
+    persist_static_state(&fixture.state_path, &state).unwrap();
+    let before = fs::read(&fixture.state_path).unwrap();
+    let executor_lease = acquire_executor(&fixture).await;
+    let (reader, reads) = mock_reader(vec![]);
+    let (writer, requests) = mock_writer(vec![]);
+    let driver = runtime(
+        &fixture,
+        &database,
+        Command::Serve,
+        &executor_lease,
+        &reader,
+        &writer,
+    );
+    assert!(matches!(
+        OzonStaticGuardStateLease::acquire(&fixture.state_path),
+        Err(crate::control::OzonStaticGuardStateError::LeaseBusy)
+    ));
+    let error = tokio::time::timeout(Duration::from_secs(3), driver.run(std::future::pending()))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("state audit watermark differs from PostgreSQL")
+    );
+    assert_eq!(reads.try_iter().count(), 0);
+    assert_eq!(requests.try_iter().count(), 0);
+    assert_eq!(fs::read(&fixture.state_path).unwrap(), before);
+    assert_eq!(
+        database
+            .executor
+            .latest_static_guard_audit_event_id("account")
+            .await
+            .unwrap(),
+        Some(database_cursor)
+    );
+    OzonStaticGuardStateLease::acquire(&fixture.state_path).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL roles"]
 async fn postgres_static_driver_reconcile_clears_incident_only_after_exact_reads() {
     let _lock = CONTROL_DB_TEST_LOCK.lock().await;
     let database = Database::connect()
