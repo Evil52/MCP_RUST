@@ -5,7 +5,7 @@
     "src/bin/report-collector.rs": 1127,
     "src/bin/wb-automation.rs": 2002,
     "src/config.rs": 3380,
-    "src/control/automation_executor.rs": 4298,
+    "src/control/automation_executor.rs": 4273,
     "src/control/automation_observer.rs": 1278,
     "src/control/automation_postgres.rs": 2494,
     "src/control/automation.rs": 1792,
