@@ -60,7 +60,9 @@ impl Operator {
         journal.assert_not_attempted("start")?;
         journal.require_receipt("fund")?;
         ensure!(
-            journal.campaign_id()? == id && *policy == self.target_policy(id),
+            journal.campaign_id()? == id
+                && *policy == self.target_policy(id)
+                && observer.policy() == policy,
             "startup scope drifted"
         );
         let lease = store
@@ -70,20 +72,27 @@ impl Operator {
         self.writer
             .start_campaign_with_permit(id, || async {
                 self.fresh_authorization()?;
-                ensure!(
-                    read_policy_json::<WbAutomationPolicy>(&self.manifest.robot_policy)? == *policy,
-                    "robot policy changed while waiting for write slot"
-                );
-                ensure!(
-                    lease
-                        .verify_launch_cycles(observer.policy_sha256(), Utc::now())
-                        .await?,
-                    "two fresh periodic Nexus robot cycles are required before start"
-                );
+                let snapshot = observer
+                    .observe(Utc::now(), WbAutomationStateView::default())
+                    .await?;
+                validate_initial_observation(&snapshot.observation, policy)?;
+                self.inactive(id, true).await?;
                 let state = lease
                     .load_state()
                     .await?
                     .context("Nexus protective state is not installed")?;
+                ensure!(
+                    lease.verify_launch_cycles(observer.policy_sha256()).await?,
+                    "two fresh periodic Nexus robot cycles are required before start"
+                );
+                // No awaited reads follow these final checks: authorization,
+                // installed protection and evidence must all hold at the write.
+                ensure!(
+                    read_policy_json::<WbAutomationPolicy>(&self.manifest.robot_policy)? == *policy,
+                    "robot policy changed while waiting for write slot"
+                );
+                self.fresh_authorization()?;
+                validate_initial_observation(&snapshot.observation, policy)?;
                 ensure!(
                     state.policy_digest == observer.policy_sha256()
                         && state.incident_class.is_none()
@@ -93,13 +102,6 @@ impl Operator {
                         && state.business_date == wb_automation_business_date(Utc::now()),
                     "protective robot state is not clean/current; no locks may be bypassed"
                 );
-                let snapshot = observer
-                    .observe(Utc::now(), WbAutomationStateView::default())
-                    .await?;
-                validate_initial_observation(&snapshot.observation, policy)?;
-                self.inactive(id, true).await?;
-                self.fresh_authorization()?;
-                validate_initial_observation(&snapshot.observation, policy)?;
                 journal.attempt("start", &json!({"campaign_id":id,"snapshot":snapshot}))
             })
             .await
