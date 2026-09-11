@@ -5,6 +5,7 @@
 //! the same guarantee: the copy drifts, and the routes that only exist in the
 //! binary — liveness/readiness and the OAuth resource metadata — go unverified.
 
+mod request;
 mod session;
 
 use std::{
@@ -1085,19 +1086,9 @@ async fn limit_mcp_request_concurrency(
         return response;
     }
 
-    let (request, post_response_permit) = if method == Method::POST {
-        match buffer_mcp_post_body(request, limits.body_read_timeout).await {
-            Ok((request, true)) => {
-                let Some(response_permit) = limits.try_enter_post_response() else {
-                    return capacity_exhausted_response("MCP response capacity exhausted");
-                };
-                (request, Some(response_permit))
-            }
-            Ok((request, false)) => (request, None),
-            Err(response) => return *response,
-        }
-    } else {
-        (request, None)
+    let (request, post_response_permit) = match request::prepare_body(&limits, request).await {
+        Ok(prepared) => prepared,
+        Err(response) => return *response,
     };
     let response = next.run(request).await;
     if let Err(response) = session::reconcile_response(
