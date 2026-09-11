@@ -662,10 +662,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the disposable PostgreSQL fixture"]
     async fn refresh_rows_must_match_the_requested_marketplace() {
-        let Ok(url) = std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL") else {
-            return;
-        };
+        let url = std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL")
+            .expect("run through scripts/with-position-test-db.sh with --include-ignored");
         let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
             .await
             .unwrap();
