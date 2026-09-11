@@ -1,10 +1,11 @@
 //! Sales snapshot selection and aggregation.
 
 use super::{
-    AccountScope, BTreeMap, Client, DataState, MAX_SALES_ANALYTICS_FACT_ROWS, NaiveDate, NaiveTime,
-    ReportingReadError, Row, SalesAnalyticsDirection, SalesAnalyticsGroup, SalesAnalyticsQuery,
-    SalesAnalyticsRow, SalesAnalyticsSort, SalesDateCoverage, SalesDateCoverageState,
-    SalesSnapshotSelection, SnapshotDescriptor, SnapshotSource, SnapshotStatus, Utc, column,
+    AccountScope, BTreeMap, BTreeSet, Client, DataState, MAX_SALES_ANALYTICS_FACT_ROWS, NaiveDate,
+    NaiveTime, ReportingMarketplace, ReportingReadError, Row, SalesAnalyticsDirection,
+    SalesAnalyticsGroup, SalesAnalyticsQuery, SalesAnalyticsResult, SalesAnalyticsRow,
+    SalesAnalyticsSort, SalesDateCoverage, SalesDateCoverageState, SalesSnapshotSelection,
+    SnapshotDescriptor, SnapshotSource, SnapshotStatus, Utc, WEEKLY_RANKING_DAYS, column,
     marketplace_str, nonnegative_i64, positive_i64, timestamp_string, validate_snapshot_fact_count,
 };
 use chrono::TimeZone;
@@ -13,100 +14,17 @@ pub(super) fn select_sales_snapshots(
     query: SalesAnalyticsQuery,
     descriptors: Vec<SnapshotDescriptor>,
 ) -> Result<SalesSnapshotSelection, ReportingReadError> {
-    let offset = super::super::yekaterinburg_offset();
-    let mut latest = BTreeMap::<NaiveDate, SnapshotDescriptor>::new();
-    for descriptor in descriptors {
-        if descriptor.source() != SnapshotSource::Sales {
-            return Err(ReportingReadError::InvalidPublishedData);
-        }
-        let (period_start, period_end) = descriptor.period();
-        let local_start = period_start.with_timezone(&offset);
-        let business_date = local_start.date_naive();
-        let next_date = business_date
-            .succ_opt()
-            .ok_or(ReportingReadError::InvalidPublishedData)?;
-        let complete_end = offset
-            .from_local_datetime(
-                &next_date
-                    .and_hms_opt(0, 0, 0)
-                    .ok_or(ReportingReadError::InvalidPublishedData)?,
-            )
-            .single()
-            .ok_or(ReportingReadError::InvalidPublishedData)?
-            .with_timezone(&Utc);
-        if local_start.time() != NaiveTime::MIN
-            || business_date < query.date_from
-            || business_date > query.date_to
-            || period_end <= period_start
-            || period_end > complete_end
-        {
-            return Err(ReportingReadError::InvalidPublishedData);
-        }
-        match latest.entry(business_date) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(descriptor);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                if entry.get().cutoff_at() == descriptor.cutoff_at() {
-                    return Err(ReportingReadError::InvalidPublishedData);
-                }
-                if entry.get().cutoff_at() < descriptor.cutoff_at() {
-                    entry.insert(descriptor);
-                }
-            }
-        }
-    }
+    let mut latest = latest_sales_snapshots(query, descriptors)?;
 
     let mut coverage = Vec::new();
     let mut expected = BTreeMap::new();
     let mut date = query.date_from;
     loop {
-        let item = match latest.remove(&date) {
-            None => SalesDateCoverage {
-                business_date: date.to_string(),
-                state: SalesDateCoverageState::Unavailable,
-                served: false,
-                cutoff_at: None,
-                source_as_of: None,
-                period_end: None,
-            },
-            Some(descriptor) => {
-                let (_, period_end) = descriptor.period();
-                let next_date = date
-                    .succ_opt()
-                    .ok_or(ReportingReadError::InvalidPublishedData)?;
-                let complete = period_end.with_timezone(&offset).naive_local()
-                    == next_date
-                        .and_hms_opt(0, 0, 0)
-                        .ok_or(ReportingReadError::InvalidPublishedData)?;
-                let served = descriptor.status() == SnapshotStatus::Succeeded
-                    && descriptor.pagination_complete();
-                let state = if !served {
-                    SalesDateCoverageState::Partial
-                } else if complete {
-                    SalesDateCoverageState::Complete
-                } else {
-                    SalesDateCoverageState::Preliminary
-                };
-                let item = SalesDateCoverage {
-                    business_date: date.to_string(),
-                    state,
-                    served,
-                    cutoff_at: Some(timestamp_string(descriptor.cutoff_at())),
-                    source_as_of: Some(timestamp_string(descriptor.source_as_of())),
-                    period_end: Some(timestamp_string(period_end)),
-                };
-                if served
-                    && expected
-                        .insert(descriptor.snapshot_id(), (date, descriptor))
-                        .is_some()
-                {
-                    return Err(ReportingReadError::InvalidPublishedData);
-                }
-                item
-            }
-        };
-        coverage.push(item);
+        coverage.push(sales_date_coverage(
+            date,
+            latest.remove(&date),
+            &mut expected,
+        )?);
         if date == query.date_to {
             break;
         }
@@ -130,17 +48,131 @@ pub(super) fn select_sales_snapshots(
     })
 }
 
+fn sales_snapshot_date(
+    query: SalesAnalyticsQuery,
+    descriptor: &SnapshotDescriptor,
+) -> Result<NaiveDate, ReportingReadError> {
+    let offset = super::super::yekaterinburg_offset();
+    if descriptor.source() != SnapshotSource::Sales {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+    let (period_start, period_end) = descriptor.period();
+    let local_start = period_start.with_timezone(&offset);
+    let business_date = local_start.date_naive();
+    let next_date = business_date
+        .succ_opt()
+        .ok_or(ReportingReadError::InvalidPublishedData)?;
+    let complete_end = offset
+        .from_local_datetime(
+            &next_date
+                .and_hms_opt(0, 0, 0)
+                .ok_or(ReportingReadError::InvalidPublishedData)?,
+        )
+        .single()
+        .ok_or(ReportingReadError::InvalidPublishedData)?
+        .with_timezone(&Utc);
+    if local_start.time() != NaiveTime::MIN
+        || business_date < query.date_from
+        || business_date > query.date_to
+        || period_end <= period_start
+        || period_end > complete_end
+    {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+    Ok(business_date)
+}
+
+fn latest_sales_snapshots(
+    query: SalesAnalyticsQuery,
+    descriptors: Vec<SnapshotDescriptor>,
+) -> Result<BTreeMap<NaiveDate, SnapshotDescriptor>, ReportingReadError> {
+    let mut latest = BTreeMap::<NaiveDate, SnapshotDescriptor>::new();
+    for descriptor in descriptors {
+        let business_date = sales_snapshot_date(query, &descriptor)?;
+        match latest.entry(business_date) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(descriptor);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().cutoff_at() == descriptor.cutoff_at() {
+                    return Err(ReportingReadError::InvalidPublishedData);
+                }
+                if entry.get().cutoff_at() < descriptor.cutoff_at() {
+                    entry.insert(descriptor);
+                }
+            }
+        }
+    }
+
+    Ok(latest)
+}
+
+fn sales_date_coverage(
+    date: NaiveDate,
+    descriptor: Option<SnapshotDescriptor>,
+    expected: &mut BTreeMap<i64, (NaiveDate, SnapshotDescriptor)>,
+) -> Result<SalesDateCoverage, ReportingReadError> {
+    let offset = super::super::yekaterinburg_offset();
+    let item = match descriptor {
+        None => SalesDateCoverage {
+            business_date: date.to_string(),
+            state: SalesDateCoverageState::Unavailable,
+            served: false,
+            cutoff_at: None,
+            source_as_of: None,
+            period_end: None,
+        },
+        Some(descriptor) => {
+            let (_, period_end) = descriptor.period();
+            let next_date = date
+                .succ_opt()
+                .ok_or(ReportingReadError::InvalidPublishedData)?;
+            let complete = period_end.with_timezone(&offset).naive_local()
+                == next_date
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or(ReportingReadError::InvalidPublishedData)?;
+            let served = descriptor.status() == SnapshotStatus::Succeeded
+                && descriptor.pagination_complete();
+            let state = if !served {
+                SalesDateCoverageState::Partial
+            } else if complete {
+                SalesDateCoverageState::Complete
+            } else {
+                SalesDateCoverageState::Preliminary
+            };
+            let item = SalesDateCoverage {
+                business_date: date.to_string(),
+                state,
+                served,
+                cutoff_at: Some(timestamp_string(descriptor.cutoff_at())),
+                source_as_of: Some(timestamp_string(descriptor.source_as_of())),
+                period_end: Some(timestamp_string(period_end)),
+            };
+            if served
+                && expected
+                    .insert(descriptor.snapshot_id(), (date, descriptor))
+                    .is_some()
+            {
+                return Err(ReportingReadError::InvalidPublishedData);
+            }
+            item
+        }
+    };
+    Ok(item)
+}
+
 pub(super) fn validate_selected_sales_fact_count(
     expected: &BTreeMap<i64, (NaiveDate, SnapshotDescriptor)>,
 ) -> Result<(), ReportingReadError> {
-    let count = expected.values().try_fold(0_u64, |total, (_, descriptor)| {
-        total.checked_add(u64::from(descriptor.row_count()))
-    });
-    match count {
-        Some(count) if count <= MAX_SALES_ANALYTICS_FACT_ROWS => Ok(()),
-        Some(_) => Err(ReportingReadError::InvalidRequest),
-        None => Err(ReportingReadError::InvalidPublishedData),
+    let mut remaining = MAX_SALES_ANALYTICS_FACT_ROWS;
+    for (_, descriptor) in expected.values() {
+        let count = u64::from(descriptor.row_count());
+        if count > remaining {
+            return Err(ReportingReadError::InvalidRequest);
+        }
+        remaining -= count;
     }
+    Ok(())
 }
 
 pub(super) async fn validate_sales_fact_rows(
@@ -169,15 +201,12 @@ pub(super) async fn validate_sales_fact_rows(
         let minimum: Option<NaiveDate> = column(&row, 2)?;
         let maximum: Option<NaiveDate> = column(&row, 3)?;
         let valid: bool = column(&row, 4)?;
-        let Some((business_date, _)) = expected.get(&snapshot_id) else {
-            return Err(ReportingReadError::InvalidPublishedData);
-        };
+        // WHERE limits IDs to this map; GROUP BY returns each ID exactly once.
+        let (business_date, _) = &expected[&snapshot_id];
         if !valid || minimum != Some(*business_date) || maximum != Some(*business_date) {
             return Err(ReportingReadError::InvalidPublishedData);
         }
-        if actual.insert(snapshot_id, count).is_some() {
-            return Err(ReportingReadError::InvalidPublishedData);
-        }
+        actual.insert(snapshot_id, count);
     }
     for (snapshot_id, (_, descriptor)) in expected {
         let actual = actual.get(snapshot_id).copied().unwrap_or(0);
@@ -320,4 +349,68 @@ pub(super) fn decimal_u64(value: &str) -> Result<u64, ReportingReadError> {
     value
         .parse()
         .map_err(|_| ReportingReadError::InvalidPublishedData)
+}
+
+pub(super) fn validate_weekly_ranking_result(
+    account: &AccountScope,
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+    result: &SalesAnalyticsResult,
+) -> Result<(), ReportingReadError> {
+    let expected_marketplace: ReportingMarketplace = account.marketplace().into();
+    if result.account_id != account.account_id()
+        || result.marketplace != expected_marketplace
+        || result.date_from != date_from.to_string()
+        || result.date_to != date_to.to_string()
+        || result.source != "published_postgresql_snapshots"
+        || result.group_by != SalesAnalyticsGroup::Day
+        || result.sort_by != SalesAnalyticsSort::Dimension
+        || result.direction != SalesAnalyticsDirection::Asc
+        || i64::from(result.limit) != WEEKLY_RANKING_DAYS
+        || result.offset != 0
+        || usize::try_from(result.total_rows).ok() != Some(result.rows.len())
+    {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+
+    let mut expected_dates = BTreeSet::new();
+    for offset in 0..WEEKLY_RANKING_DAYS {
+        let date = date_from
+            .checked_add_days(chrono::Days::new(
+                u64::try_from(offset).map_err(|_| ReportingReadError::InvalidPublishedData)?,
+            ))
+            .ok_or(ReportingReadError::InvalidPublishedData)?;
+        expected_dates.insert(date.to_string());
+    }
+    if expected_dates.last().map(String::as_str) != Some(date_to.to_string().as_str()) {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+
+    let coverage_dates = result
+        .coverage
+        .iter()
+        .map(|coverage| coverage.business_date.clone())
+        .collect::<BTreeSet<_>>();
+    if coverage_dates != expected_dates || coverage_dates.len() != result.coverage.len() {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+
+    let mut row_dates = BTreeSet::new();
+    for row in &result.rows {
+        let Some(business_date) = &row.business_date else {
+            return Err(ReportingReadError::InvalidPublishedData);
+        };
+        if row.sku.is_some()
+            || row.currency != "RUB"
+            || !expected_dates.contains(business_date)
+            || !row_dates.insert(business_date.clone())
+            || !result
+                .coverage
+                .iter()
+                .any(|date| date.business_date == *business_date && date.served)
+        {
+            return Err(ReportingReadError::InvalidPublishedData);
+        }
+    }
+    Ok(())
 }
