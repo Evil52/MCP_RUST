@@ -237,4 +237,6 @@ mod mutation_boundaries;
 mod static_driver;
 mod unix_shutdown;
 
+mod durable_tasks;
+
 mod static_cycle_edges;
