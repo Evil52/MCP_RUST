@@ -1638,8 +1638,11 @@ mod tests {
         let incomplete = account.account_id() == "rank_missing" || unavailable;
         let mut coverage = Vec::new();
         let mut rows = Vec::new();
-        let mut date = query.date_from;
-        loop {
+        for date in query
+            .date_from
+            .iter_days()
+            .take_while(|date| *date <= query.date_to)
+        {
             let missing = unavailable || (incomplete && date == query.date_to);
             coverage.push(SalesDateCoverage {
                 business_date: date.to_string(),
@@ -1662,10 +1665,6 @@ mod tests {
                     currency: "RUB".to_owned(),
                 });
             }
-            if date == query.date_to {
-                break;
-            }
-            date = date.succ_opt().unwrap();
         }
         SalesAnalyticsResult {
             account_id: account.account_id().to_owned(),
