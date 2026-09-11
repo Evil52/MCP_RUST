@@ -15,6 +15,9 @@ const ID: u64 = 1_984_773_211;
 #[path = "start_workflow_tests.rs"]
 mod startup;
 
+#[path = "authorization_workflow_tests.rs"]
+mod authorization;
+
 struct Fixture {
     root: PathBuf,
     manifest: Manifest,

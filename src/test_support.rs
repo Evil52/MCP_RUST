@@ -10,15 +10,28 @@ use std::{
     reason = "the shared fixture is deliberately restricted to this crate's tests"
 )]
 pub(crate) fn mock_http(responses: Vec<(u16, String)>) -> (String, mpsc::Receiver<String>) {
+    mock_http_with_hook(responses, |_| {})
+}
+
+/// Changes test state after a request arrives but before its response is sent.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "the shared fixture is deliberately restricted to this crate's tests"
+)]
+pub(crate) fn mock_http_with_hook(
+    responses: Vec<(u16, String)>,
+    mut before_response: impl FnMut(usize) + Send + 'static,
+) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (sender, receiver) = mpsc::channel();
 
     thread::spawn(move || {
-        for (status, body) in responses {
+        for (index, (status, body)) in responses.into_iter().enumerate() {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_request(&stream);
             let _ = sender.send(request);
+            before_response(index);
 
             let reason = if status == 200 { "OK" } else { "Error" };
             write!(

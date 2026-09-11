@@ -503,6 +503,7 @@ impl Operator {
                     self.budget(id).await? == 0,
                     "campaign funded while waiting; no initial bid write permitted"
                 );
+                self.fresh_authorization()?;
                 journal.attempt("bids", &json!({"campaign_id":id,"changes":changes}))
             })
             .await
