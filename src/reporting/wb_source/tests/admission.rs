@@ -1,5 +1,60 @@
 use super::*;
 
+#[tokio::test]
+async fn campaign_inventory_and_stats_scope_are_validated_before_publication() {
+    let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+    let mut invalid = FixtureTransport::complete();
+    invalid.campaign_ids = json!({"adverts":"invalid"});
+    assert_eq!(
+        WbReportSource::new(invalid).collect_advertising(date).await,
+        Err(WbReportSourceError::InvalidCampaignResponse)
+    );
+    for (campaign, business_date) in [(5, "2026-08-17"), (4, "2026-08-18")] {
+        let fixture = FixtureTransport::complete();
+        *fixture.stats.lock().unwrap() = VecDeque::from([Ok(
+            json!([{"advertId":campaign,"stats":[{
+                "date":business_date,"nm_id":1,"views":10,"clicks":1,"sum":2,"orders":1,"sum_price":90
+            }]}]),
+        )]);
+        assert_eq!(
+            WbReportSource::new(fixture).collect_advertising(date).await,
+            Err(WbReportSourceError::InvalidPromotionResponse)
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_advertising_snapshot_has_a_bound_across_individually_valid_chunks() {
+    let mut fixture = FixtureTransport::complete();
+    fixture.campaign_ids = json!({"adverts":[{"status":9,"advert_list":(1..=51).map(|id|json!({"advertId":id})).collect::<Vec<_>>()}]});
+    *fixture.stats.lock().unwrap() = [1, 51]
+        .into_iter()
+        .map(|campaign| {
+            Ok(
+                json!([{"advertId":campaign,"stats":(1..=12501).map(|sku|json!({
+            "date":"2026-08-17","nm_id":sku,"views":10,"clicks":1,"sum":2,"orders":1,"sum_price":90
+        })).collect::<Vec<_>>()}]),
+            )
+        })
+        .collect();
+    assert_eq!(
+        WbReportSource::new(fixture)
+            .collect_advertising(NaiveDate::from_ymd_opt(2026, 8, 17).unwrap())
+            .await,
+        Err(WbReportSourceError::PaginationLimit)
+    );
+}
+
+#[test]
+fn rate_limited_source_failure_keeps_the_rounded_vendor_delay() {
+    let error = wb_source_failure(&WbError::RateLimited {
+        request_id: None,
+        retry_after: Some(Duration::from_millis(1500)),
+    });
+    assert_eq!(error.code(), "rate_limited");
+    assert_eq!(error.failure().retry_after, Some(2));
+}
+
 #[tokio::test(start_paused = true)]
 async fn local_admission_uses_one_deadline_without_retrying_zero_or_expired_waits() {
     let started = Instant::now();

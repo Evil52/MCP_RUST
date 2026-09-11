@@ -660,4 +660,30 @@ mod tests {
             .is_err()
         );
     }
+
+    #[tokio::test]
+    async fn refresh_rows_must_match_the_requested_marketplace() {
+        let Ok(url) = std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL") else {
+            return;
+        };
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let driver = tokio::spawn(connection);
+        for marketplace in ["wildberries", "unknown"] {
+            let row = client
+                .query_one(
+                    "SELECT 1::bigint, 'queued'::text, $1::text",
+                    &[&marketplace],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                refresh_status("account", Marketplace::Ozon, &row, false),
+                Err(RefreshRequestError::InvalidData)
+            );
+        }
+        drop(client);
+        driver.await.unwrap().unwrap();
+    }
 }

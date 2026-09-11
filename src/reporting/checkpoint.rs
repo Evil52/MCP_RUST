@@ -149,12 +149,25 @@ pub(crate) mod tests {
             .unwrap(),
             vec![7]
         );
+        let next_page = || async { Ok::<_, CheckpointError>(vec![8_u64]) };
         assert_eq!(
-            checkpointed(&resumed, serde_json::json!(["source", 1]), || async {
-                Ok::<_, CheckpointError>(vec![8_u64])
-            })
-            .await,
+            checkpointed(&resumed, serde_json::json!(["source", 1]), next_page).await,
             Err(CheckpointError::Deferred)
+        );
+        assert_eq!(
+            checkpointed(
+                &journal(&pages),
+                serde_json::json!(["source", 1]),
+                next_page
+            )
+            .await
+            .unwrap(),
+            vec![8]
+        );
+        assert_eq!(CheckpointError::Deferred.code(), "checkpoint_deferred");
+        assert_eq!(
+            CheckpointError::Unavailable.code(),
+            "checkpoint_unavailable"
         );
         assert_eq!(delay_seconds(std::time::Duration::from_millis(1500)), 2);
     }

@@ -5,6 +5,7 @@ use crate::reporting::{
     ozon_adapter::{
         OzonReportRequest, product_page_request, sales_request, warehouse_stock_page_request,
     },
+    postgres_collector::PostgresCollectorError,
     snapshot::AccountScope,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -13,6 +14,99 @@ use std::{fs, path::PathBuf, str::FromStr};
 use tokio_postgres::{Client, Config, NoTls};
 
 static DATABASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+async fn source_journal_enforces_bounds_and_publication_preserves_expenses() {
+    let (Ok(admin_url), Ok(collector_url)) = (
+        std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),
+        std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL"),
+    ) else {
+        return;
+    };
+    let _database = DATABASE.lock().await;
+    let fixture = Fixture::new(&admin_url, &collector_url).await;
+    fixture.writer.dispatch_source_refreshes(&[]).await.unwrap();
+    assert!(
+        fixture
+            .writer
+            .claim_source_job(&[], "empty-scope")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+    let start = now - Duration::days(1);
+    assert_eq!(
+        fixture
+            .writer
+            .enqueue_source_jobs(fixture.config.collection_plan(), now, now, start)
+            .await,
+        Err(PostgresCollectorError::InvalidInput)
+    );
+    fixture
+        .writer
+        .enqueue_source_jobs(fixture.config.collection_plan(), now, start, now)
+        .await
+        .unwrap();
+    fixture
+        .admin
+        .batch_execute("GRANT UPDATE ON daily_reporting.source_collection_jobs TO report_collector")
+        .await
+        .unwrap();
+    let contract = fixture.writer.verify_source_job_contract().await;
+    fixture
+        .admin
+        .batch_execute(
+            "REVOKE UPDATE ON daily_reporting.source_collection_jobs FROM report_collector",
+        )
+        .await
+        .unwrap();
+    assert_eq!(contract, Err(PostgresCollectorError::Unavailable));
+    let account = &fixture.config.collection_plan()[0].account_id;
+    fixture.select(account, "advertising", now).await;
+    let claim = fixture.claim().await;
+    let journal = fixture.writer.source_checkpoints(&claim).unwrap();
+    journal.admit().await.unwrap();
+    assert_eq!(
+        journal
+            .save(&"a".repeat(64), Value::String("x".repeat(4_194_305)))
+            .await,
+        Err(CheckpointError::Invalid)
+    );
+    journal.save(&"b".repeat(64), json!([])).await.unwrap();
+    assert_eq!(
+        fixture
+            .writer
+            .publish_source_job(&claim, CollectedFacts::Advertising(vec![]), vec![], "")
+            .await,
+        Err(PostgresCollectorError::InvalidInput)
+    );
+    let expenses = vec![
+        crate::reporting::postgres_collector::CollectedAdvertisingExpenseFact {
+            business_date: business_date(start),
+            campaign_id: 7,
+            money_spent_minor: 123,
+            bonus_spent_minor: 23,
+            prepayment_spent_minor: 100,
+        },
+    ];
+    let snapshot_id = fixture
+        .writer
+        .publish_source_job(
+            &claim,
+            CollectedFacts::Advertising(vec![]),
+            expenses,
+            "expense-test",
+        )
+        .await
+        .unwrap();
+    let amount:i64 = fixture.admin.query_one("SELECT money_spent_minor FROM daily_reporting.advertising_expense_facts WHERE snapshot_id=$1", &[&snapshot_id]).await.unwrap().get(0);
+    assert_eq!(amount, 123);
+    assert_eq!(
+        journal.save(&"c".repeat(64), json!([])).await,
+        Err(CheckpointError::Unavailable)
+    );
+}
 
 struct Fixture {
     root: PathBuf,
