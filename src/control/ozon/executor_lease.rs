@@ -160,79 +160,84 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated Ozon planner, executor and PostgreSQL admin roles"]
     async fn postgres_session_lease_rejects_a_second_connection_for_the_same_identity() {
-        let Ok(database_url) = std::env::var("OZON_EXECUTOR_TEST_DATABASE_URL") else {
-            return;
-        };
+        let database_url = std::env::var("OZON_EXECUTOR_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the Ozon executor role");
+        let planner_url = std::env::var("OZON_CONTROL_TEST_DATABASE_URL")
+            .expect("test wrapper must provide the Ozon planner role");
+        let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL")
+            .expect("test wrapper must provide the PostgreSQL admin role");
         let _database_guard = CONTROL_DB_TEST_LOCK.lock().await;
         let database = database_url.parse::<Config>().unwrap();
         let fingerprint = "a".repeat(64);
-        if let Ok(planner_url) = std::env::var("OZON_CONTROL_TEST_DATABASE_URL") {
-            let planner_database = planner_url.parse::<Config>().unwrap();
-            assert_eq!(
-                OzonExecutorLease::acquire(&planner_database, &fingerprint)
-                    .await
-                    .unwrap_err(),
-                OzonExecutorLeaseError::InvalidRole
-            );
-        }
+        let planner_database = planner_url.parse::<Config>().unwrap();
+        assert_eq!(
+            OzonExecutorLease::acquire(&planner_database, &fingerprint)
+                .await
+                .unwrap_err(),
+            OzonExecutorLeaseError::InvalidRole
+        );
         let first = OzonExecutorLease::acquire(&database, &fingerprint)
             .await
             .unwrap();
         OzonExecutorLease::verify_held(&database, &fingerprint)
             .await
             .unwrap();
-        assert_eq!(
-            OzonExecutorLease::acquire(&database, &fingerprint)
-                .await
-                .unwrap_err(),
-            OzonExecutorLeaseError::Busy
-        );
         let second_identity = OzonExecutorLease::acquire(&database, &"b".repeat(64))
             .await
             .unwrap();
-        drop(second_identity);
-        drop(first);
 
-        let reacquired = tokio::time::timeout(Duration::from_secs(3), async {
+        // Observe real contention before releasing the owner. This makes the
+        // recovery assertion independent of backend disconnection timing.
+        let (blocked_sender, blocked_receiver) = tokio::sync::oneshot::channel();
+        let reacquire = async {
+            let mut blocked_sender = Some(blocked_sender);
             loop {
-                match OzonExecutorLease::acquire(&database, &fingerprint).await {
-                    Ok(lease) => break lease,
-                    Err(OzonExecutorLeaseError::Busy) => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Err(error) => panic!("unexpected executor lease error: {error}"),
+                let attempt = OzonExecutorLease::acquire(&database, &fingerprint).await;
+                if !matches!(attempt, Err(OzonExecutorLeaseError::Busy)) {
+                    break attempt.expect("executor identity remains valid during release");
                 }
+                if let Some(sender) = blocked_sender.take() {
+                    sender.send(()).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        };
+        let release = async {
+            blocked_receiver.await.unwrap();
+            drop(second_identity);
+            drop(first);
+        };
+        let (reacquired, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(reacquire, release)
         })
         .await
         .expect("executor session lock was not released");
-        if let Ok(admin_url) = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL") {
-            let (admin, admin_connection) = admin_url
-                .parse::<Config>()
-                .unwrap()
-                .connect(NoTls)
-                .await
-                .unwrap();
-            let admin_task = tokio::spawn(admin_connection);
-            let backend_pid: i32 = reacquired
-                .client
-                .query_one("SELECT pg_backend_pid()", &[])
-                .await
-                .unwrap()
-                .get(0);
-            let terminated: bool = admin
-                .query_one("SELECT pg_terminate_backend($1)", &[&backend_pid])
-                .await
-                .unwrap()
-                .get(0);
-            assert!(terminated);
-            tokio::time::timeout(Duration::from_secs(3), reacquired.lost())
-                .await
-                .expect("executor lease did not report its lost database session");
-            drop(admin);
-            admin_task.await.unwrap().unwrap();
-        }
+        let (admin, admin_connection) = admin_url
+            .parse::<Config>()
+            .unwrap()
+            .connect(NoTls)
+            .await
+            .unwrap();
+        let admin_task = tokio::spawn(admin_connection);
+        let backend_pid: i32 = reacquired
+            .client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let terminated: bool = admin
+            .query_one("SELECT pg_terminate_backend($1)", &[&backend_pid])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(terminated);
+        tokio::time::timeout(Duration::from_secs(3), reacquired.lost())
+            .await
+            .expect("executor lease did not report its lost database session");
+        drop(admin);
+        admin_task.await.unwrap().unwrap();
         drop(reacquired);
     }
 }
