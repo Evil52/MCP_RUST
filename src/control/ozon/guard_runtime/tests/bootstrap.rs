@@ -101,7 +101,7 @@ impl Drop for IsolatedChild {
     }
 }
 
-async fn run_child(mode: &str, environment: &BTreeMap<String, OsString>) {
+fn spawn_child(mode: &str, environment: &BTreeMap<String, OsString>) -> (IsolatedChild, PathBuf) {
     let registry = PathBuf::from(&environment["CONTROL_MCP_ACCESS_CONFIG"]);
     let output_path = registry.parent().unwrap().join(format!("child-{mode}.log"));
     let output_file = File::create(&output_path).unwrap();
@@ -113,7 +113,11 @@ async fn run_child(mode: &str, environment: &BTreeMap<String, OsString>) {
         .envs(environment)
         .stdout(Stdio::from(output_file.try_clone().unwrap()))
         .stderr(Stdio::from(output_file));
-    let mut child = IsolatedChild(command.spawn().unwrap());
+    (IsolatedChild(command.spawn().unwrap()), output_path)
+}
+
+async fn run_child(mode: &str, environment: &BTreeMap<String, OsString>) {
+    let (mut child, output_path) = spawn_child(mode, environment);
     let result = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
@@ -169,6 +173,9 @@ async fn child_run(mode: &str) {
         "invalid_command" => Some("usage:"),
         "unarmed" => Some("armed writer"),
         "runtime_missing" => Some("Ozon runtime"),
+        "durable_failure" => {
+            Some("durable Ozon Launch workflow exceeded its consecutive failure limit")
+        }
         _ => None,
     };
     if let Some(expected) = expected_error {
@@ -284,6 +291,83 @@ async fn subprocess_bootstrap_initializes_checks_and_serves_without_marketplace_
             Err(crate::control::ozon::executor_lease::OzonExecutorLeaseError::NotHeld),
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL roles"]
+async fn postgres_bootstrap_exits_after_launch_database_failures_without_marketplace_io() {
+    let _lock = CONTROL_DB_TEST_LOCK.lock().await;
+    let database = Database::connect()
+        .await
+        .expect("isolated PostgreSQL roles are configured");
+    let fixture = StaticFixture::new();
+    database.prepare_plan(&fixture.authorization).await;
+    let database_url = std::env::var("OZON_EXECUTOR_TEST_DATABASE_URL").unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let environment = child_environment(
+        &fixture,
+        &database_url,
+        &format!("http://{}", proxy.local_addr().unwrap()),
+    );
+    let (mut child, output_path) = spawn_child("durable_failure", &environment);
+    // Revoke only after the actual runtime has verified its role and started
+    // both loops. Otherwise this would test startup authorization instead.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fs::read_to_string(&output_path)
+                .unwrap()
+                .contains("independent durable Ozon launch and guard workflows started")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("durable child must reach its workflow loops");
+    database
+        .admin
+        .batch_execute("REVOKE SELECT ON control.ozon_campaign_plans FROM ozon_control_executor")
+        .await
+        .unwrap();
+    // The production five-second interval remains intact: at most one healthy
+    // initial tick can precede revocation, followed by three failed polls.
+    let status = tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    // Restore the shared fixture role before asserting the child's outcome.
+    database
+        .admin
+        .batch_execute("GRANT SELECT ON control.ozon_campaign_plans TO ozon_control_executor")
+        .await
+        .unwrap();
+    let output = fs::read_to_string(output_path).unwrap();
+    assert!(
+        status.is_ok_and(|status| status.success()),
+        "durable failure child did not exit as expected: {output}"
+    );
+    assert_eq!(
+        output.matches("durable Ozon launch drain failed").count(),
+        3
+    );
+    assert_eq!(
+        proxy.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture_lease_is_held(&database, &fixture.fingerprint).await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("exited child must release its executor lease");
 }
 
 #[test]
