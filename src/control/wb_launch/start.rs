@@ -23,6 +23,7 @@ impl Operator {
             policy == self.target_policy(id),
             "installed Nexus robot policy differs from reviewed copy"
         );
+        validate_protective_policy(&policy, Utc::now())?;
         let observer = WbAutomationObserver::from_files(
             &self.manifest.robot_policy,
             &self.manifest.registry,
@@ -127,6 +128,7 @@ fn validate_initial_observation(
     observation: &WbAutomationObservation,
     policy: &WbAutomationPolicy,
 ) -> Result<()> {
+    validate_protective_policy(policy, Utc::now())?;
     ensure!(
         matches!(observation.campaign_status, 4 | 11)
             && observation.budget_remaining_minor == 100_000
@@ -161,6 +163,21 @@ fn validate_initial_observation(
                         .contains(&sku.current_bid_kopecks)
                     && sku.spend_minor == 0),
         "initial guard SKU evidence is incompatible"
+    );
+    Ok(())
+}
+
+fn validate_protective_policy(
+    policy: &WbAutomationPolicy,
+    now: chrono::DateTime<Utc>,
+) -> Result<()> {
+    ensure!(
+        policy.write_enabled
+            && policy.bid_writes_enabled
+            && policy.authorized_at <= now
+            && policy.observe_until <= now
+            && now < policy.authorization_expires_at,
+        "protective robot must be authorized and past its observation-only window before start"
     );
     Ok(())
 }
@@ -234,6 +251,42 @@ mod tests {
         changed = observation;
         changed.paused_by_automation = true;
         assert!(validate_initial_observation(&changed, &policy).is_err());
+    }
+
+    #[test]
+    fn startup_rejects_observation_only_protection_before_ads_can_spend() {
+        use crate::control::{WbAutomationAction, evaluate_wb_automation};
+
+        let (observation, mut policy) = fixture();
+        policy.observe_until = observation.observed_at + chrono::Duration::hours(1);
+        assert!(validate_initial_observation(&observation, &policy).is_err());
+
+        policy.observe_until = observation.observed_at;
+        validate_initial_observation(&observation, &policy).unwrap();
+        let mut active = observation;
+        active.campaign_status = 9;
+        active.daily_spend_minor = policy.daily_pause_threshold_minor;
+        assert_eq!(
+            evaluate_wb_automation(&policy, &active).unwrap().action,
+            WbAutomationAction::PauseCampaignForDailyCap
+        );
+    }
+
+    #[test]
+    fn protective_policy_requires_live_authorization_at_the_write_boundary() {
+        let (_, policy) = fixture();
+        let now = policy.observe_until;
+        validate_protective_policy(&policy, now).unwrap();
+        assert!(
+            validate_protective_policy(&policy, now - chrono::Duration::nanoseconds(1)).is_err()
+        );
+        assert!(validate_protective_policy(&policy, policy.authorization_expires_at).is_err());
+        let mut disabled = policy.clone();
+        disabled.write_enabled = false;
+        assert!(validate_protective_policy(&disabled, now).is_err());
+        disabled = policy;
+        disabled.bid_writes_enabled = false;
+        assert!(validate_protective_policy(&disabled, now).is_err());
     }
 
     #[test]
