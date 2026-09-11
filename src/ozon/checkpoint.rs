@@ -65,10 +65,25 @@ mod tests {
         },
     };
 
+    struct CheckpointPeer {
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl CheckpointPeer {
+        async fn finish(self) {
+            self.shutdown.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), self.server)
+                .await
+                .expect("checkpoint peer shuts down after the request completes")
+                .expect("checkpoint peer completes successfully");
+        }
+    }
+
     async fn fixture(
         status: StatusCode,
         retry_after: &'static str,
-    ) -> (OzonClient, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    ) -> (OzonClient, Arc<AtomicUsize>, CheckpointPeer) {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
         let router = Router::new().fallback(post(move || {
@@ -82,8 +97,14 @@ mod tests {
             .await
             .unwrap();
         let address = listener.local_addr().unwrap();
+        let (shutdown, shutdown_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_received.await;
+                })
+                .await
+                .unwrap();
         });
         let client = OzonClient::new(
             format!("http://{address}"),
@@ -97,7 +118,7 @@ mod tests {
             )]),
         )
         .unwrap();
-        (client, calls, server)
+        (client, calls, CheckpointPeer { shutdown, server })
     }
 
     #[tokio::test]
@@ -138,8 +159,9 @@ mod tests {
             "the deferred checkpoint must not send HTTP"
         );
         tokio::time::resume();
-        server.abort();
-        let _ = server.await;
+        drop(transport);
+        drop(client);
+        server.finish().await;
     }
 
     #[tokio::test]
@@ -161,7 +183,7 @@ mod tests {
             }
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        server.abort();
-        let _ = server.await;
+        drop(client);
+        server.finish().await;
     }
 }
