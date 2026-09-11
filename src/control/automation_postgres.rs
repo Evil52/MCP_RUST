@@ -9,6 +9,8 @@ mod acquire;
 #[cfg(test)]
 mod cancellation_tests;
 mod launch;
+#[cfg(test)]
+mod mapping_tests;
 mod state_read;
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -2363,99 +2365,6 @@ fn applied_replay_pause_state_matches(
     }
 }
 
-#[cfg(coverage)]
-#[doc(hidden)]
-pub fn exercise_coverage_only_database_mappings() {
-    assert_eq!(
-        parse_action_kind("change_bids"),
-        Ok(WbAutomationDurableActionKind::ChangeBids)
-    );
-    assert_eq!(
-        parse_action_kind("pause_campaign_for_daily_cap"),
-        Ok(WbAutomationDurableActionKind::PauseCampaignForDailyCap)
-    );
-    assert_eq!(
-        parse_action_kind("resume_campaign_after_daily_cap"),
-        Ok(WbAutomationDurableActionKind::ResumeCampaignAfterDailyCap)
-    );
-    assert_eq!(
-        parse_action_kind("unknown"),
-        Err(WbAutomationPostgresError::Unavailable)
-    );
-    for (status, database) in [
-        (WbAutomationDurableActionStatus::Reserved, "reserved"),
-        (
-            WbAutomationDurableActionStatus::WriteStarted,
-            "write_started",
-        ),
-        (
-            WbAutomationDurableActionStatus::AwaitingReadback,
-            "awaiting_readback",
-        ),
-        (WbAutomationDurableActionStatus::Applied, "applied"),
-        (
-            WbAutomationDurableActionStatus::ReconciliationRequired,
-            "reconciliation_required",
-        ),
-        (WbAutomationDurableActionStatus::Cancelled, "cancelled"),
-    ] {
-        assert_eq!(status_database(status), database);
-    }
-    let mut reservation = WbAutomationActionReservation {
-        idempotency_key: "1".repeat(64),
-        cycle_id: "2".repeat(64),
-        policy_digest: "3".repeat(64),
-        request_digest: "4".repeat(64),
-        action_kind: WbAutomationDurableActionKind::ChangeBids,
-        request_json: "{\"kind\":\"change_bids\",\"changes\":[{}]}".to_owned(),
-        business_date: NaiveDate::from_ymd_opt(2026, 8, 26).expect("valid coverage date"),
-        expected_state_revision: 1,
-        max_actions_per_day: 2,
-    };
-    assert_eq!(validate_reservation(&reservation), Ok(()));
-    reservation.expected_state_revision = 0;
-    assert_eq!(
-        validate_reservation(&reservation),
-        Err(WbAutomationPostgresError::InvalidInput)
-    );
-    reservation.expected_state_revision = 1;
-    reservation.max_actions_per_day = 0;
-    assert_eq!(
-        validate_reservation(&reservation),
-        Err(WbAutomationPostgresError::InvalidInput)
-    );
-    reservation.max_actions_per_day = 501;
-    assert_eq!(
-        validate_reservation(&reservation),
-        Err(WbAutomationPostgresError::InvalidInput)
-    );
-    reservation.max_actions_per_day = 2;
-    reservation.request_json = "{".to_owned();
-    assert_eq!(
-        validate_reservation(&reservation),
-        Err(WbAutomationPostgresError::InvalidInput)
-    );
-    reservation.request_json = "{\"kind\":\"pause_campaign_for_daily_cap\"}".to_owned();
-    assert_eq!(
-        validate_reservation(&reservation),
-        Err(WbAutomationPostgresError::InvalidInput)
-    );
-    reservation.request_json = "{\"kind\":\"change_bids\",\"changes\":[]}".to_owned();
-    assert_eq!(
-        validate_reservation(&reservation),
-        Err(WbAutomationPostgresError::InvalidInput)
-    );
-    reservation.action_kind = WbAutomationDurableActionKind::PauseCampaignForDailyCap;
-    reservation.request_json = "{\"kind\":\"pause_campaign_for_daily_cap\"}".to_owned();
-    assert_eq!(validate_reservation(&reservation), Ok(()));
-    reservation.request_json =
-        "{\"kind\":\"pause_campaign_for_daily_cap\",\"changes\":[]}".to_owned();
-    assert_eq!(
-        validate_reservation(&reservation),
-        Err(WbAutomationPostgresError::InvalidInput)
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2549,6 +2458,19 @@ mod tests {
             Err(WbAutomationPostgresError::InvalidInput)
         );
         reservation.expected_state_revision = 1;
+        for invalid_max_actions in [0, 501] {
+            reservation.max_actions_per_day = invalid_max_actions;
+            assert_eq!(
+                validate_reservation(&reservation),
+                Err(WbAutomationPostgresError::InvalidInput)
+            );
+        }
+        reservation.max_actions_per_day = 2;
+        reservation.request_json = "{".to_owned();
+        assert_eq!(
+            validate_reservation(&reservation),
+            Err(WbAutomationPostgresError::InvalidInput)
+        );
         reservation.request_json = "{\"kind\":\"pause_campaign_for_daily_cap\"}".to_owned();
         assert_eq!(
             validate_reservation(&reservation),
@@ -2560,6 +2482,8 @@ mod tests {
             Err(WbAutomationPostgresError::InvalidInput)
         );
         reservation.action_kind = WbAutomationDurableActionKind::PauseCampaignForDailyCap;
+        reservation.request_json = "{\"kind\":\"pause_campaign_for_daily_cap\"}".to_owned();
+        assert_eq!(validate_reservation(&reservation), Ok(()));
         reservation.request_json =
             "{\"kind\":\"pause_campaign_for_daily_cap\",\"changes\":[]}".to_owned();
         assert_eq!(

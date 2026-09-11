@@ -7,7 +7,7 @@
     "src/config.rs": 3382,
     "src/control/automation_executor.rs": 4322,
     "src/control/automation_observer.rs": 1278,
-    "src/control/automation_postgres.rs": 2570,
+    "src/control/automation_postgres.rs": 2494,
     "src/control/automation.rs": 1792,
     "src/control/config/tests.rs": 1490,
     "src/control/ozon/guard_runtime.rs": 2272,
@@ -38,6 +38,6 @@
     "src/wb.rs": 5162,
     "tests/http_router.rs": 1117,
     "tests/reporting_postgres_outbox.rs": 1384,
-    "tests/wb_automation_postgres.rs": 1931
+    "tests/wb_automation_postgres.rs": 1929
   }
 }
