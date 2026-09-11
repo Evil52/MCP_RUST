@@ -138,7 +138,8 @@ fn validate_initial_observation(
         "initial guard snapshot is incomplete, already spent, paused by protection or not funded"
     );
     ensure!(
-        (0..=90).contains(&(Utc::now() - observation.observed_at).num_seconds()),
+        (chrono::Duration::zero()..=chrono::Duration::seconds(90))
+            .contains(&(Utc::now() - observation.observed_at)),
         "initial guard snapshot is stale"
     );
     ensure!(

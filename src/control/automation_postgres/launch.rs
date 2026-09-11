@@ -1,5 +1,5 @@
 use super::{WbAutomationCampaignLease, WbAutomationPostgresError};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
 impl WbAutomationCampaignLease<'_> {
     /// Startup is permitted only after two recent observations by the already
@@ -27,7 +27,60 @@ impl WbAutomationCampaignLease<'_> {
         }
         let latest: DateTime<Utc> = rows[0].get(1);
         let preceding: DateTime<Utc> = rows[1].get(1);
-        Ok((0..=90).contains(&(now - latest).num_seconds())
-            && (240..=420).contains(&(latest - preceding).num_seconds()))
+        Ok(cycle_times_are_fresh(latest, preceding, now))
+    }
+}
+
+fn cycle_times_are_fresh(
+    latest: DateTime<Utc>,
+    preceding: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    // Preserve subsecond precision: num_seconds truncates negative fractions
+    // to zero and would accept future timestamps (including PostgreSQL's
+    // microsecond round-trip of a nanosecond-resolution observation).
+    (Duration::zero()..=Duration::seconds(90)).contains(&(now - latest))
+        && (Duration::seconds(240)..=Duration::seconds(420)).contains(&(latest - preceding))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycle_freshness_preserves_fractional_boundaries() {
+        let now = DateTime::from_timestamp(1_800_000_000, 123_456_789).unwrap();
+        let ns = Duration::nanoseconds(1);
+        for age in [Duration::zero(), Duration::seconds(90)] {
+            for gap in [Duration::seconds(240), Duration::seconds(420)] {
+                let latest = now - age;
+                assert!(cycle_times_are_fresh(latest, latest - gap, now));
+            }
+        }
+        for age in [
+            -ns,
+            -Duration::milliseconds(999),
+            Duration::seconds(90) + ns,
+        ] {
+            let latest = now - age;
+            assert!(!cycle_times_are_fresh(
+                latest,
+                latest - Duration::seconds(300),
+                now
+            ));
+        }
+        for gap in [
+            Duration::seconds(240) - ns,
+            Duration::seconds(420) + ns,
+            -ns,
+        ] {
+            assert!(!cycle_times_are_fresh(now, now - gap, now));
+        }
+        let stored = DateTime::from_timestamp_micros(now.timestamp_micros()).unwrap();
+        assert!(!cycle_times_are_fresh(
+            stored,
+            stored - Duration::seconds(300),
+            now - Duration::seconds(1)
+        ));
     }
 }
