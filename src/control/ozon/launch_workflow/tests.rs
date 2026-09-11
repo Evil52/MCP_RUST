@@ -763,3 +763,5 @@ fn parser_error_classes_and_budget_constants_are_exact() {
 pub(in crate::control::ozon) mod adapter_fixture;
 mod adapter_postgres;
 mod adapter_reads;
+
+mod completion_boundaries;

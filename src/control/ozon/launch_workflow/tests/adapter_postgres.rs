@@ -90,70 +90,85 @@ async fn postgres_adapter_prewrite_failures_release_or_fail_without_mutations() 
             "binding",
             "gate",
         ] {
-            let lease = database.prepare(&authorization).await;
-            let responses = match case {
-                "conflict" => vec![
-                    (200, campaign(&lease.plan, "CAMPAIGN_STATE_RUNNING")),
-                    (200, products()),
-                ],
-                "read_failure" => vec![(200, "{}".to_owned())],
-                "preflight_timeout" => vec![],
-                _ => vec![
-                    (200, EMPTY_CAMPAIGNS.to_owned()),
-                    (200, EMPTY_CAMPAIGNS.to_owned()),
-                ],
-            };
-            let (reader, _) = mock_reader(responses);
-            let token_needed = !matches!(case, "conflict" | "read_failure" | "preflight_timeout");
-            let (writer, requests) = mock_writer(if token_needed {
-                vec![(if case == "oauth" { 403 } else { 200 }, TOKEN.to_owned())]
-            } else {
-                vec![]
-            });
-            let mut io = database.io(&authorization, reader, writer);
-            match case {
-                "preflight_timeout" => io.clock.timeout_at = Some(0),
-                "final_timeout" => io.clock.timeout_at = Some(1),
-                "registry" => std::fs::rename(
-                    authorization.path.join("registry.json"),
-                    authorization.path.join("registry.hidden"),
-                )
-                .unwrap(),
-                "binding" => io.account_id = "other".to_owned(),
-                "gate" => {
-                    database.admin.execute("UPDATE control.ozon_runtime_gates SET enabled=false WHERE gate_key='global'", &[]).await.unwrap();
-                }
-                _ => {}
-            }
-            let result = execute(
-                database.executor.as_ref(),
-                &io,
-                &NoOzonLaunchFailpoints,
-                &lease,
-            )
-            .await;
-            if case == "registry" {
-                std::fs::rename(
-                    authorization.path.join("registry.hidden"),
-                    authorization.path.join("registry.json"),
-                )
-                .unwrap();
-            }
-            let plan = database.planner.load(&lease.plan.plan_id).await.unwrap();
-            if case == "conflict" {
-                assert!(matches!(result, Err(OzonLaunchWorkflowError::Write(_))));
-                assert_eq!(plan.status, OzonLaunchStatus::Failed);
-            } else {
-                assert!(
-                    matches!(result, Err(OzonLaunchWorkflowError::WriteNotStarted(_))),
-                    "case {case}"
-                );
-                assert_eq!(plan.status, OzonLaunchStatus::Approved);
-            }
-            assert!(plan.workflow_write_started_at.is_none());
-            assert_eq!(requests.try_iter().count(), usize::from(token_needed));
+            assert_prewrite_case(&database, &authorization, case).await;
         }
     }
+}
+
+async fn assert_prewrite_case(
+    database: &Database,
+    authorization: &AuthorizationFixture,
+    case: &str,
+) {
+    let lease = database.prepare(authorization).await;
+    let responses = match case {
+        "conflict" => vec![
+            (200, campaign(&lease.plan, "CAMPAIGN_STATE_RUNNING")),
+            (200, products()),
+        ],
+        "read_failure" => vec![(200, "{}".to_owned())],
+        "preflight_timeout" => vec![],
+        _ => vec![
+            (200, EMPTY_CAMPAIGNS.to_owned()),
+            (200, EMPTY_CAMPAIGNS.to_owned()),
+        ],
+    };
+    let (reader, _) = mock_reader(responses);
+    let token_needed = !matches!(case, "conflict" | "read_failure" | "preflight_timeout");
+    let (writer, requests) = mock_writer(if token_needed {
+        vec![(if case == "oauth" { 403 } else { 200 }, TOKEN.to_owned())]
+    } else {
+        vec![]
+    });
+    let mut io = database.io(authorization, reader, writer);
+    match case {
+        "preflight_timeout" => io.clock.timeout_at = Some(0),
+        "final_timeout" => io.clock.timeout_at = Some(1),
+        "registry" => std::fs::rename(
+            authorization.path.join("registry.json"),
+            authorization.path.join("registry.hidden"),
+        )
+        .unwrap(),
+        "binding" => io.account_id = "other".to_owned(),
+        "gate" => {
+            database
+                .admin
+                .execute(
+                    "UPDATE control.ozon_runtime_gates SET enabled=false WHERE gate_key='global'",
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+        _ => {}
+    }
+    let result = execute(
+        database.executor.as_ref(),
+        &io,
+        &NoOzonLaunchFailpoints,
+        &lease,
+    )
+    .await;
+    if case == "registry" {
+        std::fs::rename(
+            authorization.path.join("registry.hidden"),
+            authorization.path.join("registry.json"),
+        )
+        .unwrap();
+    }
+    let plan = database.planner.load(&lease.plan.plan_id).await.unwrap();
+    if case == "conflict" {
+        assert!(matches!(result, Err(OzonLaunchWorkflowError::Write(_))));
+        assert_eq!(plan.status, OzonLaunchStatus::Failed);
+    } else {
+        assert!(
+            matches!(result, Err(OzonLaunchWorkflowError::WriteNotStarted(_))),
+            "case {case}"
+        );
+        assert_eq!(plan.status, OzonLaunchStatus::Approved);
+    }
+    assert!(plan.workflow_write_started_at.is_none());
+    assert_eq!(requests.try_iter().count(), usize::from(token_needed));
 }
 
 #[tokio::test]
