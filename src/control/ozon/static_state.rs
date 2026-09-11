@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::static_guard::MAX_OZON_STATIC_GUARDS;
+use super::static_guard::{MAX_OZON_STATIC_GUARDS, is_canonical_static_guard_date};
 
 /// Maximum serialized state accepted from disk.
 pub const MAX_OZON_STATIC_GUARD_STATE_BYTES: u64 = 256 * 1024;
@@ -496,7 +496,7 @@ fn valid_complete_binding(
         && min_bid <= max_bid
         && min_bid.is_multiple_of(1_000_000)
         && max_bid.is_multiple_of(1_000_000)
-        && chrono::NaiveDate::parse_from_str(date_from, "%Y-%m-%d").is_ok()
+        && is_canonical_static_guard_date(date_from)
         && spend_cap != 0
         && spend_cap.is_multiple_of(10_000)
         && (10..=100).contains(&target_drr)
@@ -973,5 +973,6 @@ mod tests {
         ));
     }
 
+    mod date_contract_tests;
     mod io_tests;
 }
