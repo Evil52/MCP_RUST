@@ -29,7 +29,9 @@ echo "==> Formatting"
 cargo fmt --all -- --check
 
 echo "==> Tests"
-cargo test --locked --workspace --all-targets --all-features -- --test-threads=1 \
+./scripts/with-position-test-db.sh cargo test \
+  --locked --workspace --all-targets --all-features -- \
+  --include-ignored --test-threads=1 \
   | tee "$test_output"
 python3 "$project_root/scripts/sonar-test-report.py" "$test_output" "$test_report_tmp"
 mv "$test_report_tmp" "$test_report"
@@ -44,15 +46,14 @@ if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo "cargo-llvm-cov is missing. Install it with: cargo install cargo-llvm-cov --locked" >&2
   exit 1
 fi
-# Serialize harness tests sharing connection-limited PostgreSQL roles. The
-# environment also works for binary probes without forwarding harness flags.
+# Every PostgreSQL contract runs against the isolated fixture database.
+# The environment also works for binary probes without forwarding harness flags.
 RUST_TEST_THREADS=1 ./scripts/with-position-test-db.sh cargo llvm-cov \
-  --locked --workspace \
-  --all-targets \
-  --all-features \
+  --locked --workspace --all-targets --all-features \
   --ignore-filename-regex 'src/(main|bin/(mcp-ozon-control|ozon-campaign-guard|position-collector|report-collector|report-worker|wb-automation))\.rs$' \
   --lcov \
-  --output-path "$coverage_report_tmp"
+  --output-path "$coverage_report_tmp" \
+  -- --include-ignored
 sed -i.bak "s#SF:$project_root/#SF:#" "$coverage_report_tmp"
 mv "$coverage_report_tmp" "$coverage_report"
 

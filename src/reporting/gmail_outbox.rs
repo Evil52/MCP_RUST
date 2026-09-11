@@ -1163,14 +1163,11 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[cfg_attr(
-        not(coverage),
-        ignore = "requires the isolated report-worker PostgreSQL role"
-    )]
+    #[ignore = "requires the isolated report-worker PostgreSQL role"]
     #[tokio::test]
     async fn concrete_outbox_artifact_oauth_and_gmail_adapters_complete_one_local_delivery() {
         let database_url = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL")
-            .expect("coverage wrapper must provide the report-worker database URL");
+            .expect("isolated test fixture must provide REPORT_OUTBOX_TEST_WORKER_URL");
         exercise_concrete_delivery(&database_url).await;
     }
 

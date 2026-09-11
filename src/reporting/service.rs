@@ -650,14 +650,11 @@ mod tests {
         assert!(config(&invalid_credentials).is_err());
     }
 
-    #[cfg_attr(
-        not(coverage),
-        ignore = "requires the isolated report-worker PostgreSQL role"
-    )]
+    #[ignore = "requires the isolated report-worker PostgreSQL role"]
     #[tokio::test]
     async fn canary_builds_the_non_looping_delivery_worker() {
         let database_url = std::env::var("REPORT_OUTBOX_TEST_WORKER_URL")
-            .expect("coverage wrapper must provide the report-worker database URL");
+            .expect("isolated test fixture must provide REPORT_OUTBOX_TEST_WORKER_URL");
         let mut entries = canary_entries();
         entries
             .iter_mut()

@@ -70,6 +70,6 @@ fi
     --show-missing-lines \
     --fail-under-functions 95.5 \
     --fail-under-lines 95.8 \
-    -- --test-threads=1
+    -- --include-ignored --test-threads=1
 
 echo "Local CI passed."
