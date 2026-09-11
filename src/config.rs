@@ -1,3 +1,5 @@
+mod oidc_actor;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -590,23 +592,6 @@ impl AccessRegistry {
                 .as_ref()
                 .is_some_and(|ozon| account.id == selector.0 || ozon.store_id == *selector)
         })
-    }
-
-    pub fn actor_for_oidc(&self, subject: &str) -> Result<&Actor> {
-        let mut matches = self.actors.iter().filter(|actor| {
-            actor
-                .oidc
-                .as_ref()
-                .and_then(|identity| identity.subject.as_deref())
-                == Some(subject)
-        });
-        let actor = matches
-            .next()
-            .context("OIDC-пользователь не зарегистрирован в реестре доступа")?;
-        if matches.next().is_some() {
-            bail!("OIDC identity неоднозначно соответствует нескольким пользователям");
-        }
-        Ok(actor)
     }
 }
 
@@ -1602,6 +1587,15 @@ mod tests {
         );
         assert_eq!(registry.actor_for_oidc("subject-1").unwrap().id, "admin");
         assert!(registry.actor_for_oidc("unknown").is_err());
+        let mut ambiguous = registry;
+        ambiguous.actors[1].oidc = ambiguous.actors[0].oidc.clone();
+        assert!(
+            ambiguous
+                .actor_for_oidc("subject-1")
+                .unwrap_err()
+                .to_string()
+                .contains("неоднозначно")
+        );
     }
 
     #[test]
