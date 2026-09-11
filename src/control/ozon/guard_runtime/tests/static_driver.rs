@@ -5,7 +5,7 @@ use crate::control::{
 };
 use tracing::instrument::WithSubscriber as _;
 
-fn runtime<'a>(
+pub(super) fn runtime<'a>(
     fixture: &'a StaticFixture,
     database: &'a Database,
     command: Command,
@@ -27,7 +27,7 @@ fn runtime<'a>(
     }
 }
 
-async fn acquire_executor(fixture: &StaticFixture) -> OzonExecutorLease {
+pub(super) async fn acquire_executor(fixture: &StaticFixture) -> OzonExecutorLease {
     let database = std::env::var("OZON_EXECUTOR_TEST_DATABASE_URL")
         .unwrap()
         .parse()

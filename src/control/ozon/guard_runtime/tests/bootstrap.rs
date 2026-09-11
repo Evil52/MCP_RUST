@@ -90,7 +90,7 @@ fn child_environment(
     values
 }
 
-struct IsolatedChild(Child);
+pub(super) struct IsolatedChild(pub(super) Child);
 
 impl Drop for IsolatedChild {
     fn drop(&mut self) {
