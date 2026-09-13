@@ -1,4 +1,5 @@
 mod proxy;
+mod quota;
 
 use std::{
     collections::BTreeMap,
@@ -17,6 +18,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, SemaphorePermit};
 
+use crate::marketplace_quota::{QuotaError, SharedQuota};
 use mcp_marketplace_types::{PerformanceCredentials, StoreId};
 
 const PERFORMANCE_API_BASE_URL: &str = "https://api-performance.ozon.ru";
@@ -37,11 +39,12 @@ const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_SKEW: Duration = Duration::from_secs(60);
 /// How long a failed token request suppresses further attempts.
 ///
-/// The OAuth endpoint sits outside the pacing gate and both in-flight
+/// The OAuth endpoint sits outside the local API pacing gate and both in-flight
 /// semaphores, because holding scarce capacity while a single-flight refresh
 /// waits would be worse. That exemption is only safe with a cooldown: without
 /// one, a token endpoint returning 429 or 5xx is re-attempted once per API
-/// call for as long as the failure lasts.
+/// call for as long as the failure lasts. When configured, the deployment quota
+/// additionally coordinates OAuth attempts across processes.
 const TOKEN_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_IN_FLIGHT_PER_CLIENT: usize = 2;
@@ -194,6 +197,8 @@ pub enum PerformanceError {
     Network,
     #[error("локальный лимит параллельных запросов Ozon Performance API исчерпан")]
     Overloaded,
+    #[error("Ozon Performance shared quota: {0}")]
+    SharedQuota(#[from] QuotaError),
     #[error("Ozon Performance API вернул некорректный JSON (request-id: {request_id:?})")]
     InvalidJson {
         request_id: Option<String>,
@@ -235,11 +240,13 @@ impl PerformanceError {
             Self::MissingCredentials(_) => PerformanceErrorKind::MissingCredentials,
             Self::Unauthorized { .. } => PerformanceErrorKind::Unauthorized,
             Self::Forbidden { .. } => PerformanceErrorKind::Forbidden,
-            Self::RateLimited { .. } => PerformanceErrorKind::RateLimited,
+            Self::RateLimited { .. } | Self::SharedQuota(QuotaError::Limited { .. }) => {
+                PerformanceErrorKind::RateLimited
+            }
             Self::Api { .. } => PerformanceErrorKind::Http,
             Self::Timeout => PerformanceErrorKind::Timeout,
             Self::Network => PerformanceErrorKind::Network,
-            Self::Overloaded => PerformanceErrorKind::Overloaded,
+            Self::Overloaded | Self::SharedQuota(_) => PerformanceErrorKind::Overloaded,
             Self::InvalidJson { .. } => PerformanceErrorKind::InvalidJson,
             Self::InvalidToken => PerformanceErrorKind::InvalidToken,
             Self::TokenUnavailable { .. } => PerformanceErrorKind::TokenUnavailable,
@@ -257,6 +264,7 @@ impl PerformanceError {
             | Self::InvalidJson { request_id, .. }
             | Self::ResponseTooLarge { request_id, .. } => request_id.as_deref(),
             Self::EndpointNotAllowed { .. }
+            | Self::SharedQuota(_)
             | Self::MissingCredentials(_)
             | Self::Timeout
             | Self::Network
@@ -423,6 +431,7 @@ pub struct PerformanceClient {
     logical_timeout: Duration,
     accounts: Arc<BTreeMap<StoreId, Arc<AccountState>>>,
     global_in_flight: Arc<Semaphore>,
+    shared_quota: SharedQuota,
 }
 
 impl PerformanceClient {
@@ -464,6 +473,7 @@ impl PerformanceClient {
             .timeout(timeout)
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
             .redirect(Policy::none())
+            .retry(reqwest::retry::never())
             .no_proxy()
             .user_agent(user_agent)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -494,6 +504,7 @@ impl PerformanceClient {
             logical_timeout: timeout,
             accounts: Arc::new(accounts),
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT)),
+            shared_quota: SharedQuota::from_env(),
         })
     }
 
@@ -744,7 +755,10 @@ impl PerformanceClient {
                 continue;
             }
 
+            self.admit_shared_request(state, "api", MIN_REQUEST_INTERVAL)
+                .await?;
             let response = self.send_request(&method, path, query, body, token).await?;
+            self.defer_shared_response(state, "api", &response).await?;
             if response.status() == StatusCode::UNAUTHORIZED {
                 let request_id = safe_request_id(response.headers());
                 drop(response);
@@ -846,6 +860,8 @@ impl PerformanceClient {
         &self,
         state: &AccountState,
     ) -> Result<(String, Instant), PerformanceError> {
+        self.admit_shared_request(state, "oauth", TOKEN_FAILURE_COOLDOWN)
+            .await?;
         let response = self
             .http
             .post(format!("{}{}", self.base_url, TOKEN_PATH))
@@ -857,6 +873,8 @@ impl PerformanceClient {
             .send()
             .await
             .map_err(|error| classify_transport(&error))?;
+        self.defer_shared_response(state, "oauth", &response)
+            .await?;
         let request_id = safe_request_id(response.headers());
         let status = response.status();
         if !status.is_success() {
@@ -990,6 +1008,7 @@ fn safe_request_id(headers: &HeaderMap) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod quota;
     use super::*;
     use crate::test_support::mock_http;
     use std::{
@@ -1026,66 +1045,6 @@ mod tests {
                 )
             })
             .collect()
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn shared_pacer_orders_reads_around_an_exclusive_write_boundary() {
-        let pacer = PerformanceRequestPacer::new();
-        let reader = PerformanceClient::new_with_https_proxy_and_pacer(
-            Duration::from_secs(2),
-            credentials(),
-            "http://127.0.0.1:3128",
-            &pacer,
-        )
-        .unwrap();
-        assert!(Arc::ptr_eq(
-            &reader.accounts[&StoreId::from("shop")].pacing.next_allowed,
-            &pacer.next_allowed
-        ));
-        assert!(
-            PerformanceClient::new_with_https_proxy_and_pacer(
-                Duration::from_secs(2),
-                credentials(),
-                "http://[invalid",
-                &pacer
-            )
-            .is_err()
-        );
-        assert!(pacer.try_claim_request_slot(Duration::from_secs(10)).await);
-
-        let writer_pacer = pacer.clone();
-        let mut writer = tokio::spawn(async move { writer_pacer.reserve_write().await });
-        tokio::task::yield_now().await;
-        assert!(
-            !writer.is_finished(),
-            "a write must wait for the preceding read start interval"
-        );
-        tokio::time::advance(Duration::from_secs(10)).await;
-        let mut write_guard = (&mut writer).await.unwrap();
-        drop(writer);
-        write_guard.mark_request_started(Duration::from_secs(5));
-
-        let reader_pacer = pacer.clone();
-        let reader = tokio::spawn(async move {
-            reader_pacer.wait_until_ready().await;
-            reader_pacer
-                .try_claim_request_slot(Duration::from_secs(1))
-                .await
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !reader.is_finished(),
-            "a read must not cross an active write marker-to-result boundary"
-        );
-
-        drop(write_guard);
-        tokio::task::yield_now().await;
-        assert!(
-            !reader.is_finished(),
-            "the write request-start interval remains active after its result"
-        );
-        tokio::time::advance(Duration::from_secs(5)).await;
-        assert!(reader.await.unwrap());
     }
 
     async fn cache_access_token(

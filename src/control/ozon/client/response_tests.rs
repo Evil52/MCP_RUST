@@ -12,6 +12,119 @@ use tokio::sync::mpsc;
 
 use super::*;
 
+#[test]
+fn shared_write_cooldown_preserves_zero_and_long_vendor_delays() {
+    for delay in [
+        Duration::ZERO,
+        Duration::from_hours(2),
+        Duration::from_hours(48),
+    ] {
+        assert_eq!(
+            shared_response_cooldown(StatusCode::TOO_MANY_REQUESTS, Some(delay)),
+            Some(delay)
+        );
+        assert_eq!(
+            shared_response_cooldown(StatusCode::SERVICE_UNAVAILABLE, Some(delay)),
+            Some(delay)
+        );
+    }
+    assert_eq!(
+        shared_response_cooldown(StatusCode::SERVICE_UNAVAILABLE, None),
+        None
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires the isolated reporting PostgreSQL fixture"]
+async fn shared_quota_refusal_after_permit_sends_no_ozon_write() {
+    let database_url = std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL")
+        .expect("run through scripts/with-position-test-db.sh");
+    let quota = SharedQuota::from_database_url(&database_url);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let client_id = format!(
+        "write-quota-{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap()
+    );
+    let client = OzonAdsWriteClient::new_for_test(
+        &format!("http://{}", listener.local_addr().unwrap()),
+        PerformanceCredentials {
+            client_id: client_id.clone(),
+            client_secret: "quota-test-secret".to_owned(),
+        },
+        Duration::from_secs(2),
+    )
+    .with_shared_quota(quota.clone());
+    client.token.lock().await.cached = Some(CachedToken {
+        value: "test-token".to_owned(),
+        refresh_at: Instant::now() + Duration::from_secs(60),
+    });
+    let permits = AtomicUsize::new(0);
+    let key = QuotaKey::ozon_performance(&client_id, "api").unwrap();
+    let error = client
+        .activate_campaign_with_permit(42, || async {
+            permits.fetch_add(1, Ordering::SeqCst);
+            // Model another process's 429 arriving during the durable preflight.
+            quota.defer(&key, Duration::from_secs(60)).await.unwrap();
+            Ok::<_, ()>(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OzonGuardedWriteError::Write(OzonWriteError::SharedQuota(QuotaError::Limited { .. }))
+    ));
+    assert_eq!(permits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[tokio::test]
+async fn unavailable_shared_quota_precedes_oauth_write_and_durable_permit() {
+    for cached_token in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = OzonAdsWriteClient::new_for_test(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            PerformanceCredentials {
+                client_id: "quota-test-client".to_owned(),
+                client_secret: "quota-test-secret".to_owned(),
+            },
+            Duration::from_secs(1),
+        )
+        .with_shared_quota(SharedQuota::from_database_url("invalid-quota-url"));
+        if cached_token {
+            client.token.lock().await.cached = Some(CachedToken {
+                value: "test-token".to_owned(),
+                refresh_at: Instant::now() + Duration::from_secs(60),
+            });
+        }
+        let permits = AtomicUsize::new(0);
+        let error = client
+            .activate_campaign_with_permit(42, || async {
+                permits.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ()>(())
+            })
+            .await
+            .unwrap_err();
+        let OzonGuardedWriteError::Write(error) = error else {
+            panic!("quota must refuse before the permit");
+        };
+        assert!(matches!(
+            error,
+            OzonWriteError::SharedQuota(QuotaError::Unavailable)
+        ));
+        assert_eq!(error.kind(), OzonWriteErrorKind::Definite);
+        assert_eq!(permits.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
 struct ResponseFrames(mpsc::Receiver<Result<Frame<Bytes>, std::io::Error>>);
 
 impl HttpBody for ResponseFrames {

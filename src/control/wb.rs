@@ -116,6 +116,8 @@ pub(super) enum WbGuardedWriteError<E> {
 
 #[derive(Error, Debug)]
 pub(super) enum WbWriteError {
+    #[error("общая квота WB отклонила write до отправки: {0}")]
+    SharedQuota(crate::marketplace_quota::QuotaError),
     #[error("некорректный WB write request: {0}")]
     InvalidRequest(&'static str),
     #[error("WB вернул HTTP {status} после отправки write (request-id: {request_id:?})")]
@@ -133,7 +135,7 @@ pub(super) enum WbWriteError {
 impl WbWriteError {
     pub(super) const fn outcome_kind(&self) -> WbWriteOutcomeKind {
         match self {
-            Self::InvalidRequest(_) => WbWriteOutcomeKind::DefiniteFailure,
+            Self::InvalidRequest(_) | Self::SharedQuota(_) => WbWriteOutcomeKind::DefiniteFailure,
             // Once request bytes may have reached WB, an HTTP status alone is
             // not evidence that a batch had no partial/late effect.
             Self::HttpStatus { .. } | Self::Ambiguous { .. } => WbWriteOutcomeKind::Ambiguous,
@@ -148,11 +150,13 @@ impl WbWriteError {
     fn http_status_request_id(&self) -> Option<Option<&str>> {
         match self {
             Self::HttpStatus { request_id, .. } => Some(request_id.as_deref()),
-            Self::InvalidRequest(_) | Self::Ambiguous { .. } => None,
+            Self::InvalidRequest(_) | Self::SharedQuota(_) | Self::Ambiguous { .. } => None,
         }
     }
 }
 
+#[cfg(test)]
+mod quota_tests;
 #[cfg(test)]
 mod retry_tests;
 #[cfg(test)]

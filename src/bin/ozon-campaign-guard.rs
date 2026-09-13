@@ -9,5 +9,8 @@ async fn main() -> Result<()> {
     if print_runtime_version_if_requested("ozon-campaign-guard", &arguments)? {
         return Ok(());
     }
+    mcp_ozon::marketplace_quota::SharedQuota::from_env()
+        .preflight()
+        .await?;
     run_ozon_campaign_guard(&arguments).await
 }

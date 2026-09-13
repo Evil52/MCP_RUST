@@ -9,7 +9,7 @@ AND EXISTS (
       AND NOT runtime_role.rolinherit
       AND NOT runtime_role.rolreplication
       AND NOT runtime_role.rolbypassrls
-      AND runtime_role.rolconnlimit = 2
+      AND runtime_role.rolconnlimit = 4
 )
 AND has_database_privilege(current_user, current_database(), 'CONNECT')
 AND NOT has_database_privilege(current_user, current_database(), 'TEMPORARY')

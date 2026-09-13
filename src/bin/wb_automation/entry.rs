@@ -16,6 +16,9 @@ pub async fn run() -> Result<()> {
     if print_runtime_version_if_requested("wb-automation", &arguments)? {
         return Ok(());
     }
+    mcp_ozon::marketplace_quota::SharedQuota::from_env()
+        .preflight()
+        .await?;
     if arguments
         .first()
         .is_some_and(|arg| arg == "campaign-launch")

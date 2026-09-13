@@ -51,6 +51,9 @@ async fn main() -> Result<()> {
             Some(JwtAuthenticator::new(jwt_config.clone(), registry.clone())?)
         }
     };
+    mcp_ozon::marketplace_quota::SharedQuota::from_env()
+        .preflight()
+        .await?;
     let ozon_services = match &config.ozon_runtime {
         Some(runtime) => {
             let plans = OzonPlanRepository::connect(&runtime.database)
