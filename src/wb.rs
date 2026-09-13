@@ -1,3 +1,6 @@
+mod finance;
+mod hosts;
+use hosts::BaseUrls;
 mod operator_reads;
 mod policy;
 pub use mcp_marketplace_types::WbCredentials;
@@ -9,6 +12,7 @@ use validation::{
     validate_promotion_period, validate_promotion_statuses, validate_search_period,
     validate_search_texts, validate_top_order_by, validate_unsigned_id,
 };
+mod request;
 mod response;
 use response::{
     ParsedRetryDelay, classify_transport_error, decode_response, extract_request_id, is_retriable,
@@ -45,7 +49,10 @@ const CONTENT_API_BASE_URL: &str = "https://content-api.wildberries.ru";
 const PRICES_API_BASE_URL: &str = "https://discounts-prices-api.wildberries.ru";
 const COMMON_API_BASE_URL: &str = "https://common-api.wildberries.ru";
 const PROMOTION_API_BASE_URL: &str = "https://advert-api.wildberries.ru";
+const FINANCE_API_BASE_URL: &str = "https://finance-api.wildberries.ru";
 const MARKETPLACE_API_BASE_URL: &str = "https://marketplace-api.wildberries.ru";
+const FINANCE_DETAILS_PATH: &str = "/api/finance/v1/sales-reports/detailed";
+const FINANCE_MIN_REQUEST_INTERVAL: Duration = Duration::from_hours(12);
 const PING_PATH: &str = "/ping";
 const SALES_FUNNEL_PATH: &str = "/api/analytics/v3/sales-funnel/products";
 const SALES_FUNNEL_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/products/history";
@@ -361,6 +368,7 @@ struct TokenLimiter {
     promotion_recommendations: PacingGate,
     promotion_cluster_bids: PacingGate,
     seller_inventory: PacingGate,
+    finance_reports: PacingGate,
 }
 
 impl TokenLimiter {
@@ -383,6 +391,7 @@ impl TokenLimiter {
             promotion_recommendations: PacingGate::new(),
             promotion_cluster_bids: PacingGate::new(),
             seller_inventory: PacingGate::new(),
+            finance_reports: PacingGate::new(),
         }
     }
 
@@ -404,6 +413,7 @@ impl TokenLimiter {
             RequestClass::PromotionRecommendedBids => &self.promotion_recommendations,
             RequestClass::PromotionClusterBids => &self.promotion_cluster_bids,
             RequestClass::SellerInventory => &self.seller_inventory,
+            RequestClass::FinanceReport => &self.finance_reports,
         }
     }
 
@@ -468,57 +478,6 @@ impl TokenLimiter {
 }
 
 #[derive(Debug, Clone)]
-struct BaseUrls {
-    analytics: String,
-    statistics: String,
-    content: String,
-    prices: String,
-    common: String,
-    promotion: String,
-    marketplace: String,
-}
-
-impl BaseUrls {
-    fn production() -> Self {
-        Self {
-            analytics: ANALYTICS_API_BASE_URL.to_owned(),
-            statistics: STATISTICS_API_BASE_URL.to_owned(),
-            content: CONTENT_API_BASE_URL.to_owned(),
-            prices: PRICES_API_BASE_URL.to_owned(),
-            common: COMMON_API_BASE_URL.to_owned(),
-            promotion: PROMOTION_API_BASE_URL.to_owned(),
-            marketplace: MARKETPLACE_API_BASE_URL.to_owned(),
-        }
-    }
-
-    #[cfg(test)]
-    fn for_test(common_base_url: &str, analytics_base_url: &str) -> Self {
-        let common = common_base_url.trim_end_matches('/').to_owned();
-        Self {
-            analytics: analytics_base_url.trim_end_matches('/').to_owned(),
-            statistics: common.clone(),
-            content: common.clone(),
-            prices: common.clone(),
-            common: common.clone(),
-            promotion: common.clone(),
-            marketplace: common,
-        }
-    }
-
-    fn base_url(&self, host: ApiHost) -> &str {
-        match host {
-            ApiHost::Analytics => &self.analytics,
-            ApiHost::Statistics => &self.statistics,
-            ApiHost::Content => &self.content,
-            ApiHost::Prices => &self.prices,
-            ApiHost::Common => &self.common,
-            ApiHost::Promotion => &self.promotion,
-            ApiHost::Marketplace => &self.marketplace,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct WbClient {
     http: Client,
     base_urls: BaseUrls,
@@ -546,6 +505,7 @@ struct AttemptContext<'a> {
 
 enum AttemptOutcome {
     Complete(Value),
+    NoContent,
     Retry { delay: Duration, error: WbError },
 }
 
@@ -1163,56 +1123,6 @@ impl WbClient {
         self.request(account, method, path, None, None).await
     }
 
-    async fn request(
-        &self,
-        account: &str,
-        method: Method,
-        path: &str,
-        query: Option<Vec<(&'static str, String)>>,
-        payload: Option<Value>,
-    ) -> Result<Value, WbError> {
-        // Enforced here, at the only point where a WB request can leave the
-        // process, so the read-only guarantee does not depend on callers.
-        let Some(endpoint_policy) = EndpointPolicy::for_request(&method, path) else {
-            return Err(WbError::EndpointNotAllowed {
-                method,
-                path: path.to_owned(),
-            });
-        };
-        let endpoint = endpoint_policy.label;
-        let request_class = endpoint_policy.request_class;
-        let base_url = self.base_urls.base_url(endpoint_policy.host);
-        let mut url = Url::parse(&format!("{base_url}{path}"))
-            .expect("static production or validated test WB base URL");
-        if let Some(query) = query {
-            url.query_pairs_mut().extend_pairs(query);
-        }
-        let url = url.to_string();
-        let credentials = self
-            .accounts
-            .get(account)
-            .ok_or_else(|| WbError::MissingCredentials(account.to_owned()))?;
-        let limiter = self
-            .limiters
-            .get(account)
-            .expect("configured WB account has a limiter");
-        let authorization = bearer_authorization(&credentials.token)?;
-
-        let deadline = TokioInstant::now() + self.logical_timeout;
-        self.request_with_retries(
-            account,
-            method,
-            endpoint,
-            request_class,
-            limiter,
-            url,
-            authorization,
-            payload,
-            deadline,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn request_with_retries(
         &self,
@@ -1225,7 +1135,7 @@ impl WbClient {
         authorization: HeaderValue,
         payload: Option<Value>,
         deadline: TokioInstant,
-    ) -> Result<Value, WbError> {
+    ) -> Result<Option<Value>, WbError> {
         let context = AttemptContext {
             account,
             deadline,
@@ -1253,7 +1163,8 @@ impl WbClient {
                     Ok(Ok(outcome)) => outcome,
                 };
             match outcome {
-                AttemptOutcome::Complete(value) => return Ok(value),
+                AttemptOutcome::Complete(value) => return Ok(Some(value)),
+                AttemptOutcome::NoContent => return Ok(None),
                 AttemptOutcome::Retry { delay, error } => {
                     // A timed-out quota-state read means no retry can fit. Map
                     // it to an impossible wait so the shared fit check below
@@ -1368,10 +1279,12 @@ impl WbClient {
             .flatten();
         let vendor_cooldown = match retry_after {
             ParsedRetryDelay::Valid(delay)
-                if context.request_class == RequestClass::SellerInventory
-                    && is_retriable(status) =>
+                if matches!(
+                    context.request_class,
+                    RequestClass::SellerInventory | RequestClass::FinanceReport
+                ) && is_retriable(status) =>
             {
-                // The one-attempt inventory reader must still honor a long
+                // One-attempt inventory/finance reads must still honor a long
                 // Retry-After for sibling callers. Cap untrusted delays at a
                 // day; the generic retry budget is not this shared cooldown.
                 Some(delay.min(Duration::from_hours(24)))
@@ -1436,6 +1349,24 @@ impl WbClient {
                     String::from_utf8_lossy(&diagnostic).into_owned(),
                 ),
             });
+        }
+
+        if context.request_class == RequestClass::FinanceReport && status == StatusCode::NO_CONTENT
+        {
+            // Only the documented finance endpoint uses 204 as terminal proof.
+            // A 200 JSON null or empty array remains a distinct response.
+            read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
+            trace_response(
+                context.account,
+                context.endpoint,
+                attempt,
+                started,
+                status,
+                request_id.as_deref(),
+                None,
+                false,
+            );
+            return Ok(AttemptOutcome::NoContent);
         }
 
         let result = decode_response(response, request_id.clone(), retry_after.duration()).await;
@@ -1798,6 +1729,13 @@ mod tests {
     #[test]
     fn endpoint_policy_table_matches_the_immutable_security_snapshot() {
         let expected = [
+            (
+                Method::POST,
+                FINANCE_DETAILS_PATH,
+                "finance:/api/finance/v1/sales-reports/detailed",
+                ApiHost::Finance,
+                RequestClass::FinanceReport,
+            ),
             (
                 Method::GET,
                 SELLER_WAREHOUSES_PATH,
@@ -2428,6 +2366,7 @@ mod tests {
             Duration::from_secs(2),
             credentials(),
             BaseUrls {
+                finance: "http://127.0.0.1:1".to_owned(),
                 analytics,
                 statistics,
                 content,
@@ -2575,6 +2514,7 @@ mod tests {
             Duration::from_secs(2),
             credentials(),
             BaseUrls {
+                finance: "http://127.0.0.1:1".to_owned(),
                 analytics,
                 statistics: unreachable.clone(),
                 content: unreachable.clone(),

@@ -16,6 +16,7 @@ use super::normalization::{
 };
 use super::validation::build_supply_order_timeslot;
 use super::*;
+mod analytics_security;
 mod wb_inventory;
 use crate::config::{JwtConfig, MarketplaceAccount, PerformanceCredentials};
 use crate::ozon::{
@@ -11510,78 +11511,4 @@ async fn performance_errors_are_structured_and_status_never_exposes_credentials(
     assert!(!serialized.contains("test-performance-client"));
     assert!(!serialized.contains("test-performance-secret"));
     assert!(requests.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn independent_source_tool_respects_account_and_finance_access_before_reading() {
-    use crate::reporting::snapshot::SnapshotSource;
-    let repository = Arc::new(FakeReportingRepository::succeeding());
-    let manager = reporting_test_server("manager", repository.clone());
-    let input = ReportingSourceSnapshotInput {
-        account: None,
-        source: SnapshotSource::Prices,
-        snapshot_id: None,
-        limit: 100,
-        offset: 0,
-    };
-    assert_eq!(
-        manager
-            .reporting_source_snapshot(RequestIdentity::dev(), Parameters(input.clone()))
-            .await
-            .unwrap()
-            .0
-            .storage,
-        "published_postgresql_snapshots"
-    );
-    for source in [SnapshotSource::Advertising, SnapshotSource::Finance] {
-        let denied = reporting_tool_error(
-            manager
-                .reporting_source_snapshot(
-                    RequestIdentity::dev(),
-                    Parameters(ReportingSourceSnapshotInput {
-                        source,
-                        ..input.clone()
-                    }),
-                )
-                .await,
-        );
-        assert!(denied.starts_with(ROLE_ACCESS_DENIED));
-    }
-    assert!(
-        manager
-            .reporting_source_snapshot(
-                RequestIdentity::dev(),
-                Parameters(ReportingSourceSnapshotInput {
-                    account: Some("unknown_account".to_owned()),
-                    ..input.clone()
-                })
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        manager
-            .reporting_source_snapshot(
-                RequestIdentity::dev(),
-                Parameters(ReportingSourceSnapshotInput {
-                    offset: 1,
-                    ..input.clone()
-                })
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(repository.calls(), 1);
-    let finance = reporting_test_server("finance", repository.clone());
-    finance
-        .reporting_source_snapshot(
-            RequestIdentity::dev(),
-            Parameters(ReportingSourceSnapshotInput {
-                source: SnapshotSource::Finance,
-                ..input
-            }),
-        )
-        .await
-        .unwrap();
-    assert_eq!(repository.calls(), 2);
 }
