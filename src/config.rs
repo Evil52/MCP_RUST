@@ -1,3 +1,5 @@
+mod data_mode;
+pub use data_mode::McpDataMode;
 mod oidc_actor;
 
 use std::{
@@ -1018,6 +1020,7 @@ impl FromStr for TransportMode {
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
+    pub data_mode: McpDataMode,
     pub bind: SocketAddr,
     pub max_sessions: NonZeroUsize,
     pub session_idle_timeout: Duration,
@@ -1332,39 +1335,16 @@ fn load_wildberries_credentials(
     Ok(())
 }
 
+#[derive(Default)]
 struct MarketplaceCredentials {
     stores: BTreeMap<StoreId, StoreCredentials>,
     performance_stores: BTreeMap<StoreId, PerformanceCredentials>,
     wildberries_accounts: BTreeMap<String, WbCredentials>,
 }
 
-fn load_marketplace_credentials(
-    snapshot: &AccessRegistry,
-    lookup: &mut dyn FnMut(&str) -> Option<String>,
-) -> Result<MarketplaceCredentials> {
-    let mut credentials = MarketplaceCredentials {
-        stores: BTreeMap::new(),
-        performance_stores: BTreeMap::new(),
-        wildberries_accounts: BTreeMap::new(),
-    };
-    for account in &snapshot.accounts {
-        load_ozon_credentials(
-            snapshot,
-            account,
-            lookup,
-            &mut credentials.stores,
-            &mut credentials.performance_stores,
-        )?;
-        load_wildberries_credentials(account, lookup, &mut credentials.wildberries_accounts)?;
-    }
-    validate_unique_performance_client_ids(&credentials.performance_stores)?;
-    Ok(credentials)
-}
-
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
-        finish_optional_dotenv_load(dotenvy::dotenv())?;
-        Self::from_lookup(|key| std::env::var(key).ok())
+        data_mode::load_process_config()
     }
 
     fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self> {
@@ -1372,6 +1352,7 @@ impl AppConfig {
     }
 
     fn from_lookup_inner(lookup: &mut dyn FnMut(&str) -> Option<String>) -> Result<Self> {
+        let data_mode = lookup_value(lookup, "MCP_DATA_MODE", "live_analytics").parse()?;
         let bind: SocketAddr = lookup_value(lookup, "MCP_BIND", "127.0.0.1:8787")
             .parse()
             .context("MCP_BIND должен иметь формат IP:PORT")?;
@@ -1418,8 +1399,14 @@ impl AppConfig {
                 "MCP_AUTH_MODE=dev с MCP_TRANSPORT=http разрешён только на loopback; для изолированного контейнера задайте MCP_DEV_ALLOW_NON_LOOPBACK=true явно"
             );
         }
-        let credentials = load_marketplace_credentials(&snapshot, lookup)?;
+        let credentials = match data_mode {
+            McpDataMode::LiveAnalytics => {
+                data_mode::load_marketplace_credentials(&snapshot, lookup)?
+            }
+            McpDataMode::ReportingOnly => MarketplaceCredentials::default(),
+        };
         Ok(Self {
+            data_mode,
             bind,
             max_sessions,
             session_idle_timeout,
@@ -1449,6 +1436,7 @@ fn finish_optional_dotenv_load(result: dotenvy::Result<PathBuf>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    mod data_mode;
     use super::*;
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::{

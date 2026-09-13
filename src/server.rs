@@ -1,4 +1,6 @@
 mod contracts;
+mod reporting_mode;
+mod router_policy;
 pub use contracts::{
     AccountStatus, AccountsResult, ActorStatus, EmptyInput, MemberAccountStatus, MemberStatus,
     MembersResult, OzonLiveMarketingAction, OzonLivePriceItem, OzonLivePricesResult,
@@ -300,6 +302,7 @@ fn redact_marketplace_pii(value: &mut Value) {
 
 #[derive(Debug, Clone)]
 pub struct OzonMcp {
+    reporting_only: bool,
     client: OzonClient,
     performance_client: PerformanceClient,
     wb_client: WbClient,
@@ -313,62 +316,11 @@ pub struct OzonMcp {
     tool_call_slots: Arc<Semaphore>,
 }
 
-fn tool_security_schemes(authenticator: Option<&JwtAuthenticator>) -> Vec<JsonObject> {
-    let mut scheme = JsonObject::new();
-    match authenticator {
-        Some(authenticator) => {
-            scheme.insert("type".to_owned(), Value::String("oauth2".to_owned()));
-            scheme.insert(
-                "scopes".to_owned(),
-                Value::Array(
-                    authenticator
-                        .required_scopes()
-                        .iter()
-                        .cloned()
-                        .map(Value::String)
-                        .collect(),
-                ),
-            );
-        }
-        None => {
-            scheme.insert("type".to_owned(), Value::String("noauth".to_owned()));
-        }
-    }
-    vec![scheme]
-}
-
 impl OzonMcp {
-    fn default_tool_router(authenticator: Option<&JwtAuthenticator>) -> ToolRouter<Self> {
-        let mut tool_router = Self::build_tool_router();
-        let security_schemes = tool_security_schemes(authenticator);
-        let security_schemes_value = Value::Array(
-            security_schemes
-                .iter()
-                .cloned()
-                .map(Value::Object)
-                .collect(),
-        );
-        for route in tool_router.map.values_mut() {
-            let read_only = !REPORT_REFRESH_WRITE_TOOLS.contains(&route.attr.name.as_ref());
-            let annotations = route.attr.annotations.get_or_insert_default();
-            annotations.read_only_hint = Some(read_only);
-            annotations.destructive_hint = Some(false);
-            annotations.idempotent_hint = Some(true);
-            annotations.open_world_hint.get_or_insert(true);
-            route.attr.security_schemes = Some(security_schemes.clone());
-            route
-                .attr
-                .meta
-                .get_or_insert_with(MetaObject::new)
-                .0
-                .insert("securitySchemes".to_owned(), security_schemes_value.clone());
-        }
-        tool_router
-    }
-
     #[must_use]
     pub fn new(client: OzonClient, actor_id: String, registry: RegistrySource) -> Self {
         Self {
+            reporting_only: false,
             client,
             performance_client: PerformanceClient::empty(Duration::from_secs(30)),
             wb_client: WbClient::empty(Duration::from_secs(30)),
@@ -391,6 +343,7 @@ impl OzonMcp {
     ) -> Self {
         let tool_router = Self::default_tool_router(Some(&authenticator));
         Self {
+            reporting_only: false,
             client,
             performance_client: PerformanceClient::empty(Duration::from_secs(30)),
             wb_client: WbClient::empty(Duration::from_secs(30)),
@@ -456,13 +409,17 @@ impl OzonMcp {
 
     #[must_use]
     pub fn with_wildberries_client(mut self, wb_client: WbClient) -> Self {
-        self.wb_client = wb_client;
+        if !self.reporting_only {
+            self.wb_client = wb_client;
+        }
         self
     }
 
     #[must_use]
     pub fn with_performance_client(mut self, performance_client: PerformanceClient) -> Self {
-        self.performance_client = performance_client;
+        if !self.reporting_only {
+            self.performance_client = performance_client;
+        }
         self
     }
 
@@ -1386,6 +1343,9 @@ impl ServerHandler for OzonMcp {
     }
 
     fn get_info(&self) -> ServerInfo {
+        if self.reporting_only {
+            return Self::reporting_only_info();
+        }
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("mcp-ozon", env!("CARGO_PKG_VERSION"))

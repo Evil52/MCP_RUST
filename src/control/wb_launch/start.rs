@@ -11,19 +11,31 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use std::str::FromStr;
 
+#[path = "first_launch.rs"]
+mod first_launch;
+
 impl Operator {
-    pub(super) async fn start(&self, journal: &Journal) -> Result<Value> {
-        self.manifest.authorize_stage("start")?;
-        let id = journal.campaign_id()?;
-        journal.assert_not_attempted("start")?;
-        journal.require_receipt("fund")?;
-        validate_start_status(self.inactive(id, true).await?.status)?;
+    pub(super) fn installed_protection(&self, id: u64) -> Result<WbAutomationPolicy> {
         let policy: WbAutomationPolicy = read_policy_json(&self.manifest.robot_policy)?;
         ensure!(
             policy == self.target_policy(id),
             "installed Nexus robot policy differs from reviewed copy"
         );
         validate_protective_policy(&policy, Utc::now())?;
+        Ok(policy)
+    }
+
+    pub(super) async fn start(&self, journal: &Journal) -> Result<Value> {
+        self.manifest.authorize_stage("start")?;
+        let id = journal.campaign_id()?;
+        journal.assert_not_attempted("start")?;
+        journal.require_receipt("fund")?;
+        let status = self.inactive(id, true).await?.status;
+        validate_start_status(status)?;
+        if status == 4 {
+            first_launch::validate_receipts(journal, id, &self.manifest.bids_kopecks)?;
+        }
+        let policy = self.installed_protection(id)?;
         let observer = WbAutomationObserver::from_files(
             &self.manifest.robot_policy,
             &self.manifest.registry,
@@ -76,7 +88,19 @@ impl Operator {
                     .observe(Utc::now(), WbAutomationStateView::default())
                     .await?;
                 validate_initial_observation(&snapshot.observation, policy)?;
-                self.inactive(id, true).await?;
+                ensure!(
+                    self.inactive(id, true).await?.status == snapshot.observation.campaign_status,
+                    "startup campaign status changed during checks"
+                );
+                if snapshot.observation.campaign_status == 4 {
+                    first_launch::validate_receipts(journal, id, &self.manifest.bids_kopecks)?;
+                    ensure!(
+                        lease
+                            .verify_first_launch_cycles(observer.policy_sha256())
+                            .await?,
+                        "first launch needs two fresh ready-state cycles and no earlier activity"
+                    );
+                }
                 let state = lease
                     .load_state()
                     .await?
@@ -99,6 +123,8 @@ impl Operator {
                         && state.pending_idempotency_key.is_none()
                         && state.paused_for_daily_cap_on.is_none()
                         && state.actions_today == 0
+                        && (snapshot.observation.campaign_status != 4
+                            || state.last_action_at.is_none())
                         && state.business_date == wb_automation_business_date(Utc::now()),
                     "protective robot state is not clean/current; no locks may be bypassed"
                 );
@@ -111,17 +137,26 @@ impl Operator {
             state.status == 9 && state.bids == self.manifest.bids_kopecks,
             "start readback differs; reconcile only"
         );
-        journal.receipt("start", &json!({"campaign_id":id,"wb_http":200,"status":9,
-            "checked_at":Utc::now(),"bids_kopecks":state.bids,"budget_rubles":self.budget(id).await?}))?;
+        let budget = self.budget(id).await?;
+        ensure!(
+            (1..=1000).contains(&budget),
+            "start budget readback differs; reconcile only"
+        );
+        journal.receipt(
+            "start",
+            &json!({"campaign_id":id,"wb_http":200,"status":9,
+            "checked_at":Utc::now(),"bids_kopecks":state.bids,"budget_rubles":budget,
+            "post_start_robot_cycle_confirmed":false}),
+        )?;
         lease.release().await?;
         self.reconcile(journal).await
     }
 }
 
-fn validate_start_status(status: i32) -> Result<()> {
+pub(super) fn validate_start_status(status: i32) -> Result<()> {
     ensure!(
-        status == 11,
-        "guarded startup needs verified spend evidence: WB fullstats supports statuses 7/9/11, not a new status-4 campaign; a separately reviewed first-launch protocol is required, no write attempted"
+        matches!(status, 4 | 11),
+        "guarded startup requires ready status 4 or paused status 11"
     );
     Ok(())
 }
@@ -134,9 +169,15 @@ fn validate_initial_observation(
     ensure!(
         matches!(observation.campaign_status, 4 | 11)
             && observation.budget_remaining_minor == 100_000
-            && observation.daily_spend_complete
             && observation.daily_spend_minor == 0
-            && observation.attribution_complete
+            && if observation.campaign_status == 4 {
+                !observation.daily_spend_complete
+                    && !observation.attribution_complete
+                    && observation.current_campaign_metrics.is_none()
+                    && observation.campaign_level_metrics.is_none()
+            } else {
+                observation.daily_spend_complete && observation.attribution_complete
+            }
             && !observation.paused_by_automation
             && observation.actions_today == 0,
         "initial guard snapshot is incomplete, already spent, paused by protection or not funded"
@@ -190,9 +231,10 @@ mod tests {
     use crate::control::WbAutomationSkuObservation;
 
     #[test]
-    fn new_campaign_never_attempts_unsupported_stats_or_start() {
+    fn startup_accepts_only_ready_or_paused_status() {
         assert!(validate_start_status(11).is_ok());
-        for status in [4, 7, 9, -1] {
+        assert!(validate_start_status(4).is_ok());
+        for status in [7, 9, -1] {
             assert!(validate_start_status(status).is_err());
         }
     }
@@ -232,6 +274,18 @@ mod tests {
     }
 
     #[test]
+    fn ready_evidence_is_missing_not_fabricated_zero_statistics() {
+        let (mut observation, policy) = fixture();
+        observation.campaign_status = 4;
+        assert!(validate_initial_observation(&observation, &policy).is_err());
+        observation.daily_spend_complete = false;
+        observation.attribution_complete = false;
+        assert!(validate_initial_observation(&observation, &policy).is_ok());
+        observation.paused_by_automation = true;
+        assert!(validate_initial_observation(&observation, &policy).is_err());
+    }
+
+    #[test]
     fn startup_requires_full_zero_spend_funded_snapshot() {
         let (observation, policy) = fixture();
         validate_initial_observation(&observation, &policy).unwrap();
@@ -246,6 +300,9 @@ mod tests {
         assert!(validate_initial_observation(&changed, &policy).is_err());
         changed = observation.clone();
         changed.budget_remaining_minor = 0;
+        assert!(validate_initial_observation(&changed, &policy).is_err());
+        changed = observation.clone();
+        changed.campaign_status = 4;
         assert!(validate_initial_observation(&changed, &policy).is_err());
         changed = observation.clone();
         changed.campaign_status = 9;

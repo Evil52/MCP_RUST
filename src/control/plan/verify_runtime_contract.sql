@@ -181,6 +181,23 @@ AND NOT EXISTS (
       AND has_function_privilege(
         current_user, accessible_function.oid, 'EXECUTE'
       )
+      -- The shared coordinator grants exactly two scalar operations. Match
+      -- catalog fields rather than nullable to_regprocedure lookups: an absent
+      -- migration must never hide another executable user function.
+      AND NOT (
+        function_schema.nspname = 'marketplace_quota'
+        AND accessible_function.prokind = 'f'
+        AND NOT accessible_function.proretset
+        AND accessible_function.pronargs = 2
+        AND accessible_function.proargtypes[0] = 'pg_catalog.text'::regtype
+        AND accessible_function.proargtypes[1] = 'pg_catalog.int8'::regtype
+        AND (
+          (accessible_function.proname = 'try_acquire'
+            AND accessible_function.prorettype = 'pg_catalog.int8'::regtype)
+          OR (accessible_function.proname = 'extend_cooldown'
+            AND accessible_function.prorettype = 'pg_catalog.void'::regtype)
+        )
+      )
 )
 AND (
     SELECT array_agg(

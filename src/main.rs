@@ -5,7 +5,7 @@ use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 use anyhow::Result;
 use mcp_ozon::{
     auth::JwtAuthenticator,
-    config::{AppConfig, AuthConfig, TransportMode},
+    config::{AppConfig, AuthConfig, McpDataMode, TransportMode},
     http::build_router_with_cancellation_and_session_idle_timeout,
     ozon::OzonClient,
     ozon_performance::PerformanceClient,
@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
         .init();
 
     let config = AppConfig::from_env()?;
+    mcp_ozon::marketplace_quota::SharedQuota::from_env()
+        .preflight()
+        .await?;
     let reporting_database_url = match std::env::var("MCP_REPORTING_DATABASE_URL") {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
@@ -64,9 +67,6 @@ async fn main() -> Result<()> {
         config.request_timeout,
         config.stores,
     )?;
-    let wb_client = WbClient::new(config.request_timeout, config.wildberries_accounts);
-    let performance_client =
-        PerformanceClient::new(config.request_timeout, config.performance_stores)?;
     let registry = config.registry.clone();
     let server = match &config.auth {
         AuthConfig::Dev { actor_id } => OzonMcp::new(client, actor_id.clone(), registry),
@@ -74,9 +74,19 @@ async fn main() -> Result<()> {
             let authenticator = JwtAuthenticator::new(jwt_config.clone(), registry.clone())?;
             OzonMcp::new_authenticated(client, registry, authenticator)
         }
+    };
+    let server = match config.data_mode {
+        McpDataMode::ReportingOnly => server.into_reporting_only()?,
+        McpDataMode::LiveAnalytics => server
+            .with_wildberries_client(WbClient::new(
+                config.request_timeout,
+                config.wildberries_accounts,
+            ))
+            .with_performance_client(PerformanceClient::new(
+                config.request_timeout,
+                config.performance_stores,
+            )?),
     }
-    .with_wildberries_client(wb_client)
-    .with_performance_client(performance_client)
     .with_reporting_reader(reporting_reader)
     .with_refresh_requests(refresh_requests)
     .with_tool_telemetry(tool_telemetry)

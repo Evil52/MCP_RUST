@@ -448,8 +448,8 @@ verify_server() {
     --arg restart "$expected_restart" '.restart == $restart'
 }
 
-# The reporting-reader overlay may add exactly two restricted database URLs
-# and attach the existing
+# The reporting-reader overlay may add restricted database URLs and required
+# shared quota coordination, and attach the existing
 # internal database network. Everything else, including the outbound bridge,
 # mounts, published port, filesystem and resource hardening, must remain byte-
 # for-byte equivalent after Compose has merged the files.
@@ -466,14 +466,20 @@ verify_reporting_reader() {
   check "reporting reader: only the URLs and network attachment differ from main" "$service" \
     --argjson base "$base_service" \
     'del(.environment.MCP_REPORTING_DATABASE_URL,
-         .environment.MCP_REPORT_REFRESH_DATABASE_URL, .networks)
+         .environment.MCP_REPORT_REFRESH_DATABASE_URL,
+         .environment.MCP_MARKETPLACE_QUOTA_DATABASE_URL,
+         .environment.MCP_MARKETPLACE_QUOTA_REQUIRED, .networks)
      == ($base | del(.environment.MCP_REPORTING_DATABASE_URL,
-                     .environment.MCP_REPORT_REFRESH_DATABASE_URL, .networks))'
+                     .environment.MCP_REPORT_REFRESH_DATABASE_URL,
+         .environment.MCP_MARKETPLACE_QUOTA_DATABASE_URL,
+         .environment.MCP_MARKETPLACE_QUOTA_REQUIRED, .networks))'
   check "reporting reader: only the restricted reader and requester URLs are added" "$service" \
     --arg database_url "$expected_database_url" \
     --arg refresh_database_url "$expected_refresh_database_url" \
     '.environment.MCP_REPORTING_DATABASE_URL == $database_url
      and .environment.MCP_REPORT_REFRESH_DATABASE_URL == $refresh_database_url
+     and .environment.MCP_MARKETPLACE_QUOTA_DATABASE_URL == $refresh_database_url
+     and .environment.MCP_MARKETPLACE_QUOTA_REQUIRED == "true"
      and (.environment | has("POSITION_DB_ADMIN_PASSWORD") | not)
      and (.environment | has("POSITION_COLLECTOR_DB_PASSWORD") | not)
      and (.environment | has("POSITION_READER_DB_PASSWORD") | not)
@@ -576,6 +582,8 @@ verify_position_collector() {
   check "position collector: disabled credential-isolated environment is exact" "$service" \
     --arg database_url "$expected_database_url" \
     '.environment == {
+       "MCP_MARKETPLACE_QUOTA_DATABASE_URL": $database_url,
+       "MCP_MARKETPLACE_QUOTA_REQUIRED": "true",
        "POSITION_COLLECTOR_DATABASE_URL": $database_url,
        "POSITION_COLLECTOR_MODE": "disabled",
        "RUST_LOG": "mcp_ozon::position_collector=info"
@@ -628,6 +636,8 @@ verify_wb_automation_shadow() {
     --arg database_url "$expected_database_url" \
     '.environment == {
        "RUST_LOG": "mcp_ozon::control=info",
+       "MCP_MARKETPLACE_QUOTA_DATABASE_URL": $database_url,
+       "MCP_MARKETPLACE_QUOTA_REQUIRED": "true",
        "WB_AUTOMATION_DATABASE_URL": $database_url
      }'
   check "WB automation shadow: command has read token and no writer capability" "$service" \
@@ -700,6 +710,8 @@ verify_wb_automation_live() {
     --arg database_url "$expected_database_url" \
     '.environment == {
        "RUST_LOG": "mcp_ozon::control=info",
+       "MCP_MARKETPLACE_QUOTA_DATABASE_URL": $database_url,
+       "MCP_MARKETPLACE_QUOTA_REQUIRED": "true",
        "WB_AUTOMATION_DATABASE_URL": $database_url
      }
      and .command == [
@@ -833,6 +845,8 @@ verify_reporting_service() {
       '.environment == {
          ($mode_name): "disabled",
          ($database_name): $database_url,
+         "MCP_MARKETPLACE_QUOTA_DATABASE_URL": $database_url,
+         "MCP_MARKETPLACE_QUOTA_REQUIRED": "true",
          "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
          "DAILY_REPORT_POLICY": "/etc/mcp-ozon/daily-report-policy.json",
          "RUST_LOG": "mcp_ozon::reporting=info"
@@ -912,6 +926,8 @@ verify_reporting_live() {
     --arg database_url "$expected_database_url" \
     '.environment == {
        "REPORT_COLLECTOR_MODE": "scheduled",
+       "MCP_MARKETPLACE_QUOTA_DATABASE_URL": $database_url,
+       "MCP_MARKETPLACE_QUOTA_REQUIRED": "true",
        "REPORT_COLLECTOR_DATABASE_URL": $database_url,
        "REPORT_COLLECTOR_CREDENTIAL_DIR": "/run/mcp-ozon/report-credentials",
        "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
@@ -995,6 +1011,8 @@ verify_reporting_canary() {
     --arg database_url "$expected_database_url" \
     '.environment == {
        "REPORT_COLLECTOR_MODE": "ozon_dry_run",
+       "MCP_MARKETPLACE_QUOTA_DATABASE_URL": $database_url,
+       "MCP_MARKETPLACE_QUOTA_REQUIRED": "true",
        "REPORT_COLLECTOR_DATABASE_URL": $database_url,
        "REPORT_COLLECTOR_CREDENTIAL_DIR": "/run/mcp-ozon/report-credentials",
        "MCP_ACCESS_CONFIG": "/etc/mcp-ozon/access.json",
@@ -1412,6 +1430,8 @@ verify_control_wb_plan() {
     --arg database_url "$expected_database_url" \
     '.environment == ($base.environment + {
        "CONTROL_MCP_AUTH_MODE": "jwt",
+       "MCP_MARKETPLACE_QUOTA_DATABASE_URL": $database_url,
+       "MCP_MARKETPLACE_QUOTA_REQUIRED": "true",
        "CONTROL_MCP_DATABASE_URL": $database_url,
        "CONTROL_MCP_JWT_AUDIENCE": "https://control.example.test/mcp",
        "CONTROL_MCP_JWT_ISSUER": "https://auth.example.test/realms/ofk",
@@ -2081,7 +2101,7 @@ check_contains \
 check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
-  "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"
+  "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru finance-api.wildberries.ru content-api.wildberries.ru"
 check_contains \
   "report egress: proxy applies the exact read API host allowlist" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \

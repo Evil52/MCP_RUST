@@ -1,12 +1,12 @@
 # Vendored rmcp
 
-This directory contains the source of `rmcp` 3.1.4 from the official
+This directory contains the source of `rmcp` 3.3.0 from the official
 Model Context Protocol Rust SDK:
 
 - upstream: https://github.com/modelcontextprotocol/rust-sdk
-- crate: https://crates.io/crates/rmcp/3.1.4
-- crate checksum: `1a15bc53261a9dc37e105df006e4656c598379a8f9581f8950debb130f27a7cf`
-- upstream commit: `4a738b9dd99eaca418b614afa433a0cbdaf8d056`
+- crate: https://crates.io/crates/rmcp/3.3.0
+- crate checksum: `b88db56b8ae316560e9e868b6b978ea940f27cb883323fc90e07435e44158f5c`
+- upstream commit: `3e636cab26c013eca5131103c03d20237f12c4df`
 - license: Apache-2.0 (see `LICENSE`)
 
 Local modification: `Tool` exposes the OpenAI plugin authentication extension
@@ -60,3 +60,36 @@ gap and removal conditions are recorded in
 [ADR 0003](../../docs/adr/0003-vendored-rmcp.md).
 Removal requires equivalent behavior for every patch above (or a verified
 application-level replacement), not only the typed field.
+
+## 3.3.0 maintenance review (2026-09-13)
+
+The published archive checksum and `.cargo_vcs_info.json` were verified against
+the [official release](https://github.com/modelcontextprotocol/rust-sdk/releases/tag/rmcp-v3.3.0).
+The 3.1.4-to-3.3.0 source diff was imported with a three-way comparison against
+the verified 3.1.4 archive. No upstream Git-hook build script is imported.
+
+Upstream now keeps `initialize` on legacy protocol versions and exposes
+`ServerHandler::negotiate_initialize` (PRs
+[#1228](https://github.com/modelcontextprotocol/rust-sdk/pull/1228) and
+[#1247](https://github.com/modelcontextprotocol/rust-sdk/pull/1247)). HTTP errors
+use a boxed internal wrapper; the application-facing early header classifier
+still returns the existing sanitized `BoxResponse` contract. Session admission,
+restore error classification, cancellation propagation and the bounded positive
+schema cache remain local, with no relaxation of their budgets.
+
+There are no verified upstream acceptance/issue IDs for our local patches.
+They remain application-local for these reasons: `securitySchemes` is an OpenAI
+plugin compatibility extension; session and result/schema budgets are this
+service's resource policy; early HTTP admission and sanitized errors are its
+auth/body-read boundary; root cancellation is required by its bounded shutdown;
+omitting `build.rs` prevents an SDK import from modifying repository Git hooks.
+Upstream feature additions are not evidence that these contracts can be removed.
+
+Local validation: the OAuth wire, HTTP router, session cap/expiry, bounded JSON,
+schema-cache and Nexus CLI suites passed, together with the negotiation tests
+in `tests/rmcp_upgrade.rs`. The full all-feature/all-target workspace run passed
+1,213 tests (50 database-fixture-only tests remain explicitly ignored there);
+four PostgreSQL session-hardening tests also passed against a disposable database.
+Clippy with denied warnings, rustdoc with denied warnings, formatting and the
+first-party Rust structure budget passed. These are local build proofs, not
+production deployment or campaign-control evidence.
