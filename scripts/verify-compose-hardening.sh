@@ -2081,7 +2081,7 @@ check_contains \
 check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
-  "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru"
+  "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru content-api.wildberries.ru"
 check_contains \
   "report egress: proxy applies the exact read API host allowlist" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \

@@ -135,6 +135,16 @@ mod tests {
             (461_126_890, 7354),
             (529_996_417, 4263),
         ]);
+        assert!(require_single_subject(&subjects).is_err());
+    }
+
+    #[test]
+    fn selected_products_with_category_drift_are_rejected() {
+        let mut subjects = NMS
+            .into_iter()
+            .map(|nm| (nm, 4263))
+            .collect::<BTreeMap<_, _>>();
+        subjects.insert(NMS[0], 6341);
         let error = require_single_subject(&subjects).unwrap_err().to_string();
         assert!(error.contains("CPC requires one category"));
         assert!(error.contains("no write attempted"));

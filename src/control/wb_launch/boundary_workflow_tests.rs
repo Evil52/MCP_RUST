@@ -52,6 +52,7 @@ fn receipt_failure_responses(fixture: &Fixture, stage: &str) -> Vec<(u16, Value)
         preflight(fixture)
     };
     if stage == "fund" {
+        responses.insert(0, (200, target(11, 922)));
         responses.extend([
             (200, minimums()),
             (200, target(11, 922)),
@@ -80,6 +81,10 @@ async fn receipt_persistence_failure_never_repeats_a_completed_marketplace_write
                 fs::create_dir(&receipt_path).unwrap();
             }
         });
+        private_json(
+            &fixture.manifest.robot_policy,
+            &serde_json::to_value(operator.target_policy(ID)).unwrap(),
+        );
         let journal = fixture.journal();
         journal
             .receipt("create", &json!({"campaign_id":ID}))

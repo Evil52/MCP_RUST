@@ -23,6 +23,9 @@ pub(super) fn digest(bytes: &[u8]) -> String {
 #[path = "journal_tests.rs"]
 mod tests;
 
+#[path = "recreate_journal.rs"]
+mod recreate;
+
 pub(super) fn read_private_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     read_json(path, 0o077)
 }
@@ -55,9 +58,39 @@ fn read_json<T: DeserializeOwned>(path: &Path, forbidden_permissions: u32) -> Re
 pub(super) struct Journal {
     directory: PathBuf,
     lock: Option<File>,
+    recovery: bool,
 }
 
 impl Journal {
+    /// Advisory read-only check; create still locks and journals before POST.
+    pub(super) fn inspect_recreate(root: &Path, manifest: &Value) -> Result<()> {
+        let old = read_private_json(&root.join("ofk_region_wb-Nexus/manifest.json"))?;
+        let original = Self::open(root, &old, false)?;
+        recreate::validate(&original.directory, manifest)?;
+        let revised_path = original.directory.join("recreate-manifest.json");
+        if revised_path.try_exists()? {
+            ensure!(
+                read_private_json::<Value>(&revised_path)? == *manifest,
+                "replacement manifest differs from immutable authorization"
+            );
+        }
+        ensure!(
+            !original
+                .directory
+                .join("recreate-create-attempted.json")
+                .try_exists()?,
+            "replacement create already attempted; reconcile only"
+        );
+        ensure!(
+            !original
+                .directory
+                .join("recreate-create-receipt.json")
+                .try_exists()?,
+            "replacement create already confirmed; reconcile only"
+        );
+        Ok(())
+    }
+
     pub(super) fn open(root: &Path, manifest: &Value, writable: bool) -> Result<Self> {
         let metadata = fs::symlink_metadata(root)?;
         ensure!(
@@ -98,8 +131,24 @@ impl Journal {
         } else {
             None
         };
-        let journal = Self { directory, lock };
-        let path = journal.directory.join("manifest.json");
+        let recovery = manifest.get("recreate").is_some_and(|v| !v.is_null());
+        let journal = Self {
+            directory,
+            lock,
+            recovery,
+        };
+        if recovery {
+            recreate::validate(&journal.directory, manifest)?;
+        } else if writable {
+            ensure!(
+                !journal
+                    .directory
+                    .join("recreate-manifest.json")
+                    .try_exists()?,
+                "replacement authorization already recorded; legacy writes forbidden"
+            );
+        }
+        let path = journal.path("manifest");
         if writable && !path.try_exists()? {
             journal.record("manifest", manifest)?;
         }
@@ -115,21 +164,28 @@ impl Journal {
             self.lock.is_some(),
             "read-only reconcile cannot write journal"
         );
+        ensure!(
+            !self.recovery || !name.starts_with("fund") && !name.starts_with("start"),
+            "replacement create cannot fund or start"
+        );
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(self.directory.join(format!("{name}.json")))?;
+            .open(self.path(name))?;
         file.write_all(&serde_json::to_vec(value)?)?;
         file.sync_all()?;
         File::open(&self.directory)?.sync_all()?;
         Ok(())
     }
 
+    fn path(&self, name: &str) -> PathBuf {
+        let prefix = if self.recovery { "recreate-" } else { "" };
+        self.directory.join(format!("{prefix}{name}.json"))
+    }
+
     pub(super) fn attempted(&self, stage: &str) -> bool {
-        self.directory
-            .join(format!("{stage}-attempted.json"))
-            .exists()
+        self.path(&format!("{stage}-attempted")).exists()
     }
 
     pub(super) fn assert_not_attempted(&self, stage: &str) -> Result<()> {
@@ -141,6 +197,10 @@ impl Journal {
     }
 
     pub(super) fn attempt(&self, stage: &str, evidence: &Value) -> Result<()> {
+        if self.recovery {
+            let manifest = read_private_json(&self.path("manifest"))?;
+            recreate::validate(&self.directory, &manifest)?;
+        }
         self.record(
             &format!("{stage}-attempted"),
             &json!({"attempted_at":chrono::Utc::now(),"evidence":evidence}),
@@ -152,13 +212,11 @@ impl Journal {
     }
 
     pub(super) fn has_receipt(&self, stage: &str) -> bool {
-        self.directory
-            .join(format!("{stage}-receipt.json"))
-            .exists()
+        self.path(&format!("{stage}-receipt")).exists()
     }
 
     pub(super) fn require_receipt(&self, stage: &str) -> Result<Value> {
-        read_private_json(&self.directory.join(format!("{stage}-receipt.json")))
+        read_private_json(&self.path(&format!("{stage}-receipt")))
     }
 
     pub(super) fn maybe_campaign_id(&self) -> Result<Option<u64>> {
