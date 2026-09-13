@@ -59,7 +59,7 @@ pub struct WbFinancialLedgerResult {
     /// COMPLETE means a published batch ended with HTTP 204; it is not profit.
     /// No batch means N/D, while a complete empty batch has `row_count = 0`.
     pub state: DataState,
-    /// Independent official-summary reconciliation is not implemented yet.
+    /// A period batch has no report-ID reconciliation; use the official report reader.
     pub reconciliation_state: DataState,
     pub batch: Option<FinancialLedgerProvenance>,
     pub rows: Vec<FinancialLedgerRow>,
@@ -198,7 +198,7 @@ fn validate_batch(
     Ok(count)
 }
 
-fn public_row(row: WbFinanceDetailRow) -> FinancialLedgerRow {
+pub(super) fn public_row(row: WbFinanceDetailRow) -> FinancialLedgerRow {
     FinancialLedgerRow {
         rrd_id: row.rrd_id.to_string(),
         report_id: row.report_id.to_string(),

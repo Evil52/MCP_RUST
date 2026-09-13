@@ -302,7 +302,7 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   claims must never select an actor. Verify POST, GET and DELETE cannot use another subject's MCP
   session ID and return the same 404 as an unknown session. Saturate and time out readiness probes,
   confirm only one dependency probe runs, and confirm `/livez` plus MCP traffic remain responsive.
-- Verify the Analytics MCP tool list for this release contains exactly 87 stable tools, no preview tools,
+- Verify the Analytics MCP tool list for this release contains exactly 88 stable tools, no preview tools,
   and every tool advertises `destructiveHint=false` and the expected OAuth/noauth policy.
   `ofk_request_ozon_sales_refresh` and `ofk_request_marketplace_sales_refresh` have
   `readOnlyHint=false`: each inserts or reuses one

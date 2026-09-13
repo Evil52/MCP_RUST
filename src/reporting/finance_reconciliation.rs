@@ -39,11 +39,11 @@ pub const WB_RAW_AMOUNT_COLUMNS: &[&str] = &[
     "paymentSchedule",
 ];
 
-const MAX_SCALE: u32 = 9;
+const MAX_SCALE: u32 = 18;
 const MAX_SIGNED_ID: u64 = u64::MAX >> 1;
 
 /// Exact `units / 10^scale`; JSON uses a string coefficient to preserve values
-/// above JavaScript's integer precision and above a single row's i64 bound.
+/// above JavaScript's integer precision. Rescaling and addition are checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactFinanceTotal {
@@ -57,7 +57,7 @@ impl ExactFinanceTotal {
         let scale = self.scale.max(value.scale);
         let left = self.rescaled_units(scale)?;
         let right = Self {
-            units: i128::from(value.units),
+            units: value.units,
             scale: value.scale,
         }
         .rescaled_units(scale)?;

@@ -10,7 +10,7 @@ fn input() -> ReportingWbFinancialLedgerInput {
     }
 }
 
-fn ledger_server(actor: &str, repository: Arc<dyn ReportingReadRepository>) -> OzonMcp {
+pub(super) fn ledger_server(actor: &str, repository: Arc<dyn ReportingReadRepository>) -> OzonMcp {
     let mut server = reporting_test_server(actor, repository);
     let mut registry: Value =
         serde_json::from_slice(&fs::read(server.registry.path()).unwrap()).unwrap();
@@ -25,6 +25,21 @@ fn ledger_server(actor: &str, repository: Arc<dyn ReportingReadRepository>) -> O
     .unwrap();
     server.registry = RegistrySource::new(server.registry.path().to_path_buf()).unwrap();
     server.into_reporting_only().unwrap()
+}
+
+pub(super) fn missing_result(
+    account: &AccountScope,
+) -> crate::reporting::mcp_read::WbFinancialLedgerResult {
+    crate::reporting::mcp_read::WbFinancialLedgerResult {
+        account_id: account.account_id().to_owned(),
+        marketplace: ReadMarketplace::Wildberries,
+        storage: "published_postgresql_financial_ledger".into(),
+        state: DataState::Unavailable,
+        reconciliation_state: DataState::Unavailable,
+        batch: None,
+        rows: Vec::new(),
+        next_after_rrd_id: None,
+    }
 }
 
 #[tokio::test]

@@ -17,7 +17,13 @@ fn row(id: u64, document: Option<&str>, units: i64, scale: u32) -> WbFinanceDeta
         operation_type: Some("Продажа".into()),
         quantity: Some(1),
         amounts: BTreeMap::from([
-            ("forPay".into(), WbFinanceDecimal { units, scale }),
+            (
+                "forPay".into(),
+                WbFinanceDecimal {
+                    units: i128::from(units),
+                    scale,
+                },
+            ),
             (
                 "retailAmount".into(),
                 WbFinanceDecimal {
@@ -387,7 +393,7 @@ fn empty_unknown_and_out_of_range_baselines_do_not_pass() {
     );
     for (column, amount) in [
         ("profit", total(1, 0)),
-        ("forPay", total(1, 10)),
+        ("forPay", total(1, 19)),
         ("forPay", total(i128::MAX, 0)),
     ] {
         let mut invalid = baseline();

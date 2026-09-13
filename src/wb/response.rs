@@ -1,9 +1,10 @@
 //! Bounded response decoding, safe diagnostics and retry decisions.
 
 use super::{
-    ClientPolicy, DateTime, Duration, HeaderMap, Instant, MAX_ERROR_BODY_BYTES,
-    MAX_REQUEST_ID_BYTES, MAX_RESPONSE_BODY_BYTES, RETRY_AFTER, Response, StatusCode, Utc, Value,
-    WbError, WbErrorKind, classify_http_status, info, warn,
+    AttemptContext, AttemptOutcome, ClientPolicy, DateTime, Duration, HeaderMap, Instant,
+    MAX_ERROR_BODY_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESPONSE_BODY_BYTES, RETRY_AFTER, RequestClass,
+    Response, StatusCode, Utc, Value, WbClient, WbError, WbErrorKind, classify_http_status, info,
+    warn,
 };
 
 pub(super) fn classify_transport_error(
@@ -239,4 +240,148 @@ pub(super) fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option
                 }))
             .then(|| value.to_owned())
         })
+}
+
+impl WbClient {
+    pub(super) async fn response_outcome(
+        &self,
+        context: AttemptContext<'_>,
+        attempt: usize,
+        started: Instant,
+        response: Response,
+    ) -> Result<AttemptOutcome, WbError> {
+        let status = response.status();
+        let request_id = extract_request_id(response.headers());
+        let retry_after = parse_retry_delay(response.headers(), Utc::now());
+        let planned_retry = context
+            .request_class
+            .allows_automatic_retry()
+            .then(|| retry_plan(status, attempt, retry_after, &self.policy))
+            .flatten();
+        let vendor_cooldown = match retry_after {
+            ParsedRetryDelay::Valid(delay)
+                if matches!(
+                    context.request_class,
+                    RequestClass::SellerInventory | RequestClass::FinanceReport
+                ) && is_retriable(status) =>
+            {
+                // One-attempt inventory/finance reads must still honor a long
+                // Retry-After for sibling callers. Cap untrusted delays at a
+                // day; the generic retry budget is not this shared cooldown.
+                Some(delay.min(Duration::from_hours(24)))
+            }
+            ParsedRetryDelay::Valid(delay)
+                if is_retriable(status) && delay <= self.policy.max_retry_delay =>
+            {
+                Some(delay)
+            }
+            ParsedRetryDelay::Absent | ParsedRetryDelay::Invalid | ParsedRetryDelay::Valid(_) => {
+                None
+            }
+        };
+        let inventory_cooldown = if context.request_class == RequestClass::SellerInventory {
+            match status {
+                // WB charges ten requests for a 409 in both inventory groups.
+                StatusCode::CONFLICT => Some(self.policy.seller_inventory_interval * 10),
+                StatusCode::TOO_MANY_REQUESTS if vendor_cooldown.is_none() => {
+                    Some(Duration::from_secs(60))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(delay) = planned_retry
+            .into_iter()
+            .chain(vendor_cooldown)
+            .chain(inventory_cooldown)
+            .max()
+        {
+            // A vendor-directed retry is shared by every alias using this
+            // seller token and endpoint class. Extending the gate before
+            // permits are released prevents sibling calls from creating a
+            // same-token 429/503 retry storm during the cooldown.
+            context
+                .limiter
+                .extend_cooldown(context.request_class, delay)
+                .await;
+        }
+
+        if let Some(delay) = planned_retry {
+            let diagnostic = read_body(response, MAX_ERROR_BODY_BYTES, request_id.as_deref())
+                .await
+                .unwrap_or_default();
+            trace_response(
+                context.account,
+                context.endpoint,
+                attempt,
+                started,
+                status,
+                request_id.as_deref(),
+                None,
+                true,
+            );
+            return Ok(AttemptOutcome::Retry {
+                delay,
+                error: classify_http_status(
+                    status,
+                    request_id,
+                    retry_after.duration(),
+                    String::from_utf8_lossy(&diagnostic).into_owned(),
+                ),
+            });
+        }
+
+        if context.request_class == RequestClass::FinanceReport && status == StatusCode::NO_CONTENT
+        {
+            // Only the documented finance endpoint uses 204 as terminal proof.
+            // A 200 JSON null or empty array remains a distinct response.
+            read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
+            trace_response(
+                context.account,
+                context.endpoint,
+                attempt,
+                started,
+                status,
+                request_id.as_deref(),
+                None,
+                false,
+            );
+            return Ok(AttemptOutcome::NoContent);
+        }
+
+        let result = if context.request_class == RequestClass::FinanceReport
+            && status.is_success()
+            && status != StatusCode::OK
+        {
+            Err(WbError::Api {
+                status,
+                request_id: request_id.clone(),
+                diagnostic: String::new(),
+            })
+        } else {
+            decode_response(response, request_id.clone(), retry_after.duration()).await
+        };
+        let will_retry = context.request_class.allows_automatic_retry()
+            && result.as_ref().is_err_and(|error| {
+                is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts
+            });
+        trace_response(
+            context.account,
+            context.endpoint,
+            attempt,
+            started,
+            status,
+            request_id.as_deref(),
+            result.as_ref().err(),
+            will_retry,
+        );
+        match result {
+            Err(error) if will_retry => Ok(AttemptOutcome::Retry {
+                delay: retry_delay(attempt, None, &self.policy),
+                error,
+            }),
+            result => result.map(AttemptOutcome::Complete),
+        }
+    }
 }

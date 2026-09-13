@@ -1,5 +1,6 @@
 //! Read-only endpoint policy and fixed hosts, never supplied by callers.
 
+use super::finance::{FINANCE_LIST_PATH, FINANCE_REPORT_ID_PATH};
 use super::{
     ACCEPTANCE_COEFFICIENTS_PATH, ACCEPTANCE_MIN_REQUEST_INTERVAL, ANALYTICS_MIN_REQUEST_INTERVAL,
     BASE_RETRY_DELAY, COMMISSION_MIN_REQUEST_INTERVAL, CONTENT_MIN_REQUEST_INTERVAL, Duration,
@@ -71,6 +72,20 @@ pub(super) struct EndpointPolicy {
 /// [`WbClient::request`], the only place a WB request can leave the process, so
 /// adding a mutating call requires deliberately editing this list.
 pub(super) const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
+    EndpointPolicy {
+        method: Method::POST,
+        path: FINANCE_LIST_PATH,
+        label: "finance:/api/finance/v1/sales-reports/list",
+        host: ApiHost::Finance,
+        request_class: RequestClass::FinanceReport,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: FINANCE_REPORT_ID_PATH,
+        label: "finance:/api/finance/v1/sales-reports/detailed/{reportId}",
+        host: ApiHost::Finance,
+        request_class: RequestClass::FinanceReport,
+    },
     EndpointPolicy {
         method: Method::POST,
         path: FINANCE_DETAILS_PATH,
@@ -268,6 +283,8 @@ impl EndpointPolicy {
             policy.method == *method
                 && if policy.path == SELLER_STOCKS_PATH {
                     is_seller_stock_read_path(path)
+                } else if policy.path == FINANCE_REPORT_ID_PATH {
+                    canonical_positive_id_segment(path, "/api/finance/v1/sales-reports/detailed/")
                 } else {
                     policy.path == path
                 }
@@ -278,7 +295,11 @@ impl EndpointPolicy {
 /// Admit only one canonical positive int64 segment. Never admit a prefix,
 /// encoded path, query, or the neighboring PUT/DELETE inventory operations.
 pub(super) fn is_seller_stock_read_path(path: &str) -> bool {
-    let Some(id) = path.strip_prefix("/api/v3/stocks/") else {
+    canonical_positive_id_segment(path, "/api/v3/stocks/")
+}
+
+fn canonical_positive_id_segment(path: &str, prefix: &str) -> bool {
+    let Some(id) = path.strip_prefix(prefix) else {
         return false;
     };
     !id.starts_with('0')

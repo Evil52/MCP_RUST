@@ -50,6 +50,9 @@ pub mod snapshot;
 pub mod unit_economics;
 pub mod wb_adapter;
 pub mod wb_finance_source;
+pub mod wb_official_reconciliation;
+pub mod wb_report_repository;
+pub mod wb_report_source;
 pub mod wb_source;
 pub mod xlsx;
 

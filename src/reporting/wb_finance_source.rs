@@ -11,6 +11,10 @@
 //! exactly as received alongside the document and operation types. Mapping
 //! them into profit categories requires a separately verified reconciliation.
 
+mod coefficient;
+mod diagnostics;
+pub use diagnostics::{WbFinancePageDiagnostics, diagnose_finance_page};
+
 use std::{collections::BTreeMap, future::Future, pin::Pin};
 
 use chrono::NaiveDate;
@@ -30,7 +34,7 @@ const MAX_PAGES: usize = 1_000;
 const MAX_DAYS: i64 = 31;
 const MAX_TYPE_BYTES: usize = 512;
 const MAX_DECIMAL_BYTES: usize = 32;
-const MAX_DECIMAL_SCALE: u32 = 9;
+const MAX_DECIMAL_SCALE: u32 = 18;
 const MAX_SIGNED_ID: u64 = u64::MAX >> 1;
 const FIRST_SUPPORTED_DATE: NaiveDate =
     NaiveDate::from_ymd_opt(2024, 1, 29).expect("valid constant date");
@@ -93,13 +97,18 @@ const AMOUNT_FIELDS: &[&str] = &[
     "paymentSchedule",
 ];
 
-/// Exact decimal: `units / 10^scale`. WB documents amounts as JSON strings,
-/// including a three-decimal logistics amount. Never round them to kopecks
+/// Exact decimal: `units / 10^scale`.
+///
+/// WB documents amounts as JSON strings,
+/// including observed 16-decimal commission values. The bound is 18 places.
+/// Coefficients serialize as strings; legacy int64 checkpoints replay exactly.
+/// Never round them to kopecks
 /// or deserialize them through floating point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WbFinanceDecimal {
-    pub units: i64,
+    #[serde(with = "coefficient")]
+    pub units: i128,
     pub scale: u32,
 }
 
@@ -269,7 +278,7 @@ fn validate_page_cursor(
     Ok(cursor)
 }
 
-fn parse_page(response: &Value) -> Result<Vec<WbFinanceDetailRow>, WbReportSourceError> {
+pub(crate) fn parse_page(response: &Value) -> Result<Vec<WbFinanceDetailRow>, WbReportSourceError> {
     let rows = response
         .as_array()
         .ok_or(WbReportSourceError::InvalidResponse)?;
@@ -354,7 +363,7 @@ fn optional_type_text(value: Option<&Value>) -> Result<Option<String>, WbReportS
         .transpose()
 }
 
-fn parse_decimal(raw: &str) -> Result<WbFinanceDecimal, WbReportSourceError> {
+pub(crate) fn parse_decimal(raw: &str) -> Result<WbFinanceDecimal, WbReportSourceError> {
     if raw.is_empty() || raw.len() > MAX_DECIMAL_BYTES {
         return Err(WbReportSourceError::InvalidResponse);
     }
@@ -387,8 +396,10 @@ fn parse_decimal(raw: &str) -> Result<WbFinanceDecimal, WbReportSourceError> {
     } else {
         unsigned_units
     };
-    let units = i64::try_from(signed_units).map_err(|_| WbReportSourceError::InvalidResponse)?;
-    Ok(WbFinanceDecimal { units, scale })
+    Ok(WbFinanceDecimal {
+        units: signed_units,
+        scale,
+    })
 }
 
 #[cfg(test)]

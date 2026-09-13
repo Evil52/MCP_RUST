@@ -127,6 +127,10 @@ fn fresh_resolution_detects_revocation_and_same_seller_key_rotation_without_netw
     fixture.token(SID, 1);
     let rotated = access::resolve(&fixture.arguments).unwrap();
     assert!(before.identity != rotated.identity);
+    assert_ne!(
+        before.identity.fingerprint(),
+        rotated.identity.fingerprint()
+    );
     fixture.registry(Some(SID), "manager");
     fs::remove_file(fixture.arguments.credentials_dir.join("WB_TEST_TOKEN")).unwrap();
     let error = access::resolve(&fixture.arguments).err().unwrap();

@@ -148,7 +148,7 @@ async fn read_rows(
                 'business_date', r.business_date, 'sku', r.sku, 'currency', r.currency, \
                 'document_type', r.document_type, 'operation_type', r.operation_type, \
                 'quantity', r.quantity, 'amounts', \
-                jsonb_object_agg(r.field, jsonb_build_object('units', r.units, 'scale', r.scale)))::text \
+                jsonb_object_agg(r.field, jsonb_build_object('units', r.units::text, 'scale', r.scale)))::text \
              FROM daily_reporting.mcp_financial_ledger_rows r JOIN page USING (rrd_id) \
              WHERE r.account_id = $1 AND r.batch_id = $2 \
              GROUP BY r.rrd_id, r.report_id, r.business_date, r.sku, r.currency, \

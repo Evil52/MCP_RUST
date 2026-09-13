@@ -17,31 +17,45 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use mcp_ozon::reporting::checkpoint::{CheckpointError, JournalFuture, PageJournal};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const QUOTA_INTERVAL: Duration = Duration::hours(12);
+#[path = "quota.rs"]
+mod quota;
+use quota::{LegacySuccessReceipt, Quota};
 const MAX_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_QUOTA_BYTES: u64 = 4096;
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Quota {
-    next_allowed_at: Option<DateTime<Utc>>,
-}
 
 pub struct LocalJournal {
     seller_root: PathBuf,
     pages: PathBuf,
     quota: Mutex<Quota>,
+    personal_key: Option<String>,
+    attempted_at: Mutex<Option<DateTime<Utc>>>,
     _lease: File,
 }
 
 impl LocalJournal {
     pub fn open(root: &Path, seller_scope: &str, collection: &str) -> Result<Self> {
+        Self::open_scoped(root, seller_scope, collection)
+    }
+
+    pub fn open_personal(
+        root: &Path,
+        seller_scope: &str,
+        collection: &str,
+        key: &str,
+    ) -> Result<Self> {
+        ensure!(valid_digest(key), "personal quota key binding is invalid");
+        let mut journal = Self::open(root, seller_scope, collection)?;
+        journal.personal_key = Some(key.to_owned());
+        Ok(journal)
+    }
+
+    fn open_scoped(root: &Path, seller_scope: &str, collection: &str) -> Result<Self> {
         ensure!(valid_digest(seller_scope), "seller quota scope is invalid");
         let root = private_directory(root)?;
         let seller_root = private_directory(&root.join(format!("wb-{seller_scope}")))?;
@@ -66,15 +80,10 @@ impl LocalJournal {
             Some(bytes) => {
                 let quota: Quota =
                     serde_json::from_slice(&bytes).context("financial quota journal is invalid")?;
-                ensure!(
-                    quota.next_allowed_at.is_some(),
-                    "financial quota journal is incomplete"
-                );
+                quota.validate()?;
                 quota
             }
-            None => Quota {
-                next_allowed_at: None,
-            },
+            None => Quota::default(),
         };
         let pages = private_directory(
             &seller_root.join(format!("pages-{}", sha256(collection.as_bytes()))),
@@ -83,6 +92,8 @@ impl LocalJournal {
             seller_root,
             pages,
             quota: Mutex::new(quota),
+            personal_key: None,
+            attempted_at: Mutex::new(None),
             _lease: lease,
         })
     }
@@ -92,35 +103,103 @@ impl LocalJournal {
             .quota
             .lock()
             .map_err(|_| CheckpointError::Unavailable)?;
-        if quota.next_allowed_at.is_some_and(|next| now < next) {
+        if !quota
+            .reserve(now, self.personal_key.as_deref())
+            .map_err(|_| CheckpointError::Invalid)?
+        {
             return Err(CheckpointError::Deferred);
         }
-        quota.next_allowed_at = Some(
-            now.checked_add_signed(QUOTA_INTERVAL)
-                .ok_or(CheckpointError::Invalid)?,
-        );
         persist_json(&self.seller_root, "quota.json", &*quota)
-            .map_err(|_| CheckpointError::Unavailable)
+            .map_err(|_| CheckpointError::Unavailable)?;
+        drop(quota);
+        *self
+            .attempted_at
+            .lock()
+            .map_err(|_| CheckpointError::Unavailable)? = Some(now);
+        Ok(())
     }
 
     pub fn postpone(&self, seconds: u64) -> Result<()> {
-        let delay = Duration::try_seconds(
-            i64::try_from(seconds).context("upstream pause exceeds the supported bound")?,
-        )
-        .context("upstream pause exceeds the supported bound")?;
-        let next = Utc::now()
-            .checked_add_signed(delay)
-            .context("upstream pause exceeds the supported bound")?;
         let mut quota = self
             .quota
             .lock()
             .map_err(|_| anyhow::anyhow!("financial quota lock is unavailable"))?;
-        quota.next_allowed_at = Some(
-            quota
-                .next_allowed_at
-                .map_or(next, |previous| previous.max(next)),
-        );
+        quota.postpone(Utc::now(), seconds)?;
         persist_json(&self.seller_root, "quota.json", &*quota)
+    }
+
+    /// Called only for an observed successful Finance response, after rechecking
+    /// the exact Personal/RO key identity. It cannot lower vendor Retry-After.
+    pub fn confirm_personal_read(&self) -> Result<()> {
+        let Some(key) = self.personal_key.as_deref() else {
+            return Ok(());
+        };
+        let attempted = self
+            .attempted_at
+            .lock()
+            .map_err(|_| anyhow::anyhow!("quota lock unavailable"))?
+            .ok_or_else(|| anyhow::anyhow!("no request was reserved in this invocation"))?;
+        let mut quota = self
+            .quota
+            .lock()
+            .map_err(|_| anyhow::anyhow!("quota lock unavailable"))?;
+        quota.confirm(key, attempted)?;
+        persist_json(&self.seller_root, "quota.json", &*quota)
+    }
+
+    /// Explicit operator migration of one exact prior successful probe. Unknown
+    /// legacy pauses remain blocked. The original reservation and receipt remain.
+    pub fn migrate_personal_legacy(&self, actor: &str, seller: &str) -> Result<()> {
+        let key = self
+            .personal_key
+            .as_deref()
+            .context("a scoped Personal key is required")?;
+        let bytes = read_private(
+            &self.seller_root.join("legacy-success-receipt.json"),
+            MAX_QUOTA_BYTES,
+        )?
+        .context("a reviewed legacy success receipt is required")?;
+        let receipt: LegacySuccessReceipt =
+            serde_json::from_slice(&bytes).context("legacy success receipt is invalid")?;
+        let mut quota = self
+            .quota
+            .lock()
+            .map_err(|_| anyhow::anyhow!("quota lock unavailable"))?;
+        let legacy = serde_json::to_vec(&*quota).context("legacy quota unavailable")?;
+        quota.migrate(&receipt, actor, key, seller, Utc::now(), sha256(&bytes))?;
+        persist_bytes(
+            &self.seller_root,
+            &format!("legacy-quota-{}.json", sha256(&legacy)),
+            &legacy,
+        )?;
+        persist_json(&self.seller_root, "quota.json", &*quota)
+    }
+
+    /// Fixed local evidence files only; no URL downloads or arbitrary output path.
+    pub fn save_evidence(&self, name: &str, value: &impl Serialize) -> Result<String> {
+        ensure!(
+            name == "report-list.json"
+                || name
+                    .strip_prefix("official-report-")
+                    .and_then(|id| id.strip_suffix(".json"))
+                    .and_then(|id| id.parse::<i64>().ok().map(|value| (id, value)))
+                    .is_some_and(|(id, value)| value > 0 && value.to_string() == id),
+            "unsupported evidence file"
+        );
+        let bytes = serde_json::to_vec(value).context("evidence encoding failed")?;
+        ensure!(
+            bytes.len() as u64 <= MAX_CHECKPOINT_BYTES,
+            "evidence exceeds its bound"
+        );
+        if let Some(previous) = read_private(&self.pages.join(name), MAX_CHECKPOINT_BYTES)? {
+            ensure!(
+                previous == bytes,
+                "immutable evidence conflicts; use a new observation"
+            );
+        } else {
+            persist_bytes(&self.pages, name, &bytes)?;
+        }
+        Ok(self.pages.join(name).display().to_string())
     }
 
     pub fn next_allowed_at(&self) -> Result<Option<DateTime<Utc>>> {

@@ -34,7 +34,8 @@ fn raw_rows() -> Value {
     json!([
         {"rrdId": 11, "reportId": 21, "rrDate": "2026-09-10", "nmId": 31,
          "currency": "RUB", "docTypeName": "Продажа", "quantity": 1,
-         "forPay": "112.345", "retailAmount": "200.00", "deliveryService": "-0.000000001"},
+         "forPay": "112.345", "retailAmount": "200.00", "deliveryService": "-0.000000001",
+         "vw": "-9999.123456789012345678"},
         {"rrdId": 12, "reportId": 21, "rrDate": "2026-09-10", "nmId": 0,
          "currency": "RUB", "docTypeName": "Возврат", "quantity": -1,
          "forPay": "-25.1", "retailAmount": null}
@@ -96,6 +97,11 @@ async fn financial_ledger_preserves_decimals_rejects_revisions_and_isolates_acco
     assert!(!stored[1].amounts.contains_key("retailAmount"));
     assert_eq!(stored[0].amounts["deliveryService"].units, -1);
     assert_eq!(stored[0].amounts["deliveryService"].scale, 9);
+    assert_eq!(
+        stored[0].amounts["vw"].units,
+        -9_999_123_456_789_012_345_678_i128
+    );
+    assert_eq!(stored[0].amounts["vw"].scale, 18);
     let next = reader
         .read_wb_rows(&cabinet, publication.batch_id, 11, 1)
         .await

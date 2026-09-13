@@ -137,7 +137,7 @@ fn decimal_is_exact_signed_bounded_and_never_floating_point() {
     assert_eq!(
         parse_decimal("-9223372036854775808").unwrap(),
         WbFinanceDecimal {
-            units: i64::MIN,
+            units: i128::from(i64::MIN),
             scale: 0
         }
     );
@@ -160,9 +160,7 @@ fn decimal_is_exact_signed_bounded_and_never_floating_point() {
         "NaN",
         "1,50",
         " 1.2",
-        "1.0000000001",
-        "9223372036854775808",
-        "-9223372036854775809",
+        "1.0000000000000000001",
         "99999999999999999999999999999999999",
     ] {
         assert_eq!(
@@ -176,6 +174,48 @@ fn decimal_is_exact_signed_bounded_and_never_floating_point() {
         parse_row(&numeric),
         Err(WbReportSourceError::InvalidResponse)
     );
+}
+
+#[test]
+fn extended_precision_is_lossless_and_legacy_checkpoint_coefficients_remain_readable() {
+    let amount = parse_decimal("1234.1234567890123456").unwrap();
+    assert_eq!(amount.units, 12_341_234_567_890_123_456);
+    assert_eq!(amount.scale, 16);
+    assert_eq!(parse_decimal("-0.123456789012345678").unwrap().scale, 18);
+    assert_eq!(
+        serde_json::to_value(amount).unwrap(),
+        json!({"units":"12341234567890123456","scale":16})
+    );
+    for value in [i128::MIN, i128::MAX, amount.units] {
+        let expected = WbFinanceDecimal {
+            units: value,
+            scale: 18,
+        };
+        let encoded = serde_json::to_vec(&expected).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<WbFinanceDecimal>(&encoded).unwrap(),
+            expected
+        );
+    }
+    let legacy = serde_json::from_value::<WbFinanceDecimal>(
+        json!({"units": 9_007_199_254_740_993_i64,"scale":9}),
+    )
+    .unwrap();
+    assert_eq!(legacy.units, 9_007_199_254_740_993);
+    assert!(serde_json::to_value(legacy).unwrap()["units"].is_string());
+    for invalid in [
+        json!(1.5),
+        json!(u64::MAX),
+        json!("+1"),
+        json!("01"),
+        json!("-0"),
+        json!("1e3"),
+        json!("170141183460469231731687303715884105728"),
+    ] {
+        assert!(
+            serde_json::from_value::<WbFinanceDecimal>(json!({"units":invalid,"scale":0})).is_err()
+        );
+    }
 }
 
 #[test]

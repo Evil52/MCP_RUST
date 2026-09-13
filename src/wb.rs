@@ -1,4 +1,7 @@
 mod finance;
+mod finance_quota;
+pub use finance::WbFinancePeriod;
+use finance_quota::FinanceAccess;
 mod hosts;
 use hosts::BaseUrls;
 mod operator_reads;
@@ -14,10 +17,13 @@ use validation::{
 };
 mod request;
 mod response;
+#[cfg(test)]
 use response::{
-    ParsedRetryDelay, classify_transport_error, decode_response, extract_request_id, is_retriable,
-    is_retriable_transport, parse_retry_delay, read_body, retry_delay, retry_plan, trace_response,
-    trace_transport_failure,
+    ParsedRetryDelay, extract_request_id, is_retriable, parse_retry_delay, retry_plan,
+    trace_response,
+};
+use response::{
+    classify_transport_error, is_retriable_transport, retry_delay, trace_transport_failure,
 };
 
 use std::{
@@ -36,7 +42,7 @@ use reqwest::{
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, Semaphore, SemaphorePermit},
+    sync::{Mutex, Semaphore},
     time::{Instant as TokioInstant, sleep, timeout_at},
 };
 use tracing::{info, warn};
@@ -369,6 +375,7 @@ struct TokenLimiter {
     promotion_cluster_bids: PacingGate,
     seller_inventory: PacingGate,
     finance_reports: PacingGate,
+    finance_access: FinanceAccess,
 }
 
 impl TokenLimiter {
@@ -392,6 +399,7 @@ impl TokenLimiter {
             promotion_cluster_bids: PacingGate::new(),
             seller_inventory: PacingGate::new(),
             finance_reports: PacingGate::new(),
+            finance_access: FinanceAccess::new(),
         }
     }
 
@@ -469,7 +477,13 @@ impl TokenLimiter {
     }
 
     async fn extend_cooldown(&self, request_class: RequestClass, delay: Duration) {
-        self.gate(request_class).extend_cooldown(delay).await;
+        if request_class == RequestClass::FinanceReport {
+            self.finance_access
+                .extend_cooldown(&self.finance_reports, delay)
+                .await;
+        } else {
+            self.gate(request_class).extend_cooldown(delay).await;
+        }
     }
 
     async fn ready_in(&self, request_class: RequestClass) -> Duration {
@@ -1191,41 +1205,6 @@ impl WbClient {
         }
     }
 
-    async fn acquire_request_permits<'a>(
-        &'a self,
-        limiter: &'a TokenLimiter,
-        request_class: RequestClass,
-        retry: bool,
-        deadline: TokioInstant,
-    ) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>), WbError> {
-        let interval = self.policy.interval(request_class);
-        loop {
-            // Readiness does not consume quota. Queued callers therefore hold
-            // no network capacity, and a fail-fast permit rejection cannot
-            // postpone the next real WB request by 20 or 60s.
-            limiter
-                .wait_until_ready(request_class, retry, deadline)
-                .await?;
-            let global_permit = self
-                .global_in_flight
-                .try_acquire()
-                .map_err(|_| WbError::Overloaded)?;
-            let Ok(token_permit) = limiter.in_flight.try_acquire() else {
-                drop(global_permit);
-                return Err(WbError::Overloaded);
-            };
-            if limiter.try_claim(request_class, interval).await.is_ok() {
-                return Ok((global_permit, token_permit));
-            }
-
-            // Another ready caller claimed the departure between our readiness
-            // check and permit acquisition. Never queue while reserving scarce
-            // HTTP capacity; retry the readiness phase.
-            drop(token_permit);
-            drop(global_permit);
-        }
-    }
-
     async fn request_attempt(
         &self,
         context: AttemptContext<'_>,
@@ -1259,137 +1238,6 @@ impl WbClient {
             Err(source) => {
                 transport_failure_outcome(context, attempt, started, source, &self.policy)
             }
-        }
-    }
-
-    async fn response_outcome(
-        &self,
-        context: AttemptContext<'_>,
-        attempt: usize,
-        started: Instant,
-        response: Response,
-    ) -> Result<AttemptOutcome, WbError> {
-        let status = response.status();
-        let request_id = extract_request_id(response.headers());
-        let retry_after = parse_retry_delay(response.headers(), Utc::now());
-        let planned_retry = context
-            .request_class
-            .allows_automatic_retry()
-            .then(|| retry_plan(status, attempt, retry_after, &self.policy))
-            .flatten();
-        let vendor_cooldown = match retry_after {
-            ParsedRetryDelay::Valid(delay)
-                if matches!(
-                    context.request_class,
-                    RequestClass::SellerInventory | RequestClass::FinanceReport
-                ) && is_retriable(status) =>
-            {
-                // One-attempt inventory/finance reads must still honor a long
-                // Retry-After for sibling callers. Cap untrusted delays at a
-                // day; the generic retry budget is not this shared cooldown.
-                Some(delay.min(Duration::from_hours(24)))
-            }
-            ParsedRetryDelay::Valid(delay)
-                if is_retriable(status) && delay <= self.policy.max_retry_delay =>
-            {
-                Some(delay)
-            }
-            ParsedRetryDelay::Absent | ParsedRetryDelay::Invalid | ParsedRetryDelay::Valid(_) => {
-                None
-            }
-        };
-        let inventory_cooldown = if context.request_class == RequestClass::SellerInventory {
-            match status {
-                // WB charges ten requests for a 409 in both inventory groups.
-                StatusCode::CONFLICT => Some(self.policy.seller_inventory_interval * 10),
-                StatusCode::TOO_MANY_REQUESTS if vendor_cooldown.is_none() => {
-                    Some(Duration::from_secs(60))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(delay) = planned_retry
-            .into_iter()
-            .chain(vendor_cooldown)
-            .chain(inventory_cooldown)
-            .max()
-        {
-            // A vendor-directed retry is shared by every alias using this
-            // seller token and endpoint class. Extending the gate before
-            // permits are released prevents sibling calls from creating a
-            // same-token 429/503 retry storm during the cooldown.
-            context
-                .limiter
-                .extend_cooldown(context.request_class, delay)
-                .await;
-        }
-
-        if let Some(delay) = planned_retry {
-            let diagnostic = read_body(response, MAX_ERROR_BODY_BYTES, request_id.as_deref())
-                .await
-                .unwrap_or_default();
-            trace_response(
-                context.account,
-                context.endpoint,
-                attempt,
-                started,
-                status,
-                request_id.as_deref(),
-                None,
-                true,
-            );
-            return Ok(AttemptOutcome::Retry {
-                delay,
-                error: classify_http_status(
-                    status,
-                    request_id,
-                    retry_after.duration(),
-                    String::from_utf8_lossy(&diagnostic).into_owned(),
-                ),
-            });
-        }
-
-        if context.request_class == RequestClass::FinanceReport && status == StatusCode::NO_CONTENT
-        {
-            // Only the documented finance endpoint uses 204 as terminal proof.
-            // A 200 JSON null or empty array remains a distinct response.
-            read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
-            trace_response(
-                context.account,
-                context.endpoint,
-                attempt,
-                started,
-                status,
-                request_id.as_deref(),
-                None,
-                false,
-            );
-            return Ok(AttemptOutcome::NoContent);
-        }
-
-        let result = decode_response(response, request_id.clone(), retry_after.duration()).await;
-        let will_retry = context.request_class.allows_automatic_retry()
-            && result.as_ref().is_err_and(|error| {
-                is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts
-            });
-        trace_response(
-            context.account,
-            context.endpoint,
-            attempt,
-            started,
-            status,
-            request_id.as_deref(),
-            result.as_ref().err(),
-            will_retry,
-        );
-        match result {
-            Err(error) if will_retry => Ok(AttemptOutcome::Retry {
-                delay: retry_delay(attempt, None, &self.policy),
-                error,
-            }),
-            result => result.map(AttemptOutcome::Complete),
         }
     }
 }
@@ -1731,6 +1579,20 @@ mod tests {
         let expected = [
             (
                 Method::POST,
+                finance::FINANCE_LIST_PATH,
+                "finance:/api/finance/v1/sales-reports/list",
+                ApiHost::Finance,
+                RequestClass::FinanceReport,
+            ),
+            (
+                Method::POST,
+                finance::FINANCE_REPORT_ID_PATH,
+                "finance:/api/finance/v1/sales-reports/detailed/{reportId}",
+                ApiHost::Finance,
+                RequestClass::FinanceReport,
+            ),
+            (
+                Method::POST,
                 FINANCE_DETAILS_PATH,
                 "finance:/api/finance/v1/sales-reports/detailed",
                 ApiHost::Finance,
@@ -1947,6 +1809,8 @@ mod tests {
             assert!(!policy.path.contains("//"));
             let path = if policy.path == SELLER_STOCKS_PATH {
                 "/api/v3/stocks/123"
+            } else if policy.path == finance::FINANCE_REPORT_ID_PATH {
+                "/api/finance/v1/sales-reports/detailed/123"
             } else {
                 policy.path
             };

@@ -142,6 +142,25 @@ pub(super) const fn default_source_snapshot_limit() -> u16 {
     100
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportingWbReportReconciliationInput {
+    #[schemars(
+        description = "Разрешённый канонический account_id кабинета WB",
+        length(min = 1, max = 128)
+    )]
+    pub account_id: String,
+    /// Точный положительный int64 ID отчёта, строкой без потери разрядов.
+    #[schemars(length(min = 1, max = 19))]
+    pub report_id: String,
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 19))]
+    pub after_rrd_id: Option<String>,
+    #[serde(default = "default_source_snapshot_limit")]
+    #[schemars(range(min = 1, max = 1000))]
+    pub limit: u16,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReportingOzonSalesAnalyticsInput {

@@ -161,3 +161,22 @@ fn query_requires_wb_and_bounded_stable_pagination() {
         );
     }
 }
+
+#[test]
+fn ledger_preserves_large_sixteen_decimal_financial_coefficients_as_strings() {
+    let mut value = row(1);
+    value.amounts.insert(
+        "vw".into(),
+        WbFinanceDecimal {
+            units: 19_223_372_036_854_775_808_i128,
+            scale: 16,
+        },
+    );
+    let result = page_result(&account(), query(), Some((batch(1), vec![value], false))).unwrap();
+    let encoded = serde_json::to_value(result).unwrap();
+    assert_eq!(
+        encoded["rows"][0]["amounts"]["vw"]["units"],
+        "19223372036854775808"
+    );
+    assert_eq!(encoded["rows"][0]["amounts"]["vw"]["scale"], 16);
+}

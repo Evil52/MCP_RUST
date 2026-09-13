@@ -5,10 +5,14 @@
 
 #[path = "finance-collector/access.rs"]
 mod access;
+#[path = "finance-collector/arguments.rs"]
+mod arguments;
 #[path = "finance-collector/checkpoint.rs"]
 mod checkpoint;
+#[path = "finance-collector/reports.rs"]
+mod reports;
 
-use std::{collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use anyhow::{Context, Result, ensure};
 use chrono::{NaiveDate, Utc};
@@ -26,29 +30,7 @@ use serde_json::{Value, json};
 
 use checkpoint::LocalJournal;
 
-#[derive(Clone, Copy)]
-enum Egress {
-    Direct,
-    CollectorProxy,
-}
-
-#[derive(Clone, Copy)]
-enum Command {
-    ProbeWb,
-    CollectWb,
-}
-
-struct Arguments {
-    command: Command,
-    registry: PathBuf,
-    actor: String,
-    account: String,
-    credentials_dir: PathBuf,
-    state_dir: PathBuf,
-    from: NaiveDate,
-    to: NaiveDate,
-    egress: Egress,
-}
+use arguments::{Arguments, Command, Egress, parse_arguments};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,10 +40,13 @@ async fn main() -> Result<()> {
     }
     if arguments == ["--help"] {
         println!(
-            "finance-collector probe-wb|collect-wb --registry PATH --actor ID --account ID --credentials-dir PATH --state-dir PATH --from YYYY-MM-DD --to YYYY-MM-DD [--egress collector-proxy|direct]"
+            "finance-collector probe-wb|collect-wb|list-reports-wb|reconcile-report-wb|publish-report-wb|migrate-personal-quota --registry PATH --actor ID --account ID --credentials-dir PATH --state-dir PATH --from YYYY-MM-DD --to YYYY-MM-DD [--egress collector-proxy|direct]"
         );
         println!(
-            "collect-wb reads REPORT_COLLECTOR_DATABASE_URL. Reuse one deployment-owned private state directory for all invocations. Default egress is collector-proxy. A probe reserves the same 12-hour seller quota as collection."
+            "Official report commands require --observation ID and accept --period weekly|daily (default weekly), --currency RUB. reconcile-report-wb and publish-report-wb also require --report-id INT64. Reuse the same observation to resume pages; use a new ID to observe revisions."
+        );
+        println!(
+            "collect-wb and publish-report-wb read REPORT_COLLECTOR_DATABASE_URL. Reuse one deployment-owned private state directory for all invocations. Default egress is collector-proxy. Seller quota becomes 60 seconds only after an observed successful Personal read. migrate-personal-quota requires a reviewed local legacy success receipt and sends no HTTP request."
         );
         return Ok(());
     }
@@ -74,89 +59,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn parse_arguments(raw: &[String]) -> Result<Arguments> {
-    let command = match raw.first().map(String::as_str) {
-        Some("probe-wb") => Command::ProbeWb,
-        Some("collect-wb") => Command::CollectWb,
-        _ => anyhow::bail!("an explicit probe-wb or collect-wb command is required; see --help"),
-    };
-    ensure!(
-        raw.len() % 2 == 1,
-        "every option requires exactly one value"
-    );
-    let mut values = BTreeMap::new();
-    for pair in raw[1..].as_chunks::<2>().0 {
-        ensure!(
-            matches!(
-                pair[0].as_str(),
-                "--registry"
-                    | "--actor"
-                    | "--account"
-                    | "--credentials-dir"
-                    | "--state-dir"
-                    | "--from"
-                    | "--to"
-                    | "--egress"
-            ),
-            "unknown finance collector option"
-        );
-        ensure!(
-            !pair[1].is_empty() && values.insert(pair[0].as_str(), pair[1].as_str()).is_none(),
-            "empty or duplicate finance collector option"
-        );
-    }
-    let required = |name| {
-        values
-            .get(name)
-            .copied()
-            .context("a required finance collector option is missing")
-    };
-    let from = date(required("--from")?)?;
-    let to = date(required("--to")?)?;
-    ensure!(
-        from >= NaiveDate::from_ymd_opt(2024, 1, 29).expect("constant date")
-            && to >= from
-            && (to - from).num_days() < 31
-            && to < Utc::now().date_naive(),
-        "financial collection requires a closed date interval of at most 31 days since 2024-01-29"
-    );
-    let egress = match values.get("--egress").copied().unwrap_or("collector-proxy") {
-        "collector-proxy" => Egress::CollectorProxy,
-        "direct" => Egress::Direct,
-        _ => anyhow::bail!("egress must be collector-proxy or direct"),
-    };
-    Ok(Arguments {
-        command,
-        registry: required("--registry")?.into(),
-        actor: required("--actor")?.to_owned(),
-        account: required("--account")?.to_owned(),
-        credentials_dir: required("--credentials-dir")?.into(),
-        state_dir: required("--state-dir")?.into(),
-        from,
-        to,
-        egress,
-    })
-}
-
-fn date(raw: &str) -> Result<NaiveDate> {
-    let value = NaiveDate::parse_from_str(raw, "%Y-%m-%d").context("date must use YYYY-MM-DD")?;
-    ensure!(
-        raw.len() == 10 && value.to_string() == raw,
-        "date must use YYYY-MM-DD"
-    );
-    Ok(value)
-}
-
 async fn execute(arguments: &Arguments) -> Result<Value> {
     let scoped = access::resolve(arguments)?;
-    let identity = format!(
-        "wb-detailed-v1:{}:{}:{}",
-        arguments.account, arguments.from, arguments.to
-    );
-    let journal = Arc::new(LocalJournal::open(
+    let identity = reports::collection_identity(arguments)?;
+    let journal = Arc::new(LocalJournal::open_personal(
         &arguments.state_dir,
         &scoped.identity.seller_scope,
         &identity,
+        scoped.identity.fingerprint(),
     )?);
     match arguments.command {
         Command::ProbeWb => {
@@ -175,16 +85,19 @@ async fn execute(arguments: &Arguments) -> Result<Value> {
                 .financial_report_page(&arguments.account, arguments.from, arguments.to, 1, 0)
                 .await;
             match result {
-                Ok(response) => Ok(json!({
-                    "account_id": arguments.account, "actor_id": arguments.actor,
-                    "status": "method_read_succeeded", "http_status": if response.is_some() { 200 } else { 204 },
-                    "endpoint": "POST https://finance-api.wildberries.ru/api/finance/v1/sales-reports/detailed",
-                    "checked_at": Utc::now(),
-                    "local_claims_only": { "personal": true, "read_only": true, "finance_category": true },
-                    "pagination_complete": response.is_none(),
-                    "next_request_at": journal.next_allowed_at()?,
-                    "financial_rows_emitted": 0,
-                })),
+                Ok(response) => {
+                    journal.confirm_personal_read()?;
+                    Ok(json!({
+                        "account_id": arguments.account, "actor_id": arguments.actor,
+                        "status": "method_read_succeeded", "http_status": if response.is_some() { 200 } else { 204 },
+                        "endpoint": "POST https://finance-api.wildberries.ru/api/finance/v1/sales-reports/detailed",
+                        "checked_at": Utc::now(),
+                        "local_claims_only": { "personal": true, "read_only": true, "finance_category": true },
+                        "pagination_complete": response.is_none(),
+                        "next_request_at": journal.next_allowed_at()?,
+                        "financial_rows_emitted": 0,
+                    }))
+                }
                 Err(error) => {
                     match &error {
                         WbError::RateLimited {
@@ -225,6 +138,7 @@ async fn execute(arguments: &Arguments) -> Result<Value> {
             let transport = AuthorizedTransport {
                 arguments,
                 identity: &scoped.identity,
+                journal: &journal,
             };
             let checkpoints: Checkpoints = Some(journal.clone());
             let batch = match WbFinanceBatch::collect(
@@ -264,6 +178,17 @@ async fn execute(arguments: &Arguments) -> Result<Value> {
                 "next_request_at": journal.next_allowed_at()?}),
             )
         }
+        Command::ListReportsWb | Command::ReconcileReportWb | Command::PublishReportWb => {
+            reports::execute(arguments, &scoped.identity, &journal).await
+        }
+        Command::MigratePersonalQuota => {
+            journal.migrate_personal_legacy(&arguments.actor, &scoped.identity.seller_scope)?;
+            Ok(
+                json!({"account_id": arguments.account, "actor_id": arguments.actor,
+                "status": "personal_quota_migrated", "http_requests": 0,
+                "next_request_at": journal.next_allowed_at()?}),
+            )
+        }
     }
 }
 
@@ -278,6 +203,7 @@ fn deferred(arguments: &Arguments, journal: &LocalJournal) -> Result<Value> {
 struct AuthorizedTransport<'a> {
     arguments: &'a Arguments,
     identity: &'a access::CredentialIdentity,
+    journal: &'a LocalJournal,
 }
 
 impl WbFinanceTransport for AuthorizedTransport<'_> {
@@ -294,9 +220,14 @@ impl WbFinanceTransport for AuthorizedTransport<'_> {
             if &fresh.identity != self.identity {
                 return Err(WbReportSourceError::Upstream(WbErrorKind::Forbidden));
             }
-            WbClientFinanceTransport::new(fresh.client, self.arguments.account.clone())
-                .finance_page(start, end, limit, rrd_id)
-                .await
+            let response =
+                WbClientFinanceTransport::new(fresh.client, self.arguments.account.clone())
+                    .finance_page(start, end, limit, rrd_id)
+                    .await?;
+            self.journal
+                .confirm_personal_read()
+                .map_err(|_| WbReportSourceError::Checkpoint(CheckpointError::Unavailable))?;
+            Ok(response)
         })
     }
 }

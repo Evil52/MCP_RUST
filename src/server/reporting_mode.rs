@@ -22,7 +22,7 @@ impl OzonMcp {
             .map
             .retain(|name, _| matches!(name.as_ref(), "marketplace_accounts" | "list_members"));
         self.tool_router = Self::configure_tool_router(
-            Self::reporting_router() + directory,
+            Self::reporting_router() + Self::wb_report_router() + directory,
             self.authenticator.as_ref(),
         );
         for route in self.tool_router.map.values_mut() {

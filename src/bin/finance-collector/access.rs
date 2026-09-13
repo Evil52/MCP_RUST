@@ -39,6 +39,12 @@ pub struct CredentialIdentity {
     fingerprint: String,
 }
 
+impl CredentialIdentity {
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
 pub struct ScopedClient {
     pub client: WbClient,
     pub identity: CredentialIdentity,
