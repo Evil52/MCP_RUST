@@ -17,6 +17,8 @@ use super::normalization::{
 use super::validation::build_supply_order_timeslot;
 use super::*;
 mod analytics_security;
+mod financial_ledger;
+mod tool_catalog;
 mod wb_inventory;
 use crate::config::{JwtConfig, MarketplaceAccount, PerformanceCredentials};
 use crate::ozon::{
@@ -272,6 +274,23 @@ impl ReportingReadRepository for FakeReportingRepository {
             rows: vec![],
             next_offset: None,
             latest_collection: None,
+        })
+    }
+
+    fn wb_financial_ledger<'a>(
+        &'a self,
+        account: &'a AccountScope,
+        _query: crate::reporting::mcp_read::WbFinancialLedgerQuery,
+    ) -> ReportingReadFuture<'a, crate::reporting::mcp_read::WbFinancialLedgerResult> {
+        self.complete(crate::reporting::mcp_read::WbFinancialLedgerResult {
+            account_id: account.account_id().to_owned(),
+            marketplace: ReadMarketplace::Wildberries,
+            storage: "published_postgresql_financial_ledger".into(),
+            state: DataState::Unavailable,
+            reconciliation_state: DataState::Unavailable,
+            batch: None,
+            rows: Vec::new(),
+            next_after_rrd_id: None,
         })
     }
 
@@ -1494,56 +1513,6 @@ async fn authentication_still_precedes_tool_call_admission_control() {
     let response = call_tool_over_http(server, "marketplace_accounts", json!({})).await;
     assert!(response.contains("Требуется авторизация"), "{response}");
     assert!(!response.contains("local_overloaded"), "{response}");
-}
-
-#[test]
-fn all_tools_have_truthful_annotations_and_descriptions() {
-    const INTERNAL_REPORTING_TOOLS: &[&str] = &[
-        "ofk_collection_status",
-        "ofk_source_snapshot",
-        "ofk_data_completeness",
-        "ofk_manager_actions",
-        "ofk_marketplace_sales_refresh_status",
-        "ofk_metrics_history",
-        "ofk_ozon_sales_analytics",
-        "ofk_ozon_sales_refresh_status",
-        "ofk_request_marketplace_sales_refresh",
-        "ofk_request_ozon_sales_refresh",
-        "ofk_reports",
-        "ofk_tool_call_log",
-        "ofk_weekly_marketplace_ranking",
-    ];
-    let tools = server()
-        .with_preview_features(false, true)
-        .tool_router
-        .list_all();
-    assert!(tools.len() >= 10);
-    for tool in tools {
-        assert!(!tool.description.as_deref().unwrap_or_default().is_empty());
-        assert_eq!(
-            tool.annotations
-                .as_ref()
-                .and_then(|annotations| annotations.read_only_hint),
-            Some(!REPORT_REFRESH_WRITE_TOOLS.contains(&tool.name.as_ref())),
-            "{} has an incorrect read-only annotation",
-            tool.name
-        );
-        let annotations = tool.annotations.as_ref().unwrap();
-        assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
-        assert_eq!(annotations.idempotent_hint, Some(true), "{}", tool.name);
-        assert_eq!(
-            annotations.open_world_hint,
-            Some(!INTERNAL_REPORTING_TOOLS.contains(&tool.name.as_ref())),
-            "{}",
-            tool.name
-        );
-        assert_eq!(
-            tool.input_schema.get("additionalProperties"),
-            Some(&Value::Bool(false)),
-            "{} must reject unknown input fields",
-            tool.name
-        );
-    }
 }
 
 #[tokio::test]
@@ -5784,7 +5753,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     // The release checklist in `SECURITY.md` states this count verbatim.
     // Changing it here without updating that gate leaves the gate
     // describing a router that no longer exists.
-    assert_eq!(dev_tools.len(), 86);
+    assert_eq!(dev_tools.len(), 87);
     assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
     let seed = server();
@@ -5795,7 +5764,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
     let jwt_tools = authenticated.tool_router.list_all();
-    assert_eq!(jwt_tools.len(), 86);
+    assert_eq!(jwt_tools.len(), 87);
     assert_policy(
         jwt_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -5807,7 +5776,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
         .with_preview_features(false, true)
         .tool_router
         .list_all();
-    assert_eq!(legacy_flag_tools.len(), 86);
+    assert_eq!(legacy_flag_tools.len(), 87);
     assert_policy(
         legacy_flag_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -5823,6 +5792,7 @@ fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
         "marketplace_accounts",
         "list_members",
         "ofk_collection_status",
+        "ofk_wb_financial_ledger",
         "ofk_source_snapshot",
         "ofk_data_completeness",
         "ofk_marketplace_sales_refresh_status",

@@ -302,7 +302,7 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   claims must never select an actor. Verify POST, GET and DELETE cannot use another subject's MCP
   session ID and return the same 404 as an unknown session. Saturate and time out readiness probes,
   confirm only one dependency probe runs, and confirm `/livez` plus MCP traffic remain responsive.
-- Verify the Analytics MCP production tool list contains exactly 84 stable tools, no preview tools,
+- Verify the Analytics MCP tool list for this release contains exactly 87 stable tools, no preview tools,
   and every tool advertises `destructiveHint=false` and the expected OAuth/noauth policy.
   `ofk_request_ozon_sales_refresh` and `ofk_request_marketplace_sales_refresh` have
   `readOnlyHint=false`: each inserts or reuses one
@@ -320,11 +320,11 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   reconcile are non-read-only because they persist Control state. Approval must be non-read-only,
   destructive, idempotent and closed-world because it grants execution authority. Both apply tools
   must be non-read-only, destructive and idempotent; Ozon apply is also closed-world because it only
-  enqueues the durable workflow. The combined implementation inventory is 96, but no release check
+  enqueues the durable workflow. The combined implementation inventory is 99, but no release check
   may treat it as one security boundary.
 - Verify `ofk_collection_status`, `ofk_data_completeness`, `ofk_metrics_history`,
   `ofk_manager_actions`, `ofk_ozon_sales_analytics`, `ofk_ozon_sales_refresh_status`, and
-  `ofk_reports` and `ofk_source_snapshot` are internal read-only reporting tools with
+  `ofk_reports`, `ofk_source_snapshot`, and `ofk_wb_financial_ledger` are internal read-only reporting tools with
   `openWorldHint=false`. They must read only curated PostgreSQL views through the restricted
   reporting reader, enforce actor/account RBAC before database access, and return a stable
   unavailable result when the reporting database is not configured; they must never mutate a

@@ -12,6 +12,7 @@ fn reporting_only_registry_contains_only_prepared_data_and_directory_tools() {
         "marketplace_accounts",
         "list_members",
         "ofk_collection_status",
+        "ofk_wb_financial_ledger",
         "ofk_data_completeness",
         "ofk_metrics_history",
         "ofk_weekly_marketplace_ranking",

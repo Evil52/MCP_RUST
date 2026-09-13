@@ -116,6 +116,28 @@ pub struct ReportingSourceSnapshotInput {
     #[serde(default)]
     pub offset: u32,
 }
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReportingWbFinancialLedgerInput {
+    #[serde(default)]
+    #[schemars(
+        description = "Разрешённый канонический account_id кабинета Wildberries",
+        length(min = 1, max = 128)
+    )]
+    pub account: Option<String>,
+    /// Для следующей страницы повторите `batch_id` из первого ответа.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub batch_id: Option<i64>,
+    /// Точный строковый `rrd_id` из `next_after_rrd_id`; без значения начало пакета.
+    #[serde(default)]
+    #[schemars(length(min = 1, max = 19))]
+    pub after_rrd_id: Option<String>,
+    #[serde(default = "default_source_snapshot_limit")]
+    #[schemars(range(min = 1, max = 1000))]
+    pub limit: u16,
+}
 pub(super) const fn default_source_snapshot_limit() -> u16 {
     100
 }

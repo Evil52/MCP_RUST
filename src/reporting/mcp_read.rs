@@ -11,6 +11,13 @@
 //! values are rebuilt from immutable published facts with the same Rust KPI
 //! and rule code used by server-generated reports.
 
+mod finance_ledger;
+mod repository;
+pub use finance_ledger::{
+    FinancialLedgerAmount, FinancialLedgerProvenance, FinancialLedgerRow, WbFinancialLedgerQuery,
+    WbFinancialLedgerResult,
+};
+
 mod model;
 pub use model::{
     ActionSeverity, CollectionState, CollectionStatusItem, CollectionStatusResult,
@@ -125,6 +132,14 @@ pub trait ReportingReadRepository: Send + Sync {
         _account: &'a AccountScope,
         _query: SourceSnapshotQuery,
     ) -> ReportingReadFuture<'a, SourceSnapshotResult> {
+        Box::pin(async { Err(ReportingReadError::Disabled) })
+    }
+
+    fn wb_financial_ledger<'a>(
+        &'a self,
+        _account: &'a AccountScope,
+        _query: WbFinancialLedgerQuery,
+    ) -> ReportingReadFuture<'a, WbFinancialLedgerResult> {
         Box::pin(async { Err(ReportingReadError::Disabled) })
     }
 
@@ -1240,70 +1255,6 @@ fn report_schedule_matches(
             matches_hours(UTC_03_00, UTC_09_00) || matches_hours(UTC_12_00, UTC_18_00)
         }
         ReadyReportKind::Evening => matches_hours(UTC_12_00, UTC_18_00),
-    }
-}
-
-impl ReportingReadRepository for PostgresReportingRepository {
-    fn enabled(&self) -> bool {
-        true
-    }
-
-    fn probe(&self) -> ReportingReadFuture<'_, ()> {
-        Box::pin(self.verify_runtime_contract())
-    }
-
-    fn source_snapshot<'a>(
-        &'a self,
-        account: &'a AccountScope,
-        query: SourceSnapshotQuery,
-    ) -> ReportingReadFuture<'a, SourceSnapshotResult> {
-        Box::pin(self.source_snapshot_impl(account, query))
-    }
-
-    fn collection_status<'a>(
-        &'a self,
-        account: &'a AccountScope,
-        limit: u16,
-    ) -> ReportingReadFuture<'a, CollectionStatusResult> {
-        Box::pin(async move { self.collection_status_impl(account, limit).await })
-    }
-
-    fn data_completeness<'a>(
-        &'a self,
-        account: &'a AccountScope,
-        cutoff: Option<DateTime<Utc>>,
-    ) -> ReportingReadFuture<'a, DataCompletenessResult> {
-        Box::pin(async move { self.data_completeness_impl(account, cutoff).await })
-    }
-
-    fn metrics_history<'a>(
-        &'a self,
-        account: &'a AccountScope,
-        from: Option<NaiveDate>,
-        to: Option<NaiveDate>,
-        limit: u16,
-    ) -> ReportingReadFuture<'a, MetricsHistoryResult> {
-        Box::pin(async move { self.metrics_history_impl(account, from, to, limit).await })
-    }
-
-    fn sales_analytics<'a>(
-        &'a self,
-        account: &'a AccountScope,
-        query: SalesAnalyticsQuery,
-    ) -> ReportingReadFuture<'a, SalesAnalyticsResult> {
-        Box::pin(async move { self.sales_analytics_impl(account, query).await })
-    }
-
-    fn manager_actions<'a>(
-        &'a self,
-        account: &'a AccountScope,
-        cutoff: Option<DateTime<Utc>>,
-    ) -> ReportingReadFuture<'a, ManagerActionsResult> {
-        Box::pin(async move { self.manager_actions_impl(account, cutoff).await })
-    }
-
-    fn ready_reports(&self, limit: u16) -> ReportingReadFuture<'_, ReadyReportsResult> {
-        Box::pin(async move { self.ready_reports_impl(limit).await })
     }
 }
 
