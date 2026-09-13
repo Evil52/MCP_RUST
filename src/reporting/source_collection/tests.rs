@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, str::FromStr};
 use tokio_postgres::{Client, Config, NoTls};
 
+mod recovery;
 mod sales_publication;
+mod seller_stocks;
 
 static DATABASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -283,7 +285,10 @@ fn empty_pages(claim: &SourceJobClaim) -> Vec<(Value, Value)> {
             vec![(json!(["wb_sales_v2", date, 250, 0]), json!([[], 0]))]
         }
         (Marketplace::Wildberries, SnapshotSource::Stocks) => {
-            vec![(json!(["wb_stock", 0]), json!([[], 0]))]
+            vec![
+                (json!(["wb_stock", 0]), json!([[], 0])),
+                (json!(["wb_seller_warehouses_v1"]), json!([])),
+            ]
         }
         (Marketplace::Wildberries, SnapshotSource::Prices) => {
             vec![(json!(["wb_price", 0]), json!([[], 0]))]

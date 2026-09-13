@@ -113,3 +113,36 @@ fn unknown_unused_duplicate_and_unbounded_options_are_rejected() {
     assert_eq!(period_name(parsed.period), "daily");
     assert!(matches!(parsed.egress, Egress::Direct));
 }
+
+#[test]
+fn report_sync_requires_durable_observation_and_bounded_follow_options() {
+    let mut options = raw("sync-reports-wb");
+    assert!(parse_arguments(&options).is_err());
+    options.extend(
+        [
+            "--observation",
+            "period_202608",
+            "--follow",
+            "true",
+            "--max-run-seconds",
+            "60",
+        ]
+        .map(str::to_owned),
+    );
+    let parsed = parse_arguments(&options).unwrap();
+    assert_eq!(parsed.command, Command::SyncReportsWb);
+    assert!(parsed.follow);
+    assert_eq!(parsed.max_run_seconds, 60);
+    for invalid in ["0", "86401", "-1", "bad"] {
+        *options.last_mut().unwrap() = invalid.into();
+        assert!(parse_arguments(&options).is_err());
+    }
+    *options.last_mut().unwrap() = "60".into();
+    for option in [("--report-id", "7"), ("--currency", "RUB")] {
+        let mut invalid = options.clone();
+        invalid.extend(<[&str; 2]>::from(option).map(str::to_owned));
+        assert!(parse_arguments(&invalid).is_err());
+    }
+    options[0] = "list-reports-wb".into();
+    assert!(parse_arguments(&options).is_err());
+}

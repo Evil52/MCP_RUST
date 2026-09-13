@@ -7,10 +7,14 @@
 mod access;
 #[path = "finance-collector/arguments.rs"]
 mod arguments;
+#[path = "finance-collector/batch.rs"]
+mod batch;
 #[path = "finance-collector/checkpoint.rs"]
 mod checkpoint;
 #[path = "finance-collector/reports.rs"]
 mod reports;
+#[path = "finance-collector/runner.rs"]
+mod runner;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -40,18 +44,24 @@ async fn main() -> Result<()> {
     }
     if arguments == ["--help"] {
         println!(
-            "finance-collector probe-wb|collect-wb|list-reports-wb|reconcile-report-wb|publish-report-wb|migrate-personal-quota --registry PATH --actor ID --account ID --credentials-dir PATH --state-dir PATH --from YYYY-MM-DD --to YYYY-MM-DD [--egress collector-proxy|direct]"
+            "finance-collector probe-wb|collect-wb|list-reports-wb|reconcile-report-wb|publish-report-wb|sync-reports-wb|migrate-personal-quota --registry PATH --actor ID --account ID --credentials-dir PATH --state-dir PATH --from YYYY-MM-DD --to YYYY-MM-DD [--egress collector-proxy|direct]"
         );
         println!(
-            "Official report commands require --observation ID and accept --period weekly|daily (default weekly), --currency RUB. reconcile-report-wb and publish-report-wb also require --report-id INT64. Reuse the same observation to resume pages; use a new ID to observe revisions."
+            "sync-reports-wb publishes every closed report and its comparison, preserving each currency. --follow true continues deferred pages within --max-run-seconds 1..86400 (default 3600). Restart with the same observation and state directory to resume."
         );
         println!(
-            "collect-wb and publish-report-wb read REPORT_COLLECTOR_DATABASE_URL. Reuse one deployment-owned private state directory for all invocations. Default egress is collector-proxy. Seller quota becomes 60 seconds only after an observed successful Personal read. migrate-personal-quota requires a reviewed local legacy success receipt and sends no HTTP request."
+            "Official report commands require --observation ID and accept --period weekly|daily (default weekly). Single-report commands accept --currency RUB; reconcile-report-wb and publish-report-wb also require --report-id INT64. Reuse the same observation to resume pages; use a new ID to observe revisions."
+        );
+        println!(
+            "collect-wb, publish-report-wb and sync-reports-wb read REPORT_COLLECTOR_DATABASE_URL. Reuse one deployment-owned private state directory for all invocations. Default egress is collector-proxy. Seller quota becomes 60 seconds only after an observed successful Personal read. migrate-personal-quota requires a reviewed local legacy success receipt and sends no HTTP request."
         );
         return Ok(());
     }
     let arguments = parse_arguments(&arguments)?;
-    let result = execute(&arguments).await?;
+    let result = runner::run(arguments.follow, arguments.max_run_seconds, || {
+        execute(&arguments)
+    })
+    .await?;
     println!(
         "{}",
         serde_json::to_string(&result).context("operator result cannot be encoded")?
@@ -178,9 +188,10 @@ async fn execute(arguments: &Arguments) -> Result<Value> {
                 "next_request_at": journal.next_allowed_at()?}),
             )
         }
-        Command::ListReportsWb | Command::ReconcileReportWb | Command::PublishReportWb => {
-            reports::execute(arguments, &scoped.identity, &journal).await
-        }
+        Command::ListReportsWb
+        | Command::ReconcileReportWb
+        | Command::PublishReportWb
+        | Command::SyncReportsWb => reports::execute(arguments, &scoped.identity, &journal).await,
         Command::MigratePersonalQuota => {
             journal.migrate_personal_legacy(&arguments.actor, &scoped.identity.seller_scope)?;
             Ok(

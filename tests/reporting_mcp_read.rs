@@ -788,11 +788,28 @@ async fn sales_queries_sort_page_and_reject_corrupt_or_excessive_snapshot_histor
         .get(0);
     replace_sales_fact_date(&mut admin, snapshot, day + Duration::days(2)).await;
     let corrupted = reader.sales_analytics(&account, query).await;
+    let invalid_day_only = reader
+        .sales_analytics(
+            &account,
+            SalesAnalyticsQuery {
+                date_to: day,
+                ..query
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_day_only.state, DataState::Partial);
+    assert!(invalid_day_only.rows.is_empty());
+    assert_eq!(invalid_day_only.total_rows, 0);
+    assert!(!invalid_day_only.coverage[0].served);
     replace_sales_fact_date(&mut admin, snapshot, day).await;
-    assert_eq!(
-        corrupted.err(),
-        Some(ReportingReadError::InvalidPublishedData)
-    );
+    let corrupted = corrupted.unwrap();
+    assert_eq!(corrupted.state, DataState::Partial);
+    assert_eq!(corrupted.total_rows, 1);
+    assert_eq!(corrupted.rows[0].ordered_units, 9);
+    assert!(!corrupted.coverage[0].served);
+    assert_eq!(corrupted.coverage[0].state, SalesDateCoverageState::Partial);
+    assert!(corrupted.coverage[1].served);
     // Two days and 61 replacements are exactly the supported 63 candidates.
     for revision in 1..=61 {
         publish_ranking_day(&writer, &account, day, 3, revision).await;

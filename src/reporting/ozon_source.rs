@@ -5,13 +5,13 @@
 //! exact contract in `ozon_adapter` and every response is normalized before it
 //! can reach report persistence.
 mod failures;
+pub use failures::OzonReportSourceError;
 
 use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use thiserror::Error;
 
 use crate::{
     config::StoreId,
@@ -19,7 +19,7 @@ use crate::{
 };
 
 use super::{
-    checkpoint::{CheckpointError, Checkpoints, checkpointed},
+    checkpoint::{Checkpoints, checkpointed},
     ozon_adapter::{
         OzonReportParseError, OzonReportRequest, next_warehouse_stock_cursor, parse_price_page,
         parse_sales_page, parse_stock_page, parse_warehouse_stock_page, product_page_request,
@@ -431,73 +431,6 @@ impl<T> OzonReportSource<T> {
     }
 }
 
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum OzonReportSourceError {
-    #[error("collection quota requires a pause")]
-    RetryAfter { seconds: u64 },
-    #[error(transparent)]
-    Checkpoint(#[from] CheckpointError),
-    #[error("Ozon daily-report source request failed")]
-    Upstream(OzonErrorKind),
-    #[error("Ozon daily-report source request failed")]
-    Transport,
-    #[error("Ozon daily-report source response is invalid")]
-    InvalidResponse,
-    #[error("Ozon daily-report sales response is invalid")]
-    InvalidSalesResponse { shape: String },
-    #[error("Ozon daily-report stocks response is invalid")]
-    InvalidStocksResponse,
-    #[error("Ozon daily-report prices response is invalid")]
-    InvalidPricesResponse,
-    #[error("Ozon daily-report finance response is invalid")]
-    InvalidFinanceResponse,
-    #[error("Ozon daily-report snapshot input is invalid")]
-    InvalidSnapshotInput,
-    #[error("Ozon daily-report source pagination exceeded its fixed bound")]
-    PaginationLimit,
-}
-
-impl OzonReportSourceError {
-    #[must_use]
-    pub const fn failure(&self) -> super::source_collection::SourceFailure {
-        super::source_collection::SourceFailure {
-            code: self.code(),
-            retry_after: match self {
-                Self::RetryAfter { seconds } => Some(*seconds),
-                _ => None,
-            },
-        }
-    }
-    /// A stable, non-sensitive diagnostic code suitable for operator logs.
-    #[must_use]
-    pub const fn code(&self) -> &'static str {
-        match self {
-            Self::RetryAfter { .. } => "rate_limited",
-            Self::Checkpoint(error) => error.code(),
-            Self::Upstream(kind) => kind.code(),
-            Self::Transport => "transport_error",
-            Self::InvalidResponse => "invalid_response",
-            Self::InvalidSalesResponse { .. } => "invalid_sales_response",
-            Self::InvalidStocksResponse => "invalid_stocks_response",
-            Self::InvalidPricesResponse => "invalid_prices_response",
-            Self::InvalidFinanceResponse => "invalid_finance_response",
-            Self::InvalidSnapshotInput => "invalid_snapshot_input",
-            Self::PaginationLimit => "pagination_limit",
-        }
-    }
-
-    /// A value-free, bounded structural fingerprint for the one sales parse
-    /// failure that needs operator investigation. It never includes an Ozon
-    /// response value, identifier, amount, name, or credential.
-    #[must_use]
-    pub fn diagnostic(&self) -> Option<&str> {
-        match self {
-            Self::InvalidSalesResponse { shape } => Some(shape),
-            _ => None,
-        }
-    }
-}
-
 impl<T: OzonReportTransport> OzonReportSource<T> {
     pub async fn collect_finance_pages(
         &self,
@@ -567,12 +500,27 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         date_to: NaiveDate,
     ) -> Result<Vec<CollectedSalesFact>, OzonReportSourceError> {
         let mut facts = Vec::new();
+        let mut identities = BTreeSet::new();
         for page in 0..MAX_SALES_PAGES {
             let offset = u32::try_from(page)
                 .ok()
                 .and_then(|page| page.checked_mul(1_000))
                 .ok_or(OzonReportSourceError::PaginationLimit)?;
             let rows = self.sales_page(date_from, date_to, offset).await?;
+            if rows
+                .iter()
+                .any(|row| row.business_date < date_from || row.business_date > date_to)
+            {
+                return Err(OzonReportSourceError::InvalidSalesResponse {
+                    shape: "date_outside_requested_period".to_owned(),
+                });
+            }
+            if rows
+                .iter()
+                .any(|row| !identities.insert((row.business_date, row.sku)))
+            {
+                return Err(OzonReportSourceError::SalesPageOverlap);
+            }
             let complete = rows.len() < 1_000;
             facts.extend(rows);
             if complete {
@@ -858,6 +806,7 @@ impl From<OzonErrorKind> for OzonReportSourceError {
 
 #[cfg(test)]
 mod tests {
+    mod sales;
     use std::{
         collections::{BTreeMap, VecDeque},
         sync::Mutex,
@@ -1746,15 +1695,15 @@ mod tests {
 
     #[tokio::test]
     async fn pagination_limits_fail_closed_for_sales_and_cursor_sources() {
-        let full_sales_page = || {
+        let full_sales_page = |page: usize| {
             json!({"result":{"data":(0..1_000).map(|index| json!({
-                "dimensions":[{"id":index.to_string()},{"id":"2026-08-16"}],
+                "dimensions":[{"id":(page * 1_000 + index + 1).to_string()},{"id":"2026-08-16"}],
                 "metrics":["1", 1]
             })).collect::<Vec<_>>()}})
         };
         let sales = OzonReportSource::new(FixtureTransport(Mutex::new(
-            std::iter::repeat_with(|| Ok(full_sales_page()))
-                .take(MAX_SALES_PAGES)
+            (0..MAX_SALES_PAGES)
+                .map(|page| Ok(full_sales_page(page)))
                 .collect(),
         )));
         let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
