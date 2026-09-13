@@ -525,6 +525,23 @@ async fn chatgpt_oauth_contract_is_request_scoped_on_the_mcp_wire() {
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("tools/list did not return tools: {}", listed.raw_body));
     let expected_names = BTreeSet::from([
+        "wb_reviews",
+        "wb_review",
+        "wb_questions",
+        "wb_question",
+        "wb_reviews_archive",
+        "wb_return_claims",
+        "wb_product_card_errors",
+        "wb_product_card_limits",
+        "wb_product_cards_trash",
+        "wb_product_content_diagnostics",
+        "wb_subject_characteristics",
+        "wb_supplies",
+        "wb_supply",
+        "wb_supply_goods",
+        "wb_supply_packages",
+        "ozon_search_product_queries",
+        "ozon_search_product_query_details",
         "list_members",
         "marketplace_accounts",
         "ofk_collection_status",

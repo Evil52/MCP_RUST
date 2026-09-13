@@ -57,6 +57,23 @@ fn all_tools_have_truthful_annotations_and_descriptions() {
 #[test]
 fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
     const STABLE_TOOL_NAMES: &[&str] = &[
+        "wb_reviews",
+        "wb_review",
+        "wb_questions",
+        "wb_question",
+        "wb_reviews_archive",
+        "wb_return_claims",
+        "wb_product_card_errors",
+        "wb_product_card_limits",
+        "wb_product_cards_trash",
+        "wb_product_content_diagnostics",
+        "wb_subject_characteristics",
+        "wb_supplies",
+        "wb_supply",
+        "wb_supply_goods",
+        "wb_supply_packages",
+        "ozon_search_product_queries",
+        "ozon_search_product_query_details",
         "wb_seller_warehouses",
         "wb_seller_warehouse_stocks",
         "ozon_stores_status",
@@ -171,4 +188,121 @@ fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
         .with_preview_features(false, true)
         .with_preview_features(false, false);
     assert_eq!(names(&legacy_flags), default_names);
+}
+
+#[test]
+fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
+    fn assert_policy(tools: Vec<rmcp::model::Tool>, expected: &Value) {
+        for tool in tools {
+            let serialized = serde_json::to_value(&tool).unwrap();
+            assert_eq!(
+                serialized.get("securitySchemes"),
+                Some(expected),
+                "{} canonical security policy differs",
+                tool.name
+            );
+            assert_eq!(
+                serialized.pointer("/_meta/securitySchemes"),
+                Some(expected),
+                "{} compatibility mirror differs",
+                tool.name
+            );
+            assert!(serialized.get("security_schemes").is_none());
+        }
+    }
+
+    let dev_tools = server().tool_router.list_all();
+    // The release checklist in `SECURITY.md` states this count verbatim.
+    // Changing it here without updating that gate leaves the gate
+    // describing a router that no longer exists.
+    assert_eq!(dev_tools.len(), 105);
+    assert_policy(dev_tools, &json!([{"type": "noauth"}]));
+
+    let seed = server();
+    let authenticator = jwt_authenticator(&seed.registry);
+    let authenticated = OzonMcp::new_authenticated(seed.client, seed.registry, authenticator);
+    let metadata = authenticated.protected_resource_metadata().unwrap();
+    assert_eq!(metadata.resource, "http://localhost:8788/mcp");
+    assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
+
+    let jwt_tools = authenticated.tool_router.list_all();
+    assert_eq!(jwt_tools.len(), 105);
+    assert_policy(
+        jwt_tools,
+        &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
+    );
+
+    let seed = server();
+    let authenticator = jwt_authenticator(&seed.registry);
+    let legacy_flag_tools = OzonMcp::new_authenticated(seed.client, seed.registry, authenticator)
+        .with_preview_features(false, true)
+        .tool_router
+        .list_all();
+    assert_eq!(legacy_flag_tools.len(), 105);
+    assert_policy(
+        legacy_flag_tools,
+        &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
+    );
+}
+
+#[test]
+fn ozon_network_endpoints_are_confined_to_explicit_read_only_allowlist() {
+    const EXPECTED: &[&str] = &[
+        "/v1/analytics/data",
+        "/v1/analytics/product-queries",
+        "/v1/analytics/product-queries/details",
+        "/v1/analytics/turnover/stocks",
+        "/v1/finance/accrual/by-day",
+        "/v1/finance/accrual/postings",
+        "/v1/finance/accrual/types",
+        "/v1/finance/cash-flow-statement/list",
+        "/v1/finance/mutual-settlement",
+        "/v1/finance/realization/by-day",
+        "/v1/posting/fbo/cancel-reason/list",
+        "/v1/product/info/stocks-by-warehouse/fbo",
+        "/v1/product/info/warehouse/stocks",
+        "/v1/question/list",
+        "/v1/rating/history",
+        "/v1/rating/summary",
+        "/v1/returns/list",
+        "/v2/posting/fbo/get",
+        "/v2/posting/fbs/cancel-reason/list",
+        "/v2/product/info/stocks-by-warehouse/fbs",
+        "/v2/product/pictures/info",
+        "/v2/returns/rfbs/list",
+        "/v2/review/list",
+        "/v2/warehouse/list",
+        "/v3/finance/transaction/list",
+        "/v3/finance/transaction/totals",
+        "/v3/posting/fbo/list",
+        "/v3/posting/fbs/get",
+        "/v3/product/info/list",
+        "/v3/product/list",
+        "/v3/supply-order/get",
+        "/v3/supply-order/list",
+        "/v4/posting/fbs/list",
+        "/v4/posting/fbs/unfulfilled/list",
+        "/v4/product/info/attributes",
+        "/v4/product/info/stocks",
+        "/v5/product/info/prices",
+    ];
+    assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST, EXPECTED);
+    for endpoint in READ_ONLY_ENDPOINT_ALLOWLIST {
+        for forbidden in ["/create", "/delete", "/import", "/set", "/ship", "/update"] {
+            assert!(
+                !endpoint.contains(forbidden),
+                "{endpoint} contains {forbidden}"
+            );
+        }
+        assert!(is_read_only_endpoint_allowed(endpoint));
+    }
+    assert!(PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST.is_empty());
+    for endpoint in [
+        "/v1/product/update",
+        "/v1/order/create",
+        "/v2/posting/fbs/ship",
+        "/v2/posting/fbs/cancel",
+    ] {
+        assert!(!is_read_only_endpoint_allowed(endpoint));
+    }
 }
