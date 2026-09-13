@@ -149,7 +149,7 @@ fn campaign_launch_reconcile_prints_an_unconfirmed_outcome_without_writer_or_net
     )
     .unwrap();
     fs::set_permissions(&reader, fs::Permissions::from_mode(0o600)).unwrap();
-    let manifest = json!({"scope":"create_only","account_id":"ofk_region_wb","campaign_name":"Nexus","source_policy":"missing-policy","source_policy_sha256":"revoked","bids_kopecks":{"146312604":922,"207418966":922,"455101276":922,"461126890":922,"529996417":922},"budget_rubles":0,"funding_type":1,"actor_id":"admin","authorization_reference":"revoked/test","authorized_at":"2020-01-01T00:00:00Z","expires_at":"2020-01-02T00:00:00Z","registry":registry,"reader_token":reader,"writer_token":"missing-writer","reader_proxy":"http://127.0.0.1:9","writer_proxy":"http://127.0.0.1:9","allow_broad_reader":false,"journal_directory":root,"robot_policy":"missing-robot"});
+    let manifest = json!({"scope":"create_only","account_id":"ofk_region_wb","campaign_name":"Nexus","source_policy":"missing-policy","source_policy_sha256":"revoked","bids_kopecks":{"190904855":922,"207418966":922,"218972074":922,"455101276":922,"529996417":922},"budget_rubles":0,"funding_type":1,"actor_id":"admin","authorization_reference":"revoked/test","authorized_at":"2020-01-01T00:00:00Z","expires_at":"2020-01-02T00:00:00Z","registry":registry,"reader_token":reader,"writer_token":"missing-writer","reader_proxy":"http://127.0.0.1:9","writer_proxy":"http://127.0.0.1:9","allow_broad_reader":false,"journal_directory":root,"robot_policy":"missing-robot"});
     private_json(&root.join("manifest.json"), &manifest);
     private_json(&journal.join("manifest.json"), &manifest);
     let output = run(&["campaign-launch", "reconcile", "manifest.json"], &root);

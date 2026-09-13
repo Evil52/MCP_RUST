@@ -17,8 +17,17 @@ const ID: u64 = 1_984_773_211;
 #[path = "start_workflow_tests.rs"]
 mod startup;
 
+#[path = "first_launch_workflow_tests.rs"]
+mod first_start;
+
 #[path = "authorization_workflow_tests.rs"]
 mod authorization;
+
+#[path = "funding_readiness_tests.rs"]
+mod funding_readiness;
+
+#[path = "recreate_workflow_tests.rs"]
+mod recreate_workflow;
 
 struct Fixture {
     root: PathBuf,
@@ -276,12 +285,13 @@ async fn initial_bids_are_patched_once_then_read_back() {
 
 #[tokio::test]
 async fn funding_requires_exact_receipt_and_is_never_repeated() {
-    for total in [1000, 999] {
+    for (status, total) in [(11, 1000), (11, 999), (4, 1000), (4, 999)] {
         let fixture = Fixture::new(LaunchScope::FundAndStart);
-        let mut responses = preflight(&fixture);
+        let mut responses = vec![(200, target(status, 922))];
+        responses.extend(preflight(&fixture));
         responses.extend([
             (200, minimums()),
-            (200, target(11, 922)),
+            (200, target(status, 922)),
             (200, json!({"total":0})),
             (200, json!({"balance":1000})),
             (200, json!({"total":total})),
@@ -289,13 +299,17 @@ async fn funding_requires_exact_receipt_and_is_never_repeated() {
         if total == 1000 {
             responses.extend([
                 (200, json!({"total":1000})),
-                (200, target(11, 922)),
-                (200, target(11, 922)),
+                (200, target(status, 922)),
+                (200, target(status, 922)),
                 (200, json!({"total":1000})),
             ]);
         }
         let count = responses.len();
         let (operator, receiver) = fixture.operator(responses);
+        private_json(
+            &fixture.manifest.robot_policy,
+            &serde_json::to_value(operator.target_policy(ID)).unwrap(),
+        );
         let journal = fixture.journal();
         journal
             .receipt("create", &json!({"campaign_id":ID}))
@@ -375,7 +389,7 @@ async fn independent_readback_returns_vendor_state_not_an_assumed_launch() {
 }
 
 #[tokio::test]
-async fn new_status_four_is_rejected_before_observer_database_or_start() {
+async fn new_status_four_without_provenance_is_rejected_before_database_or_start() {
     let fixture = Fixture::new(LaunchScope::FundAndStart);
     let (operator, receiver) = fixture.operator(vec![(200, target(4, 922))]);
     let journal = fixture.journal();
@@ -383,14 +397,7 @@ async fn new_status_four_is_rejected_before_observer_database_or_start() {
         .receipt("create", &json!({"campaign_id":ID}))
         .unwrap();
     journal.receipt("fund", &json!({})).unwrap();
-    assert!(
-        operator
-            .start(&journal)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("status-4")
-    );
+    assert!(operator.start(&journal).await.is_err());
     assert!(!journal.attempted("start"));
     assert!(requests(&receiver, 1)[0].starts_with("GET /api/advert/v2/adverts?"));
 }

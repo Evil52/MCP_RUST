@@ -15,6 +15,7 @@ use validation::{
     validate_promotion_period, validate_promotion_statuses, validate_search_period,
     validate_search_texts, validate_top_order_by, validate_unsigned_id,
 };
+pub(crate) mod quota;
 mod request;
 mod response;
 #[cfg(test)]
@@ -47,7 +48,9 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+use crate::marketplace_quota::SharedQuota;
 use crate::retry::RetryPolicy;
+use quota::read_quota_error;
 
 const ANALYTICS_API_BASE_URL: &str = "https://seller-analytics-api.wildberries.ru";
 const STATISTICS_API_BASE_URL: &str = "https://statistics-api.wildberries.ru";
@@ -191,6 +194,8 @@ pub enum WbError {
         "локальный лимит частоты запросов WB ещё не восстановлен (retry-after: {retry_after:?})"
     )]
     LocalRateLimited { retry_after: Duration },
+    #[error("общий координатор квот WB недоступен: {reason}")]
+    SharedQuota { reason: &'static str },
     #[error("WB API вернул HTTP {status} (request-id: {request_id:?})")]
     Api {
         status: StatusCode,
@@ -253,7 +258,7 @@ impl WbError {
             Self::Api { .. } => WbErrorKind::Http,
             Self::Timeout { .. } | Self::DeadlineExceeded => WbErrorKind::Timeout,
             Self::Network { .. } => WbErrorKind::Network,
-            Self::Overloaded => WbErrorKind::Overloaded,
+            Self::Overloaded | Self::SharedQuota { .. } => WbErrorKind::Overloaded,
             Self::InvalidJson { .. } => WbErrorKind::InvalidJson,
             Self::ResponseTooLarge { .. } => WbErrorKind::ResponseTooLarge,
         }
@@ -275,6 +280,7 @@ impl WbError {
             | Self::InvalidArguments { .. }
             | Self::MissingCredentials(_)
             | Self::LocalRateLimited { .. }
+            | Self::SharedQuota { .. }
             | Self::DeadlineExceeded
             | Self::Overloaded => None,
         }
@@ -500,6 +506,7 @@ pub struct WbClient {
     global_in_flight: Arc<Semaphore>,
     logical_timeout: Duration,
     policy: ClientPolicy,
+    shared_quota: SharedQuota,
 }
 
 #[derive(Clone, Copy)]
@@ -607,6 +614,8 @@ impl WbClient {
             .timeout(timeout)
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
             .redirect(Policy::none())
+            // Every wire departure must pass the shared quota coordinator.
+            .retry(reqwest::retry::never())
             // Marketplace credentials must never traverse an ambient proxy.
             .no_proxy()
             .user_agent(concat!("mcp-ozon/", env!("CARGO_PKG_VERSION")))
@@ -645,7 +654,14 @@ impl WbClient {
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT_REQUESTS)),
             logical_timeout: policy.logical_timeout,
             policy,
+            shared_quota: SharedQuota::from_env(),
         })
+    }
+
+    #[must_use]
+    pub fn with_shared_quota(mut self, shared_quota: SharedQuota) -> Self {
+        self.shared_quota = shared_quota;
+        self
     }
 
     #[must_use]
@@ -1201,42 +1217,6 @@ impl WbClient {
                     sleep(delay).await;
                     attempt += 1;
                 }
-            }
-        }
-    }
-
-    async fn request_attempt(
-        &self,
-        context: AttemptContext<'_>,
-        attempt: usize,
-        retry: bool,
-    ) -> Result<AttemptOutcome, WbError> {
-        // Both permits are released when this helper returns, before the retry
-        // loop performs any backoff sleep.
-        let (_global_permit, _token_permit) = self
-            .acquire_request_permits(
-                context.limiter,
-                context.request_class,
-                retry,
-                context.deadline,
-            )
-            .await?;
-        let mut request = self
-            .http
-            .request(context.method.clone(), context.url)
-            .header(AUTHORIZATION, context.authorization.clone());
-        if let Some(payload) = context.payload {
-            request = request.json(payload);
-        }
-
-        let started = Instant::now();
-        match request.send().await {
-            Ok(response) => {
-                self.response_outcome(context, attempt, started, response)
-                    .await
-            }
-            Err(source) => {
-                transport_failure_outcome(context, attempt, started, source, &self.policy)
             }
         }
     }

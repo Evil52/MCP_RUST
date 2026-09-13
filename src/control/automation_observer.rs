@@ -178,18 +178,9 @@ impl WbAutomationObserver {
             .await
             .context("WB automation campaign budget недоступен")?;
         let budget_remaining_minor = parse_budget_minor(&budget)?;
-        let stats_response = self
-            .client
-            .promotion_stats(
-                &self.policy.account_id,
-                vec![self.policy.campaign_id],
-                previous_date.format("%Y-%m-%d").to_string(),
-                current_date.format("%Y-%m-%d").to_string(),
-            )
-            .await
-            .context("WB automation campaign stats недоступны")?;
-        let advertising = parse_promotion_stats(&stats_response)
-            .map_err(|_| anyhow::anyhow!("WB automation campaign stats имеют неверную форму"))?;
+        let advertising = self
+            .advertising(campaign.status, previous_date, current_date)
+            .await?;
         let stocks = stocks::collect(&self.client, &self.policy).await?;
         let observation = build_observation(
             &self.policy,
@@ -216,6 +207,7 @@ impl WbAutomationObserver {
 }
 
 mod campaign;
+mod readiness;
 mod stocks;
 pub(super) use campaign::{CampaignObservation, parse_campaign};
 

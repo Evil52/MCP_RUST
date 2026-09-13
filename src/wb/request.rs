@@ -1,8 +1,9 @@
 //! One enforced dispatch boundary for every WB read.
 
 use super::{
-    EndpointPolicy, Method, RequestClass, StatusCode, TokenLimiter, TokioInstant, Url, Value,
-    WbClient, WbError, bearer_authorization,
+    AUTHORIZATION, AttemptContext, AttemptOutcome, ClientPolicy, EndpointPolicy, Instant, Method,
+    RequestClass, StatusCode, TokenLimiter, TokioInstant, Url, Value, WbClient, WbError,
+    bearer_authorization, read_quota_error, transport_failure_outcome,
 };
 
 use tokio::sync::SemaphorePermit;
@@ -113,6 +114,51 @@ impl WbClient {
             // HTTP capacity; retry the readiness phase.
             drop(token_permit);
             drop(global_permit);
+        }
+    }
+    pub(super) async fn request_attempt(
+        &self,
+        context: AttemptContext<'_>,
+        attempt: usize,
+        retry: bool,
+    ) -> Result<AttemptOutcome, WbError> {
+        // Both permits are released when this helper returns, before the retry
+        // loop performs any backoff sleep.
+        let (_global_permit, _token_permit) = self
+            .acquire_request_permits(
+                context.limiter,
+                context.request_class,
+                retry,
+                context.deadline,
+            )
+            .await?;
+        let quota_key = self.shared_quota_key(context)?;
+        if let Some(key) = quota_key.as_ref() {
+            self.shared_quota
+                .admit(
+                    key,
+                    ClientPolicy::production(self.logical_timeout).interval(context.request_class),
+                )
+                .await
+                .map_err(read_quota_error)?;
+        }
+        let mut request = self
+            .http
+            .request(context.method.clone(), context.url)
+            .header(AUTHORIZATION, context.authorization.clone());
+        if let Some(payload) = context.payload {
+            request = request.json(payload);
+        }
+
+        let started = Instant::now();
+        match request.send().await {
+            Ok(response) => {
+                self.response_outcome(context, attempt, started, response, quota_key.as_ref())
+                    .await
+            }
+            Err(source) => {
+                transport_failure_outcome(context, attempt, started, source, &self.policy)
+            }
         }
     }
 }

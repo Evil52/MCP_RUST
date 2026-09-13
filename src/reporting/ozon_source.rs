@@ -4,6 +4,7 @@
 //! explicit canary runtime to `OzonClient`. Every request is first built by the
 //! exact contract in `ozon_adapter` and every response is normalized before it
 //! can reach report persistence.
+mod failures;
 
 use std::{collections::BTreeSet, future::Future, pin::Pin};
 
@@ -209,24 +210,7 @@ impl OzonReportTransport for OzonClientReportTransport {
                     // Keep only the stable, non-sensitive classification. In
                     // particular, never retain Ozon's error body in report
                     // collection diagnostics.
-                    .map_err(|error| match &error {
-                        OzonError::RateLimited {
-                            retry_after,
-                            local_cooldown,
-                            ..
-                        } => (*retry_after).max(*local_cooldown).map_or(
-                            OzonReportSourceError::Upstream(OzonErrorKind::RateLimited),
-                            |delay| OzonReportSourceError::RetryAfter {
-                                seconds: super::checkpoint::delay_seconds(delay),
-                            },
-                        ),
-                        OzonError::LocalRateLimited { retry_after } => {
-                            OzonReportSourceError::RetryAfter {
-                                seconds: super::checkpoint::delay_seconds(*retry_after),
-                            }
-                        }
-                        _ => OzonReportSourceError::Upstream(error.kind()),
-                    })
+                    .map_err(|error| failures::source_failure(&error))
             })
             .await
         })

@@ -1,11 +1,13 @@
 //! Bounded response decoding, safe diagnostics and retry decisions.
 
+use super::quota::{read_quota_error, vendor_quota_cooldown};
 use super::{
     AttemptContext, AttemptOutcome, ClientPolicy, DateTime, Duration, HeaderMap, Instant,
     MAX_ERROR_BODY_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESPONSE_BODY_BYTES, RETRY_AFTER, RequestClass,
     Response, StatusCode, Utc, Value, WbClient, WbError, WbErrorKind, classify_http_status, info,
     warn,
 };
+use crate::marketplace_quota::QuotaKey;
 
 pub(super) fn classify_transport_error(
     error: reqwest::Error,
@@ -249,8 +251,10 @@ impl WbClient {
         attempt: usize,
         started: Instant,
         response: Response,
+        quota_key: Option<&QuotaKey>,
     ) -> Result<AttemptOutcome, WbError> {
         let status = response.status();
+        let shared_cooldown = vendor_quota_cooldown(response.headers(), status);
         let request_id = extract_request_id(response.headers());
         let retry_after = parse_retry_delay(response.headers(), Utc::now());
         let planned_retry = context
@@ -291,6 +295,21 @@ impl WbClient {
         } else {
             None
         };
+        let shared_inventory_cooldown = (context.request_class == RequestClass::SellerInventory
+            && status == StatusCode::CONFLICT)
+            .then_some(super::SELLER_INVENTORY_MIN_REQUEST_INTERVAL * 10);
+        if let (Some(key), Some(delay)) = (
+            quota_key,
+            shared_cooldown
+                .into_iter()
+                .chain(shared_inventory_cooldown)
+                .max(),
+        ) {
+            self.shared_quota
+                .defer(key, delay)
+                .await
+                .map_err(read_quota_error)?;
+        }
         if let Some(delay) = planned_retry
             .into_iter()
             .chain(vendor_cooldown)

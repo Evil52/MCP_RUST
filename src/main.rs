@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
         .init();
 
     let config = AppConfig::from_env()?;
+    mcp_ozon::marketplace_quota::SharedQuota::from_env()
+        .preflight()
+        .await?;
     let reporting_database_url = match std::env::var("MCP_REPORTING_DATABASE_URL") {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
