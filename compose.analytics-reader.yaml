@@ -1,0 +1,59 @@
+# Standalone opt-in reader. Do not merge with compose.yaml, which mounts .env.
+# Requires an already prepared internal PostgreSQL network and an HTTPS JWKS
+# service reachable on that network. No external network or marketplace keys.
+name: ofk-analytics-reader
+
+services:
+  analytics-reader:
+    image: ${MCP_ANALYTICS_IMAGE:?Set the reviewed analytics reader image}
+    environment:
+      MCP_DATA_MODE: reporting_only
+      MCP_TRANSPORT: http
+      MCP_BIND: 0.0.0.0:8787
+      MCP_AUTH_MODE: jwt
+      MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
+      MCP_JWT_ISSUER: ${MCP_ANALYTICS_JWT_ISSUER:?Set the trusted issuer}
+      MCP_JWT_AUDIENCE: ${MCP_ANALYTICS_PUBLIC_URL:?Set the dedicated MCP URL}
+      MCP_PUBLIC_URL: ${MCP_ANALYTICS_PUBLIC_URL:?Set the dedicated MCP URL}
+      MCP_JWT_JWKS_URL: ${MCP_ANALYTICS_JWKS_URL:?Set the internally reachable HTTPS JWKS URL}
+      MCP_REPORTING_DATABASE_URL: ${MCP_ANALYTICS_READER_DATABASE_URL:?Set the restricted PostgreSQL reader URL}
+      MCP_REPORT_REFRESH_DATABASE_URL: ${MCP_ANALYTICS_REFRESH_DATABASE_URL:?Set the restricted local queue and audit URL}
+    ports:
+      - "127.0.0.1:${MCP_ANALYTICS_PORT:-8789}:8787"
+    networks:
+      - analytics-internal
+    volumes:
+      - type: bind
+        source: ${MCP_ANALYTICS_ACCESS_CONFIG:?Set the metadata-only access registry path}
+        target: /etc/mcp-ozon/access.json
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 768m
+    cpus: 2.0
+    pids_limit: 256
+    restart: unless-stopped
+    stop_grace_period: 70s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8787/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+networks:
+  analytics-internal:
+    name: ${MCP_ANALYTICS_INTERNAL_NETWORK:-mcp-ozon-position-internal}
+    external: true

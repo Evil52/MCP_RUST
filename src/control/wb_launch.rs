@@ -38,10 +38,10 @@ const ACCOUNT: &str = "ofk_region_wb";
 const NAME: &str = "Nexus";
 const SOURCE: u64 = 39_807_762;
 const NMS: [u64; 5] = [
-    146_312_604,
+    190_904_855,
     207_418_966,
+    218_972_074,
     455_101_276,
-    461_126_890,
     529_996_417,
 ];
 
@@ -71,6 +71,16 @@ struct Manifest {
     /// One stable private runtime directory. Never delete to retry a write.
     journal_directory: PathBuf,
     robot_policy: PathBuf,
+    /// Explicit reviewed replacement of the original failed create, never funding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recreate: Option<RecreateApproval>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecreateApproval {
+    previous_manifest_sha256: String,
+    previous_attempt_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +93,7 @@ enum LaunchScope {
 impl Manifest {
     const fn financial_scope_matches(&self) -> bool {
         self.funding_type == 1
+            && (self.recreate.is_none() || matches!(self.scope, LaunchScope::CreateOnly))
             && match self.scope {
                 LaunchScope::CreateOnly => self.budget_rubles == 0,
                 LaunchScope::FundAndStart => self.budget_rubles == 1000,
@@ -129,7 +140,8 @@ impl Manifest {
         ensure!(
             !self.authorization_reference.trim().is_empty()
                 && (allow_expired || (self.authorized_at <= now && now < self.expires_at))
-                && (1..=86400).contains(&(self.expires_at - self.authorized_at).num_seconds()),
+                && (chrono::Duration::seconds(1)..=chrono::Duration::hours(24))
+                    .contains(&(self.expires_at - self.authorized_at)),
             "launch authorization is absent or expired (maximum 24 hours)"
         );
         super::validate_wb_automation_policy(policy)?;
@@ -259,6 +271,12 @@ impl Operator {
 
     async fn preflight(&self, own_id: Option<u64>) -> Result<Value> {
         self.fresh_authorization()?;
+        if self.manifest.recreate.is_some() && own_id.is_none() {
+            Journal::inspect_recreate(
+                &self.manifest.journal_directory,
+                &serde_json::to_value(&self.manifest)?,
+            )?;
+        }
         let subject_id = self.verify_category().await?;
         let source = self
             .reader
@@ -266,7 +284,12 @@ impl Operator {
             .await?;
         parse_campaign(&source, &self.policy)?;
         let groups = self.reader.promotion_campaigns(ACCOUNT).await?;
-        let ids = nonfinished_campaign_ids(&groups, own_id)?;
+        let ids = if self.manifest.recreate.is_some() {
+            recovery_campaign_ids(&groups, own_id)?
+        } else {
+            nonfinished_campaign_ids(&groups, own_id)?
+        };
+        let checked_campaign_count = ids.len();
         for chunk in ids.into_iter().collect::<Vec<_>>().chunks(50) {
             let response = self
                 .reader
@@ -292,6 +315,11 @@ impl Operator {
                         != NAME,
                     "another Nexus campaign exists; reconcile instead of creating a duplicate"
                 );
+                if self.manifest.recreate.is_some()
+                    && matches!(ad.get("status").and_then(Value::as_i64), Some(-1 | 7 | 8))
+                {
+                    continue;
+                }
                 let nms = ad
                     .get("nm_settings")
                     .and_then(Value::as_array)
@@ -348,6 +376,8 @@ impl Operator {
             "cash_balance_rubles":balance,"scope":self.manifest.scope,
             "authorized_funding_rubles":self.manifest.budget_rubles,
             "subject_id":subject_id,
+            "campaign_scan":{"listed_total":groups.get("all"),"checked_details":checked_campaign_count,
+                "scope":if self.manifest.recreate.is_some(){"all_modern_including_terminal; obsolete_terminal_types_excluded"}else{"nonfinished"}},
             "bids_kopecks":self.manifest.bids_kopecks,"wb_stock":totals,
             "source_policy_sha256":self.manifest.source_policy_sha256,
             "daily_cap_rubles":500,"pause_threshold_rubles":450,"target_drr_percent":15,
@@ -497,12 +527,18 @@ impl Operator {
         let id = journal.campaign_id()?;
         journal.assert_not_attempted("fund")?;
         journal.require_receipt("bids")?;
+        let initial_status = self.inactive(id, true).await?.status;
+        start::validate_start_status(initial_status)?;
+        self.installed_protection(id)?;
         let preflight = self.preflight(Some(id)).await?;
         self.writer
             .deposit_once_with_permit(id, || async {
                 self.fresh_authorization()?;
                 self.minimums(id).await?;
-                self.inactive(id, true).await?;
+                ensure!(
+                    self.inactive(id, true).await?.status == initial_status,
+                    "campaign status drifted before funding"
+                );
                 ensure!(
                     self.budget(id).await? == 0,
                     "new campaign budget no longer zero"
@@ -513,6 +549,7 @@ impl Operator {
                     "WB type=1 balance {balance} RUB is insufficient"
                 );
                 self.fresh_authorization()?;
+                self.installed_protection(id)?;
                 journal.attempt(
                     "fund",
                     &json!({"campaign_id":id,"sum":1000,"type":1,
@@ -592,6 +629,65 @@ fn nonfinished_campaign_ids(groups: &Value, own_id: Option<u64>) -> Result<BTree
         "campaign overlap check exceeds bounded scan"
     );
     Ok(ids)
+}
+
+// Include every modern campaign, even completed: the earlier create may have
+// succeeded then stopped. Retired types 4..7 cannot be produced by seacat CPC
+// create and are absent from v2 details (WB API announcement /forum/1659).
+// Only terminal retired campaigns are excluded; all other unknown data blocks.
+fn recovery_campaign_ids(groups: &Value, own_id: Option<u64>) -> Result<BTreeSet<u64>> {
+    let rows = groups
+        .get("adverts")
+        .and_then(Value::as_array)
+        .context("campaign listing incomplete")?;
+    let mut count = 0usize;
+    let mut all_ids = BTreeSet::new();
+    let mut selected = BTreeSet::new();
+    for group in rows {
+        let kind = group
+            .get("type")
+            .and_then(Value::as_u64)
+            .context("campaign type missing")?;
+        let status = group
+            .get("status")
+            .and_then(Value::as_i64)
+            .context("campaign status missing")?;
+        ensure!(
+            matches!(status, -1 | 4 | 7 | 8 | 9 | 11),
+            "unknown campaign status"
+        );
+        let modern = matches!(kind, 8 | 9);
+        ensure!(
+            modern || (matches!(kind, 4..=7) && matches!(status, -1 | 7 | 8)),
+            "unknown or nonterminal legacy campaign type; cannot safely exclude"
+        );
+        let list = group
+            .get("advert_list")
+            .and_then(Value::as_array)
+            .context("campaign listing missing IDs")?;
+        ensure!(
+            group.get("count").and_then(Value::as_u64) == Some(list.len() as u64),
+            "campaign group truncated"
+        );
+        count += list.len();
+        ensure!(count <= 500, "campaign overlap check exceeds bounded scan");
+        for item in list {
+            let id = item
+                .get("advertId")
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0)
+                .context("invalid advertId")?;
+            ensure!(all_ids.insert(id), "campaign listing duplicate ID");
+            if modern && Some(id) != own_id {
+                selected.insert(id);
+            }
+        }
+    }
+    ensure!(
+        groups.get("all").and_then(Value::as_u64) == Some(count as u64),
+        "campaign listing total incomplete"
+    );
+    Ok(selected)
 }
 
 fn validate_registry(manifest: &Manifest) -> Result<String> {

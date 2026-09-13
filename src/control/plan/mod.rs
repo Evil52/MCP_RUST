@@ -27,4 +27,6 @@ use validation::{
 pub(crate) static CONTROL_DB_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
+mod quota_contract_tests;
+#[cfg(test)]
 mod tests;

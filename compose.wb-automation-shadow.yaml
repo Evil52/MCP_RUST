@@ -10,6 +10,8 @@ services:
         MCP_RELEASE_GIT_SHA: ${MCP_RELEASE_GIT_SHA:-unverified}
     environment:
       WB_AUTOMATION_DATABASE_URL: postgresql://wb_automation_writer:${WB_AUTOMATION_DB_PASSWORD:?WB_AUTOMATION_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      MCP_MARKETPLACE_QUOTA_REQUIRED: "true"
+      MCP_MARKETPLACE_QUOTA_DATABASE_URL: postgresql://wb_automation_writer:${WB_AUTOMATION_DB_PASSWORD:?WB_AUTOMATION_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
       RUST_LOG: mcp_ozon::control=info
     command:
       - shadow-once-pg

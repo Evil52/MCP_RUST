@@ -148,7 +148,7 @@ SELECT
           AND NOT rolinherit
           AND NOT rolreplication
           AND NOT rolbypassrls
-          AND rolconnlimit = 2
+          AND rolconnlimit = 4
     )
     AND to_regprocedure(
         'control.validate_wb_policy_revision_insert()'

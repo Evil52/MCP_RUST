@@ -48,6 +48,18 @@ test = false
 required-features = ["runtime-binaries"]
 
 [[bin]]
+name = "cost-import"
+path = "src/bin/cost-import.rs"
+test = false
+required-features = ["runtime-binaries"]
+
+[[bin]]
+name = "finance-collector"
+path = "src/bin/finance-collector.rs"
+test = false
+required-features = ["runtime-binaries"]
+
+[[bin]]
 name = "wb-automation"
 path = "src/bin/wb-automation.rs"
 test = false
@@ -105,7 +117,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "query",
     "rustls",
 ] }
-rmcp = { version = "=3.1.4", features = ["transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "=3.3.0", features = ["transport-io", "transport-streamable-http-server"] }
 rust_xlsxwriter = { version = "0.98.2", default-features = false }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }

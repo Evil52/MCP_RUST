@@ -36,6 +36,8 @@ services:
       CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: "true"
       CONTROL_MCP_OZON_ACCOUNT_ID: furnitura_dlya_doma
       CONTROL_MCP_OZON_EXECUTOR_DATABASE_URL: postgresql://ozon_control_executor:${OZON_CONTROL_EXECUTOR_DB_PASSWORD:?OZON_CONTROL_EXECUTOR_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      MCP_MARKETPLACE_QUOTA_REQUIRED: "true"
+      MCP_MARKETPLACE_QUOTA_DATABASE_URL: postgresql://ozon_control_executor:${OZON_CONTROL_EXECUTOR_DB_PASSWORD:?OZON_CONTROL_EXECUTOR_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
       CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE: /run/secrets/ozon-executor-performance-client-id
       CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE: /run/secrets/ozon-executor-performance-client-secret
       CONTROL_MCP_OZON_PROXY: http://control-ozon-write-egress:3130

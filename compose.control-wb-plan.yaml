@@ -15,6 +15,8 @@ services:
       CONTROL_MCP_WB_ACCOUNT_ID: ip_domnyshev_wb
       CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE: /run/mcp-ozon/control-credentials/wb-promotion-read.token
       CONTROL_MCP_DATABASE_URL: postgresql://control_writer:${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      MCP_MARKETPLACE_QUOTA_REQUIRED: "true"
+      MCP_MARKETPLACE_QUOTA_DATABASE_URL: postgresql://control_writer:${CONTROL_WRITER_DB_PASSWORD:?CONTROL_WRITER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
       CONTROL_MCP_WB_PROXY: http://control-write-egress:3130
       CONTROL_MCP_WB_TIMEOUT_SECONDS: "20"
     volumes:
