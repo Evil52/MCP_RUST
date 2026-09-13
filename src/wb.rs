@@ -9,6 +9,7 @@ use validation::{
     validate_promotion_period, validate_promotion_statuses, validate_search_period,
     validate_search_texts, validate_top_order_by, validate_unsigned_id,
 };
+pub(crate) mod quota;
 mod response;
 use response::{
     ParsedRetryDelay, classify_transport_error, decode_response, extract_request_id, is_retriable,
@@ -37,7 +38,9 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+use crate::marketplace_quota::SharedQuota;
 use crate::retry::RetryPolicy;
+use quota::read_quota_error;
 
 const ANALYTICS_API_BASE_URL: &str = "https://seller-analytics-api.wildberries.ru";
 const STATISTICS_API_BASE_URL: &str = "https://statistics-api.wildberries.ru";
@@ -178,6 +181,8 @@ pub enum WbError {
         "локальный лимит частоты запросов WB ещё не восстановлен (retry-after: {retry_after:?})"
     )]
     LocalRateLimited { retry_after: Duration },
+    #[error("общий координатор квот WB недоступен: {reason}")]
+    SharedQuota { reason: &'static str },
     #[error("WB API вернул HTTP {status} (request-id: {request_id:?})")]
     Api {
         status: StatusCode,
@@ -240,7 +245,7 @@ impl WbError {
             Self::Api { .. } => WbErrorKind::Http,
             Self::Timeout { .. } | Self::DeadlineExceeded => WbErrorKind::Timeout,
             Self::Network { .. } => WbErrorKind::Network,
-            Self::Overloaded => WbErrorKind::Overloaded,
+            Self::Overloaded | Self::SharedQuota { .. } => WbErrorKind::Overloaded,
             Self::InvalidJson { .. } => WbErrorKind::InvalidJson,
             Self::ResponseTooLarge { .. } => WbErrorKind::ResponseTooLarge,
         }
@@ -262,6 +267,7 @@ impl WbError {
             | Self::InvalidArguments { .. }
             | Self::MissingCredentials(_)
             | Self::LocalRateLimited { .. }
+            | Self::SharedQuota { .. }
             | Self::DeadlineExceeded
             | Self::Overloaded => None,
         }
@@ -527,6 +533,7 @@ pub struct WbClient {
     global_in_flight: Arc<Semaphore>,
     logical_timeout: Duration,
     policy: ClientPolicy,
+    shared_quota: SharedQuota,
 }
 
 #[derive(Clone, Copy)]
@@ -633,6 +640,8 @@ impl WbClient {
             .timeout(timeout)
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
             .redirect(Policy::none())
+            // Every wire departure must pass the shared quota coordinator.
+            .retry(reqwest::retry::never())
             // Marketplace credentials must never traverse an ambient proxy.
             .no_proxy()
             .user_agent(concat!("mcp-ozon/", env!("CARGO_PKG_VERSION")))
@@ -671,7 +680,14 @@ impl WbClient {
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT_REQUESTS)),
             logical_timeout: policy.logical_timeout,
             policy,
+            shared_quota: SharedQuota::from_env(),
         })
+    }
+
+    #[must_use]
+    pub fn with_shared_quota(mut self, shared_quota: SharedQuota) -> Self {
+        self.shared_quota = shared_quota;
+        self
     }
 
     #[must_use]
@@ -1331,6 +1347,16 @@ impl WbClient {
                 context.deadline,
             )
             .await?;
+        let quota_key = self.shared_quota_key(context)?;
+        if let Some(key) = quota_key.as_ref() {
+            self.shared_quota
+                .admit(
+                    key,
+                    ClientPolicy::production(self.logical_timeout).interval(context.request_class),
+                )
+                .await
+                .map_err(read_quota_error)?;
+        }
         let mut request = self
             .http
             .request(context.method.clone(), context.url)
@@ -1342,123 +1368,12 @@ impl WbClient {
         let started = Instant::now();
         match request.send().await {
             Ok(response) => {
-                self.response_outcome(context, attempt, started, response)
+                self.response_outcome(context, attempt, started, response, quota_key.as_ref())
                     .await
             }
             Err(source) => {
                 transport_failure_outcome(context, attempt, started, source, &self.policy)
             }
-        }
-    }
-
-    async fn response_outcome(
-        &self,
-        context: AttemptContext<'_>,
-        attempt: usize,
-        started: Instant,
-        response: Response,
-    ) -> Result<AttemptOutcome, WbError> {
-        let status = response.status();
-        let request_id = extract_request_id(response.headers());
-        let retry_after = parse_retry_delay(response.headers(), Utc::now());
-        let planned_retry = context
-            .request_class
-            .allows_automatic_retry()
-            .then(|| retry_plan(status, attempt, retry_after, &self.policy))
-            .flatten();
-        let vendor_cooldown = match retry_after {
-            ParsedRetryDelay::Valid(delay)
-                if context.request_class == RequestClass::SellerInventory
-                    && is_retriable(status) =>
-            {
-                // The one-attempt inventory reader must still honor a long
-                // Retry-After for sibling callers. Cap untrusted delays at a
-                // day; the generic retry budget is not this shared cooldown.
-                Some(delay.min(Duration::from_hours(24)))
-            }
-            ParsedRetryDelay::Valid(delay)
-                if is_retriable(status) && delay <= self.policy.max_retry_delay =>
-            {
-                Some(delay)
-            }
-            ParsedRetryDelay::Absent | ParsedRetryDelay::Invalid | ParsedRetryDelay::Valid(_) => {
-                None
-            }
-        };
-        let inventory_cooldown = if context.request_class == RequestClass::SellerInventory {
-            match status {
-                // WB charges ten requests for a 409 in both inventory groups.
-                StatusCode::CONFLICT => Some(self.policy.seller_inventory_interval * 10),
-                StatusCode::TOO_MANY_REQUESTS if vendor_cooldown.is_none() => {
-                    Some(Duration::from_secs(60))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(delay) = planned_retry
-            .into_iter()
-            .chain(vendor_cooldown)
-            .chain(inventory_cooldown)
-            .max()
-        {
-            // A vendor-directed retry is shared by every alias using this
-            // seller token and endpoint class. Extending the gate before
-            // permits are released prevents sibling calls from creating a
-            // same-token 429/503 retry storm during the cooldown.
-            context
-                .limiter
-                .extend_cooldown(context.request_class, delay)
-                .await;
-        }
-
-        if let Some(delay) = planned_retry {
-            let diagnostic = read_body(response, MAX_ERROR_BODY_BYTES, request_id.as_deref())
-                .await
-                .unwrap_or_default();
-            trace_response(
-                context.account,
-                context.endpoint,
-                attempt,
-                started,
-                status,
-                request_id.as_deref(),
-                None,
-                true,
-            );
-            return Ok(AttemptOutcome::Retry {
-                delay,
-                error: classify_http_status(
-                    status,
-                    request_id,
-                    retry_after.duration(),
-                    String::from_utf8_lossy(&diagnostic).into_owned(),
-                ),
-            });
-        }
-
-        let result = decode_response(response, request_id.clone(), retry_after.duration()).await;
-        let will_retry = context.request_class.allows_automatic_retry()
-            && result.as_ref().is_err_and(|error| {
-                is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts
-            });
-        trace_response(
-            context.account,
-            context.endpoint,
-            attempt,
-            started,
-            status,
-            request_id.as_deref(),
-            result.as_ref().err(),
-            will_retry,
-        );
-        match result {
-            Err(error) if will_retry => Ok(AttemptOutcome::Retry {
-                delay: retry_delay(attempt, None, &self.policy),
-                error,
-            }),
-            result => result.map(AttemptOutcome::Complete),
         }
     }
 }

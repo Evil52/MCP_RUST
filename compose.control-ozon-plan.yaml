@@ -9,6 +9,8 @@ services:
       CONTROL_MCP_MARKETPLACE_WRITES_ENABLED: "false"
       CONTROL_MCP_OZON_ACCOUNT_ID: furnitura_dlya_doma
       CONTROL_MCP_OZON_PLANNER_DATABASE_URL: postgresql://ozon_control_planner:${OZON_CONTROL_PLANNER_DB_PASSWORD:?OZON_CONTROL_PLANNER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      MCP_MARKETPLACE_QUOTA_REQUIRED: "true"
+      MCP_MARKETPLACE_QUOTA_DATABASE_URL: postgresql://ozon_control_planner:${OZON_CONTROL_PLANNER_DB_PASSWORD:?OZON_CONTROL_PLANNER_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
     networks:
       - position-internal
       - control-auth-egress-internal

@@ -63,6 +63,67 @@ expect_failure_containing() {
   fi
 }
 
+assert_marketplace_quota_contract() {
+  local description="$1" contract
+  shift
+  contract="$({ "$@" --tuples-only --no-align --command "
+    WITH allowed_roles(role_name) AS (
+      SELECT unnest(ARRAY[
+        'position_collector','report_collector','report_refresh_requester',
+        'control_writer','ozon_control_planner','ozon_control_executor',
+        'wb_automation_writer'
+      ]::name[])
+    ), denied_roles(role_name) AS (
+      SELECT unnest(ARRAY['position_reader','report_worker']::name[])
+    ), routines AS (
+      SELECT routine.* FROM pg_proc AS routine
+      JOIN pg_namespace AS namespace ON namespace.oid=routine.pronamespace
+      WHERE namespace.nspname='marketplace_quota'
+    )
+    SELECT (
+      SELECT bool_and(
+        has_schema_privilege(role_name,'marketplace_quota','USAGE')
+        AND NOT has_schema_privilege(role_name,'marketplace_quota','CREATE')
+        AND NOT has_table_privilege(role_name,'marketplace_quota.departures',
+          'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+        AND has_function_privilege(role_name,
+          'marketplace_quota.try_acquire(text,bigint)','EXECUTE')
+        AND has_function_privilege(role_name,
+          'marketplace_quota.extend_cooldown(text,bigint)','EXECUTE')
+      ) FROM allowed_roles
+    ) AND (
+      SELECT bool_and(
+        NOT has_schema_privilege(role_name,'marketplace_quota','USAGE,CREATE')
+        AND NOT has_table_privilege(role_name,'marketplace_quota.departures',
+          'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+        AND NOT has_function_privilege(role_name,
+          'marketplace_quota.try_acquire(text,bigint)','EXECUTE')
+        AND NOT has_function_privilege(role_name,
+          'marketplace_quota.extend_cooldown(text,bigint)','EXECUTE')
+      ) FROM denied_roles
+    ) AND (
+      SELECT count(*)=2
+        AND bool_and(prosecdef AND proconfig=ARRAY['search_path=pg_catalog'])
+      FROM routines
+    ) AND NOT EXISTS (
+      SELECT 1 FROM routines
+      CROSS JOIN LATERAL aclexplode(coalesce(proacl,acldefault('f',proowner))) AS acl
+      WHERE acl.grantee=0
+    ) AND NOT EXISTS (
+      SELECT 1 FROM pg_namespace AS namespace
+      CROSS JOIN LATERAL aclexplode(
+        coalesce(namespace.nspacl,acldefault('n',namespace.nspowner))
+      ) AS acl
+      WHERE namespace.nspname='marketplace_quota' AND acl.grantee=0
+    )
+  "; } | tr -d '[:space:]')"
+  if [[ "$contract" != t ]]; then
+    echo "$description does not match the shared marketplace quota ACL contract" >&2
+    printf '%s\n' "$contract" >&2
+    exit 1
+  fi
+}
+
 assert_control_schema_contract() {
   local description="$1" contract
   shift
@@ -697,6 +758,7 @@ control_writer_psql=(
   --no-psqlrc --set ON_ERROR_STOP=1
 )
 docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
+assert_marketplace_quota_contract "fresh database" "${admin_psql[@]}"
 
 # Compare the ledger against the migrations this repository actually ships
 # rather than against a hand-updated count. A literal count only failed when a
@@ -1095,6 +1157,8 @@ migration_admin_psql=(
   --file /opt/mcp-ozon/migrations/029_independent_source_collection.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /opt/mcp-ozon/migrations/030_ozon_reconciled_launch_completion.sql >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/032_marketplace_shared_quotas.sql >/dev/null
 # Reapplying an additive migration is required to converge an existing volume
 # without changing the exposed contract or broadening the reader role.
 "${migration_admin_psql[@]}" \
@@ -1105,6 +1169,18 @@ migration_admin_psql=(
   --file /opt/mcp-ozon/migrations/021_wb_automation_state.sql >/dev/null
 "${migration_admin_psql[@]}" \
   --file /opt/mcp-ozon/migrations/022_wb_automation_explicit_resume.sql >/dev/null
+"${migration_admin_psql[@]}" --command "
+  SELECT marketplace_quota.try_acquire(repeat('a',64),86400000)
+" >/dev/null
+"${migration_admin_psql[@]}" \
+  --file /opt/mcp-ozon/migrations/032_marketplace_shared_quotas.sql >/dev/null
+assert_marketplace_quota_contract "existing-volume migration" "${migration_admin_psql[@]}"
+quota_survived_migration="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
+  --command "SELECT marketplace_quota.try_acquire(repeat('a',64),1)>0"; } | tr -d '[:space:]')"
+if [[ "$quota_survived_migration" != t ]]; then
+  echo "idempotent migration lost an existing marketplace quota reservation" >&2
+  exit 1
+fi
 optional_sales_metrics="$({ "${migration_admin_psql[@]}" --tuples-only --no-align \
   --field-separator=: --command "
     SELECT string_agg(column_name || ':' || is_nullable, ',' ORDER BY column_name)
@@ -3538,7 +3614,7 @@ role_attributes="$("${admin_psql[@]}" --tuples-only --no-align --field-separator
     )
     ORDER BY rolname
   ")"
-expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nozon_control_executor:t:f:f:f:f:f:f:4\nozon_control_planner:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_refresh_requester:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4\nwb_automation_writer:t:f:f:f:f:f:f:2'
+expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nozon_control_executor:t:f:f:f:f:f:f:4\nozon_control_planner:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_refresh_requester:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4\nwb_automation_writer:t:f:f:f:f:f:f:4'
 if [[ "$role_attributes" != "$expected_attributes" ]]; then
   echo "restricted database role attributes differ from the expected policy" >&2
   printf '%s\n' "$role_attributes" >&2

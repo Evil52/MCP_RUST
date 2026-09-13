@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{sync::Mutex, time::Instant};
 
-use crate::{config::PerformanceCredentials, ozon_performance::PerformanceRequestPacer};
+use crate::{
+    config::PerformanceCredentials,
+    marketplace_quota::{QuotaError, QuotaKey, SharedQuota},
+    ozon_performance::PerformanceRequestPacer,
+};
 
 const PERFORMANCE_BASE_URL: &str = "https://api-performance.ozon.ru";
 const TOKEN_PATH: &str = "/api/client/token";
@@ -25,6 +29,15 @@ const MAX_TITLE_BYTES: usize = 128;
 const MAX_TOKEN_LIFETIME: Duration = Duration::from_hours(24);
 const TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(60);
 const MIN_WRITE_INTERVAL: Duration = Duration::from_secs(1);
+const TOKEN_QUOTA_INTERVAL: Duration = Duration::from_secs(30);
+
+fn shared_response_cooldown(status: StatusCode, vendor: Option<Duration>) -> Option<Duration> {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => Some(vendor.unwrap_or(TOKEN_QUOTA_INTERVAL)),
+        StatusCode::SERVICE_UNAVAILABLE => vendor,
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum OzonPlacement {
@@ -80,6 +93,8 @@ pub enum OzonWriteErrorKind {
 
 #[derive(Debug, Error)]
 pub enum OzonWriteError {
+    #[error("Ozon Performance shared quota: {0}")]
+    SharedQuota(#[from] QuotaError),
     #[error("Ozon Performance write request имеет недопустимые данные")]
     InvalidRequest,
     #[error("Ozon Performance OAuth token response некорректен")]
@@ -113,6 +128,7 @@ impl OzonWriteError {
             }
             Self::Http { status } if status.is_server_error() => OzonWriteErrorKind::Ambiguous,
             Self::InvalidRequest
+            | Self::SharedQuota(_)
             | Self::InvalidToken
             | Self::TokenTransport
             | Self::TokenHttp { .. }
@@ -152,6 +168,7 @@ pub struct OzonAdsWriteClient {
     write_lock: Arc<Mutex<Instant>>,
     pacing: PerformanceRequestPacer,
     minimum_interval: Duration,
+    shared_quota: SharedQuota,
 }
 
 impl fmt::Debug for OzonAdsWriteClient {
@@ -258,6 +275,50 @@ impl OzonAdsWriteClient {
             write_lock: Arc::new(Mutex::new(Instant::now())),
             pacing,
             minimum_interval,
+            shared_quota: SharedQuota::from_env(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_shared_quota(mut self, quota: SharedQuota) -> Self {
+        self.shared_quota = quota;
+        self
+    }
+
+    async fn admit_shared_request(
+        &self,
+        bucket: &str,
+        interval: Duration,
+    ) -> Result<(), OzonWriteError> {
+        if self.shared_quota.is_enabled() {
+            self.shared_quota
+                .admit(
+                    &QuotaKey::ozon_performance(&self.credentials.client_id, bucket)?,
+                    interval,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn defer_shared_response(&self, bucket: &str, response: &Response) {
+        if !self.shared_quota.is_enabled() {
+            return;
+        }
+        let Some(delay) = shared_response_cooldown(
+            response.status(),
+            crate::ozon::retry_after_duration(response.headers()),
+        ) else {
+            return;
+        };
+        // A response proves this request was sent. Preserve its actual outcome
+        // instead of replacing it with an error representing a pre-send refusal.
+        let result = match QuotaKey::ozon_performance(&self.credentials.client_id, bucket) {
+            Ok(key) => self.shared_quota.defer(&key, delay).await,
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            tracing::warn!("Ozon Performance shared cooldown could not be persisted");
         }
     }
 
@@ -402,6 +463,10 @@ impl OzonAdsWriteClient {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| OzonWriteError::InvalidToken)?;
         authorization.set_sensitive(true);
+        self.shared_quota
+            .preflight()
+            .await
+            .map_err(OzonWriteError::from)?;
         let mut next_start = self.write_lock.lock().await;
         if *next_start > Instant::now() {
             tokio::time::sleep_until(*next_start).await;
@@ -412,6 +477,10 @@ impl OzonAdsWriteClient {
         // traffic. OAuth refreshes happen before this write-side boundary.
         let mut pacing = self.pacing.reserve_write().await;
         permit().await.map_err(OzonGuardedWriteError::Permit)?;
+        // The permit can perform readback using this same account quota. Claim
+        // the actual write departure only once that async preflight completes.
+        // A refusal sends nothing and never triggers a transport retry.
+        self.admit_shared_request("api", MIN_WRITE_INTERVAL).await?;
         *next_start = Instant::now() + self.minimum_interval;
         pacing.mark_request_started(self.minimum_interval);
         let response = self
@@ -423,6 +492,7 @@ impl OzonAdsWriteClient {
             .send()
             .await
             .map_err(|_| OzonWriteError::AmbiguousTransport)?;
+        self.defer_shared_response("api", &response).await;
         drop(pacing);
         decode_write_response(response).await.map_err(Into::into)
     }
@@ -438,6 +508,8 @@ impl OzonAdsWriteClient {
         {
             return Ok(cached.value.clone());
         }
+        self.admit_shared_request("oauth", TOKEN_QUOTA_INTERVAL)
+            .await?;
         let response = self
             .http
             .post(format!("{}{}", self.base_url, TOKEN_PATH))
@@ -449,6 +521,7 @@ impl OzonAdsWriteClient {
             .send()
             .await
             .map_err(|_| OzonWriteError::TokenTransport)?;
+        self.defer_shared_response("oauth", &response).await;
         let status = response.status();
         if !status.is_success() {
             return Err(OzonWriteError::TokenHttp { status });

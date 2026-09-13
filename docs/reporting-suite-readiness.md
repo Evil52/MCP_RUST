@@ -3,6 +3,8 @@
 ## What is implemented
 
 The existing `report-collector` is the only scheduled Ozon/WB collector.
+For cross-process API admission and deployment requirements, see
+[Shared marketplace quotas](marketplace-shared-quotas.md).
 `ofk_weekly_marketplace_ranking` reads published PostgreSQL sales snapshots and
 withholds ranking/leader/outsider unless all registry accounts have complete
 coverage for the same completed seven-day interval. For the current inventory
