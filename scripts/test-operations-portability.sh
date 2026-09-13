@@ -3,7 +3,8 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-test_root="$(mktemp -d)"
+# Command doubles must not confuse command names with temporary path fragments.
+test_root="$(mktemp -d "${TMPDIR:-/tmp}/ops-tar-pg_dump.XXXXXX")"
 cleanup() {
   rm -rf "$test_root"
 }
@@ -87,8 +88,8 @@ case "${1:-}" in
     case "$*" in
       *--detach*) printf 'test-lease-container\n' ;;
       *'cat /guard-state/state.json'*) printf '{"last_static_audit_event_id":1}\n' ;;
-      *pg_dump*) head -c 4096 /dev/zero ;;
-      *tar*) printf 'synthetic artifact archive' ;;
+      *'    pg_dump '*) head -c 4096 /dev/zero ;;
+      *'exec tar --create '*) printf 'synthetic artifact archive' ;;
       *) cat >"${TEST_OPS_SQL_CAPTURE:-/dev/null}"; printf 'cycle_age|0\n' ;;
     esac
     ;;
