@@ -6,8 +6,8 @@ use reqwest::Method;
 use serde_json::Value;
 
 impl WbClient {
-    /// Returns account funding sources without transferring money. `balance`
-    /// is WB's type=1 mutual-settlement source, not bonuses or an external card.
+    /// Returns funding sources without transferring money. `net` is WB's
+    /// type=1 mutual settlement; `balance` is the prepaid type=0 account.
     pub async fn promotion_balance(&self, account: &str) -> Result<Value, WbError> {
         self.request(account, Method::GET, PROMOTION_BALANCE_PATH, None, None)
             .await

@@ -26,6 +26,8 @@ mod authorization;
 #[path = "funding_readiness_tests.rs"]
 mod funding_readiness;
 
+#[path = "continuation_workflow_tests.rs"]
+mod continued_workflow;
 #[path = "recreate_workflow_tests.rs"]
 mod recreate_workflow;
 
@@ -177,7 +179,7 @@ fn preflight(fixture: &Fixture) -> Vec<(u16, Value)> {
         (200, json!({"data":{"items":NMS.iter().map(|nm| json!({"nmId":nm,"warehouseId":1,"quantity":25})).collect::<Vec<_>>()}})),
     ]);
     if fixture.manifest.scope == LaunchScope::FundAndStart {
-        responses.push((200, json!({"balance":1000})));
+        responses.push((200, json!({"balance":0,"net":1000})));
     }
     responses
 }
@@ -293,7 +295,7 @@ async fn funding_requires_exact_receipt_and_is_never_repeated() {
             (200, minimums()),
             (200, target(status, 922)),
             (200, json!({"total":0})),
-            (200, json!({"balance":1000})),
+            (200, json!({"balance":0,"net":1000})),
             (200, json!({"total":total})),
         ]);
         if total == 1000 {
@@ -406,10 +408,11 @@ async fn new_status_four_without_provenance_is_rejected_before_database_or_start
 async fn cli_write_dispatch_respects_existing_attempts_without_http() {
     let fixture = Fixture::new(LaunchScope::FundAndStart);
     let journal = fixture.journal();
+    journal.attempt("create", &json!({})).unwrap();
     journal
         .receipt("create", &json!({"campaign_id":ID}))
         .unwrap();
-    for stage in ["create", "bids", "fund", "start"] {
+    for stage in ["bids", "fund", "start"] {
         journal.attempt(stage, &json!({})).unwrap();
     }
     drop(journal);
