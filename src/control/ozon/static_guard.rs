@@ -152,7 +152,7 @@ pub fn parse_ozon_static_guard_config(
                 || entry.sku == 0
                 || !campaigns.insert(entry.campaign_id)
                 || !skus.insert(entry.sku)
-                || chrono::NaiveDate::parse_from_str(&entry.date_from, "%Y-%m-%d").is_err()
+                || !is_canonical_static_guard_date(&entry.date_from)
                 || evaluate_ozon_campaign_guard(
                     0,
                     0,
@@ -189,6 +189,14 @@ pub fn parse_ozon_static_guard_config(
         guards,
         dynamic_bid_control,
     })
+}
+
+/// The reviewed date is copied to wire requests and exact recovery bindings.
+/// Reject alternate spellings rather than silently changing that identity.
+pub(super) fn is_canonical_static_guard_date(date: &str) -> bool {
+    date.len() == 10
+        && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .is_ok_and(|parsed| parsed.to_string() == date)
 }
 
 /// Validates and returns the campaign guards, ignoring optional bid controls.
@@ -547,4 +555,5 @@ mod tests {
             );
         }
     }
+    mod date_contract_tests;
 }

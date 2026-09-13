@@ -163,100 +163,106 @@ async fn collect(
     config: &ReportCollectorConfig,
     writer: &Arc<PostgresSnapshotWriter>,
     claim: &SourceJobClaim,
-) -> Result<(CollectedFacts, Vec<CollectedAdvertisingExpenseFact>), SourceFailure> {
-    let checkpoints = writer.source_checkpoints(claim);
+) -> Result<SourceFacts, SourceFailure> {
     let from = business_date(claim.period_start);
     let to = business_date(claim.period_end - Duration::microseconds(1));
-    let facts = match claim.marketplace() {
-        Marketplace::Ozon if claim.source == SnapshotSource::Advertising => {
+    let facts = match (claim.marketplace(), claim.source) {
+        (Marketplace::Ozon, SnapshotSource::Advertising) => {
             let (client, store) = config
                 .source_performance(claim)
                 .map_err(|_| "credentials_unavailable")?;
             let source = OzonPerformanceReportSource::new(PerformanceClientReportTransport::new(
                 client, store,
             ))
-            .with_checkpoints(checkpoints);
+            .with_checkpoints(writer.source_checkpoints(claim));
             let facts = source
                 .collect_extended(from)
                 .await
-                .map_err(|e| e.failure())?;
+                .map_err(|error| error.failure())?;
             return Ok((
                 CollectedFacts::Advertising(facts.advertising),
                 facts.expenses,
             ));
         }
-        Marketplace::Ozon => {
-            let (client, store) = config
-                .source_seller(claim)
-                .map_err(|_| "credentials_unavailable")?;
-            let source = OzonReportSource::new(
-                OzonClientReportTransport::new(client, store).with_durable_retry(),
-            )
-            .with_checkpoints(checkpoints);
-            match claim.source {
-                SnapshotSource::Sales => CollectedFacts::Sales(
-                    source
-                        .collect_sales_pages(from, to)
-                        .await
-                        .map_err(|e| e.failure())?,
-                ),
-                SnapshotSource::Stocks => CollectedFacts::Stocks(
-                    source
-                        .collect_stock_pages()
-                        .await
-                        .map_err(|e| e.failure())?,
-                ),
-                SnapshotSource::Prices => CollectedFacts::Prices(
-                    source
-                        .collect_price_pages()
-                        .await
-                        .map_err(|e| e.failure())?,
-                ),
-                SnapshotSource::Finance => CollectedFacts::Finance(
-                    source
-                        .collect_finance_pages(from, to)
-                        .await
-                        .map_err(|e| e.failure())?,
-                ),
-                SnapshotSource::Advertising => return Err("source_invalid".into()),
-            }
-        }
-        Marketplace::Wildberries => {
-            let (client, account) = config
-                .resolve_wb_scheduled(claim.credential_claim())
-                .map_err(|_| "credentials_unavailable")?;
-            let source = WbReportSource::new(WbClientReportTransport::new(client, account))
-                .with_checkpoints(checkpoints);
-            match claim.source {
-                SnapshotSource::Sales => CollectedFacts::Sales(
-                    source
-                        .collect_sales_pages(from)
-                        .await
-                        .map_err(|e| e.failure())?,
-                ),
-                SnapshotSource::Stocks => CollectedFacts::Stocks(
-                    source
-                        .collect_stock_pages()
-                        .await
-                        .map_err(|e| e.failure())?,
-                ),
-                SnapshotSource::Prices => CollectedFacts::Prices(
-                    source
-                        .collect_price_pages()
-                        .await
-                        .map_err(|e| e.failure())?,
-                ),
-                SnapshotSource::Advertising => CollectedFacts::Advertising(
-                    source
-                        .collect_advertising(from)
-                        .await
-                        .map_err(|e| e.failure())?,
-                ),
-                SnapshotSource::Finance => return Err("source_invalid".into()),
-            }
-        }
+        (Marketplace::Ozon, SnapshotSource::Sales) => CollectedFacts::Sales(
+            seller_source(config, writer, claim)?
+                .collect_sales_pages(from, to)
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Ozon, SnapshotSource::Stocks) => CollectedFacts::Stocks(
+            seller_source(config, writer, claim)?
+                .collect_stock_pages()
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Ozon, SnapshotSource::Prices) => CollectedFacts::Prices(
+            seller_source(config, writer, claim)?
+                .collect_price_pages()
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Ozon, SnapshotSource::Finance) => CollectedFacts::Finance(
+            seller_source(config, writer, claim)?
+                .collect_finance_pages(from, to)
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Wildberries, SnapshotSource::Sales) => CollectedFacts::Sales(
+            wb_source(config, writer, claim)?
+                .collect_sales_pages(from)
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Wildberries, SnapshotSource::Stocks) => CollectedFacts::Stocks(
+            wb_source(config, writer, claim)?
+                .collect_stock_pages()
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Wildberries, SnapshotSource::Prices) => CollectedFacts::Prices(
+            wb_source(config, writer, claim)?
+                .collect_price_pages()
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Wildberries, SnapshotSource::Advertising) => CollectedFacts::Advertising(
+            wb_source(config, writer, claim)?
+                .collect_advertising(from)
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Wildberries, SnapshotSource::Finance) => return Err("source_invalid".into()),
     };
     Ok((facts, Vec::new()))
+}
+
+fn seller_source(
+    config: &ReportCollectorConfig,
+    writer: &Arc<PostgresSnapshotWriter>,
+    claim: &SourceJobClaim,
+) -> Result<OzonReportSource<OzonClientReportTransport>, SourceFailure> {
+    let (client, store) = config
+        .source_seller(claim)
+        .map_err(|_| "credentials_unavailable")?;
+    Ok(
+        OzonReportSource::new(OzonClientReportTransport::new(client, store).with_durable_retry())
+            .with_checkpoints(writer.source_checkpoints(claim)),
+    )
+}
+
+fn wb_source(
+    config: &ReportCollectorConfig,
+    writer: &Arc<PostgresSnapshotWriter>,
+    claim: &SourceJobClaim,
+) -> Result<WbReportSource, SourceFailure> {
+    let (client, account) = config
+        .resolve_wb_scheduled(claim.credential_claim())
+        .map_err(|_| "credentials_unavailable")?;
+    Ok(
+        WbReportSource::new(WbClientReportTransport::new(client, account))
+            .with_checkpoints(writer.source_checkpoints(claim)),
+    )
 }
 
 pub async fn require_enabled(

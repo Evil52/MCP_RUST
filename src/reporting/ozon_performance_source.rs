@@ -94,15 +94,7 @@ impl OzonPerformanceReportTransport for PerformanceClientReportTransport {
                     },
                 )
                 .await
-                .map_err(|error| match error {
-                    crate::ozon_performance::PerformanceError::RateLimited {
-                        retry_after: Some(delay),
-                        ..
-                    } => OzonPerformanceReportSourceError::RetryAfter {
-                        seconds: super::checkpoint::delay_seconds(delay),
-                    },
-                    _ => OzonPerformanceReportSourceError::Upstream(error.kind()),
-                })
+                .map_err(|error| performance_source_failure(&error))
         })
     }
 
@@ -124,15 +116,7 @@ impl OzonPerformanceReportTransport for PerformanceClientReportTransport {
                     },
                 )
                 .await
-                .map_err(|error| match error {
-                    crate::ozon_performance::PerformanceError::RateLimited {
-                        retry_after: Some(delay),
-                        ..
-                    } => OzonPerformanceReportSourceError::RetryAfter {
-                        seconds: super::checkpoint::delay_seconds(delay),
-                    },
-                    _ => OzonPerformanceReportSourceError::Upstream(error.kind()),
-                })
+                .map_err(|error| performance_source_failure(&error))
         })
     }
 
@@ -154,16 +138,22 @@ impl OzonPerformanceReportTransport for PerformanceClientReportTransport {
                     },
                 )
                 .await
-                .map_err(|error| match error {
-                    crate::ozon_performance::PerformanceError::RateLimited {
-                        retry_after: Some(delay),
-                        ..
-                    } => OzonPerformanceReportSourceError::RetryAfter {
-                        seconds: super::checkpoint::delay_seconds(delay),
-                    },
-                    _ => OzonPerformanceReportSourceError::Upstream(error.kind()),
-                })
+                .map_err(|error| performance_source_failure(&error))
         })
+    }
+}
+
+fn performance_source_failure(
+    error: &crate::ozon_performance::PerformanceError,
+) -> OzonPerformanceReportSourceError {
+    match error {
+        crate::ozon_performance::PerformanceError::RateLimited {
+            retry_after: Some(delay),
+            ..
+        } => OzonPerformanceReportSourceError::RetryAfter {
+            seconds: super::checkpoint::delay_seconds(*delay),
+        },
+        _ => OzonPerformanceReportSourceError::Upstream(error.kind()),
     }
 }
 
@@ -524,6 +514,7 @@ fn parse_positive_u64(value: &Value) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    mod retry_after;
     use std::{
         collections::{BTreeMap, VecDeque},
         sync::Mutex,

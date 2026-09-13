@@ -6,9 +6,9 @@ use mcp_ozon::reporting::{
     collector_plan::CollectionTarget,
     due_deliveries,
     mcp_read::{
-        DataState, ManagerActionKind, ReadyReportKind, ReadyReportState, ReportingReader,
-        SalesAnalyticsDirection, SalesAnalyticsGroup, SalesAnalyticsQuery, SalesAnalyticsSort,
-        SalesDateCoverageState,
+        DataState, ManagerActionKind, ReadyReportKind, ReadyReportState, ReportingReadError,
+        ReportingReader, SalesAnalyticsDirection, SalesAnalyticsGroup, SalesAnalyticsQuery,
+        SalesAnalyticsSort, SalesDateCoverageState,
     },
     outbox::{ArtifactIdentity, DeliveryErrorClass},
     postgres_collector::{
@@ -62,6 +62,7 @@ async fn weekly_ranking_reads_fourteen_published_accounts_and_withholds_seven_of
                 account,
                 from + Duration::days(day),
                 u64::try_from(index).unwrap(),
+                0,
             )
             .await;
         }
@@ -104,10 +105,11 @@ async fn publish_ranking_day(
     account: &AccountScope,
     day: NaiveDate,
     amount: u64,
+    revision: i64,
 ) {
     let start = day.and_hms_opt(0, 0, 0).unwrap().and_utc() - Duration::hours(5);
     let end = start + Duration::days(1);
-    let cutoff = end + Duration::hours(8);
+    let cutoff = end + Duration::hours(8) + Duration::minutes(revision);
     let source_as_of = cutoff - Duration::minutes(1);
     let mut sources = vec![
         SnapshotSource::Sales,
@@ -725,4 +727,115 @@ async fn configured_reader_startup_errors_are_sanitized() {
         wrong_role.to_string(),
         "reporting reader database configuration is invalid"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable PostgreSQL fixture"]
+async fn sales_queries_sort_page_and_reject_corrupt_or_excessive_snapshot_history() {
+    let _guard = DB_TEST_LOCK.lock().await;
+    let reader_url = std::env::var("POSITION_REPOSITORY_TEST_READER_URL").unwrap();
+    let collector_url = std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL").unwrap();
+    let admin_url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL").unwrap();
+    let reader = ReportingReader::connect_optional(Some(&reader_url))
+        .await
+        .unwrap();
+    let writer = PostgresSnapshotWriter::connect(&Config::from_str(&collector_url).unwrap())
+        .await
+        .unwrap();
+    let (mut admin, connection) = tokio_postgres::connect(&admin_url, NoTls).await.unwrap();
+    let driver = tokio::spawn(connection);
+    let account = AccountScope::new(
+        format!("sales_contract_{}", std::process::id()),
+        Marketplace::Ozon,
+    )
+    .unwrap();
+    let day = NaiveDate::from_ymd_opt(2076, 9, 1).unwrap();
+    publish_ranking_day(&writer, &account, day, 3, 0).await;
+    publish_ranking_day(&writer, &account, day.succ_opt().unwrap(), 9, 0).await;
+    let query = SalesAnalyticsQuery {
+        date_from: day,
+        date_to: day.succ_opt().unwrap(),
+        group_by: SalesAnalyticsGroup::Day,
+        sort_by: SalesAnalyticsSort::OrderedUnits,
+        direction: SalesAnalyticsDirection::Desc,
+        limit: 100,
+        offset: 0,
+    };
+    let sorted = reader.sales_analytics(&account, query).await.unwrap();
+    assert_eq!(
+        sorted
+            .rows
+            .iter()
+            .map(|row| row.ordered_units)
+            .collect::<Vec<_>>(),
+        vec![9, 3]
+    );
+    let end = reader
+        .sales_analytics(&account, SalesAnalyticsQuery { offset: 2, ..query })
+        .await
+        .unwrap();
+    assert_eq!(end.total_rows, 2);
+    assert!(end.rows.is_empty());
+    let snapshot: i64 = admin
+        .query_one(
+            "SELECT f.snapshot_id FROM daily_reporting.sales_facts f \
+         JOIN daily_reporting.source_snapshots s ON s.id=f.snapshot_id \
+         WHERE s.account_id=$1 AND f.business_date=$2",
+            &[&account.account_id(), &day],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    replace_sales_fact_date(&mut admin, snapshot, day + Duration::days(2)).await;
+    let corrupted = reader.sales_analytics(&account, query).await;
+    replace_sales_fact_date(&mut admin, snapshot, day).await;
+    assert_eq!(
+        corrupted.err(),
+        Some(ReportingReadError::InvalidPublishedData)
+    );
+    // Two days and 61 replacements are exactly the supported 63 candidates.
+    for revision in 1..=61 {
+        publish_ranking_day(&writer, &account, day, 3, revision).await;
+    }
+    assert_eq!(
+        reader.sales_analytics(&account, query).await.unwrap().state,
+        DataState::Complete
+    );
+    publish_ranking_day(&writer, &account, day, 3, 62).await;
+    assert_eq!(
+        reader.sales_analytics(&account, query).await.err(),
+        Some(ReportingReadError::InvalidPublishedData)
+    );
+    drop(admin);
+    driver.await.unwrap().unwrap();
+}
+
+async fn replace_sales_fact_date(
+    admin: &mut tokio_postgres::Client,
+    snapshot: i64,
+    date: NaiveDate,
+) {
+    // Simulate a damaged restored fact while retaining every SQL CHECK/FK.
+    let transaction = admin.transaction().await.unwrap();
+    transaction
+        .batch_execute(
+            "ALTER TABLE daily_reporting.sales_facts DISABLE TRIGGER sales_facts_append_only",
+        )
+        .await
+        .unwrap();
+    let updated = transaction
+        .execute(
+            "UPDATE daily_reporting.sales_facts SET business_date=$2 WHERE snapshot_id=$1",
+            &[&snapshot, &date],
+        )
+        .await
+        .unwrap();
+    transaction
+        .batch_execute(
+            "ALTER TABLE daily_reporting.sales_facts ENABLE TRIGGER sales_facts_append_only",
+        )
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(updated, 1);
 }

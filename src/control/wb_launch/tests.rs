@@ -59,6 +59,26 @@ fn launch_manifest_accepts_exact_scope() {
 }
 
 #[test]
+fn launch_manifest_validates_derived_robot_authorization_before_creation() {
+    let (mut manifest, policy) = fixture();
+    for reference in [
+        "user approved Nexus".to_owned(),
+        "разрешено".to_owned(),
+        "a".repeat(129),
+    ] {
+        manifest.authorization_reference = reference;
+        assert!(manifest.validate(&policy, Utc::now(), false).is_err());
+    }
+    for reference in ["a".repeat(128), "approval/2026-09-11.admin_1".to_owned()] {
+        manifest.authorization_reference = reference;
+        manifest.validate(&policy, Utc::now(), false).unwrap();
+        super::super::validate_wb_automation_policy(&manifest.target_policy(&policy, 42)).unwrap();
+    }
+    manifest.actor_id = "invalid actor".to_owned();
+    assert!(manifest.validate(&policy, Utc::now(), false).is_err());
+}
+
+#[test]
 fn launch_manifest_rejects_source_amount_and_campaign_expansion() {
     let (manifest, policy) = fixture();
     for amount in [0, 999, 1001, 10_000] {

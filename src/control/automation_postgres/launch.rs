@@ -8,7 +8,6 @@ impl WbAutomationCampaignLease<'_> {
     pub(in crate::control) async fn verify_launch_cycles(
         &self,
         digest: &str,
-        now: DateTime<Utc>,
     ) -> Result<bool, WbAutomationPostgresError> {
         let client = self
             .client
@@ -27,7 +26,9 @@ impl WbAutomationCampaignLease<'_> {
         }
         let latest: DateTime<Utc> = rows[0].get(1);
         let preceding: DateTime<Utc> = rows[1].get(1);
-        Ok(cycle_times_are_fresh(latest, preceding, now))
+        // Query time counts towards freshness; sampling before the await
+        // could accept evidence that expired while PostgreSQL was responding.
+        Ok(cycle_times_are_fresh(latest, preceding, Utc::now()))
     }
 }
 

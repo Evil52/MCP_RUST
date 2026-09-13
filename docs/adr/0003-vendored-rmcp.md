@@ -17,6 +17,7 @@ behavior to the SDK. The current local obligations are:
 | HTTP input errors | Sanitized malformed JSON/envelope 400; unsupported media type 415 before body read | `tests/http_router.rs` |
 | Structured result budget | Bounded serialization and bounded complete result, payload-free failures; retain both content representations | `tests/structured_result_limit.rs` |
 | Session cancellation | Root shutdown reaches pending and initialized session workers | `tests/http_router.rs` bounded-shutdown tests |
+| Tool schema cache | No negative cache; bounded positive entries, names and serialized schemas; uncached tools still validate headers | `tests/tool_schema_cache.rs` |
 | Packaging | Omit upstream Git-hook-mutating build script | Review vendored manifest and build-script diff on every import |
 
 The tests document required behavior, not a claim that every fork line has

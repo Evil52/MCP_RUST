@@ -1,7 +1,9 @@
 //! Every marketplace response below is a loopback mock; no production tokens
 //! or account state are loaded by these end-to-end operator-stage tests.
+#[path = "boundary_workflow_tests.rs"]
+mod boundaries;
 use super::*;
-use crate::test_support::mock_http;
+use crate::test_support::mock_http_with_hook;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::{
     fs,
@@ -14,6 +16,9 @@ const ID: u64 = 1_984_773_211;
 
 #[path = "start_workflow_tests.rs"]
 mod startup;
+
+#[path = "authorization_workflow_tests.rs"]
+mod authorization;
 
 struct Fixture {
     root: PathBuf,
@@ -83,11 +88,20 @@ impl Fixture {
     }
 
     fn operator(&self, responses: Vec<(u16, Value)>) -> (Operator, mpsc::Receiver<String>) {
-        let (url, requests) = mock_http(
+        self.operator_with_hook(responses, |_| {})
+    }
+
+    fn operator_with_hook(
+        &self,
+        responses: Vec<(u16, Value)>,
+        before_response: impl FnMut(usize) + Send + 'static,
+    ) -> (Operator, mpsc::Receiver<String>) {
+        let (url, requests) = mock_http_with_hook(
             responses
                 .into_iter()
                 .map(|(status, value)| (status, value.to_string()))
                 .collect(),
+            before_response,
         );
         let mut operator = Operator::load(&self.path, false).unwrap();
         operator.reader = WbClient::new_for_test(

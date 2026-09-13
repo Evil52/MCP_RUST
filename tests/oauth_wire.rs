@@ -1,9 +1,3 @@
-// The normal all-targets test suite always runs this end-to-end wire contract.
-// During cargo-llvm-cov the library is already fully instrumented by its unit-test
-// binary; compiling it again for this integration binary creates duplicate async
-// regions for the same source lines and distorts LLVM's line denominator.
-#![cfg(not(coverage))]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,

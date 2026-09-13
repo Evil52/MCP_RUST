@@ -1,3 +1,5 @@
+mod checkpoint;
+
 use std::{
     collections::BTreeMap,
     fmt,
@@ -472,9 +474,24 @@ enum AnalyticsPacingMode {
     Queue,
 }
 
-enum RequestAttempt {
-    Complete(Value),
-    Retry { delay: Duration, error: OzonError },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryOwner {
+    Client,
+    Checkpoint,
+}
+
+struct AttemptFailure {
+    error: OzonError,
+    retry_delay: Option<Duration>,
+}
+
+impl AttemptFailure {
+    const fn terminal(error: OzonError) -> Self {
+        Self {
+            error,
+            retry_delay: None,
+        }
+    }
 }
 
 struct AttemptInput<'a> {
@@ -485,6 +502,7 @@ struct AttemptInput<'a> {
     payload: &'a Value,
     attempt: usize,
     pacing_mode: AnalyticsPacingMode,
+    retry_owner: RetryOwner,
 }
 
 #[derive(Debug, Clone)]
@@ -623,45 +641,6 @@ impl OzonClient {
             .await
     }
 
-    /// One guarded read attempt for a durable external retry owner. Vendor
-    /// delays must reach PostgreSQL before the short page lease can expire.
-    pub(crate) async fn post_checkpoint_page(
-        &self,
-        store: &StoreId,
-        path: &'static str,
-        payload: Value,
-    ) -> Result<Value, OzonError> {
-        if !self.is_endpoint_allowed(path) {
-            return Err(OzonError::EndpointNotAllowed(path.to_owned()));
-        }
-        let credentials = self
-            .stores
-            .get(store)
-            .ok_or_else(|| OzonError::MissingCredentials(store.clone()))?;
-        let limiter = self
-            .rate_limiters
-            .get(store)
-            .expect("configured stores always have a rate limiter");
-        let outcome = tokio::time::timeout(
-            self.request_deadline,
-            self.send_attempt(AttemptInput {
-                limiter,
-                credentials,
-                store,
-                path,
-                payload: &payload,
-                attempt: MAX_ATTEMPTS,
-                pacing_mode: AnalyticsPacingMode::FailFast,
-            }),
-        )
-        .await
-        .map_err(|_| OzonError::DeadlineExceeded)??;
-        match outcome {
-            RequestAttempt::Complete(value) => Ok(value),
-            RequestAttempt::Retry { error, .. } => Err(error),
-        }
-    }
-
     /// Queues an Analytics page behind the per-account departure gate.
     ///
     /// This is reserved for bounded background/report pagination. Interactive
@@ -761,57 +740,49 @@ impl OzonClient {
                     payload: &payload,
                     attempt,
                     pacing_mode,
+                    retry_owner: RetryOwner::Client,
                 }),
             )
             .await;
 
-            let outcome = match outcome {
+            let failure = match outcome {
                 Err(_) => {
                     return Err(previous_retry_error
                         .take()
                         .unwrap_or(OzonError::DeadlineExceeded));
                 }
-                Ok(Err(OzonError::Overloaded)) => {
-                    // Once an upstream request has failed, a local race for the
-                    // retry permits must not replace its status/request-id with
-                    // an unrelated Overloaded error.
-                    return Err(previous_retry_error.take().unwrap_or(OzonError::Overloaded));
-                }
-                Ok(Err(error)) => {
-                    // If a body stream was interrupted and the recovery
-                    // attempt cannot even establish a new connection, retain
-                    // the original marketplace request-id. It is the useful
-                    // diagnostic for the response that was actually started.
-                    if is_retriable_transport(error.kind())
-                        && let Some(previous) = previous_retry_error.take()
-                    {
-                        return Err(previous);
-                    }
-                    return Err(error);
-                }
-                Ok(Ok(outcome)) => outcome,
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(failure)) => failure,
             };
-            match outcome {
-                RequestAttempt::Complete(value) => return Ok(value),
-                RequestAttempt::Retry { delay, error } => {
-                    // Prefer the newest upstream diagnostic, but do not erase
-                    // a known request-id merely because a later recovery
-                    // attempt failed before receiving response headers.
-                    if previous_retry_error.is_none() || error.request_id().is_some() {
-                        previous_retry_error = Some(error);
-                    }
-                    if timeout_at(deadline, sleep(delay)).await.is_err() {
-                        return Err(previous_retry_error
-                            .take()
-                            .expect("a retry wait always has a preceding upstream error"));
-                    }
-                    attempt += 1;
+            let AttemptFailure { error, retry_delay } = failure;
+            let Some(delay) = retry_delay else {
+                // Preserve the upstream diagnostic if a subsequent admission
+                // or connection failure prevents its recovery attempt.
+                if error.kind() == OzonErrorKind::Overloaded {
+                    return Err(previous_retry_error.take().unwrap_or(error));
                 }
+                if is_retriable_transport(error.kind())
+                    && let Some(previous) = previous_retry_error.take()
+                {
+                    return Err(previous);
+                }
+                return Err(error);
+            };
+            // Prefer the newest upstream diagnostic, but do not erase a known
+            // request-id when a later attempt fails before response headers.
+            if previous_retry_error.is_none() || error.request_id().is_some() {
+                previous_retry_error = Some(error);
             }
+            if timeout_at(deadline, sleep(delay)).await.is_err() {
+                return Err(previous_retry_error
+                    .take()
+                    .expect("a retry wait always has a preceding upstream error"));
+            }
+            attempt += 1;
         }
     }
 
-    async fn send_attempt(&self, input: AttemptInput<'_>) -> Result<RequestAttempt, OzonError> {
+    async fn send_attempt(&self, input: AttemptInput<'_>) -> Result<Value, AttemptFailure> {
         let AttemptInput {
             limiter,
             credentials,
@@ -820,11 +791,14 @@ impl OzonClient {
             payload,
             attempt,
             pacing_mode,
+            retry_owner,
         } = input;
+        let can_retry = retry_owner == RetryOwner::Client && RETRY_POLICY.allows_attempt(attempt);
         let queue_analytics = pacing_mode == AnalyticsPacingMode::Queue || attempt > 1;
         let _permits = self
             .acquire_request_permits(limiter, path, queue_analytics)
-            .await?;
+            .await
+            .map_err(AttemptFailure::terminal)?;
         let request_trace = RequestTrace {
             store,
             endpoint: path,
@@ -845,16 +819,12 @@ impl OzonClient {
             Err(source) => {
                 let error = classify_transport_error(source, None);
                 let kind = error.kind();
-                let will_retry =
-                    is_retriable_transport(kind) && RETRY_POLICY.allows_attempt(attempt);
+                let will_retry = is_retriable_transport(kind) && can_retry;
                 trace_transport_failure(&request_trace, kind, will_retry);
-                if will_retry {
-                    return Ok(RequestAttempt::Retry {
-                        delay: retry_delay(attempt, None),
-                        error,
-                    });
-                }
-                return Err(error);
+                return Err(AttemptFailure {
+                    error,
+                    retry_delay: will_retry.then(|| retry_delay(attempt, None)),
+                });
             }
         };
         let status = response.status();
@@ -872,9 +842,12 @@ impl OzonClient {
                 None
             };
         let enforced_retry_after = local_cooldown.or(vendor_retry_after);
-        let planned_retry =
+        let planned_retry = if can_retry {
             analytics_queued_retry_plan(path, status, pacing_mode, attempt, enforced_retry_after)
-                .or_else(|| retry_plan(path, status, attempt, retry_after));
+                .or_else(|| retry_plan(path, status, attempt, retry_after))
+        } else {
+            None
+        };
 
         if path != ANALYTICS_DATA_PATH
             && let Some(delay) = shared_retry_cooldown(status, retry_after)
@@ -895,7 +868,10 @@ impl OzonClient {
                 local_cooldown,
                 diagnostic,
             );
-            return Ok(RequestAttempt::Retry { delay, error });
+            return Err(AttemptFailure {
+                error,
+                retry_delay: Some(delay),
+            });
         }
 
         let result = decode_response(
@@ -918,9 +894,9 @@ impl OzonClient {
         // all Ozon routes exposed by this client are read-only, so replaying
         // that interrupted attempt is safe and prevents partial analytics from
         // surfacing to browser clients.
-        let will_retry = result.as_ref().is_err_and(|error| {
-            is_retriable_transport(error.kind()) && RETRY_POLICY.allows_attempt(attempt)
-        });
+        let will_retry = result
+            .as_ref()
+            .is_err_and(|error| is_retriable_transport(error.kind()) && can_retry);
         trace_response(
             &request_trace,
             status,
@@ -928,13 +904,10 @@ impl OzonClient {
             will_retry,
             kind,
         );
-        match result {
-            Err(error) if will_retry => Ok(RequestAttempt::Retry {
-                delay: retry_delay(attempt, None),
-                error,
-            }),
-            result => result.map(RequestAttempt::Complete),
-        }
+        result.map_err(|error| AttemptFailure {
+            error,
+            retry_delay: will_retry.then(|| retry_delay(attempt, None)),
+        })
     }
 
     async fn acquire_request_permits<'a>(

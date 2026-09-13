@@ -25,7 +25,7 @@ pub use model::{
 mod sales;
 use sales::{
     aggregate_sales_rows, select_sales_snapshots, validate_sales_fact_rows,
-    validate_selected_sales_fact_count,
+    validate_selected_sales_fact_count, validate_weekly_ranking_result,
 };
 mod facts;
 use facts::{
@@ -404,70 +404,6 @@ impl ReportingReader {
         validate_limit(limit, MAX_READY_REPORTS)?;
         self.repository.ready_reports(limit).await
     }
-}
-
-fn validate_weekly_ranking_result(
-    account: &AccountScope,
-    date_from: NaiveDate,
-    date_to: NaiveDate,
-    result: &SalesAnalyticsResult,
-) -> Result<(), ReportingReadError> {
-    let expected_marketplace: ReportingMarketplace = account.marketplace().into();
-    if result.account_id != account.account_id()
-        || result.marketplace != expected_marketplace
-        || result.date_from != date_from.to_string()
-        || result.date_to != date_to.to_string()
-        || result.source != "published_postgresql_snapshots"
-        || result.group_by != SalesAnalyticsGroup::Day
-        || result.sort_by != SalesAnalyticsSort::Dimension
-        || result.direction != SalesAnalyticsDirection::Asc
-        || i64::from(result.limit) != WEEKLY_RANKING_DAYS
-        || result.offset != 0
-        || usize::try_from(result.total_rows).ok() != Some(result.rows.len())
-    {
-        return Err(ReportingReadError::InvalidPublishedData);
-    }
-
-    let mut expected_dates = BTreeSet::new();
-    for offset in 0..WEEKLY_RANKING_DAYS {
-        let date = date_from
-            .checked_add_days(chrono::Days::new(
-                u64::try_from(offset).map_err(|_| ReportingReadError::InvalidPublishedData)?,
-            ))
-            .ok_or(ReportingReadError::InvalidPublishedData)?;
-        expected_dates.insert(date.to_string());
-    }
-    if expected_dates.last().map(String::as_str) != Some(date_to.to_string().as_str()) {
-        return Err(ReportingReadError::InvalidPublishedData);
-    }
-
-    let coverage_dates = result
-        .coverage
-        .iter()
-        .map(|coverage| coverage.business_date.clone())
-        .collect::<BTreeSet<_>>();
-    if coverage_dates != expected_dates || coverage_dates.len() != result.coverage.len() {
-        return Err(ReportingReadError::InvalidPublishedData);
-    }
-
-    let mut row_dates = BTreeSet::new();
-    for row in &result.rows {
-        let Some(business_date) = &row.business_date else {
-            return Err(ReportingReadError::InvalidPublishedData);
-        };
-        if row.sku.is_some()
-            || row.currency != "RUB"
-            || !expected_dates.contains(business_date)
-            || !row_dates.insert(business_date.clone())
-            || !result
-                .coverage
-                .iter()
-                .any(|date| date.business_date == *business_date && date.served)
-        {
-            return Err(ReportingReadError::InvalidPublishedData);
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -1687,6 +1623,71 @@ mod tests {
     #[derive(Debug)]
     struct FakeReportingRepository;
 
+    fn ranked_sales_fixture(
+        account: &AccountScope,
+        query: SalesAnalyticsQuery,
+    ) -> SalesAnalyticsResult {
+        let multiplier = if account.account_id() == "rank_high" {
+            10
+        } else {
+            1
+        };
+        let unavailable = account.account_id().starts_with("rank_unavailable_");
+        let incomplete = account.account_id() == "rank_missing" || unavailable;
+        let mut coverage = Vec::new();
+        let mut rows = Vec::new();
+        for date in query
+            .date_from
+            .iter_days()
+            .take_while(|date| *date <= query.date_to)
+        {
+            let missing = unavailable || (incomplete && date == query.date_to);
+            coverage.push(SalesDateCoverage {
+                business_date: date.to_string(),
+                state: if missing {
+                    SalesDateCoverageState::Unavailable
+                } else {
+                    SalesDateCoverageState::Complete
+                },
+                served: !missing,
+                cutoff_at: (!missing).then(|| "2026-08-31T03:00:00Z".to_owned()),
+                source_as_of: (!missing).then(|| "2026-08-31T02:59:00Z".to_owned()),
+                period_end: (!missing).then(|| "2026-08-31T19:00:00Z".to_owned()),
+            });
+            if !missing {
+                rows.push(SalesAnalyticsRow {
+                    business_date: Some(date.to_string()),
+                    sku: None,
+                    ordered_units: multiplier,
+                    operational_gmv_minor: multiplier * 1_000,
+                    currency: "RUB".to_owned(),
+                });
+            }
+        }
+        SalesAnalyticsResult {
+            account_id: account.account_id().to_owned(),
+            marketplace: account.marketplace().into(),
+            date_from: query.date_from.to_string(),
+            date_to: query.date_to.to_string(),
+            state: if unavailable {
+                DataState::Unavailable
+            } else if incomplete {
+                DataState::Partial
+            } else {
+                DataState::Complete
+            },
+            source: "published_postgresql_snapshots".to_owned(),
+            group_by: query.group_by,
+            sort_by: query.sort_by,
+            direction: query.direction,
+            limit: query.limit,
+            offset: query.offset,
+            total_rows: rows.len() as u64,
+            rows,
+            coverage,
+        }
+    }
+
     impl ReportingReadRepository for FakeReportingRepository {
         fn enabled(&self) -> bool {
             true
@@ -1740,66 +1741,7 @@ mod tests {
         ) -> ReportingReadFuture<'a, SalesAnalyticsResult> {
             Box::pin(async move {
                 if account.account_id().starts_with("rank_") {
-                    let unavailable = account.account_id().starts_with("rank_unavailable_");
-                    let incomplete = account.account_id() == "rank_missing" || unavailable;
-                    let mut coverage = Vec::new();
-                    let mut rows = Vec::new();
-                    let mut date = query.date_from;
-                    loop {
-                        let missing = unavailable || (incomplete && date == query.date_to);
-                        coverage.push(SalesDateCoverage {
-                            business_date: date.to_string(),
-                            state: if missing {
-                                SalesDateCoverageState::Unavailable
-                            } else {
-                                SalesDateCoverageState::Complete
-                            },
-                            served: !missing,
-                            cutoff_at: (!missing).then(|| "2026-08-31T03:00:00Z".to_owned()),
-                            source_as_of: (!missing).then(|| "2026-08-31T02:59:00Z".to_owned()),
-                            period_end: (!missing).then(|| "2026-08-31T19:00:00Z".to_owned()),
-                        });
-                        if !missing {
-                            let multiplier = if account.account_id() == "rank_high" {
-                                10
-                            } else {
-                                1
-                            };
-                            rows.push(SalesAnalyticsRow {
-                                business_date: Some(date.to_string()),
-                                sku: None,
-                                ordered_units: multiplier,
-                                operational_gmv_minor: multiplier * 1_000,
-                                currency: "RUB".to_owned(),
-                            });
-                        }
-                        if date == query.date_to {
-                            break;
-                        }
-                        date = date.succ_opt().unwrap();
-                    }
-                    return Ok(SalesAnalyticsResult {
-                        account_id: account.account_id().to_owned(),
-                        marketplace: account.marketplace().into(),
-                        date_from: query.date_from.to_string(),
-                        date_to: query.date_to.to_string(),
-                        state: if unavailable {
-                            DataState::Unavailable
-                        } else if incomplete {
-                            DataState::Partial
-                        } else {
-                            DataState::Complete
-                        },
-                        source: "published_postgresql_snapshots".to_owned(),
-                        group_by: query.group_by,
-                        sort_by: query.sort_by,
-                        direction: query.direction,
-                        limit: query.limit,
-                        offset: query.offset,
-                        total_rows: rows.len() as u64,
-                        rows,
-                        coverage,
-                    });
+                    return Ok(ranked_sales_fixture(account, query));
                 }
                 Ok(SalesAnalyticsResult {
                     account_id: account.account_id().to_owned(),
@@ -2023,7 +1965,7 @@ mod tests {
             .sales_analytics(&account, query)
             .await
             .unwrap();
-        for mutation in 0..8 {
+        for mutation in 0..9 {
             let mut invalid = valid.clone();
             match mutation {
                 0 => invalid.account_id = "other".to_owned(),
@@ -2033,6 +1975,7 @@ mod tests {
                 4 => invalid.coverage[0] = invalid.coverage[1].clone(),
                 5 => invalid.rows[0].currency = "USD".to_owned(),
                 6 => invalid.coverage[0].served = false,
+                7 => invalid.rows[0].business_date = None,
                 _ => invalid.limit = 6,
             }
             assert_eq!(
@@ -2040,6 +1983,28 @@ mod tests {
                 Err(ReportingReadError::InvalidPublishedData)
             );
         }
+        let wrong_end = to.succ_opt().unwrap();
+        let mut wrong_period = valid;
+        wrong_period.date_to = wrong_end.to_string();
+        assert_eq!(
+            validate_weekly_ranking_result(&account, from, wrong_end, &wrong_period),
+            Err(ReportingReadError::InvalidPublishedData)
+        );
+        assert_eq!(
+            FakeReportingRepository
+                .source_snapshot(
+                    &account,
+                    SourceSnapshotQuery {
+                        source: SnapshotSource::Stocks,
+                        snapshot_id: None,
+                        limit: 1,
+                        offset: 0
+                    }
+                )
+                .await
+                .err(),
+            Some(ReportingReadError::Disabled)
+        );
     }
 
     #[tokio::test]

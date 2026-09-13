@@ -426,6 +426,7 @@ fn parse_outcome(value: &str) -> Result<ToolCallLogOutcome, ToolTelemetryError> 
 
 #[cfg(test)]
 mod tests {
+    mod contract;
     use super::*;
 
     #[tokio::test]
@@ -474,6 +475,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the disposable PostgreSQL fixture"]
     async fn postgres_mode_records_every_terminal_outcome_and_rejects_bad_inputs() {
         assert!(
             ToolTelemetryService::connect_optional(Some("not a database URL"))
@@ -494,9 +496,8 @@ mod tests {
             .await
             .is_err()
         );
-        let Ok(database_url) = std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL") else {
-            return;
-        };
+        let database_url = std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL")
+            .expect("run through scripts/with-position-test-db.sh with --include-ignored");
         let contractless_database_url = database_url.replacen("/ozon_positions", "/template1", 1);
         assert_eq!(
             ToolTelemetryService::connect_optional(Some(&contractless_database_url))

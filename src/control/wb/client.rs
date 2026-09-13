@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, fmt, future::Future, sync::Arc, time::Duration}
 
 use anyhow::{Context, Result, bail};
 use reqwest::{
-    Client, Proxy, StatusCode,
+    Client, ClientBuilder, Proxy, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
     redirect::Policy,
 };
@@ -97,6 +97,18 @@ async fn wait_until_write_slot(next_start: Instant) {
     }
 }
 
+pub(super) fn write_http_builder(timeout_duration: Duration) -> ClientBuilder {
+    Client::builder()
+        .redirect(Policy::none())
+        .no_proxy()
+        // Even protocol-safe HTTP/2 NACK retries would make one journaled
+        // permit emit multiple network attempts. Reconciliation and a new
+        // explicit authorization must remain the caller's responsibility.
+        .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(5).min(timeout_duration))
+        .timeout(timeout_duration)
+}
+
 #[derive(Clone)]
 pub struct WbBidWriteClient {
     http: Client,
@@ -130,12 +142,8 @@ impl WbBidWriteClient {
             bail!("CONTROL_MCP_WB_TIMEOUT_SECONDS должен задавать 1..=30 секунд");
         }
         let proxy = Proxy::https(proxy_url).context("неверный CONTROL_MCP_WB_PROXY")?;
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
+        let http = write_http_builder(timeout_duration)
             .https_only(true)
-            .connect_timeout(Duration::from_secs(5).min(timeout_duration))
-            .timeout(timeout_duration)
             .proxy(proxy)
             .build()
             .context("не удалось создать изолированный WB write HTTP client")?;
@@ -150,10 +158,7 @@ impl WbBidWriteClient {
 
     #[cfg(test)]
     pub(crate) fn new_for_test(base_url: &str, token: &str, timeout_duration: Duration) -> Self {
-        let http = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .timeout(timeout_duration)
+        let http = write_http_builder(timeout_duration)
             .build()
             .expect("test HTTP client");
         Self::from_parts(http, base_url, token, timeout_duration, Duration::ZERO)

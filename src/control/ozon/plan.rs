@@ -512,4 +512,33 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn persisted_single_sku_manifest_accepts_only_signed_or_plan_correlated_titles() {
+        let mut spec = spec();
+        spec.skus.truncate(1);
+        spec.weekly_budget_microrubles = spec.per_sku_spend_cap_microrubles;
+        let mut manifest = prepare_campaign_launch_manifest(
+            "manager",
+            1,
+            9,
+            &"a".repeat(64),
+            &spec.account_id,
+            &spec.skus,
+            spec.weekly_budget_microrubles,
+            spec.per_sku_spend_cap_microrubles,
+            spec.initial_cpc_bid_microrubles,
+            spec.max_cpc_bid_microrubles,
+            spec.target_drr_percent,
+            spec.target_position,
+            spec.clone(),
+        )
+        .unwrap();
+        let plan_id = "b".repeat(64);
+        assert!(manifest.has_exact_persisted_integrity(&plan_id));
+        manifest.create_request.title = provider_title_for_plan_id(&plan_id);
+        assert!(manifest.has_exact_persisted_integrity(&plan_id));
+        manifest.create_request.title = "unrelated campaign".to_owned();
+        assert!(!manifest.has_exact_persisted_integrity(&plan_id));
+    }
 }

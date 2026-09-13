@@ -16,10 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::{Marketplace, RegistrySource},
-    reporting::{
-        postgres_collector::CollectedAdvertisingFact,
-        wb_adapter::{parse_promotion_stats, parse_stock_page},
-    },
+    reporting::{postgres_collector::CollectedAdvertisingFact, wb_adapter::parse_promotion_stats},
     wb::{WbClient, WbCredentials},
 };
 
@@ -193,25 +190,7 @@ impl WbAutomationObserver {
             .context("WB automation campaign stats недоступны")?;
         let advertising = parse_promotion_stats(&stats_response)
             .map_err(|_| anyhow::anyhow!("WB automation campaign stats имеют неверную форму"))?;
-        let stocks = self
-            .client
-            .warehouse_stocks(
-                &self.policy.account_id,
-                serde_json::json!({
-                    "nmIds": self.policy.nm_ids,
-                    "chrtIds": [],
-                    "limit": 100,
-                    "offset": 0
-                }),
-            )
-            .await
-            .context("WB automation stock snapshot недоступен")?;
-        let (stocks, source_stock_rows) = parse_stock_page(&stocks)
-            .map_err(|_| anyhow::anyhow!("WB automation stock snapshot имеет неверную форму"))?;
-        ensure!(
-            source_stock_rows <= 100,
-            "WB automation stock response неожиданно требует pagination"
-        );
+        let stocks = stocks::collect(&self.client, &self.policy).await?;
         let observation = build_observation(
             &self.policy,
             observed_at,
@@ -237,6 +216,7 @@ impl WbAutomationObserver {
 }
 
 mod campaign;
+mod stocks;
 pub(super) use campaign::{CampaignObservation, parse_campaign};
 
 fn parse_budget_minor(response: &Value) -> Result<u64> {
@@ -560,6 +540,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod stock_pagination;
+
     use std::{
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
@@ -570,6 +552,7 @@ mod tests {
 
     use super::*;
     use crate::control::automation::{WbAutomationAction, WbAutomationHoldReason};
+    use crate::reporting::wb_adapter::parse_stock_page;
     use crate::test_support::mock_http;
 
     const TEST_SELLER_SID: &str = "123e4567-e89b-42d3-a456-426614174000";

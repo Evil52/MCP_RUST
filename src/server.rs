@@ -887,6 +887,15 @@ impl OzonMcp {
         }
     }
 
+    fn validate_read_endpoint(&self, endpoint: &str) -> Result<(), String> {
+        if !self.client.is_endpoint_allowed(endpoint) {
+            return Err(format!(
+                "{READ_ONLY_ENDPOINT_DENIED}: endpoint={endpoint} отсутствует в явном read-only allowlist"
+            ));
+        }
+        Ok(())
+    }
+
     async fn request(
         &self,
         identity: &RequestIdentity,
@@ -894,11 +903,7 @@ impl OzonMcp {
         endpoint: &'static str,
         payload: Value,
     ) -> Result<Json<OzonResult>, String> {
-        if !self.client.is_endpoint_allowed(endpoint) {
-            return Err(format!(
-                "{READ_ONLY_ENDPOINT_DENIED}: endpoint={endpoint} отсутствует в явном read-only allowlist"
-            ));
-        }
+        self.validate_read_endpoint(endpoint)?;
         if let Some(store) = store.as_ref() {
             validate_non_blank("store", &store.0)?;
             validate_max_chars("store", &store.0, MAX_STORE_SELECTOR_CHARS)?;
@@ -1059,11 +1064,7 @@ impl OzonMcp {
         }
         let (registry, actor) = self.access_context(identity)?;
         for endpoint in [FBO_POSTINGS_PATH, FBS_POSTINGS_PATH] {
-            if !self.client.is_endpoint_allowed(endpoint) {
-                return Err(format!(
-                    "{READ_ONLY_ENDPOINT_DENIED}: endpoint={endpoint} отсутствует в явном read-only allowlist"
-                ));
-            }
+            self.validate_read_endpoint(endpoint)?;
             Self::authorize_endpoint_for_role(actor.role, endpoint)?;
         }
         Self::resolve_store_for_actor(&registry, &actor, store)
@@ -1360,11 +1361,6 @@ impl ServerHandler for OzonMcp {
         // queued model calls must not grow memory without bound or reserve an
         // outbound marketplace slot long after the user has moved on.
         let dispatch = async move {
-            if context.extensions.get::<RequestRegistry>().is_none() {
-                context
-                    .extensions
-                    .insert(RequestRegistry::load(&self.registry).await);
-            }
             self.tool_router
                 .call(ToolCallContext::new(self, request, context))
                 .await

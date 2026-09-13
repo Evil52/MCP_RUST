@@ -154,4 +154,6 @@ impl WbWriteError {
 }
 
 #[cfg(test)]
+mod retry_tests;
+#[cfg(test)]
 mod tests;

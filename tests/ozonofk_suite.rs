@@ -1,6 +1,10 @@
 //! Package integrity checks, not a substitute for model behavioral evaluation.
 
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 
@@ -42,24 +46,26 @@ fn package_is_skills_only_with_two_real_workflows_and_resolvable_references() {
             if kind.is_dir() {
                 directories.push(path);
             } else if path.extension().is_some_and(|ext| ext == "md") {
-                let body = fs::read_to_string(&path).unwrap();
-                for suffix in body.split("](").skip(1) {
-                    let target = suffix.split(')').next().unwrap();
-                    if target.starts_with("https://") || target.starts_with('#') {
-                        continue;
-                    }
-                    let referenced = path
-                        .parent()
-                        .unwrap()
-                        .join(target)
-                        .canonicalize()
-                        .unwrap_or_else(|_| {
-                            panic!("missing reference {target} in {}", path.display())
-                        });
-                    assert!(referenced.starts_with(&root), "reference escapes package");
-                }
+                assert_markdown_references(&root, &path);
             }
         }
+    }
+}
+
+fn assert_markdown_references(root: &Path, path: &Path) {
+    let body = fs::read_to_string(path).unwrap();
+    for suffix in body.split("](").skip(1) {
+        let target = suffix.split(')').next().unwrap();
+        if target.starts_with("https://") || target.starts_with('#') {
+            continue;
+        }
+        let referenced = path
+            .parent()
+            .unwrap()
+            .join(target)
+            .canonicalize()
+            .unwrap_or_else(|_| panic!("missing reference {target} in {}", path.display()));
+        assert!(referenced.starts_with(root), "reference escapes package");
     }
 }
 

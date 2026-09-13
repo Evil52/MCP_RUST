@@ -4,7 +4,10 @@ use chrono::{FixedOffset, TimeZone, Utc};
 use mcp_ozon::reporting::{
     business_date,
     collector_plan::CollectionTarget,
-    postgres_collector::{CollectedFacts, CollectedSnapshot, PostgresSnapshotWriter},
+    postgres_collector::{
+        CollectedFacts, CollectedSnapshot, CollectionClaim, PostgresCollectorError,
+        PostgresSnapshotWriter,
+    },
     refresh_queue::{RefreshRequestService, SalesRefreshState},
     snapshot::{Marketplace, SnapshotSource, SnapshotStatus},
 };
@@ -242,7 +245,16 @@ async fn fourteen_parallel_manager_requests_create_one_refresh_job() {
         .await
         .expect("normalized Ozon staging checkpoint must commit");
 
+    assert_eq!(
+        writer
+            .persist_refresh_claimed_batch(&collection_claim, &second_claim, &snapshots)
+            .await,
+        Err(PostgresCollectorError::InvalidInput),
+        "a different account's refresh claim cannot publish this batch"
+    );
+
     let admin = connect_admin().await;
+    verify_staging_integrity(&admin, &writer, &collection_claim, &atomic_account).await;
     admin
         .execute(
             "UPDATE daily_reporting.ozon_sales_refresh_requests \
@@ -400,6 +412,63 @@ async fn fourteen_parallel_manager_requests_create_one_refresh_job() {
         .expect("requester must observe WB atomic completion");
     assert_eq!(wb_succeeded.marketplace, Marketplace::Wildberries);
     assert_eq!(wb_succeeded.state, SalesRefreshState::Succeeded);
+}
+
+async fn verify_staging_integrity(
+    admin: &Client,
+    writer: &PostgresSnapshotWriter,
+    claim: &CollectionClaim,
+    account: &str,
+) {
+    let original = admin
+        .query_one(
+            "SELECT s.claim_id, s.payload_json, s.payload_sha256 \
+             FROM daily_reporting.collection_staging_snapshots s \
+             JOIN daily_reporting.collection_claims c ON c.id = s.claim_id \
+             WHERE c.account_id = $1 AND c.status = 'active' AND s.source = 'prices'",
+            &[&account],
+        )
+        .await
+        .expect("staged prices must exist before corruption");
+    let claim_id: i64 = original.get(0);
+    let payload: String = original.get(1);
+    let digest: String = original.get(2);
+    let sales = admin
+        .query_one(
+            "SELECT payload_json, payload_sha256 \
+             FROM daily_reporting.collection_staging_snapshots \
+             WHERE claim_id = $1 AND source = 'sales'",
+            &[&claim_id],
+        )
+        .await
+        .expect("staged sales must exist before source substitution");
+    let sales_payload: String = sales.get(0);
+    let sales_digest: String = sales.get(1);
+    for (corrupted_payload, corrupted_digest) in [
+        (payload.clone(), "0".repeat(64)),
+        (sales_payload, sales_digest),
+    ] {
+        admin
+            .execute(
+                "UPDATE daily_reporting.collection_staging_snapshots \
+                 SET payload_json = $2, payload_sha256 = $3 \
+                 WHERE claim_id = $1 AND source = 'prices'",
+                &[&claim_id, &corrupted_payload, &corrupted_digest],
+            )
+            .await
+            .expect("test administrator must install a damaged checkpoint");
+        let failure = writer.load_staged_batch(claim).await.err();
+        admin
+            .execute(
+                "UPDATE daily_reporting.collection_staging_snapshots \
+                 SET payload_json = $2, payload_sha256 = $3 \
+                 WHERE claim_id = $1 AND source = 'prices'",
+                &[&claim_id, &payload, &digest],
+            )
+            .await
+            .expect("test administrator must restore the original checkpoint");
+        assert_eq!(failure, Some(PostgresCollectorError::InvalidInput));
+    }
 }
 
 async fn connect_admin() -> Client {

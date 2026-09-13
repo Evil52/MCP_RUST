@@ -756,3 +756,29 @@ fn wb_policy_upper_boundaries_are_inclusive_and_overflow_is_rejected() {
         assert!(parse(&invalid_limit).is_err(), "limit {field} must fail");
     }
 }
+
+#[test]
+fn ozon_launch_requires_performance_binding_and_actor_base_access() {
+    let mut policy = valid_ozon_launch_policy();
+    policy["actors"][0]["targets"] = serde_json::json!([]);
+    let mut no_performance = registry();
+    no_performance.accounts[0]
+        .ozon
+        .as_mut()
+        .unwrap()
+        .performance = None;
+    assert!(
+        parse_with_registry(&policy, &no_performance)
+            .unwrap_err()
+            .to_string()
+            .contains("требует Ozon Performance binding")
+    );
+    let mut no_access = registry();
+    no_access.accounts[0].manager_id = "another_manager".to_owned();
+    assert!(
+        parse_with_registry(&policy, &no_access)
+            .unwrap_err()
+            .to_string()
+            .contains("не имеет базового доступа")
+    );
+}

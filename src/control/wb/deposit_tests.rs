@@ -1,3 +1,5 @@
+#[path = "deposit_failure_tests.rs"]
+mod failures;
 use super::*;
 
 #[tokio::test]

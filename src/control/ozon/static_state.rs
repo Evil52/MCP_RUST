@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::static_guard::MAX_OZON_STATIC_GUARDS;
+use super::static_guard::{MAX_OZON_STATIC_GUARDS, is_canonical_static_guard_date};
 
 /// Maximum serialized state accepted from disk.
 pub const MAX_OZON_STATIC_GUARD_STATE_BYTES: u64 = 256 * 1024;
@@ -348,8 +348,7 @@ fn validate_state(state: &OzonStaticGuardState) -> Result<(), OzonStaticGuardSta
                 ) => {
                     valid_complete_binding(
                         account_id, sku, min_bid, max_bid, date_from, spend_cap, target_drr,
-                    ) && (min_bid..=max_bid).contains(&pending.from_microrubles)
-                        && (min_bid..=max_bid).contains(&pending.to_microrubles)
+                    ) && valid_static_bid_transition(pending)
                 }
                 _ => false,
             };
@@ -371,6 +370,28 @@ fn validate_state(state: &OzonStaticGuardState) -> Result<(), OzonStaticGuardSta
         return Err(OzonStaticGuardStateError::InvalidState);
     }
     Ok(())
+}
+
+/// Normal adjustments stay inside the reviewed corridor. An observed bid
+/// outside it can be repaired only to the nearest boundary; the observation
+/// itself is evidence, while the target remains the authorized write value.
+pub(super) fn valid_static_bid_transition(pending: &OzonStaticPendingBidChange) -> bool {
+    let (Some(min_bid), Some(max_bid)) = (
+        pending.min_cpc_bid_microrubles,
+        pending.max_cpc_bid_microrubles,
+    ) else {
+        return false;
+    };
+    let from = pending.from_microrubles;
+    let to = pending.to_microrubles;
+    min_bid != 0
+        && min_bid <= max_bid
+        && from != 0
+        && from != to
+        && from.is_multiple_of(1_000_000)
+        && to.is_multiple_of(1_000_000)
+        && (min_bid..=max_bid).contains(&to)
+        && ((min_bid..=max_bid).contains(&from) || to == from.clamp(min_bid, max_bid))
 }
 
 fn normalize_legacy_incidents(state: &mut OzonStaticGuardState) {
@@ -475,7 +496,7 @@ fn valid_complete_binding(
         && min_bid <= max_bid
         && min_bid.is_multiple_of(1_000_000)
         && max_bid.is_multiple_of(1_000_000)
-        && chrono::NaiveDate::parse_from_str(date_from, "%Y-%m-%d").is_ok()
+        && is_canonical_static_guard_date(date_from)
         && spend_cap != 0
         && spend_cap.is_multiple_of(10_000)
         && (10..=100).contains(&target_drr)
@@ -951,4 +972,7 @@ mod tests {
             Err(OzonStaticGuardStateError::UnsafeFile)
         ));
     }
+
+    mod date_contract_tests;
+    mod io_tests;
 }

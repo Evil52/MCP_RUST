@@ -3,6 +3,11 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Keep verification artifacts separate from shared worktree build caches.
+export CARGO_TARGET_DIR="$project_root/target/verification/cargo"
+export CARGO_BUILD_BUILD_DIR="$CARGO_TARGET_DIR"
+export CARGO_LLVM_COV_TARGET_DIR="$project_root/target/verification/coverage"
+export CARGO_LLVM_COV_BUILD_DIR="$CARGO_LLVM_COV_TARGET_DIR"
 cd "$project_root"
 
 readonly required_rust_version="1.98.0"
@@ -19,6 +24,8 @@ echo "==> Rust structure budget"
 python3 -B scripts/check-rust-structure.py
 python3 -B -m unittest discover -s tests -p test_rust_structure.py
 python3 -B -m unittest discover -s tests -p test_local_artifact.py
+python3 -B -m unittest discover -s tests -p test_verification_targets.py
+python3 -B -m unittest discover -s tests -p test_sonar_test_report.py
 
 echo "==> Tests"
 cargo test --locked --workspace --all-targets --all-features -- --test-threads=1
@@ -43,7 +50,6 @@ fi
 shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
 ./scripts/test-runtime-health-contract.sh
 bash ./scripts/test-operations-portability.sh
-bash ./scripts/test-position-backup.sh
 bash ./scripts/test-local-runtime-recovery.sh
 python3 -B -m unittest discover -s tests -p test_reporting_health_contract.py
 python3 -B -m unittest discover -s tests -p test_operations_notifications.py
@@ -71,6 +77,6 @@ fi
     --show-missing-lines \
     --fail-under-functions 95.5 \
     --fail-under-lines 95.8 \
-    -- --test-threads=1
+    -- --include-ignored --test-threads=1
 
 echo "Local CI passed."

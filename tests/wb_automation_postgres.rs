@@ -755,8 +755,6 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     reason = "leases are consumed by explicit async release, which is the behavior under test"
 )]
 async fn automation_state_is_isolated_locked_and_idempotent() {
-    #[cfg(coverage)]
-    mcp_ozon::control::exercise_coverage_only_database_mappings();
     let Ok(database_url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
         return;
     };

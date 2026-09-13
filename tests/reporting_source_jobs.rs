@@ -1,14 +1,14 @@
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use mcp_ozon::reporting::{
     business_date,
     checkpoint::{CheckpointError, checkpointed},
     collector_plan::CollectionTarget,
-    mcp_read::{DataState, ReportingReader, SourceSnapshotQuery},
+    mcp_read::{DataState, ReportingReadError, ReportingReader, SourceSnapshotQuery},
     postgres_collector::{
-        CollectedFacts, CollectedPriceFact, CollectedSalesFact, CollectedStockFact,
-        PostgresCollectorError, PostgresSnapshotWriter, SourceJobClaim,
+        CollectedFacts, CollectedPriceFact, CollectedSalesFact, CollectedSnapshot,
+        CollectedStockFact, PostgresCollectorError, PostgresSnapshotWriter, SourceJobClaim,
     },
-    snapshot::{AccountScope, Marketplace, SnapshotSource},
+    snapshot::{AccountScope, Marketplace, SnapshotSource, SnapshotStatus},
 };
 use serde_json::json;
 use std::{str::FromStr, sync::Arc};
@@ -38,6 +38,125 @@ const fn query(source: SnapshotSource) -> SourceSnapshotQuery {
         snapshot_id: None,
         limit: 1,
         offset: 0,
+    }
+}
+
+fn collection_window(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) {
+    // The delayed cutoff can still belong to the previous local date after
+    // midnight. Select a complete day relative to that cutoff, not wall time.
+    let cutoff = now - Duration::minutes(10);
+    let start = business_date(cutoff)
+        .pred_opt()
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        - Duration::hours(5);
+    (cutoff, start, start + Duration::days(1))
+}
+
+async fn verify_source_snapshot_integrity(
+    admin: &Client,
+    reader: &ReportingReader,
+    account: &AccountScope,
+    snapshot_id: i64,
+) {
+    let original = admin
+        .query_one(
+            "SELECT j.id, j.first_observed_at, s.row_count \
+             FROM daily_reporting.source_snapshots s \
+             JOIN daily_reporting.source_collection_jobs j ON j.id = s.source_job_id \
+             WHERE s.id = $1",
+            &[&snapshot_id],
+        )
+        .await
+        .unwrap();
+    let job: i64 = original.get(0);
+    let first: DateTime<Utc> = original.get(1);
+    let count: i32 = original.get(2);
+    let query = SourceSnapshotQuery {
+        snapshot_id: Some(snapshot_id),
+        limit: 100,
+        ..query(SnapshotSource::Prices)
+    };
+    for (observed_from, expected_state) in [
+        (Utc::now() - Duration::hours(2), Some("stale")),
+        (Utc::now() + Duration::minutes(6), None),
+    ] {
+        admin.execute(
+            "UPDATE daily_reporting.source_collection_jobs SET first_observed_at=$2 WHERE id=$1",
+            &[&job, &observed_from],
+        ).await.unwrap();
+        let result = reader.source_snapshot(account, query).await;
+        admin.execute(
+            "UPDATE daily_reporting.source_collection_jobs SET first_observed_at=$2 WHERE id=$1",
+            &[&job, &first],
+        ).await.unwrap();
+        if let Some(state) = expected_state {
+            let data = result.unwrap();
+            assert_eq!(data.state, state);
+            assert_eq!(data.rows.len(), 2, "stale must preserve historical data");
+        } else {
+            assert_eq!(result.err(), Some(ReportingReadError::InvalidPublishedData));
+        }
+    }
+    replace_snapshot_count(admin, snapshot_id, count + 1).await;
+    let result = reader.source_snapshot(account, query).await;
+    replace_snapshot_count(admin, snapshot_id, count).await;
+    assert_eq!(result.err(), Some(ReportingReadError::InvalidPublishedData));
+    let restored = reader.source_snapshot(account, query).await.unwrap();
+    assert_eq!(restored.state, "available");
+    assert_eq!(restored.rows.len(), 2);
+}
+
+async fn replace_snapshot_count(admin: &Client, snapshot: i64, count: i32) {
+    // The disposable administrator deliberately simulates a damaged restored
+    // snapshot; the collector role cannot bypass the append-only trigger.
+    admin
+        .batch_execute("SET session_replication_role = replica")
+        .await
+        .unwrap();
+    let updated = admin
+        .execute(
+            "UPDATE daily_reporting.source_snapshots SET row_count = $2 WHERE id = $1",
+            &[&snapshot, &count],
+        )
+        .await;
+    admin
+        .batch_execute("SET session_replication_role = origin")
+        .await
+        .unwrap();
+    assert_eq!(updated.unwrap(), 1);
+}
+
+#[test]
+fn delayed_cutoff_keeps_published_period_complete_across_business_midnight() {
+    for (current, expected_end) in [
+        ("2026-09-11T18:59:59Z", "2026-09-10T19:00:00Z"),
+        ("2026-09-11T19:00:00Z", "2026-09-10T19:00:00Z"),
+        ("2026-09-11T19:09:59Z", "2026-09-10T19:00:00Z"),
+        ("2026-09-11T19:10:00Z", "2026-09-11T19:00:00Z"),
+    ] {
+        let now: DateTime<Utc> = current.parse().unwrap();
+        let (cutoff, start, end) = collection_window(now);
+        assert_eq!(end, expected_end.parse::<DateTime<Utc>>().unwrap());
+        assert!(end <= cutoff);
+        assert_eq!(end - start, Duration::days(1));
+        // Exercise the actual publication contract that rejected the old
+        // fixture when period_end was later than the delayed cutoff.
+        CollectedSnapshot::new(
+            "midnight_contract".to_owned(),
+            Marketplace::Wildberries,
+            cutoff,
+            now,
+            start,
+            end,
+            SnapshotStatus::Succeeded,
+            true,
+            "test".to_owned(),
+            CollectedFacts::Sales(vec![]),
+        )
+        .unwrap();
     }
 }
 
@@ -79,30 +198,13 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
     // Match PostgreSQL timestamp precision on hosts whose clock exposes
     // nanoseconds; the requested cutoff must equal its persisted identity.
     let now = chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
-    let start = business_date(now)
-        .pred_opt()
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
-        - Duration::hours(5);
-    let cutoff = now - Duration::minutes(10);
+    let (cutoff, start, end) = collection_window(now);
     writer
-        .enqueue_source_jobs(
-            std::slice::from_ref(&target),
-            cutoff,
-            start,
-            start + Duration::days(1),
-        )
+        .enqueue_source_jobs(std::slice::from_ref(&target), cutoff, start, end)
         .await
         .unwrap();
     writer
-        .enqueue_source_jobs(
-            std::slice::from_ref(&target),
-            cutoff,
-            start,
-            start + Duration::days(1),
-        )
+        .enqueue_source_jobs(std::slice::from_ref(&target), cutoff, start, end)
         .await
         .unwrap();
     assert_eq!(
@@ -193,6 +295,7 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
     assert_eq!(prices.total_rows, 2);
     assert_eq!(prices.next_offset, Some(1));
     assert!(prices.source_as_of.is_some() && prices.observed_from.is_some());
+    verify_source_snapshot_integrity(&admin, &reader, &scope, snapshot).await;
     let next = reader
         .source_snapshot(
             &scope,
@@ -332,12 +435,7 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
         ..target.clone()
     };
     restarted
-        .enqueue_source_jobs(
-            std::slice::from_ref(&expiry_target),
-            cutoff,
-            start,
-            start + Duration::days(1),
-        )
+        .enqueue_source_jobs(std::slice::from_ref(&expiry_target), cutoff, start, end)
         .await
         .unwrap();
     select_source(&admin, &expiry_account, "stocks").await;
