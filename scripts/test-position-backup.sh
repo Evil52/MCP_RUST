@@ -56,6 +56,12 @@ CREATE SCHEMA control;
 CREATE SCHEMA wb_automation;
 CREATE TABLE daily_reporting.delivery_batches (artifact_object_key text);
 INSERT INTO daily_reporting.delivery_batches VALUES ('fixture-report.html');
+-- Preserve the cost-import ACL in the dump: restoring it requires this role
+-- even while the production importer remains disabled.
+CREATE ROLE report_cost_importer NOLOGIN;
+CREATE TABLE daily_reporting.cost_import_batches (export_id text);
+GRANT USAGE ON SCHEMA daily_reporting TO report_cost_importer;
+GRANT INSERT ON daily_reporting.cost_import_batches TO report_cost_importer;
 CREATE TABLE control.ozon_static_guard_audit_events (event_id bigint PRIMARY KEY, account_id text);
 INSERT INTO control.ozon_static_guard_audit_events VALUES (7, 'test_ozon');
 SQL
