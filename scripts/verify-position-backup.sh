@@ -300,7 +300,7 @@ DECLARE
 BEGIN
     FOREACH role_name IN ARRAY ARRAY[
         'position_collector', 'position_reader', 'report_worker',
-        'report_collector', 'report_refresh_requester', 'control_writer',
+        'report_collector', 'report_refresh_requester', 'report_cost_importer', 'control_writer',
         'ozon_control_planner','ozon_control_executor','wb_automation_writer'
     ] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
