@@ -61,6 +61,8 @@ services:
     environment:
       POSITION_COLLECTOR_MODE: disabled
       POSITION_COLLECTOR_DATABASE_URL: postgresql://position_collector:${POSITION_COLLECTOR_DB_PASSWORD:?POSITION_COLLECTOR_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      MCP_MARKETPLACE_QUOTA_REQUIRED: "true"
+      MCP_MARKETPLACE_QUOTA_DATABASE_URL: postgresql://position_collector:${POSITION_COLLECTOR_DB_PASSWORD:?POSITION_COLLECTOR_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
       RUST_LOG: mcp_ozon::position_collector=info
     depends_on:
       position-db:
@@ -150,6 +152,8 @@ services:
     environment:
       REPORT_COLLECTOR_MODE: disabled
       REPORT_COLLECTOR_DATABASE_URL: postgresql://report_collector:${REPORT_COLLECTOR_DB_PASSWORD:?REPORT_COLLECTOR_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+      MCP_MARKETPLACE_QUOTA_REQUIRED: "true"
+      MCP_MARKETPLACE_QUOTA_DATABASE_URL: postgresql://report_collector:${REPORT_COLLECTOR_DB_PASSWORD:?REPORT_COLLECTOR_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
       MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
       DAILY_REPORT_POLICY: /etc/mcp-ozon/daily-report-policy.json
       RUST_LOG: mcp_ozon::reporting=info

@@ -1,5 +1,9 @@
 use std::{collections::BTreeSet, fmt, future::Future, sync::Arc, time::Duration};
 
+use crate::{
+    marketplace_quota::{QuotaError, QuotaKey, SharedQuota},
+    wb::quota::vendor_quota_cooldown,
+};
 use anyhow::{Context, Result, bail};
 use reqwest::{
     Client, ClientBuilder, Proxy, StatusCode,
@@ -118,6 +122,7 @@ pub struct WbBidWriteClient {
     pacer: Arc<WritePacer>,
     create_pacer: Arc<WritePacer>,
     deposit_pacer: Arc<WritePacer>,
+    shared_quota: SharedQuota,
 }
 
 impl fmt::Debug for WbBidWriteClient {
@@ -200,7 +205,76 @@ impl WbBidWriteClient {
             } else {
                 Duration::from_secs(1)
             })),
+            shared_quota: SharedQuota::from_env(),
         })
+    }
+
+    #[must_use]
+    pub fn with_shared_quota(mut self, shared_quota: SharedQuota) -> Self {
+        self.shared_quota = shared_quota;
+        self
+    }
+
+    fn shared_quota_key(&self, path: &'static str) -> Result<Option<QuotaKey>, QuotaError> {
+        if !self.shared_quota.is_enabled() {
+            return Ok(None);
+        }
+        let token = self
+            .authorization
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or(QuotaError::InvalidIdentity)?;
+        let bucket = match path {
+            CHANGE_BIDS_PATH => "promotion_bids_write",
+            START_CAMPAIGN_PATH => "promotion_start",
+            PAUSE_CAMPAIGN_PATH => "promotion_pause",
+            CREATE_CAMPAIGN_PATH => "promotion_create",
+            DEPOSIT_BUDGET_PATH => "promotion_deposit",
+            _ => return Err(QuotaError::InvalidIdentity),
+        };
+        QuotaKey::wb(token, bucket).map(Some)
+    }
+
+    async fn preflight_shared_quota(&self, path: &'static str) -> Result<(), WbWriteError> {
+        self.shared_quota_key(path)
+            .map_err(WbWriteError::SharedQuota)?;
+        self.shared_quota
+            .preflight()
+            .await
+            .map_err(WbWriteError::SharedQuota)
+    }
+
+    async fn admit_shared_quota(&self, path: &'static str) -> Result<(), WbWriteError> {
+        let Some(key) = self
+            .shared_quota_key(path)
+            .map_err(WbWriteError::SharedQuota)?
+        else {
+            return Ok(());
+        };
+        let interval = match path {
+            CREATE_CAMPAIGN_PATH => MIN_CREATE_INTERVAL,
+            DEPOSIT_BUDGET_PATH => Duration::from_secs(1),
+            _ => MIN_WRITE_INTERVAL,
+        };
+        self.shared_quota
+            .admit(&key, interval)
+            .await
+            .map_err(WbWriteError::SharedQuota)
+    }
+
+    async fn publish_shared_cooldown(&self, path: &'static str, response: &reqwest::Response) {
+        let Some(delay) = vendor_quota_cooldown(response.headers(), response.status()) else {
+            return;
+        };
+        let Ok(Some(key)) = self.shared_quota_key(path) else {
+            return;
+        };
+        if self.shared_quota.defer(&key, delay).await.is_err() {
+            // The write has already departed. Preserve its original outcome;
+            // a failed cooldown write must never become permission to retry it.
+            tracing::warn!("WB write shared quota cooldown persistence failed");
+        }
     }
 
     /// Performs exactly one PATCH attempt. Retrying is intentionally the caller's
@@ -234,7 +308,12 @@ impl WbBidWriteClient {
         validate_write_request(advert_id, changes).map_err(WbGuardedWriteError::Write)?;
         self.pacer
             .run_guarded(
-                || async { permit().await.map_err(WbGuardedWriteError::Permit) },
+                || async {
+                    self.preflight_shared_quota(CHANGE_BIDS_PATH)
+                        .await
+                        .map_err(WbGuardedWriteError::Write)?;
+                    permit().await.map_err(WbGuardedWriteError::Permit)
+                },
                 || async {
                     self.change_bids_once(advert_id, changes)
                         .await
@@ -285,7 +364,12 @@ impl WbBidWriteClient {
         validate_advert_id(advert_id).map_err(WbGuardedWriteError::Write)?;
         self.deposit_pacer
             .run_guarded(
-                || async { permit().await.map_err(WbGuardedWriteError::Permit) },
+                || async {
+                    self.preflight_shared_quota(DEPOSIT_BUDGET_PATH)
+                        .await
+                        .map_err(WbGuardedWriteError::Write)?;
+                    permit().await.map_err(WbGuardedWriteError::Permit)
+                },
                 || async {
                     self.deposit_once(advert_id)
                         .await
@@ -296,6 +380,7 @@ impl WbBidWriteClient {
     }
 
     async fn deposit_once(&self, advert_id: u64) -> Result<u64, WbWriteError> {
+        self.admit_shared_quota(DEPOSIT_BUDGET_PATH).await?;
         let send = self
             .http
             .post(format!("{}{}", self.base_url, DEPOSIT_BUDGET_PATH))
@@ -313,6 +398,8 @@ impl WbBidWriteClient {
                 reason: "network_error",
                 request_id: None,
             })?;
+        self.publish_shared_cooldown(DEPOSIT_BUDGET_PATH, &response)
+            .await;
         let status = response.status();
         let request_id = response_request_id(&response);
         let bytes = read_bounded(response, MAX_ERROR_RESPONSE_BYTES)
@@ -347,7 +434,12 @@ impl WbBidWriteClient {
         validate_create_campaign_request(request).map_err(WbGuardedWriteError::Write)?;
         self.create_pacer
             .run_guarded(
-                || async { permit().await.map_err(WbGuardedWriteError::Permit) },
+                || async {
+                    self.preflight_shared_quota(CREATE_CAMPAIGN_PATH)
+                        .await
+                        .map_err(WbGuardedWriteError::Write)?;
+                    permit().await.map_err(WbGuardedWriteError::Permit)
+                },
                 || async {
                     self.create_campaign_once(request)
                         .await
@@ -370,7 +462,12 @@ impl WbBidWriteClient {
         validate_advert_id(advert_id).map_err(WbGuardedWriteError::Write)?;
         self.pacer
             .run_guarded(
-                || async { permit().await.map_err(WbGuardedWriteError::Permit) },
+                || async {
+                    self.preflight_shared_quota(path)
+                        .await
+                        .map_err(WbGuardedWriteError::Write)?;
+                    permit().await.map_err(WbGuardedWriteError::Permit)
+                },
                 || async {
                     self.change_campaign_status_once(advert_id, path)
                         .await
@@ -395,6 +492,7 @@ impl WbBidWriteClient {
                 })).collect::<Vec<_>>()
             }]
         });
+        self.admit_shared_quota(CHANGE_BIDS_PATH).await?;
         let send = self
             .http
             .patch(format!("{}{}", self.base_url, CHANGE_BIDS_PATH))
@@ -411,6 +509,8 @@ impl WbBidWriteClient {
                 reason: "network_error",
                 request_id: None,
             })?;
+        self.publish_shared_cooldown(CHANGE_BIDS_PATH, &response)
+            .await;
         let status = response.status();
         let request_id = response_request_id(&response);
         let limit = if status.is_success() {
@@ -457,6 +557,7 @@ impl WbBidWriteClient {
                     .collect(),
             );
         }
+        self.admit_shared_quota(CREATE_CAMPAIGN_PATH).await?;
         let send = self
             .http
             .post(format!("{}{}", self.base_url, CREATE_CAMPAIGN_PATH))
@@ -473,6 +574,8 @@ impl WbBidWriteClient {
                 reason: "network_error",
                 request_id: None,
             })?;
+        self.publish_shared_cooldown(CREATE_CAMPAIGN_PATH, &response)
+            .await;
         let status = response.status();
         let request_id = response_request_id(&response);
         let limit = if status.is_success() {
@@ -507,6 +610,7 @@ impl WbBidWriteClient {
         advert_id: u64,
         path: &'static str,
     ) -> Result<Value, WbWriteError> {
+        self.admit_shared_quota(path).await?;
         let send = self
             .http
             .get(format!("{}{}", self.base_url, path))
@@ -523,6 +627,7 @@ impl WbBidWriteClient {
                 reason: "network_error",
                 request_id: None,
             })?;
+        self.publish_shared_cooldown(path, &response).await;
         let status = response.status();
         let request_id = response_request_id(&response);
         let limit = if status.is_success() {

@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod control;
 pub mod http;
+pub mod marketplace_quota;
 pub mod ozon;
 pub mod ozon_performance;
 pub mod ozon_posting_sales;

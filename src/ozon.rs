@@ -1,4 +1,5 @@
 mod checkpoint;
+mod quota;
 
 use std::{
     collections::BTreeMap,
@@ -20,7 +21,10 @@ use tokio::{
     time::{Instant as TokioInstant, sleep, timeout_at},
 };
 
-use crate::retry::RetryPolicy;
+use crate::{
+    marketplace_quota::{QuotaError, SharedQuota},
+    retry::RetryPolicy,
+};
 use mcp_marketplace_types::{StoreCredentials, StoreId};
 
 const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1_048_576;
@@ -30,6 +34,7 @@ const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_IN_FLIGHT_REQUESTS_PER_CLIENT: usize = 16;
 const MAX_GLOBAL_IN_FLIGHT_REQUESTS: usize = 32;
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(20);
+const SHARED_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 // Ozon documents one Analytics request per minute. A five-second guard keeps
 // rolling-window and clock-boundary implementations from seeing two departures
 // inside the same vendor minute.
@@ -182,6 +187,8 @@ pub enum OzonError {
     },
     #[error("локальный cooldown Ozon API ещё активен (local-cooldown: {retry_after:?})")]
     LocalRateLimited { retry_after: Duration },
+    #[error("Ozon shared quota: {0}")]
+    SharedQuota(#[from] QuotaError),
     #[error("временная ошибка Ozon API (HTTP {status}, request-id: {request_id:?})")]
     Server {
         status: StatusCode,
@@ -245,12 +252,14 @@ impl OzonError {
             Self::Unauthorized { .. } => OzonErrorKind::Unauthorized,
             Self::Forbidden { .. } => OzonErrorKind::Forbidden,
             Self::NotFound { .. } => OzonErrorKind::NotFound,
-            Self::RateLimited { .. } | Self::LocalRateLimited { .. } => OzonErrorKind::RateLimited,
+            Self::RateLimited { .. }
+            | Self::LocalRateLimited { .. }
+            | Self::SharedQuota(QuotaError::Limited { .. }) => OzonErrorKind::RateLimited,
             Self::Server { .. } => OzonErrorKind::Server,
             Self::Api { .. } => OzonErrorKind::Http,
             Self::Timeout { .. } | Self::DeadlineExceeded => OzonErrorKind::Timeout,
             Self::Network { .. } => OzonErrorKind::Network,
-            Self::Overloaded => OzonErrorKind::Overloaded,
+            Self::Overloaded | Self::SharedQuota(_) => OzonErrorKind::Overloaded,
             Self::InvalidJson { .. } => OzonErrorKind::InvalidJson,
             Self::ResponseTooLarge { .. } => OzonErrorKind::ResponseTooLarge,
         }
@@ -263,6 +272,7 @@ impl OzonError {
             | Self::MissingCredentials(_)
             | Self::DeadlineExceeded
             | Self::Overloaded
+            | Self::SharedQuota(_)
             | Self::LocalRateLimited { .. } => None,
             Self::Unauthorized { request_id }
             | Self::Forbidden { request_id }
@@ -514,6 +524,7 @@ pub struct OzonClient {
     rate_limiters: Arc<BTreeMap<StoreId, Arc<RateLimiter>>>,
     global_in_flight: Arc<Semaphore>,
     analytics_cache: Arc<AnalyticsCache>,
+    shared_quota: SharedQuota,
 }
 
 impl OzonClient {
@@ -570,6 +581,7 @@ impl OzonClient {
             .timeout(timeout)
             .connect_timeout(timeout.min(MAX_CONNECT_TIMEOUT))
             .redirect(Policy::none())
+            .retry(reqwest::retry::never())
             // Marketplace credentials must never be forwarded through an
             // ambient HTTP(S)_PROXY inherited from the host/container.
             .no_proxy()
@@ -611,6 +623,7 @@ impl OzonClient {
             rate_limiters: Arc::new(rate_limiters),
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT_REQUESTS)),
             analytics_cache: Arc::new(AnalyticsCache::default()),
+            shared_quota: SharedQuota::from_env(),
         })
     }
 
@@ -805,6 +818,9 @@ impl OzonClient {
             started_at: Instant::now(),
             attempt,
         };
+        self.admit_shared_request(&credentials.client_id, path)
+            .await
+            .map_err(AttemptFailure::terminal)?;
         let response = self
             .http
             .post(format!("{}{path}", self.base_url))
@@ -841,7 +857,12 @@ impl OzonClient {
             } else {
                 None
             };
-        let enforced_retry_after = local_cooldown.or(vendor_retry_after);
+        let enforced_retry_after = local_cooldown.max(vendor_retry_after);
+        if let Some(delay) = quota::response_cooldown(status, vendor_retry_after, local_cooldown) {
+            self.defer_shared_request(&credentials.client_id, path, delay)
+                .await
+                .map_err(AttemptFailure::terminal)?;
+        }
         let planned_retry = if can_retry {
             analytics_queued_retry_plan(path, status, pacing_mode, attempt, enforced_retry_after)
                 .or_else(|| retry_plan(path, status, attempt, retry_after))
@@ -1308,6 +1329,7 @@ pub(crate) fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+    mod quota;
     use std::fmt::Write as _;
     use std::{
         future::Future,
@@ -3130,48 +3152,6 @@ mod tests {
         assert_eq!(error.kind(), OzonErrorKind::Server);
         assert_eq!(error.request_id(), Some("causal-request-id"));
         assert!(requests.try_recv().is_err());
-    }
-
-    #[test]
-    fn stores_with_the_same_client_id_share_one_rate_limiter() {
-        let stores = BTreeMap::from([
-            (
-                StoreId::from("first"),
-                StoreCredentials {
-                    client_id: "shared-client".to_owned(),
-                    api_key: "first-key".to_owned(),
-                },
-            ),
-            (
-                StoreId::from("second"),
-                StoreCredentials {
-                    client_id: "shared-client".to_owned(),
-                    api_key: "second-key".to_owned(),
-                },
-            ),
-            (
-                StoreId::from("third"),
-                StoreCredentials {
-                    client_id: "other-client".to_owned(),
-                    api_key: "third-key".to_owned(),
-                },
-            ),
-        ]);
-        let client = OzonClient::new(
-            "http://127.0.0.1:1".to_owned(),
-            Duration::from_secs(1),
-            stores,
-        )
-        .unwrap();
-
-        assert!(Arc::ptr_eq(
-            &client.rate_limiters[&StoreId::from("first")],
-            &client.rate_limiters[&StoreId::from("second")],
-        ));
-        assert!(!Arc::ptr_eq(
-            &client.rate_limiters[&StoreId::from("first")],
-            &client.rate_limiters[&StoreId::from("third")],
-        ));
     }
 
     #[tokio::test]
