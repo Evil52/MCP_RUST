@@ -1,3 +1,8 @@
+mod policy;
+pub use policy::{
+    ANALYTICS_DATA_PATH, PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST, READ_ONLY_ENDPOINT_ALLOWLIST,
+    is_read_only_endpoint_allowed,
+};
 mod checkpoint;
 mod quota;
 
@@ -63,65 +68,6 @@ const MAX_REQUEST_ID_BYTES: usize = 128;
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Every Ozon Seller API path this process is allowed to reach.
-///
-/// This is the single source of truth for the read-only guarantee: it is
-/// enforced by [`OzonClient::post`] itself, at the only place where an HTTP
-/// request can leave the process, so no caller — present or future — can reach
-/// a mutating Ozon endpoint even if a higher layer forgets to check.
-pub const ANALYTICS_DATA_PATH: &str = "/v1/analytics/data";
-
-pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
-    ANALYTICS_DATA_PATH,
-    "/v1/analytics/turnover/stocks",
-    "/v1/finance/accrual/by-day",
-    "/v1/finance/accrual/postings",
-    "/v1/finance/accrual/types",
-    "/v1/finance/cash-flow-statement/list",
-    "/v1/finance/mutual-settlement",
-    "/v1/finance/realization/by-day",
-    "/v1/posting/fbo/cancel-reason/list",
-    "/v1/product/info/stocks-by-warehouse/fbo",
-    "/v1/product/info/warehouse/stocks",
-    "/v1/question/list",
-    "/v1/rating/history",
-    "/v1/rating/summary",
-    "/v1/returns/list",
-    "/v2/posting/fbo/get",
-    "/v2/posting/fbs/cancel-reason/list",
-    "/v2/product/info/stocks-by-warehouse/fbs",
-    "/v2/product/pictures/info",
-    "/v2/returns/rfbs/list",
-    "/v2/review/list",
-    "/v2/warehouse/list",
-    "/v3/finance/transaction/list",
-    "/v3/finance/transaction/totals",
-    "/v3/posting/fbo/list",
-    "/v3/posting/fbs/get",
-    "/v3/product/info/list",
-    "/v3/product/list",
-    "/v3/supply-order/get",
-    "/v3/supply-order/list",
-    "/v4/posting/fbs/list",
-    "/v4/posting/fbs/unfulfilled/list",
-    "/v4/product/info/attributes",
-    "/v4/product/info/stocks",
-    "/v5/product/info/prices",
-];
-
-/// Reserved for future canary-only read endpoints.
-///
-/// The finance accrual
-/// contracts have completed their canary period and now live in the stable
-/// allowlist above. The empty constant keeps the feature-flag API compatible
-/// while callers migrate away from the old preview switch.
-pub const PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[];
-
-#[must_use]
-pub fn is_read_only_endpoint_allowed(endpoint: &str) -> bool {
-    READ_ONLY_ENDPOINT_ALLOWLIST.contains(&endpoint)
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OzonErrorKind {
@@ -292,6 +238,7 @@ impl OzonError {
 struct RateLimiter {
     next_allowed: Mutex<Instant>,
     analytics_next_allowed: Mutex<Instant>,
+    search_next_allowed: Mutex<Instant>,
     analytics_rate_limit_strikes: Mutex<u8>,
     in_flight: Semaphore,
     #[cfg(test)]
@@ -308,6 +255,7 @@ impl RateLimiter {
         Self {
             next_allowed: Mutex::new(Instant::now()),
             analytics_next_allowed: Mutex::new(Instant::now()),
+            search_next_allowed: Mutex::new(Instant::now()),
             analytics_rate_limit_strikes: Mutex::new(0),
             in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_CLIENT),
             #[cfg(test)]
@@ -342,6 +290,11 @@ impl RateLimiter {
                 .lock()
                 .await
                 .saturating_duration_since(now)
+        } else if policy::is_search_path(path) {
+            self.search_next_allowed
+                .lock()
+                .await
+                .saturating_duration_since(now)
         } else {
             Duration::ZERO
         };
@@ -361,6 +314,8 @@ impl RateLimiter {
         let mut next_allowed = self.next_allowed.lock().await;
         let mut analytics_next_allowed = if path == ANALYTICS_DATA_PATH {
             Some(self.analytics_next_allowed.lock().await)
+        } else if policy::is_search_path(path) {
+            Some(self.search_next_allowed.lock().await)
         } else {
             None
         };
@@ -806,7 +761,9 @@ impl OzonClient {
             pacing_mode,
             retry_owner,
         } = input;
-        let can_retry = retry_owner == RetryOwner::Client && RETRY_POLICY.allows_attempt(attempt);
+        let can_retry = retry_owner == RetryOwner::Client
+            && RETRY_POLICY.allows_attempt(attempt)
+            && !policy::is_search_path(path);
         let queue_analytics = pacing_mode == AnalyticsPacingMode::Queue || attempt > 1;
         let _permits = self
             .acquire_request_permits(limiter, path, queue_analytics)
@@ -857,6 +814,14 @@ impl OzonClient {
             } else {
                 None
             };
+        if policy::is_search_path(path)
+            && let Some(delay) = quota::response_cooldown(status, vendor_retry_after, None)
+        {
+            let mut next = limiter.search_next_allowed.lock().await;
+            // Bound untrusted header arithmetic, as the WB client does. The
+            // uncapped vendor delay is still returned and passed to shared quota.
+            *next = (*next).max(Instant::now() + delay.min(Duration::from_hours(24)));
+        }
         let enforced_retry_after = local_cooldown.max(vendor_retry_after);
         if let Some(delay) = quota::response_cooldown(status, vendor_retry_after, local_cooldown) {
             self.defer_shared_request(&credentials.client_id, path, delay)
@@ -940,7 +905,8 @@ impl OzonClient {
         loop {
             let wait = limiter.ready_in_for(path).await;
             if !wait.is_zero() {
-                if path == ANALYTICS_DATA_PATH && !queue_analytics {
+                if (path == ANALYTICS_DATA_PATH || policy::is_search_path(path)) && !queue_analytics
+                {
                     return Err(OzonError::LocalRateLimited { retry_after: wait });
                 }
                 sleep(wait).await;
@@ -1637,7 +1603,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, READ_ONLY_ENDPOINT_ALLOWLIST);
-        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 35);
+        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 37);
 
         for endpoint in READ_ONLY_ENDPOINT_ALLOWLIST {
             assert!(endpoint.starts_with('/'), "{endpoint}");

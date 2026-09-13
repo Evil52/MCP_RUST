@@ -30,6 +30,9 @@ pub(super) enum ApiHost {
     Promotion,
     Marketplace,
     Finance,
+    Feedbacks,
+    Returns,
+    Supplies,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +54,10 @@ pub(super) enum RequestClass {
     PromotionClusterBids,
     SellerInventory,
     FinanceReport,
+    FeedbackReport,
+    ReturnClaims,
+    SupplyReport,
+    CardErrors,
 }
 
 /// Single source of truth for every request that may leave this process.
@@ -279,16 +286,26 @@ pub(super) const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
 
 impl EndpointPolicy {
     pub(super) fn for_request(method: &Method, path: &str) -> Option<&'static Self> {
-        READ_ONLY_ENDPOINT_ALLOWLIST.iter().find(|policy| {
-            policy.method == *method
-                && if policy.path == SELLER_STOCKS_PATH {
-                    is_seller_stock_read_path(path)
-                } else if policy.path == FINANCE_REPORT_ID_PATH {
-                    canonical_positive_id_segment(path, "/api/finance/v1/sales-reports/detailed/")
-                } else {
-                    policy.path == path
-                }
-        })
+        READ_ONLY_ENDPOINT_ALLOWLIST
+            .iter()
+            .chain(super::coverage_policy::ENDPOINTS)
+            .find(|policy| {
+                policy.method == *method
+                    && if policy.path == SELLER_STOCKS_PATH {
+                        is_seller_stock_read_path(path)
+                    } else if policy.path == FINANCE_REPORT_ID_PATH {
+                        canonical_positive_id_segment(
+                            path,
+                            "/api/finance/v1/sales-reports/detailed/",
+                        )
+                    } else if let Some(matches) =
+                        super::coverage_policy::matches_dynamic(policy.path, path)
+                    {
+                        matches
+                    } else {
+                        policy.path == path
+                    }
+            })
     }
 }
 
@@ -312,6 +329,10 @@ impl RequestClass {
         !matches!(
             self,
             Self::StatisticsReport
+                | Self::FeedbackReport
+                | Self::ReturnClaims
+                | Self::SupplyReport
+                | Self::CardErrors
                 | Self::FinanceReport
                 | Self::CommissionTariff
                 | Self::SearchReport
@@ -343,6 +364,10 @@ pub(super) struct ClientPolicy {
     pub(super) promotion_cluster_bids_interval: Duration,
     pub(super) seller_inventory_interval: Duration,
     pub(super) finance_interval: Duration,
+    pub(super) feedback_interval: Duration,
+    pub(super) claims_interval: Duration,
+    pub(super) supplies_interval: Duration,
+    pub(super) card_errors_interval: Duration,
     pub(super) max_attempts: usize,
     pub(super) base_retry_delay: Duration,
     pub(super) max_retry_delay: Duration,
@@ -380,6 +405,10 @@ impl ClientPolicy {
             promotion_cluster_bids_interval: PROMOTION_CLUSTER_BIDS_MIN_REQUEST_INTERVAL,
             seller_inventory_interval: SELLER_INVENTORY_MIN_REQUEST_INTERVAL,
             finance_interval: FINANCE_MIN_REQUEST_INTERVAL,
+            feedback_interval: Duration::from_mins(12),
+            claims_interval: Duration::from_hours(1),
+            supplies_interval: Duration::from_hours(1),
+            card_errors_interval: Duration::from_secs(6),
             max_attempts: MAX_ATTEMPTS,
             base_retry_delay: BASE_RETRY_DELAY,
             max_retry_delay: MAX_RETRY_DELAY,
@@ -408,6 +437,10 @@ impl ClientPolicy {
             promotion_cluster_bids_interval: Duration::ZERO,
             seller_inventory_interval: Duration::ZERO,
             finance_interval: Duration::ZERO,
+            feedback_interval: Duration::ZERO,
+            claims_interval: Duration::ZERO,
+            supplies_interval: Duration::ZERO,
+            card_errors_interval: Duration::ZERO,
             max_attempts: 1,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -434,6 +467,10 @@ impl ClientPolicy {
             RequestClass::PromotionClusterBids => self.promotion_cluster_bids_interval,
             RequestClass::SellerInventory => self.seller_inventory_interval,
             RequestClass::FinanceReport => self.finance_interval,
+            RequestClass::FeedbackReport => self.feedback_interval,
+            RequestClass::ReturnClaims => self.claims_interval,
+            RequestClass::SupplyReport => self.supplies_interval,
+            RequestClass::CardErrors => self.card_errors_interval,
         }
     }
 }

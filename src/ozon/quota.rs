@@ -34,10 +34,17 @@ impl OzonClient {
         if !self.shared_quota.is_enabled() {
             return Ok(());
         }
-        if path == ANALYTICS_DATA_PATH {
+        if path == ANALYTICS_DATA_PATH || super::policy::is_search_path(path) {
             self.shared_quota
                 .admit(
-                    &QuotaKey::ozon_seller(client_id, "analytics")?,
+                    &QuotaKey::ozon_seller(
+                        client_id,
+                        if super::policy::is_search_path(path) {
+                            "search_analytics"
+                        } else {
+                            "analytics"
+                        },
+                    )?,
                     ANALYTICS_REQUEST_INTERVAL,
                 )
                 .await?;
@@ -62,6 +69,8 @@ impl OzonClient {
         if self.shared_quota.is_enabled() {
             let bucket = if path == ANALYTICS_DATA_PATH {
                 "analytics"
+            } else if super::policy::is_search_path(path) {
+                "search_analytics"
             } else {
                 "api"
             };
