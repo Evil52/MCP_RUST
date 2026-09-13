@@ -112,24 +112,31 @@ impl OzonMcp {
                 .iter()
                 .filter(|account| actor.can_access_account(account))
                 .map(|account| {
-                    let (integration_status, configured) = account.ozon.as_ref().map_or_else(
-                        || {
-                            if account.wildberries.is_some() {
+                    let (integration_status, configured) = if self.reporting_only {
+                        (
+                            "published_postgresql_snapshots",
+                            self.reporting_reader.is_enabled(),
+                        )
+                    } else {
+                        account.ozon.as_ref().map_or_else(
+                            || {
+                                if account.wildberries.is_some() {
+                                    (
+                                        "read_only_wildberries_api",
+                                        self.wb_client.is_configured(&account.id),
+                                    )
+                                } else {
+                                    ("directory_only", false)
+                                }
+                            },
+                            |ozon| {
                                 (
-                                    "read_only_wildberries_api",
-                                    self.wb_client.is_configured(&account.id),
+                                    "read_only_ozon_api",
+                                    self.client.is_configured(&ozon.store_id),
                                 )
-                            } else {
-                                ("directory_only", false)
-                            }
-                        },
-                        |ozon| {
-                            (
-                                "read_only_ozon_api",
-                                self.client.is_configured(&ozon.store_id),
-                            )
-                        },
-                    );
+                            },
+                        )
+                    };
                     let manager = registry
                         .actor(&account.manager_id)
                         .expect("validated manager");

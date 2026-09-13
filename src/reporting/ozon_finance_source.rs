@@ -52,7 +52,7 @@ pub async fn collect_finance_facts_checkpointed(
     if date_from > date_to {
         return Err(OzonReportSourceError::InvalidSnapshotInput);
     }
-    let types = checkpointed(checkpoints, json!(["ozon_finance_types"]), || async {
+    let types = checkpointed(checkpoints, json!(["ozon_finance_types_v2"]), || async {
         let response = transport
             .post(OzonReportRequest {
                 path: "/v1/finance/accrual/types",
@@ -104,7 +104,7 @@ async fn collect_day(
     for _ in 0..MAX_PAGES_PER_DAY {
         let (facts, rows, next) = checkpointed(
             checkpoints,
-            json!(["ozon_finance_day", date, last_id]),
+            json!(["ozon_finance_day_v2", date, last_id]),
             || async {
                 let response = transport.post(OzonReportRequest {
                 path: "/v1/finance/accrual/by-day",
@@ -204,12 +204,16 @@ fn parse_page(
         if date != requested_date {
             return Err(OzonFinanceParseError::Value);
         }
-        let type_id = parse_u64(
-            row.get("accrual_id")
-                .or_else(|| row.get("type_id"))
-                .ok_or(OzonFinanceParseError::Shape)?,
-        )?;
-        let kind = types.get(&type_id);
+        // An accrual identifier does not establish its dictionary type. Keep
+        // the amount, but leave its category unknown without an explicit type.
+        // Never infer a category from coincidentally equal numeric identifiers.
+        let type_id = row.get("type_id").map(parse_u64).transpose()?;
+        if type_id.is_none() {
+            // Retain the existing identifier shape check even when the
+            // identifier cannot establish an accounting category.
+            parse_u64(row.get("accrual_id").ok_or(OzonFinanceParseError::Shape)?)?;
+        }
+        let kind = type_id.and_then(|id| types.get(&id));
         let category = kind.map_or(FinanceCategory::Other, |value| value.category);
         let unknown = u32::from(kind.is_none_or(|value| !value.known));
         let amount = parse_money(
@@ -264,7 +268,7 @@ fn classify_type(text: &str) -> (FinanceCategory, bool) {
         (FinanceCategory::Storage, &["хранен", "storage"][..]),
         (
             FinanceCategory::PaidAcceptance,
-            &["платн", "прием", "acceptance"][..],
+            &["приемк", "приёмк", "acceptance"][..],
         ),
         (
             FinanceCategory::Logistics,
@@ -414,16 +418,16 @@ mod tests {
                 {"id":2, "name":"new", "description":"unknown fee"}
             ]}),
             json!({"accruals":[
-                {"date":"2026-08-19T10:00:00Z", "accrual_id":"1", "total_amount":amount("10.00"),
+                {"date":"2026-08-19T10:00:00Z", "accrual_id":"2", "type_id":"1", "total_amount":amount("10.00"),
                  "posting":{"products":[{"sku":"55"},{"sku":55}]}},
                 {"date":"2026-08-19", "type_id":999, "total_amount":amount("-1.25")}
             ], "last_id":"next"}),
             json!({"accruals":[
-                {"date":"2026-08-19", "accrual_id":1, "total_amount":amount("2.50"),
+                {"date":"2026-08-19", "accrual_id":2, "type_id":1, "total_amount":amount("2.50"),
                  "posting":{"products":[{"sku":55}]}}
             ], "last_id":""}),
             json!({"accruals":[
-                {"date":"2026-08-20", "accrual_id":2, "total_amount":amount("1"),
+                {"date":"2026-08-20", "accrual_id":1, "type_id":2, "total_amount":amount("1"),
                  "posting":{"products":[{"sku":55},{"sku":56}]}}
             ], "last_id":""}),
         ]);
@@ -451,11 +455,117 @@ mod tests {
         let requests = transport.requests.lock().unwrap();
         assert_eq!(requests.len(), 4);
         assert_eq!(requests[0].path, "/v1/finance/accrual/types");
-        assert_eq!(requests[1].path, "/v1/finance/accrual/by-day");
+        assert_eq!(requests[0].payload, json!({}));
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.path == "/v1/finance/accrual/by-day")
+        );
         assert_eq!(requests[1].payload["date"], "2026-08-19");
         assert_eq!(requests[1].payload["last_id"], "");
         assert_eq!(requests[2].payload["last_id"], "next");
         assert_eq!(requests[3].payload["date"], "2026-08-20");
+    }
+
+    #[tokio::test]
+    async fn collection_preserves_unknown_accrual_identifiers_without_guessing_types() {
+        let transport = FixtureTransport::new(vec![
+            json!({"accrual_types":[
+                {"id":1, "name":"Продажа", "description":""},
+                {"id":2, "name":"Платная реклама", "description":""}
+            ]}),
+            json!({"accruals":[
+                {"date":"2026-08-19", "accrual_id":1, "total_amount":amount("-1.25")},
+                {"date":"2026-08-19", "accrual_id":1, "type_id":2, "total_amount":amount("-2.50")},
+                {"date":"2026-08-19", "accrual_id":2, "type_id":999, "total_amount":amount("-3.75")}
+            ], "last_id":""}),
+        ]);
+
+        let facts = collect_finance_facts(&transport, date(), date())
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 2);
+        assert!(facts.iter().any(|fact| {
+            fact.category == FinanceCategory::Advertising
+                && fact.amount_minor == -250
+                && fact.line_count == 1
+                && fact.unknown_type_count == 0
+        }));
+        assert!(facts.iter().any(|fact| {
+            fact.category == FinanceCategory::Other
+                && fact.amount_minor == -500
+                && fact.line_count == 2
+                && fact.unknown_type_count == 2
+        }));
+        assert_eq!(
+            facts.iter().map(|fact| fact.amount_minor).sum::<i64>(),
+            -750
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_finance_page_never_returns_partial_facts_or_tries_legacy_routes() {
+        let transport = FixtureTransport::new(vec![
+            json!({"accrual_types":[]}),
+            json!({"accruals":[{
+                "date":"2026-08-19", "accrual_id":1, "total_amount":amount("42.05")
+            }], "last_id":"next"}),
+        ]);
+        assert_eq!(
+            collect_finance_facts(&transport, date(), date()).await,
+            Err(OzonReportSourceError::Transport)
+        );
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].path, "/v1/finance/accrual/types");
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.path == "/v1/finance/accrual/by-day")
+        );
+        assert_eq!(requests[2].payload["last_id"], "next");
+    }
+
+    #[tokio::test]
+    async fn finance_checkpoint_resume_preserves_each_page_once() {
+        use super::super::checkpoint::{
+            CheckpointError,
+            tests::{MemoryPages, journal},
+        };
+
+        let pages = MemoryPages::default();
+        let transport = FixtureTransport::new(vec![
+            json!({"accrual_types":[]}),
+            json!({"accruals":[{
+                "date":"2026-08-19", "accrual_id":1, "total_amount":amount("42.05")
+            }], "last_id":"next"}),
+            json!({"accruals":[{
+                "date":"2026-08-19", "accrual_id":2, "total_amount":amount("-2.01")
+            }], "last_id":""}),
+        ]);
+        for _ in 0..2 {
+            assert_eq!(
+                collect_finance_facts_checkpointed(&transport, date(), date(), &journal(&pages))
+                    .await,
+                Err(OzonReportSourceError::Checkpoint(CheckpointError::Deferred))
+            );
+        }
+        let facts =
+            collect_finance_facts_checkpointed(&transport, date(), date(), &journal(&pages))
+                .await
+                .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].amount_minor, 4_004);
+        assert_eq!(facts[0].line_count, 2);
+        assert_eq!(facts[0].unknown_type_count, 2);
+        assert_eq!(transport.requests.lock().unwrap().len(), 3);
+        assert_eq!(
+            collect_finance_facts_checkpointed(&transport, date(), date(), &journal(&pages))
+                .await
+                .unwrap(),
+            facts
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -583,6 +693,8 @@ mod tests {
             json!({"accruals":[{"date":"2026-08-18", "type_id":1, "total_amount":amount("1")}], "last_id":""}),
             json!({"accruals":[{"date":"2026-08-19", "total_amount":amount("1")}], "last_id":""}),
             json!({"accruals":[{"date":"2026-08-19", "type_id":"bad", "total_amount":amount("1")}], "last_id":""}),
+            json!({"accruals":[{"date":"2026-08-19", "accrual_id":null, "total_amount":amount("1")}], "last_id":""}),
+            json!({"accruals":[{"date":"2026-08-19", "accrual_id":"bad", "total_amount":amount("1")}], "last_id":""}),
             json!({"accruals":[{"date":"2026-08-19", "type_id":1}], "last_id":""}),
             json!({"accruals":[{"date":"2026-08-19", "type_id":1, "total_amount":{"currency":"USD", "amount":"1"}}], "last_id":""}),
             json!({"accruals":[], "last_id":7}),
@@ -671,10 +783,13 @@ mod tests {
             ("Услуга эквайринга", FinanceCategory::Acquiring),
             ("storage fee", FinanceCategory::Storage),
             ("paid acceptance", FinanceCategory::PaidAcceptance),
+            ("Платная приёмка", FinanceCategory::PaidAcceptance),
+            ("Приемка товаров", FinanceCategory::PaidAcceptance),
             ("delivery", FinanceCategory::Logistics),
             ("commission", FinanceCategory::Commission),
             ("compensation", FinanceCategory::Compensation),
             ("advertising", FinanceCategory::Advertising),
+            ("Платная реклама", FinanceCategory::Advertising),
             ("bonus", FinanceCategory::MarketplaceDiscount),
             ("sale", FinanceCategory::Sale),
         ] {
@@ -682,6 +797,10 @@ mod tests {
         }
         assert_eq!(
             classify_type("new unknown fee"),
+            (FinanceCategory::Other, false)
+        );
+        assert_eq!(
+            classify_type("Платная дополнительная услуга"),
             (FinanceCategory::Other, false)
         );
     }

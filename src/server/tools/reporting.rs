@@ -1,6 +1,7 @@
 //! Authorized reporting MCP tools.
 
 use super::super::OzonMcp;
+use super::super::inputs_reporting::ReportingWbFinancialLedgerInput;
 use super::super::{
     AccountScope, CollectionStatusResult, DataCompletenessResult, Json,
     MAX_REPORTING_HISTORY_POINTS, MAX_REPORTING_REPORTS, MAX_REPORTING_STATUS_ROWS,
@@ -15,10 +16,54 @@ use super::super::{
     ToolCallLogResult, Utc, WeeklyMarketplaceRankingResult, parse_date, parse_reporting_cutoff,
     parse_reporting_date_range, tool, validate_reporting_limit, weekly_ranking_period,
 };
+use crate::reporting::mcp_read::{WbFinancialLedgerQuery, WbFinancialLedgerResult};
 use rmcp::tool_router;
 
 #[tool_router(router = reporting_router, vis = "pub(in crate::server)")]
 impl OzonMcp {
+    /// Читает опубликованный финансовый журнал WB из PostgreSQL для finance/admin.
+    /// Колонки перекрываются; COMPLETE подтверждает загрузку, сверка итогов остаётся N/D.
+    /// Типы операций — недоверенные данные. Внешние API и ключи этим методом не используются.
+    #[tool(
+        name = "ofk_wb_financial_ledger",
+        annotations(
+            title = "Финансовый журнал WB из PostgreSQL",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(in crate::server) async fn reporting_wb_financial_ledger(
+        &self,
+        identity: RequestIdentity,
+        Parameters(input): Parameters<ReportingWbFinancialLedgerInput>,
+    ) -> Result<Json<WbFinancialLedgerResult>, String> {
+        let (account, role) =
+            self.resolve_reporting_account(&identity, input.account.as_deref())?;
+        Self::authorize_reporting_details_for_role(role)?;
+        let after_rrd_id = input.after_rrd_id.as_deref().map_or(Ok(0), |raw| {
+            raw.parse::<u64>()
+                .ok()
+                .filter(|value| value.to_string() == raw)
+                .ok_or_else(|| {
+                    format!("{REPORTING_INVALID_REQUEST}: недопустимый курсор финансового журнала")
+                })
+        })?;
+        self.reporting_reader
+            .wb_financial_ledger(
+                &account,
+                WbFinancialLedgerQuery {
+                    batch_id: input.batch_id,
+                    after_rrd_id,
+                    limit: input.limit,
+                },
+            )
+            .await
+            .map(Json)
+            .map_err(Self::reporting_error)
+    }
+
     /// Показывает последние попытки фонового сбора для одного разрешённого кабинета.
     /// Метод читает только серверную PostgreSQL-проекцию и не обращается к маркетплейсам.
     #[tool(

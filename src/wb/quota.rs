@@ -1,16 +1,12 @@
 //! Shared quota names and vendor cooldowns used by WB reads and guarded writes.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Utc;
-use reqwest::{Response, StatusCode, header::HeaderMap};
+use reqwest::{StatusCode, header::HeaderMap};
 
-use super::{
-    AttemptContext, AttemptOutcome, MAX_ERROR_BODY_BYTES, ParsedRetryDelay, WbError,
-    classify_http_status, decode_response, extract_request_id, is_retriable,
-    is_retriable_transport, parse_retry_delay, policy::RequestClass, read_body, retry_delay,
-    retry_plan, trace_response,
-};
+use super::response::{is_retriable, parse_retry_delay};
+use super::{AttemptContext, WbError, policy::RequestClass};
 use crate::marketplace_quota::{QuotaError, QuotaKey};
 
 const PROMOTION_CAMPAIGN_BUCKET: &str = "promotion_campaign";
@@ -22,6 +18,7 @@ impl RequestClass {
             Self::AnalyticsPing => "analytics_ping",
             Self::AnalyticsReport => "analytics_report",
             Self::StatisticsReport => "statistics_report",
+            Self::FinanceReport => "finance_report",
             Self::ContentReport => "content_report",
             Self::PricesReport => "prices_report",
             Self::CommissionTariff => "commission_tariff",
@@ -83,134 +80,6 @@ impl super::WbClient {
         .map(Some)
         .map_err(read_quota_error)
     }
-
-    pub(super) async fn response_outcome(
-        &self,
-        context: AttemptContext<'_>,
-        attempt: usize,
-        started: Instant,
-        response: Response,
-        quota_key: Option<&QuotaKey>,
-    ) -> Result<AttemptOutcome, WbError> {
-        let status = response.status();
-        let shared_cooldown = vendor_quota_cooldown(response.headers(), status);
-        let request_id = extract_request_id(response.headers());
-        let retry_after = parse_retry_delay(response.headers(), Utc::now());
-        let planned_retry = context
-            .request_class
-            .allows_automatic_retry()
-            .then(|| retry_plan(status, attempt, retry_after, &self.policy))
-            .flatten();
-        let vendor_cooldown = match retry_after {
-            ParsedRetryDelay::Valid(delay)
-                if context.request_class == RequestClass::SellerInventory
-                    && is_retriable(status) =>
-            {
-                // The one-attempt inventory reader must still honor a long
-                // Retry-After for sibling callers. Cap untrusted delays at a
-                // day; the generic retry budget is not this shared cooldown.
-                Some(delay.min(Duration::from_hours(24)))
-            }
-            ParsedRetryDelay::Valid(delay)
-                if is_retriable(status) && delay <= self.policy.max_retry_delay =>
-            {
-                Some(delay)
-            }
-            ParsedRetryDelay::Absent | ParsedRetryDelay::Invalid | ParsedRetryDelay::Valid(_) => {
-                None
-            }
-        };
-        let inventory_cooldown = if context.request_class == RequestClass::SellerInventory {
-            match status {
-                // WB charges ten requests for a 409 in both inventory groups.
-                StatusCode::CONFLICT => Some(self.policy.seller_inventory_interval * 10),
-                StatusCode::TOO_MANY_REQUESTS if vendor_cooldown.is_none() => {
-                    Some(Duration::from_secs(60))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let shared_inventory_cooldown = (context.request_class == RequestClass::SellerInventory
-            && status == StatusCode::CONFLICT)
-            .then_some(super::SELLER_INVENTORY_MIN_REQUEST_INTERVAL * 10);
-        if let (Some(key), Some(delay)) = (
-            quota_key,
-            shared_cooldown
-                .into_iter()
-                .chain(shared_inventory_cooldown)
-                .max(),
-        ) {
-            self.shared_quota
-                .defer(key, delay)
-                .await
-                .map_err(read_quota_error)?;
-        }
-        if let Some(delay) = planned_retry
-            .into_iter()
-            .chain(vendor_cooldown)
-            .chain(inventory_cooldown)
-            .max()
-        {
-            // A vendor-directed retry is shared by every alias using this
-            // seller token and endpoint class. Extending the gate before
-            // permits are released prevents sibling calls from creating a
-            // same-token 429/503 retry storm during the cooldown.
-            context
-                .limiter
-                .extend_cooldown(context.request_class, delay)
-                .await;
-        }
-
-        if let Some(delay) = planned_retry {
-            let diagnostic = read_body(response, MAX_ERROR_BODY_BYTES, request_id.as_deref())
-                .await
-                .unwrap_or_default();
-            trace_response(
-                context.account,
-                context.endpoint,
-                attempt,
-                started,
-                status,
-                request_id.as_deref(),
-                None,
-                true,
-            );
-            return Ok(AttemptOutcome::Retry {
-                delay,
-                error: classify_http_status(
-                    status,
-                    request_id,
-                    retry_after.duration(),
-                    String::from_utf8_lossy(&diagnostic).into_owned(),
-                ),
-            });
-        }
-
-        let result = decode_response(response, request_id.clone(), retry_after.duration()).await;
-        let will_retry = context.request_class.allows_automatic_retry()
-            && result.as_ref().is_err_and(|error| {
-                is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts
-            });
-        trace_response(
-            context.account,
-            context.endpoint,
-            attempt,
-            started,
-            status,
-            request_id.as_deref(),
-            result.as_ref().err(),
-            will_retry,
-        );
-        match result {
-            Err(error) if will_retry => Ok(AttemptOutcome::Retry {
-                delay: retry_delay(attempt, None, &self.policy),
-                error,
-            }),
-            result => result.map(AttemptOutcome::Complete),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -263,8 +132,10 @@ mod tests {
             assert!(read > 0);
             request.extend_from_slice(&buffer[..read]);
         }
+        let body = if status.starts_with("204 ") { "" } else { "{}" };
         let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n{headers}\r\n{{}}"
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+            body.len()
         );
         socket.write_all(response.as_bytes()).await.unwrap();
         listener
@@ -282,6 +153,33 @@ mod tests {
         assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
         let error = first.err().or_else(|| second.err()).unwrap();
         assert!(matches!(error, WbError::LocalRateLimited { .. }));
+        let listener = server.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL"]
+    async fn terminal_finance_read_still_reserves_shared_seller_quota() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let first = database_client(&base, "d1000000-0000-4000-8000-000000000004", "first");
+        let second = database_client(&base, "d1000000-0000-4000-8000-000000000004", "rotated");
+        let server = tokio::spawn(serve_one(listener, "204 No Content", ""));
+        assert!(
+            first
+                .financial_report_by_id_page("store", 42, 1, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            second.financial_report_by_id_page("store", 42, 1, 0).await,
+            Err(WbError::LocalRateLimited { .. })
+        ));
         let listener = server.await.unwrap();
         assert!(
             timeout(Duration::from_millis(25), listener.accept())
@@ -354,6 +252,7 @@ mod tests {
             (Method::POST, super::super::SALES_FUNNEL_PATH),
             (Method::GET, super::super::PROMOTION_CAMPAIGNS_PATH),
             (Method::GET, super::super::SELLER_WAREHOUSES_PATH),
+            (Method::POST, super::super::FINANCE_DETAILS_PATH),
         ] {
             let error = client
                 .request("store", method, path, None, None)

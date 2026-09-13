@@ -2,12 +2,14 @@
 
 use std::process::Command;
 
-const RUNTIME_BINARY_NAMES: [&str; 7] = [
+const RUNTIME_BINARY_NAMES: [&str; 9] = [
     "mcp-ozon",
     "mcp-ozon-control",
     "position-collector",
     "report-worker",
     "report-collector",
+    "finance-collector",
+    "cost-import",
     "wb-automation",
     "ozon-campaign-guard",
 ];
@@ -75,6 +77,17 @@ runtime_probe!(
     ozon_campaign_guard_probe,
     "CARGO_BIN_EXE_ozon-campaign-guard",
     "ozon-campaign-guard"
+);
+
+runtime_probe!(
+    finance_collector_probe,
+    "CARGO_BIN_EXE_finance-collector",
+    "finance-collector"
+);
+runtime_probe!(
+    cost_import_probe,
+    "CARGO_BIN_EXE_cost-import",
+    "cost-import"
 );
 
 #[test]

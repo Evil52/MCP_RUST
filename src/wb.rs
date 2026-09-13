@@ -1,3 +1,9 @@
+mod finance;
+mod finance_quota;
+pub use finance::WbFinancePeriod;
+use finance_quota::FinanceAccess;
+mod hosts;
+use hosts::BaseUrls;
 mod operator_reads;
 mod policy;
 pub use mcp_marketplace_types::WbCredentials;
@@ -10,11 +16,15 @@ use validation::{
     validate_search_texts, validate_top_order_by, validate_unsigned_id,
 };
 pub(crate) mod quota;
+mod request;
 mod response;
+#[cfg(test)]
 use response::{
-    ParsedRetryDelay, classify_transport_error, decode_response, extract_request_id, is_retriable,
-    is_retriable_transport, parse_retry_delay, read_body, retry_delay, retry_plan, trace_response,
-    trace_transport_failure,
+    ParsedRetryDelay, extract_request_id, is_retriable, parse_retry_delay, retry_plan,
+    trace_response,
+};
+use response::{
+    classify_transport_error, is_retriable_transport, retry_delay, trace_transport_failure,
 };
 
 use std::{
@@ -33,7 +43,7 @@ use reqwest::{
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, Semaphore, SemaphorePermit},
+    sync::{Mutex, Semaphore},
     time::{Instant as TokioInstant, sleep, timeout_at},
 };
 use tracing::{info, warn};
@@ -48,7 +58,10 @@ const CONTENT_API_BASE_URL: &str = "https://content-api.wildberries.ru";
 const PRICES_API_BASE_URL: &str = "https://discounts-prices-api.wildberries.ru";
 const COMMON_API_BASE_URL: &str = "https://common-api.wildberries.ru";
 const PROMOTION_API_BASE_URL: &str = "https://advert-api.wildberries.ru";
+const FINANCE_API_BASE_URL: &str = "https://finance-api.wildberries.ru";
 const MARKETPLACE_API_BASE_URL: &str = "https://marketplace-api.wildberries.ru";
+const FINANCE_DETAILS_PATH: &str = "/api/finance/v1/sales-reports/detailed";
+const FINANCE_MIN_REQUEST_INTERVAL: Duration = Duration::from_hours(12);
 const PING_PATH: &str = "/ping";
 const SALES_FUNNEL_PATH: &str = "/api/analytics/v3/sales-funnel/products";
 const SALES_FUNNEL_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/products/history";
@@ -367,6 +380,8 @@ struct TokenLimiter {
     promotion_recommendations: PacingGate,
     promotion_cluster_bids: PacingGate,
     seller_inventory: PacingGate,
+    finance_reports: PacingGate,
+    finance_access: FinanceAccess,
 }
 
 impl TokenLimiter {
@@ -389,6 +404,8 @@ impl TokenLimiter {
             promotion_recommendations: PacingGate::new(),
             promotion_cluster_bids: PacingGate::new(),
             seller_inventory: PacingGate::new(),
+            finance_reports: PacingGate::new(),
+            finance_access: FinanceAccess::new(),
         }
     }
 
@@ -410,6 +427,7 @@ impl TokenLimiter {
             RequestClass::PromotionRecommendedBids => &self.promotion_recommendations,
             RequestClass::PromotionClusterBids => &self.promotion_cluster_bids,
             RequestClass::SellerInventory => &self.seller_inventory,
+            RequestClass::FinanceReport => &self.finance_reports,
         }
     }
 
@@ -465,62 +483,17 @@ impl TokenLimiter {
     }
 
     async fn extend_cooldown(&self, request_class: RequestClass, delay: Duration) {
-        self.gate(request_class).extend_cooldown(delay).await;
+        if request_class == RequestClass::FinanceReport {
+            self.finance_access
+                .extend_cooldown(&self.finance_reports, delay)
+                .await;
+        } else {
+            self.gate(request_class).extend_cooldown(delay).await;
+        }
     }
 
     async fn ready_in(&self, request_class: RequestClass) -> Duration {
         self.gate(request_class).ready_in().await
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BaseUrls {
-    analytics: String,
-    statistics: String,
-    content: String,
-    prices: String,
-    common: String,
-    promotion: String,
-    marketplace: String,
-}
-
-impl BaseUrls {
-    fn production() -> Self {
-        Self {
-            analytics: ANALYTICS_API_BASE_URL.to_owned(),
-            statistics: STATISTICS_API_BASE_URL.to_owned(),
-            content: CONTENT_API_BASE_URL.to_owned(),
-            prices: PRICES_API_BASE_URL.to_owned(),
-            common: COMMON_API_BASE_URL.to_owned(),
-            promotion: PROMOTION_API_BASE_URL.to_owned(),
-            marketplace: MARKETPLACE_API_BASE_URL.to_owned(),
-        }
-    }
-
-    #[cfg(test)]
-    fn for_test(common_base_url: &str, analytics_base_url: &str) -> Self {
-        let common = common_base_url.trim_end_matches('/').to_owned();
-        Self {
-            analytics: analytics_base_url.trim_end_matches('/').to_owned(),
-            statistics: common.clone(),
-            content: common.clone(),
-            prices: common.clone(),
-            common: common.clone(),
-            promotion: common.clone(),
-            marketplace: common,
-        }
-    }
-
-    fn base_url(&self, host: ApiHost) -> &str {
-        match host {
-            ApiHost::Analytics => &self.analytics,
-            ApiHost::Statistics => &self.statistics,
-            ApiHost::Content => &self.content,
-            ApiHost::Prices => &self.prices,
-            ApiHost::Common => &self.common,
-            ApiHost::Promotion => &self.promotion,
-            ApiHost::Marketplace => &self.marketplace,
-        }
     }
 }
 
@@ -553,6 +526,7 @@ struct AttemptContext<'a> {
 
 enum AttemptOutcome {
     Complete(Value),
+    NoContent,
     Retry { delay: Duration, error: WbError },
 }
 
@@ -1179,56 +1153,6 @@ impl WbClient {
         self.request(account, method, path, None, None).await
     }
 
-    async fn request(
-        &self,
-        account: &str,
-        method: Method,
-        path: &str,
-        query: Option<Vec<(&'static str, String)>>,
-        payload: Option<Value>,
-    ) -> Result<Value, WbError> {
-        // Enforced here, at the only point where a WB request can leave the
-        // process, so the read-only guarantee does not depend on callers.
-        let Some(endpoint_policy) = EndpointPolicy::for_request(&method, path) else {
-            return Err(WbError::EndpointNotAllowed {
-                method,
-                path: path.to_owned(),
-            });
-        };
-        let endpoint = endpoint_policy.label;
-        let request_class = endpoint_policy.request_class;
-        let base_url = self.base_urls.base_url(endpoint_policy.host);
-        let mut url = Url::parse(&format!("{base_url}{path}"))
-            .expect("static production or validated test WB base URL");
-        if let Some(query) = query {
-            url.query_pairs_mut().extend_pairs(query);
-        }
-        let url = url.to_string();
-        let credentials = self
-            .accounts
-            .get(account)
-            .ok_or_else(|| WbError::MissingCredentials(account.to_owned()))?;
-        let limiter = self
-            .limiters
-            .get(account)
-            .expect("configured WB account has a limiter");
-        let authorization = bearer_authorization(&credentials.token)?;
-
-        let deadline = TokioInstant::now() + self.logical_timeout;
-        self.request_with_retries(
-            account,
-            method,
-            endpoint,
-            request_class,
-            limiter,
-            url,
-            authorization,
-            payload,
-            deadline,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn request_with_retries(
         &self,
@@ -1241,7 +1165,7 @@ impl WbClient {
         authorization: HeaderValue,
         payload: Option<Value>,
         deadline: TokioInstant,
-    ) -> Result<Value, WbError> {
+    ) -> Result<Option<Value>, WbError> {
         let context = AttemptContext {
             account,
             deadline,
@@ -1269,7 +1193,8 @@ impl WbClient {
                     Ok(Ok(outcome)) => outcome,
                 };
             match outcome {
-                AttemptOutcome::Complete(value) => return Ok(value),
+                AttemptOutcome::Complete(value) => return Ok(Some(value)),
+                AttemptOutcome::NoContent => return Ok(None),
                 AttemptOutcome::Retry { delay, error } => {
                     // A timed-out quota-state read means no retry can fit. Map
                     // it to an impossible wait so the shared fit check below
@@ -1292,87 +1217,6 @@ impl WbClient {
                     sleep(delay).await;
                     attempt += 1;
                 }
-            }
-        }
-    }
-
-    async fn acquire_request_permits<'a>(
-        &'a self,
-        limiter: &'a TokenLimiter,
-        request_class: RequestClass,
-        retry: bool,
-        deadline: TokioInstant,
-    ) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>), WbError> {
-        let interval = self.policy.interval(request_class);
-        loop {
-            // Readiness does not consume quota. Queued callers therefore hold
-            // no network capacity, and a fail-fast permit rejection cannot
-            // postpone the next real WB request by 20 or 60s.
-            limiter
-                .wait_until_ready(request_class, retry, deadline)
-                .await?;
-            let global_permit = self
-                .global_in_flight
-                .try_acquire()
-                .map_err(|_| WbError::Overloaded)?;
-            let Ok(token_permit) = limiter.in_flight.try_acquire() else {
-                drop(global_permit);
-                return Err(WbError::Overloaded);
-            };
-            if limiter.try_claim(request_class, interval).await.is_ok() {
-                return Ok((global_permit, token_permit));
-            }
-
-            // Another ready caller claimed the departure between our readiness
-            // check and permit acquisition. Never queue while reserving scarce
-            // HTTP capacity; retry the readiness phase.
-            drop(token_permit);
-            drop(global_permit);
-        }
-    }
-
-    async fn request_attempt(
-        &self,
-        context: AttemptContext<'_>,
-        attempt: usize,
-        retry: bool,
-    ) -> Result<AttemptOutcome, WbError> {
-        // Both permits are released when this helper returns, before the retry
-        // loop performs any backoff sleep.
-        let (_global_permit, _token_permit) = self
-            .acquire_request_permits(
-                context.limiter,
-                context.request_class,
-                retry,
-                context.deadline,
-            )
-            .await?;
-        let quota_key = self.shared_quota_key(context)?;
-        if let Some(key) = quota_key.as_ref() {
-            self.shared_quota
-                .admit(
-                    key,
-                    ClientPolicy::production(self.logical_timeout).interval(context.request_class),
-                )
-                .await
-                .map_err(read_quota_error)?;
-        }
-        let mut request = self
-            .http
-            .request(context.method.clone(), context.url)
-            .header(AUTHORIZATION, context.authorization.clone());
-        if let Some(payload) = context.payload {
-            request = request.json(payload);
-        }
-
-        let started = Instant::now();
-        match request.send().await {
-            Ok(response) => {
-                self.response_outcome(context, attempt, started, response, quota_key.as_ref())
-                    .await
-            }
-            Err(source) => {
-                transport_failure_outcome(context, attempt, started, source, &self.policy)
             }
         }
     }
@@ -1714,6 +1558,27 @@ mod tests {
     fn endpoint_policy_table_matches_the_immutable_security_snapshot() {
         let expected = [
             (
+                Method::POST,
+                finance::FINANCE_LIST_PATH,
+                "finance:/api/finance/v1/sales-reports/list",
+                ApiHost::Finance,
+                RequestClass::FinanceReport,
+            ),
+            (
+                Method::POST,
+                finance::FINANCE_REPORT_ID_PATH,
+                "finance:/api/finance/v1/sales-reports/detailed/{reportId}",
+                ApiHost::Finance,
+                RequestClass::FinanceReport,
+            ),
+            (
+                Method::POST,
+                FINANCE_DETAILS_PATH,
+                "finance:/api/finance/v1/sales-reports/detailed",
+                ApiHost::Finance,
+                RequestClass::FinanceReport,
+            ),
+            (
                 Method::GET,
                 SELLER_WAREHOUSES_PATH,
                 "marketplace:/api/v3/warehouses",
@@ -1924,6 +1789,8 @@ mod tests {
             assert!(!policy.path.contains("//"));
             let path = if policy.path == SELLER_STOCKS_PATH {
                 "/api/v3/stocks/123"
+            } else if policy.path == finance::FINANCE_REPORT_ID_PATH {
+                "/api/finance/v1/sales-reports/detailed/123"
             } else {
                 policy.path
             };
@@ -2343,6 +2210,7 @@ mod tests {
             Duration::from_secs(2),
             credentials(),
             BaseUrls {
+                finance: "http://127.0.0.1:1".to_owned(),
                 analytics,
                 statistics,
                 content,
@@ -2490,6 +2358,7 @@ mod tests {
             Duration::from_secs(2),
             credentials(),
             BaseUrls {
+                finance: "http://127.0.0.1:1".to_owned(),
                 analytics,
                 statistics: unreachable.clone(),
                 content: unreachable.clone(),

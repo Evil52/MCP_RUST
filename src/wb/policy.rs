@@ -1,12 +1,14 @@
 //! Read-only endpoint policy and fixed hosts, never supplied by callers.
 
+use super::finance::{FINANCE_LIST_PATH, FINANCE_REPORT_ID_PATH};
 use super::{
     ACCEPTANCE_COEFFICIENTS_PATH, ACCEPTANCE_MIN_REQUEST_INTERVAL, ANALYTICS_MIN_REQUEST_INTERVAL,
     BASE_RETRY_DELAY, COMMISSION_MIN_REQUEST_INTERVAL, CONTENT_MIN_REQUEST_INTERVAL, Duration,
-    LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL, MAX_ATTEMPTS, MAX_LOGICAL_REQUEST_DURATION,
-    MAX_RETRY_DELAY, Method, ORDERS_PATH, PING_MIN_REQUEST_INTERVAL, PING_PATH,
-    PRICES_MIN_REQUEST_INTERVAL, PRODUCT_CARDS_PATH, PRODUCT_PRICES_PATH, PROMOTION_BALANCE_PATH,
-    PROMOTION_BUDGET_PATH, PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL, PROMOTION_CAMPAIGNS_PATH,
+    FINANCE_DETAILS_PATH, FINANCE_MIN_REQUEST_INTERVAL, LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL,
+    MAX_ATTEMPTS, MAX_LOGICAL_REQUEST_DURATION, MAX_RETRY_DELAY, Method, ORDERS_PATH,
+    PING_MIN_REQUEST_INTERVAL, PING_PATH, PRICES_MIN_REQUEST_INTERVAL, PRODUCT_CARDS_PATH,
+    PRODUCT_PRICES_PATH, PROMOTION_BALANCE_PATH, PROMOTION_BUDGET_PATH,
+    PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL, PROMOTION_CAMPAIGNS_PATH,
     PROMOTION_CLUSTER_BIDS_MIN_REQUEST_INTERVAL, PROMOTION_CLUSTER_BIDS_PATH,
     PROMOTION_DETAILS_PATH, PROMOTION_MINIMUM_BIDS_MIN_REQUEST_INTERVAL,
     PROMOTION_MINIMUM_BIDS_PATH, PROMOTION_RECOMMENDATIONS_MIN_REQUEST_INTERVAL,
@@ -27,6 +29,7 @@ pub(super) enum ApiHost {
     Common,
     Promotion,
     Marketplace,
+    Finance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +50,7 @@ pub(super) enum RequestClass {
     PromotionRecommendedBids,
     PromotionClusterBids,
     SellerInventory,
+    FinanceReport,
 }
 
 /// Single source of truth for every request that may leave this process.
@@ -68,6 +72,27 @@ pub(super) struct EndpointPolicy {
 /// [`WbClient::request`], the only place a WB request can leave the process, so
 /// adding a mutating call requires deliberately editing this list.
 pub(super) const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
+    EndpointPolicy {
+        method: Method::POST,
+        path: FINANCE_LIST_PATH,
+        label: "finance:/api/finance/v1/sales-reports/list",
+        host: ApiHost::Finance,
+        request_class: RequestClass::FinanceReport,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: FINANCE_REPORT_ID_PATH,
+        label: "finance:/api/finance/v1/sales-reports/detailed/{reportId}",
+        host: ApiHost::Finance,
+        request_class: RequestClass::FinanceReport,
+    },
+    EndpointPolicy {
+        method: Method::POST,
+        path: FINANCE_DETAILS_PATH,
+        label: "finance:/api/finance/v1/sales-reports/detailed",
+        host: ApiHost::Finance,
+        request_class: RequestClass::FinanceReport,
+    },
     EndpointPolicy {
         method: Method::GET,
         path: SELLER_WAREHOUSES_PATH,
@@ -258,6 +283,8 @@ impl EndpointPolicy {
             policy.method == *method
                 && if policy.path == SELLER_STOCKS_PATH {
                     is_seller_stock_read_path(path)
+                } else if policy.path == FINANCE_REPORT_ID_PATH {
+                    canonical_positive_id_segment(path, "/api/finance/v1/sales-reports/detailed/")
                 } else {
                     policy.path == path
                 }
@@ -268,7 +295,11 @@ impl EndpointPolicy {
 /// Admit only one canonical positive int64 segment. Never admit a prefix,
 /// encoded path, query, or the neighboring PUT/DELETE inventory operations.
 pub(super) fn is_seller_stock_read_path(path: &str) -> bool {
-    let Some(id) = path.strip_prefix("/api/v3/stocks/") else {
+    canonical_positive_id_segment(path, "/api/v3/stocks/")
+}
+
+fn canonical_positive_id_segment(path: &str, prefix: &str) -> bool {
+    let Some(id) = path.strip_prefix(prefix) else {
         return false;
     };
     !id.starts_with('0')
@@ -281,6 +312,7 @@ impl RequestClass {
         !matches!(
             self,
             Self::StatisticsReport
+                | Self::FinanceReport
                 | Self::CommissionTariff
                 | Self::SearchReport
                 | Self::SellerInventory
@@ -310,6 +342,7 @@ pub(super) struct ClientPolicy {
     pub(super) promotion_recommendations_interval: Duration,
     pub(super) promotion_cluster_bids_interval: Duration,
     pub(super) seller_inventory_interval: Duration,
+    pub(super) finance_interval: Duration,
     pub(super) max_attempts: usize,
     pub(super) base_retry_delay: Duration,
     pub(super) max_retry_delay: Duration,
@@ -346,6 +379,7 @@ impl ClientPolicy {
             promotion_recommendations_interval: PROMOTION_RECOMMENDATIONS_MIN_REQUEST_INTERVAL,
             promotion_cluster_bids_interval: PROMOTION_CLUSTER_BIDS_MIN_REQUEST_INTERVAL,
             seller_inventory_interval: SELLER_INVENTORY_MIN_REQUEST_INTERVAL,
+            finance_interval: FINANCE_MIN_REQUEST_INTERVAL,
             max_attempts: MAX_ATTEMPTS,
             base_retry_delay: BASE_RETRY_DELAY,
             max_retry_delay: MAX_RETRY_DELAY,
@@ -373,6 +407,7 @@ impl ClientPolicy {
             promotion_recommendations_interval: Duration::ZERO,
             promotion_cluster_bids_interval: Duration::ZERO,
             seller_inventory_interval: Duration::ZERO,
+            finance_interval: Duration::ZERO,
             max_attempts: 1,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -398,6 +433,7 @@ impl ClientPolicy {
             RequestClass::PromotionRecommendedBids => self.promotion_recommendations_interval,
             RequestClass::PromotionClusterBids => self.promotion_cluster_bids_interval,
             RequestClass::SellerInventory => self.seller_inventory_interval,
+            RequestClass::FinanceReport => self.finance_interval,
         }
     }
 }
