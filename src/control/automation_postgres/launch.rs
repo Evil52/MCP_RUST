@@ -2,6 +2,36 @@ use super::{WbAutomationCampaignLease, WbAutomationPostgresError};
 use chrono::{DateTime, Duration, Utc};
 
 impl WbAutomationCampaignLease<'_> {
+    /// Stronger provenance for a campaign which cannot yet have fullstats.
+    /// Earlier actions or active/unknown cycles cannot qualify.
+    pub(in crate::control) async fn verify_first_launch_cycles(
+        &self,
+        digest: &str,
+    ) -> Result<bool, WbAutomationPostgresError> {
+        if !self.verify_launch_cycles(digest).await? {
+            return Ok(false);
+        }
+        let client = self
+            .client
+            .as_ref()
+            .ok_or(WbAutomationPostgresError::Unavailable)?;
+        let row = client.query_one(
+            "SELECT NOT EXISTS (SELECT 1 FROM wb_automation.action_attempts WHERE account_id=$1 AND advert_id=$2) \
+             AND NOT EXISTS (SELECT 1 FROM wb_automation.cycles WHERE account_id=$1 AND advert_id=$2 \
+               AND (snapshot_json::jsonb #>> '{observation,campaign_status}') IS DISTINCT FROM '4') \
+             AND NOT EXISTS (SELECT 1 FROM (SELECT snapshot_json::jsonb AS snapshot_json FROM wb_automation.cycles \
+               WHERE account_id=$1 AND advert_id=$2 ORDER BY observed_at DESC LIMIT 2) recent \
+               WHERE (snapshot_json #>> '{observation,budget_remaining_minor}') IS DISTINCT FROM '100000' \
+                 OR (snapshot_json #>> '{observation,daily_spend_complete}') IS DISTINCT FROM 'false' \
+                 OR (snapshot_json #>> '{observation,attribution_complete}') IS DISTINCT FROM 'false' \
+                 OR (snapshot_json #>> '{observation,actions_today}') IS DISTINCT FROM '0' \
+                 OR (snapshot_json #>> '{observation,paused_by_automation}') IS DISTINCT FROM 'false' \
+                 OR (snapshot_json #> '{observation,last_action_at}') IS DISTINCT FROM 'null'::jsonb)",
+            &[&self.account_id, &self.campaign_id],
+        ).await.map_err(|_| WbAutomationPostgresError::Unavailable)?;
+        Ok(row.get(0))
+    }
+
     /// Startup is permitted only after two recent observations by the already
     /// registered robot, under the exact target policy and account lease.
     /// A healthy container or an operator-supplied boolean is not evidence.
