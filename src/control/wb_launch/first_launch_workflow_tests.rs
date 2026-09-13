@@ -14,12 +14,27 @@ async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_writ
         return;
     };
     let config: tokio_postgres::Config = url.parse().unwrap();
-    let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
-    store.verify_runtime_contract().await.unwrap();
-    for (offset, http, readback_status) in [(2, 200, 9), (3, 500, 9), (4, 200, 11)] {
+    for (offset, http, readback_status, continuation) in [
+        (2, 200, 9, false),
+        (3, 500, 9, false),
+        (4, 200, 11, false),
+        (0, 200, 9, true),
+    ] {
+        // Independent operator invocations: an ambiguous start deliberately
+        // discards its SQL session and fences reuse of that store instance.
+        let store = WbAutomationPostgresStore::connect(&config).await.unwrap();
+        store.verify_runtime_contract().await.unwrap();
         let success = http == 200 && readback_status == 9;
-        let id = ID + offset;
-        let fixture = Fixture::new(LaunchScope::FundAndStart);
+        let id = if continuation {
+            crate::control::wb_launch::continuation::CAMPAIGN_ID
+        } else {
+            ID + offset
+        };
+        let fixture = if continuation {
+            continued_workflow::fixture()
+        } else {
+            Fixture::new(LaunchScope::FundAndStart)
+        };
         let target = |status| details(id, NAME, &NMS, status, 922);
         let stock = json!({"data":{"items":NMS.iter().map(|nm|
             json!({"nmId":nm,"warehouseId":1,"quantity":25})).collect::<Vec<_>>()}});
@@ -117,9 +132,16 @@ async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_writ
         );
         lease.release().await.unwrap();
         let journal = fixture.journal();
-        journal
-            .receipt("create", &json!({"campaign_id":id,"wb_http":200}))
-            .unwrap();
+        if continuation {
+            assert_eq!(
+                journal.require_receipt("create").unwrap(),
+                json!({"campaign_id":id,"wb_http":200})
+            );
+        } else {
+            journal
+                .receipt("create", &json!({"campaign_id":id,"wb_http":200}))
+                .unwrap();
+        }
         journal
             .receipt(
                 "bids",

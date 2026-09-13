@@ -57,7 +57,7 @@ fn receipt_failure_responses(fixture: &Fixture, stage: &str) -> Vec<(u16, Value)
             (200, minimums()),
             (200, target(11, 922)),
             (200, json!({"total":0})),
-            (200, json!({"balance":1000})),
+            (200, json!({"balance":0,"net":1000})),
             (200, json!({"total":1000})),
             (200, json!({"total":1000})),
             (200, target(11, 922)),

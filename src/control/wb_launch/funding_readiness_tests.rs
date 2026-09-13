@@ -82,7 +82,7 @@ async fn protection_revoked_during_last_balance_read_prevents_deposit() {
         (200, minimums()),
         (200, target(11, 922)),
         (200, json!({"total":0})),
-        (200, json!({"balance":1000})),
+        (200, json!({"balance":0,"net":1000})),
     ]);
     let count = responses.len();
     let policy_path = fixture.manifest.robot_policy.clone();
