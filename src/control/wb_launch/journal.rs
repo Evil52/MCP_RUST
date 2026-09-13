@@ -25,6 +25,18 @@ mod tests;
 
 #[path = "recreate_journal.rs"]
 mod recreate;
+pub(super) fn validate_recreate(directory: &Path, manifest: &Value) -> Result<()> {
+    recreate::validate(directory, manifest)
+}
+
+/// A dangling symlink/partial file also fences a previously attempted stage.
+pub(super) fn entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
 
 pub(super) fn read_private_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     read_json(path, 0o077)
@@ -59,6 +71,7 @@ pub(super) struct Journal {
     directory: PathBuf,
     lock: Option<File>,
     recovery: bool,
+    continuation: bool,
 }
 
 impl Journal {
@@ -132,14 +145,27 @@ impl Journal {
             None
         };
         let recovery = manifest.get("recreate").is_some_and(|v| !v.is_null());
+        let continuation = manifest
+            .get("continue_created")
+            .is_some_and(|v| !v.is_null());
         let journal = Self {
             directory,
             lock,
             recovery,
+            continuation,
         };
+        if continuation {
+            super::continuation::validate(&journal.directory, manifest)?;
+        }
+        if writable && !continuation {
+            ensure!(
+                !entry_exists(&journal.directory.join("continue-manifest.json"))?,
+                "continuation authorization recorded; earlier writes forbidden"
+            );
+        }
         if recovery {
             recreate::validate(&journal.directory, manifest)?;
-        } else if writable {
+        } else if writable && !continuation {
             ensure!(
                 !journal
                     .directory
@@ -164,6 +190,15 @@ impl Journal {
             self.lock.is_some(),
             "read-only reconcile cannot write journal"
         );
+        if self.continuation {
+            ensure!(!name.starts_with("create"), "continuation cannot create");
+            let manifest = if name == "manifest" {
+                value.clone()
+            } else {
+                read_private_json(&self.path("manifest"))?
+            };
+            super::continuation::validate(&self.directory, &manifest)?;
+        }
         ensure!(
             !self.recovery || !name.starts_with("fund") && !name.starts_with("start"),
             "replacement create cannot fund or start"
@@ -180,23 +215,32 @@ impl Journal {
     }
 
     fn path(&self, name: &str) -> PathBuf {
-        let prefix = if self.recovery { "recreate-" } else { "" };
+        let prefix = if self.continuation && !name.starts_with("create-") {
+            "continue-"
+        } else if self.recovery || self.continuation {
+            "recreate-"
+        } else {
+            ""
+        };
         self.directory.join(format!("{prefix}{name}.json"))
     }
 
     pub(super) fn attempted(&self, stage: &str) -> bool {
-        self.path(&format!("{stage}-attempted")).exists()
+        entry_exists(&self.path(&format!("{stage}-attempted"))).unwrap_or(true)
     }
 
     pub(super) fn assert_not_attempted(&self, stage: &str) -> Result<()> {
         ensure!(
-            !self.attempted(stage),
+            !self.attempted(stage)
+                && !self.has_receipt(stage)
+                && !self.has_receipt(&format!("{stage}-response")),
             "{stage} already attempted; reconcile only, do not repeat"
         );
         Ok(())
     }
 
     pub(super) fn attempt(&self, stage: &str, evidence: &Value) -> Result<()> {
+        self.assert_not_attempted(stage)?;
         if self.recovery {
             let manifest = read_private_json(&self.path("manifest"))?;
             recreate::validate(&self.directory, &manifest)?;
@@ -212,7 +256,7 @@ impl Journal {
     }
 
     pub(super) fn has_receipt(&self, stage: &str) -> bool {
-        self.path(&format!("{stage}-receipt")).exists()
+        entry_exists(&self.path(&format!("{stage}-receipt"))).unwrap_or(true)
     }
 
     pub(super) fn require_receipt(&self, stage: &str) -> Result<Value> {

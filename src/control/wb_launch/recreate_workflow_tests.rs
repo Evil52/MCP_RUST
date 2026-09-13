@@ -1,6 +1,6 @@
 use super::*;
 
-fn fixture() -> Fixture {
+pub(super) fn fixture() -> Fixture {
     let mut fixture = Fixture::new(LaunchScope::CreateOnly);
     let mut old = fixture.manifest.clone();
     old.bids_kopecks = [
