@@ -16,6 +16,9 @@ pub(super) struct BaseUrls {
     pub(super) promotion: String,
     pub(super) marketplace: String,
     pub(super) finance: String,
+    pub(super) feedbacks: String,
+    pub(super) returns: String,
+    pub(super) supplies: String,
 }
 
 impl BaseUrls {
@@ -29,6 +32,9 @@ impl BaseUrls {
             promotion: PROMOTION_API_BASE_URL.to_owned(),
             marketplace: MARKETPLACE_API_BASE_URL.to_owned(),
             finance: FINANCE_API_BASE_URL.to_owned(),
+            feedbacks: "https://feedbacks-api.wildberries.ru".to_owned(),
+            returns: "https://returns-api.wildberries.ru".to_owned(),
+            supplies: "https://supplies-api.wildberries.ru".to_owned(),
         }
     }
 
@@ -43,6 +49,9 @@ impl BaseUrls {
             common: common.clone(),
             promotion: common.clone(),
             marketplace: common.clone(),
+            feedbacks: common.clone(),
+            returns: common.clone(),
+            supplies: common.clone(),
             finance: common,
         }
     }
@@ -57,6 +66,9 @@ impl BaseUrls {
             ApiHost::Promotion => &self.promotion,
             ApiHost::Marketplace => &self.marketplace,
             ApiHost::Finance => &self.finance,
+            ApiHost::Feedbacks => &self.feedbacks,
+            ApiHost::Returns => &self.returns,
+            ApiHost::Supplies => &self.supplies,
         }
     }
 }

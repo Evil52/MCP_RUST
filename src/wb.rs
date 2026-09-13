@@ -1,8 +1,38 @@
+mod constants;
+pub(crate) use constants::{
+    ACCEPTANCE_COEFFICIENTS_PATH, ACCEPTANCE_MIN_REQUEST_INTERVAL, ANALYTICS_API_BASE_URL,
+    ANALYTICS_MIN_REQUEST_INTERVAL, BASE_RETRY_DELAY, COMMISSION_MIN_REQUEST_INTERVAL,
+    COMMON_API_BASE_URL, CONTENT_API_BASE_URL, CONTENT_MIN_REQUEST_INTERVAL, FINANCE_API_BASE_URL,
+    FINANCE_DETAILS_PATH, FINANCE_MIN_REQUEST_INTERVAL, HTTP2_KEEP_ALIVE_INTERVAL,
+    LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL, MARKETPLACE_API_BASE_URL, MAX_ATTEMPTS,
+    MAX_CONNECT_TIMEOUT, MAX_ERROR_BODY_BYTES, MAX_GLOBAL_IN_FLIGHT_REQUESTS,
+    MAX_IN_FLIGHT_REQUESTS_PER_TOKEN, MAX_LOGICAL_REQUEST_DURATION, MAX_PROMOTION_BID_NM_IDS,
+    MAX_PROMOTION_CAMPAIGN_IDS, MAX_PROMOTION_CLUSTER_BID_ITEMS, MAX_PROMOTION_STATS_IDS,
+    MAX_REQUEST_ID_BYTES, MAX_RESPONSE_BODY_BYTES, MAX_RETRY_DELAY, MAX_SEARCH_ORDERS_PERIOD_DAYS,
+    MAX_SEARCH_PRODUCT_PERIOD_DAYS, MAX_SEARCH_REPORT_LIMIT, MAX_SEARCH_REPORT_NM_IDS,
+    MAX_SEARCH_REPORT_TEXTS, MAX_SEARCH_TEXT_BYTES, MAX_SELLER_STOCK_CHRT_IDS, MAX_WB_SIGNED_ID,
+    ORDERS_PATH, PING_MIN_REQUEST_INTERVAL, PING_PATH, POOL_IDLE_TIMEOUT, PRICES_API_BASE_URL,
+    PRICES_MIN_REQUEST_INTERVAL, PRODUCT_CARDS_PATH, PRODUCT_PRICES_PATH, PROMOTION_API_BASE_URL,
+    PROMOTION_BALANCE_PATH, PROMOTION_BUDGET_PATH, PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL,
+    PROMOTION_CAMPAIGNS_PATH, PROMOTION_CLUSTER_BIDS_MIN_REQUEST_INTERVAL,
+    PROMOTION_CLUSTER_BIDS_PATH, PROMOTION_DETAILS_PATH,
+    PROMOTION_MINIMUM_BIDS_MIN_REQUEST_INTERVAL, PROMOTION_MINIMUM_BIDS_PATH,
+    PROMOTION_RECOMMENDATIONS_MIN_REQUEST_INTERVAL, PROMOTION_RECOMMENDATIONS_PATH,
+    PROMOTION_STATS_MIN_REQUEST_INTERVAL, PROMOTION_STATS_PATH, SALES_FUNNEL_GROUPED_HISTORY_PATH,
+    SALES_FUNNEL_HISTORY_PATH, SALES_FUNNEL_PATH, SALES_PATH, SEARCH_ORDERS_POSITIONS_PATH,
+    SEARCH_PRODUCT_QUERIES_PATH, SEARCH_REPORT_MIN_REQUEST_INTERVAL,
+    SELLER_INVENTORY_MIN_REQUEST_INTERVAL, SELLER_STOCKS_PATH, SELLER_WAREHOUSES_PATH,
+    STATISTICS_API_BASE_URL, STATISTICS_MIN_REQUEST_INTERVAL, TARIFF_BOXES_PATH,
+    TARIFF_COMMISSIONS_PATH, TARIFF_PALLETS_PATH, TARIFF_RETURNS_PATH, TCP_KEEPALIVE,
+    WAREHOUSE_STOCKS_PATH,
+};
 mod finance;
 mod finance_quota;
 pub use finance::WbFinancePeriod;
 use finance_quota::FinanceAccess;
+mod coverage_policy;
 mod hosts;
+pub mod read_coverage;
 use hosts::BaseUrls;
 mod operator_reads;
 mod policy;
@@ -51,83 +81,6 @@ use tracing::{info, warn};
 use crate::marketplace_quota::SharedQuota;
 use crate::retry::RetryPolicy;
 use quota::read_quota_error;
-
-const ANALYTICS_API_BASE_URL: &str = "https://seller-analytics-api.wildberries.ru";
-const STATISTICS_API_BASE_URL: &str = "https://statistics-api.wildberries.ru";
-const CONTENT_API_BASE_URL: &str = "https://content-api.wildberries.ru";
-const PRICES_API_BASE_URL: &str = "https://discounts-prices-api.wildberries.ru";
-const COMMON_API_BASE_URL: &str = "https://common-api.wildberries.ru";
-const PROMOTION_API_BASE_URL: &str = "https://advert-api.wildberries.ru";
-const FINANCE_API_BASE_URL: &str = "https://finance-api.wildberries.ru";
-const MARKETPLACE_API_BASE_URL: &str = "https://marketplace-api.wildberries.ru";
-const FINANCE_DETAILS_PATH: &str = "/api/finance/v1/sales-reports/detailed";
-const FINANCE_MIN_REQUEST_INTERVAL: Duration = Duration::from_hours(12);
-const PING_PATH: &str = "/ping";
-const SALES_FUNNEL_PATH: &str = "/api/analytics/v3/sales-funnel/products";
-const SALES_FUNNEL_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/products/history";
-const SALES_FUNNEL_GROUPED_HISTORY_PATH: &str = "/api/analytics/v3/sales-funnel/grouped/history";
-const WAREHOUSE_STOCKS_PATH: &str = "/api/analytics/v1/stocks-report/wb-warehouses";
-const SELLER_WAREHOUSES_PATH: &str = "/api/v3/warehouses";
-const SELLER_STOCKS_PATH: &str = "/api/v3/stocks/{warehouseId}";
-const SELLER_INVENTORY_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
-const MAX_SELLER_STOCK_CHRT_IDS: usize = 1_000;
-const ORDERS_PATH: &str = "/api/v1/supplier/orders";
-const SALES_PATH: &str = "/api/v1/supplier/sales";
-const PRODUCT_CARDS_PATH: &str = "/content/v2/get/cards/list";
-const PRODUCT_PRICES_PATH: &str = "/api/v2/list/goods/filter";
-const TARIFF_COMMISSIONS_PATH: &str = "/api/v1/tariffs/commission";
-const TARIFF_BOXES_PATH: &str = "/api/v1/tariffs/box";
-const TARIFF_PALLETS_PATH: &str = "/api/v1/tariffs/pallet";
-const TARIFF_RETURNS_PATH: &str = "/api/v1/tariffs/return";
-const ACCEPTANCE_COEFFICIENTS_PATH: &str = "/api/tariffs/v1/acceptance/coefficients";
-pub(crate) const PROMOTION_CAMPAIGNS_PATH: &str = "/adv/v1/promotion/count";
-pub(crate) const PROMOTION_DETAILS_PATH: &str = "/api/advert/v2/adverts";
-pub(crate) const PROMOTION_BUDGET_PATH: &str = "/adv/v1/budget";
-pub(crate) const PROMOTION_BALANCE_PATH: &str = "/adv/v1/balance";
-pub(crate) const PROMOTION_STATS_PATH: &str = "/adv/v3/fullstats";
-pub(crate) const SEARCH_PRODUCT_QUERIES_PATH: &str = "/api/v2/search-report/product/search-texts";
-pub(crate) const SEARCH_ORDERS_POSITIONS_PATH: &str = "/api/v2/search-report/product/orders";
-pub(crate) const PROMOTION_MINIMUM_BIDS_PATH: &str = "/api/advert/v1/bids/min";
-pub(crate) const PROMOTION_RECOMMENDATIONS_PATH: &str = "/api/advert/v0/bids/recommendations";
-pub(crate) const PROMOTION_CLUSTER_BIDS_PATH: &str = "/adv/v0/normquery/get-bids";
-const MAX_RESPONSE_BODY_BYTES: usize = 2 * 1_048_576;
-const MAX_ERROR_BODY_BYTES: usize = 4_096;
-const MAX_ATTEMPTS: usize = 3;
-const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_IN_FLIGHT_REQUESTS_PER_TOKEN: usize = 4;
-const MAX_GLOBAL_IN_FLIGHT_REQUESTS: usize = 8;
-const MAX_REQUEST_ID_BYTES: usize = 128;
-const PING_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
-const ANALYTICS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
-const STATISTICS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
-const CONTENT_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(600);
-const PRICES_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(600);
-const COMMISSION_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(60);
-const LOGISTICS_TARIFF_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
-const ACCEPTANCE_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
-const PROMOTION_CAMPAIGN_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(250);
-const PROMOTION_STATS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
-const SEARCH_REPORT_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(20);
-const PROMOTION_MINIMUM_BIDS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
-const PROMOTION_RECOMMENDATIONS_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(12);
-const PROMOTION_CLUSTER_BIDS_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(200);
-const MAX_PROMOTION_CAMPAIGN_IDS: usize = 50;
-const MAX_PROMOTION_STATS_IDS: usize = 50;
-const MAX_SEARCH_REPORT_NM_IDS: usize = 50;
-const MAX_SEARCH_REPORT_TEXTS: usize = 30;
-const MAX_SEARCH_REPORT_LIMIT: u32 = 30;
-const MAX_SEARCH_PRODUCT_PERIOD_DAYS: i64 = 31;
-const MAX_SEARCH_ORDERS_PERIOD_DAYS: i64 = 7;
-const MAX_PROMOTION_BID_NM_IDS: usize = 100;
-const MAX_PROMOTION_CLUSTER_BID_ITEMS: usize = 100;
-const MAX_WB_SIGNED_ID: u64 = i64::MAX as u64;
-const MAX_SEARCH_TEXT_BYTES: usize = 256;
-const BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-const MAX_LOGICAL_REQUEST_DURATION: Duration = Duration::from_secs(60);
-const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
-const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WbErrorKind {
@@ -380,6 +333,10 @@ struct TokenLimiter {
     promotion_recommendations: PacingGate,
     promotion_cluster_bids: PacingGate,
     seller_inventory: PacingGate,
+    feedback_reports: PacingGate,
+    return_claims: PacingGate,
+    supply_reports: PacingGate,
+    card_errors: PacingGate,
     finance_reports: PacingGate,
     finance_access: FinanceAccess,
 }
@@ -404,6 +361,10 @@ impl TokenLimiter {
             promotion_recommendations: PacingGate::new(),
             promotion_cluster_bids: PacingGate::new(),
             seller_inventory: PacingGate::new(),
+            feedback_reports: PacingGate::new(),
+            return_claims: PacingGate::new(),
+            supply_reports: PacingGate::new(),
+            card_errors: PacingGate::new(),
             finance_reports: PacingGate::new(),
             finance_access: FinanceAccess::new(),
         }
@@ -427,6 +388,10 @@ impl TokenLimiter {
             RequestClass::PromotionRecommendedBids => &self.promotion_recommendations,
             RequestClass::PromotionClusterBids => &self.promotion_cluster_bids,
             RequestClass::SellerInventory => &self.seller_inventory,
+            RequestClass::FeedbackReport => &self.feedback_reports,
+            RequestClass::ReturnClaims => &self.return_claims,
+            RequestClass::SupplyReport => &self.supply_reports,
+            RequestClass::CardErrors => &self.card_errors,
             RequestClass::FinanceReport => &self.finance_reports,
         }
     }
@@ -1291,6 +1256,7 @@ fn transport_failure_outcome(
 #[cfg(test)]
 mod tests {
     use super::policy::READ_ONLY_ENDPOINT_ALLOWLIST;
+    mod read_coverage;
     mod reporting_admission;
     mod seller_inventory;
 
@@ -2211,6 +2177,9 @@ mod tests {
             credentials(),
             BaseUrls {
                 finance: "http://127.0.0.1:1".to_owned(),
+                feedbacks: "http://127.0.0.1:1".to_owned(),
+                returns: "http://127.0.0.1:1".to_owned(),
+                supplies: "http://127.0.0.1:1".to_owned(),
                 analytics,
                 statistics,
                 content,
@@ -2359,6 +2328,9 @@ mod tests {
             credentials(),
             BaseUrls {
                 finance: "http://127.0.0.1:1".to_owned(),
+                feedbacks: "http://127.0.0.1:1".to_owned(),
+                returns: "http://127.0.0.1:1".to_owned(),
+                supplies: "http://127.0.0.1:1".to_owned(),
                 analytics,
                 statistics: unreachable.clone(),
                 content: unreachable.clone(),
