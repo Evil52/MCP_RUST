@@ -138,7 +138,11 @@ async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_writ
         let result = operator
             .execute_start(&journal, id, &policy, &observer, &store)
             .await;
-        assert_eq!(result.is_ok(), success, "{result:?}");
+        assert_eq!(
+            result.is_ok(),
+            success,
+            "unexpected start outcome for mock HTTP {http}, readback status {readback_status}"
+        );
         assert!(journal.attempted("start"));
         assert_eq!(journal.has_receipt("start"), success);
         assert!(
