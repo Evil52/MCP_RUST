@@ -71,13 +71,7 @@ def private_file(path, flags):
 
 
 def deliver(command, state_dir, findings, report, timeout):
-    directory = Path(state_dir)
-    if directory.is_symlink():
-        raise ValueError("notification state directory cannot be a symlink")
-    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
-    info = directory.stat()
-    if stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid():
-        raise ValueError("notification state directory must be private")
+    directory = private_state_directory(state_dir)
     keys = sorted(set(findings))
     destination = hook_identity(command)
     fingerprint = hashlib.sha256(json.dumps(keys, separators=(",", ":")).encode()).hexdigest()
@@ -87,20 +81,7 @@ def deliver(command, state_dir, findings, report, timeout):
         except BlockingIOError:
             raise ValueError("notification delivery is already in progress") from None
         state_path = directory / "delivered.json"
-        previous = None
-        if state_path.exists() or state_path.is_symlink():
-            with os.fdopen(private_file(state_path, os.O_RDONLY)) as state:
-                previous = json.loads(state.read(4097))
-            if (not isinstance(previous, dict) or previous.get("version") != 1
-                    or not isinstance(previous.get("fingerprint"), str)
-                    or not re.fullmatch("[0-9a-f]{64}", previous["fingerprint"])
-                    or type(previous.get("finding_count")) is not int
-                    or not 0 <= previous["finding_count"] <= 1000):
-                raise ValueError("notification state has an invalid contract")
-            if previous.get("hook_identity") != destination:
-                # A replacement receiver must see ongoing incidents. An old
-                # receiver's alert is not evidence of delivery to this one.
-                previous = None
+        previous = previous_delivery(state_path, destination)
         if previous and previous["fingerprint"] == fingerprint:
             return "unchanged"
         if keys:
@@ -113,18 +94,52 @@ def deliver(command, state_dir, findings, report, timeout):
         run_hook(command, body, event, timeout)
         # A failed delivery never advances dedup state. A crash between the
         # external acknowledgement and this replace can repeat an event.
-        with tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=".delivered-", delete=False) as output:
-            temporary = Path(output.name)
-            json.dump({"version": 1, "fingerprint": fingerprint, "finding_count": len(keys),
-                       "hook_identity": destination}, output)
-            output.flush()
-            os.fsync(output.fileno())
-        try:
-            temporary.chmod(0o600)
-            temporary.replace(state_path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        record_delivery(state_path, {"version": 1, "fingerprint": fingerprint,
+                                     "finding_count": len(keys), "hook_identity": destination})
         return event
+
+
+def private_state_directory(state_dir):
+    directory = Path(state_dir)
+    if directory.is_symlink():
+        raise ValueError("notification state directory cannot be a symlink")
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = directory.stat()
+    if stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid():
+        raise ValueError("notification state directory must be private")
+    return directory
+
+
+def previous_delivery(state_path, destination):
+    """The validated last delivery to this hook, or None when there is none."""
+    if not (state_path.exists() or state_path.is_symlink()):
+        return None
+    with os.fdopen(private_file(state_path, os.O_RDONLY)) as state:
+        previous = json.loads(state.read(4097))
+    if (not isinstance(previous, dict) or previous.get("version") != 1
+            or not isinstance(previous.get("fingerprint"), str)
+            or not re.fullmatch("[0-9a-f]{64}", previous["fingerprint"])
+            or type(previous.get("finding_count")) is not int
+            or not 0 <= previous["finding_count"] <= 1000):
+        raise ValueError("notification state has an invalid contract")
+    if previous.get("hook_identity") != destination:
+        # A replacement receiver must see ongoing incidents. An old
+        # receiver's alert is not evidence of delivery to this one.
+        return None
+    return previous
+
+
+def record_delivery(state_path, record):
+    with tempfile.NamedTemporaryFile(mode="w", dir=state_path.parent, prefix=".delivered-", delete=False) as output:
+        temporary = Path(output.name)
+        json.dump(record, output)
+        output.flush()
+        os.fsync(output.fileno())
+    try:
+        temporary.chmod(0o600)
+        temporary.replace(state_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def timeout_seconds(value):

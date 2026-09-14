@@ -4,6 +4,8 @@
 //! ruble amounts into integer kopecks. It performs no I/O and never retains
 //! product titles, buyer data, credentials, or upstream error bodies.
 
+mod campaign_day;
+use campaign_day::campaign_day_product_rows;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write,
@@ -330,21 +332,7 @@ fn parse_campaign_day(
     campaign_id: u64,
     totals: &mut BTreeMap<(NaiveDate, u64, u64), AdvertisingTotals>,
 ) -> Result<(), WbReportParseError> {
-    let mut product_rows = Vec::new();
-    if let Some(apps) = day.get("apps") {
-        for app in array(apps)? {
-            let app = object(app)?;
-            // Fullstats v3 uses nms. Reject ambiguous dual shapes.
-            if app.contains_key("nm") && app.contains_key("nms") {
-                return Err(WbReportParseError::Shape);
-            }
-            if let Some(products) = app.get("nms").or_else(|| app.get("nm")) {
-                for product in array(products)? {
-                    product_rows.push(object(product)?);
-                }
-            }
-        }
-    }
+    let product_rows = campaign_day_product_rows(day)?;
     if product_rows.is_empty() {
         add_advertising_row(day, campaign_id, 0, totals)
     } else {

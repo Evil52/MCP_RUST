@@ -13,8 +13,8 @@ use crate::reporting::{
     },
     wb_finance_source::{WB_FINANCE_MAX_ROWS, WbFinanceDetailRow},
     wb_official_reconciliation::{
-        WB_OFFICIAL_MAPPING_VERSION, WbOfficialComparison, WbOfficialComparisonStatus,
-        reconcile_wb_official_report,
+        WB_OFFICIAL_MAPPING_VERSION, WbOfficialColumnComparison, WbOfficialComparison,
+        WbOfficialComparisonStatus, WbOfficialUnavailable, reconcile_wb_official_report,
     },
     wb_report_repository::{
         StoredWbOfficialReport, WbReportRepositoryError, read_wb_official_report_page,
@@ -343,53 +343,73 @@ fn validate_comparison(comparison: &WbOfficialComparison) -> Result<(), Reportin
         .iter()
         .zip([("retailAmount", "retailAmountSum"), ("forPay", "forPaySum")])
     {
-        let amounts_valid = [column.detail_total, column.summary_total, column.difference]
-            .into_iter()
-            .flatten()
-            .all(|amount| amount.scale <= 18);
-        if !amounts_valid {
-            return Err(ReportingReadError::InvalidPublishedData);
-        }
-        let status_valid = match column.status {
-            WbOfficialComparisonStatus::PrimaryTotalsMatch => {
-                column
-                    .difference
-                    .is_some_and(|difference| difference.units == 0)
-                    && column.unavailable_reason.is_none()
-            }
-            WbOfficialComparisonStatus::Mismatch => {
-                column
-                    .difference
-                    .is_some_and(|difference| difference.units != 0)
-                    && column.unavailable_reason.is_none()
-            }
-            WbOfficialComparisonStatus::Unavailable => {
-                column.difference.is_none() && column.unavailable_reason.is_some()
-            }
-        };
-        let expected_difference = column
-            .detail_total
-            .zip(column.summary_total)
-            .map(|(detail, summary)| subtract(detail, summary))
-            .transpose()?;
-        let difference_valid =
-            expected_difference.map(normalize_amount) == column.difference.map(normalize_amount);
-        if column.detail_column != detail
-            || column.summary_column != summary
-            || !status_valid
-            || !difference_valid
-        {
-            return Err(ReportingReadError::InvalidPublishedData);
-        }
+        validate_comparison_column(column, detail, summary)?;
     }
-    let reason = comparison
-        .columns
-        .iter()
-        .find_map(|column| column.unavailable_reason);
-    let expected = if reason.is_some() {
+    let (expected, reason) = expected_comparison_status(&comparison.columns);
+    if comparison.status != expected || comparison.unavailable_reason != reason {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+    Ok(())
+}
+
+/// Checks one column against its fixed detail/summary pair: bounded scales, a
+/// status consistent with its difference, and an exact detail-minus-summary
+/// difference.
+fn validate_comparison_column(
+    column: &WbOfficialColumnComparison,
+    detail: &str,
+    summary: &str,
+) -> Result<(), ReportingReadError> {
+    let amounts_valid = [column.detail_total, column.summary_total, column.difference]
+        .into_iter()
+        .flatten()
+        .all(|amount| amount.scale <= 18);
+    if !amounts_valid {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+    let status_valid = match column.status {
+        WbOfficialComparisonStatus::PrimaryTotalsMatch => {
+            column
+                .difference
+                .is_some_and(|difference| difference.units == 0)
+                && column.unavailable_reason.is_none()
+        }
+        WbOfficialComparisonStatus::Mismatch => {
+            column
+                .difference
+                .is_some_and(|difference| difference.units != 0)
+                && column.unavailable_reason.is_none()
+        }
+        WbOfficialComparisonStatus::Unavailable => {
+            column.difference.is_none() && column.unavailable_reason.is_some()
+        }
+    };
+    let expected_difference = column
+        .detail_total
+        .zip(column.summary_total)
+        .map(|(detail, summary)| subtract(detail, summary))
+        .transpose()?;
+    let difference_valid =
+        expected_difference.map(normalize_amount) == column.difference.map(normalize_amount);
+    if column.detail_column != detail
+        || column.summary_column != summary
+        || !status_valid
+        || !difference_valid
+    {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+    Ok(())
+}
+
+/// The report-level status the columns imply: any unavailable reason wins,
+/// then any mismatch, otherwise the primary totals match.
+fn expected_comparison_status(
+    columns: &[WbOfficialColumnComparison],
+) -> (WbOfficialComparisonStatus, Option<WbOfficialUnavailable>) {
+    let reason = columns.iter().find_map(|column| column.unavailable_reason);
+    let status = if reason.is_some() {
         WbOfficialComparisonStatus::Unavailable
-    } else if comparison
-        .columns
+    } else if columns
         .iter()
         .any(|column| column.status == WbOfficialComparisonStatus::Mismatch)
     {
@@ -397,10 +417,7 @@ fn validate_comparison(comparison: &WbOfficialComparison) -> Result<(), Reportin
     } else {
         WbOfficialComparisonStatus::PrimaryTotalsMatch
     };
-    if comparison.status != expected || comparison.unavailable_reason != reason {
-        return Err(ReportingReadError::InvalidPublishedData);
-    }
-    Ok(())
+    (status, reason)
 }
 
 fn subtract(
