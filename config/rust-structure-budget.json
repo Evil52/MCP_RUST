@@ -1,7 +1,7 @@
 {
   "max_new_file_lines": 1000,
   "legacy_file_lines": {
-    "src/auth.rs": 1911,
+    "src/auth.rs": 1893,
     "src/bin/report-collector.rs": 1026,
     "src/bin/wb-automation.rs": 2002,
     "src/config.rs": 3368,
