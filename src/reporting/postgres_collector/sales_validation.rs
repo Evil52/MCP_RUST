@@ -33,7 +33,12 @@ pub(super) fn validate_metadata(
     status: SnapshotStatus,
     pagination_complete: bool,
 ) -> Result<u32, PostgresCollectorError> {
-    let reason = if facts.len() > MAX_FACT_ROWS {
+    let max_rows = if matches!(facts, CollectedFacts::SellerStocks(_)) {
+        super::seller_stocks::MAX_SIZE_PAIRS
+    } else {
+        MAX_FACT_ROWS
+    };
+    let reason = if facts.len() > max_rows {
         Some("row_limit")
     } else if version.is_empty()
         || version.len() > MAX_COLLECTOR_VERSION_BYTES
@@ -44,6 +49,10 @@ pub(super) fn validate_metadata(
         Some("invalid_collector_version")
     } else if status == SnapshotStatus::Succeeded && !pagination_complete {
         Some("incomplete_pagination")
+    } else if status == SnapshotStatus::Succeeded
+        && matches!(facts, CollectedFacts::SellerStocks(rows) if rows.iter().any(|row| row.sellable_units.is_none()))
+    {
+        Some("incomplete_seller_coverage")
     } else {
         None
     };

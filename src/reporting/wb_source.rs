@@ -1,5 +1,7 @@
 //! Bounded read-only Wildberries source for daily reports.
 
+mod stocks;
+
 use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -471,36 +473,6 @@ impl WbReportSource {
         Err(WbReportSourceError::PaginationLimit)
     }
 
-    pub async fn collect_stock_pages(
-        &self,
-    ) -> Result<Vec<CollectedStockFact>, WbReportSourceError> {
-        self.collect_stock_pages_with_limit(MAX_PAGES).await
-    }
-
-    async fn collect_stock_pages_with_limit(
-        &self,
-        max_pages: usize,
-    ) -> Result<Vec<CollectedStockFact>, WbReportSourceError> {
-        let mut facts = Vec::new();
-        for page in 0..max_pages {
-            let offset = page_offset(page, PAGE_SIZE_U32)?;
-            let (rows, source_rows) =
-                checkpointed(&self.checkpoints, json!(["wb_stock", offset]), || async {
-                    parse_stock_page(&self.transport.stock_page(PAGE_SIZE_U32, offset).await?)
-                        .map_err(|_| WbReportSourceError::InvalidStockResponse)
-                })
-                .await?;
-            // Multiple chrt rows can normalize into one SKU/warehouse fact.
-            // Only the raw response count proves that the page was short.
-            let complete = source_rows < PAGE_SIZE;
-            facts.extend(rows);
-            if complete {
-                return Ok(facts);
-            }
-        }
-        Err(WbReportSourceError::PaginationLimit)
-    }
-
     pub async fn collect_price_pages(
         &self,
     ) -> Result<Vec<CollectedPriceFact>, WbReportSourceError> {
@@ -542,6 +514,7 @@ mod tests {
     use crate::{reporting::checkpoint::CheckpointError, wb::WbErrorKind};
     mod admission;
     mod sales;
+    mod stocks;
 
     use std::{
         collections::BTreeMap,
@@ -558,6 +531,7 @@ mod tests {
     #[derive(Clone)]
     struct FixtureTransport {
         stocks: Arc<Mutex<VecDeque<Value>>>,
+        requested_stocks: Arc<Mutex<Vec<(u32, u32)>>>,
         prices: Arc<Mutex<VecDeque<Value>>>,
         campaign_ids: Value,
         stats: Arc<Mutex<VecDeque<Result<Value, WbReportSourceError>>>>,
@@ -618,6 +592,7 @@ mod tests {
                 stocks: Arc::new(Mutex::new(VecDeque::from([json!({"data":{"items":[
                     {"nmId":1,"warehouseId":2,"quantity":3}
                 ]}})]))),
+                requested_stocks: Arc::new(Mutex::new(Vec::new())),
                 prices: Arc::new(Mutex::new(VecDeque::from([json!({"data":{"listGoods":[{
                     "nmID":1,"currencyIsoCode4217":"RUB",
                     "sizes":[{"price":100,"discountedPrice":90}]
@@ -666,11 +641,12 @@ mod tests {
 
         fn stock_page<'a>(
             &'a self,
-            _limit: u32,
-            _offset: u32,
+            limit: u32,
+            offset: u32,
         ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-            Box::pin(async {
+            Box::pin(async move {
                 self.calls.lock().unwrap().push("stocks");
+                self.requested_stocks.lock().unwrap().push((limit, offset));
                 self.stocks
                     .lock()
                     .unwrap()

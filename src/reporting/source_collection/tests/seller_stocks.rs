@@ -107,7 +107,7 @@ async fn seller_stock_quotas_survive_restart_and_cannot_bypass_analytics_or_othe
 }
 
 #[tokio::test]
-async fn complete_stock_publication_keeps_seller_warehouses_distinct_from_fbw() {
+async fn scheduled_fbw_publication_is_independent_of_seller_checkpoints() {
     let (Ok(admin_url), Ok(collector_url)) = (
         std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL"),
         std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL"),
@@ -137,8 +137,8 @@ async fn complete_stock_publication_keeps_seller_warehouses_distinct_from_fbw() 
     let claim = fixture.claim().await;
     for (identity, page) in [
         (
-            json!(["wb_stock", 0]),
-            json!([[{"sku":7,"warehouse_id":"wb:10","sellable_units":3}],1]),
+            json!(["wb_stock_v2", 1_000, 0]),
+            json!({"facts":[{"sku":7,"warehouse_id":"wb:10","sellable_units":3}],"source_rows":1,"sizes":[]}),
         ),
         (
             json!(["wb_seller_warehouses_v1"]),
@@ -169,13 +169,9 @@ async fn complete_stock_publication_keeps_seller_warehouses_distinct_from_fbw() 
     );
     assert_eq!(fixture.state(&claim).await.0, "published");
     let rows=fixture.admin.query("SELECT warehouse_id,sellable_units::bigint FROM daily_reporting.mcp_stock_facts WHERE account_id=$1 ORDER BY warehouse_id",&[&target.account_id]).await.unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 1);
     assert_eq!(
         (rows[0].get::<_, String>(0), rows[0].get::<_, i64>(1)),
         ("wb:10".into(), 3)
-    );
-    assert_eq!(
-        (rows[1].get::<_, String>(0), rows[1].get::<_, i64>(1)),
-        ("wb:seller:1:10".into(), 5)
     );
 }

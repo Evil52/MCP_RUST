@@ -3,9 +3,9 @@
 use super::quota::{read_quota_error, vendor_quota_cooldown};
 use super::{
     AttemptContext, AttemptOutcome, ClientPolicy, DateTime, Duration, HeaderMap, Instant,
-    MAX_ERROR_BODY_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESPONSE_BODY_BYTES, RETRY_AFTER, RequestClass,
-    Response, StatusCode, Utc, Value, WbClient, WbError, WbErrorKind, classify_http_status, info,
-    warn,
+    MAX_ERROR_BODY_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESPONSE_BODY_BYTES, Method, RETRY_AFTER,
+    RequestClass, Response, StatusCode, Utc, Value, WAREHOUSE_STOCKS_PATH, WbClient, WbError,
+    WbErrorKind, classify_http_status, info, warn,
 };
 use crate::marketplace_quota::QuotaKey;
 
@@ -369,7 +369,26 @@ impl WbClient {
             return Ok(AttemptOutcome::NoContent);
         }
 
-        let result = if context.request_class == RequestClass::FinanceReport
+        let result = if status == StatusCode::NO_CONTENT
+            && *context.method == Method::POST
+            && context.endpoint == "analytics:/api/analytics/v1/stocks-report/wb-warehouses"
+        {
+            // This endpoint documents 204 as no data. Preserve that evidence
+            // separately from a JSON response or a confirmed stock quantity.
+            read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref())
+                .await
+                .map(|_| {
+                    serde_json::json!({
+                        "data": {"items": []},
+                        "meta": {
+                            "upstream_status": status.as_u16(),
+                            "data_state": "no_data",
+                            "source_endpoint": WAREHOUSE_STOCKS_PATH,
+                            "request_id": request_id,
+                        },
+                    })
+                })
+        } else if context.request_class == RequestClass::FinanceReport
             && status.is_success()
             && status != StatusCode::OK
         {

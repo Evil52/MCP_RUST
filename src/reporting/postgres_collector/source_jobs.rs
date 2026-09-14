@@ -93,6 +93,11 @@ impl PostgresSnapshotWriter {
             .await.map_err(|_| PostgresCollectorError::Unavailable)?;
         client.prepare("SELECT payload FROM daily_reporting.source_collection_pages WHERE job_id=$1 AND request_key=$2")
             .await.map_err(|_| PostgresCollectorError::Unavailable)?;
+        let seller = client.query_one("SELECT has_table_privilege(current_user, 'daily_reporting.seller_stock_facts', 'INSERT') AND NOT has_table_privilege(current_user, 'daily_reporting.seller_stock_facts', 'UPDATE,DELETE')", &[])
+            .await.map_err(|_| PostgresCollectorError::Unavailable)?;
+        if !seller.get::<_, bool>(0) {
+            return Err(PostgresCollectorError::Unavailable);
+        }
         client
             .prepare("SELECT daily_reporting.restart_overlapping_sales($1,$2,$3), daily_reporting.admit_source_page($1,$2,$3,$4)")
             .await
@@ -148,7 +153,9 @@ impl PostgresSnapshotWriter {
             .await
             .map_err(|_| PostgresCollectorError::Unavailable)?;
         for target in targets {
-            for source in &target.sources {
+            let seller = (target.marketplace == Marketplace::Wildberries)
+                .then_some(SnapshotSource::SellerStocks);
+            for source in target.sources.iter().chain(seller.iter()) {
                 tx.execute(
                     "SELECT daily_reporting.enqueue_source_collection($1,$2,$3,$4,$5,$6)",
                     &[
@@ -206,6 +213,7 @@ impl PostgresSnapshotWriter {
                 source: match row.get::<_, &str>("source") {
                     "sales" => SnapshotSource::Sales,
                     "stocks" => SnapshotSource::Stocks,
+                    "seller_stocks" => SnapshotSource::SellerStocks,
                     "prices" => SnapshotSource::Prices,
                     "advertising" => SnapshotSource::Advertising,
                     "finance" => SnapshotSource::Finance,
@@ -297,6 +305,12 @@ impl PostgresSnapshotWriter {
             claim.source,
             SnapshotSource::Sales | SnapshotSource::Advertising | SnapshotSource::Finance
         );
+        let status = if matches!(&facts, CollectedFacts::SellerStocks(rows) if rows.iter().any(|row| row.sellable_units.is_none()))
+        {
+            SnapshotStatus::Partial
+        } else {
+            SnapshotStatus::Succeeded
+        };
         let mut snapshot = CollectedSnapshot::new(
             c.account_id.clone(),
             c.marketplace,
@@ -304,7 +318,7 @@ impl PostgresSnapshotWriter {
             observed,
             if period { claim.period_start } else { observed },
             if period { claim.period_end } else { observed },
-            SnapshotStatus::Succeeded,
+            status,
             true,
             version.to_owned(),
             facts,

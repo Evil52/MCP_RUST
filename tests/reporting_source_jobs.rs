@@ -14,6 +14,11 @@ use serde_json::json;
 use std::{str::FromStr, sync::Arc};
 use tokio_postgres::{Client, Config, NoTls};
 
+#[path = "reporting_source_jobs/fbs_publication.rs"]
+mod fbs_publication;
+#[path = "reporting_source_jobs/stock_recovery.rs"]
+mod stock_recovery;
+
 async fn connect(url: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
     tokio::spawn(async move {
@@ -216,7 +221,7 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
             .await
             .unwrap()
             .get::<_, i64>(0),
-        4
+        5
     );
     select_source(&admin, &account, "prices").await;
     let first = claim(&writer, &target).await;
@@ -501,6 +506,57 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
             .unwrap()
             .is_none()
     );
+    // An optional same-cutoff FBS job must neither fail the standard refresh
+    // nor add a fifth snapshot to its four-source completion count.
+    collector.execute(
+        "SELECT daily_reporting.enqueue_source_collection(account_id,marketplace,'seller_stocks',cutoff_at,period_start,period_end) FROM daily_reporting.source_collection_jobs WHERE account_id=$1 AND source='stocks'",
+        &[&refresh_account],
+    ).await.unwrap();
+    select_source(&admin, &refresh_account, "seller_stocks").await;
+    let optional = claim(&restarted, &refresh_target).await;
+    checkpointed(
+        &restarted.source_checkpoints(&optional),
+        json!(["optional_refresh_fbs", 0]),
+        || async { Ok::<_, CheckpointError>(Vec::<i32>::new()) },
+    )
+    .await
+    .unwrap();
+    restarted
+        .defer_source_job(&optional, Some("invalid_json"), 1, true)
+        .await
+        .unwrap();
+    restarted
+        .dispatch_source_refreshes(std::slice::from_ref(&refresh_target))
+        .await
+        .unwrap();
+    assert_eq!(
+        admin
+            .query_one(
+                "SELECT status FROM daily_reporting.ozon_sales_refresh_requests WHERE id=$1",
+                &[&request_id],
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "queued",
+        "a failed optional FBS job must not terminate the standard refresh"
+    );
+    let resumed = admin.query_one(
+        "SELECT daily_reporting.resume_stock_collection(account_id,marketplace,id,generation,error_class,'fixed optional FBS parser') FROM daily_reporting.source_collection_jobs WHERE account_id=$1 AND source='seller_stocks'",
+        &[&refresh_account],
+    ).await.unwrap().get::<_, bool>(0);
+    assert!(resumed);
+    select_source(&admin, &refresh_account, "seller_stocks").await;
+    let optional = claim(&restarted, &refresh_target).await;
+    restarted
+        .publish_source_job(
+            &optional,
+            CollectedFacts::SellerStocks(vec![]),
+            vec![],
+            "test",
+        )
+        .await
+        .unwrap();
     for (name, facts) in [
         ("prices", CollectedFacts::Prices(vec![])),
         ("stocks", CollectedFacts::Stocks(vec![])),
@@ -541,4 +597,6 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
             }
         );
     }
+    stock_recovery::verify(&admin, &collector, &reader_db, &reader, &restarted).await;
+    fbs_publication::verify(&admin, &collector, &reader, &restarted).await;
 }

@@ -227,10 +227,21 @@ async fn collect(
         ),
         (Marketplace::Wildberries, SnapshotSource::Stocks) => CollectedFacts::Stocks(
             wb_source(config, writer, claim)?
-                .collect_complete_stock_pages()
+                .collect_stock_pages()
                 .await
                 .map_err(|error| error.failure())?,
         ),
+        (Marketplace::Wildberries, SnapshotSource::SellerStocks) => {
+            let (client, account) = config
+                .resolve_wb_scheduled(claim.credential_claim())
+                .map_err(|_| "credentials_unavailable")?;
+            CollectedFacts::SellerStocks(
+                super::wb_seller_source::WbSellerSource::new(client, account)
+                    .with_checkpoints(writer.source_checkpoints(claim))
+                    .collect()
+                    .await?,
+            )
+        }
         (Marketplace::Wildberries, SnapshotSource::Prices) => CollectedFacts::Prices(
             wb_source(config, writer, claim)?
                 .collect_price_pages()
@@ -243,7 +254,8 @@ async fn collect(
                 .await
                 .map_err(|error| error.failure())?,
         ),
-        (Marketplace::Wildberries, SnapshotSource::Finance) => return Err("source_invalid".into()),
+        (Marketplace::Wildberries, SnapshotSource::Finance)
+        | (Marketplace::Ozon, SnapshotSource::SellerStocks) => return Err("source_invalid".into()),
     };
     Ok((facts, Vec::new()))
 }
