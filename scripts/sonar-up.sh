@@ -8,6 +8,15 @@ stack_env="$project_root/.sonar-stack.env"
 sonar_url="http://127.0.0.1:9000"
 
 if [[ ! -f "$stack_env" ]]; then
+  # The Compose project name is fixed, so every clone and worktree shares one
+  # database volume. Fresh credentials would recreate the containers with a
+  # password the initialized database does not accept.
+  if docker volume inspect mcp-ozon-sonar_postgresql_data >/dev/null 2>&1; then
+    echo "SonarQube data already exists in volume mcp-ozon-sonar_postgresql_data," >&2
+    echo "but this checkout has no .sonar-stack.env. Copy .sonar-stack.env and" >&2
+    echo ".sonar.env (mode 600) from the checkout that created the stack." >&2
+    exit 1
+  fi
   if ! command -v openssl >/dev/null 2>&1; then
     echo "openssl is required to generate the local SonarQube database password." >&2
     exit 1
