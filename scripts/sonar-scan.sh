@@ -56,12 +56,13 @@ if [[ "$SONAR_HOST_URL" == "http://127.0.0.1:9000" ]] \
   fi
 fi
 
-if [[ ! -s "$project_root/target/sonar/test-executions.xml" ]] \
-  || [[ ! -s "$project_root/target/sonar/lcov.info" ]] \
-  || [[ ! -s "$project_root/target/sonar/clippy.json" ]]; then
-  echo "Sonar reports are missing. Run ./scripts/sonar-reports.sh first." >&2
-  exit 1
-fi
+for report in test-executions.xml lcov.info clippy.json python-coverage.xml \
+  shellcheck-issues.json zizmor.sarif; do
+  if [[ ! -s "$project_root/target/sonar/$report" ]]; then
+    echo "Sonar report $report is missing. Run ./scripts/sonar-reports.sh first." >&2
+    exit 1
+  fi
+done
 
 if [[ -z "${SONAR_TOKEN:-}" ]]; then
   read -r -s -p "Sonar token: " SONAR_TOKEN
@@ -92,26 +93,53 @@ if [[ "$token_status" != "200" ]]; then
   exit 1
 fi
 
+snapshot_dir="$(mktemp -d)"
+
 cleanup() {
   docker rm -f "$scanner_container" >/dev/null 2>&1 || true
+  rm -rf "$snapshot_dir"
 }
 trap cleanup EXIT
 
+# The text and secrets sensor applies sonar.text.inclusions (shell, SQL, conf)
+# only inside a git repository, and the container runs as another uid.
 docker create \
   --name "$scanner_container" \
   --platform linux/amd64 \
   --env SONAR_HOST_URL="$scanner_host_url" \
   --env SONAR_TOKEN \
+  --env GIT_CONFIG_COUNT=1 \
+  --env GIT_CONFIG_KEY_0=safe.directory \
+  --env GIT_CONFIG_VALUE_0=/usr/src \
   --workdir /usr/src \
   "$scanner_image" >/dev/null
 
-echo "Copying project files and Sonar reports..."
-docker cp "$project_root/Cargo.toml" "$scanner_container:/usr/src/Cargo.toml" >/dev/null
-docker cp "$project_root/Cargo.lock" "$scanner_container:/usr/src/Cargo.lock" >/dev/null
-docker cp "$project_root/sonar-project.properties" "$scanner_container:/usr/src/sonar-project.properties" >/dev/null
-docker cp "$project_root/crates" "$scanner_container:/usr/src/crates" >/dev/null
-docker cp "$project_root/src" "$scanner_container:/usr/src/src" >/dev/null
-docker cp "$project_root/tests" "$scanner_container:/usr/src/tests" >/dev/null
+echo "Copying tracked project files and Sonar reports..."
+# Only git-tracked paths enter the scanner. Untracked local secrets such as
+# .env or report-credentials/ can never be indexed or uploaded.
+# `git ls-files` lists the working-tree state, so uncommitted edits to tracked
+# files are analysed as well.
+# COPYFILE_DISABLE stops macOS tar from adding AppleDouble ._* entries, and
+# --no-xattrs/--no-acls keep host metadata such as com.apple.provenance out of
+# the stream; docker cp cannot apply it inside the Linux container.
+(cd "$project_root" && git ls-files -z --cached \
+  | while IFS= read -r -d '' path; do
+      if [[ -f "$path" && ! -L "$path" ]]; then
+        printf '%s\0' "$path"
+      fi
+    done \
+  | COPYFILE_DISABLE=1 tar --create --no-xattrs --no-acls --null --files-from - --file -) \
+  | tar --extract --file - --directory "$snapshot_dir"
+# A throwaway one-commit repository for the text sensor. Blame stays disabled
+# (sonar.scm.disabled), so this history never affects the new-code period.
+# Hooks and signing from the operator's global git configuration are bypassed.
+git -C "$snapshot_dir" -c init.defaultBranch=snapshot init --quiet
+git -C "$snapshot_dir" add --all --force
+git -C "$snapshot_dir" -c core.hooksPath=/dev/null \
+  -c user.name=sonar-scan -c user.email=sonar-scan@localhost \
+  commit --quiet --no-gpg-sign --no-verify --message "tracked tree snapshot"
+COPYFILE_DISABLE=1 tar --create --no-xattrs --no-acls --directory "$snapshot_dir" --file - . \
+  | docker cp - "$scanner_container:/usr/src" >/dev/null
 docker cp "$project_root/target/sonar" "$scanner_container:/usr/src/reports" >/dev/null
 
 docker start --attach "$scanner_container"
