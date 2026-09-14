@@ -173,19 +173,7 @@ impl WbReportSource {
                     )
                 })
                 .await?;
-            for (sku, ids) in page.products {
-                if !products.insert(sku) {
-                    return Err(WbReportSourceError::InvalidStockResponse);
-                }
-                for id in ids {
-                    if sizes.insert(id, sku).is_some() {
-                        return Err(WbReportSourceError::InvalidStockResponse);
-                    }
-                    if sizes.len() > MAX_IDENTITIES {
-                        return Err(WbReportSourceError::PaginationLimit);
-                    }
-                }
-            }
+            index_card_sizes(page.products, &mut products, &mut sizes)?;
             let Some(next) = page.next else {
                 return Ok(sizes);
             };
@@ -196,6 +184,29 @@ impl WbReportSource {
         }
         Err(WbReportSourceError::PaginationLimit)
     }
+}
+
+/// Adds one card page to the size catalog. A product or size seen twice across
+/// pages is an invalid response; the catalog stays within `MAX_IDENTITIES`.
+fn index_card_sizes(
+    page_products: Vec<(u64, Vec<u64>)>,
+    products: &mut BTreeSet<u64>,
+    sizes: &mut BTreeMap<u64, u64>,
+) -> Result<(), WbReportSourceError> {
+    for (sku, ids) in page_products {
+        if !products.insert(sku) {
+            return Err(WbReportSourceError::InvalidStockResponse);
+        }
+        for id in ids {
+            if sizes.insert(id, sku).is_some() {
+                return Err(WbReportSourceError::InvalidStockResponse);
+            }
+            if sizes.len() > MAX_IDENTITIES {
+                return Err(WbReportSourceError::PaginationLimit);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn id(value: Option<&Value>) -> Result<u64, WbReportSourceError> {

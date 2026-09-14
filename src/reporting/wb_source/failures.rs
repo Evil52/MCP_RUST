@@ -1,5 +1,10 @@
+use chrono::NaiveDate;
+
 use crate::{
-    reporting::{checkpoint::CheckpointError, wb_adapter::WbReportParseError},
+    reporting::{
+        checkpoint::CheckpointError, postgres_collector::CollectedAdvertisingFact,
+        wb_adapter::WbReportParseError,
+    },
     wb::WbErrorKind,
 };
 use thiserror::Error;
@@ -75,4 +80,41 @@ impl From<WbReportParseError> for WbReportSourceError {
     fn from(_: WbReportParseError) -> Self {
         Self::InvalidResponse
     }
+}
+
+pub(super) fn campaign_inventory_error(error: WbReportParseError) -> WbReportSourceError {
+    tracing::warn!(
+        source = "campaigns",
+        parse_error = ?error,
+        "WB campaign inventory could not be collected"
+    );
+    if error == WbReportParseError::TooManyRows {
+        WbReportSourceError::CampaignInventoryLimit
+    } else {
+        WbReportSourceError::InvalidCampaignResponse
+    }
+}
+
+pub(super) fn promotion_stats_error(error: WbReportParseError) -> WbReportSourceError {
+    tracing::warn!(parse_error = ?error, "WB promotion statistics rejected");
+    if error == WbReportParseError::InconsistentAdvertisingCounts {
+        WbReportSourceError::InconsistentPromotionCounts
+    } else {
+        WbReportSourceError::InvalidPromotionResponse
+    }
+}
+
+/// Every statistics row must belong to the requested date and campaign chunk.
+pub(super) fn ensure_promotion_rows_in_scope(
+    rows: &[CollectedAdvertisingFact],
+    date: NaiveDate,
+    chunk: &[u64],
+) -> Result<(), WbReportSourceError> {
+    if rows
+        .iter()
+        .any(|row| row.business_date != date || !chunk.contains(&row.campaign_id))
+    {
+        return Err(WbReportSourceError::InvalidPromotionResponse);
+    }
+    Ok(())
 }
