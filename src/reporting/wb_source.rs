@@ -8,6 +8,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
 mod failures;
 pub use failures::WbReportSourceError;
+use failures::{campaign_inventory_error, ensure_promotion_rows_in_scope, promotion_stats_error};
 mod seller_stocks;
 pub use seller_stocks::SellerStockRequest;
 use tokio::time::{Instant, sleep};
@@ -22,8 +23,8 @@ use super::{
     },
     snapshot::{Marketplace, SnapshotStatus},
     wb_adapter::{
-        WbReportParseError, parse_campaign_ids, parse_price_page, parse_promotion_stats,
-        parse_sales_page, parse_stock_page,
+        parse_campaign_ids, parse_price_page, parse_promotion_stats, parse_sales_page,
+        parse_stock_page,
     },
 };
 
@@ -371,18 +372,7 @@ impl WbReportSource {
             } else {
                 parse_campaign_ids(&response)
             };
-            parsed.map_err(|error| {
-                tracing::warn!(
-                    source = "campaigns",
-                    parse_error = ?error,
-                    "WB campaign inventory could not be collected"
-                );
-                if error == WbReportParseError::TooManyRows {
-                    WbReportSourceError::CampaignInventoryLimit
-                } else {
-                    WbReportSourceError::InvalidCampaignResponse
-                }
-            })
+            parsed.map_err(campaign_inventory_error)
         })
         .await?;
         log_source_completed("campaigns", ids.len());
@@ -397,23 +387,11 @@ impl WbReportSource {
                         .transport
                         .promotion_stats(chunk.to_vec(), date, date)
                         .await?;
-                    parse_promotion_stats(&response).map_err(|error| {
-                        tracing::warn!(parse_error = ?error, "WB promotion statistics rejected");
-                        if error == WbReportParseError::InconsistentAdvertisingCounts {
-                            WbReportSourceError::InconsistentPromotionCounts
-                        } else {
-                            WbReportSourceError::InvalidPromotionResponse
-                        }
-                    })
+                    parse_promotion_stats(&response).map_err(promotion_stats_error)
                 },
             )
             .await?;
-            if rows
-                .iter()
-                .any(|row| row.business_date != date || !chunk.contains(&row.campaign_id))
-            {
-                return Err(WbReportSourceError::InvalidPromotionResponse);
-            }
+            ensure_promotion_rows_in_scope(&rows, date, chunk)?;
             advertising.extend(rows);
             if advertising.len() > 25_000 {
                 return Err(WbReportSourceError::PaginationLimit);
@@ -511,7 +489,10 @@ fn page_offset(page: usize, page_size: u32) -> Result<u32, WbReportSourceError> 
 
 #[cfg(test)]
 mod tests {
-    use crate::{reporting::checkpoint::CheckpointError, wb::WbErrorKind};
+    use crate::{
+        reporting::{checkpoint::CheckpointError, wb_adapter::WbReportParseError},
+        wb::WbErrorKind,
+    };
     mod admission;
     mod sales;
     mod stocks;

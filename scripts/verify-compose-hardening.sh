@@ -179,7 +179,7 @@ render_control_ozon_live_compose() {
   printf 'verification-executor-client-secret\n' >"$executor_secret"
   chmod 600 "$executor_id" "$executor_secret"
   CONTROL_MCP_ACCESS_CONFIG_HOST="$project_dir/config/access.example.json" \
-    CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.ozon-furnitura.live.example.json" \
+    CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.ozon-furnitura.live.json" \
     CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE_HOST="$executor_id" \
     CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE_HOST="$executor_secret" \
     CONTROL_MCP_JWT_ISSUER="https://auth.example.test/realms/ofk" \

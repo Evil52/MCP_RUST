@@ -45,6 +45,24 @@ def build_scope(policy, registry):
     require(type(policy.get("version")) is int and policy["version"] == 1)
     require(type(policy.get("enabled")) is bool)
     require(policy.get("timezone") == "Asia/Yekaterinburg")
+    accounts = registry_accounts(registry)
+    if "account_ids" in policy:
+        require(set(policy) == {"version", "enabled", "timezone", "account_ids"})
+        selected = identifiers(policy["account_ids"])
+    else:
+        require(set(policy) == {"version", "enabled", "timezone", "sender_email_env", "audiences"})
+        selected = identifiers(audience_account_ids(policy["audiences"], accounts))
+    require(all(account_id in accounts for account_id in selected))
+    if not policy["enabled"]:
+        return []
+    return [
+        {"account_id": account_id, "marketplace": accounts[account_id]["marketplace"]}
+        for account_id in sorted(selected)
+    ]
+
+
+def registry_accounts(registry):
+    """Index registry accounts by a unique identifier and a known marketplace."""
     require(type(registry.get("version")) is int and registry["version"] == 1)
     require(isinstance(registry.get("accounts"), list))
     accounts = {}
@@ -55,34 +73,25 @@ def build_scope(policy, registry):
         require(account_id not in accounts)
         require(account.get("marketplace") in ("ozon", "wildberries"))
         accounts[account_id] = account
+    return accounts
 
-    if "account_ids" in policy:
-        require(set(policy) == {"version", "enabled", "timezone", "account_ids"})
-        selected = identifiers(policy["account_ids"])
-    else:
-        require(set(policy) == {"version", "enabled", "timezone", "sender_email_env", "audiences"})
-        audiences = policy["audiences"]
-        require(isinstance(audiences, list) and 1 <= len(audiences) <= 64)
-        selected = []
-        for audience in audiences:
-            require(isinstance(audience, dict) and set(audience) == {"id", "email_env", "managers"})
-            managers = audience["managers"]
-            require(isinstance(managers, list) and 1 <= len(managers) <= 64)
-            for manager in managers:
-                require(isinstance(manager, dict) and set(manager) == {"actor_id", "account_ids"})
-                identifiers([manager["actor_id"]])
-                for account_id in identifiers(manager["account_ids"]):
-                    require(account_id in accounts)
-                    require(accounts[account_id].get("manager_id") == manager["actor_id"])
-                    selected.append(account_id)
-        identifiers(selected)
-    require(all(account_id in accounts for account_id in selected))
-    if not policy["enabled"]:
-        return []
-    return [
-        {"account_id": account_id, "marketplace": accounts[account_id]["marketplace"]}
-        for account_id in sorted(selected)
-    ]
+
+def audience_account_ids(audiences, accounts):
+    """Every account a manager reports on, which must be that manager's own."""
+    require(isinstance(audiences, list) and 1 <= len(audiences) <= 64)
+    selected = []
+    for audience in audiences:
+        require(isinstance(audience, dict) and set(audience) == {"id", "email_env", "managers"})
+        managers = audience["managers"]
+        require(isinstance(managers, list) and 1 <= len(managers) <= 64)
+        for manager in managers:
+            require(isinstance(manager, dict) and set(manager) == {"actor_id", "account_ids"})
+            identifiers([manager["actor_id"]])
+            for account_id in identifiers(manager["account_ids"]):
+                require(account_id in accounts)
+                require(accounts[account_id].get("manager_id") == manager["actor_id"])
+                selected.append(account_id)
+    return selected
 
 
 def main():

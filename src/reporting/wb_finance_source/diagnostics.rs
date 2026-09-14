@@ -72,103 +72,114 @@ pub fn diagnose_finance_page(
         if parse_row(row).is_err() {
             record(&mut issues, "row", "normalization_failed", None);
         }
-        for field in ["reportId", "rrdId", "nmId"] {
-            let value = fields.get(field);
-            if field == "nmId" && value.is_none_or(Value::is_null) {
-                continue;
-            }
-            if value
-                .and_then(Value::as_u64)
-                .is_none_or(|id| id > MAX_SIGNED_ID || (id == 0 && field != "nmId"))
-            {
-                record(&mut issues, field, "expected_int64_id", value);
-            }
-        }
-        if fields
-            .get("reportId")
-            .and_then(Value::as_u64)
-            .is_some_and(|id| id != expected_report_id)
-        {
-            record(
-                &mut issues,
-                "reportId",
-                "scope_mismatch",
-                fields.get("reportId"),
-            );
-        }
-        if let Some(id) = fields.get("rrdId").and_then(Value::as_u64) {
-            if id <= cursor {
-                record(
-                    &mut issues,
-                    "rrdId",
-                    "non_increasing_cursor",
-                    fields.get("rrdId"),
-                );
-            }
-            cursor = id;
-        }
-        match fields.get("currency").and_then(Value::as_str) {
-            Some(value) if valid_currency(value) => {
-                if value != expected_currency {
-                    record(
-                        &mut issues,
-                        "currency",
-                        "scope_mismatch",
-                        fields.get("currency"),
-                    );
-                }
-            }
-            _ => record(
-                &mut issues,
-                "currency",
-                "invalid_currency",
-                fields.get("currency"),
-            ),
-        }
+        diagnose_ids(fields, expected_report_id, &mut cursor, &mut issues);
+        diagnose_currency(fields.get("currency"), expected_currency, &mut issues);
         diagnose_date(fields.get("rrDate"), &mut result, &mut issues);
-        for field in ["docTypeName", "sellerOperName"] {
-            let value = fields.get(field).filter(|value| !value.is_null());
-            if value.is_some_and(|value| value.as_str().is_none_or(|text| !valid_type_text(text))) {
-                record(&mut issues, field, "invalid_bounded_text", value);
-            }
-        }
-        let quantity = fields.get("quantity").filter(|value| !value.is_null());
-        if quantity.is_some_and(|value| value.as_i64().is_none()) {
-            record(&mut issues, "quantity", "expected_int64", quantity);
-        }
-        let mut present_amounts = 0;
-        for field in AMOUNT_FIELDS {
-            let Some(value) = fields.get(*field).filter(|value| !value.is_null()) else {
-                continue;
-            };
-            present_amounts += 1;
-            if let Some(raw) = value.as_str() {
-                let scale = raw
-                    .split_once('.')
-                    .map_or(0, |(_, fraction)| fraction.len());
-                result.max_decimal_scale = result.max_decimal_scale.max(scale);
-                if parse_decimal(raw).is_err() {
-                    let reason = if scale > 18 {
-                        "decimal_scale_exceeds_18"
-                    } else if raw.len() > 32 {
-                        "decimal_bytes_exceed_32"
-                    } else {
-                        "invalid_decimal_format_or_i128_overflow"
-                    };
-                    record(&mut issues, field, reason, Some(value));
-                }
-            } else {
-                record(&mut issues, field, "expected_decimal_string", Some(value));
-            }
-        }
-        if present_amounts == 0 {
-            record(&mut issues, "amounts", "no_amounts_present", None);
-        }
+        diagnose_optional_scalars(fields, &mut issues);
+        diagnose_amounts(fields, &mut result, &mut issues);
     }
     if issues.is_empty() {
         None
     } else {
         Some(finish(result, issues))
+    }
+}
+
+type Fields = serde_json::Map<String, Value>;
+
+fn diagnose_ids(fields: &Fields, expected_report_id: u64, cursor: &mut u64, issues: &mut Issues) {
+    for field in ["reportId", "rrdId", "nmId"] {
+        let value = fields.get(field);
+        if field == "nmId" && value.is_none_or(Value::is_null) {
+            continue;
+        }
+        if value
+            .and_then(Value::as_u64)
+            .is_none_or(|id| id > MAX_SIGNED_ID || (id == 0 && field != "nmId"))
+        {
+            record(issues, field, "expected_int64_id", value);
+        }
+    }
+    if fields
+        .get("reportId")
+        .and_then(Value::as_u64)
+        .is_some_and(|id| id != expected_report_id)
+    {
+        record(issues, "reportId", "scope_mismatch", fields.get("reportId"));
+    }
+    if let Some(id) = fields.get("rrdId").and_then(Value::as_u64) {
+        if id <= *cursor {
+            record(
+                issues,
+                "rrdId",
+                "non_increasing_cursor",
+                fields.get("rrdId"),
+            );
+        }
+        *cursor = id;
+    }
+}
+
+fn diagnose_currency(value: Option<&Value>, expected_currency: &str, issues: &mut Issues) {
+    match value.and_then(Value::as_str) {
+        Some(currency) if valid_currency(currency) => {
+            if currency != expected_currency {
+                record(issues, "currency", "scope_mismatch", value);
+            }
+        }
+        _ => record(issues, "currency", "invalid_currency", value),
+    }
+}
+
+fn diagnose_optional_scalars(fields: &Fields, issues: &mut Issues) {
+    for field in ["docTypeName", "sellerOperName"] {
+        let value = fields.get(field).filter(|value| !value.is_null());
+        if value.is_some_and(|value| value.as_str().is_none_or(|text| !valid_type_text(text))) {
+            record(issues, field, "invalid_bounded_text", value);
+        }
+    }
+    let quantity = fields.get("quantity").filter(|value| !value.is_null());
+    if quantity.is_some_and(|value| value.as_i64().is_none()) {
+        record(issues, "quantity", "expected_int64", quantity);
+    }
+}
+
+fn diagnose_amounts(fields: &Fields, result: &mut WbFinancePageDiagnostics, issues: &mut Issues) {
+    let mut present_amounts = 0;
+    for field in AMOUNT_FIELDS {
+        let Some(value) = fields.get(*field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        present_amounts += 1;
+        let Some(raw) = value.as_str() else {
+            record(issues, field, "expected_decimal_string", Some(value));
+            continue;
+        };
+        let scale = raw
+            .split_once('.')
+            .map_or(0, |(_, fraction)| fraction.len());
+        result.max_decimal_scale = result.max_decimal_scale.max(scale);
+        if parse_decimal(raw).is_err() {
+            record(
+                issues,
+                field,
+                decimal_failure_reason(raw, scale),
+                Some(value),
+            );
+        }
+    }
+    if present_amounts == 0 {
+        record(issues, "amounts", "no_amounts_present", None);
+    }
+}
+
+const fn decimal_failure_reason(raw: &str, scale: usize) -> &'static str {
+    if scale > 18 {
+        "decimal_scale_exceeds_18"
+    } else if raw.len() > 32 {
+        "decimal_bytes_exceed_32"
+    } else {
+        "invalid_decimal_format_or_i128_overflow"
     }
 }
 

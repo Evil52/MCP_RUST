@@ -244,6 +244,102 @@ pub(super) fn extract_request_id(headers: &reqwest::header::HeaderMap) -> Option
         })
 }
 
+/// Cooldowns one response imposes on later calls with the same token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResponseCooldowns {
+    /// Local gate extension honoring a vendor Retry-After.
+    vendor: Option<Duration>,
+    /// Local seller-inventory penalty for a 409 or a header-less 429.
+    inventory: Option<Duration>,
+    /// Shared-quota penalty for a seller-inventory 409.
+    shared_inventory: Option<Duration>,
+}
+
+fn response_cooldowns(
+    request_class: RequestClass,
+    status: StatusCode,
+    retry_after: ParsedRetryDelay,
+    policy: &ClientPolicy,
+) -> ResponseCooldowns {
+    let vendor = match retry_after {
+        ParsedRetryDelay::Valid(delay)
+            if matches!(
+                request_class,
+                RequestClass::SellerInventory | RequestClass::FinanceReport
+            ) && is_retriable(status) =>
+        {
+            // One-attempt inventory/finance reads must still honor a long
+            // Retry-After for sibling callers. Cap untrusted delays at a
+            // day; the generic retry budget is not this shared cooldown.
+            Some(delay.min(Duration::from_hours(24)))
+        }
+        ParsedRetryDelay::Valid(delay)
+            if is_retriable(status) && delay <= policy.max_retry_delay =>
+        {
+            Some(delay)
+        }
+        ParsedRetryDelay::Absent | ParsedRetryDelay::Invalid | ParsedRetryDelay::Valid(_) => None,
+    };
+    let inventory = if request_class == RequestClass::SellerInventory {
+        match status {
+            // WB charges ten requests for a 409 in both inventory groups.
+            StatusCode::CONFLICT => Some(policy.seller_inventory_interval * 10),
+            StatusCode::TOO_MANY_REQUESTS if vendor.is_none() => Some(Duration::from_secs(60)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let shared_inventory = (request_class == RequestClass::SellerInventory
+        && status == StatusCode::CONFLICT)
+        .then_some(super::SELLER_INVENTORY_MIN_REQUEST_INTERVAL * 10);
+    ResponseCooldowns {
+        vendor,
+        inventory,
+        shared_inventory,
+    }
+}
+
+/// The finance endpoint documents only 200 and 204; any other 2xx is an error.
+fn is_unexpected_finance_success(request_class: RequestClass, status: StatusCode) -> bool {
+    request_class == RequestClass::FinanceReport && status.is_success() && status != StatusCode::OK
+}
+
+/// Applies documented endpoint-specific response semantics after retry and
+/// finance terminal-page handling. Other successful responses must be JSON.
+async fn decode_endpoint_response(
+    context: AttemptContext<'_>,
+    response: Response,
+    request_id: Option<String>,
+    retry_after: Option<Duration>,
+) -> Result<Value, WbError> {
+    let status = response.status();
+    if status == StatusCode::NO_CONTENT
+        && *context.method == Method::POST
+        && context.endpoint == "analytics:/api/analytics/v1/stocks-report/wb-warehouses"
+    {
+        // Preserve no-data evidence separately from JSON or a confirmed quantity.
+        read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
+        return Ok(serde_json::json!({
+            "data": {"items": []},
+            "meta": {
+                "upstream_status": status.as_u16(),
+                "data_state": "no_data",
+                "source_endpoint": WAREHOUSE_STOCKS_PATH,
+                "request_id": request_id,
+            },
+        }));
+    }
+    if is_unexpected_finance_success(context.request_class, status) {
+        return Err(WbError::Api {
+            status,
+            request_id,
+            diagnostic: String::new(),
+        });
+    }
+    decode_response(response, request_id, retry_after).await
+}
+
 impl WbClient {
     pub(super) async fn response_outcome(
         &self,
@@ -262,47 +358,13 @@ impl WbClient {
             .allows_automatic_retry()
             .then(|| retry_plan(status, attempt, retry_after, &self.policy))
             .flatten();
-        let vendor_cooldown = match retry_after {
-            ParsedRetryDelay::Valid(delay)
-                if matches!(
-                    context.request_class,
-                    RequestClass::SellerInventory | RequestClass::FinanceReport
-                ) && is_retriable(status) =>
-            {
-                // One-attempt inventory/finance reads must still honor a long
-                // Retry-After for sibling callers. Cap untrusted delays at a
-                // day; the generic retry budget is not this shared cooldown.
-                Some(delay.min(Duration::from_hours(24)))
-            }
-            ParsedRetryDelay::Valid(delay)
-                if is_retriable(status) && delay <= self.policy.max_retry_delay =>
-            {
-                Some(delay)
-            }
-            ParsedRetryDelay::Absent | ParsedRetryDelay::Invalid | ParsedRetryDelay::Valid(_) => {
-                None
-            }
-        };
-        let inventory_cooldown = if context.request_class == RequestClass::SellerInventory {
-            match status {
-                // WB charges ten requests for a 409 in both inventory groups.
-                StatusCode::CONFLICT => Some(self.policy.seller_inventory_interval * 10),
-                StatusCode::TOO_MANY_REQUESTS if vendor_cooldown.is_none() => {
-                    Some(Duration::from_secs(60))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let shared_inventory_cooldown = (context.request_class == RequestClass::SellerInventory
-            && status == StatusCode::CONFLICT)
-            .then_some(super::SELLER_INVENTORY_MIN_REQUEST_INTERVAL * 10);
+        let cooldowns =
+            response_cooldowns(context.request_class, status, retry_after, &self.policy);
         if let (Some(key), Some(delay)) = (
             quota_key,
             shared_cooldown
                 .into_iter()
-                .chain(shared_inventory_cooldown)
+                .chain(cooldowns.shared_inventory)
                 .max(),
         ) {
             self.shared_quota
@@ -312,8 +374,8 @@ impl WbClient {
         }
         if let Some(delay) = planned_retry
             .into_iter()
-            .chain(vendor_cooldown)
-            .chain(inventory_cooldown)
+            .chain(cooldowns.vendor)
+            .chain(cooldowns.inventory)
             .max()
         {
             // A vendor-directed retry is shared by every alias using this
@@ -369,37 +431,13 @@ impl WbClient {
             return Ok(AttemptOutcome::NoContent);
         }
 
-        let result = if status == StatusCode::NO_CONTENT
-            && *context.method == Method::POST
-            && context.endpoint == "analytics:/api/analytics/v1/stocks-report/wb-warehouses"
-        {
-            // This endpoint documents 204 as no data. Preserve that evidence
-            // separately from a JSON response or a confirmed stock quantity.
-            read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref())
-                .await
-                .map(|_| {
-                    serde_json::json!({
-                        "data": {"items": []},
-                        "meta": {
-                            "upstream_status": status.as_u16(),
-                            "data_state": "no_data",
-                            "source_endpoint": WAREHOUSE_STOCKS_PATH,
-                            "request_id": request_id,
-                        },
-                    })
-                })
-        } else if context.request_class == RequestClass::FinanceReport
-            && status.is_success()
-            && status != StatusCode::OK
-        {
-            Err(WbError::Api {
-                status,
-                request_id: request_id.clone(),
-                diagnostic: String::new(),
-            })
-        } else {
-            decode_response(response, request_id.clone(), retry_after.duration()).await
-        };
+        let result = decode_endpoint_response(
+            context,
+            response,
+            request_id.clone(),
+            retry_after.duration(),
+        )
+        .await;
         let will_retry = context.request_class.allows_automatic_retry()
             && result.as_ref().is_err_and(|error| {
                 is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts
