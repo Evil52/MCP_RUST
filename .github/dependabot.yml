@@ -8,6 +8,10 @@ updates:
       time: "04:00"
       timezone: Asia/Yekaterinburg
     open-pull-requests-limit: 10
+    # Version updates wait a week so a hijacked release is likely yanked
+    # before it reaches a pull request. Security updates are not delayed.
+    cooldown:
+      default-days: 7
     groups:
       rust-patch-updates:
         update-types: [patch]
@@ -20,6 +24,8 @@ updates:
       time: "04:30"
       timezone: Asia/Yekaterinburg
     open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
     groups:
       codeql-actions:
         patterns:
@@ -33,6 +39,8 @@ updates:
       time: "05:00"
       timezone: Asia/Yekaterinburg
     open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
 
   # A PostgreSQL major upgrade cannot be applied by replacing the image: the
   # existing PGDATA is unreadable to the new major and the container fails to
@@ -48,6 +56,8 @@ updates:
       time: "05:15"
       timezone: Asia/Yekaterinburg
     open-pull-requests-limit: 10
+    cooldown:
+      default-days: 7
     ignore:
       - dependency-name: postgres
         update-types:
