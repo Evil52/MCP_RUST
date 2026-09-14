@@ -47,6 +47,8 @@ MAX_FILE = 8 * 1024 * 1024
 MAX_TOTAL = 32 * 1024 * 1024
 MAX_ENVELOPE = 40 * 1024 * 1024
 MAX_MANIFEST = 256 * 1024
+MANIFEST_NAME = "manifest.json"
+FILE_PREFIX = "files/"
 IMAGE = re.compile(r"ghcr\.io/evil52/mcp-rust-runtime@sha256:[0-9a-f]{64}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -231,7 +233,7 @@ def validate_release(record, contents):
 def canonical_tar(manifest_bytes, contents):
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        entries = [("manifest.json", manifest_bytes)] + [("files/" + k, contents[k]) for k in sorted(contents)]
+        entries = [(MANIFEST_NAME, manifest_bytes)] + [(FILE_PREFIX + k, contents[k]) for k in sorted(contents)]
         for name, content in entries:
             member = tarfile.TarInfo(name)
             member.mode = 0o600
@@ -272,16 +274,16 @@ def parse_plaintext(data):
             require(member.name not in files and member.isreg() and not member.pax_headers
                     and member.mode == 0o600 and 0 < member.size <= MAX_FILE,
                     "archive contains an unsafe or duplicate entry")
-            require(member.name == "manifest.json" or member.name in {"files/" + x for x in SLOTS},
+            require(member.name == MANIFEST_NAME or member.name in {FILE_PREFIX + x for x in SLOTS},
                     "archive entry is outside the fixed allowlist")
-            require(member.name != "manifest.json" or member.size <= MAX_MANIFEST,
+            require(member.name != MANIFEST_NAME or member.size <= MAX_MANIFEST,
                     "archive manifest exceeds size limit")
             file = archive.extractfile(member)
             require(file is not None, "archive regular file is unavailable")
             files[member.name] = file.read()
             require(sum(map(len, files.values())) <= MAX_TOTAL + MAX_MANIFEST, "archive payload exceeds size limit")
-    require("manifest.json" in files, "archive manifest missing")
-    manifest_bytes = files.pop("manifest.json")
+    require(MANIFEST_NAME in files, "archive manifest missing")
+    manifest_bytes = files.pop(MANIFEST_NAME)
     reject_identity(manifest_bytes)
     manifest = decode_json(manifest_bytes)
     require(isinstance(manifest, dict) and set(manifest) == {"schema_version", "kind", "created_at", "escrow", "runtime", "files"}
@@ -295,7 +297,7 @@ def parse_plaintext(data):
     record = {"schema_version": manifest["schema_version"], "escrow": manifest["escrow"],
               "runtime": manifest["runtime"], "files": {k: v["source_path"] for k, v in metadata.items()}}
     validate_contract(record)
-    contents = {k.removeprefix("files/"): v for k, v in files.items()}
+    contents = {k.removeprefix(FILE_PREFIX): v for k, v in files.items()}
     require(set(contents) == set(metadata), "archive file set does not match manifest")
     for slot, content in contents.items():
         value = metadata[slot]
@@ -382,7 +384,7 @@ def extract_new(path, manifest, contents):
             require(opened.st_uid == os.getuid() and stat.S_IMODE(opened.st_mode) == 0o700
                     and (entry.st_dev, entry.st_ino) == (opened.st_dev, opened.st_ino),
                     "new plaintext directory identity changed")
-            for slot, content in [("manifest.json", json_bytes(manifest)), *sorted(contents.items())]:
+            for slot, content in [(MANIFEST_NAME, json_bytes(manifest)), *sorted(contents.items())]:
                 fd = os.open(slot, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
                 with os.fdopen(fd, "wb") as file:
                     file.write(content)
@@ -390,7 +392,7 @@ def extract_new(path, manifest, contents):
                     os.fsync(file.fileno())
             os.fsync(directory)
         except BaseException:
-            for child in ["manifest.json", *contents]:
+            for child in [MANIFEST_NAME, *contents]:
                 try:
                     os.unlink(child, dir_fd=directory)
                 except FileNotFoundError:
@@ -430,7 +432,7 @@ def main():
         print(json.dumps({"input_template": {
             "schema_version": 1, "escrow": {"status": "pending", "reference": None},
             "runtime": {"git_sha": "40 lowercase hex characters", "server_image": "ghcr.io/evil52/mcp-rust-runtime@sha256:64_lowercase_hex"},
-            "files": {k: "/absolute/source/path" for k in sorted(REQUIRED)}},
+            "files": dict.fromkeys(sorted(REQUIRED), "/absolute/source/path")},
             "optional_slots": sorted(OPTIONAL)}, indent=2))
         return
     if args.command == "create":
