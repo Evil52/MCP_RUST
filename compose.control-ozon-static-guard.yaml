@@ -52,7 +52,7 @@ services:
         target: /etc/mcp-ozon/access.json
         read_only: true
       - type: bind
-        source: ./config/control-policy.ozon-furnitura.live.example.json
+        source: ./config/control-policy.ozon-furnitura.live.json
         target: /etc/mcp-ozon/control-policy.json
         read_only: true
       - type: bind
