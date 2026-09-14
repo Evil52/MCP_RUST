@@ -26,6 +26,7 @@ use std::{
 };
 
 mod categories;
+mod continuation;
 mod journal;
 mod start;
 #[cfg(test)]
@@ -74,6 +75,9 @@ struct Manifest {
     /// Explicit reviewed replacement of the original failed create, never funding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recreate: Option<RecreateApproval>,
+    /// Fresh approval to fund/start the confirmed create-only Nexus, not recreate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continue_created: Option<continuation::Approval>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +98,8 @@ impl Manifest {
     const fn financial_scope_matches(&self) -> bool {
         self.funding_type == 1
             && (self.recreate.is_none() || matches!(self.scope, LaunchScope::CreateOnly))
+            && (self.continue_created.is_none()
+                || (self.recreate.is_none() && matches!(self.scope, LaunchScope::FundAndStart)))
             && match self.scope {
                 LaunchScope::CreateOnly => self.budget_rubles == 0,
                 LaunchScope::FundAndStart => self.budget_rubles == 1000,
@@ -101,6 +107,17 @@ impl Manifest {
     }
 
     fn authorize_stage(&self, mode: &str) -> Result<()> {
+        if self.continue_created.is_some() {
+            ensure!(
+                self.financial_scope_matches()
+                    && matches!(
+                        mode,
+                        "preflight" | "prepare" | "bids" | "fund" | "start" | "reconcile"
+                    ),
+                "confirmed Nexus continuation cannot create another campaign"
+            );
+            return Ok(());
+        }
         ensure!(
             matches!(mode, "preflight" | "create" | "bids" | "reconcile")
                 || (self.scope == LaunchScope::FundAndStart && matches!(mode, "fund" | "start")),
@@ -137,6 +154,16 @@ impl Manifest {
             self.financial_scope_matches(),
             "create-only requires zero funding; fund-and-start permits exactly 1000 RUB type=1"
         );
+        if let Some(approval) = &self.continue_created {
+            approval.validate_scope(self)?;
+            ensure!(
+                policy.hard_drr_basis_points == 1500
+                    && policy.min_bid_kopecks == 500
+                    && policy.max_bid_kopecks == 1050
+                    && policy.cooldown_seconds == 1800,
+                "continuation must preserve reviewed hard DRR, corridor and cooldown"
+            );
+        }
         ensure!(
             !self.authorization_reference.trim().is_empty()
                 && (allow_expired || (self.authorized_at <= now && now < self.expires_at))
@@ -264,13 +291,14 @@ impl Operator {
     async fn balance(&self) -> Result<u64> {
         let value = self.reader.promotion_balance(ACCOUNT).await?;
         value
-            .get("balance")
+            .get("net")
             .and_then(Value::as_u64)
-            .context("WB type=1 balance unavailable")
+            .context("WB type=1 netting balance (net) unavailable")
     }
 
     async fn preflight(&self, own_id: Option<u64>) -> Result<Value> {
         self.fresh_authorization()?;
+        let own_id = self.continuation_preflight_id(own_id)?;
         if self.manifest.recreate.is_some() && own_id.is_none() {
             Journal::inspect_recreate(
                 &self.manifest.journal_directory,
@@ -373,7 +401,7 @@ impl Operator {
         self.fresh_authorization()?;
         Ok(
             json!({"checked_at":Utc::now(),"account_id":ACCOUNT,"campaign_name":NAME,
-            "cash_balance_rubles":balance,"scope":self.manifest.scope,
+            "netting_balance_rubles":balance,"scope":self.manifest.scope,
             "authorized_funding_rubles":self.manifest.budget_rubles,
             "subject_id":subject_id,
             "campaign_scan":{"listed_total":groups.get("all"),"checked_details":checked_campaign_count,
@@ -450,6 +478,7 @@ impl Operator {
     }
 
     async fn create(&self, journal: &Journal) -> Result<Value> {
+        self.manifest.authorize_stage("create")?;
         journal.assert_not_attempted("create")?;
         let preflight = self.preflight(None).await?;
         let request = WbCreateCampaignRequest {
@@ -480,6 +509,10 @@ impl Operator {
     async fn bids(&self, journal: &Journal) -> Result<Value> {
         let id = journal.campaign_id()?;
         journal.assert_not_attempted("bids")?;
+        if self.manifest.continue_created.is_some() {
+            self.validate_prepared_continuation(journal, id)?;
+            self.preflight(Some(id)).await?;
+        }
         let before = self.inactive(id, false).await?;
         ensure!(
             self.budget(id).await? == 0,
@@ -723,6 +756,7 @@ fn write_error(error: WbGuardedWriteError<anyhow::Error>) -> anyhow::Error {
 }
 
 enum WriteStage {
+    Prepare,
     Create,
     Bids,
     Fund,
@@ -736,6 +770,7 @@ pub async fn run_wb_campaign_launch(mode: &str, manifest_path: &Path) -> Result<
     let stage = match mode {
         "reconcile" => return reconcile_read_only(manifest_path).await,
         "preflight" => return Operator::load(manifest_path, false)?.preflight(None).await,
+        "prepare" => WriteStage::Prepare,
         "create" => WriteStage::Create,
         "bids" => WriteStage::Bids,
         "fund" => WriteStage::Fund,
@@ -750,6 +785,7 @@ pub async fn run_wb_campaign_launch(mode: &str, manifest_path: &Path) -> Result<
         true,
     )?;
     match stage {
+        WriteStage::Prepare => operator.prepare_continuation(&journal).await,
         WriteStage::Create => operator.create(&journal).await,
         WriteStage::Bids => operator.bids(&journal).await,
         WriteStage::Fund => operator.fund(&journal).await,

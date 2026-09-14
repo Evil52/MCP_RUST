@@ -1,11 +1,11 @@
 {
   "max_new_file_lines": 1000,
   "legacy_file_lines": {
-    "src/auth.rs": 1911,
+    "src/auth.rs": 1893,
     "src/bin/report-collector.rs": 1026,
     "src/bin/wb-automation.rs": 2002,
     "src/config.rs": 3368,
-    "src/control/automation_executor.rs": 4273,
+    "src/control/automation_executor.rs": 4267,
     "src/control/automation_observer.rs": 1270,
     "src/control/automation_postgres.rs": 2494,
     "src/control/automation.rs": 1792,

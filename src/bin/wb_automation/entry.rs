@@ -25,7 +25,7 @@ pub async fn run() -> Result<()> {
     {
         ensure!(
             arguments.len() == 3,
-            "usage: wb-automation campaign-launch preflight|create|bids|fund|start|reconcile MANIFEST.json"
+            "usage: wb-automation campaign-launch preflight|prepare|create|bids|fund|start|reconcile MANIFEST.json"
         );
         let result =
             mcp_ozon::control::run_wb_campaign_launch(&arguments[1], Path::new(&arguments[2]))

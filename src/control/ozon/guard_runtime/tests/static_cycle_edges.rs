@@ -284,3 +284,86 @@ async fn postgres_static_cycle_rejects_clock_rollback_before_any_bid_write() {
         state.last_static_audit_event_id
     );
 }
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL roles"]
+async fn postgres_static_cycle_failure_on_one_campaign_still_guards_the_rest() {
+    let _lock = CONTROL_DB_TEST_LOCK.lock().await;
+    let database = Database::connect()
+        .await
+        .expect("isolated PostgreSQL roles are configured");
+    let fixture = dynamic_fixture();
+    let dynamic = load_static_guards(&fixture.config_path, "account")
+        .unwrap()
+        .0
+        .dynamic_bid_control
+        .unwrap();
+    let slot = observed_at() + chrono::Duration::minutes(90);
+    let cycle_time = slot + chrono::Duration::minutes(30);
+    // The first campaign fails before any write: its last bid change lies in
+    // the future of the cycle clock. The second campaign must still be read
+    // and evaluated in the same cycle.
+    let mut persisted = fixture.initialize(&database).await;
+    persisted
+        .last_bid_change_at
+        .insert(21, cycle_time + chrono::Duration::seconds(1));
+    persist_static_state(&fixture.state_path, &persisted).unwrap();
+    let mut state = load_static_state(&fixture.state_path).unwrap();
+    publish_position(&database, &dynamic.position_region_name, slot).await;
+    let position = OzonBidPositionReader::connect(
+        &std::env::var("POSITION_REPOSITORY_TEST_READER_URL").unwrap(),
+    )
+    .await
+    .unwrap();
+    position.verify_runtime_contract().await.unwrap();
+    let second = test_static_guard(22, 12_000_000);
+    let (reader, reads) = mock_reader(vec![
+        (
+            200,
+            serde_json::json!({"list":[
+                {"id":21,"state":"CAMPAIGN_STATE_RUNNING"},
+                {"id":22,"state":"CAMPAIGN_STATE_RUNNING"}
+            ]})
+            .to_string(),
+        ),
+        (
+            200,
+            serde_json::json!({"rows":[
+                {"id":"21","title":"Static fixture","date":"2026-09-01","views":"10","clicks":"1","moneySpent":"1.00","orders":"1","ordersMoney":"100.00"},
+                {"id":"22","title":"Second fixture","date":"2026-09-01","views":"10","clicks":"1","moneySpent":"1.00","orders":"1","ordersMoney":"100.00"}
+            ]})
+            .to_string(),
+        ),
+        (200, product(7_000_000)),
+        (
+            200,
+            serde_json::json!({"products":[{"sku":second.guard.sku,"bid":7_000_000}]}).to_string(),
+        ),
+    ]);
+    let (writer, requests) = mock_writer(vec![]);
+    let error = guard_once_static(
+        &[fixture.guard.clone(), second],
+        &mut state,
+        &fixture.state_path,
+        &reader,
+        &writer,
+        &fixture.store,
+        fixture.write_authorization(&database),
+        Some(&dynamic),
+        Some(&position),
+        cycle_time,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<crate::control::ozon::pacing::OzonBidPacingError>(),
+        Some(&crate::control::ozon::pacing::OzonBidPacingError::InvalidObservation)
+    );
+    // Token, campaign list and shared metrics, then one product snapshot per
+    // campaign: the second campaign was evaluated after the first one failed.
+    let reads = reads.try_iter().collect::<Vec<_>>();
+    assert_eq!(reads.len(), 5, "{reads:#?}");
+    assert!(reads[4].contains("/api/client/campaign/22/v2/products"));
+    assert_eq!(requests.try_iter().count(), 0);
+    assert_eq!(state, persisted);
+}

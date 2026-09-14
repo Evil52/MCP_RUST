@@ -32,6 +32,7 @@ pub(super) fn fixture() -> (Manifest, WbAutomationPolicy) {
         journal_directory: PathBuf::from("journal"),
         robot_policy: PathBuf::from("robot.json"),
         recreate: None,
+        continue_created: None,
     };
     (manifest, policy)
 }

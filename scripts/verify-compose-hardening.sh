@@ -2193,7 +2193,15 @@ check_contains \
 check_contains \
   "control auth egress: upstream host/path are the only routing substitutions" \
   "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
-  'proxy_pass https://${CONTROL_AUTH_JWKS_HOST}${CONTROL_AUTH_JWKS_PATH};'
+  'set $jwks_upstream https://${CONTROL_AUTH_JWKS_HOST}${CONTROL_AUTH_JWKS_PATH};'
+check_contains \
+  "control auth egress: the fixed upstream variable is the only proxy target" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  'proxy_pass $jwks_upstream;'
+check_contains \
+  "control auth egress: the IdP address is re-resolved through Docker DNS" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  'resolver 127.0.0.11 valid=60s ipv6=off;'
 check_contains \
   "control auth egress: upstream certificate verification is mandatory" \
   "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \

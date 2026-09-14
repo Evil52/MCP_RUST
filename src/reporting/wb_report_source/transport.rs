@@ -100,3 +100,6 @@ fn source_error(error: &WbError) -> WbReportSourceError {
         _ => WbReportSourceError::Upstream(error.kind()),
     }
 }
+
+#[cfg(test)]
+mod tests;
