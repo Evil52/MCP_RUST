@@ -65,7 +65,9 @@ jobs:
         run: |
           command -v shellcheck >/dev/null
           shellcheck --version
-          shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
+          # Every tracked script, including nested entrypoints such as
+          # position-monitor/control-auth-egress/entrypoint.sh.
+          git ls-files -z -- '*.sh' | xargs -0 shellcheck -x
           ./scripts/test-runtime-health-contract.sh
           bash ./scripts/test-operations-portability.sh
           bash ./scripts/test-position-backup.sh
@@ -91,6 +93,10 @@ jobs:
           python3 -B scripts/check-rust-structure.py
           python3 -B -m unittest discover -s tests -p test_rust_structure.py
           python3 -B -m unittest discover -s tests -p test_local_artifact.py
+          python3 -B -m unittest discover -s tests -p test_verification_targets.py
+          python3 -B -m unittest discover -s tests -p test_sonar_test_report.py
+          python3 -B -m unittest discover -s tests -p test_sonar_external_issues.py
+          python3 -B -m unittest discover -s tests -p test_sonar_lcov_normalize.py
 
       - name: Check OzonOFK Suite source allowlist and synchronization
         run: bash scripts/build-ozonofk-suite.sh --check

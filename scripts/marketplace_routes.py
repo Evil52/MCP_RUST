@@ -29,7 +29,9 @@ MARKETPLACE_HOSTS = (
     "common-api.wildberries.ru", "advert-api.wildberries.ru",
     "marketplace-api.wildberries.ru",
 )
-VPN_HOSTS = ("api.openai.com", "chatgpt.com")
+ROUTE_BINARY = "/sbin/route"
+OPENAI_API_HOST = "api.openai.com"
+VPN_HOSTS = (OPENAI_API_HOST, "chatgpt.com")
 STATE_DIR = Path("/private/var/db/mcp-ozon-marketplace-routing")
 MAX_IPS = 64
 
@@ -52,7 +54,7 @@ def read_json(path):
         raise RoutingError("unsafe_or_missing_json_file")
     try:
         return json.loads(path.read_text())
-    except (ValueError, UnicodeError):
+    except ValueError:  # UnicodeDecodeError is a ValueError
         raise RoutingError("invalid_json") from None
 
 
@@ -106,11 +108,11 @@ class System:
 
     @staticmethod
     def lan_default(interface):
-        return parse_route(run(["/sbin/route", "-n", "get", "-inet", "-ifscope", interface, "default"]))
+        return parse_route(run([ROUTE_BINARY, "-n", "get", "-inet", "-ifscope", interface, "default"]))
 
     @staticmethod
     def route(address):
-        return parse_route(run(["/sbin/route", "-n", "get", "-inet", address]))
+        return parse_route(run([ROUTE_BINARY, "-n", "get", "-inet", address]))
 
     @staticmethod
     def add(address, config):
@@ -122,7 +124,7 @@ class System:
 
 
 def route_command(action, address, config):
-    args = ["/sbin/route", "-n", action, "-inet", "-host", address, config["gateway"]]
+    args = [ROUTE_BINARY, "-n", action, "-inet", "-host", address, config["gateway"]]
     if action == "add":
         args += ["-static", "-proto2"]
     return args
@@ -293,8 +295,12 @@ def locked_state(config):
 
 def https_probe(item):
     host, address = item
-    path = "/v1/models" if host == "api.openai.com" else (
-        "/ping" if host.endswith(".wildberries.ru") else "/")
+    if host == OPENAI_API_HOST:
+        path = "/v1/models"
+    elif host.endswith(".wildberries.ru"):
+        path = "/ping"
+    else:
+        path = "/"
     output = run([
         "/usr/bin/curl", "--noproxy", "*", "--proto", "=https", "--ipv4",
         "--connect-timeout", "3", "--max-time", "5", "--silent", "--output", "/dev/null",
@@ -304,7 +310,7 @@ def https_probe(item):
     ], timeout=6).split()
     if len(output) != 3 or not re.fullmatch(r"[1-5][0-9]{2}", output[0]):
         raise RoutingError("tls_http_probe_failed: " + host)
-    if host == "api.openai.com" and output[0] != "401":
+    if host == OPENAI_API_HOST and output[0] != "401":
         raise RoutingError("openai_control_plane_expected_401")
     return {"host": host, "address": address, "http_status": int(output[0]),
             "tls_seconds": float(output[1]), "total_seconds": float(output[2])}
@@ -316,7 +322,7 @@ def check(system, config, probes=False, tunnel_url_file=None):
         raise RoutingError("marketplace_direct_route_missing")
     result = {"route_check": "passed", "resolved": plan["resolved"], "routes": plan["routes"]}
     if probes:
-        items = [(host, ip) for host in MARKETPLACE_HOSTS + ("api.openai.com",)
+        items = [(host, ip) for host in MARKETPLACE_HOSTS + (OPENAI_API_HOST,)
                  for ip in plan["resolved"][host]]
         with ThreadPoolExecutor(max_workers=3) as pool:
             result["https_transport"] = list(pool.map(https_probe, items))

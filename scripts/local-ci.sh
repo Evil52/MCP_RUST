@@ -26,6 +26,8 @@ python3 -B -m unittest discover -s tests -p test_rust_structure.py
 python3 -B -m unittest discover -s tests -p test_local_artifact.py
 python3 -B -m unittest discover -s tests -p test_verification_targets.py
 python3 -B -m unittest discover -s tests -p test_sonar_test_report.py
+python3 -B -m unittest discover -s tests -p test_sonar_external_issues.py
+python3 -B -m unittest discover -s tests -p test_sonar_lcov_normalize.py
 
 echo "==> Tests"
 cargo test --locked --workspace --all-targets --all-features -- --test-threads=1
@@ -47,7 +49,7 @@ if ! command -v shellcheck >/dev/null 2>&1; then
   echo "shellcheck is required: brew install shellcheck" >&2
   exit 1
 fi
-shellcheck scripts/*.sh position-monitor/*.sh position-monitor/initdb/*.sh
+git ls-files -z -- '*.sh' | xargs -0 shellcheck -x
 ./scripts/test-runtime-health-contract.sh
 bash ./scripts/test-operations-portability.sh
 bash ./scripts/test-local-runtime-recovery.sh
