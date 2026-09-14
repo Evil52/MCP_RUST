@@ -106,6 +106,12 @@ impl StaticGuardCycle<'_> {
                 return Err(error.context("static guard telemetry failed closed"));
             }
         };
+        // Every running campaign must reach its spend and DRR check in every
+        // cycle. A failure on one campaign happens before any write for it, so
+        // it is reported after the remaining campaigns have been evaluated
+        // instead of skipping their stops. The first failure still fails the
+        // cycle and counts towards the consecutive failure limit.
+        let mut first_failure = None;
         for static_guard in guards {
             let guard = &static_guard.guard;
             if state.incident_campaign_ids.contains(&guard.campaign_id)
@@ -113,10 +119,17 @@ impl StaticGuardCycle<'_> {
             {
                 continue;
             }
-            self.guard_observation(static_guard, state, &metrics)
-                .await?;
+            if let Err(error) = self.guard_observation(static_guard, state, &metrics).await {
+                tracing::error!(
+                    campaign_id = guard.campaign_id,
+                    sku = guard.sku,
+                    %error,
+                    "static Ozon guard observation failed; remaining campaigns are still guarded"
+                );
+                first_failure.get_or_insert(error);
+            }
         }
-        Ok(())
+        first_failure.map_or(Ok(()), Err)
     }
 
     async fn stop_unobserved_campaigns(
