@@ -98,6 +98,7 @@ async fn background_report_collects_all_campaign_chunks_through_local_quota() {
             r#"{"data":{"currency":"RUB","products":[]}}"#.to_owned(),
         ),
         (200, r#"{"data":{"items":[]}}"#.to_owned()),
+        (200, "[]".to_owned()),
         (200, r#"{"data":{"listGoods":[]}}"#.to_owned()),
     ]);
     let (base_url, requests) = mock_http(responses);
@@ -126,7 +127,7 @@ async fn background_report_collects_all_campaign_chunks_through_local_quota() {
     assert!(facts.stocks.is_empty() && facts.prices.is_empty());
 
     let requests = requests.try_iter().collect::<Vec<_>>();
-    assert_eq!(requests.len(), 9);
+    assert_eq!(requests.len(), 10);
     assert!(requests[0].starts_with("GET /adv/v1/promotion/count HTTP/1.1"));
     for (index, request) in requests[1..6].iter().enumerate() {
         let path = request
@@ -148,7 +149,8 @@ async fn background_report_collects_all_campaign_chunks_through_local_quota() {
     }
     assert!(requests[6].starts_with("POST /api/analytics/v3/sales-funnel/products "));
     assert!(requests[7].starts_with("POST /api/analytics/v1/stocks-report/wb-warehouses "));
-    assert!(requests[8].starts_with("GET /api/v2/list/goods/filter?"));
+    assert!(requests[8].starts_with("GET /api/v3/warehouses "));
+    assert!(requests[9].starts_with("GET /api/v2/list/goods/filter?"));
 }
 
 #[tokio::test]

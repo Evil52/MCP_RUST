@@ -179,7 +179,7 @@ pub(super) async fn validate_sales_fact_rows(
     client: &Client,
     account: &AccountScope,
     expected: &BTreeMap<i64, (NaiveDate, SnapshotDescriptor)>,
-) -> Result<(), ReportingReadError> {
+) -> Result<BTreeSet<i64>, ReportingReadError> {
     let snapshot_ids = expected.keys().copied().collect::<Vec<_>>();
     let marketplace = marketplace_str(account.marketplace());
     let rows = client
@@ -195,6 +195,7 @@ pub(super) async fn validate_sales_fact_rows(
         .await
         .map_err(|_| ReportingReadError::Unavailable)?;
     let mut actual = BTreeMap::<i64, u64>::new();
+    let mut invalid_periods = BTreeSet::new();
     for row in rows {
         let snapshot_id: i64 = column(&row, 0)?;
         let count = nonnegative_i64(column(&row, 1)?)?;
@@ -203,8 +204,11 @@ pub(super) async fn validate_sales_fact_rows(
         let valid: bool = column(&row, 4)?;
         // WHERE limits IDs to this map; GROUP BY returns each ID exactly once.
         let (business_date, _) = &expected[&snapshot_id];
-        if !valid || minimum != Some(*business_date) || maximum != Some(*business_date) {
+        if !valid {
             return Err(ReportingReadError::InvalidPublishedData);
+        }
+        if minimum != Some(*business_date) || maximum != Some(*business_date) {
+            invalid_periods.insert(snapshot_id);
         }
         actual.insert(snapshot_id, count);
     }
@@ -214,7 +218,30 @@ pub(super) async fn validate_sales_fact_rows(
             usize::try_from(actual).map_err(|_| ReportingReadError::InvalidPublishedData)?;
         validate_snapshot_fact_count(actual, descriptor.row_count())?;
     }
-    Ok(())
+    Ok(invalid_periods)
+}
+
+/// Exclude the entire legacy snapshot with misdated facts, retaining unrelated
+/// dates. Scope, count and schema corruption still fail closed above.
+pub(super) fn exclude_invalid_sales_periods(
+    selection: &mut SalesSnapshotSelection,
+    invalid: &BTreeSet<i64>,
+) {
+    let dates = invalid
+        .iter()
+        .filter_map(|id| selection.expected.remove(id).map(|(date, _)| date))
+        .map(|date| date.to_string())
+        .collect::<BTreeSet<_>>();
+    if dates.is_empty() {
+        return;
+    }
+    for coverage in &mut selection.coverage {
+        if dates.contains(&coverage.business_date) {
+            coverage.served = false;
+            coverage.state = SalesDateCoverageState::Partial;
+        }
+    }
+    selection.state = DataState::Partial;
 }
 
 pub(super) async fn aggregate_sales_rows(
@@ -414,3 +441,11 @@ pub(super) fn validate_weekly_ranking_result(
     }
     Ok(())
 }
+
+pub(super) const SALES_SNAPSHOT_CANDIDATES_QUERY: &str = "SELECT snapshot_id, account_id, marketplace, source, cutoff_at, source_as_of, \
+            period_start, period_end, status, pagination_complete, row_count \
+     FROM daily_reporting.mcp_published_source_snapshots \
+     WHERE account_id = $1 AND marketplace = $2 AND source = 'sales' \
+       AND period_start >= $3 AND period_start < $4 \
+     ORDER BY cutoff_at, snapshot_id \
+     LIMIT 64";

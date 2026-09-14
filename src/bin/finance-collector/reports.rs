@@ -11,7 +11,7 @@ use mcp_ozon::{
         wb_report_repository::PostgresWbReportRepository,
         wb_report_source::{
             WbClientOfficialReportTransport, WbCompleteReportDetails, WbOfficialReportFuture,
-            WbOfficialReportTransport, collect_report_list_checkpointed,
+            WbOfficialReportTransport, WbSelectedReport, collect_report_list_checkpointed,
         },
         wb_source::WbReportSourceError,
     },
@@ -29,7 +29,10 @@ use super::{
 pub fn collection_identity(arguments: &Arguments) -> Result<String> {
     if matches!(
         arguments.command,
-        Command::ListReportsWb | Command::ReconcileReportWb | Command::PublishReportWb
+        Command::ListReportsWb
+            | Command::ReconcileReportWb
+            | Command::PublishReportWb
+            | Command::SyncReportsWb
     ) {
         let observation = arguments
             .observation
@@ -56,7 +59,10 @@ pub async fn execute(
     identity: &access::CredentialIdentity,
     journal: &Arc<LocalJournal>,
 ) -> Result<Value> {
-    let writer = if matches!(arguments.command, Command::PublishReportWb) {
+    let writer = if matches!(
+        arguments.command,
+        Command::PublishReportWb | Command::SyncReportsWb
+    ) {
         let database_url = std::env::var("REPORT_COLLECTOR_DATABASE_URL")
             .context("REPORT_COLLECTOR_DATABASE_URL is required for publish-report-wb")?;
         let config = database_url
@@ -124,6 +130,23 @@ pub async fn execute(
             "evidence_file": path, "next_request_at": journal.next_allowed_at()?,
         }));
     }
+    if arguments.command == Command::SyncReportsWb {
+        let mut result = super::batch::sync_reports(&list, moscow_today(), |selected| {
+            let transport = &transport;
+            let writer = writer.as_ref();
+            async move {
+                finish_report(arguments, identity, journal, transport, writer, &selected).await
+            }
+        })
+        .await?;
+        recheck(arguments, identity)?;
+        result["account_id"] = json!(arguments.account);
+        result["actor_id"] = json!(arguments.actor);
+        result["observation"] = json!(arguments.observation);
+        result["date_from"] = json!(arguments.from);
+        result["date_to"] = json!(arguments.to);
+        return Ok(result);
+    }
     ensure!(
         matches!(
             arguments.command,
@@ -133,8 +156,28 @@ pub async fn execute(
     );
     let report_id = arguments.report_id.context("report ID is required")?;
     let selected = list.select_closed(report_id, &arguments.currency, moscow_today())?;
-    let details = match WbCompleteReportDetails::collect(&transport, &selected, &checkpoints).await
-    {
+    finish_report(
+        arguments,
+        identity,
+        journal,
+        &transport,
+        writer.as_ref(),
+        &selected,
+    )
+    .await
+}
+
+async fn finish_report(
+    arguments: &Arguments,
+    identity: &access::CredentialIdentity,
+    journal: &Arc<LocalJournal>,
+    transport: &AuthorizedOfficialTransport<'_>,
+    writer: Option<&PostgresWbReportRepository>,
+    selected: &WbSelectedReport,
+) -> Result<Value> {
+    let checkpoints: Checkpoints = Some(journal.clone());
+    let report_id = selected.summary().scope.report_id;
+    let details = match WbCompleteReportDetails::collect(transport, selected, &checkpoints).await {
         Ok(details) => details,
         Err(error) => return source_failure(error, arguments, journal),
     };
@@ -157,11 +200,7 @@ pub async fn execute(
     )?;
     let publication = if let Some(writer) = writer {
         recheck(arguments, identity)?;
-        Some(
-            writer
-                .publish(&selected, &details, &arguments.actor)
-                .await?,
-        )
+        Some(writer.publish(selected, &details, &arguments.actor).await?)
     } else {
         None
     };

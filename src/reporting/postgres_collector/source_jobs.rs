@@ -12,7 +12,9 @@ use super::{
     marketplace_name, parse_marketplace, persist_snapshot_contents, require_claim_completed,
     snapshot_source_name, validate_coverage_targets, validate_error_class, validate_owner_id,
 };
-use crate::reporting::checkpoint::{CheckpointError, Checkpoints, JournalFuture, PageJournal};
+use crate::reporting::checkpoint::{
+    CheckpointError, Checkpoints, JournalFuture, PageJournal, StockPageScope,
+};
 
 #[derive(Debug, Clone)]
 pub struct SourceJobClaim {
@@ -91,13 +93,38 @@ impl PostgresSnapshotWriter {
             .await.map_err(|_| PostgresCollectorError::Unavailable)?;
         client.prepare("SELECT payload FROM daily_reporting.source_collection_pages WHERE job_id=$1 AND request_key=$2")
             .await.map_err(|_| PostgresCollectorError::Unavailable)?;
-        let row=client.query_one("SELECT has_function_privilege(current_user, 'daily_reporting.claim_source_collection(jsonb,text)', 'EXECUTE') AND NOT has_table_privilege(current_user, 'daily_reporting.source_collection_jobs','UPDATE')", &[])
+        client
+            .prepare("SELECT daily_reporting.restart_overlapping_sales($1,$2,$3), daily_reporting.admit_source_page($1,$2,$3,$4)")
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let row=client.query_one("SELECT has_function_privilege(current_user, 'daily_reporting.claim_source_collection(jsonb,text)', 'EXECUTE') AND has_function_privilege(current_user, 'daily_reporting.restart_overlapping_sales(bigint,bigint,text)', 'EXECUTE') AND has_function_privilege(current_user, 'daily_reporting.admit_source_page(bigint,bigint,text,text)', 'EXECUTE') AND NOT has_table_privilege(current_user, 'daily_reporting.source_collection_jobs','UPDATE')", &[])
             .await.map_err(|_| PostgresCollectorError::Unavailable)?;
         if row.get::<_, bool>(0) {
             Ok(())
         } else {
             Err(PostgresCollectorError::Unavailable)
         }
+    }
+
+    /// The database owns the retry budget and never revives terminal jobs.
+    pub async fn restart_overlapping_sales(
+        &self,
+        claim: &SourceJobClaim,
+    ) -> Result<(), PostgresCollectorError> {
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        let c = &claim.lease;
+        let row = client
+            .query_one(
+                "SELECT daily_reporting.restart_overlapping_sales($1,$2,$3)",
+                &[&c.id, &c.generation, &c.owner_id],
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        require_claim_completed(row.get(0))
     }
 
     pub async fn enqueue_source_jobs(
@@ -327,6 +354,17 @@ impl PageJournal for PostgresPageJournal {
         })
     }
     fn admit(&self) -> JournalFuture<'_, ()> {
+        self.admit_quota("default")
+    }
+    fn admit_stock_page(&self, scope: StockPageScope) -> JournalFuture<'_, ()> {
+        self.admit_quota(scope.quota_name())
+    }
+    fn save<'a>(&'a self, key: &'a str, page: Value) -> JournalFuture<'a, ()> {
+        self.save_page(key, page)
+    }
+}
+impl PostgresPageJournal {
+    fn admit_quota(&self, quota: &'static str) -> JournalFuture<'_, ()> {
         Box::pin(async move {
             if self.admitted.swap(true, Ordering::SeqCst) {
                 return Err(CheckpointError::Deferred);
@@ -340,8 +378,8 @@ impl PageJournal for PostgresPageJournal {
             let c = &self.claim.lease;
             let row = client
                 .query_one(
-                    "SELECT daily_reporting.admit_source_page($1,$2,$3)",
-                    &[&c.id, &c.generation, &c.owner_id],
+                    "SELECT daily_reporting.admit_source_page($1,$2,$3,$4)",
+                    &[&c.id, &c.generation, &c.owner_id, &quota],
                 )
                 .await
                 .map_err(|_| CheckpointError::Unavailable)?;
@@ -352,7 +390,7 @@ impl PageJournal for PostgresPageJournal {
             }
         })
     }
-    fn save<'a>(&'a self, key: &'a str, page: Value) -> JournalFuture<'a, ()> {
+    fn save_page<'a>(&'a self, key: &'a str, page: Value) -> JournalFuture<'a, ()> {
         Box::pin(async move {
             let client = self
                 .writer

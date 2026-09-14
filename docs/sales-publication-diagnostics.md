@@ -1,5 +1,10 @@
 # Sales publication validation
 
+The bounded recovery and historical-read changes are described in
+[analytics collection recovery](analytics-collection-recovery.md). The
+historical incident below remains evidence of a publication failure, not
+proof of its exact upstream cause.
+
 The September 2026 operational audit found Sales jobs ending in
 `invalid_source_publication` after their pages had been collected. A read-only
 database check on September 11 distinguished these cutoffs (UTC):
