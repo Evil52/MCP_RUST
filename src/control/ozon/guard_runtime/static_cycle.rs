@@ -17,6 +17,13 @@ use std::{
     time::Duration,
 };
 
+/// Pause after a stop request before the guard moves on to the next campaign.
+#[cfg(not(test))]
+const STOP_REQUEST_PAUSE: Duration = Duration::from_secs(7);
+/// Unit tests keep the same ordering without waiting in real time.
+#[cfg(test)]
+const STOP_REQUEST_PAUSE: Duration = Duration::from_millis(10);
+
 #[derive(Clone, Copy)]
 struct StaticGuardCycle<'a> {
     state_path: &'a Path,
@@ -216,7 +223,7 @@ impl StaticGuardCycle<'_> {
             {
                 tracing::error!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"static Ozon hard-stop failed");
             }
-            tokio::time::sleep(Duration::from_secs(7)).await;
+            tokio::time::sleep(STOP_REQUEST_PAUSE).await;
             return Ok(());
         }
         let Some(current_bid_microrubles) = self
@@ -297,7 +304,7 @@ impl StaticGuardCycle<'_> {
                 {
                     tracing::error!(campaign_id=guard.campaign_id,sku=guard.sku,%error,"static Ozon guard item failed");
                 }
-                tokio::time::sleep(Duration::from_secs(7)).await;
+                tokio::time::sleep(STOP_REQUEST_PAUSE).await;
                 return Ok(None);
             }
             Ok(bid_microrubles) => {
