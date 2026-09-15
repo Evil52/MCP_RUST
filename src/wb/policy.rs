@@ -1,6 +1,7 @@
 //! Read-only endpoint policy and fixed hosts, never supplied by callers.
 
 use super::finance::{FINANCE_LIST_PATH, FINANCE_REPORT_ID_PATH};
+use super::seller_stock_report::{SELLER_STOCK_REPORT_LABEL, SELLER_STOCK_REPORT_PATH};
 use super::{
     ACCEPTANCE_COEFFICIENTS_PATH, ACCEPTANCE_MIN_REQUEST_INTERVAL, ANALYTICS_MIN_REQUEST_INTERVAL,
     BASE_RETRY_DELAY, COMMISSION_MIN_REQUEST_INTERVAL, CONTENT_MIN_REQUEST_INTERVAL, Duration,
@@ -58,6 +59,9 @@ pub(super) enum RequestClass {
     ReturnClaims,
     SupplyReport,
     CardErrors,
+    FbsOrders,
+    PromotionCosts,
+    PromotionPayments,
 }
 
 /// Single source of truth for every request that may leave this process.
@@ -79,6 +83,13 @@ pub(super) struct EndpointPolicy {
 /// [`WbClient::request`], the only place a WB request can leave the process, so
 /// adding a mutating call requires deliberately editing this list.
 pub(super) const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
+    EndpointPolicy {
+        method: Method::POST,
+        path: SELLER_STOCK_REPORT_PATH,
+        label: SELLER_STOCK_REPORT_LABEL,
+        host: ApiHost::Analytics,
+        request_class: RequestClass::AnalyticsReport,
+    },
     EndpointPolicy {
         method: Method::POST,
         path: FINANCE_LIST_PATH,
@@ -289,6 +300,7 @@ impl EndpointPolicy {
         READ_ONLY_ENDPOINT_ALLOWLIST
             .iter()
             .chain(super::coverage_policy::ENDPOINTS)
+            .chain(super::operational_policy::ENDPOINTS)
             .find(|policy| {
                 policy.method == *method
                     && if policy.path == SELLER_STOCKS_PATH {
@@ -329,6 +341,9 @@ impl RequestClass {
         !matches!(
             self,
             Self::StatisticsReport
+                | Self::FbsOrders
+                | Self::PromotionCosts
+                | Self::PromotionPayments
                 | Self::FeedbackReport
                 | Self::ReturnClaims
                 | Self::SupplyReport
@@ -368,6 +383,8 @@ pub(super) struct ClientPolicy {
     pub(super) claims_interval: Duration,
     pub(super) supplies_interval: Duration,
     pub(super) card_errors_interval: Duration,
+    pub(super) fbs_orders_interval: Duration,
+    pub(super) promotion_history_interval: Duration,
     pub(super) max_attempts: usize,
     pub(super) base_retry_delay: Duration,
     pub(super) max_retry_delay: Duration,
@@ -409,6 +426,10 @@ impl ClientPolicy {
             claims_interval: Duration::from_hours(1),
             supplies_interval: Duration::from_hours(1),
             card_errors_interval: Duration::from_secs(6),
+            // Below the 300/min seller quota, including the 10x 4XX charge.
+            fbs_orders_interval: Duration::from_secs(2),
+            // Safe for Base tokens too; never infer a faster tier from credentials.
+            promotion_history_interval: Duration::from_hours(1),
             max_attempts: MAX_ATTEMPTS,
             base_retry_delay: BASE_RETRY_DELAY,
             max_retry_delay: MAX_RETRY_DELAY,
@@ -441,6 +462,8 @@ impl ClientPolicy {
             claims_interval: Duration::ZERO,
             supplies_interval: Duration::ZERO,
             card_errors_interval: Duration::ZERO,
+            fbs_orders_interval: Duration::ZERO,
+            promotion_history_interval: Duration::ZERO,
             max_attempts: 1,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -471,6 +494,10 @@ impl ClientPolicy {
             RequestClass::ReturnClaims => self.claims_interval,
             RequestClass::SupplyReport => self.supplies_interval,
             RequestClass::CardErrors => self.card_errors_interval,
+            RequestClass::FbsOrders => self.fbs_orders_interval,
+            RequestClass::PromotionCosts | RequestClass::PromotionPayments => {
+                self.promotion_history_interval
+            }
         }
     }
 }

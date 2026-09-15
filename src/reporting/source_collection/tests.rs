@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use std::{fs, path::PathBuf, str::FromStr};
 use tokio_postgres::{Client, Config, NoTls};
 
+mod recovery;
 mod sales_publication;
+mod seller_stocks;
 
 static DATABASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -235,6 +237,7 @@ fn source_name(source: SnapshotSource) -> &'static str {
     match source {
         SnapshotSource::Sales => "sales",
         SnapshotSource::Stocks => "stocks",
+        SnapshotSource::SellerStocks => "seller_stocks",
         SnapshotSource::Prices => "prices",
         SnapshotSource::Advertising => "advertising",
         SnapshotSource::Finance => "finance",
@@ -283,7 +286,10 @@ fn empty_pages(claim: &SourceJobClaim) -> Vec<(Value, Value)> {
             vec![(json!(["wb_sales_v2", date, 250, 0]), json!([[], 0]))]
         }
         (Marketplace::Wildberries, SnapshotSource::Stocks) => {
-            vec![(json!(["wb_stock", 0]), json!([[], 0]))]
+            vec![(
+                json!(["wb_stock_v2", 1_000, 0]),
+                json!({"facts":[],"source_rows":0,"sizes":[]}),
+            )]
         }
         (Marketplace::Wildberries, SnapshotSource::Prices) => {
             vec![(json!(["wb_price", 0]), json!([[], 0]))]
@@ -291,7 +297,9 @@ fn empty_pages(claim: &SourceJobClaim) -> Vec<(Value, Value)> {
         (Marketplace::Wildberries, SnapshotSource::Advertising) => {
             vec![(json!(["wb_campaigns", date]), json!([]))]
         }
-        (Marketplace::Wildberries, SnapshotSource::Finance) => unreachable!(),
+        (Marketplace::Wildberries, SnapshotSource::Finance) | (_, SnapshotSource::SellerStocks) => {
+            unreachable!()
+        }
     }
 }
 
@@ -342,8 +350,8 @@ async fn scheduler_replays_all_sources_and_isolates_corrupt_pages_and_credential
     let row = fixture.admin.query_one("SELECT count(*),min(cutoff_at),max(cutoff_at) FROM daily_reporting.source_collection_jobs WHERE account_id=ANY($1)", &[&fixture.accounts()]).await.unwrap();
     assert_eq!(
         row.get::<_, i64>(0),
-        18,
-        "two daily occurrences, nine independent sources, deduplicated"
+        20,
+        "two daily occurrences, ten independent sources including optional FBS, deduplicated"
     );
     let old: DateTime<Utc> = row.get(1);
     let latest: DateTime<Utc> = row.get(2);

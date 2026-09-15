@@ -57,6 +57,15 @@ fn all_tools_have_truthful_annotations_and_descriptions() {
 #[test]
 fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
     const STABLE_TOOL_NAMES: &[&str] = &[
+        "wb_seller_warehouses_stock_report",
+        "wb_fbs_new_orders",
+        "wb_fbs_orders",
+        "wb_fbs_order_statuses",
+        "wb_promotion_balance",
+        "wb_promotion_budget",
+        "wb_promotion_costs",
+        "wb_promotion_payments",
+        "ozon_api_key_roles",
         "wb_reviews",
         "wb_review",
         "wb_questions",
@@ -215,7 +224,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     // The release checklist in `SECURITY.md` states this count verbatim.
     // Changing it here without updating that gate leaves the gate
     // describing a router that no longer exists.
-    assert_eq!(dev_tools.len(), 105);
+    assert_eq!(dev_tools.len(), 114);
     assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
     let seed = server();
@@ -226,7 +235,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
     let jwt_tools = authenticated.tool_router.list_all();
-    assert_eq!(jwt_tools.len(), 105);
+    assert_eq!(jwt_tools.len(), 114);
     assert_policy(
         jwt_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -238,7 +247,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
         .with_preview_features(false, true)
         .tool_router
         .list_all();
-    assert_eq!(legacy_flag_tools.len(), 105);
+    assert_eq!(legacy_flag_tools.len(), 114);
     assert_policy(
         legacy_flag_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -265,6 +274,7 @@ fn ozon_network_endpoints_are_confined_to_explicit_read_only_allowlist() {
         "/v1/rating/history",
         "/v1/rating/summary",
         "/v1/returns/list",
+        "/v1/roles",
         "/v2/posting/fbo/get",
         "/v2/posting/fbs/cancel-reason/list",
         "/v2/product/info/stocks-by-warehouse/fbs",

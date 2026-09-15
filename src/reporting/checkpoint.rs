@@ -7,6 +7,50 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub type Checkpoints = Option<Arc<dyn PageJournal>>;
+
+#[derive(Clone, Copy)]
+pub enum StockPageScope {
+    Content,
+    SellerInventory,
+}
+
+impl StockPageScope {
+    #[must_use]
+    pub const fn quota_name(self) -> &'static str {
+        match self {
+            Self::Content => "wb_stock_content",
+            Self::SellerInventory => "wb_seller_inventory",
+        }
+    }
+}
+
+/// Share one page quantum and lease while using the actual upstream quota.
+#[must_use]
+pub fn stock_checkpoints(journal: &Checkpoints, scope: StockPageScope) -> Checkpoints {
+    journal.as_ref().map(|journal| {
+        Arc::new(StockJournal {
+            journal: Arc::clone(journal),
+            scope,
+        }) as Arc<dyn PageJournal>
+    })
+}
+
+struct StockJournal {
+    journal: Arc<dyn PageJournal>,
+    scope: StockPageScope,
+}
+
+impl PageJournal for StockJournal {
+    fn load<'a>(&'a self, key: &'a str) -> JournalFuture<'a, Option<Value>> {
+        self.journal.load(key)
+    }
+    fn admit(&self) -> JournalFuture<'_, ()> {
+        self.journal.admit_stock_page(self.scope)
+    }
+    fn save<'a>(&'a self, key: &'a str, page: Value) -> JournalFuture<'a, ()> {
+        self.journal.save(key, page)
+    }
+}
 pub type JournalFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, CheckpointError>> + Send + 'a>>;
 
@@ -36,6 +80,9 @@ impl CheckpointError {
 pub trait PageJournal: Send + Sync {
     fn load<'a>(&'a self, key: &'a str) -> JournalFuture<'a, Option<Value>>;
     fn admit(&self) -> JournalFuture<'_, ()>;
+    fn admit_stock_page(&self, _scope: StockPageScope) -> JournalFuture<'_, ()> {
+        self.admit()
+    }
     fn save<'a>(&'a self, key: &'a str, page: Value) -> JournalFuture<'a, ()>;
 }
 

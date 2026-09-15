@@ -179,7 +179,7 @@ render_control_ozon_live_compose() {
   printf 'verification-executor-client-secret\n' >"$executor_secret"
   chmod 600 "$executor_id" "$executor_secret"
   CONTROL_MCP_ACCESS_CONFIG_HOST="$project_dir/config/access.example.json" \
-    CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.ozon-furnitura.live.example.json" \
+    CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.ozon-furnitura.live.json" \
     CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_ID_FILE_HOST="$executor_id" \
     CONTROL_MCP_OZON_EXECUTOR_PERFORMANCE_CLIENT_SECRET_FILE_HOST="$executor_secret" \
     CONTROL_MCP_JWT_ISSUER="https://auth.example.test/realms/ofk" \
@@ -2101,7 +2101,7 @@ check_contains \
 check_contains \
   "report egress: proxy permits the exact Ozon and WB report API hosts" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
-  "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru finance-api.wildberries.ru content-api.wildberries.ru feedbacks-api.wildberries.ru returns-api.wildberries.ru supplies-api.wildberries.ru"
+  "acl marketplace_read_api dstdomain api-seller.ozon.ru api-performance.ozon.ru seller-analytics-api.wildberries.ru discounts-prices-api.wildberries.ru advert-api.wildberries.ru finance-api.wildberries.ru content-api.wildberries.ru feedbacks-api.wildberries.ru returns-api.wildberries.ru supplies-api.wildberries.ru marketplace-api.wildberries.ru"
 check_contains \
   "report egress: proxy applies the exact read API host allowlist" \
   "$project_dir/position-monitor/ozon-egress/squid.conf" \
@@ -2193,7 +2193,15 @@ check_contains \
 check_contains \
   "control auth egress: upstream host/path are the only routing substitutions" \
   "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
-  'proxy_pass https://${CONTROL_AUTH_JWKS_HOST}${CONTROL_AUTH_JWKS_PATH};'
+  'set $jwks_upstream https://${CONTROL_AUTH_JWKS_HOST}${CONTROL_AUTH_JWKS_PATH};'
+check_contains \
+  "control auth egress: the fixed upstream variable is the only proxy target" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  'proxy_pass $jwks_upstream;'
+check_contains \
+  "control auth egress: the IdP address is re-resolved through Docker DNS" \
+  "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \
+  'resolver 127.0.0.11 valid=60s ipv6=off;'
 check_contains \
   "control auth egress: upstream certificate verification is mandatory" \
   "$project_dir/position-monitor/control-auth-egress/nginx.conf.template" \

@@ -22,7 +22,14 @@ http {
             limit_except GET { deny all; }
             if ($args != "") { return 404; }
 
-            proxy_pass https://${CONTROL_AUTH_JWKS_HOST}${CONTROL_AUTH_JWKS_PATH};
+            # A variable upstream is re-resolved through Docker's embedded DNS
+            # instead of pinning the address seen at startup, so an IdP behind a
+            # CDN keeps serving keys after its IP changes. Host and path are
+            # still the only substitutions.
+            resolver 127.0.0.11 valid=60s ipv6=off;
+            resolver_timeout 5s;
+            set $jwks_upstream https://${CONTROL_AUTH_JWKS_HOST}${CONTROL_AUTH_JWKS_PATH};
+            proxy_pass $jwks_upstream;
             proxy_pass_request_body off;
             proxy_pass_request_headers off;
             proxy_set_header Host ${CONTROL_AUTH_JWKS_HOST};

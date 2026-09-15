@@ -384,8 +384,11 @@ impl JwtAuthenticator {
             .ok_or(JwtAuthenticationFailure::MissingCredentials)?
             .to_str()
             .map_err(|_| JwtAuthenticationFailure::InvalidToken)?;
+        // RFC 9110 section 11.1: the scheme name is case-insensitive.
         let token = value
-            .strip_prefix("Bearer ")
+            .get(..7)
+            .filter(|scheme| scheme.eq_ignore_ascii_case("Bearer "))
+            .and_then(|_| value.get(7..))
             .filter(|token| !token.trim().is_empty())
             .ok_or(JwtAuthenticationFailure::InvalidToken)?;
         let header = decode_header(token).map_err(|_| JwtAuthenticationFailure::InvalidToken)?;
@@ -442,6 +445,8 @@ pub struct ProtectedResourceMetadata {
 
 #[cfg(test)]
 mod tests {
+    mod scheme;
+
     use std::fmt::Write as _;
     use std::{
         collections::BTreeMap,
@@ -1466,32 +1471,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_bad_headers_algorithms_claims_and_unknown_users() {
+    async fn rejects_bad_algorithms_claims_and_unknown_users() {
         let auth =
             JwtAuthenticator::new(config("http://127.0.0.1:1".to_owned()), registry()).unwrap();
-        assert_eq!(
-            auth.authenticate(&HeaderMap::new()).await.unwrap_err(),
-            JwtAuthenticationFailure::MissingCredentials
-        );
-
-        for value in ["Basic abc", "Bearer ", "Bearer not-a-jwt"] {
-            let mut headers = HeaderMap::new();
-            headers.insert(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
-            assert_eq!(
-                auth.authenticate(&headers).await.unwrap_err(),
-                JwtAuthenticationFailure::InvalidToken
-            );
-        }
-        let mut invalid_text = HeaderMap::new();
-        invalid_text.insert(
-            AUTHORIZATION,
-            HeaderValue::from_bytes(b"Bearer \xff").unwrap(),
-        );
-        assert_eq!(
-            auth.authenticate(&invalid_text).await.unwrap_err(),
-            JwtAuthenticationFailure::InvalidToken
-        );
-
         let hs_token = encode(
             &Header::new(Algorithm::HS256),
             &json!({"sub": "subject-1"}),

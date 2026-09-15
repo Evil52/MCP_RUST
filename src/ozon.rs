@@ -3,6 +3,7 @@ pub use policy::{
     ANALYTICS_DATA_PATH, PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST, READ_ONLY_ENDPOINT_ALLOWLIST,
     is_read_only_endpoint_allowed,
 };
+mod attempt;
 mod checkpoint;
 mod quota;
 
@@ -750,152 +751,6 @@ impl OzonClient {
         }
     }
 
-    async fn send_attempt(&self, input: AttemptInput<'_>) -> Result<Value, AttemptFailure> {
-        let AttemptInput {
-            limiter,
-            credentials,
-            store,
-            path,
-            payload,
-            attempt,
-            pacing_mode,
-            retry_owner,
-        } = input;
-        let can_retry = retry_owner == RetryOwner::Client
-            && RETRY_POLICY.allows_attempt(attempt)
-            && !policy::is_search_path(path);
-        let queue_analytics = pacing_mode == AnalyticsPacingMode::Queue || attempt > 1;
-        let _permits = self
-            .acquire_request_permits(limiter, path, queue_analytics)
-            .await
-            .map_err(AttemptFailure::terminal)?;
-        let request_trace = RequestTrace {
-            store,
-            endpoint: path,
-            started_at: Instant::now(),
-            attempt,
-        };
-        self.admit_shared_request(&credentials.client_id, path)
-            .await
-            .map_err(AttemptFailure::terminal)?;
-        let response = self
-            .http
-            .post(format!("{}{path}", self.base_url))
-            .header("Client-Id", &credentials.client_id)
-            .header("Api-Key", &credentials.api_key)
-            .json(payload)
-            .send()
-            .await;
-
-        let mut response = match response {
-            Ok(response) => response,
-            Err(source) => {
-                let error = classify_transport_error(source, None);
-                let kind = error.kind();
-                let will_retry = is_retriable_transport(kind) && can_retry;
-                trace_transport_failure(&request_trace, kind, will_retry);
-                return Err(AttemptFailure {
-                    error,
-                    retry_delay: will_retry.then(|| retry_delay(attempt, None)),
-                });
-            }
-        };
-        let status = response.status();
-        let request_id = safe_request_id(response.headers());
-        let retry_after = parse_retry_after(response.headers(), Utc::now());
-        let vendor_retry_after = retry_after.duration();
-        let local_cooldown =
-            if path == ANALYTICS_DATA_PATH && status == StatusCode::TOO_MANY_REQUESTS {
-                Some(
-                    limiter
-                        .record_analytics_rate_limit(vendor_retry_after)
-                        .await,
-                )
-            } else {
-                None
-            };
-        if policy::is_search_path(path)
-            && let Some(delay) = quota::response_cooldown(status, vendor_retry_after, None)
-        {
-            let mut next = limiter.search_next_allowed.lock().await;
-            // Bound untrusted header arithmetic, as the WB client does. The
-            // uncapped vendor delay is still returned and passed to shared quota.
-            *next = (*next).max(Instant::now() + delay.min(Duration::from_hours(24)));
-        }
-        let enforced_retry_after = local_cooldown.max(vendor_retry_after);
-        if let Some(delay) = quota::response_cooldown(status, vendor_retry_after, local_cooldown) {
-            self.defer_shared_request(&credentials.client_id, path, delay)
-                .await
-                .map_err(AttemptFailure::terminal)?;
-        }
-        let planned_retry = if can_retry {
-            analytics_queued_retry_plan(path, status, pacing_mode, attempt, enforced_retry_after)
-                .or_else(|| retry_plan(path, status, attempt, retry_after))
-        } else {
-            None
-        };
-
-        if path != ANALYTICS_DATA_PATH
-            && let Some(delay) = shared_retry_cooldown(status, retry_after)
-        {
-            // Install a vendor-directed cooldown before `_permits` is
-            // released, closing the window in which a same-Client-Id sibling
-            // could leave during Retry-After.
-            limiter.extend_cooldown(delay).await;
-        }
-
-        if let Some((delay, kind)) = planned_retry {
-            trace_response(&request_trace, status, request_id.as_deref(), true, kind);
-            let diagnostic = read_bounded_diagnostic_body(&mut response).await;
-            let error = classify_http_error(
-                status,
-                request_id,
-                vendor_retry_after,
-                local_cooldown,
-                diagnostic,
-            );
-            return Err(AttemptFailure {
-                error,
-                retry_delay: Some(delay),
-            });
-        }
-
-        let result = decode_response(
-            &mut response,
-            status,
-            request_id.clone(),
-            vendor_retry_after,
-            local_cooldown,
-        )
-        .await;
-        if path == ANALYTICS_DATA_PATH && result.is_ok() {
-            limiter.clear_analytics_rate_limit().await;
-        }
-        let kind = result
-            .as_ref()
-            .err()
-            .map_or(OzonErrorKind::Http, OzonError::kind);
-        // Receiving a successful status does not mean the complete JSON body
-        // reached us. A proxy or upstream can close the stream between chunks;
-        // all Ozon routes exposed by this client are read-only, so replaying
-        // that interrupted attempt is safe and prevents partial analytics from
-        // surfacing to browser clients.
-        let will_retry = result
-            .as_ref()
-            .is_err_and(|error| is_retriable_transport(error.kind()) && can_retry);
-        trace_response(
-            &request_trace,
-            status,
-            request_id.as_deref(),
-            will_retry,
-            kind,
-        );
-        result.map_err(|error| AttemptFailure {
-            error,
-            retry_delay: will_retry.then(|| retry_delay(attempt, None)),
-        })
-    }
-
     async fn acquire_request_permits<'a>(
         &'a self,
         limiter: &'a RateLimiter,
@@ -1603,7 +1458,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, READ_ONLY_ENDPOINT_ALLOWLIST);
-        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 37);
+        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 38);
 
         for endpoint in READ_ONLY_ENDPOINT_ALLOWLIST {
             assert!(endpoint.starts_with('/'), "{endpoint}");

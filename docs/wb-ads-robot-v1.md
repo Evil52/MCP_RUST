@@ -39,6 +39,12 @@ remaining mandatory data and execution guards are implemented and replayed.
 - Missing current-day spend is explicit and blocks actions instead of becoming
   a trusted zero.
 - A protective pause is not automatically resumed after midnight or restart.
+- Spend observed at or above the daily ceiling on a still-active campaign
+  sends the protective pause first, through the same reservation, permit and
+  read-back path. The next cycle records `daily_spend_cap_breached` and stops
+  automation until an operator reviews it. A breach with no reservable pause
+  (campaign not active, daily action quota exhausted) locks immediately without
+  a write.
 - The business date is calculated at the Moscow UTC+3 boundary.
 - A shadow-policy digest migration preserves pending, cooldown, pause and
   incident state instead of resetting the robot.
@@ -214,6 +220,25 @@ policy uses `raise-traffic-frontier-limits-pg`. It accepts only the exact
 5.40-to-10 RUB and 300-to-500 RUB transition, performs a read-only preflight,
 preserves durable counters, cooldown, pause and incident state, and appends
 `traffic_frontier_limits_raised`. A repeated rollout is idempotent.
+
+## Reviewed v4 7--12 RUB corridor for Одуванчик and Nexus
+
+`adjust-traffic-frontier-v4-corridor-pg` is a separate transition for only
+`ofk_region_wb` campaigns **39807762 / Одуванчик** and **40141836 / Nexus**.
+It accepts a current `traffic_frontier_v4` policy with the 10.50 RUB ceiling
+and changes only `min_bid_kopecks` to 700 and `max_bid_kopecks` to 1200. The
+new policy must use the exact authorization reference
+`chat/2026-09-15/oduvanchik-nexus-traffic-frontier-v4-7-12`; a different
+campaign, source policy, amount, placement, budget/DRR/stop setting or any
+other policy field fails closed.
+
+Before registering the new policy digest it performs a read-only WB preflight,
+acquires the existing PostgreSQL campaign lock and rejects pending writes or
+incidents. The durable transition preserves counters, cooldown, pause and
+feedback history and appends `traffic_frontier_v4_corridor_adjusted` with both
+old and new bounds. It does not place a bid itself. The scheduled worker may
+only make a later ordinary guarded adjustment after its own readback and all
+existing spend/DRR/stock checks pass.
 
 ## CPC compatibility corrections
 

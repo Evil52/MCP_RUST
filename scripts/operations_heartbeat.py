@@ -18,7 +18,9 @@ POLL_METRIC = "commands_poll_last_successful_timestamp_seconds"
 
 
 def parse_launch_agent_result(output):
-    values = re.findall(r"^\s*last exit code\s*=\s*(.*?)\s*$", output, re.M)
+    # The value starts at its first non-space character, so the whitespace
+    # before it and the value itself never compete for the same input.
+    values = [value.rstrip() for value in re.findall(r"^\s*last exit code\s*=\s*(\S.*)?$", output, re.M)]
     if not values or values == ["(never exited)"] or values == ["never exited"]:
         return None
     if len(values) != 1 or not re.fullmatch(r"-?[0-9]+", values[0]):

@@ -1,4 +1,6 @@
 use super::*;
+#[path = "operational_reads.rs"]
+mod operational_reads;
 
 fn wb_tools() -> Vec<(&'static str, Value)> {
     vec![
@@ -145,4 +147,27 @@ async fn search_and_supplemental_wb_tools_are_absent_in_reporting_only_mode() {
         let text = call_tool_over_http(server.clone(), name, json!({})).await;
         assert!(text.contains("tool not found"), "{name}: {text}");
     }
+}
+
+#[tokio::test]
+async fn readiness_tracks_the_configured_refresh_queue() {
+    let healthy_repository = Arc::new(FakeRefreshRequestRepository::default());
+    let healthy =
+        server().with_refresh_requests(RefreshRequestService::from_repository(healthy_repository));
+    assert_eq!(healthy.readiness().await, Ok(()));
+
+    let unavailable_repository = Arc::new(FakeRefreshRequestRepository::unavailable());
+    let unavailable = server().with_refresh_requests(RefreshRequestService::from_repository(
+        unavailable_repository,
+    ));
+    assert_eq!(unavailable.readiness().await, Err(()));
+}
+
+#[tokio::test]
+async fn readiness_fails_when_the_configured_reporting_reader_is_unavailable() {
+    let repository = Arc::new(FakeReportingRepository::unavailable());
+    let server = reporting_test_server("admin", repository.clone());
+
+    assert!(server.readiness().await.is_err());
+    assert_eq!(repository.calls(), 1);
 }

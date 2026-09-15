@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    fmt::Write as _,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -17,7 +16,6 @@ use mcp_ozon::control::{
     wb_automation_business_date,
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio_postgres::Config;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -26,6 +24,14 @@ const DATABASE_URL_ENV: &str = "WB_AUTOMATION_DATABASE_URL";
 
 #[path = "wb_automation/entry.rs"]
 mod entry;
+mod wb_automation {
+    pub mod digest;
+    pub mod v4_corridor;
+}
+use wb_automation::digest::{is_lower_sha256, sha256_domain};
+#[cfg(test)]
+#[path = "wb_automation/v4_corridor_tests.rs"]
+mod v4_corridor_tests;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1168,6 +1174,7 @@ enum Command {
     ActivateTrafficFrontierV2Postgres(ActivatePolicyOptions),
     ActivateTrafficFrontierV3Postgres(ActivatePolicyOptions),
     ActivateTrafficFrontierV4Postgres(ActivatePolicyOptions),
+    AdjustTrafficFrontierV4CorridorPostgres(ActivatePolicyOptions),
     RaiseTrafficFrontierLimitsPostgres(ActivatePolicyOptions),
     TightenTrafficFrontierCorridorPostgres(ActivatePolicyOptions),
     ExecutePostgres(PostgresExecuteOptions),
@@ -1257,6 +1264,7 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
         | "activate-traffic-frontier-v2-pg"
         | "activate-traffic-frontier-v3-pg"
         | "activate-traffic-frontier-v4-pg"
+        | "adjust-traffic-frontier-v4-corridor-pg"
         | "raise-traffic-frontier-limits-pg"
         | "tighten-traffic-frontier-corridor-pg" => {
             let options = parse_activation_options(arguments)?;
@@ -1272,6 +1280,9 @@ fn parse_command(arguments: &[String]) -> Result<Command> {
                 }
                 "activate-traffic-frontier-v4-pg" => {
                     Command::ActivateTrafficFrontierV4Postgres(options)
+                }
+                "adjust-traffic-frontier-v4-corridor-pg" => {
+                    Command::AdjustTrafficFrontierV4CorridorPostgres(options)
                 }
                 "raise-traffic-frontier-limits-pg" => {
                     Command::RaiseTrafficFrontierLimitsPostgres(options)
@@ -1632,7 +1643,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn usage<T>() -> Result<T> {
     bail!(
-        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bounded-pacing-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v2-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v3-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v4-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation raise-traffic-frontier-limits-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation tighten-traffic-frontier-corridor-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation explicit-quota-override-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <authorization-reference> --confirm-one-extra-audited-action [reader-proxy-url] | wb-automation explicit-resume-after-daily-cap-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> --confirm-explicit-resume-after-daily-cap [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
+        "usage: wb-automation observe-once <policy.json> <access.json> <read-token-file> <private-state-directory> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation shadow-once-pg <policy.json> <access.json> <read-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-protective-live-pg <shadow-policy.json> <live-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bid-writes-pg <protective-policy.json> <bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-bounded-pacing-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v2-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v3-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation activate-traffic-frontier-v4-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation adjust-traffic-frontier-v4-corridor-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation raise-traffic-frontier-limits-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation tighten-traffic-frontier-corridor-pg <source-bid-policy.json> <target-bid-policy.json> <access.json> <read-token-file> <allow-broad-reader:true|false> [reader-proxy-url] | wb-automation execute-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url] | wb-automation explicit-exposure-increase-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <target-impressions> --confirm-explicit-exposure-increase [reader-proxy-url] | wb-automation explicit-quota-override-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> <authorization-reference> --confirm-one-extra-audited-action [reader-proxy-url] | wb-automation explicit-resume-after-daily-cap-once-pg <policy.json> <access.json> <read-token-file> <write-token-file> <legacy-execution-state.json> <allow-broad-reader:true|false> <writer-proxy-url> --confirm-explicit-resume-after-daily-cap [reader-proxy-url] | wb-automation <execute-once|auto-once> <policy.json> <access.json> <read-token-file> <write-token-file> <private-state-directory> <allow-broad-reader:true|false> <writer-proxy-url> [reader-proxy-url]"
     )
 }
 
@@ -1689,27 +1700,6 @@ fn load_legacy_state(
         incident_class: state.incident_class,
         legacy_digest: sha256_domain("wb-automation-legacy-state-v1", &bytes),
     })
-}
-
-fn sha256_domain(domain: &str, bytes: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(domain.as_bytes());
-    digest.update([0]);
-    digest.update(bytes);
-    digest
-        .finalize()
-        .iter()
-        .fold(String::with_capacity(64), |mut output, byte| {
-            write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
-            output
-        })
-}
-
-fn is_lower_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 #[cfg(test)]

@@ -269,3 +269,6 @@ async fn wb_seller_stock_rejects_malformed_and_unrequested_rows() {
         assert!(requests.try_recv().is_err());
     }
 }
+
+#[path = "wb_stock_report.rs"]
+mod stock_report;

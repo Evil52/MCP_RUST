@@ -488,6 +488,7 @@ Production router публикует 76 stable tools:
 - `ozon_performance_sku_statistics`
 - `ozon_seller_rating`
 - `ozon_seller_rating_history`
+- `ozon_api_key_roles`
 - `ozon_reviews`
 - `ozon_questions`
 - `wb_stores_status`
@@ -495,6 +496,9 @@ Production router публикует 76 stable tools:
 - `wb_product_cards`
 - `wb_product_prices`
 - `wb_promotion_campaigns`
+- `wb_promotion_balance`, `wb_promotion_budget`
+- `wb_promotion_costs`, `wb_promotion_payments`
+- `wb_fbs_new_orders`, `wb_fbs_orders`, `wb_fbs_order_statuses`
 - `wb_promotion_campaign_details`
 - `wb_promotion_stats`
 - `wb_search_product_queries`
@@ -508,6 +512,7 @@ Production router публикует 76 stable tools:
 - `wb_warehouse_stocks`
 - `wb_seller_warehouses`
 - `wb_seller_warehouse_stocks`
+- `wb_seller_warehouses_stock_report`
 - `wb_orders`
 - `wb_sales`
 - `wb_tariff_commissions`
@@ -521,7 +526,19 @@ Production router публикует 76 stable tools:
 `wb_warehouse_stocks` получает **текущие FBW-остатки на складах WB**
 (аналог FBO). Его страницы `limit/offset` не содержат FBS-остатков.
 
-Для **текущих остатков на складах продавца / FBS**:
+Для **текущих остатков на складах продавца / FBS** используйте
+`wb_seller_warehouses_stock_report(account, limit, offset)` — отчёт Analytics
+без предварительного обхода каталога. Оставьте `nm_ids` и `chrt_ids` пустыми,
+начните с `offset=0` и пройдите все `next_offset` до `page_is_last=true`.
+Проверяйте отсутствие повторов `(chrtId, warehouseId)` между страницами.
+MCP ограничивает страницу 1000 строками и ответ 2 МиБ; запросы используют
+общую квоту Analytics с интервалом 20 секунд. WB обновляет отчёт раз в 30 минут.
+Нужен Personal/Service токен категории Analytics. Сопоставьте `warehouseId`
+с `wb_seller_warehouses`: только `deliveryType=1` относится к FBS.
+HTTP 204 означает отсутствие данных; пропущенные пары не становятся нулями.
+Документация: https://dev.wildberries.cn/docs/openapi/analytics
+
+Для точечной проверки через прежний Marketplace API:
 
 1. Разрешите кабинет через `marketplace_accounts` / `wb_stores_status`.
 2. Вызовите `wb_seller_warehouses(account)`: это полный список без пагинации.
@@ -568,6 +585,8 @@ PUT/DELETE и создание складов запрещены. Использ
 Дополнительно доступны отзывы, вопросы, заявки на возврат, диагностика карточек
 и поставки FBW для WB, а также поисковая аналитика Ozon. Контракты, пагинация
 и ограничения описаны в [каталоге новых методов чтения](docs/marketplace-read-coverage.md).
+Первый пакет операционных данных (FBS, рекламные деньги WB и права ключа Ozon)
+описан в [контрактах и ограничениях](docs/operational-read-expansion.md).
 
 Для отдельного MCP с подготовленной аналитикой задайте в окружении процесса
 `MCP_DATA_MODE=reporting_only`. Этот режим не импортирует `.env`, не загружает

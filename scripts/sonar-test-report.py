@@ -7,11 +7,37 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
-RESULT = re.compile(r"^test (.+) \.\.\. (.*)$")
+RESULT_PREFIX = "test "
+RESULT_SEPARATOR = " ... "
 STATUS = re.compile(r"^(ok|FAILED|ignored)(?:, (.*))?$")
 SUMMARY = re.compile(
     r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored;"
 )
+
+
+def split_result(line: str) -> tuple[str, str] | None:
+    """Splits `test NAME ... REMAINDER` at the last separator, like a greedy match."""
+    if not line.startswith(RESULT_PREFIX):
+        return None
+    name, separator, remainder = line[len(RESULT_PREFIX):].rpartition(RESULT_SEPARATOR)
+    return (name, remainder) if separator and name else None
+
+
+def completed_test(line: str, pending: str | None):
+    """Returns the still pending test name and a completed (name, status, reason)."""
+    result = split_result(line)
+    if result:
+        if pending is not None:
+            raise ValueError(f"missing result for {pending}")
+        pending, remainder = result
+        status_match = STATUS.match(remainder)
+    else:
+        status_match = STATUS.match(line) if pending is not None else None
+    # A test can write directly to stdout (bypassing harness capture).
+    # With one harness thread its result follows on a separate line.
+    if status_match is None:
+        return pending, None
+    return None, (pending, *status_match.groups())
 
 
 def convert(output: str) -> ET.Element:
@@ -25,20 +51,10 @@ def convert(output: str) -> ET.Element:
         summary = SUMMARY.match(line)
         if summary:
             expected = [a + int(b) for a, b in zip(expected, summary.groups())]
-        result = RESULT.match(line)
-        if result:
-            if pending is not None:
-                raise ValueError(f"missing result for {pending}")
-            pending, remainder = result.groups()
-            status_match = STATUS.match(remainder)
-        else:
-            status_match = STATUS.match(line) if pending is not None else None
-        # A test can write directly to stdout (bypassing harness capture).
-        # With one harness thread its result follows on a separate line.
-        if status_match is None:
+        pending, completed = completed_test(line, pending)
+        if completed is None:
             continue
-        name, pending = pending, None
-        status, reason = status_match.groups()
+        name, status, reason = completed
         counts[name] = counts.get(name, 0) + 1
         if counts[name] > 1:
             name = f"{name} [{counts[name]}]"

@@ -318,74 +318,8 @@ impl Operator {
             nonfinished_campaign_ids(&groups, own_id)?
         };
         let checked_campaign_count = ids.len();
-        for chunk in ids.into_iter().collect::<Vec<_>>().chunks(50) {
-            let response = self
-                .reader
-                .promotion_campaign_details(ACCOUNT, chunk.to_vec(), vec![], None)
-                .await?;
-            let adverts = response
-                .get("adverts")
-                .and_then(Value::as_array)
-                .context("incomplete campaign details")?;
-            let returned = adverts
-                .iter()
-                .filter_map(|ad| ad.get("id").and_then(Value::as_u64))
-                .collect::<BTreeSet<_>>();
-            ensure!(
-                returned == chunk.iter().copied().collect() && adverts.len() == chunk.len(),
-                "campaign overlap check did not return every selected campaign"
-            );
-            for ad in adverts {
-                ensure!(
-                    ad.pointer("/settings/name")
-                        .and_then(Value::as_str)
-                        .context("campaign name absent")?
-                        != NAME,
-                    "another Nexus campaign exists; reconcile instead of creating a duplicate"
-                );
-                if self.manifest.recreate.is_some()
-                    && matches!(ad.get("status").and_then(Value::as_i64), Some(-1 | 7 | 8))
-                {
-                    continue;
-                }
-                let nms = ad
-                    .get("nm_settings")
-                    .and_then(Value::as_array)
-                    .context("campaign SKU list absent")?;
-                for nm in nms {
-                    let id = nm
-                        .get("nm_id")
-                        .and_then(Value::as_u64)
-                        .context("campaign SKU invalid")?;
-                    ensure!(
-                        !NMS.contains(&id),
-                        "SKU {id} already belongs to another non-finished campaign"
-                    );
-                }
-            }
-        }
-        let stocks = self
-            .reader
-            .warehouse_stocks(
-                ACCOUNT,
-                json!({"nmIds":NMS,"chrtIds":[],"limit":100,"offset":0}),
-            )
-            .await?;
-        let (stocks, count) = crate::reporting::wb_adapter::parse_stock_page(&stocks)?;
-        ensure!(count < 100, "stock page may be truncated");
-        let mut totals = BTreeMap::<u64, u64>::new();
-        for row in stocks {
-            let total = totals.entry(row.sku).or_default();
-            *total = total
-                .checked_add(row.sellable_units)
-                .context("stock overflow")?;
-        }
-        for nm in NMS {
-            ensure!(
-                totals.get(&nm).copied().unwrap_or(0) >= 20,
-                "SKU {nm} has insufficient verified WB stock (minimum 20)"
-            );
-        }
+        self.verify_no_campaign_overlap(ids).await?;
+        let totals = self.verified_stock_totals().await?;
         let balance = if self.manifest.scope == LaunchScope::FundAndStart {
             let balance = self.balance().await?;
             ensure!(
@@ -411,6 +345,92 @@ impl Operator {
             "daily_cap_rubles":500,"pause_threshold_rubles":450,"target_drr_percent":15,
             "auto_top_up":false,"credential_role":"seller-bound promotion-only dedicated writer"}),
         )
+    }
+
+    /// Rejects a launch while another Nexus campaign exists or a launch SKU
+    /// already belongs to a non-finished campaign. Every selected campaign
+    /// must come back from the details endpoint.
+    async fn verify_no_campaign_overlap(&self, ids: BTreeSet<u64>) -> Result<()> {
+        for chunk in ids.into_iter().collect::<Vec<_>>().chunks(50) {
+            let response = self
+                .reader
+                .promotion_campaign_details(ACCOUNT, chunk.to_vec(), vec![], None)
+                .await?;
+            let adverts = response
+                .get("adverts")
+                .and_then(Value::as_array)
+                .context("incomplete campaign details")?;
+            let returned = adverts
+                .iter()
+                .filter_map(|ad| ad.get("id").and_then(Value::as_u64))
+                .collect::<BTreeSet<_>>();
+            ensure!(
+                returned == chunk.iter().copied().collect() && adverts.len() == chunk.len(),
+                "campaign overlap check did not return every selected campaign"
+            );
+            for ad in adverts {
+                self.verify_campaign_does_not_overlap(ad)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_campaign_does_not_overlap(&self, ad: &Value) -> Result<()> {
+        ensure!(
+            ad.pointer("/settings/name")
+                .and_then(Value::as_str)
+                .context("campaign name absent")?
+                != NAME,
+            "another Nexus campaign exists; reconcile instead of creating a duplicate"
+        );
+        if self.manifest.recreate.is_some()
+            && matches!(ad.get("status").and_then(Value::as_i64), Some(-1 | 7 | 8))
+        {
+            return Ok(());
+        }
+        let nms = ad
+            .get("nm_settings")
+            .and_then(Value::as_array)
+            .context("campaign SKU list absent")?;
+        for nm in nms {
+            let id = nm
+                .get("nm_id")
+                .and_then(Value::as_u64)
+                .context("campaign SKU invalid")?;
+            ensure!(
+                !NMS.contains(&id),
+                "SKU {id} already belongs to another non-finished campaign"
+            );
+        }
+        Ok(())
+    }
+
+    /// Reads one complete stock page and requires at least 20 sellable units
+    /// for every launch SKU.
+    async fn verified_stock_totals(&self) -> Result<BTreeMap<u64, u64>> {
+        let stocks = self
+            .reader
+            .warehouse_stocks(
+                ACCOUNT,
+                json!({"nmIds":NMS,"chrtIds":[],"limit":100,"offset":0}),
+            )
+            .await?;
+        let (stocks, count) = crate::reporting::wb_adapter::parse_stock_page(&stocks)?;
+        ensure!(count < 100, "stock page may be truncated");
+        let mut totals = BTreeMap::<u64, u64>::new();
+        for row in stocks {
+            let total = totals.entry(row.sku).or_default();
+            *total = total
+                .checked_add(row.sellable_units)
+                .context("stock overflow")?;
+        }
+        for nm in NMS {
+            ensure!(
+                totals.get(&nm).copied().unwrap_or(0) >= 20,
+                "SKU {nm} has insufficient verified WB stock (minimum 20)"
+            );
+        }
+        Ok(totals)
     }
 
     async fn minimums(&self, id: u64) -> Result<()> {

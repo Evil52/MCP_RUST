@@ -89,6 +89,15 @@ async fn complete_quantum(
     claim: &SourceJobClaim,
     outcome: Result<SourceFacts, SourceFailure>,
 ) -> Result<()> {
+    if outcome
+        .as_ref()
+        .is_err_and(|failure| failure.code == "sales_page_overlap")
+    {
+        return match writer.restart_overlapping_sales(claim).await {
+            Ok(()) | Err(super::postgres_collector::PostgresCollectorError::ClaimLost) => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
     match outcome {
         Ok((facts, expenses)) => {
             match writer
@@ -126,7 +135,9 @@ async fn complete_quantum(
         }) => writer.defer_source_job(claim, None, 1, false).await?,
         Err(failure) => {
             let code = failure.code;
-            let retry = retryable(code) && failure.retry_after.is_none_or(|s| s <= 86400);
+            let retry = (retryable(code)
+                || retry_current_advertising_counts(code, claim, Utc::now()))
+                && failure.retry_after.is_none_or(|s| s <= 86400);
             let delay = 65_u32
                 .saturating_mul(1 << claim.consecutive_failures.min(4))
                 .min(900)
@@ -220,6 +231,17 @@ async fn collect(
                 .await
                 .map_err(|error| error.failure())?,
         ),
+        (Marketplace::Wildberries, SnapshotSource::SellerStocks) => {
+            let (client, account) = config
+                .resolve_wb_scheduled(claim.credential_claim())
+                .map_err(|_| "credentials_unavailable")?;
+            CollectedFacts::SellerStocks(
+                super::wb_seller_source::WbSellerSource::new(client, account)
+                    .with_checkpoints(writer.source_checkpoints(claim))
+                    .collect()
+                    .await?,
+            )
+        }
         (Marketplace::Wildberries, SnapshotSource::Prices) => CollectedFacts::Prices(
             wb_source(config, writer, claim)?
                 .collect_price_pages()
@@ -232,9 +254,21 @@ async fn collect(
                 .await
                 .map_err(|error| error.failure())?,
         ),
-        (Marketplace::Wildberries, SnapshotSource::Finance) => return Err("source_invalid".into()),
+        (Marketplace::Wildberries, SnapshotSource::Finance)
+        | (Marketplace::Ozon, SnapshotSource::SellerStocks) => return Err("source_invalid".into()),
     };
     Ok((facts, Vec::new()))
+}
+
+fn retry_current_advertising_counts(
+    code: &str,
+    claim: &SourceJobClaim,
+    now: DateTime<Utc>,
+) -> bool {
+    code == "promotion_counts_inconsistent"
+        && claim.marketplace() == Marketplace::Wildberries
+        && claim.source == SnapshotSource::Advertising
+        && business_date(claim.period_start) == business_date(now)
 }
 
 fn seller_source(

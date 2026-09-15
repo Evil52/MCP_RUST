@@ -8,7 +8,7 @@ use mcp_ozon::reporting::{
     mcp_read::{
         DataState, ManagerActionKind, ReadyReportKind, ReadyReportState, ReportingReadError,
         ReportingReader, SalesAnalyticsDirection, SalesAnalyticsGroup, SalesAnalyticsQuery,
-        SalesAnalyticsSort, SalesDateCoverageState,
+        SalesAnalyticsSort, SalesDateCoverageState, SourceSnapshotQuery,
     },
     outbox::{ArtifactIdentity, DeliveryErrorClass},
     postgres_collector::{
@@ -151,7 +151,9 @@ async fn publish_ranking_day(
         .map(|facts| {
             let (period_start, period_end) = if matches!(
                 &facts,
-                CollectedFacts::Stocks(_) | CollectedFacts::Prices(_)
+                CollectedFacts::Stocks(_)
+                    | CollectedFacts::SellerStocks(_)
+                    | CollectedFacts::Prices(_)
             ) {
                 (source_as_of, source_as_of)
             } else {
@@ -225,7 +227,9 @@ fn snapshot_with_status(
             timestamp("2098-09-14T19:00:00Z"),
             timestamp("2098-09-15T19:00:00Z"),
         ),
-        CollectedFacts::Stocks(_) | CollectedFacts::Prices(_) => (source_as_of, source_as_of),
+        CollectedFacts::Stocks(_) | CollectedFacts::SellerStocks(_) | CollectedFacts::Prices(_) => {
+            (source_as_of, source_as_of)
+        }
     };
     CollectedSnapshot::new(
         account_id.to_owned(),
@@ -788,11 +792,28 @@ async fn sales_queries_sort_page_and_reject_corrupt_or_excessive_snapshot_histor
         .get(0);
     replace_sales_fact_date(&mut admin, snapshot, day + Duration::days(2)).await;
     let corrupted = reader.sales_analytics(&account, query).await;
+    let invalid_day_only = reader
+        .sales_analytics(
+            &account,
+            SalesAnalyticsQuery {
+                date_to: day,
+                ..query
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_day_only.state, DataState::Partial);
+    assert!(invalid_day_only.rows.is_empty());
+    assert_eq!(invalid_day_only.total_rows, 0);
+    assert!(!invalid_day_only.coverage[0].served);
     replace_sales_fact_date(&mut admin, snapshot, day).await;
-    assert_eq!(
-        corrupted.err(),
-        Some(ReportingReadError::InvalidPublishedData)
-    );
+    let corrupted = corrupted.unwrap();
+    assert_eq!(corrupted.state, DataState::Partial);
+    assert_eq!(corrupted.total_rows, 1);
+    assert_eq!(corrupted.rows[0].ordered_units, 9);
+    assert!(!corrupted.coverage[0].served);
+    assert_eq!(corrupted.coverage[0].state, SalesDateCoverageState::Partial);
+    assert!(corrupted.coverage[1].served);
     // Two days and 61 replacements are exactly the supported 63 candidates.
     for revision in 1..=61 {
         publish_ranking_day(&writer, &account, day, 3, revision).await;
@@ -838,4 +859,114 @@ async fn replace_sales_fact_date(
         .unwrap();
     transaction.commit().await.unwrap();
     assert_eq!(updated, 1);
+}
+
+#[tokio::test]
+async fn historical_stock_scope_includes_seller_rows_outside_the_requested_page() {
+    let (Ok(reader_url), Ok(collector_url)) = (
+        std::env::var("POSITION_REPOSITORY_TEST_READER_URL"),
+        std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL"),
+    ) else {
+        return;
+    };
+    let _guard = DB_TEST_LOCK.lock().await;
+    let account = AccountScope::new(
+        format!("legacy_inventory_{}", std::process::id()),
+        Marketplace::Wildberries,
+    )
+    .unwrap();
+    let target = CollectionTarget {
+        account_id: account.account_id().to_owned(),
+        marketplace: account.marketplace(),
+        sources: vec![
+            SnapshotSource::Sales,
+            SnapshotSource::Advertising,
+            SnapshotSource::Stocks,
+            SnapshotSource::Prices,
+        ],
+    };
+    let writer = PostgresSnapshotWriter::connect(&Config::from_str(&collector_url).unwrap())
+        .await
+        .unwrap();
+    let cutoff = Utc::now();
+    let claim = writer
+        .claim_target(&target, cutoff, "legacy-inventory-test")
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshots = [
+        CollectedFacts::Sales(Vec::new()),
+        CollectedFacts::Advertising(Vec::new()),
+        CollectedFacts::Stocks(vec![
+            CollectedStockFact {
+                sku: 1,
+                warehouse_id: "wb:10".to_owned(),
+                sellable_units: 2,
+            },
+            CollectedStockFact {
+                sku: 2,
+                warehouse_id: "wb:seller:2:20".to_owned(),
+                sellable_units: 3,
+            },
+        ]),
+        CollectedFacts::Prices(Vec::new()),
+    ]
+    .into_iter()
+    .map(|facts| {
+        let period_start = if matches!(
+            &facts,
+            CollectedFacts::Sales(_) | CollectedFacts::Advertising(_)
+        ) {
+            cutoff - Duration::days(1)
+        } else {
+            cutoff
+        };
+        CollectedSnapshot::new(
+            account.account_id().to_owned(),
+            account.marketplace(),
+            cutoff,
+            cutoff,
+            period_start,
+            cutoff,
+            SnapshotStatus::Succeeded,
+            true,
+            "legacy-inventory-test".to_owned(),
+            facts,
+        )
+        .unwrap()
+    })
+    .collect::<Vec<_>>();
+    writer
+        .persist_claimed_batch(&claim, &snapshots)
+        .await
+        .unwrap();
+    let reader = ReportingReader::connect_optional(Some(&reader_url))
+        .await
+        .unwrap();
+    let query = SourceSnapshotQuery {
+        source: SnapshotSource::Stocks,
+        snapshot_id: None,
+        limit: 1,
+        offset: 0,
+    };
+    let first = reader.source_snapshot(&account, query).await.unwrap();
+    assert_eq!(first.total_rows, 2);
+    assert_eq!(first.rows.len(), 1);
+    assert_eq!(first.rows[0]["warehouse_id"], "wb:10");
+    assert_eq!(first.inventory_scope.as_deref(), Some("mixed"));
+    assert_eq!(first.next_offset, Some(1));
+    let second = reader
+        .source_snapshot(
+            &account,
+            SourceSnapshotQuery {
+                snapshot_id: Some(first.snapshot_id.unwrap().parse().unwrap()),
+                offset: 1,
+                ..query
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.rows[0]["warehouse_id"], "wb:seller:2:20");
+    assert_eq!(second.inventory_scope.as_deref(), Some("mixed"));
+    assert_eq!(second.next_offset, None);
 }

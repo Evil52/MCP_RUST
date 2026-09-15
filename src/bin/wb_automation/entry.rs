@@ -52,6 +52,9 @@ pub async fn run() -> Result<()> {
         Command::ActivateTrafficFrontierV4Postgres(options) => {
             activate_traffic_frontier_v4_postgres(options).await
         }
+        Command::AdjustTrafficFrontierV4CorridorPostgres(options) => {
+            super::wb_automation::v4_corridor::adjust(options).await
+        }
         Command::RaiseTrafficFrontierLimitsPostgres(options) => {
             raise_traffic_frontier_limits_postgres(options).await
         }
