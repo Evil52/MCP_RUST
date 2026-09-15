@@ -1,4 +1,5 @@
 use super::{Command, WbAutomationPolicy, parse_command, wb_automation::v4_corridor};
+use mcp_ozon::control::validate_wb_automation_policy;
 use std::path::PathBuf;
 
 fn corridor_target(source: &WbAutomationPolicy) -> WbAutomationPolicy {
@@ -25,6 +26,8 @@ fn accepts_only_both_reviewed_campaigns() {
     let oduvanchik = oduvanchik();
     let target = corridor_target(&oduvanchik);
     v4_corridor::validate(&oduvanchik, &target).expect("reviewed Oduvanchik 7-12 is accepted");
+    validate_wb_automation_policy(&target)
+        .expect("reviewed Oduvanchik 7-12 remains a valid runnable policy");
 
     let mut nexus = oduvanchik;
     nexus.campaign_id = 40_141_836;
@@ -34,6 +37,8 @@ fn accepts_only_both_reviewed_campaigns() {
     nexus.min_bid_kopecks = 102;
     let nexus_target = corridor_target(&nexus);
     v4_corridor::validate(&nexus, &nexus_target).expect("reviewed Nexus 7-12 is accepted");
+    validate_wb_automation_policy(&nexus_target)
+        .expect("reviewed Nexus 7-12 remains a valid runnable policy");
 
     let mut changed_budget = nexus_target.clone();
     changed_budget.daily_spend_cap_minor += 1;
