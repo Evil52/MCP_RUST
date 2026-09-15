@@ -699,7 +699,6 @@ const fn valid_marginal_feedback_policy(policy: &WbAutomationPolicy) -> bool {
         && policy.cooldown_seconds >= 1_800
         && policy.cooldown_seconds <= 3_600
 }
-
 const fn valid_traffic_frontier_policy(policy: &WbAutomationPolicy) -> bool {
     let Some(frontier) = policy.traffic_frontier_bid_kopecks else {
         return false;
@@ -707,12 +706,13 @@ const fn valid_traffic_frontier_policy(policy: &WbAutomationPolicy) -> bool {
     let Some(feedback_timeout) = policy.traffic_frontier_feedback_timeout_seconds else {
         return false;
     };
-    let emergency_headroom = policy
+    let headroom = policy
         .daily_spend_cap_minor
         .saturating_sub(policy.daily_pause_threshold_minor);
-    frontier > policy.min_bid_kopecks
+    let floor = policy.min_bid_kopecks;
+    (frontier > floor || (frontier == floor && policy.autonomous_pacing.allows_zero_cost_probe()))
         && frontier <= policy.max_bid_kopecks
-        && policy.max_bid_kopecks <= emergency_headroom
+        && policy.max_bid_kopecks <= headroom
         && feedback_timeout >= policy.cooldown_seconds
         && feedback_timeout <= 86_400
 }
