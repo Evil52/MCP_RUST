@@ -52,6 +52,7 @@ fn every_automation_command_fails_closed_on_missing_local_policy() {
         "activate-traffic-frontier-v2-pg",
         "activate-traffic-frontier-v3-pg",
         "activate-traffic-frontier-v4-pg",
+        "adjust-traffic-frontier-v4-corridor-pg",
         "raise-traffic-frontier-limits-pg",
         "tighten-traffic-frontier-corridor-pg",
     ] {

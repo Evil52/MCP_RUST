@@ -1,10 +1,11 @@
 use super::{
     Command, activate_bid_writes_postgres, activate_bounded_pacing_postgres,
     activate_protective_live_postgres, activate_traffic_frontier_v2_postgres,
-    activate_traffic_frontier_v3_postgres, activate_traffic_frontier_v4_postgres, auto_once,
-    execute_once, execute_postgres_once, explicit_exposure_increase_postgres_once,
-    explicit_quota_override_postgres_once, explicit_resume_after_daily_cap_postgres_once,
-    observe_once, parse_command, raise_traffic_frontier_limits_postgres, shadow_postgres_once,
+    activate_traffic_frontier_v3_postgres, activate_traffic_frontier_v4_postgres,
+    adjust_traffic_frontier_v4_corridor_postgres, auto_once, execute_once, execute_postgres_once,
+    explicit_exposure_increase_postgres_once, explicit_quota_override_postgres_once,
+    explicit_resume_after_daily_cap_postgres_once, observe_once, parse_command,
+    raise_traffic_frontier_limits_postgres, shadow_postgres_once,
     tighten_traffic_frontier_corridor_postgres,
 };
 use anyhow::{Result, ensure};
@@ -51,6 +52,9 @@ pub async fn run() -> Result<()> {
         }
         Command::ActivateTrafficFrontierV4Postgres(options) => {
             activate_traffic_frontier_v4_postgres(options).await
+        }
+        Command::AdjustTrafficFrontierV4CorridorPostgres(options) => {
+            adjust_traffic_frontier_v4_corridor_postgres(options).await
         }
         Command::RaiseTrafficFrontierLimitsPostgres(options) => {
             raise_traffic_frontier_limits_postgres(options).await

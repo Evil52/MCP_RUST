@@ -182,6 +182,14 @@ enum PolicyTransition {
         from_max_bid_kopecks: u64,
         to_max_bid_kopecks: u64,
     },
+    /// The reviewed v4 change raises the floor to 7 RUB and the ceiling to
+    /// 12 RUB without resetting any protective runtime state.
+    TrafficFrontierV4CorridorAdjusted {
+        from_min_bid_kopecks: u64,
+        to_min_bid_kopecks: u64,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+    },
 }
 
 impl PolicyTransition {
@@ -195,6 +203,9 @@ impl PolicyTransition {
             Self::TrafficFrontierV4Activated { .. } => "traffic_frontier_v4_activated",
             Self::TrafficFrontierLimitsRaised { .. } => "traffic_frontier_limits_raised",
             Self::TrafficFrontierCorridorTightened { .. } => "traffic_frontier_corridor_tightened",
+            Self::TrafficFrontierV4CorridorAdjusted { .. } => {
+                "traffic_frontier_v4_corridor_adjusted"
+            }
         }
     }
 
@@ -207,7 +218,8 @@ impl PolicyTransition {
             | Self::TrafficFrontierV3Activated { .. }
             | Self::TrafficFrontierV4Activated { .. }
             | Self::TrafficFrontierLimitsRaised { .. }
-            | Self::TrafficFrontierCorridorTightened { .. } => "bid_live",
+            | Self::TrafficFrontierCorridorTightened { .. }
+            | Self::TrafficFrontierV4CorridorAdjusted { .. } => "bid_live",
         }
     }
 
@@ -221,6 +233,7 @@ impl PolicyTransition {
                 | Self::TrafficFrontierV4Activated { .. }
                 | Self::TrafficFrontierLimitsRaised { .. }
                 | Self::TrafficFrontierCorridorTightened { .. }
+                | Self::TrafficFrontierV4CorridorAdjusted { .. }
         )
     }
 
@@ -237,6 +250,11 @@ impl PolicyTransition {
                 ..
             }
             | Self::TrafficFrontierCorridorTightened {
+                from_max_bid_kopecks,
+                to_max_bid_kopecks,
+                ..
+            }
+            | Self::TrafficFrontierV4CorridorAdjusted {
                 from_max_bid_kopecks,
                 to_max_bid_kopecks,
                 ..
@@ -267,7 +285,8 @@ impl PolicyTransition {
             | Self::BidWrites
             | Self::TrafficFrontierV2Activated { .. }
             | Self::TrafficFrontierLimitsRaised { .. }
-            | Self::TrafficFrontierCorridorTightened { .. } => None,
+            | Self::TrafficFrontierCorridorTightened { .. }
+            | Self::TrafficFrontierV4CorridorAdjusted { .. } => None,
         }
     }
 }
@@ -728,6 +747,38 @@ impl WbAutomationCampaignLease<'_> {
         .await
     }
 
+    /// Records the narrow v4 7--12 RUB adjustment.  The caller must prove the
+    /// account/campaign/authorization and that every other policy field is
+    /// unchanged; this durable layer preserves all existing safety state.
+    pub async fn activate_traffic_frontier_v4_corridor_policy(
+        &mut self,
+        source_policy_digest: &str,
+        target_policy_digest: &str,
+        from_min_bid_kopecks: u64,
+        to_min_bid_kopecks: u64,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+    ) -> Result<WbAutomationStateTransitionReceipt, WbAutomationPostgresError> {
+        if !(102..=700).contains(&from_min_bid_kopecks)
+            || to_min_bid_kopecks != 700
+            || from_max_bid_kopecks != 1_050
+            || to_max_bid_kopecks != 1_200
+        {
+            return Err(WbAutomationPostgresError::InvalidInput);
+        }
+        self.activate_policy_transition(
+            source_policy_digest,
+            target_policy_digest,
+            PolicyTransition::TrafficFrontierV4CorridorAdjusted {
+                from_min_bid_kopecks,
+                to_min_bid_kopecks,
+                from_max_bid_kopecks,
+                to_max_bid_kopecks,
+            },
+        )
+        .await
+    }
+
     async fn activate_policy_transition(
         &mut self,
         source_policy_digest: &str,
@@ -930,6 +981,16 @@ impl WbAutomationCampaignLease<'_> {
             payload["autonomous_pacing"] = "traffic_frontier_v2".into();
             payload["from_traffic_frontier_bid_kopecks"] = from_frontier_bid_kopecks.into();
             payload["to_traffic_frontier_bid_kopecks"] = to_frontier_bid_kopecks.into();
+        }
+        if let PolicyTransition::TrafficFrontierV4CorridorAdjusted {
+            from_min_bid_kopecks,
+            to_min_bid_kopecks,
+            ..
+        } = transition
+        {
+            payload["autonomous_pacing"] = "traffic_frontier_v4".into();
+            payload["from_min_bid_kopecks"] = from_min_bid_kopecks.into();
+            payload["to_min_bid_kopecks"] = to_min_bid_kopecks.into();
         }
         let payload_json = payload.to_string();
         insert_audit_event(

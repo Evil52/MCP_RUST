@@ -52,6 +52,7 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     let frontier_corridor_policy_digest = "a".repeat(64);
     let frontier_v3_policy_digest = "b".repeat(64);
     let frontier_v4_policy_digest = "c".repeat(64);
+    let frontier_v4_corridor_policy_digest = "d".repeat(64);
     let live_cycle_id = format!("{campaign_id:064x}");
     let bid_cycle_id = format!("{:064x}", campaign_id + 1);
     let paced_cycle_id = format!("{:064x}", campaign_id + 2);
@@ -59,6 +60,7 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     let frontier_limits_cycle_id = format!("{:064x}", campaign_id + 4);
     let frontier_corridor_cycle_id = format!("{:064x}", campaign_id + 5);
     let frontier_v3_cycle_id = format!("{:064x}", campaign_id + 6);
+    let frontier_v4_cycle_id = format!("{:064x}", campaign_id + 7);
     let business_date = NaiveDate::from_ymd_opt(2026, 8, 26).expect("valid date");
     let observed_at = Utc
         .with_ymd_and_hms(2026, 8, 26, 12, 0, 0)
@@ -741,6 +743,80 @@ async fn protective_live_policy_activation_is_locked_audited_and_idempotent() {
     assert_eq!(v4_payload["feedback_timeout_seconds"], 1_800);
     assert_eq!(v4_payload["zero_cost_probe_enabled"], true);
     assert_eq!(v4_payload["state_revision"], 9);
+
+    lease
+        .persist_shadow_cycle(
+            &frontier_v4_cycle_id,
+            &frontier_v4_policy_digest,
+            observed_at + Duration::seconds(8),
+            business_date,
+            9,
+            "{}",
+            "{}",
+        )
+        .await
+        .expect("latest traffic-frontier v4 evidence is persisted");
+    assert_eq!(
+        lease
+            .activate_traffic_frontier_v4_corridor_policy(
+                &frontier_v4_policy_digest,
+                &frontier_v4_corridor_policy_digest,
+                701,
+                700,
+                1_050,
+                1_200,
+            )
+            .await,
+        Err(WbAutomationPostgresError::InvalidInput)
+    );
+    let v4_corridor = lease
+        .activate_traffic_frontier_v4_corridor_policy(
+            &frontier_v4_policy_digest,
+            &frontier_v4_corridor_policy_digest,
+            500,
+            700,
+            1_050,
+            1_200,
+        )
+        .await
+        .expect("traffic-frontier v4 7-12 corridor is adjusted atomically");
+    assert!(v4_corridor.changed);
+    assert_eq!(v4_corridor.state_revision, 10);
+    let v4_corridor_replay = lease
+        .activate_traffic_frontier_v4_corridor_policy(
+            &frontier_v4_policy_digest,
+            &frontier_v4_corridor_policy_digest,
+            500,
+            700,
+            1_050,
+            1_200,
+        )
+        .await
+        .expect("traffic-frontier v4 corridor replay is idempotent");
+    assert!(!v4_corridor_replay.changed);
+    assert_eq!(v4_corridor_replay.state_revision, 10);
+    let v4_corridor_audit = admin
+        .query_one(
+            "SELECT cycle_id, payload_json FROM wb_automation.audit_events \
+             WHERE account_id=$1 AND advert_id=$2 \
+               AND event_type='traffic_frontier_v4_corridor_adjusted'",
+            &[&account_id, &campaign_id_i64],
+        )
+        .await
+        .expect("traffic-frontier v4 corridor audit evidence is readable");
+    assert_eq!(v4_corridor_audit.get::<_, String>(0), frontier_v4_cycle_id);
+    let v4_corridor_payload =
+        serde_json::from_str::<serde_json::Value>(&v4_corridor_audit.get::<_, String>(1))
+            .expect("traffic-frontier v4 corridor audit payload is valid JSON");
+    assert_eq!(v4_corridor_payload["from_min_bid_kopecks"], 500);
+    assert_eq!(v4_corridor_payload["to_min_bid_kopecks"], 700);
+    assert_eq!(v4_corridor_payload["from_max_bid_kopecks"], 1_050);
+    assert_eq!(v4_corridor_payload["to_max_bid_kopecks"], 1_200);
+    assert_eq!(
+        v4_corridor_payload["autonomous_pacing"],
+        "traffic_frontier_v4"
+    );
+    assert_eq!(v4_corridor_payload["state_revision"], 10);
 
     lease.release().await.expect("campaign lock is released");
     drop(admin);
