@@ -34,7 +34,12 @@ mod coverage_policy;
 mod hosts;
 pub mod read_coverage;
 use hosts::BaseUrls;
+pub mod fbs_orders;
+mod limiter;
+mod operational_policy;
 mod operator_reads;
+pub mod promotion_money;
+use limiter::TokenLimiter;
 mod policy;
 pub use mcp_marketplace_types::WbCredentials;
 use policy::{ApiHost, ClientPolicy, EndpointPolicy, RequestClass};
@@ -45,9 +50,11 @@ use validation::{
     validate_promotion_period, validate_promotion_statuses, validate_search_period,
     validate_search_texts, validate_top_order_by, validate_unsigned_id,
 };
+mod inventory;
 pub(crate) mod quota;
 mod request;
 mod response;
+pub mod seller_stock_report;
 #[cfg(test)]
 use response::{
     ParsedRetryDelay, extract_request_id, is_retriable, parse_retry_delay, retry_plan,
@@ -314,154 +321,6 @@ impl PacingGate {
     }
 }
 
-#[derive(Debug)]
-struct TokenLimiter {
-    in_flight: Semaphore,
-    analytics_ping: PacingGate,
-    analytics_reports: PacingGate,
-    statistics_reports: PacingGate,
-    content_reports: PacingGate,
-    prices_reports: PacingGate,
-    commission_tariffs: PacingGate,
-    logistics_tariffs: PacingGate,
-    acceptance_tariffs: PacingGate,
-    promotion_campaigns: PacingGate,
-    promotion_balance: PacingGate,
-    promotion_stats: PacingGate,
-    search_reports: PacingGate,
-    promotion_minimum_bids: PacingGate,
-    promotion_recommendations: PacingGate,
-    promotion_cluster_bids: PacingGate,
-    seller_inventory: PacingGate,
-    feedback_reports: PacingGate,
-    return_claims: PacingGate,
-    supply_reports: PacingGate,
-    card_errors: PacingGate,
-    finance_reports: PacingGate,
-    finance_access: FinanceAccess,
-}
-
-impl TokenLimiter {
-    fn new() -> Self {
-        Self {
-            in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS_PER_TOKEN),
-            analytics_ping: PacingGate::new(),
-            analytics_reports: PacingGate::new(),
-            statistics_reports: PacingGate::new(),
-            content_reports: PacingGate::new(),
-            prices_reports: PacingGate::new(),
-            commission_tariffs: PacingGate::new(),
-            logistics_tariffs: PacingGate::new(),
-            acceptance_tariffs: PacingGate::new(),
-            promotion_campaigns: PacingGate::new(),
-            promotion_balance: PacingGate::new(),
-            promotion_stats: PacingGate::new(),
-            search_reports: PacingGate::new(),
-            promotion_minimum_bids: PacingGate::new(),
-            promotion_recommendations: PacingGate::new(),
-            promotion_cluster_bids: PacingGate::new(),
-            seller_inventory: PacingGate::new(),
-            feedback_reports: PacingGate::new(),
-            return_claims: PacingGate::new(),
-            supply_reports: PacingGate::new(),
-            card_errors: PacingGate::new(),
-            finance_reports: PacingGate::new(),
-            finance_access: FinanceAccess::new(),
-        }
-    }
-
-    const fn gate(&self, request_class: RequestClass) -> &PacingGate {
-        match request_class {
-            RequestClass::AnalyticsPing => &self.analytics_ping,
-            RequestClass::AnalyticsReport => &self.analytics_reports,
-            RequestClass::StatisticsReport => &self.statistics_reports,
-            RequestClass::ContentReport => &self.content_reports,
-            RequestClass::PricesReport => &self.prices_reports,
-            RequestClass::CommissionTariff => &self.commission_tariffs,
-            RequestClass::LogisticsTariff => &self.logistics_tariffs,
-            RequestClass::AcceptanceTariff => &self.acceptance_tariffs,
-            RequestClass::PromotionCampaign => &self.promotion_campaigns,
-            RequestClass::PromotionBalance => &self.promotion_balance,
-            RequestClass::PromotionStats => &self.promotion_stats,
-            RequestClass::SearchReport => &self.search_reports,
-            RequestClass::PromotionMinimumBids => &self.promotion_minimum_bids,
-            RequestClass::PromotionRecommendedBids => &self.promotion_recommendations,
-            RequestClass::PromotionClusterBids => &self.promotion_cluster_bids,
-            RequestClass::SellerInventory => &self.seller_inventory,
-            RequestClass::FeedbackReport => &self.feedback_reports,
-            RequestClass::ReturnClaims => &self.return_claims,
-            RequestClass::SupplyReport => &self.supply_reports,
-            RequestClass::CardErrors => &self.card_errors,
-            RequestClass::FinanceReport => &self.finance_reports,
-        }
-    }
-
-    async fn wait_until_ready(
-        &self,
-        request_class: RequestClass,
-        retry: bool,
-        deadline: TokioInstant,
-    ) -> Result<(), WbError> {
-        let gate = self.gate(request_class);
-        // Classes whose quota slot is minute-scale are never queued for: a
-        // caller that missed the slot is told when to come back instead of
-        // parking on it. `StatisticsReport` paces at a full 60s — the same as
-        // `CommissionTariff` — but was absent here, so its callers queued for
-        // an entire interval only to expire against the 60s logical timeout.
-        if !retry
-            && matches!(
-                request_class,
-                RequestClass::CommissionTariff
-                    | RequestClass::StatisticsReport
-                    | RequestClass::PromotionStats
-                    | RequestClass::SearchReport
-            )
-        {
-            return gate
-                .ensure_ready_now()
-                .await
-                .map_err(|retry_after| WbError::LocalRateLimited { retry_after });
-        }
-        // A wait that cannot end before the caller's deadline is not a wait,
-        // it is a timeout dressed as one — and an expensive one, because the
-        // MCP request slot and the HTTP connection stay held for its whole
-        // duration before failing. `StatisticsReport` paces at exactly the
-        // logical timeout, so a second concurrent caller was guaranteed to
-        // spend a full minute reaching `Timeout`. Refuse now instead, naming
-        // the instant a retry could actually succeed.
-        let ready_in = gate.ready_in().await;
-        if TokioInstant::now() + ready_in >= deadline {
-            return Err(WbError::LocalRateLimited {
-                retry_after: ready_in,
-            });
-        }
-        gate.wait_until_ready().await;
-        Ok(())
-    }
-
-    async fn try_claim(
-        &self,
-        request_class: RequestClass,
-        interval: Duration,
-    ) -> Result<(), Duration> {
-        self.gate(request_class).try_claim(interval).await
-    }
-
-    async fn extend_cooldown(&self, request_class: RequestClass, delay: Duration) {
-        if request_class == RequestClass::FinanceReport {
-            self.finance_access
-                .extend_cooldown(&self.finance_reports, delay)
-                .await;
-        } else {
-            self.gate(request_class).extend_cooldown(delay).await;
-        }
-    }
-
-    async fn ready_in(&self, request_class: RequestClass) -> Duration {
-        self.gate(request_class).ready_in().await
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct WbClient {
     http: Client,
@@ -679,17 +538,6 @@ impl WbClient {
             account,
             Method::POST,
             SALES_FUNNEL_GROUPED_HISTORY_PATH,
-            None,
-            Some(payload),
-        )
-        .await
-    }
-
-    pub async fn warehouse_stocks(&self, account: &str, payload: Value) -> Result<Value, WbError> {
-        self.request(
-            account,
-            Method::POST,
-            WAREHOUSE_STOCKS_PATH,
             None,
             Some(payload),
         )
@@ -1259,6 +1107,7 @@ mod tests {
     mod read_coverage;
     mod reporting_admission;
     mod seller_inventory;
+    mod seller_stock_report;
     mod stock_responses;
 
     use std::{
@@ -1524,6 +1373,13 @@ mod tests {
     #[test]
     fn endpoint_policy_table_matches_the_immutable_security_snapshot() {
         let expected = [
+            (
+                Method::POST,
+                "/api/analytics/v1/stocks-report/seller-warehouses",
+                "analytics:/api/analytics/v1/stocks-report/seller-warehouses",
+                ApiHost::Analytics,
+                RequestClass::AnalyticsReport,
+            ),
             (
                 Method::POST,
                 finance::FINANCE_LIST_PATH,
@@ -2627,7 +2483,11 @@ mod tests {
         // lets both observe readiness before either can reacquire the gate to
         // claim the departure: the first claim wins and the loser must release
         // both network permits before waiting for the following slot.
-        let gate = limiter.analytics_ping.next_allowed.lock().await;
+        let gate = limiter
+            .gate(RequestClass::AnalyticsPing)
+            .next_allowed
+            .lock()
+            .await;
         let mut calls = tokio::task::JoinSet::new();
         {
             let client = client.clone();
@@ -3625,8 +3485,11 @@ mod tests {
         );
         let limiter = client.limiters.get("account").unwrap();
         // Exactly the state a sibling call leaves behind after claiming.
-        *limiter.statistics_reports.next_allowed.lock().await =
-            Instant::now() + STATISTICS_MIN_REQUEST_INTERVAL;
+        *limiter
+            .gate(RequestClass::StatisticsReport)
+            .next_allowed
+            .lock()
+            .await = Instant::now() + STATISTICS_MIN_REQUEST_INTERVAL;
 
         let started = Instant::now();
         let error = client
@@ -3663,8 +3526,11 @@ mod tests {
             policy,
         );
         let limiter = client.limiters.get("account").unwrap();
-        *limiter.analytics_ping.next_allowed.lock().await =
-            Instant::now() + Duration::from_millis(100);
+        *limiter
+            .gate(RequestClass::AnalyticsPing)
+            .next_allowed
+            .lock()
+            .await = Instant::now() + Duration::from_millis(100);
 
         let started = Instant::now();
         let error = client.ping("account").await.unwrap_err();
@@ -4568,8 +4434,11 @@ mod tests {
         );
         let limiter = client.limiters.get("account").unwrap();
 
-        *limiter.promotion_stats.next_allowed.lock().await =
-            Instant::now() + PROMOTION_STATS_MIN_REQUEST_INTERVAL;
+        *limiter
+            .gate(RequestClass::PromotionStats)
+            .next_allowed
+            .lock()
+            .await = Instant::now() + PROMOTION_STATS_MIN_REQUEST_INTERVAL;
         let started = Instant::now();
         let error = client
             .promotion_stats(
@@ -4592,8 +4461,11 @@ mod tests {
         // therefore blocks details before any connection can be attempted.
         // The 200ms slot cannot fit the 20ms deadline, so it is refused with
         // the retry instant rather than waited out into a timeout.
-        *limiter.promotion_campaigns.next_allowed.lock().await =
-            Instant::now() + Duration::from_millis(200);
+        *limiter
+            .gate(RequestClass::PromotionCampaign)
+            .next_allowed
+            .lock()
+            .await = Instant::now() + Duration::from_millis(200);
         let started = Instant::now();
         let error = client
             .promotion_campaign_details("account", vec![1], Vec::new(), Some("cpc".to_owned()))
