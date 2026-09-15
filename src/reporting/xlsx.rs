@@ -44,6 +44,7 @@ pub struct InventoryDetail<'a> {
     pub account_id: &'a str,
     pub sku: &'a str,
     pub sellable_stock: u64,
+    pub stock_observed: bool,
     pub price_minor: Option<u64>,
     pub observed_at: DateTime<Utc>,
 }
@@ -431,7 +432,12 @@ fn write_inventory(
             .ok_or(XlsxReportError::InvalidInput)?;
         write_text(sheet, row, 0, item.account_id)?;
         write_text(sheet, row, 1, item.sku)?;
-        write_u64(sheet, row, 2, item.sellable_stock)?;
+        write_optional_u64(
+            sheet,
+            row,
+            2,
+            item.stock_observed.then_some(item.sellable_stock),
+        )?;
         write_optional_minor(sheet, row, 3, item.price_minor, formats)?;
         sheet
             .write_string(row, 4, super::business_timestamp(item.observed_at))
@@ -663,6 +669,7 @@ const fn source_text(source: SnapshotSource) -> &'static str {
         SnapshotSource::Advertising => "Реклама",
         SnapshotSource::Finance => "Финансы",
         SnapshotSource::Stocks => "Остатки",
+        SnapshotSource::SellerStocks => "Остатки продавца",
         SnapshotSource::Prices => "Цены",
     }
 }
@@ -695,9 +702,9 @@ const fn problem_text(kind: ProblemKind) -> (&'static str, &'static str) {
 fn map_xlsx(_: XlsxError) -> XlsxReportError {
     XlsxReportError::Generation
 }
-
 #[cfg(test)]
 mod tests {
+    mod inventory;
     use chrono::{Duration, TimeZone};
 
     use super::*;
@@ -785,6 +792,7 @@ mod tests {
             account_id: "ozon_store",
             sku: "-sku",
             sellable_stock: 7,
+            stock_observed: true,
             price_minor: Some(12_345),
             observed_at: generated_at() - Duration::minutes(5),
         }];
@@ -832,40 +840,6 @@ mod tests {
         assert!(bytes.len() < MAX_OUTPUT_BYTES);
         assert_eq!(safe_text("=SUM(A1:A2)"), "'=SUM(A1:A2)");
         assert_eq!(safe_text("normal"), "normal");
-    }
-
-    #[test]
-    fn missing_optional_metrics_are_written_as_nd() {
-        let mut no_rates = kpis();
-        no_rates.ctr = None;
-        no_rates.cpc_minor = None;
-        no_rates.ad_conversion = None;
-        no_rates.cpo_minor = None;
-        no_rates.drr = None;
-        let inventory = [InventoryDetail {
-            account_id: "ozon_store",
-            sku: "sku",
-            sellable_stock: 0,
-            price_minor: None,
-            observed_at: generated_at(),
-        }];
-        let sales = [SalesDetail {
-            account_id: "ozon_store",
-            sku: "sku",
-            ordered_units: 1,
-            operational_gmv_minor: 100,
-            cancelled_units: None,
-            returned_units: None,
-        }];
-        let bytes = render_xlsx(XlsxReport {
-            summary: summary(&no_rates, &[]),
-            sales: &sales,
-            advertising: &[],
-            inventory: &inventory,
-            source_quality: &[],
-        })
-        .unwrap();
-        assert!(bytes.starts_with(b"PK"));
     }
 
     #[test]
@@ -990,6 +964,7 @@ mod tests {
             account_id: "ozon_store",
             sku: "sku",
             sellable_stock: 0,
+            stock_observed: true,
             price_minor: None,
             observed_at: generated_at() + Duration::seconds(1),
         };

@@ -39,6 +39,12 @@ remaining mandatory data and execution guards are implemented and replayed.
 - Missing current-day spend is explicit and blocks actions instead of becoming
   a trusted zero.
 - A protective pause is not automatically resumed after midnight or restart.
+- Spend observed at or above the daily ceiling on a still-active campaign
+  sends the protective pause first, through the same reservation, permit and
+  read-back path. The next cycle records `daily_spend_cap_breached` and stops
+  automation until an operator reviews it. A breach with no reservable pause
+  (campaign not active, daily action quota exhausted) locks immediately without
+  a write.
 - The business date is calculated at the Moscow UTC+3 boundary.
 - A shadow-policy digest migration preserves pending, cooldown, pause and
   incident state instead of resetting the robot.

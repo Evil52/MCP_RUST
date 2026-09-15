@@ -79,6 +79,12 @@ SELECT
     AND to_regclass('daily_reporting.source_collection_pages') IS NOT NULL
     AND to_regclass('daily_reporting.source_collection_departures') IS NOT NULL
     AND has_function_privilege('report_collector','daily_reporting.claim_source_collection(jsonb,text)','EXECUTE')
+    AND has_function_privilege('report_collector','daily_reporting.restart_overlapping_sales(bigint,bigint,text)','EXECUTE')
+    AND NOT has_function_privilege('position_reader','daily_reporting.restart_overlapping_sales(bigint,bigint,text)','EXECUTE')
+    AND NOT has_function_privilege('report_refresh_requester','daily_reporting.restart_overlapping_sales(bigint,bigint,text)','EXECUTE')
+    AND has_function_privilege('report_collector','daily_reporting.admit_source_page(bigint,bigint,text,text)','EXECUTE')
+    AND NOT has_function_privilege('position_reader','daily_reporting.admit_source_page(bigint,bigint,text,text)','EXECUTE')
+    AND NOT has_function_privilege('report_refresh_requester','daily_reporting.admit_source_page(bigint,bigint,text,text)','EXECUTE')
     AND has_function_privilege('report_collector','daily_reporting.dispatch_source_refreshes(jsonb)','EXECUTE')
     AND NOT has_table_privilege('report_collector','daily_reporting.source_collection_jobs','INSERT,UPDATE,DELETE')
     AND has_table_privilege('position_reader','daily_reporting.mcp_source_collection_jobs','SELECT')

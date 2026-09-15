@@ -566,7 +566,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
     let writer = PostgresSnapshotWriter::connect(&config).await.unwrap();
     let transport = FixtureTransport(Mutex::new(VecDeque::from([
         Ok(json!({"result":{"data":[{
-            "dimensions":[{"id":"3411079879"},{"id":"2098-08-15"}],
+            "dimensions":[{"id":"3411079879"},{"id":"2098-08-16"}],
             "metrics":["675.00", 2]
         }]}})),
         Ok(json!({"accrual_types":[]})),
@@ -627,7 +627,7 @@ async fn complete_ozon_source_set_is_published_atomically() {
     let snapshots = collect_complete_snapshots(
         &transport,
         vec![CollectedAdvertisingFact {
-            business_date: NaiveDate::from_ymd_opt(2098, 8, 15).unwrap(),
+            business_date: NaiveDate::from_ymd_opt(2098, 8, 16).unwrap(),
             campaign_id: 35_751_912,
             sku: 3_411_079_879,
             impressions: 100,

@@ -231,7 +231,7 @@ impl OzonMcp {
     /// все пакеты до 1000 ID на каждом складе. Здесь нет offset или `date_from`.
     /// `missing_chrt_ids` — неизвестные остатки, не нули. `complete_for_requested_ids`
     /// относится только к этому пакету. `fetched_at` не подтверждает остатки на
-    /// прошлую дату: для неё нужен ранее сохранённый полный снимок именно FBS.
+    /// прошлую дату: нужен ранее сохранённый снимок `seller_stocks` с нужным `delivery_type`.
     #[tool(
         name = "wb_seller_warehouse_stocks",
         annotations(

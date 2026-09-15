@@ -53,6 +53,7 @@ pub mod wb_finance_source;
 pub mod wb_official_reconciliation;
 pub mod wb_report_repository;
 pub mod wb_report_source;
+pub mod wb_seller_source;
 pub mod wb_source;
 pub mod xlsx;
 

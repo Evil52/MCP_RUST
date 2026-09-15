@@ -58,6 +58,7 @@ pub(super) fn parse_source(value: &str) -> Result<SnapshotSource, ReportingReadE
         "advertising" => Ok(SnapshotSource::Advertising),
         "finance" => Ok(SnapshotSource::Finance),
         "stocks" => Ok(SnapshotSource::Stocks),
+        "seller_stocks" => Ok(SnapshotSource::SellerStocks),
         "prices" => Ok(SnapshotSource::Prices),
         _ => Err(ReportingReadError::InvalidPublishedData),
     }

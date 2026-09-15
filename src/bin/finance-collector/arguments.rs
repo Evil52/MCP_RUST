@@ -17,6 +17,7 @@ pub enum Command {
     ListReportsWb,
     ReconcileReportWb,
     PublishReportWb,
+    SyncReportsWb,
     MigratePersonalQuota,
 }
 
@@ -34,6 +35,8 @@ pub struct Arguments {
     pub report_id: Option<u64>,
     pub currency: String,
     pub observation: Option<String>,
+    pub follow: bool,
+    pub max_run_seconds: u64,
 }
 
 pub fn parse_arguments(raw: &[String]) -> Result<Arguments> {
@@ -43,6 +46,7 @@ pub fn parse_arguments(raw: &[String]) -> Result<Arguments> {
         Some("list-reports-wb") => Command::ListReportsWb,
         Some("reconcile-report-wb") => Command::ReconcileReportWb,
         Some("publish-report-wb") => Command::PublishReportWb,
+        Some("sync-reports-wb") => Command::SyncReportsWb,
         Some("migrate-personal-quota") => Command::MigratePersonalQuota,
         _ => anyhow::bail!("an explicit finance collector command is required; see --help"),
     };
@@ -67,6 +71,8 @@ pub fn parse_arguments(raw: &[String]) -> Result<Arguments> {
                     | "--report-id"
                     | "--currency"
                     | "--observation"
+                    | "--follow"
+                    | "--max-run-seconds"
             ),
             "unknown finance collector option"
         );
@@ -85,7 +91,10 @@ pub fn parse_arguments(raw: &[String]) -> Result<Arguments> {
     let to = date(required("--to")?)?;
     let official = matches!(
         command,
-        Command::ListReportsWb | Command::ReconcileReportWb | Command::PublishReportWb
+        Command::ListReportsWb
+            | Command::ReconcileReportWb
+            | Command::PublishReportWb
+            | Command::SyncReportsWb
     );
     let earliest = if official {
         NaiveDate::from_ymd_opt(2025, 1, 1).expect("constant date")
@@ -145,6 +154,31 @@ pub fn parse_arguments(raw: &[String]) -> Result<Arguments> {
         "--report-id is required exactly for reconcile-report-wb or publish-report-wb"
     );
     let observation = values.get("--observation").map(|raw| (*raw).to_owned());
+    let follow = match values.get("--follow").copied().unwrap_or("false") {
+        "true" => true,
+        "false" => false,
+        _ => anyhow::bail!("--follow requires true or false"),
+    };
+    ensure!(
+        command == Command::SyncReportsWb
+            || (!values.contains_key("--follow") && !values.contains_key("--max-run-seconds")),
+        "follow options require sync-reports-wb"
+    );
+    ensure!(
+        command != Command::SyncReportsWb || !values.contains_key("--currency"),
+        "sync-reports-wb preserves every report currency; --currency is only for single reports"
+    );
+    let max_run_seconds = values
+        .get("--max-run-seconds")
+        .copied()
+        .unwrap_or("3600")
+        .parse::<u64>()
+        .context("max run seconds must be an integer")?;
+    ensure!(
+        (1..=86_400).contains(&max_run_seconds)
+            && (follow || !values.contains_key("--max-run-seconds")),
+        "--max-run-seconds requires follow and must be between 1 and 86400"
+    );
     if official {
         let value = observation
             .as_deref()
@@ -171,6 +205,8 @@ pub fn parse_arguments(raw: &[String]) -> Result<Arguments> {
         report_id,
         currency: currency.to_owned(),
         observation,
+        follow,
+        max_run_seconds,
     })
 }
 

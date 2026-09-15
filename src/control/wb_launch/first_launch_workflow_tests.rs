@@ -5,10 +5,6 @@ use crate::control::{
 };
 
 #[tokio::test]
-#[expect(
-    clippy::significant_drop_tightening,
-    reason = "lease spans cycle evidence then is released for startup"
-)]
 async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_write() {
     let Ok(url) = std::env::var("WB_AUTOMATION_TEST_DATABASE_URL") else {
         return;
@@ -35,29 +31,7 @@ async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_writ
         } else {
             Fixture::new(LaunchScope::FundAndStart)
         };
-        let target = |status| details(id, NAME, &NMS, status, 922);
-        let stock = json!({"data":{"items":NMS.iter().map(|nm|
-            json!({"nmId":nm,"warehouseId":1,"quantity":25})).collect::<Vec<_>>()}});
-        let mut responses = Vec::new();
-        for _ in 0..3 {
-            responses.extend([
-                (200, target(4)),
-                (200, minimums()),
-                (200, json!({"total":1000})),
-                (200, stock.clone()),
-            ]);
-        }
-        responses.extend([(200, target(4)), (http, json!({}))]);
-        if http == 200 {
-            responses.push((200, target(readback_status)));
-        }
-        if success {
-            responses.extend([
-                (200, json!({"total":1000})),
-                (200, target(9)),
-                (200, json!({"total":1000})),
-            ]);
-        }
+        let responses = start_responses(id, http, readback_status, success);
         let count = responses.len();
         let (operator, receiver) = fixture.operator(responses);
         let policy = operator.target_policy(id);
@@ -75,88 +49,9 @@ async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_writ
         )
         .unwrap();
         observer.replace_client_for_test(operator.reader.clone());
-        let now = Utc::now();
-        let mut lease = store
-            .try_acquire_campaign(ACCOUNT, id)
-            .await
-            .unwrap()
-            .unwrap();
-        lease
-            .initialize_from_legacy(&WbAutomationLegacyStateSeed {
-                policy_digest: observer.policy_sha256().into(),
-                business_date: wb_automation_business_date(now),
-                actions_today: 0,
-                last_action_at: None,
-                paused_for_daily_cap_on: None,
-                incident_class: None,
-                legacy_digest: journal::digest(fixture.root.to_string_lossy().as_bytes()),
-            })
-            .await
-            .unwrap();
-        assert!(
-            !lease
-                .verify_first_launch_cycles(observer.policy_sha256())
-                .await
-                .unwrap()
-        );
-        for (index, at) in [(0, now - chrono::Duration::minutes(5)), (1, now)] {
-            let snapshot = observer
-                .observe(at, WbAutomationStateView::default())
-                .await
-                .unwrap();
-            assert!(!snapshot.observation.daily_spend_complete);
-            assert!(!snapshot.observation.attribution_complete);
-            assert!(matches!(
-                snapshot.decision.action,
-                crate::control::WbAutomationAction::Hold { .. }
-            ));
-            let key = journal::digest(format!("{}-{index}", fixture.root.display()).as_bytes());
-            lease
-                .persist_shadow_cycle(
-                    &key,
-                    observer.policy_sha256(),
-                    at,
-                    wb_automation_business_date(at),
-                    1,
-                    &serde_json::to_string(&snapshot).unwrap(),
-                    &serde_json::to_string(&snapshot.decision).unwrap(),
-                )
-                .await
-                .unwrap();
-        }
-        assert!(
-            lease
-                .verify_first_launch_cycles(observer.policy_sha256())
-                .await
-                .unwrap()
-        );
-        lease.release().await.unwrap();
+        record_readiness_cycles(&store, id, &observer, &fixture).await;
         let journal = fixture.journal();
-        if continuation {
-            assert_eq!(
-                journal.require_receipt("create").unwrap(),
-                json!({"campaign_id":id,"wb_http":200})
-            );
-        } else {
-            journal
-                .receipt("create", &json!({"campaign_id":id,"wb_http":200}))
-                .unwrap();
-        }
-        journal
-            .receipt(
-                "bids",
-                &json!({"campaign_id":id,"bids_kopecks":fixture.manifest.bids_kopecks}),
-            )
-            .unwrap();
-        journal
-            .receipt("fund-response", &json!({"wb_http":200,"total":1000}))
-            .unwrap();
-        journal
-            .receipt(
-                "fund",
-                &json!({"campaign_id":id,"transferred_rubles":1000,"type":1,"budget_after":1000}),
-            )
-            .unwrap();
+        record_prestart_receipts(&journal, id, &fixture, continuation);
         let result = operator
             .execute_start(&journal, id, &policy, &observer, &store)
             .await;
@@ -185,4 +80,133 @@ async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_writ
                 .all(|r| !r.contains("fullstats") && !r.contains("budget/deposit"))
         );
     }
+}
+
+/// Mock WB responses for three readiness rounds, the start call and, when the
+/// start is accepted, its read-back and post-start checks.
+fn start_responses(id: u64, http: u16, readback_status: i32, success: bool) -> Vec<(u16, Value)> {
+    let target = |status| details(id, NAME, &NMS, status, 922);
+    let stock = json!({"data":{"items":NMS.iter().map(|nm|
+        json!({"nmId":nm,"warehouseId":1,"quantity":25})).collect::<Vec<_>>()}});
+    let mut responses = Vec::new();
+    for _ in 0..3 {
+        responses.extend([
+            (200, target(4)),
+            (200, minimums()),
+            (200, json!({"total":1000})),
+            (200, stock.clone()),
+        ]);
+    }
+    responses.extend([(200, target(4)), (http, json!({}))]);
+    if http == 200 {
+        responses.push((200, target(readback_status)));
+    }
+    if success {
+        responses.extend([
+            (200, json!({"total":1000})),
+            (200, target(9)),
+            (200, json!({"total":1000})),
+        ]);
+    }
+    responses
+}
+
+/// Persists the two real shadow cycles first launch requires, proving the
+/// gate is closed before them and open after them.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "lease spans cycle evidence then is released for startup"
+)]
+async fn record_readiness_cycles(
+    store: &WbAutomationPostgresStore,
+    id: u64,
+    observer: &WbAutomationObserver,
+    fixture: &Fixture,
+) {
+    let now = Utc::now();
+    let mut lease = store
+        .try_acquire_campaign(ACCOUNT, id)
+        .await
+        .unwrap()
+        .unwrap();
+    lease
+        .initialize_from_legacy(&WbAutomationLegacyStateSeed {
+            policy_digest: observer.policy_sha256().into(),
+            business_date: wb_automation_business_date(now),
+            actions_today: 0,
+            last_action_at: None,
+            paused_for_daily_cap_on: None,
+            incident_class: None,
+            legacy_digest: journal::digest(fixture.root.to_string_lossy().as_bytes()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !lease
+            .verify_first_launch_cycles(observer.policy_sha256())
+            .await
+            .unwrap()
+    );
+    for (index, at) in [(0, now - chrono::Duration::minutes(5)), (1, now)] {
+        let snapshot = observer
+            .observe(at, WbAutomationStateView::default())
+            .await
+            .unwrap();
+        assert!(!snapshot.observation.daily_spend_complete);
+        assert!(!snapshot.observation.attribution_complete);
+        assert!(matches!(
+            snapshot.decision.action,
+            crate::control::WbAutomationAction::Hold { .. }
+        ));
+        let key = journal::digest(format!("{}-{index}", fixture.root.display()).as_bytes());
+        lease
+            .persist_shadow_cycle(
+                &key,
+                observer.policy_sha256(),
+                at,
+                wb_automation_business_date(at),
+                1,
+                &serde_json::to_string(&snapshot).unwrap(),
+                &serde_json::to_string(&snapshot.decision).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        lease
+            .verify_first_launch_cycles(observer.policy_sha256())
+            .await
+            .unwrap()
+    );
+    lease.release().await.unwrap();
+}
+
+/// Journals create (or confirms the continued create), bids and funding so
+/// that only the start step remains.
+fn record_prestart_receipts(journal: &Journal, id: u64, fixture: &Fixture, continuation: bool) {
+    if continuation {
+        assert_eq!(
+            journal.require_receipt("create").unwrap(),
+            json!({"campaign_id":id,"wb_http":200})
+        );
+    } else {
+        journal
+            .receipt("create", &json!({"campaign_id":id,"wb_http":200}))
+            .unwrap();
+    }
+    journal
+        .receipt(
+            "bids",
+            &json!({"campaign_id":id,"bids_kopecks":fixture.manifest.bids_kopecks}),
+        )
+        .unwrap();
+    journal
+        .receipt("fund-response", &json!({"wb_http":200,"total":1000}))
+        .unwrap();
+    journal
+        .receipt(
+            "fund",
+            &json!({"campaign_id":id,"transferred_rubles":1000,"type":1,"budget_after":1000}),
+        )
+        .unwrap();
 }

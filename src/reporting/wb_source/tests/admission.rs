@@ -1,6 +1,46 @@
 use super::*;
 
 #[tokio::test]
+async fn v3_stats_refetch_inconsistent_counters_and_ignore_campaign_only_checkpoints() {
+    use crate::reporting::checkpoint::tests::{MemoryPages, journal};
+    let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+    let pages = MemoryPages::default();
+    checkpointed(&journal(&pages), json!(["wb_stats", date, [4]]), || async {
+        Ok::<_, WbReportSourceError>(Vec::<CollectedAdvertisingFact>::new())
+    })
+    .await
+    .unwrap();
+    let fixture = FixtureTransport::complete();
+    *fixture.stats.lock().unwrap() = [0, 10]
+        .into_iter()
+        .map(|views| {
+            Ok(json!([{
+                "advertId":4,"days":[{"date":"2026-08-17T00:00:00Z","apps":[{"nms":[{
+                    "nmId":7,"views":views,"clicks":2,"sum":1.25,"orders":1,"sum_price":50
+                }]}]}]
+            }]))
+        })
+        .collect();
+    let mut source = WbReportSource::new(fixture).with_checkpoints(journal(&pages));
+    assert_eq!(
+        source.collect_advertising(date).await,
+        Err(WbReportSourceError::Checkpoint(CheckpointError::Deferred))
+    );
+    source.checkpoints = journal(&pages);
+    assert_eq!(
+        source.collect_advertising(date).await,
+        Err(WbReportSourceError::InconsistentPromotionCounts)
+    );
+    source.checkpoints = journal(&pages);
+    let facts = source.collect_advertising(date).await.unwrap();
+    assert_eq!(facts.len(), 1);
+    assert_eq!(
+        (facts[0].sku, facts[0].clicks, facts[0].spend_minor),
+        (7, 2, 125)
+    );
+}
+
+#[tokio::test]
 async fn campaign_inventory_and_stats_scope_are_validated_before_publication() {
     let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
     let mut invalid = FixtureTransport::complete();

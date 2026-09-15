@@ -4,6 +4,8 @@
 //! ruble amounts into integer kopecks. It performs no I/O and never retains
 //! product titles, buyer data, credentials, or upstream error bodies.
 
+mod campaign_day;
+use campaign_day::campaign_day_product_rows;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write,
@@ -29,6 +31,8 @@ pub enum WbReportParseError {
     Shape,
     #[error("Wildberries daily-report response contains an invalid value")]
     Value,
+    #[error("Wildberries advertising counters are inconsistent")]
+    InconsistentAdvertisingCounts,
     #[error("Wildberries daily-report response exceeds its fixed row bound")]
     TooManyRows,
 }
@@ -291,7 +295,7 @@ pub fn parse_promotion_stats(
         .into_iter()
         .map(|((business_date, campaign_id, sku), value)| {
             if value.clicks > value.impressions {
-                return Err(WbReportParseError::Value);
+                return Err(WbReportParseError::InconsistentAdvertisingCounts);
             }
             Ok(CollectedAdvertisingFact {
                 business_date,
@@ -328,17 +332,7 @@ fn parse_campaign_day(
     campaign_id: u64,
     totals: &mut BTreeMap<(NaiveDate, u64, u64), AdvertisingTotals>,
 ) -> Result<(), WbReportParseError> {
-    let mut product_rows = Vec::new();
-    if let Some(apps) = day.get("apps") {
-        for app in array(apps)? {
-            let app = object(app)?;
-            if let Some(products) = app.get("nm") {
-                for product in array(products)? {
-                    product_rows.push(object(product)?);
-                }
-            }
-        }
-    }
+    let product_rows = campaign_day_product_rows(day)?;
     if product_rows.is_empty() {
         add_advertising_row(day, campaign_id, 0, totals)
     } else {
@@ -470,6 +464,7 @@ fn ensure_unique<T, K: Ord>(values: &[T], key: impl Fn(&T) -> K) -> Result<(), W
 
 #[cfg(test)]
 mod tests {
+    mod advertising;
     use chrono::NaiveDate;
     use serde_json::json;
 
@@ -936,55 +931,6 @@ mod tests {
             ),
             (98486, 34000, Some(45000))
         );
-    }
-
-    #[test]
-    fn campaigns_and_both_stats_shapes_are_normalized_without_double_counting() {
-        assert!(parse_promotion_stats(&Value::Null).unwrap().is_empty());
-        let ids = parse_campaign_ids(&json!({"adverts":[
-            {"status":9,"advert_list":[{"advertId":2},{"advertId":1}]},
-            {"status":8,"advert_list":[{"advertId":3}]}
-        ]}))
-        .unwrap();
-        assert_eq!(ids, vec![1, 2]);
-
-        let facts = parse_promotion_stats(&json!([{
-            "advertId":1,"days":[{"date":"2026-08-17T00:00:00Z","views":99,
-                "clicks":9,"sum":10,"orders":2,"sum_price":200,
-                "apps":[{"nm":[
-                    {"nmId":7,"views":20,"clicks":2,"sum":4.25,"orders":1,"sum_price":100},
-                    {"nmId":7,"views":10,"clicks":1,"sum":2,"orders":0,"sum_price":0}
-                ]}]}]
-        },{
-            "advert_id":2,"stats":[{"date":"2026-08-17","nm_id":8,"views":5,
-                "clicks":1,"sum":"1.20","orders":1,"sumPrice":50}]
-        }]))
-        .unwrap();
-        assert_eq!(facts.len(), 2);
-        assert_eq!(
-            (
-                facts[0].campaign_id,
-                facts[0].sku,
-                facts[0].impressions,
-                facts[0].spend_minor
-            ),
-            (1, 7, 30, 625)
-        );
-        assert_eq!(
-            (
-                facts[1].campaign_id,
-                facts[1].sku,
-                facts[1].attributed_revenue_minor
-            ),
-            (2, 8, 5000)
-        );
-
-        let campaign_only = parse_promotion_stats(&json!([{
-            "advertId":3,"days":[{"date":"2026-08-17","views":8,"clicks":1,
-                "sum":2,"orders":0,"sum_price":0}]
-        }]))
-        .unwrap();
-        assert_eq!(campaign_only[0].sku, 0);
     }
 
     #[test]

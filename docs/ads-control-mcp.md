@@ -258,9 +258,13 @@ Legacy failed add-products/activate rows with a campaign ID are reclassified
 to `ambiguous`, audited as `legacy_failed_reclassified`, and claimed only for
 readback recovery. The executor never repeats their provider mutation.
 
-Use `config/control-policy.ozon-furnitura.live.example.json` only with the
-reviewed five SKUs. The plan-only rehearsal file has a different revision, so
-plans from it are intentionally invalid after switching to live policy.
+`config/control-policy.ozon-furnitura.live.json` is the live write policy
+mounted by `compose.control-ozon-static-guard.yaml`, not a sample: editing it
+changes the authorization of real bid writes. Use it only with the reviewed
+five SKUs. The plan-only rehearsal file has a different revision, so plans
+from it are intentionally invalid after switching to live policy. The policy
+digest covers the file contents only, so renaming the file does not
+invalidate approved plans.
 
 ## Safety contract
 

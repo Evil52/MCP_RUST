@@ -193,11 +193,19 @@ impl WbAutomationExecutor {
         // `daily_pause_threshold_minor` is validated to sit at or below
         // `daily_spend_cap_minor`, so an unpaused run that has already reached
         // the cap means the soft pause did not hold: it was never sent, WB did
-        // not apply it, or spend outran the observe-write-reconcile cycle.
-        // Nothing is in flight to correct it at this point, so stop automating
-        // and leave the campaign for an operator rather than issuing further
-        // spend-affecting writes.
-        if snapshot.observation.daily_spend_minor >= self.observer.policy().daily_spend_cap_minor {
+        // not apply it, or spend outran the observe-write-reconcile cycle
+        // (WB statistics arrive in batches and can cross both limits at once).
+        // A still-active campaign keeps spending until someone stops it, so a
+        // protective pause decided by this cycle is sent first through the
+        // ordinary pending and read-back path. Every other breach, including
+        // the next cycle that observes the paused campaign still above the cap,
+        // stops automating and leaves the campaign for an operator.
+        if daily_cap_breach_requires_lock(
+            self.observer.policy(),
+            &snapshot.observation,
+            &decision,
+            true,
+        ) {
             state.incident_class = Some("daily_spend_cap_breached".to_owned());
             save_execution_state(&self.state_directory, &state)?;
             return Ok(receipt(
@@ -379,15 +387,16 @@ impl WbAutomationExecutor {
                 "WB explicit resume requires a durable prior-day automation pause"
             );
         }
+        let state_actions_today = if state.business_date == business_date {
+            state.actions_today
+        } else {
+            0
+        };
         let state_view = WbAutomationStateView {
             paused_by_automation: state
                 .paused_for_daily_cap_on
                 .is_some_and(|paused_on| paused_on < business_date),
-            actions_today: if state.business_date == business_date {
-                state.actions_today
-            } else {
-                0
-            },
+            actions_today: state_actions_today,
             last_action_at: state.last_action_at,
         };
         let last_applied_snapshot = load_traffic_feedback_baseline(policy, &mut lease).await?;
@@ -447,7 +456,15 @@ impl WbAutomationExecutor {
                 state.revision,
             )));
         }
-        if snapshot.observation.daily_spend_minor >= policy.daily_spend_cap_minor {
+        // Same breach contract as the file-backed executor. The durable
+        // reservation enforces the daily action quota for every action kind,
+        // so a pause that could not be reserved falls back to the lock.
+        if daily_cap_breach_requires_lock(
+            policy,
+            &snapshot.observation,
+            &decision,
+            state_actions_today < policy.max_actions_per_day,
+        ) {
             let transition = lease
                 .mark_incident_without_action(
                     &cycle_id,
@@ -852,6 +869,26 @@ fn explicit_exposure_increase_decision(
     })
 }
 
+/// Decides whether observed spend at or above the daily ceiling must lock the
+/// campaign without a write.
+///
+/// Below the ceiling nothing locks. At or above it, the only write still
+/// allowed is the protective pause the decision already chose for an active
+/// campaign, and only when the executor can actually reserve it.
+const fn daily_cap_breach_requires_lock(
+    policy: &super::automation::WbAutomationPolicy,
+    observation: &super::automation::WbAutomationObservation,
+    decision: &WbAutomationDecision,
+    pause_can_be_reserved: bool,
+) -> bool {
+    observation.daily_spend_minor >= policy.daily_spend_cap_minor
+        && !(pause_can_be_reserved
+            && matches!(
+                decision.action,
+                WbAutomationAction::PauseCampaignForDailyCap
+            ))
+}
+
 const fn receipt(
     snapshot_path: PathBuf,
     decision: WbAutomationDecision,
@@ -1021,6 +1058,7 @@ const fn durable_action_kind(kind: &PendingActionKind) -> WbAutomationDurableAct
 
 #[cfg(test)]
 mod tests {
+    mod daily_cap_breach;
     mod postgres_clock;
 
     use super::feedback::{
@@ -3262,7 +3300,8 @@ mod tests {
 
         let cap_campaign = 39_682_701;
         let cap_fixture = postgres_clock::fixture(cap_campaign, observed_at);
-        let (cap_url, _) = reader_server_for(cap_campaign, 9, 102, &current_date, Some(300), 10);
+        // Not active at the ceiling: nothing left to stop, lock without a write.
+        let (cap_url, _) = reader_server_for(cap_campaign, 11, 102, &current_date, Some(300), 10);
         let mut cap_executor = cap_fixture.executor(&cap_url, "http://127.0.0.1:1");
         let cap_legacy = postgres_legacy(&cap_executor, observed_at, None);
         let capped = cap_executor
@@ -4131,51 +4170,6 @@ mod tests {
         save_execution_state(&fixture.root, &stored).unwrap();
         let executor = fixture.executor("http://127.0.0.1:1", "http://127.0.0.1:1");
         assert!(executor.send_pending(&pending).await.is_err());
-    }
-
-    /// `daily_pause_threshold_minor` (250 RUB) is the soft pause and
-    /// `daily_spend_cap_minor` (300 RUB) is the ceiling that pause exists to
-    /// defend. Observing spend at or above the ceiling with nothing in flight
-    /// means the pause did not hold, so the executor stops automating and
-    /// leaves the campaign to an operator instead of issuing further
-    /// spend-affecting writes.
-    #[tokio::test]
-    async fn reaching_the_daily_spend_cap_locks_an_incident_without_writing() {
-        let fixture = Fixture::new();
-        let (reader_url, _) = reader_server(9, 102, "2026-08-25", Some(300), 10);
-        // An unroutable writer proves no write is attempted on this path.
-        let executor = fixture.executor(&reader_url, "http://127.0.0.1:1");
-
-        let receipt = executor.run_once(now()).await.unwrap();
-
-        assert_eq!(
-            receipt.outcome,
-            WbAutomationExecutionOutcome::IncidentLocked
-        );
-        let state = read_state_file(&fixture.root.join("execution-state.json"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            state.incident_class.as_deref(),
-            Some("daily_spend_cap_breached")
-        );
-        assert!(
-            state.pending.is_none(),
-            "a breach must not reserve a further write"
-        );
-
-        // The lock is sticky: a later run reports the incident and still does
-        // not act, even though the reader now serves a clean observation.
-        let (clean_url, _) = reader_server(9, 102, "2026-08-25", None, 10);
-        let relocked = fixture.executor(&clean_url, "http://127.0.0.1:1");
-        assert_eq!(
-            relocked
-                .run_once(now() + ChronoDuration::minutes(1))
-                .await
-                .unwrap()
-                .outcome,
-            WbAutomationExecutionOutcome::IncidentLocked
-        );
     }
 
     /// Spend below the ceiling still follows the ordinary soft-pause path.

@@ -1,7 +1,10 @@
 use std::{collections::VecDeque, sync::Mutex};
 
 use super::*;
-use crate::reporting::checkpoint::tests::{MemoryPages, journal};
+use crate::reporting::checkpoint::{
+    CheckpointError,
+    tests::{MemoryPages, journal},
+};
 
 struct RecordingTransport {
     responses: Mutex<VecDeque<Result<Value, OzonReportSourceError>>>,

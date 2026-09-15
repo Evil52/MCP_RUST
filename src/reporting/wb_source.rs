@@ -1,24 +1,30 @@
 //! Bounded read-only Wildberries source for daily reports.
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+mod stocks;
+
+use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
-use thiserror::Error;
+mod failures;
+pub use failures::WbReportSourceError;
+use failures::{campaign_inventory_error, ensure_promotion_rows_in_scope, promotion_stats_error};
+mod seller_stocks;
+pub use seller_stocks::SellerStockRequest;
 use tokio::time::{Instant, sleep};
 
-use crate::wb::{WbClient, WbError, WbErrorKind};
+use crate::wb::{WbClient, WbError};
 
 use super::{
-    checkpoint::{CheckpointError, Checkpoints, checkpointed},
+    checkpoint::{Checkpoints, checkpointed},
     postgres_collector::{
         CollectedAdvertisingFact, CollectedFacts, CollectedPriceFact, CollectedSalesFact,
         CollectedSnapshot, CollectedStockFact, PostgresCollectorError,
     },
     snapshot::{Marketplace, SnapshotStatus},
     wb_adapter::{
-        WbReportParseError, parse_campaign_ids, parse_price_page, parse_promotion_stats,
-        parse_sales_page, parse_stock_page,
+        parse_campaign_ids, parse_price_page, parse_promotion_stats, parse_sales_page,
+        parse_stock_page,
     },
 };
 
@@ -34,6 +40,13 @@ const CAMPAIGNS_PER_REQUEST: usize = 50;
 const PROMOTION_STATS_ADMISSION_BUDGET: Duration = Duration::from_secs(60);
 
 pub trait WbReportTransport: Send + Sync {
+    fn seller_inventory(
+        &self,
+        _request: SellerStockRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(async { Err(WbReportSourceError::InvalidStockResponse) })
+    }
+
     fn sales_page<'a>(
         &'a self,
         start: NaiveDate,
@@ -148,6 +161,13 @@ fn promotion_stats_failure(error: &WbError) -> WbReportSourceError {
 }
 
 impl WbReportTransport for WbClientReportTransport {
+    fn seller_inventory(
+        &self,
+        request: SellerStockRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(self.fetch_seller_inventory(request))
+    }
+
     fn sales_page<'a>(
         &'a self,
         start: NaiveDate,
@@ -316,70 +336,6 @@ impl WbCollectedFacts {
     }
 }
 
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum WbReportSourceError {
-    #[error("collection quota requires a pause")]
-    RetryAfter { seconds: u64 },
-    #[error(transparent)]
-    Checkpoint(#[from] CheckpointError),
-    #[error("Wildberries daily-report source request failed")]
-    Upstream(WbErrorKind),
-    #[error("Wildberries daily-report source response is invalid")]
-    InvalidResponse,
-    #[error("Wildberries sales response is invalid")]
-    InvalidSalesResponse,
-    #[error("Wildberries stock response is invalid")]
-    InvalidStockResponse,
-    #[error("Wildberries price response is invalid")]
-    InvalidPriceResponse,
-    #[error("Wildberries campaign response is invalid")]
-    InvalidCampaignResponse,
-    #[error("Wildberries campaign inventory exceeds the bounded collection capacity")]
-    CampaignInventoryLimit,
-    #[error("Wildberries promotion statistics response is invalid")]
-    InvalidPromotionResponse,
-    #[error("Wildberries daily-report source pagination exceeded its fixed bound")]
-    PaginationLimit,
-    #[error("Wildberries daily-report snapshot input is invalid")]
-    InvalidSnapshotInput,
-}
-
-impl WbReportSourceError {
-    #[must_use]
-    pub const fn failure(&self) -> super::source_collection::SourceFailure {
-        super::source_collection::SourceFailure {
-            code: self.code(),
-            retry_after: match self {
-                Self::RetryAfter { seconds } => Some(*seconds),
-                _ => None,
-            },
-        }
-    }
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::RetryAfter { .. } => "rate_limited",
-            Self::Checkpoint(error) => error.code(),
-            Self::Upstream(kind) => kind.code(),
-            Self::InvalidResponse => "invalid_response",
-            Self::InvalidSalesResponse => "invalid_sales_response",
-            Self::InvalidStockResponse => "invalid_stock_response",
-            Self::InvalidPriceResponse => "invalid_price_response",
-            Self::InvalidCampaignResponse => "invalid_campaign_response",
-            Self::CampaignInventoryLimit => "campaign_inventory_limit",
-            Self::InvalidPromotionResponse => "invalid_promotion_response",
-            Self::PaginationLimit => "pagination_limit",
-            Self::InvalidSnapshotInput => "invalid_snapshot_input",
-        }
-    }
-}
-
-impl From<WbReportParseError> for WbReportSourceError {
-    fn from(_: WbReportParseError) -> Self {
-        Self::InvalidResponse
-    }
-}
-
 fn log_source_completed(source: &'static str, facts: usize) {
     tracing::info!(source, facts, "WB source completed");
 }
@@ -391,7 +347,7 @@ impl WbReportSource {
         let sales = self.collect_sales_pages(date).await?;
         log_source_completed("sales", sales.len());
         tracing::info!(source = "stocks", "collecting WB daily-report source");
-        let stocks = self.collect_stock_pages().await?;
+        let stocks = self.collect_complete_stock_pages().await?;
         log_source_completed("stocks", stocks.len());
         tracing::info!(source = "prices", "collecting WB daily-report source");
         let prices = self.collect_price_pages().await?;
@@ -416,18 +372,7 @@ impl WbReportSource {
             } else {
                 parse_campaign_ids(&response)
             };
-            parsed.map_err(|error| {
-                tracing::warn!(
-                    source = "campaigns",
-                    parse_error = ?error,
-                    "WB campaign inventory could not be collected"
-                );
-                if error == WbReportParseError::TooManyRows {
-                    WbReportSourceError::CampaignInventoryLimit
-                } else {
-                    WbReportSourceError::InvalidCampaignResponse
-                }
-            })
+            parsed.map_err(campaign_inventory_error)
         })
         .await?;
         log_source_completed("campaigns", ids.len());
@@ -435,24 +380,18 @@ impl WbReportSource {
         for chunk in ids.chunks(CAMPAIGNS_PER_REQUEST) {
             let rows: Vec<CollectedAdvertisingFact> = checkpointed(
                 &self.checkpoints,
-                json!(["wb_stats", date, chunk]),
+                // v3 nms rows must never reuse campaign-only checkpoints.
+                json!(["wb_stats_v3_sku", date, chunk]),
                 || async {
-                    parse_promotion_stats(
-                        &self
-                            .transport
-                            .promotion_stats(chunk.to_vec(), date, date)
-                            .await?,
-                    )
-                    .map_err(|_| WbReportSourceError::InvalidPromotionResponse)
+                    let response = self
+                        .transport
+                        .promotion_stats(chunk.to_vec(), date, date)
+                        .await?;
+                    parse_promotion_stats(&response).map_err(promotion_stats_error)
                 },
             )
             .await?;
-            if rows
-                .iter()
-                .any(|row| row.business_date != date || !chunk.contains(&row.campaign_id))
-            {
-                return Err(WbReportSourceError::InvalidPromotionResponse);
-            }
+            ensure_promotion_rows_in_scope(&rows, date, chunk)?;
             advertising.extend(rows);
             if advertising.len() > 25_000 {
                 return Err(WbReportSourceError::PaginationLimit);
@@ -476,6 +415,7 @@ impl WbReportSource {
         max_pages: usize,
     ) -> Result<Vec<CollectedSalesFact>, WbReportSourceError> {
         let mut facts = Vec::new();
+        let mut identities = BTreeSet::new();
         for page in 0..max_pages {
             let offset = page_offset(page, SALES_PAGE_SIZE_U32)?;
             let (rows, source_rows) = checkpointed(
@@ -497,38 +437,14 @@ impl WbReportSource {
             if source_rows > SALES_PAGE_SIZE || rows.iter().any(|row| row.business_date != date) {
                 return Err(WbReportSourceError::InvalidSalesResponse);
             }
+            if rows
+                .iter()
+                .any(|row| !identities.insert((row.business_date, row.sku)))
+            {
+                return Err(WbReportSourceError::SalesPageOverlap);
+            }
             facts.extend(rows);
             if source_rows < SALES_PAGE_SIZE {
-                return Ok(facts);
-            }
-        }
-        Err(WbReportSourceError::PaginationLimit)
-    }
-
-    pub async fn collect_stock_pages(
-        &self,
-    ) -> Result<Vec<CollectedStockFact>, WbReportSourceError> {
-        self.collect_stock_pages_with_limit(MAX_PAGES).await
-    }
-
-    async fn collect_stock_pages_with_limit(
-        &self,
-        max_pages: usize,
-    ) -> Result<Vec<CollectedStockFact>, WbReportSourceError> {
-        let mut facts = Vec::new();
-        for page in 0..max_pages {
-            let offset = page_offset(page, PAGE_SIZE_U32)?;
-            let (rows, source_rows) =
-                checkpointed(&self.checkpoints, json!(["wb_stock", offset]), || async {
-                    parse_stock_page(&self.transport.stock_page(PAGE_SIZE_U32, offset).await?)
-                        .map_err(|_| WbReportSourceError::InvalidStockResponse)
-                })
-                .await?;
-            // Multiple chrt rows can normalize into one SKU/warehouse fact.
-            // Only the raw response count proves that the page was short.
-            let complete = source_rows < PAGE_SIZE;
-            facts.extend(rows);
-            if complete {
                 return Ok(facts);
             }
         }
@@ -573,8 +489,13 @@ fn page_offset(page: usize, page_size: u32) -> Result<u32, WbReportSourceError> 
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        reporting::{checkpoint::CheckpointError, wb_adapter::WbReportParseError},
+        wb::WbErrorKind,
+    };
     mod admission;
     mod sales;
+    mod stocks;
 
     use std::{
         collections::BTreeMap,
@@ -591,6 +512,7 @@ mod tests {
     #[derive(Clone)]
     struct FixtureTransport {
         stocks: Arc<Mutex<VecDeque<Value>>>,
+        requested_stocks: Arc<Mutex<Vec<(u32, u32)>>>,
         prices: Arc<Mutex<VecDeque<Value>>>,
         campaign_ids: Value,
         stats: Arc<Mutex<VecDeque<Result<Value, WbReportSourceError>>>>,
@@ -651,6 +573,7 @@ mod tests {
                 stocks: Arc::new(Mutex::new(VecDeque::from([json!({"data":{"items":[
                     {"nmId":1,"warehouseId":2,"quantity":3}
                 ]}})]))),
+                requested_stocks: Arc::new(Mutex::new(Vec::new())),
                 prices: Arc::new(Mutex::new(VecDeque::from([json!({"data":{"listGoods":[{
                     "nmID":1,"currencyIsoCode4217":"RUB",
                     "sizes":[{"price":100,"discountedPrice":90}]
@@ -669,6 +592,13 @@ mod tests {
     }
 
     impl WbReportTransport for FixtureTransport {
+        fn seller_inventory(
+            &self,
+            request: SellerStockRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+            assert!(matches!(request, SellerStockRequest::Warehouses));
+            Box::pin(async { Ok(json!([])) })
+        }
         fn sales_page<'a>(
             &'a self,
             start: NaiveDate,
@@ -692,11 +622,12 @@ mod tests {
 
         fn stock_page<'a>(
             &'a self,
-            _limit: u32,
-            _offset: u32,
+            limit: u32,
+            offset: u32,
         ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-            Box::pin(async {
+            Box::pin(async move {
                 self.calls.lock().unwrap().push("stocks");
+                self.requested_stocks.lock().unwrap().push((limit, offset));
                 self.stocks
                     .lock()
                     .unwrap()

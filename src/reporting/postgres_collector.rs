@@ -4,7 +4,9 @@
 )]
 
 mod sales_validation;
+mod seller_stocks;
 mod source_jobs;
+pub use seller_stocks::CollectedSellerStockFact;
 pub use source_jobs::SourceJobClaim;
 
 use std::collections::BTreeSet;
@@ -133,6 +135,7 @@ pub enum CollectedFacts {
     Advertising(Vec<CollectedAdvertisingFact>),
     Finance(Vec<CollectedFinanceFact>),
     Stocks(Vec<CollectedStockFact>),
+    SellerStocks(Vec<CollectedSellerStockFact>),
     Prices(Vec<CollectedPriceFact>),
 }
 
@@ -143,6 +146,7 @@ impl CollectedFacts {
             Self::Advertising(_) => SnapshotSource::Advertising,
             Self::Finance(_) => SnapshotSource::Finance,
             Self::Stocks(_) => SnapshotSource::Stocks,
+            Self::SellerStocks(_) => SnapshotSource::SellerStocks,
             Self::Prices(_) => SnapshotSource::Prices,
         }
     }
@@ -153,6 +157,7 @@ impl CollectedFacts {
             Self::Advertising(facts) => facts.len(),
             Self::Finance(facts) => facts.len(),
             Self::Stocks(facts) => facts.len(),
+            Self::SellerStocks(facts) => facts.len(),
             Self::Prices(facts) => facts.len(),
         }
     }
@@ -994,6 +999,7 @@ const fn snapshot_source_name(source: SnapshotSource) -> &'static str {
         SnapshotSource::Advertising => "advertising",
         SnapshotSource::Finance => "finance",
         SnapshotSource::Stocks => "stocks",
+        SnapshotSource::SellerStocks => "seller_stocks",
         SnapshotSource::Prices => "prices",
     }
 }
@@ -1163,7 +1169,10 @@ async fn insert_facts(
             insert_finance_facts(transaction, snapshot_id, facts).await?;
         }
         CollectedFacts::Stocks(facts) => {
-            insert_stock_facts(transaction, snapshot_id, facts).await?;
+            seller_stocks::insert_fbw(transaction, snapshot_id, facts).await?;
+        }
+        CollectedFacts::SellerStocks(facts) => {
+            seller_stocks::insert(transaction, snapshot_id, facts).await?;
         }
         CollectedFacts::Prices(facts) => {
             insert_price_facts(transaction, snapshot_id, facts).await?;
@@ -1357,36 +1366,6 @@ async fn insert_finance_facts(
     Ok(())
 }
 
-async fn insert_stock_facts(
-    transaction: &Transaction<'_>,
-    snapshot_id: i64,
-    facts: &[CollectedStockFact],
-) -> Result<(), PostgresCollectorError> {
-    if facts.is_empty() {
-        return Ok(());
-    }
-    let skus = collect_i64(facts.iter().map(|fact| fact.sku))?;
-    let warehouse_ids = facts
-        .iter()
-        .map(|fact| fact.warehouse_id.clone())
-        .collect::<Vec<_>>();
-    let sellable_units = facts
-        .iter()
-        .map(|fact| as_i32(fact.sellable_units))
-        .collect::<Result<Vec<_>, _>>()?;
-    transaction
-        .execute(
-            "INSERT INTO daily_reporting.stock_facts \
-             (snapshot_id, sku, warehouse_id, sellable_units) \
-             SELECT $1, batch.* \
-             FROM unnest($2::bigint[], $3::text[], $4::integer[]) AS batch",
-            &[&snapshot_id, &skus, &warehouse_ids, &sellable_units],
-        )
-        .await
-        .map_err(|_| PostgresCollectorError::Unavailable)?;
-    Ok(())
-}
-
 async fn insert_price_facts(
     transaction: &Transaction<'_>,
     snapshot_id: i64,
@@ -1455,6 +1434,7 @@ fn validate_facts(facts: &CollectedFacts) -> Result<(), PostgresCollectorError> 
                     && fact.unknown_type_count <= fact.line_count
             },
         ),
+        CollectedFacts::SellerStocks(facts) => seller_stocks::validate(facts),
         CollectedFacts::Stocks(facts) => ensure_unique(
             facts,
             |fact| (fact.sku, fact.warehouse_id.clone()),
@@ -1558,7 +1538,9 @@ mod tests {
             SnapshotSource::Sales | SnapshotSource::Advertising | SnapshotSource::Finance => {
                 (cutoff() - Duration::days(1), cutoff())
             }
-            SnapshotSource::Stocks | SnapshotSource::Prices => (source_as_of, source_as_of),
+            SnapshotSource::Stocks | SnapshotSource::SellerStocks | SnapshotSource::Prices => {
+                (source_as_of, source_as_of)
+            }
         };
         CollectedSnapshot::new(
             "pilot".to_owned(),

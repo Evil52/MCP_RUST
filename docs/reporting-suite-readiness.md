@@ -75,10 +75,15 @@ operational coordination.
 
 Normalized checkpoints contain curated facts and pagination metadata, not raw
 vendor bodies. Limits: 4 MiB/page, 32 MiB/job, 4,096 pages; source-specific fact
-and pagination bounds also apply. Completed or terminal jobs discard temporary
-page data, while published history remains immutable. Eight consecutive errors
+and pagination bounds also apply. Completed jobs discard temporary page data;
+failed stock/seller-stock jobs retain it for up to 24 hours for diagnosis under migration
+038. Other terminal jobs discard their pages. Published history remains
+immutable. Eight consecutive errors
 without page progress stop that source. Stock/price runs expire after a
 30-minute observation span; resumed pages are never labelled as new live data.
+Malformed JSON and authorization failures remain stopped. Stock recovery is an
+explicit operator action with the original observation window and a fresh
+fenced lease; see [stock checkpoint recovery](stock-checkpoint-recovery.md).
 
 WB resumable advertising accepts up to 5,000 eligible campaigns and retains
 50-ID chunks; it does not truncate inventories. The legacy manual collector
