@@ -57,7 +57,7 @@ use decode::{
 };
 
 mod source_snapshot;
-pub use source_snapshot::{SourceSnapshotQuery, SourceSnapshotResult};
+pub use source_snapshot::{SourceSnapshotCoverage, SourceSnapshotQuery, SourceSnapshotResult};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -592,7 +592,7 @@ impl PostgresReportingRepository {
             .query_one(
                 "SELECT max(cutoff_at) \
                  FROM daily_reporting.mcp_published_source_snapshots \
-                 WHERE account_id = $1 AND marketplace = $2",
+                 WHERE account_id = $1 AND marketplace = $2 AND source <> 'seller_stocks'",
                 &[&account.account_id(), &marketplace],
             )
             .await
@@ -1221,7 +1221,7 @@ const COLLECTION_STATUS_QUERY: &str = "SELECT snapshot_id, account_id, marketpla
 const PUBLISHED_SNAPSHOTS_QUERY: &str = "SELECT snapshot_id, account_id, marketplace, source, cutoff_at, source_as_of, \
             period_start, period_end, status, pagination_complete, row_count \
      FROM daily_reporting.mcp_published_source_snapshots \
-     WHERE account_id = $1 AND marketplace = $2 AND cutoff_at = $3 \
+     WHERE account_id = $1 AND marketplace = $2 AND cutoff_at = $3 AND source <> 'seller_stocks' \
      ORDER BY source";
 
 const CONTRACT_PROBES: &[&str] = &[
@@ -1286,7 +1286,7 @@ impl PostgresReportingRepository {
                 "SELECT cutoff_at \
                  FROM daily_reporting.mcp_published_source_snapshots \
                  WHERE account_id = $1 AND marketplace = $2 \
-                   AND cutoff_at >= $3 AND cutoff_at < $4 \
+                   AND cutoff_at >= $3 AND cutoff_at < $4 AND source <> 'seller_stocks' \
                  GROUP BY cutoff_at \
                  ORDER BY cutoff_at DESC \
                  LIMIT $5",
@@ -1320,7 +1320,7 @@ impl PostgresReportingRepository {
                         period_start, period_end, status, pagination_complete, row_count \
                  FROM daily_reporting.mcp_published_source_snapshots \
                  WHERE account_id = $1 AND marketplace = $2 \
-                   AND cutoff_at = ANY($3::timestamptz[]) \
+                   AND cutoff_at = ANY($3::timestamptz[]) AND source <> 'seller_stocks' \
                  ORDER BY cutoff_at, source",
                 &[&account.account_id(), &marketplace, &cutoffs],
             )

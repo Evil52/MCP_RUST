@@ -303,6 +303,7 @@ impl ReportDataset {
                 account_id: &row.account_id,
                 sku: &row.sku,
                 sellable_stock: row.sellable_stock,
+                stock_observed: row.stock_observed,
                 price_minor: row.price_minor,
                 observed_at: row.observed_at,
             })
@@ -582,6 +583,7 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.inventory.len(), 1);
         assert!(!dataset.inventory[0].stock_observed);
+        assert!(!dataset.inventory_details()[0].stock_observed);
         assert_eq!(dataset.inventory[0].sellable_stock, 0);
     }
 

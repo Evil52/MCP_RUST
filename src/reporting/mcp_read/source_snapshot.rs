@@ -1,5 +1,5 @@
 use super::{
-    AccountScope, DateTime, Deserialize, Duration, JsonSchema, Marketplace,
+    AccountScope, DataQuality, DateTime, Deserialize, Duration, JsonSchema, Marketplace,
     PostgresReportingRepository, ReportingMarketplace, ReportingReadError, ReportingReader,
     Serialize, SnapshotSource, Utc, marketplace_str, timestamp_string,
 };
@@ -20,6 +20,13 @@ pub struct SourceSnapshotResult {
     pub source: SnapshotSource,
     pub storage: String,
     pub state: String,
+    pub data_state: String,
+    pub catalog_scope: Option<String>,
+    pub quality: Option<DataQuality>,
+    pub inventory_scope: Option<String>,
+    pub pagination_complete: Option<bool>,
+    /// Coverage counts describe the entire selected snapshot, never one page.
+    pub coverage: Option<SourceSnapshotCoverage>,
     pub snapshot_id: Option<String>,
     pub cutoff_at: Option<String>,
     pub source_as_of: Option<String>,
@@ -33,6 +40,21 @@ pub struct SourceSnapshotResult {
     pub latest_collection: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct SourceSnapshotCoverage {
+    pub total_pairs: u64,
+    pub known_pairs: u64,
+    pub missing_pairs: u64,
+}
+
+const fn source_row_limit(source: SnapshotSource) -> u32 {
+    if matches!(source, SnapshotSource::SellerStocks) {
+        2_500_000
+    } else {
+        25_000
+    }
+}
+
 impl ReportingReader {
     pub async fn source_snapshot(
         &self,
@@ -40,11 +62,13 @@ impl ReportingReader {
         query: SourceSnapshotQuery,
     ) -> Result<SourceSnapshotResult, ReportingReadError> {
         if !(1..=1000).contains(&query.limit)
-            || query.offset > 25_000
+            || query.offset > source_row_limit(query.source)
             || query.snapshot_id.is_some_and(|id| id <= 0)
             || (query.offset > 0 && query.snapshot_id.is_none())
             || (query.source == SnapshotSource::Finance
                 && account.marketplace() != Marketplace::Ozon)
+            || (query.source == SnapshotSource::SellerStocks
+                && account.marketplace() != Marketplace::Wildberries)
         {
             return Err(ReportingReadError::InvalidRequest);
         }
@@ -67,6 +91,7 @@ impl PostgresReportingRepository {
         let source = match query.source {
             SnapshotSource::Sales => "sales",
             SnapshotSource::Stocks => "stocks",
+            SnapshotSource::SellerStocks => "seller_stocks",
             SnapshotSource::Prices => "prices",
             SnapshotSource::Finance => "finance",
             SnapshotSource::Advertising => "advertising",
@@ -79,7 +104,7 @@ impl PostgresReportingRepository {
                     .map_err(|_| ReportingReadError::InvalidPublishedData)
             })
             .transpose()?;
-        let row=client.query_opt("SELECT s.snapshot_id,s.cutoff_at,s.source_as_of,s.period_start,s.period_end,s.row_count,COALESCE(j.first_observed_at,s.source_as_of) FROM daily_reporting.mcp_published_source_snapshots s LEFT JOIN daily_reporting.mcp_source_collection_jobs j ON j.account_id=s.account_id AND j.marketplace=s.marketplace AND j.source=s.source AND j.cutoff_at=s.cutoff_at WHERE s.account_id=$1 AND s.marketplace=$2 AND s.source=$3 AND s.status='succeeded' AND s.pagination_complete AND ($4::bigint IS NULL OR s.snapshot_id=$4) ORDER BY s.cutoff_at DESC,s.snapshot_id DESC LIMIT 1", &[&account.account_id(),&market,&source,&query.snapshot_id])
+        let row=client.query_opt("SELECT s.snapshot_id,s.cutoff_at,s.source_as_of,s.period_start,s.period_end,s.row_count,COALESCE(j.first_observed_at,s.source_as_of),s.status,s.pagination_complete FROM daily_reporting.mcp_published_source_snapshots s LEFT JOIN daily_reporting.mcp_source_collection_jobs j ON j.account_id=s.account_id AND j.marketplace=s.marketplace AND j.source=s.source AND j.cutoff_at=s.cutoff_at WHERE s.account_id=$1 AND s.marketplace=$2 AND s.source=$3 AND ((s.status='succeeded' AND s.pagination_complete) OR ($3='seller_stocks' AND s.status='partial' AND s.pagination_complete)) AND ($4::bigint IS NULL OR s.snapshot_id=$4) ORDER BY s.cutoff_at DESC,s.snapshot_id DESC LIMIT 1", &[&account.account_id(),&market,&source,&query.snapshot_id])
             .await.map_err(|_| ReportingReadError::Unavailable)?;
         let mut result = SourceSnapshotResult {
             account_id: account.account_id().to_owned(),
@@ -87,6 +112,19 @@ impl PostgresReportingRepository {
             source: query.source,
             storage: "published_postgresql_snapshots".to_owned(),
             state: "missing".to_owned(),
+            data_state: "missing".to_owned(),
+            catalog_scope: (query.source == SnapshotSource::SellerStocks)
+                .then(|| "active_non_trash_cards".to_owned()),
+            quality: None,
+            inventory_scope: match (account.marketplace(), query.source) {
+                (Marketplace::Wildberries, SnapshotSource::Stocks) => Some("fbw".to_owned()),
+                (Marketplace::Wildberries, SnapshotSource::SellerStocks) => {
+                    Some("seller".to_owned())
+                }
+                _ => None,
+            },
+            pagination_complete: None,
+            coverage: None,
             snapshot_id: None,
             cutoff_at: None,
             source_as_of: None,
@@ -106,20 +144,82 @@ impl PostgresReportingRepository {
         let first: DateTime<Utc> = row.get(6);
         let total: u64 = u64::try_from(row.get::<_, i32>(5))
             .map_err(|_| ReportingReadError::InvalidPublishedData)?;
-        if first > observed || observed > Utc::now() + Duration::minutes(5) || total > 25_000 {
+        if first > observed
+            || observed > Utc::now() + Duration::minutes(5)
+            || total > u64::from(source_row_limit(query.source))
+        {
             return Err(ReportingReadError::InvalidPublishedData);
         }
+        let pagination_complete: bool = row.get(8);
+        let mut partial = row.get::<_, String>(7) == "partial" || !pagination_complete;
+        if query.source == SnapshotSource::SellerStocks {
+            let counts = client
+                .query_one(
+                    "SELECT count(*)::bigint,count(sellable_units)::bigint \
+                     FROM daily_reporting.mcp_seller_stock_facts \
+                     WHERE account_id=$1 AND marketplace=$2 AND snapshot_id=$3",
+                    &[&account.account_id(), &market, &id],
+                )
+                .await
+                .map_err(|_| ReportingReadError::Unavailable)?;
+            let actual = u64::try_from(counts.get::<_, i64>(0))
+                .map_err(|_| ReportingReadError::InvalidPublishedData)?;
+            let known = u64::try_from(counts.get::<_, i64>(1))
+                .map_err(|_| ReportingReadError::InvalidPublishedData)?;
+            if actual != total || known > total {
+                return Err(ReportingReadError::InvalidPublishedData);
+            }
+            partial |= known < total;
+            result.coverage = Some(SourceSnapshotCoverage {
+                total_pairs: total,
+                known_pairs: known,
+                missing_pairs: total - known,
+            });
+        }
+        if account.marketplace() == Marketplace::Wildberries
+            && query.source == SnapshotSource::Stocks
+        {
+            // PR 102 published some combined snapshots. Inspect the entire
+            // immutable snapshot, since the current page may contain only FBW.
+            let legacy_seller_rows: bool = client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM daily_reporting.mcp_stock_facts \
+                     WHERE account_id=$1 AND marketplace=$2 AND snapshot_id=$3 \
+                       AND warehouse_id LIKE 'wb:seller:%')",
+                    &[&account.account_id(), &market, &id],
+                )
+                .await
+                .map_err(|_| ReportingReadError::Unavailable)?
+                .get(0);
+            if legacy_seller_rows {
+                result.inventory_scope = Some("mixed".to_owned());
+            }
+        }
         let sla = match query.source {
-            SnapshotSource::Stocks | SnapshotSource::Prices => Duration::hours(1),
+            SnapshotSource::Stocks | SnapshotSource::SellerStocks | SnapshotSource::Prices => {
+                Duration::hours(1)
+            }
             SnapshotSource::Advertising => Duration::hours(2),
             _ => Duration::hours(6),
         };
-        if Utc::now() - first > sla {
-            "stale"
+        let (state, quality) = if Utc::now() - first > sla {
+            ("stale", DataQuality::Stale)
+        } else if partial {
+            ("partial", DataQuality::Partial)
+        } else {
+            ("available", DataQuality::Complete)
+        };
+        state.clone_into(&mut result.state);
+        if total == 0 {
+            "no_data"
+        } else if partial {
+            "partial"
         } else {
             "available"
         }
-        .clone_into(&mut result.state);
+        .clone_into(&mut result.data_state);
+        result.quality = Some(quality);
+        result.pagination_complete = Some(pagination_complete);
         result.snapshot_id = Some(id.to_string());
         result.cutoff_at = Some(timestamp_string(row.get(1)));
         result.source_as_of = Some(timestamp_string(observed));
@@ -131,6 +231,10 @@ impl PostgresReportingRepository {
         let (relation, order) = match query.source {
             SnapshotSource::Sales => ("daily_reporting.mcp_sales_facts", "business_date,sku"),
             SnapshotSource::Stocks => ("daily_reporting.mcp_stock_facts", "sku,warehouse_id"),
+            SnapshotSource::SellerStocks => (
+                "daily_reporting.mcp_seller_stock_facts",
+                "sku,chrt_id,warehouse_id",
+            ),
             SnapshotSource::Prices => ("daily_reporting.mcp_price_facts", "sku"),
             SnapshotSource::Advertising => (
                 "daily_reporting.mcp_advertising_facts",
@@ -164,6 +268,15 @@ impl PostgresReportingRepository {
                     .map_err(|_| ReportingReadError::InvalidPublishedData)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if query.source == SnapshotSource::SellerStocks
+            && result.rows.iter().any(|fact| {
+                fact["delivery_type"]
+                    .as_u64()
+                    .is_none_or(|delivery_type| delivery_type == 0)
+            })
+        {
+            return Err(ReportingReadError::InvalidPublishedData);
+        }
         let expected = total
             .saturating_sub(u64::from(query.offset))
             .min(u64::from(query.limit));

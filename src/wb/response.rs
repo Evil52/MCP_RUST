@@ -3,9 +3,9 @@
 use super::quota::{read_quota_error, vendor_quota_cooldown};
 use super::{
     AttemptContext, AttemptOutcome, ClientPolicy, DateTime, Duration, HeaderMap, Instant,
-    MAX_ERROR_BODY_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESPONSE_BODY_BYTES, RETRY_AFTER, RequestClass,
-    Response, StatusCode, Utc, Value, WbClient, WbError, WbErrorKind, classify_http_status, info,
-    warn,
+    MAX_ERROR_BODY_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESPONSE_BODY_BYTES, Method, RETRY_AFTER,
+    RequestClass, Response, StatusCode, Utc, Value, WAREHOUSE_STOCKS_PATH, WbClient, WbError,
+    WbErrorKind, classify_http_status, info, warn,
 };
 use crate::marketplace_quota::QuotaKey;
 
@@ -305,6 +305,41 @@ fn is_unexpected_finance_success(request_class: RequestClass, status: StatusCode
     request_class == RequestClass::FinanceReport && status.is_success() && status != StatusCode::OK
 }
 
+/// Applies documented endpoint-specific response semantics after retry and
+/// finance terminal-page handling. Other successful responses must be JSON.
+async fn decode_endpoint_response(
+    context: AttemptContext<'_>,
+    response: Response,
+    request_id: Option<String>,
+    retry_after: Option<Duration>,
+) -> Result<Value, WbError> {
+    let status = response.status();
+    if status == StatusCode::NO_CONTENT
+        && *context.method == Method::POST
+        && context.endpoint == "analytics:/api/analytics/v1/stocks-report/wb-warehouses"
+    {
+        // Preserve no-data evidence separately from JSON or a confirmed quantity.
+        read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
+        return Ok(serde_json::json!({
+            "data": {"items": []},
+            "meta": {
+                "upstream_status": status.as_u16(),
+                "data_state": "no_data",
+                "source_endpoint": WAREHOUSE_STOCKS_PATH,
+                "request_id": request_id,
+            },
+        }));
+    }
+    if is_unexpected_finance_success(context.request_class, status) {
+        return Err(WbError::Api {
+            status,
+            request_id,
+            diagnostic: String::new(),
+        });
+    }
+    decode_response(response, request_id, retry_after).await
+}
+
 impl WbClient {
     pub(super) async fn response_outcome(
         &self,
@@ -396,15 +431,13 @@ impl WbClient {
             return Ok(AttemptOutcome::NoContent);
         }
 
-        let result = if is_unexpected_finance_success(context.request_class, status) {
-            Err(WbError::Api {
-                status,
-                request_id: request_id.clone(),
-                diagnostic: String::new(),
-            })
-        } else {
-            decode_response(response, request_id.clone(), retry_after.duration()).await
-        };
+        let result = decode_endpoint_response(
+            context,
+            response,
+            request_id.clone(),
+            retry_after.duration(),
+        )
+        .await;
         let will_retry = context.request_class.allows_automatic_retry()
             && result.as_ref().is_err_and(|error| {
                 is_retriable_transport(error.kind()) && attempt < self.policy.max_attempts

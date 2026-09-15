@@ -1259,6 +1259,7 @@ mod tests {
     mod read_coverage;
     mod reporting_admission;
     mod seller_inventory;
+    mod stock_responses;
 
     use std::{
         io::{Read, Write},
@@ -3757,38 +3758,6 @@ mod tests {
                 true,
             );
         });
-    }
-
-    #[tokio::test]
-    async fn invalid_json_and_both_response_size_limits_are_enforced() {
-        let declared = MAX_RESPONSE_BODY_BYTES as u64 + 1;
-        let declared_oversize = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
-        )
-        .into_bytes();
-        let mut streamed_oversize =
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
-                .to_vec();
-        streamed_oversize.extend(std::iter::repeat_n(b'x', MAX_RESPONSE_BODY_BYTES + 1));
-        let (base_url, requests, task) = raw_http(vec![
-            raw_response(200, "x-request-id: invalid-json-id\r\n", b"not-json"),
-            declared_oversize,
-            streamed_oversize,
-        ]);
-        let client = client(&base_url);
-        let invalid_json = client.ping("account").await.unwrap_err();
-        assert_eq!(invalid_json.kind(), WbErrorKind::InvalidJson);
-        assert_eq!(invalid_json.request_id(), Some("invalid-json-id"));
-        for _ in 0..2 {
-            assert_eq!(
-                client.ping("account").await.unwrap_err().kind(),
-                WbErrorKind::ResponseTooLarge
-            );
-        }
-        for _ in 0..3 {
-            requests.recv().unwrap();
-        }
-        task.join().unwrap();
     }
 
     #[tokio::test]

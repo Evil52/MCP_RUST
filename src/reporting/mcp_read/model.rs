@@ -19,6 +19,7 @@ pub enum ReportingSource {
     Advertising,
     Finance,
     Stocks,
+    SellerStocks,
     Prices,
 }
 
@@ -338,6 +339,7 @@ impl From<SnapshotSource> for ReportingSource {
             SnapshotSource::Advertising => Self::Advertising,
             SnapshotSource::Finance => Self::Finance,
             SnapshotSource::Stocks => Self::Stocks,
+            SnapshotSource::SellerStocks => Self::SellerStocks,
             SnapshotSource::Prices => Self::Prices,
         }
     }

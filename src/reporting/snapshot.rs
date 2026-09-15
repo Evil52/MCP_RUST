@@ -33,6 +33,8 @@ pub enum SnapshotSource {
     Advertising,
     Finance,
     Stocks,
+    /// Optional WB seller-warehouse source; never folded into FBW report totals.
+    SellerStocks,
     Prices,
 }
 
@@ -57,7 +59,7 @@ impl SnapshotSource {
         match self {
             Self::Sales | Self::Finance => Duration::hours(6),
             Self::Advertising => Duration::hours(2),
-            Self::Stocks | Self::Prices => Duration::hours(1),
+            Self::Stocks | Self::SellerStocks | Self::Prices => Duration::hours(1),
         }
     }
 
@@ -141,6 +143,9 @@ impl SnapshotDescriptor {
             return Err(SnapshotError::InvalidSnapshot);
         }
         validate_identifier(&account_id)?;
+        if source == SnapshotSource::SellerStocks && marketplace != Marketplace::Wildberries {
+            return Err(SnapshotError::ScopeMismatch);
+        }
         if source_as_of > cutoff_at + MAX_POST_CUTOFF_OBSERVATION_DELAY || period_start > period_end
         {
             return Err(SnapshotError::InvalidTimeRange);

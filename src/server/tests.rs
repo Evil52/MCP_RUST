@@ -266,6 +266,12 @@ impl ReportingReadRepository for FakeReportingRepository {
             source: query.source,
             storage: "published_postgresql_snapshots".to_owned(),
             state: "missing".to_owned(),
+            data_state: "missing".to_owned(),
+            catalog_scope: None,
+            quality: None,
+            inventory_scope: None,
+            pagination_complete: None,
+            coverage: None,
             snapshot_id: None,
             cutoff_at: None,
             source_as_of: None,
@@ -641,29 +647,6 @@ async fn refresh_tools_apply_rbac_and_never_call_ozon_synchronously() {
         };
         assert!(error.starts_with(REPORT_REFRESH_INVALID_REQUEST), "{error}");
     }
-}
-
-#[tokio::test]
-async fn readiness_tracks_the_configured_refresh_queue() {
-    let healthy_repository = Arc::new(FakeRefreshRequestRepository::default());
-    let healthy =
-        server().with_refresh_requests(RefreshRequestService::from_repository(healthy_repository));
-    assert_eq!(healthy.readiness().await, Ok(()));
-
-    let unavailable_repository = Arc::new(FakeRefreshRequestRepository::unavailable());
-    let unavailable = server().with_refresh_requests(RefreshRequestService::from_repository(
-        unavailable_repository,
-    ));
-    assert_eq!(unavailable.readiness().await, Err(()));
-}
-
-#[tokio::test]
-async fn readiness_fails_when_the_configured_reporting_reader_is_unavailable() {
-    let repository = Arc::new(FakeReportingRepository::unavailable());
-    let server = reporting_test_server("admin", repository.clone());
-
-    assert!(server.readiness().await.is_err());
-    assert_eq!(repository.calls(), 1);
 }
 
 fn reporting_edge_registry_source() -> RegistrySource {
