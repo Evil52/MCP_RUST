@@ -11,7 +11,9 @@ mod cancellation_tests;
 mod launch;
 #[cfg(test)]
 mod mapping_tests;
+mod policy_transition;
 mod state_read;
+mod v4_corridor;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
@@ -182,94 +184,14 @@ enum PolicyTransition {
         from_max_bid_kopecks: u64,
         to_max_bid_kopecks: u64,
     },
-}
-
-impl PolicyTransition {
-    const fn event_type(self) -> &'static str {
-        match self {
-            Self::ProtectiveLive => "protective_live_activated",
-            Self::BidWrites => "bid_writes_activated",
-            Self::BoundedPacingActivated { .. } => "bounded_pacing_activated",
-            Self::TrafficFrontierV2Activated { .. } => "traffic_frontier_v2_activated",
-            Self::TrafficFrontierV3Activated { .. } => "traffic_frontier_v3_activated",
-            Self::TrafficFrontierV4Activated { .. } => "traffic_frontier_v4_activated",
-            Self::TrafficFrontierLimitsRaised { .. } => "traffic_frontier_limits_raised",
-            Self::TrafficFrontierCorridorTightened { .. } => "traffic_frontier_corridor_tightened",
-        }
-    }
-
-    const fn mode(self) -> &'static str {
-        match self {
-            Self::ProtectiveLive => "protective_live",
-            Self::BidWrites
-            | Self::BoundedPacingActivated { .. }
-            | Self::TrafficFrontierV2Activated { .. }
-            | Self::TrafficFrontierV3Activated { .. }
-            | Self::TrafficFrontierV4Activated { .. }
-            | Self::TrafficFrontierLimitsRaised { .. }
-            | Self::TrafficFrontierCorridorTightened { .. } => "bid_live",
-        }
-    }
-
-    const fn bid_writes_enabled(self) -> bool {
-        matches!(
-            self,
-            Self::BidWrites
-                | Self::BoundedPacingActivated { .. }
-                | Self::TrafficFrontierV2Activated { .. }
-                | Self::TrafficFrontierV3Activated { .. }
-                | Self::TrafficFrontierV4Activated { .. }
-                | Self::TrafficFrontierLimitsRaised { .. }
-                | Self::TrafficFrontierCorridorTightened { .. }
-        )
-    }
-
-    const fn max_bid_change(self) -> Option<(u64, u64)> {
-        match self {
-            Self::BoundedPacingActivated {
-                from_max_bid_kopecks,
-                to_max_bid_kopecks,
-                ..
-            }
-            | Self::TrafficFrontierV2Activated {
-                from_max_bid_kopecks,
-                to_max_bid_kopecks,
-                ..
-            }
-            | Self::TrafficFrontierCorridorTightened {
-                from_max_bid_kopecks,
-                to_max_bid_kopecks,
-                ..
-            } => Some((from_max_bid_kopecks, to_max_bid_kopecks)),
-            Self::ProtectiveLive
-            | Self::BidWrites
-            | Self::TrafficFrontierV3Activated { .. }
-            | Self::TrafficFrontierV4Activated { .. }
-            | Self::TrafficFrontierLimitsRaised { .. } => None,
-        }
-    }
-
-    const fn target_impressions_per_day(self) -> Option<u64> {
-        match self {
-            Self::BoundedPacingActivated {
-                target_impressions_per_day,
-                ..
-            }
-            | Self::TrafficFrontierV3Activated {
-                target_impressions_per_day,
-                ..
-            }
-            | Self::TrafficFrontierV4Activated {
-                target_impressions_per_day,
-                ..
-            } => Some(target_impressions_per_day),
-            Self::ProtectiveLive
-            | Self::BidWrites
-            | Self::TrafficFrontierV2Activated { .. }
-            | Self::TrafficFrontierLimitsRaised { .. }
-            | Self::TrafficFrontierCorridorTightened { .. } => None,
-        }
-    }
+    /// The reviewed v4 change raises the floor to 7 RUB and the ceiling to
+    /// 12 RUB without resetting any protective runtime state.
+    TrafficFrontierV4CorridorAdjusted {
+        from_min_bid_kopecks: u64,
+        to_min_bid_kopecks: u64,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -930,6 +852,16 @@ impl WbAutomationCampaignLease<'_> {
             payload["autonomous_pacing"] = "traffic_frontier_v2".into();
             payload["from_traffic_frontier_bid_kopecks"] = from_frontier_bid_kopecks.into();
             payload["to_traffic_frontier_bid_kopecks"] = to_frontier_bid_kopecks.into();
+        }
+        if let PolicyTransition::TrafficFrontierV4CorridorAdjusted {
+            from_min_bid_kopecks,
+            to_min_bid_kopecks,
+            ..
+        } = transition
+        {
+            payload["autonomous_pacing"] = "traffic_frontier_v4".into();
+            payload["from_min_bid_kopecks"] = from_min_bid_kopecks.into();
+            payload["to_min_bid_kopecks"] = to_min_bid_kopecks.into();
         }
         let payload_json = payload.to_string();
         insert_audit_event(
