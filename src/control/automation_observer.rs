@@ -208,8 +208,10 @@ impl WbAutomationObserver {
 
 mod campaign;
 mod readiness;
+mod scope;
 mod stocks;
 pub(super) use campaign::{CampaignObservation, parse_campaign};
+use scope::validate_advertising_scope;
 
 fn parse_budget_minor(response: &Value) -> Result<u64> {
     let total_rubles = response
@@ -301,18 +303,12 @@ fn build_observation(
     state: WbAutomationStateView,
 ) -> Result<WbAutomationObservation> {
     let allowed = policy.nm_ids.iter().copied().collect::<BTreeSet<_>>();
-    ensure!(
-        advertising.iter().all(|fact| {
-            fact.campaign_id == policy.campaign_id
-                && (fact.sku == 0 || allowed.contains(&fact.sku))
-                && matches!(fact.business_date, date if date == current_date || date == previous_date)
-        }),
-        "WB automation stats вышли за campaign/date/SKU scope"
-    );
+    validate_advertising_scope(advertising, policy.campaign_id, current_date, previous_date)?;
     let mut current_sku_spend_minor = 0_u64;
     let mut current_sku_rows = 0_u64;
     let mut current_campaign = None;
     let mut previous = BTreeMap::<u64, &CollectedAdvertisingFact>::new();
+    let mut previous_has_sku_rows = false;
     let mut campaign_level_previous = None;
     for fact in advertising {
         if fact.business_date == current_date {
@@ -335,10 +331,13 @@ fn build_observation(
                 "WB automation stats содержат duplicate campaign total"
             );
         } else {
-            ensure!(
-                previous.insert(fact.sku, fact).is_none(),
-                "WB automation stats содержат duplicate SKU"
-            );
+            previous_has_sku_rows = true;
+            if allowed.contains(&fact.sku) {
+                ensure!(
+                    previous.insert(fact.sku, fact).is_none(),
+                    "WB automation stats содержат duplicate SKU"
+                );
+            }
         }
     }
     ensure!(
@@ -346,7 +345,7 @@ fn build_observation(
         "WB automation stats смешивают campaign и SKU totals за текущую дату"
     );
     ensure!(
-        campaign_level_previous.is_none() || previous.is_empty(),
+        campaign_level_previous.is_none() || !previous_has_sku_rows,
         "WB automation stats смешивают campaign и SKU totals за предыдущую дату"
     );
     let daily_spend_complete = current_campaign.is_some() || current_sku_rows > 0;
@@ -532,6 +531,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod stats_scope;
     mod stock_pagination;
 
     use std::{
