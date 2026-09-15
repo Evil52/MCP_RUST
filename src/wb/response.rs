@@ -1,6 +1,7 @@
 //! Bounded response decoding, safe diagnostics and retry decisions.
 
 use super::quota::{read_quota_error, vendor_quota_cooldown};
+use super::seller_stock_report::{SELLER_STOCK_REPORT_LABEL, SELLER_STOCK_REPORT_PATH};
 use super::{
     AttemptContext, AttemptOutcome, ClientPolicy, DateTime, Duration, HeaderMap, Instant,
     MAX_ERROR_BODY_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESPONSE_BODY_BYTES, Method, RETRY_AFTER,
@@ -315,8 +316,18 @@ async fn decode_endpoint_response(
 ) -> Result<Value, WbError> {
     let status = response.status();
     if status == StatusCode::NO_CONTENT
+        && *context.method == Method::GET
+        && context.endpoint == super::promotion_money::PAYMENTS_LABEL
+    {
+        read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
+        return Ok(serde_json::json!([]));
+    }
+    if status == StatusCode::NO_CONTENT
         && *context.method == Method::POST
-        && context.endpoint == "analytics:/api/analytics/v1/stocks-report/wb-warehouses"
+        && matches!(
+            context.endpoint,
+            "analytics:/api/analytics/v1/stocks-report/wb-warehouses" | SELLER_STOCK_REPORT_LABEL
+        )
     {
         // Preserve no-data evidence separately from JSON or a confirmed quantity.
         read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
@@ -325,7 +336,9 @@ async fn decode_endpoint_response(
             "meta": {
                 "upstream_status": status.as_u16(),
                 "data_state": "no_data",
-                "source_endpoint": WAREHOUSE_STOCKS_PATH,
+                "source_endpoint": if context.endpoint == SELLER_STOCK_REPORT_LABEL {
+                    SELLER_STOCK_REPORT_PATH
+                } else { WAREHOUSE_STOCKS_PATH },
                 "request_id": request_id,
             },
         }));

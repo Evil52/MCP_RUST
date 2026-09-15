@@ -1,5 +1,32 @@
 # WB inventory collection
 
+## Analytics seller inventory report
+
+`wb_seller_warehouses_stock_report` exposes the read-only Analytics endpoint
+`POST /api/analytics/v1/stocks-report/seller-warehouses`. It returns current
+size/warehouse rows without enumerating the active Content catalogue first.
+With empty `nm_ids`/`chrt_ids`, start at offset zero and follow `next_offset`
+until `page_is_last`. A full page always requires another request, even when
+the next page is empty. Deduplicate/check identities across pages before
+declaring a whole-report total. Missing rows and 204 do not prove zero stock.
+
+WB documents Personal/Service Analytics tokens, a 20-second request interval,
+and a 30-minute upstream refresh cadence. The MCP deliberately caps each page
+at 1000 rows instead of WB's 250000 maximum to retain the shared 2 MiB bound.
+`chrt_ids` requires `nm_ids`, matching the upstream filter semantics. The same
+read-only endpoint policy, Analytics quota, redaction and access checks apply.
+Use the seller warehouse directory to distinguish delivery types; this report
+alone does not classify a row as FBS. Its source timestamp is not a historical
+stock timestamp. Compare reports within their observation windows.
+
+This tool provides an independent reconciliation source. The existing durable
+`seller_stocks` collector and its historical snapshots keep their established
+Marketplace source and NULL semantics until a separately validated migration.
+Contract checked against https://dev.wildberries.cn/docs/openapi/analytics
+on 2026-09-15. There is no documented omitted-row-equals-zero guarantee.
+
+## Durable Marketplace collection
+
 WB inventory is collected as two independent sources. Current `stocks` jobs
 collect FBW inventory at WB warehouses. `seller_stocks` collects seller warehouses
 with every valid positive `deliveryType`, preserving it as `delivery_type` in each
@@ -51,7 +78,7 @@ A zero-row result has `data_state="no_data"`, which does not assert zero physica
 inventory. Existing complete snapshots remain addressable by snapshot ID. A
 cutoff or retrieval timestamp does not reconstruct inventory on another day.
 
-HTTP 204 on the documented FBW stock endpoint is a successful no-data response,
+HTTP 204 on the documented FBW and seller Analytics stock endpoints is a successful no-data response,
 normalized as an empty page with upstream status and provenance in the live
 tool response. Empty or malformed HTTP 200 and unexpected 204 from other
 endpoints remain errors. FBW aggregation runs across all pages with checked

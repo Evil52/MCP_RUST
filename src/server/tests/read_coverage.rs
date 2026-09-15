@@ -1,4 +1,6 @@
 use super::*;
+#[path = "operational_reads.rs"]
+mod operational_reads;
 
 fn wb_tools() -> Vec<(&'static str, Value)> {
     vec![

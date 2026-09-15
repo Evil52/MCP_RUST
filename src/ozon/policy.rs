@@ -24,6 +24,7 @@ pub const READ_ONLY_ENDPOINT_ALLOWLIST: &[&str] = &[
     "/v1/rating/history",
     "/v1/rating/summary",
     "/v1/returns/list",
+    "/v1/roles",
     "/v2/posting/fbo/get",
     "/v2/posting/fbs/cancel-reason/list",
     "/v2/product/info/stocks-by-warehouse/fbs",
