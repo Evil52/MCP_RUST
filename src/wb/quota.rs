@@ -36,6 +36,9 @@ impl RequestClass {
             Self::PromotionRecommendedBids => "promotion_recommended_bids",
             Self::PromotionClusterBids => "promotion_cluster_bids",
             Self::SellerInventory => "seller_inventory",
+            Self::FbsOrders => "marketplace_fbs_orders",
+            Self::PromotionCosts => "promotion_costs",
+            Self::PromotionPayments => "promotion_payments",
         }
     }
 }

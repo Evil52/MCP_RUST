@@ -9983,7 +9983,7 @@
 		},
 		{
 			"name": "Wildberries — методы MCP (строго read-only)",
-			"description": "Справочная копия всех 22 сетевых методов Wildberries, разрешённых runtime allowlist в src/wb.rs. Папка не является источником сетевых полномочий: сервер по-прежнему проверяет точную пару method/path и фиксированный host. POST-методы здесь только читают аналитику. Не добавляйте произвольные GET: у WB существуют мутирующие GET. Локальный wb_stores_status отсутствует, потому что он не обращается к WB API. Токен задавайте только через переменную wbApiToken и не сохраняйте его в коллекции. Методы wb_search_* требуют категории «Аналитика» и подписки «Джем»; отчёт обновляется раз в час и не является точной live-позицией.",
+			"description": "Справочные примеры сетевых методов Wildberries. Политики разрешённых endpoint находятся в src/wb/policy.rs, coverage_policy.rs и operational_policy.rs. Папка не является источником сетевых полномочий: сервер по-прежнему проверяет точную пару method/path и фиксированный host. POST-методы здесь только читают аналитику. Не добавляйте произвольные GET: у WB существуют мутирующие GET. Локальный wb_stores_status отсутствует, потому что он не обращается к WB API. Токен задавайте только через переменную wbApiToken и не сохраняйте его в коллекции. Методы wb_search_* требуют категории «Аналитика» и подписки «Джем»; отчёт обновляется раз в час и не является точной live-позицией.",
 			"auth": {
 				"type": "bearer",
 				"bearer": [
@@ -10061,6 +10061,21 @@
 						},
 						"url": "https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses",
 						"description": "Read-only текущие FBW-остатки на складах WB, НЕ FBS. Runtime: wb_warehouse_stocks. Пагинация limit/offset. Исторической даты нет."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_seller_warehouses_stock_report — POST /api/analytics/v1/stocks-report/seller-warehouses",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json", "type": "text" }],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"nmIds\": [],\n  \"chrtIds\": [],\n  \"limit\": 1000,\n  \"offset\": 0\n}",
+							"options": { "raw": { "language": "json" } }
+						},
+						"url": "https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/seller-warehouses",
+						"description": "Read-only текущий отчёт по складам продавца WB. FBS определяется по deliveryType=1 в wb_seller_warehouses. Runtime: wb_seller_warehouses_stock_report. Пагинация limit/offset. Данные обновляются раз в 30 минут; Personal/Service Analytics токен. Пропуски не равны нулю. Исторической даты нет."
 					},
 					"response": []
 				},
@@ -10270,6 +10285,119 @@
 						"description": "Read-only текущие ставки поисковых кластеров. Runtime: wb_promotion_search_cluster_bids."
 					},
 					"response": []
+				},
+				{
+					"name": "wb_fbs_new_orders — GET /api/v3/orders/new",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "https://marketplace-api.wildberries.ru/api/v3/orders/new",
+						"description": "Новые сборочные задания. Сохранять deliveryType; не финансовая реализация."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_fbs_orders — GET /api/v3/orders",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "https://marketplace-api.wildberries.ru/api/v3/orders?limit=100&next=0&dateFrom={{dateFromUnix}}&dateTo={{dateToUnix}}",
+						"description": "Одна страница, фиксированный UTC период до 30 суток. Передавать next из ответа; пустая страница завершает обход."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_fbs_order_statuses — POST /api/v3/orders/status",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"url": "https://marketplace-api.wildberries.ru/api/v3/orders/status",
+						"description": "Статусы 1–1000 уникальных ID. Отсутствующий ID остаётся неизвестным.",
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"orders\": [\n    123\n  ]\n}",
+							"options": { "raw": { "language": "json" } }
+						}
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_balance — GET /adv/v1/balance",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "https://advert-api.wildberries.ru/adv/v1/balance",
+						"description": "Баланс, взаимозачёт и бонусы; не расходы."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_budget — GET /adv/v1/budget",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "https://advert-api.wildberries.ru/adv/v1/budget?id={{wbAdvertId}}",
+						"description": "Бюджет одной кампании, без пополнения."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_costs — GET /adv/v1/upd",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "https://advert-api.wildberries.ru/adv/v1/upd?from={{wbDateFrom}}&to={{wbDateTo}}",
+						"description": "История расходов до 31 дня включительно. Консервативная квота MCP: раз в час."
+					},
+					"response": []
+				},
+				{
+					"name": "wb_promotion_payments — GET /adv/v1/payments",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": "https://advert-api.wildberries.ru/adv/v1/payments?from={{wbDateFrom}}&to={{wbDateTo}}",
+						"description": "Пополнения не являются расходами. HTTP 204 — пустая история. Консервативная квота MCP: раз в час."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Ozon — диагностика прав MCP",
+			"item": [
+				{
+					"name": "ozon_api_key_roles — POST /v1/roles",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Client-Id",
+								"value": "{{clientID}}"
+							},
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{}",
+							"options": {
+								"raw": {
+									"language": "json"
+								}
+							}
+						},
+						"url": "https://api-seller.ozon.ru/v1/roles",
+						"description": "Роли текущего API-ключа. Не меняет RBAC MCP и не доказывает подписку."
+					},
+					"response": []
 				}
 			]
 		}
@@ -10290,6 +10418,16 @@
 		]
 	},
 	"variable": [
+		{
+			"key": "dateFromUnix",
+			"value": "1789344000",
+			"type": "string"
+		},
+		{
+			"key": "dateToUnix",
+			"value": "1789430400",
+			"type": "string"
+		},
 		{
 			"key": "wbWarehouseId",
 			"value": "1",
