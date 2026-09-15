@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    fmt::Write as _,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -17,7 +16,6 @@ use mcp_ozon::control::{
     wb_automation_business_date,
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio_postgres::Config;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -26,6 +24,14 @@ const DATABASE_URL_ENV: &str = "WB_AUTOMATION_DATABASE_URL";
 
 #[path = "wb_automation/entry.rs"]
 mod entry;
+mod wb_automation {
+    pub mod digest;
+    pub mod v4_corridor;
+}
+use wb_automation::digest::{is_lower_sha256, sha256_domain};
+#[cfg(test)]
+#[path = "wb_automation/v4_corridor_tests.rs"]
+mod v4_corridor_tests;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -641,126 +647,6 @@ fn validate_traffic_frontier_v4_activation(
     ensure!(
         target == &expected,
         "WB traffic-frontier v4 transition changes an unapproved policy field"
-    );
-    Ok(())
-}
-
-async fn adjust_traffic_frontier_v4_corridor_postgres(
-    options: ActivatePolicyOptions,
-) -> Result<()> {
-    let source = build_observer(&options.source)?;
-    let target = build_observer(&ObserveOptions {
-        policy: options.target_policy,
-        registry: options.source.registry.clone(),
-        reader_token: options.source.reader_token.clone(),
-        state_directory: PathBuf::new(),
-        allow_broad_reader: options.source.allow_broad_reader,
-        reader_proxy_url: options.source.reader_proxy_url.clone(),
-    })?;
-    validate_traffic_frontier_v4_corridor_adjustment(source.policy(), target.policy())?;
-    let now = Utc::now();
-    ensure!(
-        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
-        "WB traffic-frontier v4 corridor authorization is not active"
-    );
-    target
-        .observe(now, WbAutomationStateView::default())
-        .await
-        .context("WB traffic-frontier v4 corridor read-only preflight failed")?;
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
-    let Some(mut lease) = store
-        .try_acquire_campaign(
-            target.policy().account_id.as_str(),
-            target.policy().campaign_id,
-        )
-        .await?
-    else {
-        bail!("WB traffic-frontier v4 corridor campaign lock is contended");
-    };
-    let receipt = lease
-        .activate_traffic_frontier_v4_corridor_policy(
-            source.policy_sha256(),
-            target.policy_sha256(),
-            source.policy().min_bid_kopecks,
-            target.policy().min_bid_kopecks,
-            source.policy().max_bid_kopecks,
-            target.policy().max_bid_kopecks,
-        )
-        .await?;
-    lease.release().await?;
-    println!(
-        "{}",
-        serde_json::json!({
-            "account_id": target.policy().account_id,
-            "campaign_id": target.policy().campaign_id,
-            "outcome": if receipt.changed {
-                "traffic_frontier_v4_corridor_adjusted"
-            } else {
-                "traffic_frontier_v4_corridor_already_active"
-            },
-            "state_revision": receipt.state_revision,
-            "min_bid_kopecks": target.policy().min_bid_kopecks,
-            "max_bid_kopecks": target.policy().max_bid_kopecks,
-            "bid_writes_enabled": true,
-        })
-    );
-    Ok(())
-}
-
-fn validate_traffic_frontier_v4_corridor_adjustment(
-    source: &WbAutomationPolicy,
-    target: &WbAutomationPolicy,
-) -> Result<()> {
-    use mcp_ozon::control::WbAutomationPacingMode;
-
-    let reviewed_source = matches!(
-        (
-            source.campaign_id,
-            source.campaign_name.as_str(),
-            source.authorization_reference.as_str(),
-        ),
-        (
-            39_807_762,
-            "Одуванчик",
-            "chat/2026-08-28/oduvanchik-traffic-frontier-v4-drr-15",
-        ) | (
-            40_141_836,
-            "Nexus",
-            "chat/2026-09-14/nexus-funded-bids-and-automation-like-oduvanchik",
-        )
-    );
-    ensure!(
-        reviewed_source
-            && source.account_id == "ofk_region_wb"
-            && source.write_enabled
-            && source.bid_writes_enabled
-            && source.autonomous_pacing == WbAutomationPacingMode::TrafficFrontierV4
-            && source.traffic_frontier_bid_kopecks == Some(700)
-            && source.min_bid_kopecks <= 700
-            && source.max_bid_kopecks == 1_050
-            && target.authorization_reference
-                == "chat/2026-09-15/oduvanchik-nexus-traffic-frontier-v4-7-12"
-            && target.min_bid_kopecks == 700
-            && target.max_bid_kopecks == 1_200,
-        "WB traffic-frontier v4 7-12 corridor transition is outside the reviewed authorization"
-    );
-    let mut expected = source.clone();
-    expected
-        .authorization_reference
-        .clone_from(&target.authorization_reference);
-    expected.authorized_at = target.authorized_at;
-    expected.authorization_expires_at = target.authorization_expires_at;
-    expected.observe_until = target.observe_until;
-    expected.min_bid_kopecks = 700;
-    expected.max_bid_kopecks = 1_200;
-    ensure!(
-        target == &expected,
-        "WB traffic-frontier v4 corridor transition changes an unapproved policy field"
     );
     Ok(())
 }
@@ -1816,27 +1702,6 @@ fn load_legacy_state(
     })
 }
 
-fn sha256_domain(domain: &str, bytes: &[u8]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(domain.as_bytes());
-    digest.update([0]);
-    digest.update(bytes);
-    digest
-        .finalize()
-        .iter()
-        .fold(String::with_capacity(64), |mut output, byte| {
-            write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
-            output
-        })
-}
-
-fn is_lower_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1976,18 +1841,6 @@ mod tests {
         (source, target)
     }
 
-    fn traffic_frontier_v4_corridor_target(source: &WbAutomationPolicy) -> WbAutomationPolicy {
-        let mut target = source.clone();
-        target.authorization_reference =
-            "chat/2026-09-15/oduvanchik-nexus-traffic-frontier-v4-7-12".to_owned();
-        target.authorized_at = "2026-09-15T05:00:00Z".parse().unwrap();
-        target.authorization_expires_at = "2026-09-16T05:00:00Z".parse().unwrap();
-        target.observe_until = "2026-09-15T05:00:01Z".parse().unwrap();
-        target.min_bid_kopecks = 700;
-        target.max_bid_kopecks = 1_200;
-        target
-    }
-
     #[test]
     fn bounded_pacing_activation_accepts_only_reviewed_changes() {
         let (source, target) = bounded_pacing_policies();
@@ -2049,35 +1902,6 @@ mod tests {
     }
 
     #[test]
-    fn traffic_frontier_v4_corridor_accepts_only_both_reviewed_campaigns() {
-        let (_, oduvanchik) = traffic_frontier_v4_policies();
-        let target = traffic_frontier_v4_corridor_target(&oduvanchik);
-        validate_traffic_frontier_v4_corridor_adjustment(&oduvanchik, &target)
-            .expect("reviewed Oduvanchik 7-12 corridor is accepted");
-
-        let mut nexus = oduvanchik;
-        nexus.campaign_id = 40_141_836;
-        nexus.campaign_name = "Nexus".to_owned();
-        nexus.authorization_reference =
-            "chat/2026-09-14/nexus-funded-bids-and-automation-like-oduvanchik".to_owned();
-        nexus.min_bid_kopecks = 102;
-        let nexus_target = traffic_frontier_v4_corridor_target(&nexus);
-        validate_traffic_frontier_v4_corridor_adjustment(&nexus, &nexus_target)
-            .expect("reviewed Nexus 7-12 corridor is accepted");
-
-        let mut changed_budget = nexus_target.clone();
-        changed_budget.daily_spend_cap_minor += 1;
-        assert!(validate_traffic_frontier_v4_corridor_adjustment(&nexus, &changed_budget).is_err());
-
-        let mut wrong_campaign = nexus;
-        wrong_campaign.campaign_id += 1;
-        assert!(
-            validate_traffic_frontier_v4_corridor_adjustment(&wrong_campaign, &nexus_target)
-                .is_err()
-        );
-    }
-
-    #[test]
     fn traffic_frontier_v4_command_parses_the_read_only_activation_inputs() {
         let arguments = [
             "activate-traffic-frontier-v4-pg",
@@ -2101,28 +1925,6 @@ mod tests {
             options.source.reader_proxy_url.as_deref(),
             Some("http://reader:3128")
         );
-    }
-
-    #[test]
-    fn traffic_frontier_v4_corridor_command_parses_only_activation_inputs() {
-        let arguments = [
-            "adjust-traffic-frontier-v4-corridor-pg",
-            "source.json",
-            "target.json",
-            "access.json",
-            "reader.token",
-            "false",
-        ]
-        .map(str::to_owned);
-        let Command::AdjustTrafficFrontierV4CorridorPostgres(options) =
-            parse_command(&arguments).expect("v4 corridor command parses")
-        else {
-            panic!("unexpected command variant");
-        };
-        assert_eq!(options.source.policy, PathBuf::from("source.json"));
-        assert_eq!(options.target_policy, PathBuf::from("target.json"));
-        assert!(!options.source.allow_broad_reader);
-        assert!(options.source.reader_proxy_url.is_none());
     }
 
     #[test]

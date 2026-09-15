@@ -3,11 +3,11 @@
   "legacy_file_lines": {
     "src/auth.rs": 1893,
     "src/bin/report-collector.rs": 1026,
-    "src/bin/wb-automation.rs": 2002,
+    "src/bin/wb-automation.rs": 1992,
     "src/config.rs": 3368,
     "src/control/automation_executor.rs": 4267,
     "src/control/automation_observer.rs": 1270,
-    "src/control/automation_postgres.rs": 2494,
+    "src/control/automation_postgres.rs": 2426,
     "src/control/automation.rs": 1792,
     "src/control/config/tests.rs": 1490,
     "src/control/ozon/guard_runtime.rs": 2069,
