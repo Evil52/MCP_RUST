@@ -186,19 +186,7 @@ impl WbSellerSource {
                     parse_cards(&self.transport.cards(cursor.clone()).await?)
                 })
                 .await?;
-            for (sku, sizes) in page.items {
-                if !items.insert(sku) {
-                    return Err("seller_catalogue_duplicate".into());
-                }
-                for id in sizes {
-                    if catalogue.insert(id, sku).is_some() {
-                        return Err("seller_catalogue_duplicate".into());
-                    }
-                }
-            }
-            if catalogue.len() > MAX_IDENTITIES {
-                return Err("seller_pair_limit".into());
-            }
+            extend_catalogue(&mut items, &mut catalogue, page.items)?;
             let Some(next) = page.next else {
                 return Ok(catalogue);
             };
@@ -209,6 +197,29 @@ impl WbSellerSource {
         }
         Err("seller_catalogue_page_limit".into())
     }
+}
+
+/// Adds one card page to the size-to-card catalogue. A repeated card or
+/// size identity fails closed instead of silently merging two cards.
+fn extend_catalogue(
+    items: &mut BTreeSet<u64>,
+    catalogue: &mut BTreeMap<u64, u64>,
+    page: Vec<(u64, Vec<u64>)>,
+) -> Result<(), SourceFailure> {
+    for (sku, sizes) in page {
+        if !items.insert(sku) {
+            return Err("seller_catalogue_duplicate".into());
+        }
+        for id in sizes {
+            if catalogue.insert(id, sku).is_some() {
+                return Err("seller_catalogue_duplicate".into());
+            }
+        }
+    }
+    if catalogue.len() > MAX_IDENTITIES {
+        return Err("seller_pair_limit".into());
+    }
+    Ok(())
 }
 
 fn id(value: Option<&Value>) -> Result<u64, SourceFailure> {
