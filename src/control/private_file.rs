@@ -1,15 +1,15 @@
-//! Crash-safe replacement of small owner-only state files.
+//! Crash-safe owner-only state files: atomic replacement and process leases.
 
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{self, ErrorKind},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const TEMPORARY_ATTEMPTS: usize = 16;
@@ -45,6 +45,48 @@ pub(super) fn replace_private_file(
         .with_context(|| format!("{label}: каталог нельзя синхронизировать"))
 }
 
+/// Takes the exclusive advisory lock on the owner-only lease file
+/// `directory/file_name`, creating it on first use. `None` means another
+/// live process holds the lease.
+///
+/// The lock belongs to the open file description, so a crashed holder
+/// releases it automatically: unlike a create-only lock file, no leftover
+/// can wedge a later run. Dropping the returned file releases the lease.
+pub(super) fn try_acquire_private_lease(
+    directory: &Path,
+    file_name: &str,
+    label: &str,
+) -> Result<Option<File>> {
+    let path = directory.join(file_name);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => ensure!(metadata.is_file(), "{label}: lease небезопасен"),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("{label}: lease недоступен")),
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("{label}: lease недоступен"))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("{label}: lease недоступен"))?;
+    ensure!(
+        metadata.is_file() && metadata.permissions().mode().is_multiple_of(0o100),
+        "{label}: lease небезопасен"
+    );
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("{label}: lease нельзя заблокировать"))
+        }
+    }
+}
+
 fn create_temporary(directory: &Path, file_name: &str) -> io::Result<(PathBuf, File)> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -75,7 +117,7 @@ fn create_temporary(directory: &Path, file_name: &str) -> io::Result<(PathBuf, F
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write as _, os::unix::fs::PermissionsExt};
+    use std::{io::Write as _, os::unix::fs::symlink};
 
     use super::*;
 
@@ -191,6 +233,55 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("test state нельзя опубликовать"));
         assert_eq!(directory.names(), ["blocked.json", "state.json"]);
+    }
+
+    #[test]
+    fn a_lease_is_exclusive_until_its_holder_releases_it() {
+        let directory = TestDirectory::new();
+        let held = try_acquire_private_lease(&directory.0, ".state.lease", "test state")
+            .unwrap()
+            .expect("an unowned lease is acquired");
+        // A second open file description is what another process would hold.
+        assert!(
+            try_acquire_private_lease(&directory.0, ".state.lease", "test state")
+                .unwrap()
+                .is_none()
+        );
+        let path = directory.0.join(".state.lease");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(held);
+        assert!(
+            try_acquire_private_lease(&directory.0, ".state.lease", "test state")
+                .unwrap()
+                .is_some(),
+            "a released or crashed holder never wedges the next run"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_lease_file_fails_closed() {
+        let directory = TestDirectory::new();
+        fs::write(directory.0.join("target"), b"").unwrap();
+        symlink(directory.0.join("target"), directory.0.join(".link.lease")).unwrap();
+        let error =
+            try_acquire_private_lease(&directory.0, ".link.lease", "test state").unwrap_err();
+        assert!(error.to_string().contains("test state: lease небезопасен"));
+
+        let shared = directory.0.join(".shared.lease");
+        fs::write(&shared, b"").unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(try_acquire_private_lease(&directory.0, ".shared.lease", "test state").is_err());
+
+        fs::create_dir(directory.0.join(".directory.lease")).unwrap();
+        assert!(try_acquire_private_lease(&directory.0, ".directory.lease", "test state").is_err());
+        assert!(
+            try_acquire_private_lease(&directory.0.join("missing"), ".state.lease", "test state")
+                .is_err()
+        );
     }
 
     #[test]
