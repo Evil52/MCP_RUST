@@ -6,7 +6,7 @@
     "src/bin/wb-automation.rs": 1992,
     "src/config.rs": 3368,
     "src/control/automation_executor.rs": 4172,
-    "src/control/automation_observer.rs": 1270,
+    "src/control/automation_observer.rs": 1262,
     "src/control/automation_postgres.rs": 2426,
     "src/control/automation.rs": 1792,
     "src/control/config/tests.rs": 1490,

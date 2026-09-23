@@ -1,15 +1,15 @@
 //! Private execution-state files and pending-action reconciliation.
 
 use super::{
-    DateTime, Deserialize, File, MAX_STATE_BYTES, NaiveDate, OpenOptions, Path, READBACK_GRACE,
-    Result, STATE_SCHEMA_VERSION, Serialize, Sha256, Utc, WbAutomationAction,
-    WbAutomationBidChange, WbAutomationExecutionOutcome, Write, ensure,
-    wb_automation_business_date,
+    DateTime, Deserialize, File, MAX_STATE_BYTES, NaiveDate, Path, READBACK_GRACE, Result,
+    STATE_SCHEMA_VERSION, Serialize, Sha256, Utc, WbAutomationAction, WbAutomationBidChange,
+    WbAutomationExecutionOutcome, Write, ensure, wb_automation_business_date,
 };
+use crate::control::private_file::replace_private_file;
 use anyhow::Context;
 use sha2::Digest;
 use std::fs;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 
 pub(super) fn sha256_domain(domain: &str, bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
@@ -120,7 +120,7 @@ pub(super) fn reconcile_pending(
         match pending.kind {
             PendingActionKind::PauseCampaignForDailyCap => {
                 // The pause belongs to the business date it was reserved on.
-                // A reconciliation that lands after the Yekaterinburg rollover
+                // A reconciliation that lands after the Moscow business-date rollover
                 // sees the next business date, and recording that instead would
                 // keep `paused_by_automation` false for the whole new day and
                 // hold the campaign paused one day longer than the cap requires.
@@ -239,22 +239,13 @@ pub(super) fn save_execution_state_bytes(
     bytes: &[u8],
     write: fn(&mut File, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    let temporary = directory.join(format!(".execution-state-{}.tmp", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .context("WB automation temporary execution state недоступен")?;
-    if let Err(error) = write(&mut file, bytes) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    fs::rename(&temporary, directory.join("execution-state.json"))
-        .context("WB automation execution state нельзя опубликовать")?;
-    File::open(directory)
-        .and_then(|directory| directory.sync_all())
-        .context("WB automation execution state directory нельзя синхронизировать")
+    replace_private_file(
+        directory,
+        "execution-state.json",
+        bytes,
+        write,
+        "WB automation execution state",
+    )
 }
 
 pub(super) fn write_state(file: &mut File, bytes: &[u8]) -> Result<()> {
