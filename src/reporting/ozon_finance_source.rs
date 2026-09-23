@@ -52,7 +52,7 @@ pub async fn collect_finance_facts_checkpointed(
     if date_from > date_to {
         return Err(OzonReportSourceError::InvalidSnapshotInput);
     }
-    let types = checkpointed(checkpoints, json!(["ozon_finance_types_v2"]), || async {
+    let types = checkpointed(checkpoints, json!(["ozon_finance_types_v3"]), || async {
         let response = transport
             .post(OzonReportRequest {
                 path: "/v1/finance/accrual/types",
@@ -104,7 +104,7 @@ async fn collect_day(
     for _ in 0..MAX_PAGES_PER_DAY {
         let (facts, rows, next) = checkpointed(
             checkpoints,
-            json!(["ozon_finance_day_v2", date, last_id]),
+            json!(["ozon_finance_day_v3", date, last_id]),
             || async {
                 let response = transport.post(OzonReportRequest {
                 path: "/v1/finance/accrual/by-day",
@@ -177,7 +177,7 @@ fn parse_types(response: &Value) -> Result<BTreeMap<u64, AccrualType>, OzonFinan
         let id = parse_u64(row.get("id").ok_or(OzonFinanceParseError::Shape)?)?;
         let name = bounded_text(row.get("name"))?;
         let description = bounded_text(row.get("description"))?;
-        let (category, known) = classify_type(&format!("{name} {description}"));
+        let (category, known) = classify_type(name, description);
         if id == 0 || result.insert(id, AccrualType { category, known }).is_some() {
             return Err(OzonFinanceParseError::Value);
         }
@@ -261,9 +261,25 @@ fn unique_posting_sku(posting: Option<&Value>) -> Result<Option<u64>, OzonFinanc
     Ok(sku)
 }
 
-fn classify_type(text: &str) -> (FinanceCategory, bool) {
+/// Classifies one dictionary type by its name. The free-text description
+/// often mentions related services ("…при доставке", "…с учётом скидки"),
+/// so it is consulted only when the name alone matches no family and can
+/// never override the name.
+fn classify_type(name: &str, description: &str) -> (FinanceCategory, bool) {
+    classify_text(name)
+        .or_else(|| classify_text(description))
+        .map_or((FinanceCategory::Other, false), |category| (category, true))
+}
+
+fn classify_text(text: &str) -> Option<FinanceCategory> {
     let text = text.to_lowercase();
     let tests = [
+        // An explicit compensation credits a loss whatever it concerns:
+        // "компенсация за повреждение при доставке" is not a logistics fee.
+        (
+            FinanceCategory::Compensation,
+            &["компенсац", "compensation"][..],
+        ),
         (FinanceCategory::Acquiring, &["эквайр", "acquir"][..]),
         (FinanceCategory::Storage, &["хранен", "storage"][..]),
         (
@@ -275,10 +291,7 @@ fn classify_type(text: &str) -> (FinanceCategory, bool) {
             &["логист", "достав", "перевоз", "logistic", "delivery"][..],
         ),
         (FinanceCategory::Commission, &["комис", "commission"][..]),
-        (
-            FinanceCategory::Compensation,
-            &["компенсац", "возмещ", "compensation"][..],
-        ),
+        (FinanceCategory::Compensation, &["возмещ"][..]),
         (FinanceCategory::Advertising, &["реклам", "advert"][..]),
         (
             FinanceCategory::MarketplaceDiscount,
@@ -289,9 +302,7 @@ fn classify_type(text: &str) -> (FinanceCategory, bool) {
     tests
         .into_iter()
         .find(|(_, needles)| needles.iter().any(|needle| text.contains(needle)))
-        .map_or((FinanceCategory::Other, false), |(category, _)| {
-            (category, true)
-        })
+        .map(|(category, _)| category)
 }
 
 fn bounded_text(value: Option<&Value>) -> Result<&str, OzonFinanceParseError> {
@@ -793,14 +804,60 @@ mod tests {
             ("bonus", FinanceCategory::MarketplaceDiscount),
             ("sale", FinanceCategory::Sale),
         ] {
-            assert_eq!(classify_type(text), (expected, true));
+            assert_eq!(classify_type(text, ""), (expected, true));
         }
         assert_eq!(
-            classify_type("new unknown fee"),
+            classify_type("new unknown fee", ""),
             (FinanceCategory::Other, false)
         );
         assert_eq!(
-            classify_type("Платная дополнительная услуга"),
+            classify_type("Платная дополнительная услуга", ""),
+            (FinanceCategory::Other, false)
+        );
+    }
+
+    #[test]
+    fn the_name_decides_and_the_description_is_only_a_fallback() {
+        for (name, description, expected) in [
+            // The description used to pull revenue into an earlier family.
+            (
+                "Продажа товара",
+                "Выручка с учётом скидки и доставки",
+                FinanceCategory::Sale,
+            ),
+            (
+                "Комиссия за продажу",
+                "Удерживается после доставки покупателю",
+                FinanceCategory::Commission,
+            ),
+            (
+                "Услуга",
+                "Хранение товара на складе",
+                FinanceCategory::Storage,
+            ),
+            // An explicit compensation outranks the service it concerns.
+            (
+                "Компенсация за повреждение при доставке",
+                "",
+                FinanceCategory::Compensation,
+            ),
+            ("Компенсация эквайринга", "", FinanceCategory::Compensation),
+            // An ambiguous reimbursement keeps its previous precedence.
+            (
+                "Возмещение стоимости доставки",
+                "",
+                FinanceCategory::Logistics,
+            ),
+            ("Возмещение", "", FinanceCategory::Compensation),
+        ] {
+            assert_eq!(
+                classify_type(name, description),
+                (expected, true),
+                "{name} / {description}"
+            );
+        }
+        assert_eq!(
+            classify_type("Прочее", "Без пояснения"),
             (FinanceCategory::Other, false)
         );
     }

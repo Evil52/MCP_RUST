@@ -51,8 +51,17 @@ is an existing direct MCP read, not a source used by the daily collector.
   `Платная реклама` was classified as acceptance before advertising was
   considered. Acceptance matching now uses acceptance terminology and
   supports both `приемка` and `приёмка` spellings.
-- Ozon dictionary/page checkpoint identities use a `v2` namespace so
-  in-progress jobs cannot replay facts classified by the old rules.
+- A type is classified by its name; the free-text description is only a
+  fallback when the name matches no family. Previously name and description
+  were matched as one string, so a description mentioning delivery or a
+  discount could move a sale or commission into logistics or discounts
+  while still counting it as known. An explicit `компенсация` now outranks
+  the service it concerns (`Компенсация за повреждение при доставке` is a
+  compensation, not logistics); the ambiguous `возмещение` keeps its
+  previous precedence.
+- Ozon dictionary/page checkpoint identities use a `v3` namespace (`v2`
+  before the name-first rule) so in-progress jobs cannot replay facts
+  classified by older rules.
 - Existing bounds remain: at most 100 pages/day, 10,000 rows/page, bounded
   cursors, repeated-cursor rejection, exact RUB minor-unit parsing,
   checked arithmetic, and refusal to publish partial results after an
@@ -68,8 +77,8 @@ advertising classification, signed amounts, overflow and parser bounds.
 Passed: `cargo test --locked --lib reporting::ozon_finance_source::tests -- --test-threads=1`
 (10 tests), file formatting and `git diff --check`. Full shared checks belong
 to the integrated change; no live marketplace validation was performed.
-The shared source-collection fixture must use the `ozon_finance_types_v2`
-and `ozon_finance_day_v2` checkpoint keys.
+The shared source-collection fixture must use the `ozon_finance_types_v3`
+and `ozon_finance_day_v3` checkpoint keys.
 
 ## Remaining work before full financial detail
 

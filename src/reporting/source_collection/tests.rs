@@ -279,8 +279,8 @@ fn empty_pages(claim: &SourceJobClaim) -> Vec<(Value, Value)> {
             json!([[], 0]),
         )],
         (Marketplace::Ozon, SnapshotSource::Finance) => vec![
-            (json!(["ozon_finance_types_v2"]), json!({})),
-            (json!(["ozon_finance_day_v2", date, ""]), json!([[], 0, ""])),
+            (json!(["ozon_finance_types_v3"]), json!({})),
+            (json!(["ozon_finance_day_v3", date, ""]), json!([[], 0, ""])),
         ],
         (Marketplace::Wildberries, SnapshotSource::Sales) => {
             vec![(json!(["wb_sales_v2", date, 250, 0]), json!([[], 0]))]
