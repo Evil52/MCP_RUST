@@ -47,9 +47,11 @@ bearer_http_status() {
 load_sonar_env
 
 SONAR_HOST_URL="${SONAR_HOST_URL:-http://127.0.0.1:9000}"
+local_stack=false
 
 if [[ "$SONAR_HOST_URL" == "http://127.0.0.1:9000" ]] \
   || [[ "$SONAR_HOST_URL" == "http://localhost:9000" ]]; then
+  local_stack=true
   "$project_root/scripts/sonar-up.sh"
   if [[ "$sonar_token_source" == ".sonar.env" || -z "${SONAR_TOKEN:-}" ]]; then
     load_sonar_env true
@@ -86,6 +88,14 @@ echo "Using SONAR_TOKEN from $sonar_token_source (value hidden)."
 
 scanner_host_url="${SONAR_HOST_URL/127.0.0.1/host.docker.internal}"
 scanner_host_url="${scanner_host_url/localhost/host.docker.internal}"
+scanner_network="bridge"
+if [[ "$local_stack" == "true" ]]; then
+  # host.docker.internal exists only under Docker Desktop, and the stack
+  # publishes 9000 on host loopback, which a Linux bridge container cannot
+  # reach. Joining the stack's own Compose network works on both.
+  scanner_network="mcp-ozon-sonar_default"
+  scanner_host_url="http://sonarqube:9000"
+fi
 
 token_status="$(bearer_http_status "$SONAR_TOKEN" "$SONAR_HOST_URL/api/v2/analysis/version")"
 if [[ "$token_status" != "200" ]]; then
@@ -106,6 +116,7 @@ trap cleanup EXIT
 docker create \
   --name "$scanner_container" \
   --platform linux/amd64 \
+  --network "$scanner_network" \
   --env SONAR_HOST_URL="$scanner_host_url" \
   --env SONAR_TOKEN \
   --env GIT_CONFIG_COUNT=1 \
@@ -133,9 +144,13 @@ echo "Copying tracked project files and Sonar reports..."
 # A throwaway one-commit repository for the text sensor. Blame stays disabled
 # (sonar.scm.disabled), so this history never affects the new-code period.
 # Hooks and signing from the operator's global git configuration are bypassed.
+# Automatic gc/maintenance is disabled: with this many loose objects the commit
+# would start a detached repack that rewrites .git while tar reads it, and GNU
+# tar fails on "file changed as we read it".
 git -C "$snapshot_dir" -c init.defaultBranch=snapshot init --quiet
 git -C "$snapshot_dir" add --all --force
 git -C "$snapshot_dir" -c core.hooksPath=/dev/null \
+  -c gc.auto=0 -c maintenance.auto=false \
   -c user.name=sonar-scan -c user.email=sonar-scan@localhost \
   commit --quiet --no-gpg-sign --no-verify --message "tracked tree snapshot"
 COPYFILE_DISABLE=1 tar --create --no-xattrs --no-acls --directory "$snapshot_dir" --file - . \
