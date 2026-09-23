@@ -1060,9 +1060,10 @@ const fn durable_action_kind(kind: &PendingActionKind) -> WbAutomationDurableAct
 mod tests {
     mod daily_cap_breach;
     mod postgres_clock;
+    mod traffic_frontier_v3;
 
     use super::feedback::{
-        campaign_drr_basis_points, traffic_feedback_delta, traffic_frontier_dynamic_cap,
+        campaign_drr_basis_points, traffic_frontier_dynamic_cap,
         traffic_frontier_v2_feedback_is_actionable,
     };
     use super::state::{ExecutionState, read_state_file, save_execution_state_bytes};
@@ -2141,102 +2142,6 @@ mod tests {
             WbAutomationAction::Hold {
                 reason: WbAutomationHoldReason::TrafficFeedbackPending,
             }
-        );
-    }
-
-    #[test]
-    fn traffic_frontier_v3_increases_only_after_efficient_incremental_orders() {
-        let (policy, snapshot) = traffic_frontier_v3_snapshot();
-        let baseline = traffic_frontier_v3_baseline(&snapshot);
-        let delta = traffic_feedback_delta(
-            &snapshot,
-            snapshot
-                .observation
-                .current_campaign_metrics
-                .as_ref()
-                .unwrap(),
-            Some(&baseline),
-        )
-        .unwrap();
-        assert_eq!(
-            delta,
-            WbAutomationCampaignMetrics {
-                impressions: 220,
-                clicks: 10,
-                spend_minor: 1_000,
-                attributed_orders: 1,
-                attributed_revenue_minor: 100_000,
-            }
-        );
-
-        assert!(matches!(
-            traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
-                .unwrap()
-                .expect("efficient marginal order permits one bounded increase")
-                .action,
-            WbAutomationAction::ChangeBids { ref changes }
-                if changes.len() == 1
-                    && changes[0].reason == WbAutomationBidReason::TrafficFrontierBootstrap
-        ));
-
-        let mut target_reached = snapshot;
-        target_reached.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
-            impressions: 320,
-            clicks: 12,
-            spend_minor: 3_000,
-            attributed_orders: 3,
-            attributed_revenue_minor: 300_000,
-        });
-        let mut target_baseline = baseline;
-        target_baseline.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
-            impressions: 100,
-            clicks: 2,
-            spend_minor: 2_000,
-            attributed_orders: 2,
-            attributed_revenue_minor: 200_000,
-        });
-        assert_eq!(
-            traffic_frontier_pacing_decision(&policy, &target_reached, Some(&target_baseline),)
-                .unwrap(),
-            None
-        );
-
-        assert_eq!(
-            traffic_feedback_delta(
-                &target_reached,
-                target_reached
-                    .observation
-                    .current_campaign_metrics
-                    .as_ref()
-                    .unwrap(),
-                None,
-            )
-            .unwrap(),
-            target_reached
-                .observation
-                .current_campaign_metrics
-                .clone()
-                .unwrap()
-        );
-
-        let mut previous_day = target_baseline;
-        previous_day.observation.observed_at -= ChronoDuration::days(1);
-        assert_eq!(
-            traffic_feedback_delta(
-                &target_reached,
-                target_reached
-                    .observation
-                    .current_campaign_metrics
-                    .as_ref()
-                    .unwrap(),
-                Some(&previous_day),
-            )
-            .unwrap(),
-            target_reached
-                .observation
-                .current_campaign_metrics
-                .clone()
-                .unwrap()
         );
     }
 
