@@ -295,6 +295,14 @@ pub fn parse_promotion_stats(
         .into_iter()
         .map(|((business_date, campaign_id, sku), value)| {
             if value.clicks > value.impressions {
+                tracing::warn!(
+                    %business_date,
+                    campaign_id,
+                    sku,
+                    impressions = value.impressions,
+                    clicks = value.clicks,
+                    "WB promotion counters are inconsistent"
+                );
                 return Err(WbReportParseError::InconsistentAdvertisingCounts);
             }
             Ok(CollectedAdvertisingFact {
