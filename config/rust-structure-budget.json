@@ -29,7 +29,7 @@
     "src/reporting/postgres_collector.rs": 1730,
     "src/reporting/postgres_outbox.rs": 1425,
     "src/reporting/xlsx.rs": 1045,
-    "src/server.rs": 1311,
+    "src/server.rs": 1293,
     "src/server/tests.rs": 11235,
     "src/wb.rs": 4759,
     "tests/http_router.rs": 1117,

@@ -15,7 +15,7 @@ use mcp_ozon::{
         HTTP_NATURAL_DRAIN_TIMEOUT, print_runtime_version_if_requested,
         run_http_until_bounded_shutdown, serve_hardened_http,
     },
-    server::OzonMcp,
+    server::{OzonMcp, ToolTextContent},
     tool_telemetry::ToolTelemetryService,
     wb::WbClient,
 };
@@ -60,6 +60,13 @@ async fn main() -> Result<()> {
     };
     let refresh_requests =
         RefreshRequestService::connect_optional(refresh_database_url.as_deref()).await?;
+    let tool_text_content: ToolTextContent = match std::env::var("MCP_TOOL_TEXT_CONTENT") {
+        Ok(value) => value.parse()?,
+        Err(std::env::VarError::NotPresent) => ToolTextContent::default(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("MCP_TOOL_TEXT_CONTENT содержит недопустимую кодировку")
+        }
+    };
     let tool_telemetry =
         ToolTelemetryService::connect_optional(refresh_database_url.as_deref()).await?;
     let client = OzonClient::new(
@@ -90,6 +97,7 @@ async fn main() -> Result<()> {
     .with_reporting_reader(reporting_reader)
     .with_refresh_requests(refresh_requests)
     .with_tool_telemetry(tool_telemetry)
+    .with_tool_text_content(tool_text_content)
     .with_preview_features(
         config.ozon_postings_vnext,
         config.ozon_finance_accruals_preview,

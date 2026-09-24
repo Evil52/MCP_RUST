@@ -77,6 +77,9 @@ use validation::{
     validate_wb_search_product_queries_input, validate_year_month, wb_missing_stock_ids,
     wb_product_cards_payload, weekly_ranking_period,
 };
+mod tool_output;
+pub use tool_output::ToolTextContent;
+use tool_output::classify_tool_call_result;
 mod tools;
 
 use std::{
@@ -135,8 +138,7 @@ use crate::{
         snapshot::{AccountScope, Marketplace as ReportingMarketplace},
     },
     tool_telemetry::{
-        MAX_TOOL_CALL_LOG_ROWS, ToolCallLogResult, ToolCallOutcome, ToolTelemetryError,
-        ToolTelemetryService,
+        MAX_TOOL_CALL_LOG_ROWS, ToolCallLogResult, ToolTelemetryError, ToolTelemetryService,
     },
     wb::WbClient,
 };
@@ -241,6 +243,7 @@ pub struct OzonMcp {
     tool_telemetry: ToolTelemetryService,
     tool_router: ToolRouter<Self>,
     tool_call_slots: Arc<Semaphore>,
+    tool_text_content: ToolTextContent,
 }
 
 impl OzonMcp {
@@ -259,6 +262,7 @@ impl OzonMcp {
             tool_telemetry: ToolTelemetryService::disabled(),
             tool_router: Self::default_tool_router(None),
             tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
+            tool_text_content: ToolTextContent::Json,
         }
     }
 
@@ -282,6 +286,7 @@ impl OzonMcp {
             tool_telemetry: ToolTelemetryService::disabled(),
             tool_router,
             tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
+            tool_text_content: ToolTextContent::Json,
         }
     }
 
@@ -1118,30 +1123,6 @@ fn tool_call_cancelled_response() -> CallToolResponse {
     )
 }
 
-fn classify_tool_call_result(
-    result: &Result<CallToolResponse, rmcp::ErrorData>,
-) -> (ToolCallOutcome, Option<&'static str>) {
-    let Ok(response) = result else {
-        return (ToolCallOutcome::Failed, Some("MCP_PROTOCOL_ERROR"));
-    };
-    let CallToolResponse::Complete(result) = response else {
-        return (ToolCallOutcome::Succeeded, None);
-    };
-    if !result.is_error.unwrap_or(false) {
-        return (ToolCallOutcome::Succeeded, None);
-    }
-    match result
-        .structured_content
-        .as_ref()
-        .and_then(|value| value.pointer("/kind"))
-        .and_then(Value::as_str)
-    {
-        Some("cancelled") => (ToolCallOutcome::Cancelled, Some("MCP_CANCELLED")),
-        Some("local_overloaded") => (ToolCallOutcome::Overloaded, Some("MCP_LOCAL_OVERLOADED")),
-        _ => (ToolCallOutcome::Failed, Some("MCP_TOOL_FAILURE")),
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PostingKind {
     Fbs,
@@ -1249,9 +1230,10 @@ impl ServerHandler for OzonMcp {
                 .call(ToolCallContext::new(self, request, context))
                 .await
         };
-        let (result, final_permit) = self
+        let (mut result, final_permit) = self
             .run_tool_call_with_admission_held(cancellation, Box::pin(dispatch))
             .await;
+        self.tool_text_content.apply(&mut result);
         let (outcome, error_code) = classify_tool_call_result(&result);
         if let Err(error) = self
             .tool_telemetry
