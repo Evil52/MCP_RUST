@@ -5,6 +5,16 @@ It does not extend the analytics server or its read-only allowlists. Without an
 explicit policy, JWT auth, restricted PostgreSQL session, fixed egress and
 dedicated marketplace credentials, it starts with all writes disabled.
 
+## Reusable WB campaign setup
+
+New WB CPC search campaigns can be prepared from one account profile, created
+through the existing isolated operator, and enrolled into this Control policy
+without campaign-specific Rust code. The shared fleet runner manages explicitly
+registered robot policies. See [WB campaign manager](wb-campaign-manager.md) for
+`campaign-prepare`, `campaign-launch`, `campaign-export`, `campaign-enroll` and
+`execute-fleet-pg`. Creation remains a local operator workflow; the twelve-tool
+Control MCP registry below is unchanged.
+
 ## Implemented scope
 
 The WB workflow changes product-card bids through `PATCH /api/advert/v1/bids`.

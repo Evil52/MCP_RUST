@@ -1,6 +1,8 @@
 //! Content reads use the existing validated reader, never the writer token.
 //! Missing category access/evidence is a blocker, not permission to guess.
-use super::{ACCOUNT, NMS, Operator};
+use super::Operator;
+#[cfg(test)]
+use super::{ACCOUNT, NMS};
 use crate::wb::WbClient;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -8,15 +10,25 @@ use std::collections::BTreeMap;
 
 impl Operator {
     pub(super) async fn verify_category(&self) -> Result<u64> {
-        verify_categories(&self.reader).await
+        verify_categories_for(
+            &self.reader,
+            &self.manifest.account_id,
+            &self.manifest.nm_ids(),
+        )
+        .await
     }
 }
 
+#[cfg(test)]
 async fn verify_categories(reader: &WbClient) -> Result<u64> {
+    verify_categories_for(reader, ACCOUNT, &NMS).await
+}
+
+async fn verify_categories_for(reader: &WbClient, account: &str, nm_ids: &[u64]) -> Result<u64> {
     let mut subjects = BTreeMap::new();
-    for nm in NMS {
+    for &nm in nm_ids {
         let response = reader.product_cards(
-                ACCOUNT,
+                account,
                 Some("ru".to_owned()),
                 json!({"settings": {
                     "cursor": {"limit": 100},
@@ -25,7 +37,7 @@ async fn verify_categories(reader: &WbClient) -> Result<u64> {
             ).await.context("category preflight requires current product cards through the existing reader; do not substitute the writer or widen credentials")?;
         subjects.insert(nm, subject_for_card(&response, nm)?);
     }
-    require_single_subject(&subjects)
+    require_subject_for(&subjects, nm_ids)
 }
 
 fn subject_for_card(response: &Value, nm: u64) -> Result<u64> {
@@ -52,10 +64,15 @@ fn subject_for_card(response: &Value, nm: u64) -> Result<u64> {
         .context("category preflight: invalid subjectID")
 }
 
+#[cfg(test)]
 fn require_single_subject(subjects: &BTreeMap<u64, u64>) -> Result<u64> {
+    require_subject_for(subjects, &NMS)
+}
+
+fn require_subject_for(subjects: &BTreeMap<u64, u64>, nm_ids: &[u64]) -> Result<u64> {
     ensure!(
-        subjects.keys().copied().eq(NMS),
-        "category evidence does not cover the exact five SKUs"
+        subjects.keys().copied().eq(nm_ids.iter().copied()),
+        "category evidence does not cover the exact selected SKUs"
     );
     let subject = subjects
         .values()

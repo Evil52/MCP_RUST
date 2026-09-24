@@ -3,7 +3,7 @@
   "legacy_file_lines": {
     "src/auth.rs": 1893,
     "src/bin/report-collector.rs": 1026,
-    "src/bin/wb-automation.rs": 1992,
+    "src/bin/wb-automation.rs": 1989,
     "src/config.rs": 3368,
     "src/control/automation_executor.rs": 4093,
     "src/control/automation_observer.rs": 1262,

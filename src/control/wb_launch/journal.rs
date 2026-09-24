@@ -70,6 +70,7 @@ fn read_json<T: DeserializeOwned>(path: &Path, forbidden_permissions: u32) -> Re
 pub(super) struct Journal {
     directory: PathBuf,
     lock: Option<File>,
+    _account_lock: Option<File>,
     recovery: bool,
     continuation: bool,
 }
@@ -110,9 +111,38 @@ impl Journal {
             metadata.is_dir() && metadata.permissions().mode().trailing_zeros() >= 6,
             "journal root must be an existing private non-symlink directory"
         );
+        // Serialize v2 creation/funding across one account, including different
+        // campaign names whose product selections could overlap.
+        let account_lock = if writable && manifest.get("version").and_then(Value::as_u64) == Some(2)
+        {
+            let account = manifest
+                .get("account_id")
+                .and_then(Value::as_str)
+                .context("missing launch account")?;
+            let path = root.join(format!("account-{}.lock", digest(account.as_bytes())));
+            if entry_exists(&path)? {
+                let metadata = fs::symlink_metadata(&path)?;
+                ensure!(
+                    metadata.is_file() && metadata.permissions().mode().trailing_zeros() >= 6,
+                    "unsafe account lock"
+                );
+            }
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)?;
+            lock.try_lock()
+                .context("another campaign operation owns this account journal")?;
+            Some(lock)
+        } else {
+            None
+        };
         // Stable across authorization references and changed bids: changing
         // the manifest cannot silently unlock a second Nexus budget transfer.
-        let directory = root.join("ofk_region_wb-Nexus");
+        let directory = root.join(directory_name(manifest)?);
         if writable && !directory.try_exists()? {
             use std::os::unix::fs::DirBuilderExt;
             fs::DirBuilder::new().mode(0o700).create(&directory)?;
@@ -151,6 +181,7 @@ impl Journal {
         let journal = Self {
             directory,
             lock,
+            _account_lock: account_lock,
             recovery,
             continuation,
         };
@@ -277,4 +308,29 @@ impl Journal {
             .filter(|id| *id > 0)
             .context("confirmed create response is missing")
     }
+}
+
+/// Stable account/name identity, independent of authorization, amount and SKU edits.
+/// The legacy Nexus directory is also used by v2 so changing schema cannot reset its history.
+pub(super) fn directory_name(manifest: &Value) -> Result<String> {
+    let version = manifest.get("version").and_then(Value::as_u64).unwrap_or(1);
+    if version == 1 {
+        return Ok("ofk_region_wb-Nexus".to_owned());
+    }
+    ensure!(version == 2, "unsupported launch journal version");
+    let account = manifest
+        .get("account_id")
+        .and_then(Value::as_str)
+        .context("missing journal account")?;
+    let name = manifest
+        .get("campaign_name")
+        .and_then(Value::as_str)
+        .context("missing journal campaign name")?;
+    if account == super::ACCOUNT && name == super::NAME {
+        return Ok("ofk_region_wb-Nexus".to_owned());
+    }
+    Ok(format!(
+        "campaign-{}",
+        digest(&serde_json::to_vec(&(account, name))?)
+    ))
 }

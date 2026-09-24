@@ -11,7 +11,9 @@ mod server;
 mod wb;
 mod wb_launch;
 
-pub use wb_launch::run_wb_campaign_launch;
+pub use wb_launch::{
+    enroll_wb_campaign, export_wb_campaign, prepare_wb_campaign, run_wb_campaign_launch,
+};
 
 pub use automation::{
     WbAutomationAction, WbAutomationBidChange, WbAutomationBidReason, WbAutomationCampaignMetrics,

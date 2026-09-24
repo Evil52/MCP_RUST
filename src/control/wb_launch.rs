@@ -1,7 +1,7 @@
 //! Explicit local operator workflow. Not exposed through analytics MCP.
 //! Each stage has an immutable, fsynced attempt record before HTTP. An
 //! uncertain write permanently fences that stage; reconcile never writes WB.
-//! This first rollout provisions a paused campaign. Start is deliberately
+//! The operator provisions an inactive campaign. Start is deliberately
 //! separate from funding and must use the installed protective robot.
 
 use super::{
@@ -26,6 +26,10 @@ use std::{
 };
 
 mod categories;
+mod manifest;
+mod setup;
+
+pub use setup::{enroll_wb_campaign, export_wb_campaign, prepare_wb_campaign};
 mod continuation;
 mod journal;
 mod start;
@@ -46,11 +50,19 @@ const NMS: [u64; 5] = [
     529_996_417,
 ];
 
-/// Reviewed one-time authorization, not a generic payment service. Fixed
-/// account/name/products/amount/source keep this rollout within Nexus scope.
+/// Versioned, reviewed one-time launch authorization. Legacy documents keep
+/// their exact Nexus scope; reusable documents bind an explicit cabinet and products.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
+    /// Version 1 preserves the original Nexus authorization and journal bytes.
+    #[serde(
+        default = "manifest::legacy_version",
+        skip_serializing_if = "manifest::is_legacy"
+    )]
+    version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual_control: Option<setup::ManualControl>,
     scope: LaunchScope,
     account_id: String,
     campaign_name: String,
@@ -94,122 +106,6 @@ enum LaunchScope {
     FundAndStart,
 }
 
-impl Manifest {
-    const fn financial_scope_matches(&self) -> bool {
-        self.funding_type == 1
-            && (self.recreate.is_none() || matches!(self.scope, LaunchScope::CreateOnly))
-            && (self.continue_created.is_none()
-                || (self.recreate.is_none() && matches!(self.scope, LaunchScope::FundAndStart)))
-            && match self.scope {
-                LaunchScope::CreateOnly => self.budget_rubles == 0,
-                LaunchScope::FundAndStart => self.budget_rubles == 1000,
-            }
-    }
-
-    fn authorize_stage(&self, mode: &str) -> Result<()> {
-        if self.continue_created.is_some() {
-            ensure!(
-                self.financial_scope_matches()
-                    && matches!(
-                        mode,
-                        "preflight" | "prepare" | "bids" | "fund" | "start" | "reconcile"
-                    ),
-                "confirmed Nexus continuation cannot create another campaign"
-            );
-            return Ok(());
-        }
-        ensure!(
-            matches!(mode, "preflight" | "create" | "bids" | "reconcile")
-                || (self.scope == LaunchScope::FundAndStart && matches!(mode, "fund" | "start")),
-            "create-only authorization forbids funding and campaign start"
-        );
-        Ok(())
-    }
-
-    fn target_policy(&self, source: &WbAutomationPolicy, id: u64) -> WbAutomationPolicy {
-        let mut policy = source.clone();
-        policy.campaign_id = id;
-        NAME.clone_into(&mut policy.campaign_name);
-        policy.nm_ids = NMS.to_vec();
-        policy.authorized_by_actor_id.clone_from(&self.actor_id);
-        policy
-            .authorization_reference
-            .clone_from(&self.authorization_reference);
-        policy
-    }
-
-    fn validate(
-        &self,
-        policy: &WbAutomationPolicy,
-        now: DateTime<Utc>,
-        allow_expired: bool,
-    ) -> Result<()> {
-        ensure!(
-            self.account_id == ACCOUNT
-                && self.campaign_name == NAME
-                && self.bids_kopecks.keys().copied().eq(NMS),
-            "Nexus account/name/SKU scope mismatch"
-        );
-        ensure!(
-            self.financial_scope_matches(),
-            "create-only requires zero funding; fund-and-start permits exactly 1000 RUB type=1"
-        );
-        if let Some(approval) = &self.continue_created {
-            approval.validate_scope(self)?;
-            ensure!(
-                policy.hard_drr_basis_points == 1500
-                    && policy.min_bid_kopecks == 500
-                    && policy.max_bid_kopecks == 1050
-                    && policy.cooldown_seconds == 1800,
-                "continuation must preserve reviewed hard DRR, corridor and cooldown"
-            );
-        }
-        ensure!(
-            !self.authorization_reference.trim().is_empty()
-                && (allow_expired || (self.authorized_at <= now && now < self.expires_at))
-                && (chrono::Duration::seconds(1)..=chrono::Duration::hours(24))
-                    .contains(&(self.expires_at - self.authorized_at)),
-            "launch authorization is absent or expired (maximum 24 hours)"
-        );
-        super::validate_wb_automation_policy(policy)?;
-        ensure!(
-            policy.account_id == ACCOUNT
-                && policy.campaign_id == SOURCE
-                && policy.campaign_name == "Одуванчик"
-                && policy.payment_type == "cpc"
-                && policy.placement == "search"
-                && !policy.allow_budget_top_up
-                && policy.daily_spend_cap_minor == 50_000
-                && policy.daily_pause_threshold_minor == 45_000
-                && policy.target_drr_basis_points == 1500
-                && policy.write_enabled
-                && policy.bid_writes_enabled
-                && (allow_expired
-                    || (policy.authorized_at <= now && now < policy.authorization_expires_at)),
-            "source robot protection policy is incompatible or inactive"
-        );
-        ensure!(
-            self.bids_kopecks
-                .values()
-                .all(|bid| (policy.min_bid_kopecks..=policy.max_bid_kopecks).contains(bid)),
-            "initial bids exceed the source policy corridor"
-        );
-        ensure!(
-            journal::digest(&serde_json::to_vec(policy)?) == self.source_policy_sha256,
-            "source policy changed since review"
-        );
-        // The campaign ID is not known before create. Validate every derived
-        // field with an already valid ID before allowing the first WB write.
-        super::validate_wb_automation_policy(&self.target_policy(policy, SOURCE))
-            .context("derived target robot policy is invalid")?;
-        ensure!(
-            !self.reader_proxy.is_empty() && !self.writer_proxy.is_empty(),
-            "dedicated egress proxies are mandatory"
-        );
-        Ok(())
-    }
-}
-
 struct Operator {
     manifest_path: PathBuf,
     manifest: Manifest,
@@ -232,7 +128,7 @@ impl Operator {
         let reader = WbClient::new_with_https_proxy(
             Duration::from_secs(30),
             BTreeMap::from([(
-                ACCOUNT.to_owned(),
+                manifest.account_id.clone(),
                 WbCredentials {
                     token: reader_token,
                 },
@@ -275,13 +171,16 @@ impl Operator {
     async fn details(&self, id: u64) -> Result<CampaignObservation> {
         let details = self
             .reader
-            .promotion_campaign_details(ACCOUNT, vec![id], vec![], None)
+            .promotion_campaign_details(&self.manifest.account_id, vec![id], vec![], None)
             .await?;
         parse_campaign(&details, &self.target_policy(id))
     }
 
     async fn budget(&self, id: u64) -> Result<u64> {
-        let value = self.reader.promotion_campaign_budget(ACCOUNT, id).await?;
+        let value = self
+            .reader
+            .promotion_campaign_budget(&self.manifest.account_id, id)
+            .await?;
         value
             .get("total")
             .and_then(Value::as_u64)
@@ -289,7 +188,10 @@ impl Operator {
     }
 
     async fn balance(&self) -> Result<u64> {
-        let value = self.reader.promotion_balance(ACCOUNT).await?;
+        let value = self
+            .reader
+            .promotion_balance(&self.manifest.account_id)
+            .await?;
         value
             .get("net")
             .and_then(Value::as_u64)
@@ -306,13 +208,18 @@ impl Operator {
             )?;
         }
         let subject_id = self.verify_category().await?;
-        let source = self
+        if self.manifest.version == 1 {
+            let source = self
+                .reader
+                .promotion_campaign_details(&self.manifest.account_id, vec![SOURCE], vec![], None)
+                .await?;
+            parse_campaign(&source, &self.policy)?;
+        }
+        let groups = self
             .reader
-            .promotion_campaign_details(ACCOUNT, vec![SOURCE], vec![], None)
+            .promotion_campaigns(&self.manifest.account_id)
             .await?;
-        parse_campaign(&source, &self.policy)?;
-        let groups = self.reader.promotion_campaigns(ACCOUNT).await?;
-        let ids = if self.manifest.recreate.is_some() {
+        let ids = if self.manifest.version == 2 || self.manifest.recreate.is_some() {
             recovery_campaign_ids(&groups, own_id)?
         } else {
             nonfinished_campaign_ids(&groups, own_id)?
@@ -323,8 +230,9 @@ impl Operator {
         let balance = if self.manifest.scope == LaunchScope::FundAndStart {
             let balance = self.balance().await?;
             ensure!(
-                balance >= 1000,
-                "WB type=1 balance is {balance} RUB; 1000 RUB required"
+                balance >= self.manifest.budget_rubles,
+                "WB type=1 balance is {balance} RUB; {} RUB required",
+                self.manifest.budget_rubles
             );
             Some(balance)
         } else {
@@ -334,27 +242,27 @@ impl Operator {
         };
         self.fresh_authorization()?;
         Ok(
-            json!({"checked_at":Utc::now(),"account_id":ACCOUNT,"campaign_name":NAME,
+            json!({"checked_at":Utc::now(),"account_id":self.manifest.account_id,"campaign_name":self.manifest.campaign_name,
             "netting_balance_rubles":balance,"scope":self.manifest.scope,
             "authorized_funding_rubles":self.manifest.budget_rubles,
             "subject_id":subject_id,
             "campaign_scan":{"listed_total":groups.get("all"),"checked_details":checked_campaign_count,
-                "scope":if self.manifest.recreate.is_some(){"all_modern_including_terminal; obsolete_terminal_types_excluded"}else{"nonfinished"}},
+                "scope":if self.manifest.version == 2 || self.manifest.recreate.is_some(){"all_modern_including_terminal; obsolete_terminal_types_excluded"}else{"nonfinished"}},
             "bids_kopecks":self.manifest.bids_kopecks,"wb_stock":totals,
             "source_policy_sha256":self.manifest.source_policy_sha256,
-            "daily_cap_rubles":500,"pause_threshold_rubles":450,"target_drr_percent":15,
+            "daily_cap_kopecks":self.policy.daily_spend_cap_minor,"pause_threshold_kopecks":self.policy.daily_pause_threshold_minor,"target_drr_basis_points":self.policy.target_drr_basis_points,
             "auto_top_up":false,"credential_role":"seller-bound promotion-only dedicated writer"}),
         )
     }
 
-    /// Rejects a launch while another Nexus campaign exists or a launch SKU
+    /// Rejects a launch while another campaign with this name exists or a launch SKU
     /// already belongs to a non-finished campaign. Every selected campaign
     /// must come back from the details endpoint.
     async fn verify_no_campaign_overlap(&self, ids: BTreeSet<u64>) -> Result<()> {
         for chunk in ids.into_iter().collect::<Vec<_>>().chunks(50) {
             let response = self
                 .reader
-                .promotion_campaign_details(ACCOUNT, chunk.to_vec(), vec![], None)
+                .promotion_campaign_details(&self.manifest.account_id, chunk.to_vec(), vec![], None)
                 .await?;
             let adverts = response
                 .get("adverts")
@@ -380,10 +288,10 @@ impl Operator {
             ad.pointer("/settings/name")
                 .and_then(Value::as_str)
                 .context("campaign name absent")?
-                != NAME,
-            "another Nexus campaign exists; reconcile instead of creating a duplicate"
+                != self.manifest.campaign_name,
+            "another campaign with this name exists; reconcile instead of creating a duplicate"
         );
-        if self.manifest.recreate.is_some()
+        if (self.manifest.version == 2 || self.manifest.recreate.is_some())
             && matches!(ad.get("status").and_then(Value::as_i64), Some(-1 | 7 | 8))
         {
             return Ok(());
@@ -398,21 +306,21 @@ impl Operator {
                 .and_then(Value::as_u64)
                 .context("campaign SKU invalid")?;
             ensure!(
-                !NMS.contains(&id),
+                !self.manifest.bids_kopecks.contains_key(&id),
                 "SKU {id} already belongs to another non-finished campaign"
             );
         }
         Ok(())
     }
 
-    /// Reads one complete stock page and requires at least 20 sellable units
-    /// for every launch SKU.
+    /// Reads one complete stock page and requires the configured sellable stock
+    /// for every launch SKU (the legacy Nexus floor remains 20).
     async fn verified_stock_totals(&self) -> Result<BTreeMap<u64, u64>> {
         let stocks = self
             .reader
             .warehouse_stocks(
-                ACCOUNT,
-                json!({"nmIds":NMS,"chrtIds":[],"limit":100,"offset":0}),
+                &self.manifest.account_id,
+                json!({"nmIds":self.manifest.nm_ids(),"chrtIds":[],"limit":100,"offset":0}),
             )
             .await?;
         let (stocks, count) = crate::reporting::wb_adapter::parse_stock_page(&stocks)?;
@@ -424,10 +332,11 @@ impl Operator {
                 .checked_add(row.sellable_units)
                 .context("stock overflow")?;
         }
-        for nm in NMS {
+        for nm in self.manifest.nm_ids() {
             ensure!(
-                totals.get(&nm).copied().unwrap_or(0) >= 20,
-                "SKU {nm} has insufficient verified WB stock (minimum 20)"
+                totals.get(&nm).copied().unwrap_or(0)
+                    >= self.manifest.minimum_launch_stock(&self.policy),
+                "SKU {nm} has insufficient verified WB stock"
             );
         }
         Ok(totals)
@@ -437,9 +346,9 @@ impl Operator {
         let response = self
             .reader
             .promotion_minimum_bids(
-                ACCOUNT,
+                &self.manifest.account_id,
                 id,
-                NMS.to_vec(),
+                self.manifest.nm_ids(),
                 "cpc".to_owned(),
                 vec!["search".to_owned()],
             )
@@ -478,7 +387,10 @@ impl Operator {
                 "SKU {nm}: approved bid below WB minimum {floor} kopecks"
             );
         }
-        ensure!(seen == NMS.into_iter().collect(), "minimum bids incomplete");
+        ensure!(
+            seen == self.manifest.nm_ids().into_iter().collect(),
+            "minimum bids incomplete"
+        );
         Ok(())
     }
 
@@ -502,8 +414,8 @@ impl Operator {
         journal.assert_not_attempted("create")?;
         let preflight = self.preflight(None).await?;
         let request = WbCreateCampaignRequest {
-            name: NAME.to_owned(),
-            nm_ids: NMS.to_vec(),
+            name: self.manifest.campaign_name.clone(),
+            nm_ids: self.manifest.nm_ids(),
             bid_type: WbCampaignBidType::Manual,
             payment_type: WbCampaignPaymentType::Cpc,
             placement_types: vec![WbBidPlacement::Search],
@@ -511,8 +423,13 @@ impl Operator {
         let id = self
             .writer
             .create_campaign_with_permit(&request, || async {
+                let evidence = if self.manifest.version == 2 {
+                    self.preflight(None).await?
+                } else {
+                    preflight
+                };
                 self.fresh_authorization()?;
-                journal.attempt("create", &preflight)
+                journal.attempt("create", &evidence)
             })
             .await
             .map_err(write_error)?;
@@ -585,7 +502,7 @@ impl Operator {
         self.installed_protection(id)?;
         let preflight = self.preflight(Some(id)).await?;
         self.writer
-            .deposit_once_with_permit(id, || async {
+            .deposit_budget_with_permit(id, self.manifest.budget_rubles, || async {
                 self.fresh_authorization()?;
                 self.minimums(id).await?;
                 ensure!(
@@ -598,14 +515,14 @@ impl Operator {
                 );
                 let balance = self.balance().await?;
                 ensure!(
-                    balance >= 1000,
+                    balance >= self.manifest.budget_rubles,
                     "WB type=1 balance {balance} RUB is insufficient"
                 );
                 self.fresh_authorization()?;
                 self.installed_protection(id)?;
                 journal.attempt(
                     "fund",
-                    &json!({"campaign_id":id,"sum":1000,"type":1,
+                    &json!({"campaign_id":id,"sum":self.manifest.budget_rubles,"type":1,
                 "budget_before":0,"balance_before":balance,"preflight":preflight}),
                 )
             })
@@ -614,20 +531,20 @@ impl Operator {
             .and_then(|total| {
                 journal.receipt("fund-response", &json!({"wb_http":200,"total":total}))?;
                 ensure!(
-                    total == 1000,
+                    total == self.manifest.budget_rubles,
                     "WB deposit response total differs; reconcile, never repeat POST"
                 );
                 Ok(())
             })?;
         ensure!(
-            self.budget(id).await? == 1000,
+            self.budget(id).await? == self.manifest.budget_rubles,
             "budget readback differs; do not start or repeat deposit"
         );
         self.inactive(id, true).await?;
         journal.receipt(
             "fund",
-            &json!({"campaign_id":id,"transferred_rubles":1000,
-            "type":1,"budget_after":1000,"checked_at":Utc::now()}),
+            &json!({"campaign_id":id,"transferred_rubles":self.manifest.budget_rubles,
+            "type":1,"budget_after":self.manifest.budget_rubles,"checked_at":Utc::now()}),
         )?;
         self.reconcile(journal).await
     }
@@ -640,11 +557,11 @@ impl Operator {
         };
         let state = self.details(id).await?;
         Ok(
-            json!({"checked_at":Utc::now(),"campaign_id":id,"account_id":ACCOUNT,
-            "campaign_name":NAME,"status":state.status,"bids_kopecks":state.bids,
+            json!({"checked_at":Utc::now(),"campaign_id":id,"account_id":self.manifest.account_id,
+            "campaign_name":self.manifest.campaign_name,"status":state.status,"bids_kopecks":state.bids,
             "budget_rubles":self.budget(id).await?,"fund_attempted":journal.attempted("fund"),
             "fund_confirmed":journal.has_receipt("fund"),
-            "instruction":"Funding does not start ads. Install and verify Nexus protective robot before guarded start."}),
+            "instruction":"Funding does not start ads. Install and verify the campaign protective robot before guarded start."}),
         )
     }
 }
@@ -748,7 +665,9 @@ fn validate_registry(manifest: &Manifest) -> Result<String> {
     let account = registry
         .accounts
         .iter()
-        .find(|account| account.id == ACCOUNT && account.marketplace == Marketplace::Wildberries)
+        .find(|account| {
+            account.id == manifest.account_id && account.marketplace == Marketplace::Wildberries
+        })
         .context("WB account not bound")?;
     ensure!(
         registry
@@ -783,7 +702,7 @@ enum WriteStage {
     Start,
 }
 
-/// Explicit local CLI entry point; no generic HTTP paths or payment amounts.
+/// Explicit local CLI entry point with fixed WB routes and journaled stages.
 pub async fn run_wb_campaign_launch(mode: &str, manifest_path: &Path) -> Result<Value> {
     // A revoked/expired writer or changed source robot must never prevent
     // reading the outcome of an already attempted money operation.
@@ -815,13 +734,7 @@ pub async fn run_wb_campaign_launch(mode: &str, manifest_path: &Path) -> Result<
 
 async fn reconcile_read_only(manifest_path: &Path) -> Result<Value> {
     let manifest: Manifest = read_private_json(manifest_path)?;
-    ensure!(
-        manifest.account_id == ACCOUNT
-            && manifest.campaign_name == NAME
-            && manifest.bids_kopecks.keys().copied().eq(NMS)
-            && manifest.financial_scope_matches(),
-        "reconcile manifest is outside Nexus scope"
-    );
+    manifest.validate_identity()?;
     let sid = validate_registry(&manifest)?;
     let token = read_control_token(&manifest.reader_token, "WB_LAUNCH_READER")?;
     validate_wb_reader_token(&token, &sid, manifest.allow_broad_reader)?;
@@ -836,7 +749,7 @@ async fn reconcile_read_only(manifest_path: &Path) -> Result<Value> {
     };
     let reader = WbClient::new_with_https_proxy(
         Duration::from_secs(30),
-        BTreeMap::from([(ACCOUNT.to_owned(), WbCredentials { token })]),
+        BTreeMap::from([(manifest.account_id.clone(), WbCredentials { token })]),
         &manifest.reader_proxy,
     )?;
     reconcile_campaign(&manifest, &reader, &journal, id).await
@@ -848,12 +761,9 @@ async fn reconcile_campaign(
     journal: &Journal,
     id: u64,
 ) -> Result<Value> {
-    ensure!(
-        manifest.account_id == ACCOUNT && manifest.campaign_name == NAME,
-        "readback scope mismatch"
-    );
+    manifest.validate_identity()?;
     let response = reader
-        .promotion_campaign_details(ACCOUNT, vec![id], vec![], None)
+        .promotion_campaign_details(&manifest.account_id, vec![id], vec![], None)
         .await?;
     let adverts = response
         .get("adverts")
@@ -864,9 +774,11 @@ async fn reconcile_campaign(
         "campaign readback identity mismatch"
     );
     let ad = &adverts[0];
-    let budget = reader.promotion_campaign_budget(ACCOUNT, id).await?;
+    let budget = reader
+        .promotion_campaign_budget(&manifest.account_id, id)
+        .await?;
     Ok(
-        json!({"checked_at":Utc::now(),"account_id":ACCOUNT,"campaign_id":id,
+        json!({"checked_at":Utc::now(),"account_id":manifest.account_id,"campaign_id":id,
         "campaign_name":ad.pointer("/settings/name"),"status":ad.get("status"),
         "payment_type":ad.pointer("/settings/payment_type"),"bid_type":ad.get("bid_type"),
         "placements":ad.pointer("/settings/placements"),"nm_settings":ad.get("nm_settings"),

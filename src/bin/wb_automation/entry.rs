@@ -16,9 +16,62 @@ pub async fn run() -> Result<()> {
     if print_runtime_version_if_requested("wb-automation", &arguments)? {
         return Ok(());
     }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "campaign-prepare")
+    {
+        ensure!(
+            arguments.len() == 3,
+            "usage: wb-automation campaign-prepare PROFILE.json REQUEST.json"
+        );
+        let result = mcp_ozon::control::prepare_wb_campaign(
+            Path::new(&arguments[1]),
+            Path::new(&arguments[2]),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "campaign-export")
+    {
+        ensure!(
+            arguments.len() == 2,
+            "usage: wb-automation campaign-export MANIFEST.json"
+        );
+        let result = mcp_ozon::control::export_wb_campaign(Path::new(&arguments[1]))?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "campaign-enroll")
+    {
+        ensure!(
+            arguments.len() == 4,
+            "usage: wb-automation campaign-enroll MANIFEST.json CURRENT-CONTROL.json NEW-CONTROL.json"
+        );
+        let result = mcp_ozon::control::enroll_wb_campaign(
+            Path::new(&arguments[1]),
+            Path::new(&arguments[2]),
+            Path::new(&arguments[3]),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
     mcp_ozon::marketplace_quota::SharedQuota::from_env()
         .preflight()
         .await?;
+    if arguments
+        .first()
+        .is_some_and(|arg| arg == "execute-fleet-pg")
+    {
+        ensure!(
+            arguments.len() == 2,
+            "usage: wb-automation execute-fleet-pg FLEET.json"
+        );
+        return super::wb_automation::fleet::run(Path::new(&arguments[1])).await;
+    }
     if arguments
         .first()
         .is_some_and(|arg| arg == "campaign-launch")

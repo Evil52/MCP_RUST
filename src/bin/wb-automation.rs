@@ -24,10 +24,7 @@ const DATABASE_URL_ENV: &str = "WB_AUTOMATION_DATABASE_URL";
 
 #[path = "wb_automation/entry.rs"]
 mod entry;
-mod wb_automation {
-    pub mod digest;
-    pub mod v4_corridor;
-}
+mod wb_automation;
 use wb_automation::digest::{is_lower_sha256, sha256_domain};
 #[cfg(test)]
 #[path = "wb_automation/v4_corridor_tests.rs"]
