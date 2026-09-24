@@ -268,7 +268,10 @@ fn retry_current_advertising_counts(
     code == "promotion_counts_inconsistent"
         && claim.marketplace() == Marketplace::Wildberries
         && claim.source == SnapshotSource::Advertising
-        && business_date(claim.period_start) == business_date(now)
+        // Morning collection covers yesterday's completed business day. The
+        // cutoff, rather than the first data day, identifies current work.
+        && business_date(claim.cutoff_at()) == business_date(now)
+        && now < claim.cutoff_at() + Duration::days(1)
 }
 
 fn seller_source(
