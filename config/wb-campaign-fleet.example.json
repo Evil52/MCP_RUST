@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "account_id": "ofk_region_wb",
+  "registry": "/etc/mcp-ozon/access.json",
+  "reader_token": "/run/secrets/wb-promotion-read.token",
+  "writer_token": "/run/secrets/wb-promotion-write.token",
+  "reader_proxy": "http://ozon-egress:3128",
+  "writer_proxy": "http://write-egress:3130",
+  "allow_broad_reader": true,
+  "campaigns": [
+    {
+      "policy": "/var/lib/wb-campaigns/campaigns/REPLACE_WITH_EXPORTED_DIRECTORY/robot-policy.json",
+      "initial_state": "/var/lib/wb-campaigns/campaigns/REPLACE_WITH_EXPORTED_DIRECTORY/initial-state.json"
+    }
+  ]
+}

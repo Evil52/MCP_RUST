@@ -7,6 +7,7 @@ pub(super) fn validate_receipts(
     journal: &Journal,
     id: u64,
     expected_bids: &std::collections::BTreeMap<u64, u64>,
+    budget_rubles: u64,
 ) -> Result<()> {
     let created = journal.require_receipt("create")?;
     let funded = journal.require_receipt("fund")?;
@@ -17,10 +18,10 @@ pub(super) fn validate_receipts(
             && created["wb_http"] == 200
             && funded["campaign_id"] == id
             && funded["type"] == 1
-            && funded["transferred_rubles"] == 1000
-            && funded["budget_after"] == 1000
+            && funded["transferred_rubles"] == budget_rubles
+            && funded["budget_after"] == budget_rubles
             && response["wb_http"] == 200
-            && response["total"] == 1000
+            && response["total"] == budget_rubles
             && bids["campaign_id"] == id
             && bids["bids_kopecks"] == serde_json::to_value(expected_bids)?,
         "first launch requires confirmed create, exact bids and one-time funding receipts"

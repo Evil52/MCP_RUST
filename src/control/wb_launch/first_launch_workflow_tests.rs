@@ -10,11 +10,12 @@ async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_writ
         return;
     };
     let config: tokio_postgres::Config = url.parse().unwrap();
-    for (offset, http, readback_status, continuation) in [
-        (2, 200, 9, false),
-        (3, 500, 9, false),
-        (4, 200, 11, false),
-        (0, 200, 9, true),
+    for (offset, http, readback_status, continuation, budget_rubles) in [
+        (2, 200, 9, false, 1000),
+        (3, 500, 9, false, 1000),
+        (4, 200, 11, false, 1000),
+        (0, 200, 9, true, 1000),
+        (5, 200, 9, false, 1500),
     ] {
         // Independent operator invocations: an ambiguous start deliberately
         // discards its SQL session and fences reuse of that store instance.
@@ -26,12 +27,20 @@ async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_writ
         } else {
             ID + offset
         };
-        let fixture = if continuation {
+        let mut fixture = if continuation {
             continued_workflow::fixture()
         } else {
             Fixture::new(LaunchScope::FundAndStart)
         };
-        let responses = start_responses(id, http, readback_status, success);
+        if budget_rubles != 1000 {
+            fixture.manifest.version = 2;
+            fixture.manifest.budget_rubles = budget_rubles;
+            private_json(
+                &fixture.path,
+                &serde_json::to_value(&fixture.manifest).unwrap(),
+            );
+        }
+        let responses = start_responses(id, http, readback_status, success, budget_rubles);
         let count = responses.len();
         let (operator, receiver) = fixture.operator(responses);
         let policy = operator.target_policy(id);
@@ -84,7 +93,13 @@ async fn first_start_uses_real_readiness_cycles_and_never_retries_uncertain_writ
 
 /// Mock WB responses for three readiness rounds, the start call and, when the
 /// start is accepted, its read-back and post-start checks.
-fn start_responses(id: u64, http: u16, readback_status: i32, success: bool) -> Vec<(u16, Value)> {
+fn start_responses(
+    id: u64,
+    http: u16,
+    readback_status: i32,
+    success: bool,
+    budget_rubles: u64,
+) -> Vec<(u16, Value)> {
     let target = |status| details(id, NAME, &NMS, status, 922);
     let stock = json!({"data":{"items":NMS.iter().map(|nm|
         json!({"nmId":nm,"warehouseId":1,"quantity":25})).collect::<Vec<_>>()}});
@@ -93,7 +108,7 @@ fn start_responses(id: u64, http: u16, readback_status: i32, success: bool) -> V
         responses.extend([
             (200, target(4)),
             (200, minimums()),
-            (200, json!({"total":1000})),
+            (200, json!({"total":budget_rubles})),
             (200, stock.clone()),
         ]);
     }
@@ -103,9 +118,9 @@ fn start_responses(id: u64, http: u16, readback_status: i32, success: bool) -> V
     }
     if success {
         responses.extend([
-            (200, json!({"total":1000})),
+            (200, json!({"total":budget_rubles})),
             (200, target(9)),
-            (200, json!({"total":1000})),
+            (200, json!({"total":budget_rubles})),
         ]);
     }
     responses
@@ -143,7 +158,10 @@ async fn record_readiness_cycles(
         .unwrap();
     assert!(
         !lease
-            .verify_first_launch_cycles(observer.policy_sha256())
+            .verify_first_launch_cycles(
+                observer.policy_sha256(),
+                fixture.manifest.budget_rubles * 100
+            )
             .await
             .unwrap()
     );
@@ -174,7 +192,19 @@ async fn record_readiness_cycles(
     }
     assert!(
         lease
-            .verify_first_launch_cycles(observer.policy_sha256())
+            .verify_first_launch_cycles(
+                observer.policy_sha256(),
+                fixture.manifest.budget_rubles * 100
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !lease
+            .verify_first_launch_cycles(
+                observer.policy_sha256(),
+                fixture.manifest.budget_rubles * 100 + 1
+            )
             .await
             .unwrap()
     );
@@ -201,12 +231,15 @@ fn record_prestart_receipts(journal: &Journal, id: u64, fixture: &Fixture, conti
         )
         .unwrap();
     journal
-        .receipt("fund-response", &json!({"wb_http":200,"total":1000}))
+        .receipt(
+            "fund-response",
+            &json!({"wb_http":200,"total":fixture.manifest.budget_rubles}),
+        )
         .unwrap();
     journal
         .receipt(
             "fund",
-            &json!({"campaign_id":id,"transferred_rubles":1000,"type":1,"budget_after":1000}),
+            &json!({"campaign_id":id,"transferred_rubles":fixture.manifest.budget_rubles,"type":1,"budget_after":fixture.manifest.budget_rubles}),
         )
         .unwrap();
 }

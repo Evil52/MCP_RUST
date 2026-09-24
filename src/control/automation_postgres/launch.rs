@@ -7,6 +7,7 @@ impl WbAutomationCampaignLease<'_> {
     pub(in crate::control) async fn verify_first_launch_cycles(
         &self,
         digest: &str,
+        budget_minor: u64,
     ) -> Result<bool, WbAutomationPostgresError> {
         if !self.verify_launch_cycles(digest).await? {
             return Ok(false);
@@ -21,13 +22,13 @@ impl WbAutomationCampaignLease<'_> {
                AND (snapshot_json::jsonb #>> '{observation,campaign_status}') IS DISTINCT FROM '4') \
              AND NOT EXISTS (SELECT 1 FROM (SELECT snapshot_json::jsonb AS snapshot_json FROM wb_automation.cycles \
                WHERE account_id=$1 AND advert_id=$2 ORDER BY observed_at DESC LIMIT 2) recent \
-               WHERE (snapshot_json #>> '{observation,budget_remaining_minor}') IS DISTINCT FROM '100000' \
+               WHERE (snapshot_json #>> '{observation,budget_remaining_minor}') IS DISTINCT FROM $3::text \
                  OR (snapshot_json #>> '{observation,daily_spend_complete}') IS DISTINCT FROM 'false' \
                  OR (snapshot_json #>> '{observation,attribution_complete}') IS DISTINCT FROM 'false' \
                  OR (snapshot_json #>> '{observation,actions_today}') IS DISTINCT FROM '0' \
                  OR (snapshot_json #>> '{observation,paused_by_automation}') IS DISTINCT FROM 'false' \
                  OR (snapshot_json #> '{observation,last_action_at}') IS DISTINCT FROM 'null'::jsonb)",
-            &[&self.account_id, &self.campaign_id],
+            &[&self.account_id, &self.campaign_id, &budget_minor.to_string()],
         ).await.map_err(|_| WbAutomationPostgresError::Unavailable)?;
         Ok(row.get(0))
     }

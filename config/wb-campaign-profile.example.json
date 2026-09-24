@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "account_id": "ofk_region_wb",
+  "actor_id": "rustam_magasumov",
+  "registry": "/etc/mcp-ozon/access.json",
+  "reader_token": "/run/secrets/wb-promotion-read.token",
+  "writer_token": "/run/secrets/wb-promotion-write.token",
+  "reader_proxy": "http://ozon-egress:3128",
+  "writer_proxy": "http://write-egress:3130",
+  "allow_broad_reader": true,
+  "robot_template": "/var/lib/wb-campaigns/robot-template.json",
+  "journal_directory": "/var/lib/wb-campaigns/journal",
+  "campaigns_directory": "/var/lib/wb-campaigns/campaigns",
+  "max_initial_budget_rubles": 2000,
+  "manual_control": {
+    "approver_actor_ids": ["replace_with_existing_authorized_reviewer"],
+    "max_delta_percent": 25,
+    "action_limits": {
+      "max_actions_per_hour": 4,
+      "max_actions_per_day": 24,
+      "cooldown_seconds": 300,
+      "max_cumulative_abs_delta_kopecks_per_day": 10000
+    }
+  }
+}

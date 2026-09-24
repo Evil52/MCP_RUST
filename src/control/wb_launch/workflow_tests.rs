@@ -2,6 +2,8 @@
 //! or account state are loaded by these end-to-end operator-stage tests.
 #[path = "boundary_workflow_tests.rs"]
 mod boundaries;
+#[path = "reusable_workflow_tests.rs"]
+mod reusable;
 use super::*;
 use crate::test_support::mock_http_with_hook;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -118,7 +120,7 @@ impl Fixture {
         operator.reader = WbClient::new_for_test(
             Duration::from_secs(2),
             BTreeMap::from([(
-                ACCOUNT.to_owned(),
+                self.manifest.account_id.clone(),
                 WbCredentials {
                     token: "test-reader".to_owned(),
                 },

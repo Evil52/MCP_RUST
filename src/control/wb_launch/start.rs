@@ -1,7 +1,7 @@
 //! Startup never creates/imports/resets robot execution state or incident locks.
-//! The Nexus runner must already have produced two independently persisted
+//! The runner must already have produced two independently persisted
 //! periodic cycles; its next cycle performs ordinary guarded bid management.
-use super::{ACCOUNT, Journal, Operator, read_policy_json, write_error};
+use super::{Journal, Operator, read_policy_json, write_error};
 use crate::control::{
     WbAutomationObservation, WbAutomationObserver, WbAutomationPolicy, WbAutomationPostgresStore,
     WbAutomationStateView, wb_automation_business_date,
@@ -19,7 +19,7 @@ impl Operator {
         let policy: WbAutomationPolicy = read_policy_json(&self.manifest.robot_policy)?;
         ensure!(
             policy == self.target_policy(id),
-            "installed Nexus robot policy differs from reviewed copy"
+            "installed robot policy differs from reviewed copy"
         );
         validate_protective_policy(&policy, Utc::now())?;
         Ok(policy)
@@ -33,7 +33,12 @@ impl Operator {
         let status = self.inactive(id, true).await?.status;
         validate_start_status(status)?;
         if status == 4 {
-            first_launch::validate_receipts(journal, id, &self.manifest.bids_kopecks)?;
+            first_launch::validate_receipts(
+                journal,
+                id,
+                &self.manifest.bids_kopecks,
+                self.manifest.budget_rubles,
+            )?;
         }
         let policy = self.installed_protection(id)?;
         let observer = WbAutomationObserver::from_files(
@@ -78,25 +83,37 @@ impl Operator {
             "startup scope drifted"
         );
         let lease = store
-            .try_acquire_campaign(ACCOUNT, id)
+            .try_acquire_campaign(&self.manifest.account_id, id)
             .await?
-            .context("Nexus campaign lock is contended; no write attempted")?;
+            .context("campaign lock is contended; no write attempted")?;
         self.writer
             .start_campaign_with_permit(id, || async {
                 self.fresh_authorization()?;
                 let snapshot = observer
                     .observe(Utc::now(), WbAutomationStateView::default())
                     .await?;
-                validate_initial_observation(&snapshot.observation, policy)?;
+                validate_initial_observation(
+                    &snapshot.observation,
+                    policy,
+                    self.manifest.budget_rubles,
+                )?;
                 ensure!(
                     self.inactive(id, true).await?.status == snapshot.observation.campaign_status,
                     "startup campaign status changed during checks"
                 );
                 if snapshot.observation.campaign_status == 4 {
-                    first_launch::validate_receipts(journal, id, &self.manifest.bids_kopecks)?;
+                    first_launch::validate_receipts(
+                        journal,
+                        id,
+                        &self.manifest.bids_kopecks,
+                        self.manifest.budget_rubles,
+                    )?;
                     ensure!(
                         lease
-                            .verify_first_launch_cycles(observer.policy_sha256())
+                            .verify_first_launch_cycles(
+                                observer.policy_sha256(),
+                                self.manifest.budget_rubles * 100
+                            )
                             .await?,
                         "first launch needs two fresh ready-state cycles and no earlier activity"
                     );
@@ -104,10 +121,10 @@ impl Operator {
                 let state = lease
                     .load_state()
                     .await?
-                    .context("Nexus protective state is not installed")?;
+                    .context("protective state is not installed")?;
                 ensure!(
                     lease.verify_launch_cycles(observer.policy_sha256()).await?,
-                    "two fresh periodic Nexus robot cycles are required before start"
+                    "two fresh periodic robot cycles are required before start"
                 );
                 // No awaited reads follow these final checks: authorization,
                 // installed protection and evidence must all hold at the write.
@@ -116,7 +133,11 @@ impl Operator {
                     "robot policy changed while waiting for write slot"
                 );
                 self.fresh_authorization()?;
-                validate_initial_observation(&snapshot.observation, policy)?;
+                validate_initial_observation(
+                    &snapshot.observation,
+                    policy,
+                    self.manifest.budget_rubles,
+                )?;
                 ensure!(
                     state.policy_digest == observer.policy_sha256()
                         && state.incident_class.is_none()
@@ -139,7 +160,7 @@ impl Operator {
         );
         let budget = self.budget(id).await?;
         ensure!(
-            (1..=1000).contains(&budget),
+            (1..=self.manifest.budget_rubles).contains(&budget),
             "start budget readback differs; reconcile only"
         );
         journal.receipt(
@@ -164,11 +185,12 @@ pub(super) fn validate_start_status(status: i32) -> Result<()> {
 fn validate_initial_observation(
     observation: &WbAutomationObservation,
     policy: &WbAutomationPolicy,
+    budget_rubles: u64,
 ) -> Result<()> {
     validate_protective_policy(policy, Utc::now())?;
     ensure!(
         matches!(observation.campaign_status, 4 | 11)
-            && observation.budget_remaining_minor == 100_000
+            && Some(observation.budget_remaining_minor) == budget_rubles.checked_mul(100)
             && observation.daily_spend_minor == 0
             && if observation.campaign_status == 4 {
                 !observation.daily_spend_complete
@@ -277,39 +299,39 @@ mod tests {
     fn ready_evidence_is_missing_not_fabricated_zero_statistics() {
         let (mut observation, policy) = fixture();
         observation.campaign_status = 4;
-        assert!(validate_initial_observation(&observation, &policy).is_err());
+        assert!(validate_initial_observation(&observation, &policy, 1000).is_err());
         observation.daily_spend_complete = false;
         observation.attribution_complete = false;
-        assert!(validate_initial_observation(&observation, &policy).is_ok());
+        assert!(validate_initial_observation(&observation, &policy, 1000).is_ok());
         observation.paused_by_automation = true;
-        assert!(validate_initial_observation(&observation, &policy).is_err());
+        assert!(validate_initial_observation(&observation, &policy, 1000).is_err());
     }
 
     #[test]
     fn startup_requires_full_zero_spend_funded_snapshot() {
         let (observation, policy) = fixture();
-        validate_initial_observation(&observation, &policy).unwrap();
+        validate_initial_observation(&observation, &policy, 1000).unwrap();
         let mut changed = observation.clone();
         changed.daily_spend_complete = false;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
         changed = observation.clone();
         changed.attribution_complete = false;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
         changed = observation.clone();
         changed.daily_spend_minor = 1;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
         changed = observation.clone();
         changed.budget_remaining_minor = 0;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
         changed = observation.clone();
         changed.campaign_status = 4;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
         changed = observation.clone();
         changed.campaign_status = 9;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
         changed = observation;
         changed.paused_by_automation = true;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
     }
 
     #[test]
@@ -318,10 +340,10 @@ mod tests {
 
         let (observation, mut policy) = fixture();
         policy.observe_until = observation.observed_at + chrono::Duration::hours(1);
-        assert!(validate_initial_observation(&observation, &policy).is_err());
+        assert!(validate_initial_observation(&observation, &policy, 1000).is_err());
 
         policy.observe_until = observation.observed_at;
-        validate_initial_observation(&observation, &policy).unwrap();
+        validate_initial_observation(&observation, &policy, 1000).unwrap();
         let mut active = observation;
         active.campaign_status = 9;
         active.daily_spend_minor = policy.daily_pause_threshold_minor;
@@ -349,19 +371,28 @@ mod tests {
     }
 
     #[test]
+    fn startup_checks_the_configured_budget_exactly() {
+        let (mut observation, policy) = fixture();
+        observation.budget_remaining_minor = 150_000;
+        assert!(validate_initial_observation(&observation, &policy, 1500).is_ok());
+        assert!(validate_initial_observation(&observation, &policy, 1000).is_err());
+        assert!(validate_initial_observation(&observation, &policy, u64::MAX).is_err());
+    }
+
+    #[test]
     fn startup_rejects_stale_or_incompatible_sku_evidence() {
         let (observation, policy) = fixture();
         let mut changed = observation.clone();
         changed.observed_at -= chrono::Duration::minutes(2);
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
         changed = observation.clone();
         changed.skus[0].sellable_stock = 0;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
         changed = observation.clone();
         changed.skus[0].minimum_bid_kopecks = 1000;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
         changed = observation;
         changed.skus[0].nm_id = changed.skus[1].nm_id;
-        assert!(validate_initial_observation(&changed, &policy).is_err());
+        assert!(validate_initial_observation(&changed, &policy, 1000).is_err());
     }
 }
