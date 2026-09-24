@@ -13,6 +13,7 @@ use thiserror::Error;
 use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
+    bounded_body::{self, BoundedBodyError},
     config::PerformanceCredentials,
     marketplace_quota::{QuotaError, QuotaKey, SharedQuota},
     ozon_performance::PerformanceRequestPacer,
@@ -666,24 +667,14 @@ enum ResponseBodyError {
 }
 
 async fn read_bounded(mut response: Response, limit: usize) -> Result<Vec<u8>, ResponseBodyError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(ResponseBodyError::TooLarge);
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
+    bounded_body::read_bounded(&mut response, limit)
         .await
-        .map_err(|_| ResponseBodyError::Transport)?
-    {
-        if body.len().saturating_add(chunk.len()) > limit {
-            return Err(ResponseBodyError::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+        .map_err(|error| match error {
+            BoundedBodyError::Transport(_) => ResponseBodyError::Transport,
+            BoundedBodyError::DeclaredTooLarge(_) | BoundedBodyError::ReceivedTooLarge(_) => {
+                ResponseBodyError::TooLarge
+            }
+        })
 }
 
 fn classify_status(status: StatusCode) -> OzonWriteError {

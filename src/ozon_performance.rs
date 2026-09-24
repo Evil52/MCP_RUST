@@ -18,7 +18,10 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, SemaphorePermit};
 
-use crate::marketplace_quota::{QuotaError, SharedQuota};
+use crate::{
+    bounded_body::{BoundedBodyError, read_bounded},
+    marketplace_quota::{QuotaError, SharedQuota},
+};
 use mcp_marketplace_types::{PerformanceCredentials, StoreId};
 
 const PERFORMANCE_API_BASE_URL: &str = "https://api-performance.ozon.ru";
@@ -958,37 +961,21 @@ async fn read_body(
     limit: usize,
     request_id: Option<String>,
 ) -> Result<Vec<u8>, PerformanceError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(PerformanceError::ResponseTooLarge {
-            limit_bytes: limit,
-            actual_bytes: response.content_length(),
-            request_id,
-        });
-    }
-    let initial_capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or_default()
-        .min(limit);
-    let mut body = Vec::with_capacity(initial_capacity);
-    while let Some(chunk) = response
-        .chunk()
+    read_bounded(&mut response, limit)
         .await
-        .map_err(|error| classify_transport(&error))?
-    {
-        if body.len().saturating_add(chunk.len()) > limit {
-            return Err(PerformanceError::ResponseTooLarge {
+        .map_err(|error| match error {
+            BoundedBodyError::Transport(error) => classify_transport(&error),
+            BoundedBodyError::DeclaredTooLarge(bytes) => PerformanceError::ResponseTooLarge {
+                limit_bytes: limit,
+                actual_bytes: Some(bytes),
+                request_id,
+            },
+            BoundedBodyError::ReceivedTooLarge(_) => PerformanceError::ResponseTooLarge {
                 limit_bytes: limit,
                 actual_bytes: None,
                 request_id,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+            },
+        })
 }
 
 fn safe_request_id(headers: &HeaderMap) -> Option<String> {

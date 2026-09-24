@@ -28,6 +28,7 @@ use tokio::{
 };
 
 use crate::{
+    bounded_body::{BoundedBodyError, read_bounded},
     marketplace_quota::{QuotaError, SharedQuota},
     retry::RetryPolicy,
 };
@@ -923,38 +924,16 @@ async fn read_bounded_body(
     response: &mut Response,
     request_id: Option<String>,
 ) -> Result<Vec<u8>, OzonError> {
-    if let Some(content_length) = response.content_length()
-        && content_length > MAX_RESPONSE_BODY_BYTES as u64
-    {
-        return Err(OzonError::ResponseTooLarge {
-            limit_bytes: MAX_RESPONSE_BODY_BYTES,
-            actual_bytes: Some(content_length),
-            request_id,
-        });
-    }
-
-    let initial_capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or(0)
-        .min(MAX_RESPONSE_BODY_BYTES);
-    let mut body = Vec::with_capacity(initial_capacity);
-    while let Some(chunk) = response
-        .chunk()
+    read_bounded(response, MAX_RESPONSE_BODY_BYTES)
         .await
-        .map_err(|source| classify_transport_error(source, request_id.clone()))?
-    {
-        let next_length = body.len().saturating_add(chunk.len());
-        if next_length > MAX_RESPONSE_BODY_BYTES {
-            return Err(OzonError::ResponseTooLarge {
+        .map_err(|error| match error {
+            BoundedBodyError::Transport(source) => classify_transport_error(source, request_id),
+            too_large => OzonError::ResponseTooLarge {
                 limit_bytes: MAX_RESPONSE_BODY_BYTES,
-                actual_bytes: Some(u64::try_from(next_length).unwrap_or(u64::MAX)),
+                actual_bytes: too_large.exceeded_bytes(),
                 request_id,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+            },
+        })
 }
 
 fn classify_transport_error(source: reqwest::Error, request_id: Option<String>) -> OzonError {

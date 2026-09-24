@@ -14,6 +14,7 @@ use std::{
 use reqwest::{Client, Proxy, StatusCode, redirect::Policy};
 
 use super::gmail::access_token_is_valid;
+use crate::bounded_body::read_bounded;
 
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const MAIL_EGRESS_PROXY_URL: &str = "http://mail-egress:3129";
@@ -259,23 +260,9 @@ impl GmailOAuthClient {
 async fn parse_token_response(
     mut response: reqwest::Response,
 ) -> Result<GmailAccessToken, GmailOAuthError> {
-    let declared_length = response
-        .content_length()
-        .unwrap_or(0)
-        .min(MAX_TOKEN_RESPONSE_BYTES as u64);
-    let mut body = Vec::with_capacity(
-        usize::try_from(declared_length).expect("bounded token response length fits usize"),
-    );
-    while let Some(chunk) = response
-        .chunk()
+    let body = read_bounded(&mut response, MAX_TOKEN_RESPONSE_BYTES)
         .await
-        .map_err(|_| GmailOAuthError::InvalidResponse)?
-    {
-        if chunk.len() > MAX_TOKEN_RESPONSE_BYTES.saturating_sub(body.len()) {
-            return Err(GmailOAuthError::InvalidResponse);
-        }
-        body.extend_from_slice(&chunk);
-    }
+        .map_err(|_| GmailOAuthError::InvalidResponse)?;
     let value: serde_json::Value =
         serde_json::from_slice(&body).map_err(|_| GmailOAuthError::InvalidResponse)?;
     let access_token = value

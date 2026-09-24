@@ -105,37 +105,49 @@ impl PostgresCostRepository {
                 &batch.sha256, &count, &envelope.exported_at, &batch.imported_by],
         ).await.map_err(db_error)?;
         let batch_id: i64 = saved.get(0);
-        let statement = transaction
-            .prepare(
+        // One round trip for the whole batch; every row still passes the
+        // per-row triggers and the deferred row-count check at commit.
+        let rows = &envelope.rows;
+        let source_row_ids: Vec<&str> = rows.iter().map(|row| row.source_row_id.as_str()).collect();
+        let skus = rows
+            .iter()
+            .map(|row| i64::try_from(row.sku))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| CostImportError::InvalidInput)?;
+        let amounts: Vec<i64> = rows.iter().map(|row| row.amount_minor).collect();
+        let vat_treatments: Vec<&str> = rows.iter().map(|row| row.vat_treatment.as_str()).collect();
+        let vat_rates: Vec<Option<i32>> = rows
+            .iter()
+            .map(|row| row.vat_rate_bps.map(i32::from))
+            .collect();
+        let effective_from: Vec<NaiveDate> = rows.iter().map(|row| row.effective_from).collect();
+        let effective_to: Vec<NaiveDate> = rows.iter().map(|row| row.effective_to).collect();
+        transaction
+            .execute(
                 "INSERT INTO daily_reporting.cost_import_entries \
-             (batch_id,account_id,marketplace,source_row_id,sku,amount_minor,currency,allocation, \
-              vat_treatment,vat_rate_bps,effective_from,effective_to) \
-             VALUES ($1,$2,$3,$4,$5,$6,'RUB','per_unit',$7,$8,$9,$10)",
+                 (batch_id,account_id,marketplace,source_row_id,sku,amount_minor,currency,allocation, \
+                  vat_treatment,vat_rate_bps,effective_from,effective_to) \
+                 SELECT $1,$2,$3,batch.source_row_id,batch.sku,batch.amount_minor,'RUB','per_unit', \
+                  batch.vat_treatment,batch.vat_rate_bps,batch.effective_from,batch.effective_to \
+                 FROM unnest($4::text[],$5::bigint[],$6::bigint[],$7::text[],$8::integer[], \
+                  $9::date[],$10::date[]) \
+                 AS batch(source_row_id,sku,amount_minor,vat_treatment,vat_rate_bps, \
+                  effective_from,effective_to)",
+                &[
+                    &batch_id,
+                    &envelope.account_id,
+                    &marketplace,
+                    &source_row_ids,
+                    &skus,
+                    &amounts,
+                    &vat_treatments,
+                    &vat_rates,
+                    &effective_from,
+                    &effective_to,
+                ],
             )
             .await
             .map_err(db_error)?;
-        for row in &envelope.rows {
-            let sku = i64::try_from(row.sku).map_err(|_| CostImportError::InvalidInput)?;
-            let vat_rate = row.vat_rate_bps.map(i32::from);
-            transaction
-                .execute(
-                    &statement,
-                    &[
-                        &batch_id,
-                        &envelope.account_id,
-                        &marketplace,
-                        &row.source_row_id,
-                        &sku,
-                        &row.amount_minor,
-                        &row.vat_treatment.as_str(),
-                        &vat_rate,
-                        &row.effective_from,
-                        &row.effective_to,
-                    ],
-                )
-                .await
-                .map_err(db_error)?;
-        }
         let receipt = receipt(batch, &saved, false);
         transaction.commit().await.map_err(db_error)?;
         Ok(receipt)

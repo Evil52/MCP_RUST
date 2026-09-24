@@ -1,4 +1,5 @@
 use super::*;
+use crate::tool_telemetry::ToolCallOutcome;
 
 #[test]
 fn posting_sales_context_accepts_an_explicit_authorized_store() {
