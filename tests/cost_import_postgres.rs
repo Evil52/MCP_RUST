@@ -2,7 +2,10 @@ use std::str::FromStr;
 
 use chrono::{Duration, NaiveDate, Utc};
 use mcp_ozon::reporting::{
-    cost_import::{CostImportError, CostImportScope, PostgresCostRepository, ValidatedCostBatch},
+    cost_import::{
+        CostImportError, CostImportScope, CostVatTreatment, PostgresCostRepository,
+        ValidatedCostBatch,
+    },
     snapshot::{AccountScope, Marketplace},
 };
 use serde_json::{Value, json};
@@ -182,6 +185,59 @@ async fn costs_are_atomic_immutable_scoped_and_do_not_rewrite_historical_report_
         VALUES ($1,$2,'ozon','late_row',103,1,'RUB','per_unit','not_applicable','2026-09-01','2026-09-30')", &[&receipt.batch_id, &account]).await.unwrap_err();
     assert_eq!(sealed.code(), Some(&SqlState::CHECK_VIOLATION));
     drop(raw);
+    // A multi-row batch is inserted by one statement, including NULL VAT rates.
+    let bulk_skus = 1_000..2_000_u64;
+    let bulk_scope = CostImportScope::new(
+        AccountScope::new(account.clone(), Marketplace::Ozon).unwrap(),
+        "one_c".to_owned(),
+        bulk_skus.clone().collect(),
+        "finance_original".to_owned(),
+    )
+    .unwrap();
+    let mut bulk = payload(&account, "bulk", 1_000, "2026-09-01", "2026-09-30");
+    bulk["rows"] = bulk_skus
+        .clone()
+        .map(|sku| {
+            let (vat_treatment, vat_rate_bps) = if sku % 2 == 0 {
+                ("included", json!(2000))
+            } else {
+                ("not_applicable", Value::Null)
+            };
+            json!({"source_row_id": format!("row_{sku}"), "sku": sku, "amount_minor": sku,
+                "currency": "RUB", "allocation": "per_unit", "vat_treatment": vat_treatment,
+                "vat_rate_bps": vat_rate_bps, "effective_from": "2026-09-01",
+                "effective_to": "2026-09-30"})
+        })
+        .collect();
+    let bulk_receipt = repository
+        .import(&validated(&bulk, &bulk_scope))
+        .await
+        .unwrap();
+    assert_eq!(bulk_receipt.row_count, 1_000);
+    let stored: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM daily_reporting.cost_import_entries WHERE batch_id=$1",
+            &[&bulk_receipt.batch_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, 1_000);
+    for (sku, vat_treatment, vat_rate_bps) in [
+        (1_000, CostVatTreatment::Included, Some(2000)),
+        (1_999, CostVatTreatment::NotApplicable, None),
+    ] {
+        let cost = worker
+            .lookup(&bulk_scope, sku, date, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cost.row.source_row_id, format!("row_{sku}"));
+        assert_eq!(cost.row.amount_minor, i64::try_from(sku).unwrap());
+        assert_eq!(cost.row.vat_treatment, vat_treatment);
+        assert_eq!(cost.row.vat_rate_bps, vat_rate_bps);
+        assert_eq!(cost.batch_id, bulk_receipt.batch_id);
+    }
     let contender = PostgresCostRepository::connect(&importer_config)
         .await
         .unwrap();

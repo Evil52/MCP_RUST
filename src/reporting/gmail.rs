@@ -15,6 +15,7 @@ use reqwest::{
 use serde::Serialize;
 
 use super::mail::ReportEmail;
+use crate::bounded_body::read_bounded;
 
 const GMAIL_SEND_URL: &str = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
 const MAIL_EGRESS_PROXY_URL: &str = "http://mail-egress:3129";
@@ -144,23 +145,9 @@ pub(super) fn access_token_is_valid(access_token: &str) -> bool {
 async fn parse_success_response(
     mut response: reqwest::Response,
 ) -> Result<GmailSendReceipt, GmailSendError> {
-    let declared_length = response
-        .content_length()
-        .unwrap_or(0)
-        .min(MAX_GMAIL_RESPONSE_BYTES as u64);
-    let mut body = Vec::with_capacity(
-        usize::try_from(declared_length).expect("bounded Gmail response length fits usize"),
-    );
-    while let Some(chunk) = response
-        .chunk()
+    let body = read_bounded(&mut response, MAX_GMAIL_RESPONSE_BYTES)
         .await
-        .map_err(|_| GmailSendError::Ambiguous)?
-    {
-        if chunk.len() > MAX_GMAIL_RESPONSE_BYTES.saturating_sub(body.len()) {
-            return Err(GmailSendError::Ambiguous);
-        }
-        body.extend_from_slice(&chunk);
-    }
+        .map_err(|_| GmailSendError::Ambiguous)?;
     let value: serde_json::Value =
         serde_json::from_slice(&body).map_err(|_| GmailSendError::Ambiguous)?;
     let message_id = value

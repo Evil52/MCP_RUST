@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, fmt, future::Future, sync::Arc, time::Duration};
 
 use crate::{
+    bounded_body::{self, BoundedBodyError},
     marketplace_quota::{QuotaError, QuotaKey, SharedQuota},
     wb::quota::vendor_quota_cooldown,
 };
@@ -734,14 +735,14 @@ async fn read_bounded(
     mut response: reqwest::Response,
     maximum: usize,
 ) -> Result<Vec<u8>, &'static str> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| "response_body_error")? {
-        if body.len().saturating_add(chunk.len()) > maximum {
-            return Err("response_too_large");
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    bounded_body::read_bounded(&mut response, maximum)
+        .await
+        .map_err(|error| match error {
+            BoundedBodyError::Transport(_) => "response_body_error",
+            BoundedBodyError::DeclaredTooLarge(_) | BoundedBodyError::ReceivedTooLarge(_) => {
+                "response_too_large"
+            }
+        })
 }
 
 fn response_request_id(response: &reqwest::Response) -> Option<String> {
