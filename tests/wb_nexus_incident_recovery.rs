@@ -19,6 +19,19 @@ async fn audited_recovery_preserves_unknown_result_and_never_replays_write() {
     let task = tokio::spawn(async move {
         connection.await.unwrap();
     });
+    // The all-target coverage run shares this database with a launch unit test
+    // that already reserves the actual Nexus campaign. The dedicated DB
+    // contract runs this recovery scenario on a fresh database.
+    let occupied: bool = admin
+        .query_one("SELECT EXISTS(SELECT 1 FROM wb_automation.execution_state WHERE account_id='ofk_region_wb' AND advert_id=40141836)", &[])
+        .await
+        .unwrap()
+        .get(0);
+    if occupied {
+        drop(admin);
+        task.await.unwrap();
+        return;
+    }
     admin.batch_execute(r#"
       INSERT INTO wb_automation.cycles(cycle_id,account_id,advert_id,policy_digest,observed_at,business_date,state_revision,snapshot_json,decision_json)
       VALUES('b615c5e9c9c02ef37bf0bfbfbbc09b9ced61f95123f754e820a0e9abf4736a84','ofk_region_wb',40141836,'21fe8d4402af4847e30d0dd791fd59a26e60479e62751f54295e83a20578c51d',clock_timestamp(),(clock_timestamp() AT TIME ZONE 'Europe/Moscow')::date,1,'{}','{}');
