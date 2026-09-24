@@ -14,7 +14,10 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::config::{AccessRegistry, JwtConfig, RegistrySource};
+use crate::{
+    bounded_body::read_bounded,
+    config::{AccessRegistry, JwtConfig, RegistrySource},
+};
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedActor {
@@ -257,30 +260,9 @@ impl JwtAuthenticator {
         if !response.status().is_success() {
             return Err(JwtAuthenticationFailure::VerifierUnavailable);
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_JWKS_BODY_BYTES as u64)
-        {
-            return Err(JwtAuthenticationFailure::VerifierUnavailable);
-        }
-
-        let mut body = Vec::with_capacity(
-            response
-                .content_length()
-                .and_then(|length| usize::try_from(length).ok())
-                .unwrap_or(8 * 1024)
-                .min(MAX_JWKS_BODY_BYTES),
-        );
-        while let Some(chunk) = response
-            .chunk()
+        let body = read_bounded(&mut response, MAX_JWKS_BODY_BYTES)
             .await
-            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?
-        {
-            if chunk.len() > MAX_JWKS_BODY_BYTES.saturating_sub(body.len()) {
-                return Err(JwtAuthenticationFailure::VerifierUnavailable);
-            }
-            body.extend_from_slice(&chunk);
-        }
+            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
         parse_bounded_jwks(&body)
     }
 

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+mod bounded_body;
 pub mod config;
 pub mod control;
 pub mod http;

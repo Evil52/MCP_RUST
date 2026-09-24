@@ -8,6 +8,7 @@ use super::{
     RequestClass, Response, StatusCode, Utc, Value, WAREHOUSE_STOCKS_PATH, WbClient, WbError,
     WbErrorKind, classify_http_status, info, warn,
 };
+use crate::bounded_body::{BoundedBodyError, read_bounded};
 use crate::marketplace_quota::QuotaKey;
 
 pub(super) fn classify_transport_error(
@@ -53,37 +54,23 @@ pub(super) async fn read_body(
     limit: usize,
     request_id: Option<&str>,
 ) -> Result<Vec<u8>, WbError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(WbError::ResponseTooLarge {
-            limit_bytes: limit,
-            actual_bytes: response.content_length(),
-            request_id: request_id.map(str::to_owned),
-        });
-    }
-    let initial_capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or_default()
-        .min(limit);
-    let mut body = Vec::with_capacity(initial_capacity);
-    while let Some(chunk) = response
-        .chunk()
+    read_bounded(&mut response, limit)
         .await
-        .map_err(|source| classify_transport_error(source, request_id.map(str::to_owned)))?
-    {
-        if body.len().saturating_add(chunk.len()) > limit {
-            return Err(WbError::ResponseTooLarge {
+        .map_err(|error| match error {
+            BoundedBodyError::Transport(source) => {
+                classify_transport_error(source, request_id.map(str::to_owned))
+            }
+            BoundedBodyError::DeclaredTooLarge(bytes) => WbError::ResponseTooLarge {
+                limit_bytes: limit,
+                actual_bytes: Some(bytes),
+                request_id: request_id.map(str::to_owned),
+            },
+            BoundedBodyError::ReceivedTooLarge(_) => WbError::ResponseTooLarge {
                 limit_bytes: limit,
                 actual_bytes: None,
                 request_id: request_id.map(str::to_owned),
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+            },
+        })
 }
 
 pub(super) fn is_retriable(status: StatusCode) -> bool {
