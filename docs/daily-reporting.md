@@ -462,7 +462,9 @@ terminal telemetry. Only administrators can read the bounded projection via
 `collection-preflight` performs no marketplace request. It requires every
 target in the enabled policy to share one successful, fully paginated
 marketplace-specific cutoff no more
-than 24 hours old. A target added to the policy therefore cannot enter the
+than 24 hours old. Only the marketplace's required sources count: an optional
+source published at the same cutoff, such as WB seller-warehouse stocks, can
+neither complete a target nor make a complete one fail the proof. A target added to the policy therefore cannot enter the
 automatic scheduler until its manual canary has published the same reviewed
 occurrence as the other targets. The long-running scheduler repeats this proof
 at process startup; later publications provide bounded restart proof.

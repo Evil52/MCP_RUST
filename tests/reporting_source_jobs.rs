@@ -597,6 +597,34 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
             }
         );
     }
+    // The legacy scheduler's publication proofs count required sources only:
+    // the succeeded same-cutoff FBS snapshot neither hides nor completes one.
+    let refresh_cutoff: DateTime<Utc> = admin
+        .query_one(
+            "SELECT cutoff_at FROM daily_reporting.source_snapshots WHERE account_id=$1 AND source='seller_stocks' AND status='succeeded'",
+            &[&refresh_account],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        restarted
+            .published_targets(refresh_cutoff, std::slice::from_ref(&refresh_target))
+            .await
+            .unwrap(),
+        std::iter::once((refresh_account.clone(), Marketplace::Wildberries)).collect()
+    );
+    assert_eq!(
+        restarted
+            .verify_collection_activation(
+                std::slice::from_ref(&refresh_target),
+                refresh_cutoff + Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .cutoff_at,
+        refresh_cutoff
+    );
     stock_recovery::verify(&admin, &collector, &reader_db, &reader, &restarted).await;
     fbs_publication::verify(&admin, &collector, &reader, &restarted).await;
 }

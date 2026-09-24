@@ -95,10 +95,13 @@ pub(super) fn traffic_frontier_pacing_decision(
     // because delivery is behind its time curve. A regular bid increase
     // requires at least one incremental attributed order and revenue at or
     // below the target marginal DRR. The only exception is V4's bounded
-    // zero-cost probe established above.
+    // zero-cost probe established above. An order that arrives without any
+    // incremental click is WB attributing earlier traffic late, so it says
+    // nothing about the price of the next click and cannot fund a raise.
     if policy.autonomous_pacing.uses_marginal_feedback()
         && !feedback.zero_cost_probe
         && (feedback.metrics.attributed_orders == 0
+            || feedback.metrics.clicks == 0
             || feedback.metrics.attributed_revenue_minor == 0
             || drr.is_none_or(|value| value > policy.target_drr_basis_points))
     {
@@ -340,8 +343,10 @@ pub(super) fn traffic_frontier_dynamic_cap(
             .checked_mul(u128::from(policy.target_drr_basis_points))
             .context("WB traffic-frontier economic cap overflow")?
             / BASIS_POINTS;
-        u64::try_from(allowed_spend / u128::from(metrics.clicks))
-            .context("WB traffic-frontier economic cap is out of range")?
+        let per_click = allowed_spend
+            .checked_div(u128::from(metrics.clicks))
+            .context("WB traffic-frontier feedback has attributed orders without clicks")?;
+        u64::try_from(per_click).context("WB traffic-frontier economic cap is out of range")?
     };
     Ok(policy
         .max_bid_kopecks

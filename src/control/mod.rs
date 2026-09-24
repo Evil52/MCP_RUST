@@ -6,6 +6,7 @@ mod config;
 mod ozon;
 mod plan;
 mod policy;
+mod private_file;
 mod server;
 mod wb;
 mod wb_launch;

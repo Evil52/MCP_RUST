@@ -8,7 +8,7 @@ use state::{
 };
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::Write,
     path::{Path, PathBuf},
     time::Duration,
@@ -39,12 +39,14 @@ use super::{
         WbAutomationLegacyStateSeed, WbAutomationPostgresStore,
     },
     config::{read_control_token, validate_wb_writer_token},
+    private_file::try_acquire_private_lease,
     wb::{WbBidWriteClient, WbGuardedWriteError, WbPreparedBidChange},
 };
 
 const STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 256 * 1024;
 const READBACK_GRACE: ChronoDuration = ChronoDuration::minutes(5);
+const EXECUTION_LEASE_FILE: &str = ".execution-state.lease";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -153,6 +155,14 @@ impl WbAutomationExecutor {
         &self,
         observed_at: DateTime<Utc>,
     ) -> Result<WbAutomationExecutionReceipt> {
+        // Held for the whole cycle: two runs reading the same pending-free
+        // state could otherwise both reserve and send a write.
+        let _lease = try_acquire_private_lease(
+            &self.state_directory,
+            EXECUTION_LEASE_FILE,
+            "WB automation execution state",
+        )?
+        .context("WB automation execution state уже обслуживает другой процесс")?;
         let business_date = wb_automation_business_date(observed_at);
         let mut state = load_execution_state(
             &self.state_directory,
@@ -1060,9 +1070,11 @@ const fn durable_action_kind(kind: &PendingActionKind) -> WbAutomationDurableAct
 mod tests {
     mod daily_cap_breach;
     mod postgres_clock;
+    mod state_files;
+    mod traffic_frontier_v3;
 
     use super::feedback::{
-        campaign_drr_basis_points, traffic_feedback_delta, traffic_frontier_dynamic_cap,
+        campaign_drr_basis_points, traffic_frontier_dynamic_cap,
         traffic_frontier_v2_feedback_is_actionable,
     };
     use super::state::{ExecutionState, read_state_file, save_execution_state_bytes};
@@ -2141,102 +2153,6 @@ mod tests {
             WbAutomationAction::Hold {
                 reason: WbAutomationHoldReason::TrafficFeedbackPending,
             }
-        );
-    }
-
-    #[test]
-    fn traffic_frontier_v3_increases_only_after_efficient_incremental_orders() {
-        let (policy, snapshot) = traffic_frontier_v3_snapshot();
-        let baseline = traffic_frontier_v3_baseline(&snapshot);
-        let delta = traffic_feedback_delta(
-            &snapshot,
-            snapshot
-                .observation
-                .current_campaign_metrics
-                .as_ref()
-                .unwrap(),
-            Some(&baseline),
-        )
-        .unwrap();
-        assert_eq!(
-            delta,
-            WbAutomationCampaignMetrics {
-                impressions: 220,
-                clicks: 10,
-                spend_minor: 1_000,
-                attributed_orders: 1,
-                attributed_revenue_minor: 100_000,
-            }
-        );
-
-        assert!(matches!(
-            traffic_frontier_pacing_decision(&policy, &snapshot, Some(&baseline))
-                .unwrap()
-                .expect("efficient marginal order permits one bounded increase")
-                .action,
-            WbAutomationAction::ChangeBids { ref changes }
-                if changes.len() == 1
-                    && changes[0].reason == WbAutomationBidReason::TrafficFrontierBootstrap
-        ));
-
-        let mut target_reached = snapshot;
-        target_reached.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
-            impressions: 320,
-            clicks: 12,
-            spend_minor: 3_000,
-            attributed_orders: 3,
-            attributed_revenue_minor: 300_000,
-        });
-        let mut target_baseline = baseline;
-        target_baseline.observation.current_campaign_metrics = Some(WbAutomationCampaignMetrics {
-            impressions: 100,
-            clicks: 2,
-            spend_minor: 2_000,
-            attributed_orders: 2,
-            attributed_revenue_minor: 200_000,
-        });
-        assert_eq!(
-            traffic_frontier_pacing_decision(&policy, &target_reached, Some(&target_baseline),)
-                .unwrap(),
-            None
-        );
-
-        assert_eq!(
-            traffic_feedback_delta(
-                &target_reached,
-                target_reached
-                    .observation
-                    .current_campaign_metrics
-                    .as_ref()
-                    .unwrap(),
-                None,
-            )
-            .unwrap(),
-            target_reached
-                .observation
-                .current_campaign_metrics
-                .clone()
-                .unwrap()
-        );
-
-        let mut previous_day = target_baseline;
-        previous_day.observation.observed_at -= ChronoDuration::days(1);
-        assert_eq!(
-            traffic_feedback_delta(
-                &target_reached,
-                target_reached
-                    .observation
-                    .current_campaign_metrics
-                    .as_ref()
-                    .unwrap(),
-                Some(&previous_day),
-            )
-            .unwrap(),
-            target_reached
-                .observation
-                .current_campaign_metrics
-                .clone()
-                .unwrap()
         );
     }
 
@@ -3933,96 +3849,6 @@ mod tests {
             .kind,
             PendingActionKind::ResumeCampaignAfterDailyCap
         ));
-    }
-
-    #[test]
-    fn state_files_are_private_bounded_and_policy_bound() {
-        let fixture = Fixture::new();
-        let business_date = now().date_naive();
-        assert!(
-            read_state_file(&fixture.root.join("execution-state.json"))
-                .unwrap()
-                .is_none()
-        );
-        let initial = load_execution_state(
-            &fixture.root,
-            "a",
-            "ip_domnyshev_wb",
-            39_682_633,
-            business_date,
-            false,
-        )
-        .unwrap();
-        assert_eq!(initial.schema_version, STATE_SCHEMA_VERSION);
-
-        let mut stored = execution_state(business_date);
-        stored.policy_sha256 = "a".to_owned();
-        let pending = PendingAction {
-            reserved_at: now(),
-            kind: PendingActionKind::PauseCampaignForDailyCap,
-        };
-        stored.pending = Some(pending.clone());
-        save_execution_state(&fixture.root, &stored).unwrap();
-        assert_eq!(
-            load_execution_state(
-                &fixture.root,
-                "a",
-                "ip_domnyshev_wb",
-                39_682_633,
-                business_date,
-                false
-            )
-            .unwrap(),
-            stored
-        );
-        verify_pending_permit(&fixture.root.join("execution-state.json"), &pending).unwrap();
-        let different = PendingAction {
-            reserved_at: now(),
-            kind: PendingActionKind::ResumeCampaignAfterDailyCap,
-        };
-        assert!(
-            verify_pending_permit(&fixture.root.join("execution-state.json"), &different).is_err()
-        );
-        assert!(
-            load_execution_state(
-                &fixture.root,
-                "wrong",
-                "ip_domnyshev_wb",
-                39_682_633,
-                business_date,
-                false
-            )
-            .is_err()
-        );
-        let migrated = load_execution_state(
-            &fixture.root,
-            "shadow-policy",
-            "ip_domnyshev_wb",
-            39_682_633,
-            business_date,
-            true,
-        )
-        .unwrap();
-        assert_eq!(migrated.policy_sha256, "shadow-policy");
-        assert_eq!(migrated.pending.as_ref(), Some(&pending));
-        assert_eq!(migrated.actions_today, stored.actions_today);
-
-        fs::write(fixture.root.join("execution-state.json"), b"not-json").unwrap();
-        assert!(read_state_file(&fixture.root.join("execution-state.json")).is_err());
-
-        let regular_parent = fixture.root.join("regular-parent");
-        fs::write(&regular_parent, b"not a directory").unwrap();
-        assert!(read_state_file(&regular_parent.join("child")).is_err());
-
-        assert!(
-            save_execution_state_bytes(&fixture.root, b"{}", |_, _| Err(anyhow::anyhow!(
-                "injected write failure"
-            )))
-            .is_err()
-        );
-        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(validate_private_directory(&fixture.root).is_err());
-        fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

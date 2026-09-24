@@ -27,6 +27,7 @@ use super::{
         validate_wb_automation_policy, wb_automation_business_date,
     },
     config::{read_control_token, validate_wb_reader_token},
+    private_file::replace_private_file,
 };
 
 // Version 6 records the current vendor minimum for every SKU so a dynamic WB
@@ -432,7 +433,7 @@ pub fn persist_wb_automation_snapshot(
         .replace('.', "_");
     let history = directory.join(format!("snapshot-{stamp}.json"));
     write_new_file(&history, &bytes)?;
-    write_atomic_file(directory, Path::new("latest.json"), &bytes)?;
+    write_atomic_file(directory, "latest.json", &bytes)?;
     Ok(history)
 }
 
@@ -458,32 +459,23 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
     write_and_sync(&mut file, bytes)
 }
 
-fn write_atomic_file(directory: &Path, name: &Path, bytes: &[u8]) -> Result<()> {
+fn write_atomic_file(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     write_atomic_file_with(directory, name, bytes, write_and_sync)
 }
 
 fn write_atomic_file_with(
     directory: &Path,
-    name: &Path,
+    name: &str,
     bytes: &[u8],
     write: fn(&mut File, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    let temporary = directory.join(format!(".latest-{}.tmp", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .context("WB automation temporary snapshot недоступен")?;
-    if let Err(error) = write(&mut file, bytes) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    fs::rename(&temporary, directory.join(name))
-        .context("WB automation latest snapshot нельзя опубликовать")?;
-    File::open(directory)
-        .and_then(|directory| directory.sync_all())
-        .context("WB automation state directory нельзя синхронизировать")
+    replace_private_file(
+        directory,
+        name,
+        bytes,
+        write,
+        "WB automation latest snapshot",
+    )
 }
 
 fn write_and_sync(file: &mut File, bytes: &[u8]) -> Result<()> {
@@ -1082,7 +1074,7 @@ mod tests {
         assert!(
             write_atomic_file_with(
                 &fixture.root,
-                Path::new("never-published.json"),
+                "never-published.json",
                 b"snapshot",
                 |_, _| Err(anyhow::anyhow!("injected write failure"))
             )
