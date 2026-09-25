@@ -3,7 +3,6 @@
 /.scannerwork
 /.vscode
 .env
-.env.ip-usovik-promotion
 .position.env
 .sonar.env
 .sonar-stack.env

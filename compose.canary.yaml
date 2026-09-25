@@ -16,6 +16,14 @@ services:
       MCP_BIND: 0.0.0.0:8787
       MCP_DEV_ALLOW_NON_LOOPBACK: "true"
       MCP_ACCESS_CONFIG: /etc/mcp-ozon/access.json
+      # Keep Promotion writers out of the canary Analytics container.
+      OFK_REGION_WB_PROMOTION_WRITE_TOKEN: ""
+      IP_USOVIK_WB_PROMOTION_WRITE_TOKEN: ""
+      OFK_KOMPLEKT_WB_PROMOTION_WRITE_TOKEN: ""
+      IP_TETEREVENKOV_WB_PROMOTION_WRITE_TOKEN: ""
+      IP_SINELSHCHIKOV_WB_PROMOTION_WRITE_TOKEN: ""
+      IP_DOMNYSHEV_WB_PROMOTION_WRITE_TOKEN: ""
+      IP_VORONIN_WB_PROMOTION_WRITE_TOKEN: ""
       OZON_POSTINGS_VNEXT: "false"
       OZON_FINANCE_ACCRUALS_PREVIEW: "false"
     ports:

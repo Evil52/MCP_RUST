@@ -53,29 +53,31 @@ docker compose -f compose.wb-campaigns.yaml run --rm --no-deps wb-campaigns
 не дают гарантии остановки ровно в момент достижения порога. Размер списка
 должен позволять укладываться в пятиминутный интервал.
 
-## Ключ записи для ИП Усовик
+## Ключи записи для WB-кабинетов
 
-На этой машине создан отдельный приватный `.env.ip-usovik-promotion` с
-пустой строкой `IP_USOVIK_WB_PROMOTION_WRITE_TOKEN=`. Вставить в неё новый
-Personal JWT кабинета ИП Усовик с единственной категорией «Продвижение» и
-уровнем «Чтение и запись», без кавычек. Файл игнорируется Git и имеет права
-0600. Для нового checkout скопировать `.env.ip-usovik-promotion.example`
-в `.env.ip-usovik-promotion` и установить `chmod 600`. Общий `.env`
-использовать нельзя: он передаётся серверу аналитики.
+В общем приватном `.env` предусмотрена отдельная переменная
+`<ACCOUNT_ID_UPPERCASE>_PROMOTION_WRITE_TOKEN` для каждого из семи WB-кабинетов.
+Существующие `*_WB_API_TOKEN` остаются ключами чтения. Записи в `.env`
+перечислены в `.env.example`; новые значения хранятся только в локальном
+`.env` с правами 0600. Analytics-сервер получает для writer-переменных пустые
+значения благодаря явному переопределению в `compose.yaml` и `compose.canary.yaml`. На Fedora его
+Compose-конфигурация также содержит только ключи чтения.
 
-После вставки ключа выполнить:
+После добавления ключа нужного магазина установить его в отдельный защищённый
+файл для робота и Control:
 
 ```bash
-python3 scripts/install-wb-promotion-ip-usovik-token.py
+python3 scripts/install-wb-promotion-token.py --account ip_usovik_wb
 ```
 
-Скрипт проверяет локальные поля токена и создаёт файл
-`~/.local/share/mcp-ozon-runtime/ip-usovik-wb-promotion-write.token` с правами
-0600. Содержимое токена не печатается. Этот путь затем передаётся как
-`WB_AUTOMATION_WRITE_TOKEN_FILE_HOST` в Compose оператора, а для отдельного
-Control кабинета — как `CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST`.
-Для запуска всё равно нужны привязка seller SID в access registry, профиль
-кабинета и разрешённая конфигурация исполнителя.
+Установщик проверяет срок, права и совпадение продавца с ключом чтения этого
+кабинета, затем создаёт файл `~/.local/share/mcp-ozon-runtime/<account-id-with-hyphens>-promotion-write.token`
+с правами 0600. Существующий
+файл с другим ключом не заменяется автоматически. Путь к файлу передаётся как
+`WB_AUTOMATION_WRITE_TOKEN_FILE_HOST` в Compose оператора и как
+`CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST` в отдельный Control кабинета.
+Для запуска требуются привязка seller SID в access registry, профиль кабинета
+и разрешённая конфигурация исполнителя.
 
 ## Для каждой новой кампании
 
