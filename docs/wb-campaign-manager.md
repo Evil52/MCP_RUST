@@ -71,7 +71,8 @@ python3 scripts/install-wb-promotion-token.py --account ip_usovik_wb
 ```
 
 Установщик проверяет срок, права и совпадение продавца с ключом чтения этого
-кабинета, затем создаёт файл `~/.local/share/mcp-ozon-runtime/<account-id>-promotion-write.token` с правами 0600. Существующий
+кабинета, затем создаёт файл `~/.local/share/mcp-ozon-runtime/<account-id-with-hyphens>-promotion-write.token`
+с правами 0600. Существующий
 файл с другим ключом не заменяется автоматически. Путь к файлу передаётся как
 `WB_AUTOMATION_WRITE_TOKEN_FILE_HOST` в Compose оператора и как
 `CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST` в отдельный Control кабинета.

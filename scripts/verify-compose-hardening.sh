@@ -418,6 +418,11 @@ verify_server() {
        and .[0].source == $source
        and .[0].read_only == true'
 
+  check "$label: all seven WB Promotion writer env values are blank" "$server" \
+    '[.environment | to_entries[]
+      | select(.key | endswith("_WB_PROMOTION_WRITE_TOKEN"))]
+     | length == 7 and all(.[]; .value == "")'
+
   check "$label: non-loopback container bind has an explicit dev opt-in" "$server" \
     '.environment.MCP_BIND == "0.0.0.0:8787"
      and .environment.MCP_DEV_ALLOW_NON_LOOPBACK == "true"'
