@@ -38,7 +38,7 @@ pub use automation_postgres::{
 };
 pub use config::{
     ControlAppConfig, ControlAuthConfig, ControlOzonRuntimeConfig, ControlPolicyDatabaseConfig,
-    ControlWbRuntimeConfig,
+    ControlWbCampaignRuntimeConfig, ControlWbRuntimeConfig,
 };
 pub use ozon::{
     DEFAULT_OZON_STATIC_MAX_CPC_BID_MICROROUBLES, DEFAULT_OZON_STATIC_MIN_CPC_BID_MICROROUBLES,

@@ -172,6 +172,34 @@ render_control_wb_live_compose() {
       config --no-env-resolution --format json
 }
 
+render_control_wb_campaign_compose() {
+  local read_token_file="$scratch/wb-promotion-read.token"
+  local write_token_file="$scratch/wb-promotion-write.token"
+  local campaign_root="$scratch/wb-campaigns"
+  mkdir -m 700 "$campaign_root"
+  CONTROL_MCP_ACCESS_CONFIG_HOST="$project_dir/config/access.example.json" \
+    CONTROL_MCP_POLICY_HOST="$project_dir/config/control-policy.example.json" \
+    CONTROL_MCP_MARKETPLACE_WRITES_ENABLED="true" \
+    CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE_HOST="$read_token_file" \
+    CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST="$write_token_file" \
+    CONTROL_MCP_JWT_ISSUER="https://auth.example.test/realms/ofk" \
+    CONTROL_MCP_JWT_JWKS_HOST="auth.example.test" \
+    CONTROL_MCP_JWT_JWKS_PATH="/realms/ofk/protocol/openid-connect/certs" \
+    CONTROL_MCP_PUBLIC_URL="https://control.example.test/mcp" \
+    CONTROL_MCP_WB_CAMPAIGN_ACCOUNT_ID="wb_one" \
+    CONTROL_MCP_WB_BID_ACCOUNT_ID="" \
+    CONTROL_WRITER_DB_PASSWORD="verify-only-control-writer-not-a-secret" \
+    WB_AUTOMATION_DB_PASSWORD="verify-only-wb-automation-not-a-secret" \
+    WB_CAMPAIGNS_ROOT="$campaign_root" \
+    docker compose \
+      --env-file "$interpolation_env" \
+      -f "$project_dir/compose.control.yaml" \
+      -f "$project_dir/compose.control-wb-plan.yaml" \
+      -f "$project_dir/compose.control-wb-live.yaml" \
+      -f "$project_dir/compose.control-wb-campaign.yaml" \
+      config --no-env-resolution --format json
+}
+
 render_control_ozon_live_compose() {
   local executor_id="$scratch/ozon-executor-client-id"
   local executor_secret="$scratch/ozon-executor-client-secret"
@@ -1583,6 +1611,31 @@ verify_control_wb_live() {
        .bind == null or .bind == {} or .bind == {"create_host_path":false})'
 }
 
+verify_control_wb_campaign() {
+  local rendered="$1" control
+  control="$(jq -c '.services.control' <<<"$rendered")"
+  check "control WB campaign: account scope and credential paths are explicit" "$control" \
+    '.environment.CONTROL_MCP_AUTH_MODE == "jwt"
+     and .environment.CONTROL_MCP_WB_ACCOUNT_ID == ""
+     and .environment.CONTROL_MCP_WB_CAMPAIGN_ACCOUNT_ID == "wb_one"
+     and .environment.CONTROL_MCP_WB_CAMPAIGN_ROOT == "/var/lib/wb-campaigns"
+     and .environment.CONTROL_MCP_MARKETPLACE_WRITES_ENABLED == "true"
+     and .environment.CONTROL_MCP_WB_PROMOTION_READ_TOKEN_FILE == "/run/mcp-ozon/control-credentials/wb-promotion-read.token"
+     and .environment.CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE == "/run/mcp-ozon/control-credentials/wb-promotion-write.token"
+     and (.env_file // []) == []'
+  check "control WB campaign: only fixed private root is writable" "$control" \
+    --arg root "$scratch/wb-campaigns" \
+    '[.volumes[] | select(.read_only != true)] == [{
+       "type":"bind","source":$root,"target":"/var/lib/wb-campaigns",
+       "bind":{"create_host_path":false}
+     }]'
+  check "control WB campaign: reader network and writer alias remain isolated" "$rendered" \
+    '(.services.control.networks | has("ozon-egress-internal"))
+     and .networks["ozon-egress-internal"].external == true
+     and .services["control-write-egress"].networks["control-write-egress-internal"].aliases == ["write-egress"]
+     and .services["control-write-egress"].networks.outbound != null'
+}
+
 verify_control_ozon_guards() {
   local live="$1" static="$2" live_control live_guard static_guard live_proxy static_proxy executor_url
   live_control="$(jq -c '.services.control' <<<"$live")"
@@ -1651,6 +1704,7 @@ control_rendered="$(render_control_compose)"
 control_actor_override_rendered="$(render_control_compose verify_actor)"
 control_wb_plan_rendered="$(render_control_wb_plan_compose)"
 control_wb_live_rendered="$(render_control_wb_live_compose)"
+control_wb_campaign_rendered="$(render_control_wb_campaign_compose)"
 control_ozon_live_rendered="$(render_control_ozon_live_compose)"
 control_ozon_static_guard_rendered="$(render_control_ozon_static_guard_compose)"
 
@@ -2272,6 +2326,7 @@ verify_control "$control_rendered"
 verify_control_actor_override "$control_actor_override_rendered" "$control_rendered"
 verify_control_wb_plan "$control_wb_plan_rendered" "$control_rendered"
 verify_control_wb_live "$control_wb_live_rendered" "$control_wb_plan_rendered"
+verify_control_wb_campaign "$control_wb_campaign_rendered"
 verify_control_ozon_guards "$control_ozon_live_rendered" "$control_ozon_static_guard_rendered"
 
 if (( failures > 0 )); then
@@ -2279,4 +2334,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "Compose hardening verified for main, canary, base/plan/executor Control, position database, PostgreSQL-backed WB automation shadow, the opt-in MCP reporting reader, dedicated Control write/JWKS proxies, Ozon read-API and Gmail egress proxies, disabled collector/reporting runtimes, and the explicit reporting collection/mail canary and live overlays: exact resource/mount/health contracts, write-secret separation, loopback-only publication, isolated egress, and internal database networks."
+echo "Compose hardening verified for main, canary, base/plan/executor/campaign Control, position database, PostgreSQL-backed WB automation shadow, the opt-in MCP reporting reader, dedicated Control write/JWKS proxies, Ozon read-API and Gmail egress proxies, disabled collector/reporting runtimes, and the explicit reporting collection/mail canary and live overlays: exact resource/mount/health contracts, write-secret separation, loopback-only publication, isolated egress, and internal database networks."

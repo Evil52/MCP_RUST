@@ -7,13 +7,18 @@ dedicated marketplace credentials, it starts with all writes disabled.
 
 ## Reusable WB campaign setup
 
-New WB CPC search campaigns can be prepared from one account profile, created
-through the existing isolated operator, and enrolled into this Control policy
-without campaign-specific Rust code. The shared fleet runner manages explicitly
-registered robot policies. See [WB campaign manager](wb-campaign-manager.md) for
-`campaign-prepare`, `campaign-launch`, `campaign-export`, `campaign-enroll` and
-`execute-fleet-pg`. Creation remains a local operator workflow; the twelve-tool
-Control MCP registry below is unchanged.
+New WB CPC search campaigns use one private account profile and the same
+journaled launch operator from either local CLI or authenticated Control MCP.
+Control exposes nine campaign tools: `wb_promotion_prepare_campaign`,
+`wb_promotion_find_campaign`, `wb_promotion_campaign_preflight`, `wb_promotion_create_campaign`,
+`wb_promotion_set_initial_campaign_bids`, `wb_promotion_export_campaign_robot`,
+`wb_promotion_fund_campaign`, `wb_promotion_start_campaign`, and
+`wb_promotion_reconcile_campaign`. Each follow-up call uses an opaque handle,
+never a caller-provided filesystem path. A Control instance is bound to exactly
+one WB seller account and one admin actor; JWT auth, a private mounted profile,
+matching seller tokens, write gate, and enabled policy are required for WB writes.
+The shared fleet runner manages explicitly registered robot policies. See
+[WB campaign manager](wb-campaign-manager.md) for the exact stages and recovery.
 
 ## Implemented scope
 
@@ -26,9 +31,10 @@ sent by the Analytics MCP.
 
 Available tools:
 
-- `ozon_ads_control_status` — reports static policy/runtime prerequisites and
-  states explicitly that per-target runtime gates are still required;
-- `ozon_ads_control_scope` — shows the actor's exact local Ozon/WB policy;
+- `ozon_ads_control_status` — reports static policy/runtime prerequisites,
+  including whether WB campaign creation is configured;
+- `ozon_ads_control_scope` — shows the actor's exact local Ozon/WB policy and
+  the WB account bound to the new-campaign operator;
 - `ozon_performance_prepare_campaign_launch` — runs a live duplicate-SKU
   preflight and persists an immutable single-SKU plan;
 - `ozon_performance_approve_campaign_launch` — records a distinct authorized
@@ -46,9 +52,21 @@ Available tools:
   bounded action quota using `plan_id + plan_digest`, re-reads its precondition,
   performs one PATCH attempt, and reads the campaign back;
 - `wb_promotion_bid_plan_status` — reads durable plan state without WB egress;
-- `wb_promotion_reconcile_bid_plan` — read-back only; it never repeats a write.
+- `wb_promotion_reconcile_bid_plan` — read-back only; it never repeats a write;
+- `wb_promotion_prepare_campaign` — creates an immutable local authorization
+  from a fixed profile and exact product bids, without a WB request;
+- `wb_promotion_find_campaign` — recovers the fixed handle by account/name
+  after a lost prepare response, without WB egress;
+- `wb_promotion_campaign_preflight` — reads categories, stock, overlapping
+  campaigns and available balance before a write;
+- `wb_promotion_create_campaign` — one journaled create attempt;
+- `wb_promotion_set_initial_campaign_bids` — one guarded initial bid attempt;
+- `wb_promotion_export_campaign_robot` — exports the verified protective policy;
+- `wb_promotion_fund_campaign` — one exact authorized budget transfer;
+- `wb_promotion_start_campaign` — starts only after protective robot readiness;
+- `wb_promotion_reconcile_campaign` — readback only after an uncertain result.
 
-This is a separate twelve-tool Control registry. It is not part of the Analytics
+This is a separate twenty-one-tool Control registry. It is not part of the Analytics
 MCP release contract, which contains exactly 86 tools. The refresh-request tools
 only mutate internal deduplicated snapshot-refresh queues and have no marketplace
 egress; the other Analytics tools are read-only. In Control,

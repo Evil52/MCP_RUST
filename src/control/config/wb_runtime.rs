@@ -55,7 +55,8 @@ pub(super) fn load_wb_runtime(
     if policy.mode == ControlMode::Disabled {
         return Ok(None);
     }
-    let configured_account_id = lookup("CONTROL_MCP_WB_ACCOUNT_ID");
+    let configured_account_id =
+        lookup("CONTROL_MCP_WB_ACCOUNT_ID").filter(|value| !value.is_empty());
     if !policy
         .actors
         .iter()
