@@ -7,6 +7,7 @@ fn fixture() -> ShadowInput {
     let observed_at = Utc.with_ymd_and_hms(2026, 9, 25, 12, 0, 0).unwrap();
     ShadowInput {
         version: 1,
+        objective: OptimizationObjective::ExpectedEconomics,
         marketplace: SupportedMarketplace::Ozon,
         pricing_model: PricingModel::Cpc,
         currency: Currency::RUB,

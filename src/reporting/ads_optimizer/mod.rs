@@ -67,6 +67,7 @@ pub fn recommend(mut input: ShadowInput) -> Result<ShadowReport, OptimizerError>
     Ok(ShadowReport {
         version: 1,
         mode: "shadow".to_owned(),
+        objective: input.objective,
         currency: "RUB".to_owned(),
         account_id: input.account_id,
         as_of: input.as_of,
@@ -89,3 +90,6 @@ fn scaled(value: u64, numerator: u64, denominator: u64) -> Result<u64, Optimizer
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod advertising_objective_tests;

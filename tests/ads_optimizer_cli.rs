@@ -73,6 +73,7 @@ fn example_produces_reproducible_shadow_json_without_environment_or_file_writes(
     assert!(output.stderr.is_empty());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["mode"], "shadow");
+    assert_eq!(report["objective"]["kind"], "expected_economics");
     assert_eq!(report["account_id"], "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT");
     assert_eq!(report["allocated_daily_budget_minor"], 110_000);
     assert_eq!(report["unallocated_daily_budget_minor"], 0);
@@ -193,4 +194,40 @@ fn help_version_and_invalid_commands_need_no_configuration() {
     let text = String::from_utf8(output.stderr).unwrap();
     assert!(text.contains("arguments must be valid Unicode"));
     assert!(!text.contains("SECRET_INPUT_MUST_NOT_APPEAR"));
+}
+
+#[test]
+fn advertising_drr_example_recommends_without_cost_data_or_configuration() {
+    let directory = FixtureDirectory::new();
+    let evidence = directory.write(
+        "drr-evidence.json",
+        include_bytes!("../config/ads-optimizer-drr.example.json"),
+    );
+    let output = run(&directory.0, &evidence);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["objective"]["kind"], "target_advertising_drr");
+    assert_eq!(report["objective"]["max_drr_bps"], 1500);
+    let recommendation = &report["recommendations"][0];
+    assert_eq!(recommendation["action"], "test_budget_increase");
+    assert_eq!(recommendation["suggested_daily_budget_minor"], 110_000);
+    assert_eq!(recommendation["metrics"]["average_cpc_ceiling_minor"], 600);
+    assert_eq!(
+        recommendation["metrics"]["cpc_ceiling_basis"],
+        "target_advertising_drr"
+    );
+    assert!(recommendation["metrics"]["economic_average_cpc_ceiling_minor"].is_null());
+    assert!(
+        recommendation["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|reason| reason != "missing_economics")
+    );
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
 }

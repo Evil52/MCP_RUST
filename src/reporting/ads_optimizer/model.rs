@@ -20,6 +20,9 @@ pub struct ShadowInput {
     pub window_start: NaiveDate,
     pub window_end: NaiveDate,
     pub coverage_complete: bool,
+    /// Explicit optimization goal. Omitted legacy inputs retain economics mode.
+    #[serde(default)]
+    pub objective: OptimizationObjective,
     pub policy: OptimizerPolicy,
     pub products: Vec<ProductEvidence>,
 }
@@ -39,6 +42,26 @@ pub enum PricingModel {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum Currency {
     RUB,
+}
+
+/// Target DRR uses historical direct attributed revenue, not profit or buyout.
+/// The operator sets its target explicitly; no target is inferred from costs.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OptimizationObjective {
+    #[default]
+    ExpectedEconomics,
+    TargetAdvertisingDrr {
+        /// Explicit target in basis points, `1..=100_000` (0.01%..=1000%).
+        max_drr_bps: u32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CpcCeilingBasis {
+    ExpectedEconomics,
+    TargetAdvertisingDrr,
 }
 
 /// Explicit operator choices, not claims about Ozon's attribution window.
@@ -157,6 +180,9 @@ pub enum RecommendationReason {
     MatureSpendWithoutOrders,
     CpcAboveEconomicCeiling,
     WithinEconomicCeiling,
+    NoMatureOrdersForDrrAllowance,
+    CpcAboveAdvertisingDrrCeiling,
+    WithinAdvertisingDrrCeiling,
     NoCurrentBudget,
     ProductBudgetCap,
     PortfolioBudgetCap,
@@ -171,8 +197,13 @@ pub struct EvidenceMetrics {
     pub mature_spend_minor: u64,
     pub mature_direct_revenue_minor: u64,
     pub excluded_recent_days: u16,
+    /// Selected objective's allowance before the policy haircut. In DRR mode
+    /// this uses mature direct revenue/orders and does not imply profitability.
     pub advertising_allowance_per_order_minor: Option<u64>,
     /// Historical rate with a policy haircut; not an auction bid or forecast.
+    pub average_cpc_ceiling_minor: Option<u64>,
+    pub cpc_ceiling_basis: Option<CpcCeilingBasis>,
+    /// Legacy economics-only field; always absent in target advertising DRR mode.
     pub economic_average_cpc_ceiling_minor: Option<u64>,
 }
 
@@ -190,6 +221,7 @@ pub struct ProductRecommendation {
 pub struct ShadowReport {
     pub version: u32,
     pub mode: String,
+    pub objective: OptimizationObjective,
     pub currency: String,
     pub account_id: String,
     pub as_of: DateTime<Utc>,

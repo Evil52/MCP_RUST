@@ -1,8 +1,9 @@
 use chrono::Duration;
 
 use super::{
-    EvidenceMetrics, OptimizerError, ProductEvidence, ProductRecommendation,
-    RecommendationAction as Action, RecommendationReason as Reason, ShadowInput, scaled,
+    CpcCeilingBasis, EvidenceMetrics, OptimizationObjective, OptimizerError, ProductEvidence,
+    ProductRecommendation, RecommendationAction as Action, RecommendationReason as Reason,
+    ShadowInput, scaled,
 };
 
 pub(super) fn evaluate(
@@ -48,17 +49,54 @@ pub(super) fn evaluate(
         }
         Some(_) => {}
     }
-    let allowance = match &product.economics {
+    let allowance = match input.objective {
+        OptimizationObjective::ExpectedEconomics => economic_allowance(input, product, &mut row)?,
+        OptimizationObjective::TargetAdvertisingDrr { .. } => None,
+    };
+    if row.metrics.mature_days < policy.min_mature_days {
+        row.reasons.push(Reason::InsufficientMatureDays);
+    }
+    if row.metrics.mature_clicks < policy.min_clicks {
+        row.reasons.push(Reason::InsufficientClicks);
+    }
+    // Unknown data cannot be used to justify either performance-based increases
+    // or reductions. Fresh zero stock and a valid nonpositive allowance stand
+    // on their own and retain their pause recommendation.
+    if row.reasons.is_empty() {
+        performance(input, product, &mut row, allowance)?;
+    }
+    if row.suggested_daily_budget_minor > product.max_daily_budget_minor {
+        row.suggested_daily_budget_minor = product.max_daily_budget_minor;
+        row.reasons.push(Reason::ProductBudgetCap);
+        row.action = if product.max_daily_budget_minor == 0 {
+            Action::ReviewPause
+        } else if product.max_daily_budget_minor < product.current_daily_budget_minor {
+            Action::ReviewReduction
+        } else if product.max_daily_budget_minor == product.current_daily_budget_minor {
+            Action::Hold
+        } else {
+            Action::TestBudgetIncrease
+        };
+    }
+    Ok(row)
+}
+
+fn economic_allowance(
+    input: &ShadowInput,
+    product: &ProductEvidence,
+    row: &mut ProductRecommendation,
+) -> Result<Option<u64>, OptimizerError> {
+    match &product.economics {
         None => {
             row.reasons.push(Reason::MissingEconomics);
-            None
+            Ok(None)
         }
         Some(economics)
             if economics.valid_from > input.window_start
                 || economics.valid_to < input.as_of.date_naive() =>
         {
             row.reasons.push(Reason::EconomicsOutsidePeriod);
-            None
+            Ok(None)
         }
         Some(economics) => {
             let costs = [
@@ -78,44 +116,16 @@ pub(super) fn evaluate(
                 row.action = Action::ReviewPause;
                 row.suggested_daily_budget_minor = 0;
             }
-            Some(allowance)
+            Ok(Some(allowance))
         }
-    };
-    if row.metrics.mature_days < policy.min_mature_days {
-        row.reasons.push(Reason::InsufficientMatureDays);
     }
-    if row.metrics.mature_clicks < policy.min_clicks {
-        row.reasons.push(Reason::InsufficientClicks);
-    }
-    // Unknown data cannot be used to justify either performance-based increases
-    // or reductions. Fresh zero stock and a valid nonpositive allowance stand
-    // on their own and retain their pause recommendation.
-    if row.reasons.is_empty()
-        && let Some(allowance) = allowance
-    {
-        performance(input, product, &mut row, allowance)?;
-    }
-    if row.suggested_daily_budget_minor > product.max_daily_budget_minor {
-        row.suggested_daily_budget_minor = product.max_daily_budget_minor;
-        row.reasons.push(Reason::ProductBudgetCap);
-        row.action = if product.max_daily_budget_minor == 0 {
-            Action::ReviewPause
-        } else if product.max_daily_budget_minor < product.current_daily_budget_minor {
-            Action::ReviewReduction
-        } else if product.max_daily_budget_minor == product.current_daily_budget_minor {
-            Action::Hold
-        } else {
-            Action::TestBudgetIncrease
-        };
-    }
-    Ok(row)
 }
 
 fn performance(
     input: &ShadowInput,
     product: &ProductEvidence,
     row: &mut ProductRecommendation,
-    allowance: u64,
+    allowance: Option<u64>,
 ) -> Result<(), OptimizerError> {
     let policy = &input.policy;
     if (row.metrics.mature_clicks > 0 && row.metrics.mature_spend_minor == 0)
@@ -124,37 +134,85 @@ fn performance(
         row.reasons.push(Reason::InconsistentAdvertisingEvidence);
         return Ok(());
     }
-    if row.metrics.mature_orders == 0
-        && u128::from(row.metrics.mature_spend_minor)
-            >= u128::from(allowance) * u128::from(policy.zero_order_spend_allowances)
-    {
-        row.reasons.push(Reason::MatureSpendWithoutOrders);
-        return reduce(input, row);
+    if row.metrics.mature_orders == 0 {
+        if let OptimizationObjective::TargetAdvertisingDrr { .. } = input.objective {
+            // Zero attributed orders cannot establish an allowance per order.
+            // Do not invent economics or a generic spend threshold.
+            row.reasons.push(Reason::NoMatureOrdersForDrrAllowance);
+            return Ok(());
+        }
+        if let Some(allowance) = allowance
+            && u128::from(row.metrics.mature_spend_minor)
+                >= u128::from(allowance) * u128::from(policy.zero_order_spend_allowances)
+        {
+            row.reasons.push(Reason::MatureSpendWithoutOrders);
+            return reduce(input, row);
+        }
     }
     if row.metrics.mature_orders < policy.min_orders {
         row.reasons.push(Reason::InsufficientOrders);
         return Ok(());
     }
-    let numerator = u128::from(allowance)
-        .checked_mul(u128::from(row.metrics.mature_orders))
-        .and_then(|value| value.checked_mul(10_000 - u128::from(policy.safety_discount_bps)))
-        .ok_or(OptimizerError::Overflow)?;
-    let denominator = u128::from(row.metrics.mature_clicks) * 10_000;
-    let ceiling = u64::try_from(numerator / denominator).map_err(|_| OptimizerError::Overflow)?;
-    row.metrics.economic_average_cpc_ceiling_minor = Some(ceiling);
-    // Compare exact spend, not a rounded historical average CPC.
-    if u128::from(row.metrics.mature_spend_minor)
-        > u128::from(ceiling) * u128::from(row.metrics.mature_clicks)
-    {
-        row.reasons.push(Reason::CpcAboveEconomicCeiling);
+    let (above_ceiling, above_reason, within_reason) = match input.objective {
+        OptimizationObjective::ExpectedEconomics => {
+            let allowance = allowance.ok_or(OptimizerError::InvalidInput)?;
+            let numerator = u128::from(allowance)
+                .checked_mul(u128::from(row.metrics.mature_orders))
+                .and_then(|value| {
+                    value.checked_mul(10_000 - u128::from(policy.safety_discount_bps))
+                })
+                .ok_or(OptimizerError::Overflow)?;
+            let denominator = u128::from(row.metrics.mature_clicks) * 10_000;
+            let ceiling =
+                u64::try_from(numerator / denominator).map_err(|_| OptimizerError::Overflow)?;
+            row.metrics.average_cpc_ceiling_minor = Some(ceiling);
+            row.metrics.economic_average_cpc_ceiling_minor = Some(ceiling);
+            row.metrics.cpc_ceiling_basis = Some(CpcCeilingBasis::ExpectedEconomics);
+            (
+                u128::from(row.metrics.mature_spend_minor)
+                    > u128::from(ceiling) * u128::from(row.metrics.mature_clicks),
+                Reason::CpcAboveEconomicCeiling,
+                Reason::WithinEconomicCeiling,
+            )
+        }
+        OptimizationObjective::TargetAdvertisingDrr { max_drr_bps } => {
+            let target_spend_numerator = u128::from(row.metrics.mature_direct_revenue_minor)
+                .checked_mul(u128::from(max_drr_bps))
+                .ok_or(OptimizerError::Overflow)?;
+            let allowance =
+                target_spend_numerator / (u128::from(row.metrics.mature_orders) * 10_000);
+            row.metrics.advertising_allowance_per_order_minor =
+                Some(u64::try_from(allowance).map_err(|_| OptimizerError::Overflow)?);
+            // Retain full precision through the final CPC division. In
+            // particular, do not multiply a floored per-order allowance back
+            // by the number of orders.
+            let numerator = target_spend_numerator
+                .checked_mul(10_000 - u128::from(policy.safety_discount_bps))
+                .ok_or(OptimizerError::Overflow)?;
+            let denominator = u128::from(row.metrics.mature_clicks) * 100_000_000;
+            let ceiling =
+                u64::try_from(numerator / denominator).map_err(|_| OptimizerError::Overflow)?;
+            row.metrics.average_cpc_ceiling_minor = Some(ceiling);
+            row.metrics.cpc_ceiling_basis = Some(CpcCeilingBasis::TargetAdvertisingDrr);
+            // Decide on the exact total allowance; rounding a displayed CPC
+            // must not turn an acceptable DRR into a reduction.
+            (
+                u128::from(row.metrics.mature_spend_minor) * 100_000_000 > numerator,
+                Reason::CpcAboveAdvertisingDrrCeiling,
+                Reason::WithinAdvertisingDrrCeiling,
+            )
+        }
+    };
+    if above_ceiling {
+        row.reasons.push(above_reason);
         reduce(input, row)?;
     } else if row.current_daily_budget_minor == 0 {
         row.reasons.push(Reason::NoCurrentBudget);
     } else if let Some(reason) = budget_blocker(input, product) {
-        row.reasons.push(Reason::WithinEconomicCeiling);
+        row.reasons.push(within_reason);
         row.reasons.push(reason);
     } else {
-        row.reasons.push(Reason::WithinEconomicCeiling);
+        row.reasons.push(within_reason);
         let increment = scaled(
             row.current_daily_budget_minor,
             u64::from(policy.max_budget_increase_bps),

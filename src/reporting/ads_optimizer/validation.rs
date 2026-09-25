@@ -2,10 +2,15 @@ use std::collections::BTreeSet;
 
 use chrono::Datelike;
 
-use super::{MAX_PRODUCTS, MAX_WINDOW_DAYS, OptimizerError, ShadowInput};
+use super::{MAX_PRODUCTS, MAX_WINDOW_DAYS, OptimizationObjective, OptimizerError, ShadowInput};
 
 pub(super) fn validate(input: &ShadowInput) -> Result<(), OptimizerError> {
     let policy = &input.policy;
+    if let OptimizationObjective::TargetAdvertisingDrr { max_drr_bps } = input.objective
+        && !(1..=100_000).contains(&max_drr_bps)
+    {
+        return Err(OptimizerError::InvalidInput);
+    }
     let days = (input.window_end - input.window_start).num_days() + 1;
     if input.version != 1
         || input.account_id.is_empty()
