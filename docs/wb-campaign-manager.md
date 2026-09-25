@@ -53,6 +53,30 @@ docker compose -f compose.wb-campaigns.yaml run --rm --no-deps wb-campaigns
 не дают гарантии остановки ровно в момент достижения порога. Размер списка
 должен позволять укладываться в пятиминутный интервал.
 
+## Ключ записи для ИП Усовик
+
+На этой машине создан отдельный приватный `.env.ip-usovik-promotion` с
+пустой строкой `IP_USOVIK_WB_PROMOTION_WRITE_TOKEN=`. Вставить в неё новый
+Personal JWT кабинета ИП Усовик с единственной категорией «Продвижение» и
+уровнем «Чтение и запись», без кавычек. Файл игнорируется Git и имеет права
+0600. Для нового checkout скопировать `.env.ip-usovik-promotion.example`
+в `.env.ip-usovik-promotion` и установить `chmod 600`. Общий `.env`
+использовать нельзя: он передаётся серверу аналитики.
+
+После вставки ключа выполнить:
+
+```bash
+python3 scripts/install-wb-promotion-ip-usovik-token.py
+```
+
+Скрипт проверяет локальные поля токена и создаёт файл
+`~/.local/share/mcp-ozon-runtime/ip-usovik-wb-promotion-write.token` с правами
+0600. Содержимое токена не печатается. Этот путь затем передаётся как
+`WB_AUTOMATION_WRITE_TOKEN_FILE_HOST` в Compose оператора, а для отдельного
+Control кабинета — как `CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST`.
+Для запуска всё равно нужны привязка seller SID в access registry, профиль
+кабинета и разрешённая конфигурация исполнителя.
+
 ## Для каждой новой кампании
 
 Создать заявку по `config/wb-campaign-request.example.json`. Все ставки —
