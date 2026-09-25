@@ -1625,10 +1625,12 @@ verify_control_wb_campaign() {
      and (.env_file // []) == []'
   check "control WB campaign: only fixed private root is writable" "$control" \
     --arg root "$scratch/wb-campaigns" \
-    '[.volumes[] | select(.read_only != true)] == [{
-       "type":"bind","source":$root,"target":"/var/lib/wb-campaigns",
-       "bind":{"create_host_path":false}
-     }]'
+    '([.volumes[] | select(.read_only != true)]) as $writable
+     | ($writable | length) == 1
+       and $writable[0].type == "bind"
+       and $writable[0].source == $root
+       and $writable[0].target == "/var/lib/wb-campaigns"
+       and ($writable[0].bind.create_host_path // false) == false'
   check "control WB campaign: reader network and writer alias remain isolated" "$rendered" \
     '(.services.control.networks | has("ozon-egress-internal"))
      and .networks["ozon-egress-internal"].external == true
