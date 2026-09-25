@@ -95,6 +95,7 @@ pub struct ControlStatusResult {
     pub mode: ControlMode,
     pub explicit_policy_binding: bool,
     pub write_executor_configured: bool,
+    pub wb_campaign_creation_configured: bool,
     pub runtime_gates_required: bool,
     pub credentials_loaded: bool,
     pub marketplace_egress_enabled: bool,
@@ -111,6 +112,7 @@ pub struct ControlScopeResult {
     pub targets: Vec<ControlTargetResult>,
     pub ozon_campaign_launch_targets: Vec<OzonCampaignLaunchTargetResult>,
     pub wb_promotion_bid_targets: Vec<WbPromotionBidTargetResult>,
+    pub wb_campaign_account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -209,4 +211,40 @@ pub struct WbPlanApprovalResult {
     pub approver_id: String,
     pub approved_at: String,
     pub expires_at: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareWbCampaignInput {
+    pub account_id: String,
+    pub campaign_name: String,
+    /// WB article ID to initial manual search bid in kopecks.
+    pub bids_kopecks: std::collections::BTreeMap<u64, u64>,
+    /// Zero prepares an inactive, unfunded campaign.
+    pub budget_rubles: u64,
+    pub authorization_reference: String,
+    pub expires_at: String,
+    pub robot_authorization_expires_at: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbCampaignHandleInput {
+    pub account_id: String,
+    /// Opaque 64-character lowercase hex handle returned by prepare.
+    pub campaign_handle: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct WbCampaignToolResult {
+    pub account_id: String,
+    pub campaign_handle: String,
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WbCampaignNameInput {
+    pub account_id: String,
+    pub campaign_name: String,
 }

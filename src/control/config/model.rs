@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, num::NonZeroUsize, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration};
 
 use tokio_postgres::Config as PostgresConfig;
 
@@ -27,6 +27,7 @@ pub struct ControlAppConfig {
     pub policy_database: Option<ControlPolicyDatabaseConfig>,
     pub ozon_runtime: Option<ControlOzonRuntimeConfig>,
     pub wb_runtime: Option<ControlWbRuntimeConfig>,
+    pub wb_campaign_runtime: Option<ControlWbCampaignRuntimeConfig>,
 }
 
 #[derive(Clone)]
@@ -117,4 +118,12 @@ impl std::fmt::Debug for ControlWbRuntimeConfig {
             .field("request_timeout", &self.request_timeout)
             .finish()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlWbCampaignRuntimeConfig {
+    pub account_id: String,
+    pub actor_id: String,
+    pub root: PathBuf,
+    pub writes_enabled: bool,
 }

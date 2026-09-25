@@ -11,8 +11,8 @@ use crate::{
     auth::{JwtAuthenticator, ProtectedResourceMetadata},
     config::{AccessRegistry, Actor, RegistrySource},
     control::{
-        ozon::OzonPlanRepository, plan::WbPlanRepository, policy::ControlPolicy,
-        wb::WbBidWriteClient,
+        config::ControlWbCampaignRuntimeConfig, ozon::OzonPlanRepository, plan::WbPlanRepository,
+        policy::ControlPolicy, wb::WbBidWriteClient,
     },
     http::HttpMcpServer,
     wb::WbClient,
@@ -20,8 +20,11 @@ use crate::{
 
 use authorization::ControlIdentity;
 mod authorization;
+mod campaign;
 mod contract;
+mod plan_readback;
 mod presentation;
+mod scope;
 mod tools;
 
 const ACCESS_DENIED: &str = "CONTROL_ACCESS_DENIED";
@@ -33,6 +36,7 @@ pub struct ControlMcp {
     default_actor_id: Option<String>,
     authenticator: Option<JwtAuthenticator>,
     wb: Option<WbControlServices>,
+    wb_campaign: Option<ControlWbCampaignRuntimeConfig>,
     ozon: Option<OzonControlServices>,
     tool_router: ToolRouter<Self>,
 }
@@ -84,6 +88,7 @@ impl ControlMcp {
             default_actor_id: Some(actor_id),
             authenticator: None,
             wb: None,
+            wb_campaign: None,
             ozon: None,
             tool_router: Self::configured_tool_router(None),
         }
@@ -102,6 +107,7 @@ impl ControlMcp {
             default_actor_id: None,
             authenticator: Some(authenticator),
             wb: None,
+            wb_campaign: None,
             ozon: None,
             tool_router,
         }
@@ -113,6 +119,16 @@ impl ControlMcp {
             self.wb = Some(services);
         } else {
             tracing::error!("refusing to attach WB write services to dev/no-auth Control MCP");
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_wb_campaign_runtime(mut self, runtime: ControlWbCampaignRuntimeConfig) -> Self {
+        if self.authenticator.is_some() {
+            self.wb_campaign = Some(runtime);
+        } else {
+            tracing::error!("refusing to attach WB campaign runtime to dev/no-auth Control MCP");
         }
         self
     }
@@ -219,7 +235,7 @@ impl ServerHandler for ControlMcp {
                     .with_title("OzonOFK Advertising Control"),
             )
             .with_instructions(
-                "Отдельный fail-closed контур управления рекламой. По умолчанию marketplace credentials, egress, persistence и writes отключены. WB apply исполняет не более одного PATCH после short-lived approval и повторной проверки permit. Ozon apply только атомарно ставит одобренный plan в durable outbox; отдельный guard runtime владеет lease, marketplace writes и readback recovery. Ozon reconcile читает сохранённый статус и никогда не выполняет write. Не просите API-ключи через чат и не заявляйте об успехе, пока status не равен applied.",
+                "Отдельный fail-closed контур управления рекламой. По умолчанию marketplace credentials, egress, persistence и writes отключены. WB apply исполняет не более одного PATCH после short-lived approval и повторной проверки permit. Создание WB-кампании требует кабинетный профиль и отдельные prepare, preflight, create, bids, export, fund, start; неопределённый результат требует reconcile без повтора записи. Ozon apply только атомарно ставит одобренный plan в durable outbox; отдельный guard runtime владеет lease, marketplace writes и readback recovery. Ozon reconcile читает сохранённый статус и никогда не выполняет write. Не просите API-ключи через чат и не заявляйте об успехе, пока status не равен applied.",
             )
     }
 }

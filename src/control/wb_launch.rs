@@ -30,6 +30,60 @@ mod manifest;
 mod setup;
 
 pub use setup::{enroll_wb_campaign, export_wb_campaign, prepare_wb_campaign};
+pub use setup::{prepare_wb_campaign_from_request, wb_campaign_profile_runtime};
+
+/// Opaque reusable-campaign handle for an account/name identity. The legacy
+/// Nexus journal is reserved and cannot become a new MCP campaign bundle.
+pub fn wb_campaign_handle_for_name(account_id: &str, campaign_name: &str) -> Result<String> {
+    let directory = journal::directory_name(&json!({
+        "version": 2,
+        "account_id": account_id,
+        "campaign_name": campaign_name,
+    }))?;
+    Ok(directory
+        .strip_prefix("campaign-")
+        .context("legacy Nexus campaign identity is reserved")?
+        .to_owned())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WbCampaignManifestScope {
+    pub account_id: String,
+    pub actor_id: String,
+    pub campaign_name: String,
+}
+
+/// Bounded, read-only identity check for MCP handles resolved under a fixed root.
+pub fn wb_campaign_manifest_scope(path: &Path) -> Result<WbCampaignManifestScope> {
+    let manifest: Manifest = read_private_json(path)?;
+    ensure_mcp_bundle_identity(path, &manifest)?;
+    Ok(WbCampaignManifestScope {
+        account_id: manifest.account_id,
+        actor_id: manifest.actor_id,
+        campaign_name: manifest.campaign_name,
+    })
+}
+
+fn ensure_mcp_bundle_identity(path: &Path, manifest: &Manifest) -> Result<()> {
+    ensure!(
+        manifest.version == 2,
+        "MCP requires a reusable campaign manifest"
+    );
+    let expected = format!(
+        "campaign-{}",
+        wb_campaign_handle_for_name(&manifest.account_id, &manifest.campaign_name,)?
+    );
+    ensure!(
+        path.file_name().and_then(|name| name.to_str()) == Some("manifest.json")
+            && path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                == Some(expected.as_str()),
+        "MCP campaign handle and manifest identity differ"
+    );
+    Ok(())
+}
 mod continuation;
 mod journal;
 mod start;
@@ -704,19 +758,59 @@ enum WriteStage {
 
 /// Explicit local CLI entry point with fixed WB routes and journaled stages.
 pub async fn run_wb_campaign_launch(mode: &str, manifest_path: &Path) -> Result<Value> {
+    run_wb_campaign_launch_inner(mode, manifest_path, None).await
+}
+
+/// MCP entry point: the process-bound account and authenticated actor are
+/// checked against the manifest before any marketplace write can be attempted.
+pub async fn run_wb_campaign_launch_scoped(
+    mode: &str,
+    manifest_path: &Path,
+    account_id: &str,
+    actor_id: &str,
+) -> Result<Value> {
+    run_wb_campaign_launch_inner(mode, manifest_path, Some((account_id, actor_id))).await
+}
+
+async fn run_wb_campaign_launch_inner(
+    mode: &str,
+    manifest_path: &Path,
+    expected_scope: Option<(&str, &str)>,
+) -> Result<Value> {
+    // Reject an out-of-scope manifest before opening any credential or client.
+    // Operator::load checks the same identity again after loading its snapshot.
+    if let Some((account_id, actor_id)) = expected_scope {
+        let scope = wb_campaign_manifest_scope(manifest_path)?;
+        ensure!(
+            scope.account_id == account_id && scope.actor_id == actor_id,
+            "MCP campaign is outside account/actor scope"
+        );
+    }
     // A revoked/expired writer or changed source robot must never prevent
     // reading the outcome of an already attempted money operation.
+    if mode == "reconcile" {
+        return reconcile_read_only(manifest_path).await;
+    }
     let stage = match mode {
-        "reconcile" => return reconcile_read_only(manifest_path).await,
-        "preflight" => return Operator::load(manifest_path, false)?.preflight(None).await,
-        "prepare" => WriteStage::Prepare,
-        "create" => WriteStage::Create,
-        "bids" => WriteStage::Bids,
-        "fund" => WriteStage::Fund,
-        "start" => WriteStage::Start,
+        "preflight" => None,
+        "prepare" => Some(WriteStage::Prepare),
+        "create" => Some(WriteStage::Create),
+        "bids" => Some(WriteStage::Bids),
+        "fund" => Some(WriteStage::Fund),
+        "start" => Some(WriteStage::Start),
         _ => bail!("unknown launch stage"),
     };
     let operator = Operator::load(manifest_path, false)?;
+    if let Some((account_id, actor_id)) = expected_scope {
+        ensure_mcp_bundle_identity(manifest_path, &operator.manifest)?;
+        ensure!(
+            operator.manifest.account_id == account_id && operator.manifest.actor_id == actor_id,
+            "MCP campaign is outside account/actor scope"
+        );
+    }
+    let Some(stage) = stage else {
+        return operator.preflight(None).await;
+    };
     operator.manifest.authorize_stage(mode)?;
     let journal = Journal::open(
         &operator.manifest.journal_directory,

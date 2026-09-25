@@ -12,6 +12,7 @@ use super::{
     jwt::load_jwt_config,
     load_ozon_runtime,
     validation::{parse_max_sessions, parse_session_idle_timeout, parse_strict_bool, value_or},
+    wb_campaign::load_wb_campaign_runtime,
     wb_runtime::{load_policy_database, load_wb_runtime},
 };
 
@@ -78,7 +79,7 @@ impl ControlAppConfig {
             "CONTROL_MCP_ACCESS_CONFIG",
             DEFAULT_CONTROL_ACCESS_CONFIG,
         );
-        let registry = RegistrySource::new(registry_path)?;
+        let registry = RegistrySource::new(registry_path.clone())?;
         let snapshot = registry.load()?;
         let policy_path = value_or(lookup, "CONTROL_MCP_POLICY", DEFAULT_CONTROL_POLICY);
         let policy = ControlPolicy::load(PathBuf::from(policy_path), &snapshot)?;
@@ -117,6 +118,8 @@ impl ControlAppConfig {
         }
         let wb_runtime =
             load_wb_runtime(lookup, &auth, &policy, &snapshot, policy_database.as_ref())?;
+        let wb_campaign_runtime =
+            load_wb_campaign_runtime(lookup, &auth, &policy, &snapshot, &registry_path)?;
         let ozon_runtime = load_ozon_runtime(lookup, &auth, &policy, &snapshot, ozon_identity)?;
         Ok(Self {
             bind,
@@ -129,6 +132,7 @@ impl ControlAppConfig {
             policy_database,
             ozon_runtime,
             wb_runtime,
+            wb_campaign_runtime,
         })
     }
 }
