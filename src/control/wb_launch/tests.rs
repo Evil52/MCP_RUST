@@ -11,6 +11,8 @@ pub(super) fn fixture() -> (Manifest, WbAutomationPolicy) {
     policy.observe_until = now;
     policy.authorization_expires_at = now + chrono::Duration::days(10);
     let manifest = Manifest {
+        version: 1,
+        manual_control: None,
         scope: LaunchScope::FundAndStart,
         account_id: ACCOUNT.to_owned(),
         campaign_name: NAME.to_owned(),

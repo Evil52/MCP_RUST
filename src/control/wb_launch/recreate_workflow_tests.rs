@@ -118,7 +118,7 @@ async fn completed_nexus_blocks_replacement_before_post() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("another Nexus")
+            .contains("another campaign with this name")
     );
     assert!(!journal.attempted("create"));
     assert!(

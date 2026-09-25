@@ -350,9 +350,7 @@ impl WbBidWriteClient {
             .await
     }
 
-    /// A single, exact 1,000 RUB type=1 transfer. No configurable source,
-    /// cashback, auto-top-up or retry. The operator must durably claim the
-    /// attempt inside the permit before any request bytes can be sent.
+    #[cfg(test)]
     pub(in crate::control) async fn deposit_once_with_permit<E, F, Fut>(
         &self,
         advert_id: u64,
@@ -362,6 +360,27 @@ impl WbBidWriteClient {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<(), E>>,
     {
+        self.deposit_budget_with_permit(advert_id, 1000, permit)
+            .await
+    }
+
+    /// One explicitly authorized type=1 transfer, persisted by the final permit.
+    /// The amount never implies permission to retry or to enable automatic top-up.
+    pub(in crate::control) async fn deposit_budget_with_permit<E, F, Fut>(
+        &self,
+        advert_id: u64,
+        amount_rubles: u64,
+        permit: F,
+    ) -> Result<u64, WbGuardedWriteError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        if !(1..=1_000_000).contains(&amount_rubles) {
+            return Err(WbGuardedWriteError::Write(WbWriteError::InvalidRequest(
+                "funding must be 1..=1000000 RUB",
+            )));
+        }
         validate_advert_id(advert_id).map_err(WbGuardedWriteError::Write)?;
         self.deposit_pacer
             .run_guarded(
@@ -372,7 +391,7 @@ impl WbBidWriteClient {
                     permit().await.map_err(WbGuardedWriteError::Permit)
                 },
                 || async {
-                    self.deposit_once(advert_id)
+                    self.deposit_once(advert_id, amount_rubles)
                         .await
                         .map_err(WbGuardedWriteError::Write)
                 },
@@ -380,14 +399,14 @@ impl WbBidWriteClient {
             .await
     }
 
-    async fn deposit_once(&self, advert_id: u64) -> Result<u64, WbWriteError> {
+    async fn deposit_once(&self, advert_id: u64, amount_rubles: u64) -> Result<u64, WbWriteError> {
         self.admit_shared_quota(DEPOSIT_BUDGET_PATH).await?;
         let send = self
             .http
             .post(format!("{}{}", self.base_url, DEPOSIT_BUDGET_PATH))
             .header(AUTHORIZATION, self.authorization.clone())
             .query(&[("id", advert_id)])
-            .json(&serde_json::json!({"sum": 1000, "type": 1, "return": true}))
+            .json(&serde_json::json!({"sum": amount_rubles, "type": 1, "return": true}))
             .send();
         let response = timeout(self.timeout, send)
             .await

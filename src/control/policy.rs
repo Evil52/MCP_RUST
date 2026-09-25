@@ -158,7 +158,11 @@ impl ControlPolicy {
         Self::from_slice(&bytes, &path, registry)
     }
 
-    fn from_slice(bytes: &[u8], path: &Path, registry: &AccessRegistry) -> Result<Self> {
+    pub(in crate::control) fn from_slice(
+        bytes: &[u8],
+        path: &Path,
+        registry: &AccessRegistry,
+    ) -> Result<Self> {
         let mut policy: Self = serde_json::from_slice(bytes)
             .with_context(|| format!("не удалось разобрать control policy {}", path.display()))?;
         validation::validate_policy(&policy, registry)?;
