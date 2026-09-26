@@ -3,10 +3,12 @@ use sha2::{Digest, Sha256};
 use tokio_postgres::{Client, NoTls};
 
 fn archive_cycle_id(case: &str) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(format!("runtime_incident_recovery/{case}"))
-    )
+    use std::fmt::Write;
+    let mut key = String::with_capacity(64);
+    for byte in Sha256::digest(format!("runtime_incident_recovery/{case}")) {
+        write!(key, "{byte:02x}").unwrap();
+    }
+    key
 }
 
 async fn admin() -> Option<Client> {
