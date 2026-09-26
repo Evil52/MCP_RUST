@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+  "as_of": "2026-09-26T12:00:00Z",
+  "window_start": "2026-09-25",
+  "window_end": "2026-09-25",
+  "sku_source": {
+    "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+    "source_ref": "SYNTHETIC:published-sku-report",
+    "observed_at": "2026-09-26T04:00:00Z",
+    "coverage_complete": true,
+    "rows": [
+      {
+        "date": "2026-09-25",
+        "campaign_id": 10,
+        "sku": 1,
+        "clicks": 100,
+        "spend_minor": 10000,
+        "direct_orders": 5,
+        "direct_revenue_minor": 500000,
+        "model_orders": 2,
+        "model_revenue_minor": 200000
+      }
+    ]
+  },
+  "campaign_source": {
+    "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+    "source_ref": "SYNTHETIC:campaign-daily-report",
+    "observed_at": "2026-09-26T05:00:00Z",
+    "coverage_complete": true,
+    "rows": [
+      {
+        "date": "2026-09-25",
+        "campaign_id": 10,
+        "clicks": 100,
+        "spend_minor": 10000,
+        "orders": 7,
+        "revenue_minor": 700000
+      }
+    ]
+  }
+}

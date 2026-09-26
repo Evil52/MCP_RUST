@@ -231,3 +231,116 @@ fn advertising_drr_example_recommends_without_cost_data_or_configuration() {
     );
     assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
 }
+
+#[test]
+fn prepare_then_recommend_archives_exact_evidence_and_report_without_inventing_maturity() {
+    let directory = FixtureDirectory::new();
+    let bundle = directory.write(
+        "bundle.json",
+        include_bytes!("../config/ads-optimizer-prepare.example.json"),
+    );
+    let prepared = command(&directory.0)
+        .arg("prepare")
+        .arg(&bundle)
+        .output()
+        .unwrap();
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let evidence: Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    assert_eq!(
+        evidence["products"][0]["daily"][0]["observed_at"],
+        "2026-09-25T03:00:00Z"
+    );
+    assert!(evidence["products"][0]["economics"].is_null());
+    let input = directory.write("prepared.json", &prepared.stdout);
+    let destination = directory.0.join("run-001");
+    let output = command(&directory.0)
+        .arg("recommend")
+        .arg(&input)
+        .arg("--journal-dir")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["recommendations"][0]["action"], "hold");
+    assert_eq!(report["recommendations"][0]["metrics"]["mature_days"], 0);
+    assert_eq!(
+        fs::read(destination.join("evidence.json")).unwrap(),
+        prepared.stdout
+    );
+    assert_eq!(
+        fs::read(destination.join("report.json")).unwrap(),
+        output.stdout
+    );
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(destination.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["input_sha256"], report["input_sha256"]);
+    assert_eq!(manifest["as_of"], evidence["as_of"]);
+    assert_eq!(fs::read_dir(&destination).unwrap().count(), 3);
+    let retry = command(&directory.0)
+        .arg("recommend")
+        .arg(&input)
+        .arg("--journal-dir")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(!retry.status.success());
+    assert!(retry.stdout.is_empty());
+    assert_eq!(
+        fs::read(destination.join("report.json")).unwrap(),
+        output.stdout
+    );
+}
+
+#[test]
+fn reconcile_reports_arithmetic_without_claiming_equivalent_attribution() {
+    let directory = FixtureDirectory::new();
+    let input = directory.write(
+        "exports.json",
+        include_bytes!("../config/ads-optimizer-reconciliation.example.json"),
+    );
+    let output = command(&directory.0)
+        .arg("reconcile")
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "diagnostic_only");
+    assert_eq!(report["semantic_equivalence_verified"], false);
+    assert_eq!(report["rows"][0]["daily_minus_direct"]["orders"], "2");
+    assert_eq!(
+        report["rows"][0]["direct_plus_model_arithmetic"]["orders_match"],
+        true
+    );
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+
+#[test]
+fn rejected_prepare_provenance_and_reconciliation_inputs_do_not_echo_source_data() {
+    let directory = FixtureDirectory::new();
+    let mut value: Value =
+        serde_json::from_str(include_str!("../config/ads-optimizer-prepare.example.json")).unwrap();
+    value["advertising_pages"][0]["response"]["rows"][0]["account_id"] =
+        Value::from("SECRET_FOREIGN_ACCOUNT");
+    let input = directory.write("foreign.json", &serde_json::to_vec(&value).unwrap());
+    let malformed = directory.write("malformed.json", b"SECRET_INPUT_MUST_NOT_APPEAR");
+    for (verb, path) in [("prepare", &input), ("reconcile", &malformed)] {
+        let output = command(&directory.0).arg(verb).arg(path).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8(output.stderr).unwrap().contains("SECRET"));
+    }
+}
