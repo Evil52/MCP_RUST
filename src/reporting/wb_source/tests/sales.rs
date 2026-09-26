@@ -9,6 +9,7 @@ const HTTP_BODY_LIMIT: usize = 2 * 1_048_576;
 #[derive(Clone)]
 struct SalesFixtureTransport {
     pages: Arc<Mutex<VecDeque<Value>>>,
+    closing_pages: Arc<Mutex<VecDeque<Value>>>,
     requested: Arc<Mutex<Vec<(u32, u32)>>>,
 }
 
@@ -16,8 +17,14 @@ impl SalesFixtureTransport {
     fn new(pages: Vec<Value>) -> Self {
         Self {
             pages: Arc::new(Mutex::new(pages.into())),
+            closing_pages: Arc::new(Mutex::new(VecDeque::new())),
             requested: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn with_closing(mut self, pages: Vec<Value>) -> Self {
+        self.closing_pages = Arc::new(Mutex::new(pages.into()));
+        self
     }
 }
 
@@ -36,6 +43,24 @@ impl WbReportTransport for SalesFixtureTransport {
                 .unwrap()
                 .pop_front()
                 .ok_or(WbReportSourceError::InvalidResponse)
+        })
+    }
+
+    fn sales_closing_page(
+        &self,
+        _date: NaiveDate,
+        _limit: u32,
+        offset: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(async move {
+            let page = self
+                .closing_pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(WbReportSourceError::SalesPageOverlap)?;
+            self.requested.lock().unwrap().push((u32::MAX, offset));
+            Ok(page)
         })
     }
 
@@ -297,7 +322,15 @@ async fn zero_overlap_yields_for_control_request_and_requires_matching_totals() 
         if expected_ok {
             assert_eq!(result.unwrap().len(), 251);
         } else {
-            assert_eq!(result, Err(WbReportSourceError::SalesPageOverlap));
+            assert_eq!(
+                result,
+                Err(WbReportSourceError::Checkpoint(CheckpointError::Deferred))
+            );
+            let source = WbReportSource::new(fixture.clone()).with_checkpoints(journal(&pages));
+            assert_eq!(
+                source.collect_sales_pages(day).await,
+                Err(WbReportSourceError::SalesPageOverlap)
+            );
         }
         assert_eq!(
             *fixture.requested.lock().unwrap(),
@@ -357,3 +390,5 @@ async fn live_transport_control_requests_unfiltered_daily_history() {
     );
     assert!(requests.try_recv().is_err());
 }
+
+mod closing;
