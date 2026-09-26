@@ -5,6 +5,7 @@
 //! Historical attributed orders are not fulfilled orders or incremental sales.
 
 mod allocation;
+pub mod campaign_history;
 mod evaluate;
 pub mod journal;
 mod model;

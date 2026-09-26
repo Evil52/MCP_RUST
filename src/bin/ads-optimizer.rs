@@ -11,6 +11,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use mcp_ozon::{
     reporting::ads_optimizer::{
         MAX_INPUT_BYTES,
+        campaign_history::{analyze_campaign_history, parse_campaign_history_input},
         journal::record_run,
         parse_input,
         prepare::{MAX_PREPARATION_BYTES, prepare_input},
@@ -20,7 +21,7 @@ use mcp_ozon::{
     runtime::print_runtime_version_if_requested,
 };
 
-const USAGE: &str = "usage: ads-optimizer recommend <evidence.json> [--journal-dir <new-run-directory>]\n       ads-optimizer prepare <bundle.json>\n       ads-optimizer reconcile <exports.json>\n       ads-optimizer --help\n       ads-optimizer --version";
+const USAGE: &str = "usage: ads-optimizer recommend <evidence.json> [--journal-dir <new-run-directory>]\n       ads-optimizer prepare <bundle.json>\n       ads-optimizer reconcile <exports.json>\n       ads-optimizer campaign-history <campaign-days.json>\n       ads-optimizer --help\n       ads-optimizer --version";
 
 fn validate_file(metadata: &Metadata, max_bytes: usize) -> Result<()> {
     ensure!(metadata.is_file(), "input must be a regular file");
@@ -100,6 +101,12 @@ fn main() -> Result<()> {
         [command, input] if command == "reconcile" => {
             let bytes = read_evidence(Path::new(input), MAX_INPUT_BYTES)?;
             json_bytes(&reconcile(parse_reconciliation_input(&bytes)?)?)?
+        }
+        [command, input] if command == "campaign-history" => {
+            let bytes = read_evidence(Path::new(input), MAX_INPUT_BYTES)?;
+            json_bytes(&analyze_campaign_history(parse_campaign_history_input(
+                &bytes,
+            )?)?)?
         }
         _ => bail!("{USAGE}"),
     };

@@ -13,6 +13,7 @@
 ```bash
 cargo run --locked --bin ads-optimizer -- prepare config/ads-optimizer-prepare.example.json > prepared.json
 cargo run --locked --bin ads-optimizer -- reconcile config/ads-optimizer-reconciliation.example.json > reconciliation.json
+cargo run --locked --bin ads-optimizer -- campaign-history config/ads-optimizer-campaign-history.example.json > campaign-history.json
 mkdir -m 700 ads-runs
 cargo run --locked --bin ads-optimizer -- recommend prepared.json --journal-dir ads-runs/run-001 > recommendation.json
 ```
@@ -123,6 +124,32 @@ checkpoint: старые сохранённые product_id/количества 
 Знаковые разницы сериализуются десятичными строками, чтобы не потерять
 точность при чтении JSON. Совпадение чисел не доказывает равенство определений
 атрибуции и не разрешает объединять показатели разных отчётов.
+
+## История кампаний без подмены SKU-атрибуции
+
+`campaign-history` принимает нормализованные строки дневного отчёта кампаний
+MCP ОФК (`ozon_performance_daily`): `date`, `campaign_id`, `clicks`,
+`spend_minor`, `orders`, `revenue_minor`. Значения `moneySpent` и `ordersMoney`
+при переносе из ответа Ozon переводятся из рублей в целые копейки; время
+`observed_at` берётся из фактического `fetched_at`. `source_ref` связывает
+расчёт с сохранённым полным ответом, `source_coverage_complete` — отдельное
+подтверждение полноты экспорта оператором. Синтетический пример находится в
+[config](../config/ads-optimizer-campaign-history.example.json).
+
+Выход группирует суммы по **кампании**, показывает рекламную ДРР и средний CPC
+по самому отчёту Ozon, число наблюдаемых дней и пропущенные даты. Пропуск
+не превращается в нулевую активность. Дубликат кампании и даты, чужой период,
+неверный ID и арифметическое переполнение отклоняются. Окно ограничено
+90 днями, вход — 4 МиБ и 25 000 строками. Порядок строк не влияет на
+контрольную сумму нормализованного входа.
+
+`mode: diagnostic_only` и `direct_sku_attribution_verified: false` неизменны.
+Даже кампания, содержащая сейчас только один SKU, могла иметь другой состав
+в прошлом; дневной отчёт кампании также не доказывает равенство его заказов
+прямым заказам SKU. Выход этой команды **не является** evidence для
+`recommend`, не предлагает ставки или бюджеты и не меняет кабинет. Чтобы
+получить зрелую SKU-историю, нужен отдельно подтверждённый исторический
+источник с той же семантикой прямой атрибуции, которую требует оптимизатор.
 
 ## Журнал запусков
 
