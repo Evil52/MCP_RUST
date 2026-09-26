@@ -377,8 +377,7 @@ probe_output="$(
   {
     cat <<'SQL'
 SELECT 'incident|' || account_id || '|' || advert_id || '|' || incident_class
-FROM wb_automation.execution_state
-WHERE incident_class IS NOT NULL;
+FROM wb_automation.open_incidents;
 
 SELECT 'unresolved|' || idempotency_key || '|' || status
 FROM wb_automation.action_attempts

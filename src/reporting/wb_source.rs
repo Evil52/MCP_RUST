@@ -1,8 +1,9 @@
 //! Bounded read-only Wildberries source for daily reports.
 
+mod sales;
 mod stocks;
 
-use std::{collections::BTreeSet, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::{Value, json};
@@ -23,8 +24,8 @@ use super::{
     },
     snapshot::{Marketplace, SnapshotStatus},
     wb_adapter::{
-        parse_campaign_ids, parse_price_page, parse_promotion_stats, parse_sales_page,
-        parse_stock_page,
+        parse_campaign_ids, parse_price_page, parse_promotion_stats, parse_sales_control_totals,
+        parse_sales_page, parse_stock_page,
     },
 };
 
@@ -54,6 +55,13 @@ pub trait WbReportTransport: Send + Sync {
         limit: u32,
         offset: u32,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>>;
+
+    fn sales_control_totals(
+        &self,
+        _date: NaiveDate,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(async { Err(WbReportSourceError::SalesPageOverlap) })
+    }
 
     fn stock_page<'a>(
         &'a self,
@@ -191,6 +199,24 @@ impl WbReportTransport for WbClientReportTransport {
                         "skipDeletedNm": false,
                         "limit": limit,
                         "offset": offset,
+                    }),
+                )
+                .await
+                .map_err(|error| wb_source_failure(&error))
+        })
+    }
+
+    fn sales_control_totals(
+        &self,
+        date: NaiveDate,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(async move {
+            self.client
+                .sales_funnel_grouped_history(
+                    &self.account_id,
+                    json!({
+                        "selectedPeriod":{"start":date,"end":date},"brandNames":[],"subjectIds":[],
+                        "tagIds":[],"skipDeletedNm":false,"aggregationLevel":"day"
                     }),
                 )
                 .await
@@ -399,56 +425,6 @@ impl WbReportSource {
         }
         log_source_completed("advertising", advertising.len());
         Ok(advertising)
-    }
-
-    pub async fn collect_sales_pages(
-        &self,
-        date: NaiveDate,
-    ) -> Result<Vec<CollectedSalesFact>, WbReportSourceError> {
-        self.collect_sales_pages_with_limit(date, MAX_SALES_PAGES)
-            .await
-    }
-
-    async fn collect_sales_pages_with_limit(
-        &self,
-        date: NaiveDate,
-        max_pages: usize,
-    ) -> Result<Vec<CollectedSalesFact>, WbReportSourceError> {
-        let mut facts = Vec::new();
-        let mut identities = BTreeSet::new();
-        for page in 0..max_pages {
-            let offset = page_offset(page, SALES_PAGE_SIZE_U32)?;
-            let (rows, source_rows) = checkpointed(
-                &self.checkpoints,
-                // Old 1,000-row checkpoints have different page boundaries.
-                // Never replay them as a short 250-row page after an upgrade.
-                json!(["wb_sales_v2", date, SALES_PAGE_SIZE_U32, offset]),
-                || async {
-                    parse_sales_page(
-                        &self
-                            .transport
-                            .sales_page(date, date, SALES_PAGE_SIZE_U32, offset)
-                            .await?,
-                    )
-                    .map_err(|_| WbReportSourceError::InvalidSalesResponse)
-                },
-            )
-            .await?;
-            if source_rows > SALES_PAGE_SIZE || rows.iter().any(|row| row.business_date != date) {
-                return Err(WbReportSourceError::InvalidSalesResponse);
-            }
-            if rows
-                .iter()
-                .any(|row| !identities.insert((row.business_date, row.sku)))
-            {
-                return Err(WbReportSourceError::SalesPageOverlap);
-            }
-            facts.extend(rows);
-            if source_rows < SALES_PAGE_SIZE {
-                return Ok(facts);
-            }
-        }
-        Err(WbReportSourceError::PaginationLimit)
     }
 
     pub async fn collect_price_pages(

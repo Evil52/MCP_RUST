@@ -5,6 +5,7 @@
 //! exact contract in `ozon_adapter` and every response is normalized before it
 //! can reach report persistence.
 mod failures;
+mod sales;
 mod stocks;
 pub use failures::OzonReportSourceError;
 
@@ -22,8 +23,8 @@ use crate::{
 use super::{
     checkpoint::{Checkpoints, checkpointed},
     ozon_adapter::{
-        OzonReportParseError, OzonReportRequest, parse_price_page, parse_sales_page,
-        product_page_request, sales_request,
+        OzonReportParseError, OzonReportRequest, parse_price_page, parse_sales_control_totals,
+        parse_sales_page, product_page_request, sales_request,
     },
     ozon_finance_source::collect_finance_facts,
     postgres_collector::{
@@ -468,69 +469,6 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             stocks,
             prices,
         })
-    }
-
-    pub async fn sales_page(
-        &self,
-        date_from: NaiveDate,
-        date_to: NaiveDate,
-        offset: u32,
-    ) -> Result<Vec<CollectedSalesFact>, OzonReportSourceError> {
-        let request = sales_request(date_from, date_to, offset)
-            .map_err(|_| OzonReportSourceError::InvalidResponse)?;
-        checkpointed(
-            &self.checkpoints,
-            json!([request.path, request.payload]),
-            || async {
-                let response = self.transport.post(request).await?;
-                parse_sales_page(&response).map_err(|_| {
-                    let shape = sales_response_shape(&response);
-                    tracing::warn!(shape, "Ozon Seller analytics response shape was rejected");
-                    OzonReportSourceError::InvalidSalesResponse { shape }
-                })
-            },
-        )
-        .await
-    }
-
-    /// Collects offset-paginated sales rows under the client's one-request-per-
-    /// minute Analytics gate. A full-size final page is not accepted as
-    /// complete because the upstream response has no trustworthy total-row
-    /// contract.
-    pub async fn collect_sales_pages(
-        &self,
-        date_from: NaiveDate,
-        date_to: NaiveDate,
-    ) -> Result<Vec<CollectedSalesFact>, OzonReportSourceError> {
-        let mut facts = Vec::new();
-        let mut identities = BTreeSet::new();
-        for page in 0..MAX_SALES_PAGES {
-            let offset = u32::try_from(page)
-                .ok()
-                .and_then(|page| page.checked_mul(1_000))
-                .ok_or(OzonReportSourceError::PaginationLimit)?;
-            let rows = self.sales_page(date_from, date_to, offset).await?;
-            if rows
-                .iter()
-                .any(|row| row.business_date < date_from || row.business_date > date_to)
-            {
-                return Err(OzonReportSourceError::InvalidSalesResponse {
-                    shape: "date_outside_requested_period".to_owned(),
-                });
-            }
-            if rows
-                .iter()
-                .any(|row| !identities.insert((row.business_date, row.sku)))
-            {
-                return Err(OzonReportSourceError::SalesPageOverlap);
-            }
-            let complete = rows.len() < 1_000;
-            facts.extend(rows);
-            if complete {
-                return Ok(facts);
-            }
-        }
-        Err(OzonReportSourceError::PaginationLimit)
     }
 
     /// Collects cursor-paginated price pages with a fixed upper bound.

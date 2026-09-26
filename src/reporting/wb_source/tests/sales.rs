@@ -39,6 +39,20 @@ impl WbReportTransport for SalesFixtureTransport {
         })
     }
 
+    fn sales_control_totals(
+        &self,
+        _date: NaiveDate,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(async move {
+            self.requested.lock().unwrap().push((0, 0));
+            self.pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(WbReportSourceError::InvalidResponse)
+        })
+    }
+
     fn stock_page<'a>(
         &'a self,
         _limit: u32,
@@ -239,4 +253,107 @@ async fn smaller_sales_pages_preserve_total_catalogue_limit_and_require_terminal
         page_offset(u32::MAX as usize, 250),
         Err(WbReportSourceError::PaginationLimit)
     );
+}
+
+fn control_total(units: u64, sum: u64) -> Value {
+    json!({"data":[{"currency":"RUB","product":{"nmId":0,"subjectId":0,"brandName":""},
+        "history":[{"date":DATE,"orderCount":units,"orderSum":sum}]}]})
+}
+
+#[tokio::test]
+async fn zero_overlap_yields_for_control_request_and_requires_matching_totals() {
+    let day = NaiveDate::parse_from_str(DATE, "%Y-%m-%d").unwrap();
+    let mut first = sales_page(DATE, 0, 250, 0);
+    for row in first["data"]["products"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .skip(1)
+    {
+        row["statistic"]["selected"]["orderCount"] = json!(0);
+        row["statistic"]["selected"]["orderSum"] = json!(0);
+    }
+    let mut second = sales_page(DATE, 250, 1, 0);
+    second["data"]["products"]
+        .as_array_mut()
+        .unwrap()
+        .push(first["data"]["products"][1].clone());
+    for (units, expected_ok) in [(2, true), (3, false)] {
+        let pages = MemoryPages::default();
+        let fixture = SalesFixtureTransport::new(vec![
+            first.clone(),
+            second.clone(),
+            control_total(units, 180),
+        ]);
+        for _ in 0..2 {
+            let source = WbReportSource::new(fixture.clone()).with_checkpoints(journal(&pages));
+            assert_eq!(
+                source.collect_sales_pages(day).await,
+                Err(WbReportSourceError::Checkpoint(CheckpointError::Deferred))
+            );
+        }
+        let source = WbReportSource::new(fixture.clone()).with_checkpoints(journal(&pages));
+        let result = source.collect_sales_pages(day).await;
+        if expected_ok {
+            assert_eq!(result.unwrap().len(), 251);
+        } else {
+            assert_eq!(result, Err(WbReportSourceError::SalesPageOverlap));
+        }
+        assert_eq!(
+            *fixture.requested.lock().unwrap(),
+            vec![(250, 0), (250, 250), (0, 0)]
+        );
+    }
+}
+
+#[test]
+fn grouped_control_totals_never_accept_a_product_or_wrong_day_as_account_total() {
+    let day = NaiveDate::parse_from_str(DATE, "%Y-%m-%d").unwrap();
+    let valid = control_total(2, 180);
+    assert!(parse_sales_control_totals(&valid, day).is_ok());
+    for pointer in ["/data/0/product/nmId", "/data/0/product/subjectId"] {
+        let mut wrong = valid.clone();
+        *wrong.pointer_mut(pointer).unwrap() = json!(1);
+        assert!(parse_sales_control_totals(&wrong, day).is_err());
+    }
+    let mut wrong = valid.clone();
+    wrong["data"][0]["history"][0]["date"] = json!("2026-08-16");
+    assert!(parse_sales_control_totals(&wrong, day).is_err());
+    let mut wrong = valid;
+    wrong["data"][0]["currency"] = json!("USD");
+    assert!(parse_sales_control_totals(&wrong, day).is_err());
+}
+
+#[tokio::test]
+async fn live_transport_control_requests_unfiltered_daily_history() {
+    let (url, requests) = mock_http(vec![(200, control_total(2, 180).to_string())]);
+    let client = WbClient::new_for_test(
+        Duration::from_secs(2),
+        BTreeMap::from([(
+            "account".to_owned(),
+            WbCredentials {
+                token: "test-token".to_owned(),
+            },
+        )]),
+        &url,
+        &url,
+    );
+    let transport = WbClientReportTransport::new(client, "account".to_owned());
+    let date = NaiveDate::parse_from_str(DATE, "%Y-%m-%d").unwrap();
+    assert_eq!(
+        transport.sales_control_totals(date).await.unwrap(),
+        control_total(2, 180)
+    );
+    let request = requests.recv().unwrap();
+    assert!(request.starts_with("POST /api/analytics/v3/sales-funnel/grouped/history HTTP/1.1"));
+    let (_, body) = request.split_once("\r\n\r\n").unwrap();
+    let payload: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(
+        payload,
+        json!({
+            "selectedPeriod":{"start":DATE,"end":DATE},"brandNames":[],"subjectIds":[],
+            "tagIds":[],"skipDeletedNm":false,"aggregationLevel":"day"
+        })
+    );
+    assert!(requests.try_recv().is_err());
 }

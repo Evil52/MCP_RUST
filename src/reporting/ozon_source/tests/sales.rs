@@ -47,3 +47,56 @@ async fn sales_identity_distinguishes_days_but_never_merges_duplicates() {
         Err(OzonReportSourceError::SalesPageOverlap)
     );
 }
+
+#[tokio::test]
+async fn zero_overlap_requires_matching_independent_day_totals() {
+    let day = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+    let mut first = page(
+        &(1..=1000)
+            .map(|sku| (sku, "2026-08-17"))
+            .collect::<Vec<_>>(),
+    );
+    for row in first["result"]["data"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .skip(1)
+    {
+        row["metrics"] = json!([0, 0]);
+    }
+    let mut second = page(&[(2, "2026-08-17"), (1001, "2026-08-17")]);
+    second["result"]["data"][0]["metrics"] = json!([0, 0]);
+    for (units, expected_ok) in [(4, true), (5, false)] {
+        let control = json!({"result":{"data":[{"dimensions":[{"id":"2026-08-17"}],"metrics":["2.50",units]}]}});
+        let source = OzonReportSource::new(FixtureTransport(Mutex::new(VecDeque::from([
+            Ok(first.clone()),
+            Ok(second.clone()),
+            Ok(control),
+        ]))));
+        let result = source.collect_sales_pages(day, day).await;
+        if expected_ok {
+            assert_eq!(result.unwrap().len(), 1001);
+        } else {
+            assert_eq!(result, Err(OzonReportSourceError::SalesPageOverlap));
+        }
+    }
+}
+
+#[test]
+fn independent_ozon_totals_reject_wrong_dimensions_dates_and_counts() {
+    let day = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
+    for (dimensions, metrics) in [
+        (json!([{"id":"2026-08-16"}]), json!([1, 1])),
+        (json!([{"id":"2026-08-17"},{"id":"1"}]), json!([1, 1])),
+        (json!([{"id":"2026-08-17"}]), json!([1, -1])),
+    ] {
+        assert!(
+            parse_sales_control_totals(
+                &json!({"result":{"data":[{"dimensions":dimensions,"metrics":metrics}]}}),
+                day,
+                day
+            )
+            .is_err()
+        );
+    }
+}
