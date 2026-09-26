@@ -4,6 +4,10 @@ These fixes address two source failures observed after enabling independent
 collection on release `68c0523`. They do not change marketplace permissions,
 the HTTP response budget, the database schema, or source-job retry policy.
 
+> Follow-up: [SKU identity and available stock correction](ozon-stock-identity.md)
+> supersedes the uppercase fallback dimensions below for new snapshots.
+> The behavior below describes the earlier release and its historical data.
+
 ## Ozon fulfillment stocks
 
 The `/v4/product/info/stocks` fallback returned `stocks[].type = "rfbs"` in

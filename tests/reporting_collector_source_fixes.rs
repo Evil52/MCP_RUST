@@ -62,9 +62,9 @@ async fn rfbs_fallback_is_published_and_read_as_a_distinct_fulfillment_dimension
     let facts: Vec<CollectedStockFact> =
         checkpointed(&journal, json!(["rfbs-fixture", 0]), || async {
             parse_stock_page(&json!({"items":[{"product_id":1,"stocks":[
-                {"type":"fbo","present":2},
-                {"type":"fbs","present":3},
-                {"type":"rfbs","present":5}
+                {"type":"fbo","sku":7,"present":3,"reserved":1},
+                {"type":"fbs","sku":7,"present":5,"reserved":2},
+                {"type":"rfbs","sku":7,"present":8,"reserved":3}
             ]}],"cursor":""}))
             .map_err(|_| CheckpointError::Invalid)
         })
@@ -94,6 +94,7 @@ async fn rfbs_fallback_is_published_and_read_as_a_distinct_fulfillment_dimension
         .unwrap();
     assert_eq!(readback.state, "available");
     assert_eq!(readback.total_rows, 3);
+    assert!(readback.rows.iter().all(|row| row["sku"] == 7));
     assert_eq!(readback.next_offset, None);
     assert!(readback.source_as_of.is_some() && readback.observed_from.is_some());
     let latest = readback.latest_collection.as_ref().unwrap();
@@ -111,6 +112,10 @@ async fn rfbs_fallback_is_published_and_read_as_a_distinct_fulfillment_dimension
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(
         dimensions,
-        std::collections::BTreeMap::from([("FBO", 2), ("FBS", 3), ("RFBS", 5),])
+        std::collections::BTreeMap::from([
+            ("sku-fulfillment-v2:fbo", 2),
+            ("sku-fulfillment-v2:fbs", 3),
+            ("sku-fulfillment-v2:rfbs", 5),
+        ])
     );
 }

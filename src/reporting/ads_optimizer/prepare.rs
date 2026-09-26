@@ -21,6 +21,7 @@ use super::{
 };
 use crate::reporting::{
     business_date,
+    ozon_adapter::stocks::is_sku_fulfillment_dimension,
     postgres_snapshot::PublishedAdvertisingFact,
     snapshot::{Marketplace, SnapshotDescriptor, SnapshotSource, SnapshotStatus},
     yekaterinburg_offset,
@@ -563,7 +564,9 @@ fn stock_evidence(
             return Err(PrepareError::InvalidSnapshot);
         }
         let mut keys = BTreeSet::new();
-        let mut native_rows = Vec::new();
+        let mut verified_rows = Vec::new();
+        let mut fulfillment = false;
+        let mut warehouse = false;
         let mut legacy = false;
         for value in &snapshot.rows {
             let row: StockRow =
@@ -577,17 +580,21 @@ fn stock_evidence(
                 // without subtracting reserved. Neither identifier nor quantity
                 // can be interpreted as native sellable SKU stock here.
                 legacy = true;
+            } else if is_sku_fulfillment_dimension(&row.warehouse_id) {
+                fulfillment = true;
+                verified_rows.push(row);
             } else {
-                let warehouse = row
+                let warehouse_id = row
                     .warehouse_id
                     .strip_prefix("fbo:")
                     .or_else(|| row.warehouse_id.strip_prefix("fbs:"))
                     .and_then(|id| id.parse::<u64>().ok())
                     .filter(|id| positive_id(*id));
-                if warehouse.is_none() {
+                if warehouse_id.is_none() {
                     return Err(PrepareError::InvalidSnapshot);
                 }
-                native_rows.push(row);
+                warehouse = true;
+                verified_rows.push(row);
             }
         }
         if legacy {
@@ -597,7 +604,12 @@ fn stock_evidence(
             ));
             continue;
         }
-        for row in native_rows {
+        // These are alternative complete collection modes. Combining their
+        // totals would count the same units twice, including zero-valued rows.
+        if fulfillment && warehouse {
+            return Err(PrepareError::InvalidSnapshot);
+        }
+        for row in verified_rows {
             if selected.contains(&row.sku) {
                 let stock = stocks.entry(row.sku).or_insert_with(|| StockEvidence {
                     sellable_units: 0,

@@ -554,3 +554,65 @@ fn source_descriptor_rejects_bad_cutoff_even_when_all_fact_provenance_matches() 
     }
     assert!(matches!(prepare(late), Err(PrepareError::InvalidSnapshot)));
 }
+
+#[test]
+fn corrected_sku_fulfillment_rows_are_accepted_without_a_product_id_mapping() {
+    let source = json!({"items": [{"product_id": 999, "stocks": [
+        {"sku": 1, "type": "fbo", "present": 10, "reserved": 3},
+        {"sku": 1, "type": "fbs", "present": 7, "reserved": 1},
+        {"sku": 1, "type": "rfbs", "present": 2, "reserved": 1}
+    ]}]});
+    let normalized = crate::reporting::ozon_adapter::parse_stock_page(&source).unwrap();
+    let mut bundle = fixture();
+    bundle.stock_pages = vec![stock_page(
+        normalized
+            .iter()
+            .map(|row| stock_row(row.sku, &row.warehouse_id, row.sellable_units))
+            .collect(),
+    )];
+    let input = prepare(bundle).unwrap();
+    let stock = input.products[0].stock.as_ref().unwrap();
+    assert_eq!(input.products[0].sku, 1);
+    assert_eq!(stock.sellable_units, 14);
+    assert_eq!(stock.observed_at, time(26, 11));
+    assert!(
+        !input
+            .source_refs
+            .iter()
+            .any(|value| value.starts_with("unsupported-legacy"))
+    );
+}
+
+#[test]
+fn corrected_fulfillment_totals_cannot_be_added_to_physical_warehouse_totals() {
+    for units in [0, 7] {
+        let mut mixed = fixture();
+        mixed.stock_pages = vec![stock_page(vec![
+            stock_row(1, "sku-fulfillment-v2:fbs", units),
+            stock_row(1, "fbs:123", units),
+        ])];
+        assert!(matches!(prepare(mixed), Err(PrepareError::InvalidSnapshot)));
+    }
+    for invalid in [
+        "sku-fulfillment-v1:fbo",
+        "sku-fulfillment-v2:unknown",
+        "sku-fulfillment-v2:FBO",
+    ] {
+        let mut bundle = fixture();
+        bundle.stock_pages = vec![stock_page(vec![stock_row(1, invalid, 1)])];
+        assert!(matches!(
+            prepare(bundle),
+            Err(PrepareError::InvalidSnapshot)
+        ));
+    }
+}
+
+#[test]
+fn legacy_stock_cannot_be_rehabilitated_by_mixing_it_with_corrected_rows() {
+    let mut bundle = fixture();
+    bundle.stock_pages = vec![stock_page(vec![
+        stock_row(1, "sku-fulfillment-v2:fbs", 7),
+        stock_row(999, "FBO", 30),
+    ])];
+    assert!(prepare(bundle).unwrap().products[0].stock.is_none());
+}

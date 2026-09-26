@@ -7,8 +7,6 @@
 //! no I/O and never resolves credentials; the network adapter must pass its
 //! responses through these functions before a snapshot can be persisted.
 
-use std::collections::BTreeMap;
-
 use chrono::NaiveDate;
 use serde_json::Value;
 use thiserror::Error;
@@ -30,6 +28,9 @@ const MAX_PERFORMANCE_SKU_ROWS: usize = 20_000;
 const PRODUCT_PAGE_ROWS: usize = 100;
 const MAX_CURSOR_BYTES: usize = 4_096;
 const MAX_CAMPAIGN_TITLE_BYTES: usize = 512;
+
+pub mod stocks;
+pub use stocks::parse_stock_page;
 
 #[cfg(test)]
 mod stock_tests;
@@ -261,41 +262,6 @@ pub fn next_warehouse_stock_cursor(
     } else {
         Err(OzonReportParseError::Value)
     }
-}
-
-/// Normalizes one `/v4/product/info/stocks` page.
-///
-/// Ozon reports inventory by fulfillment type in the verified envelope. The
-/// daily-report storage calls this dimension `warehouse_id`; using the type as
-/// its stable value prevents a made-up warehouse split and lets report-level
-/// stock sum FBO/FBS/rFBS rows correctly without merging their provenance.
-pub fn parse_stock_page(response: &Value) -> Result<Vec<CollectedStockFact>, OzonReportParseError> {
-    let items = array_field(response, "items")?;
-    if items.len() > PRODUCT_PAGE_ROWS {
-        return Err(OzonReportParseError::TooManyRows);
-    }
-    let mut totals = BTreeMap::<(u64, String), u64>::new();
-    for item in items {
-        let item = item.as_object().ok_or(OzonReportParseError::Shape)?;
-        let sku = parse_u64(field(Some(item), "product_id")?)?;
-        for stock in array_field_value(item.get("stocks"))? {
-            let stock = stock.as_object().ok_or(OzonReportParseError::Shape)?;
-            let kind = parse_warehouse_kind(field(Some(stock), "type")?)?;
-            let present = parse_u64(field(Some(stock), "present")?)?;
-            let total = totals.entry((sku, kind)).or_default();
-            *total = total
-                .checked_add(present)
-                .ok_or(OzonReportParseError::Value)?;
-        }
-    }
-    Ok(totals
-        .into_iter()
-        .map(|((sku, warehouse_id), sellable_units)| CollectedStockFact {
-            sku,
-            warehouse_id,
-            sellable_units,
-        })
-        .collect())
 }
 
 /// Normalizes one `/v5/product/info/prices` page.
@@ -570,22 +536,6 @@ fn parse_count(value: &Value) -> Result<u64, OzonReportParseError> {
                 .map_err(|_| OzonReportParseError::Value)
         }
         Value::String(_) => parse_u64(value),
-        _ => Err(OzonReportParseError::Value),
-    }
-}
-
-fn parse_warehouse_kind(value: &Value) -> Result<String, OzonReportParseError> {
-    let value = value.as_str().ok_or(OzonReportParseError::Value)?;
-    // `/v4/product/info/stocks` currently returns lowercase fulfillment types
-    // (`fbo` / `fbs` / `rfbs`), while earlier verified fixtures used uppercase values.
-    // The API meaning is identical, so persist one canonical identifier rather
-    // than treating a casing-only upstream change as a new warehouse kind.
-    match value {
-        "fbo" | "FBO" => Ok("FBO".to_owned()),
-        "fbs" | "FBS" => Ok("FBS".to_owned()),
-        // Verified in bounded Seller API reads on 2026-09-10. rFBS is a
-        // distinct fulfillment scheme, not an alias for seller-fulfilled FBS.
-        "rfbs" | "RFBS" => Ok("RFBS".to_owned()),
         _ => Err(OzonReportParseError::Value),
     }
 }
@@ -900,14 +850,14 @@ mod tests {
         let stocks = parse_stock_page(&json!({"items": [{
             "product_id": 123,
             "stocks": [
-                {"type": "FBO", "present": 2},
-                {"type": "FBO", "present": 3},
-                {"type": "FBS", "present": 7}
+                {"type": "FBO", "sku": 456, "present": 5, "reserved": 0},
+                {"type": "FBS", "sku": 456, "present": 7, "reserved": 2}
             ]
         }]}))
         .unwrap();
         assert_eq!(stocks.len(), 2);
-        assert_eq!(stocks[0].warehouse_id, "FBO");
+        assert_eq!(stocks[0].warehouse_id, "sku-fulfillment-v2:fbo");
+        assert_eq!(stocks[0].sku, 456);
         assert_eq!(stocks[0].sellable_units, 5);
 
         let prices = parse_price_page(&json!({"items": [{
