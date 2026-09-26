@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "marketplace": "ozon",
+  "pricing_model": "cpc",
+  "currency": "RUB",
+  "source_refs": [
+    "SYNTHETIC:advertising-daily-example-v1",
+    "SYNTHETIC:stock-example-v1",
+    "SYNTHETIC:reviewed-economics-example-v1",
+    "SYNTHETIC:budget-constraint-example-v1"
+  ],
+  "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+  "as_of": "2026-09-25T12:00:00Z",
+  "observed_at": "2026-09-25T12:00:00Z",
+  "window_start": "2026-09-01",
+  "window_end": "2026-09-14",
+  "coverage_complete": true,
+  "policy": {
+    "total_daily_budget_minor": 110000,
+    "attribution_lag_days": 7,
+    "min_mature_days": 7,
+    "min_clicks": 100,
+    "min_orders": 5,
+    "max_data_age_hours": 48,
+    "max_stock_age_hours": 24,
+    "safety_discount_bps": 2000,
+    "max_budget_increase_bps": 1000,
+    "budget_decrease_bps": 2000,
+    "zero_order_spend_allowances": 2,
+    "max_window_end_age_days": 21
+  },
+  "products": [
+    {
+      "sku": 1,
+      "current_daily_budget_minor": 100000,
+      "max_daily_budget_minor": 150000,
+      "daily": [
+        {
+          "date": "2026-09-01",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-02",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-03",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-04",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-05",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-06",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-07",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-08",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-09",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-10",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-11",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-12",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-13",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        },
+        {
+          "date": "2026-09-14",
+          "clicks": 100,
+          "spend_minor": 10000,
+          "direct_orders": 5,
+          "direct_revenue_minor": 500000
+        }
+      ],
+      "stock": {
+        "sellable_units": 1000,
+        "observed_at": "2026-09-25T12:00:00Z"
+      },
+      "economics": {
+        "basis": "expected_per_direct_attributed_order",
+        "source_ref": "SYNTHETIC:reviewed-economics-example-v1",
+        "valid_from": "2026-09-01",
+        "valid_to": "2026-10-31",
+        "reviewed_at": "2026-09-25T12:00:00Z",
+        "expected_revenue_minor": 100000,
+        "expected_cost_of_goods_minor": 50000,
+        "expected_other_costs_minor": 25000,
+        "return_reserve_minor": 5000,
+        "target_profit_minor": 5000
+      },
+      "budget_constraint": {
+        "limited": true,
+        "observed_at": "2026-09-25T12:00:00Z"
+      }
+    }
+  ]
+}

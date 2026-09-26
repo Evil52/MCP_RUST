@@ -16,6 +16,66 @@ pub(super) async fn load_history_kpis(
     client: &Client,
     expected: &BTreeMap<i64, SnapshotDescriptor>,
 ) -> Result<BTreeMap<DateTime<Utc>, KpiSummary>, ReportingReadError> {
+    let mut summaries = BTreeMap::new();
+    for batch in history_kpi_batches(expected)? {
+        // Raw facts are released after each batch; only one summary per cutoff
+        // survives. The caller separately bounds the number of history points.
+        summaries.extend(load_history_kpi_batch(client, &batch).await?);
+    }
+    Ok(summaries)
+}
+
+/// Keep each cutoff's sales/advertising pair together so KPI calculations never
+/// see a truncated pair. The fact-row budget applies to each query batch, not
+/// the combined size of an otherwise valid multi-day history request.
+fn history_kpi_batches(
+    expected: &BTreeMap<i64, SnapshotDescriptor>,
+) -> Result<Vec<BTreeMap<i64, SnapshotDescriptor>>, ReportingReadError> {
+    let mut by_cutoff = BTreeMap::<DateTime<Utc>, Vec<&SnapshotDescriptor>>::new();
+    for descriptor in expected.values().filter(|descriptor| {
+        matches!(
+            descriptor.source(),
+            SnapshotSource::Sales | SnapshotSource::Advertising
+        )
+    }) {
+        by_cutoff
+            .entry(descriptor.cutoff_at())
+            .or_default()
+            .push(descriptor);
+    }
+
+    let mut batches = Vec::new();
+    let mut batch = BTreeMap::new();
+    let mut batch_rows = 0;
+    for descriptors in by_cutoff.into_values() {
+        let cutoff_rows = descriptors
+            .iter()
+            .try_fold(0usize, |total, descriptor| {
+                total.checked_add(descriptor.row_count() as usize)
+            })
+            .ok_or(ReportingReadError::InvalidPublishedData)?;
+        validate_expected_fact_rows(cutoff_rows)?;
+        if batch_rows + cutoff_rows > MAX_FACT_ROWS {
+            batches.push(std::mem::take(&mut batch));
+            batch_rows = 0;
+        }
+        batch_rows += cutoff_rows;
+        batch.extend(
+            descriptors
+                .into_iter()
+                .map(|descriptor| (descriptor.snapshot_id(), descriptor.clone())),
+        );
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+    Ok(batches)
+}
+
+async fn load_history_kpi_batch(
+    client: &Client,
+    expected: &BTreeMap<i64, SnapshotDescriptor>,
+) -> Result<BTreeMap<DateTime<Utc>, KpiSummary>, ReportingReadError> {
     let metric_descriptors = expected
         .values()
         .filter(|descriptor| {
@@ -487,3 +547,6 @@ pub(super) fn fact_descriptor<'a>(
     validate_fact_provenance(provenance, descriptor, expected_source)?;
     Ok((snapshot_id, descriptor))
 }
+
+#[cfg(test)]
+mod tests;

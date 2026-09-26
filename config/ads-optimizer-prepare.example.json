@@ -1,0 +1,234 @@
+{
+  "version": 1,
+  "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+  "as_of": "2026-09-26T12:00:00Z",
+  "window_start": "2026-09-24",
+  "window_end": "2026-09-25",
+  "objective": {
+    "kind": "target_advertising_drr",
+    "max_drr_bps": 1500
+  },
+  "policy": {
+    "total_daily_budget_minor": 110000,
+    "attribution_lag_days": 7,
+    "min_mature_days": 7,
+    "min_clicks": 100,
+    "min_orders": 5,
+    "max_data_age_hours": 48,
+    "max_stock_age_hours": 24,
+    "safety_discount_bps": 2000,
+    "max_budget_increase_bps": 1000,
+    "budget_decrease_bps": 2000,
+    "zero_order_spend_allowances": 2,
+    "max_window_end_age_days": 21
+  },
+  "products": [
+    {
+      "sku": 1,
+      "current_daily_budget_minor": 100000,
+      "max_daily_budget_minor": 150000,
+      "budget_constraint": null,
+      "economics": null,
+      "cpc_scope": {
+        "campaign_ids": [
+          10,
+          20
+        ],
+        "pricing_model": "cpc",
+        "source_ref": "SYNTHETIC:reviewed-complete-cpc-scope",
+        "observed_at": "2026-09-26T12:00:00Z",
+        "all_campaigns_confirmed": true
+      }
+    }
+  ],
+  "advertising_pages": [
+    {
+      "offset": 0,
+      "response": {
+        "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+        "marketplace": "ozon",
+        "source": "advertising",
+        "storage": "published_postgresql_snapshots",
+        "state": "available",
+        "data_state": "available",
+        "quality": "complete",
+        "pagination_complete": true,
+        "snapshot_id": "100",
+        "cutoff_at": "2026-09-25T03:00:00Z",
+        "source_as_of": "2026-09-25T04:00:00Z",
+        "observed_from": "2026-09-25T03:00:00Z",
+        "period_start": "2026-09-24T00:00:00+05:00",
+        "period_end": "2026-09-25T00:00:00+05:00",
+        "total_rows": 2,
+        "rows": [
+          {
+            "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+            "marketplace": "ozon",
+            "source": "advertising",
+            "snapshot_id": 100,
+            "cutoff_at": "2026-09-25T03:00:00Z",
+            "source_as_of": "2026-09-25T04:00:00Z",
+            "snapshot_status": "succeeded",
+            "pagination_complete": true,
+            "business_date": "2026-09-24",
+            "campaign_id": 10,
+            "sku": 1,
+            "currency": "RUB",
+            "impressions": 1000,
+            "clicks": 100,
+            "spend_minor": 10000,
+            "attributed_orders": 5,
+            "attributed_revenue_minor": 500000,
+            "basket_additions": 7,
+            "model_attributed_orders": 2,
+            "model_attributed_revenue_minor": 200000,
+            "product_price_minor": 100000,
+            "average_cpc_minor": 100,
+            "cpm_minor": 10000,
+            "cpl_minor": 1428
+          },
+          {
+            "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+            "marketplace": "ozon",
+            "source": "advertising",
+            "snapshot_id": 100,
+            "cutoff_at": "2026-09-25T03:00:00Z",
+            "source_as_of": "2026-09-25T04:00:00Z",
+            "snapshot_status": "succeeded",
+            "pagination_complete": true,
+            "business_date": "2026-09-24",
+            "campaign_id": 20,
+            "sku": 1,
+            "currency": "RUB",
+            "impressions": 1000,
+            "clicks": 100,
+            "spend_minor": 10000,
+            "attributed_orders": 5,
+            "attributed_revenue_minor": 500000,
+            "basket_additions": 7,
+            "model_attributed_orders": 2,
+            "model_attributed_revenue_minor": 200000,
+            "product_price_minor": 100000,
+            "average_cpc_minor": 100,
+            "cpm_minor": 10000,
+            "cpl_minor": 1428
+          }
+        ],
+        "next_offset": null
+      }
+    },
+    {
+      "offset": 0,
+      "response": {
+        "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+        "marketplace": "ozon",
+        "source": "advertising",
+        "storage": "published_postgresql_snapshots",
+        "state": "available",
+        "data_state": "available",
+        "quality": "complete",
+        "pagination_complete": true,
+        "snapshot_id": "101",
+        "cutoff_at": "2026-09-26T03:00:00Z",
+        "source_as_of": "2026-09-26T04:00:00Z",
+        "observed_from": "2026-09-26T03:00:00Z",
+        "period_start": "2026-09-25T00:00:00+05:00",
+        "period_end": "2026-09-26T00:00:00+05:00",
+        "total_rows": 2,
+        "rows": [
+          {
+            "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+            "marketplace": "ozon",
+            "source": "advertising",
+            "snapshot_id": 101,
+            "cutoff_at": "2026-09-26T03:00:00Z",
+            "source_as_of": "2026-09-26T04:00:00Z",
+            "snapshot_status": "succeeded",
+            "pagination_complete": true,
+            "business_date": "2026-09-25",
+            "campaign_id": 10,
+            "sku": 1,
+            "currency": "RUB",
+            "impressions": 1000,
+            "clicks": 100,
+            "spend_minor": 10000,
+            "attributed_orders": 5,
+            "attributed_revenue_minor": 500000,
+            "basket_additions": 7,
+            "model_attributed_orders": 2,
+            "model_attributed_revenue_minor": 200000,
+            "product_price_minor": 100000,
+            "average_cpc_minor": 100,
+            "cpm_minor": 10000,
+            "cpl_minor": 1428
+          },
+          {
+            "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+            "marketplace": "ozon",
+            "source": "advertising",
+            "snapshot_id": 101,
+            "cutoff_at": "2026-09-26T03:00:00Z",
+            "source_as_of": "2026-09-26T04:00:00Z",
+            "snapshot_status": "succeeded",
+            "pagination_complete": true,
+            "business_date": "2026-09-25",
+            "campaign_id": 20,
+            "sku": 1,
+            "currency": "RUB",
+            "impressions": 1000,
+            "clicks": 100,
+            "spend_minor": 10000,
+            "attributed_orders": 5,
+            "attributed_revenue_minor": 500000,
+            "basket_additions": 7,
+            "model_attributed_orders": 2,
+            "model_attributed_revenue_minor": 200000,
+            "product_price_minor": 100000,
+            "average_cpc_minor": 100,
+            "cpm_minor": 10000,
+            "cpl_minor": 1428
+          }
+        ],
+        "next_offset": null
+      }
+    }
+  ],
+  "stock_pages": [
+    {
+      "offset": 0,
+      "response": {
+        "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+        "marketplace": "ozon",
+        "source": "stocks",
+        "storage": "published_postgresql_snapshots",
+        "state": "available",
+        "data_state": "available",
+        "quality": "complete",
+        "pagination_complete": true,
+        "snapshot_id": "200",
+        "cutoff_at": "2026-09-26T03:00:00Z",
+        "source_as_of": "2026-09-26T04:00:00Z",
+        "observed_from": "2026-09-26T03:00:00Z",
+        "period_start": "2026-09-26T04:00:00Z",
+        "period_end": "2026-09-26T04:00:00Z",
+        "total_rows": 1,
+        "rows": [
+          {
+            "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+            "marketplace": "ozon",
+            "source": "stocks",
+            "snapshot_id": 200,
+            "cutoff_at": "2026-09-26T03:00:00Z",
+            "source_as_of": "2026-09-26T04:00:00Z",
+            "snapshot_status": "succeeded",
+            "pagination_complete": true,
+            "sku": 1,
+            "warehouse_id": "fbo:123",
+            "sellable_units": 100
+          }
+        ],
+        "next_offset": null
+      }
+    }
+  ]
+}

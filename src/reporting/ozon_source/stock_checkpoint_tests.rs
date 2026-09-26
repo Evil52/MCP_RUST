@@ -60,13 +60,13 @@ async fn rfbs_fallback_resumes_normalized_pages_without_repeating_requests() {
             Ok(json!({"items": [{
                 "product_id": 123,
                 "stocks": [
-                    {"type": "fbs", "present": 2, "reserved": 0},
-                    {"type": "rfbs", "present": 7, "reserved": 0}
+                    {"type": "fbs", "sku": 1123, "present": 2, "reserved": 1},
+                    {"type": "rfbs", "sku": 1123, "present": 7, "reserved": 2}
                 ]
             }], "cursor": "next-rfbs-page"})),
             Ok(json!({"items": [{
                 "product_id": 456,
-                "stocks": [{"type": "rfbs", "present": 0, "reserved": 0}]
+                "stocks": [{"type": "rfbs", "sku": 1456, "present": 0, "reserved": 0}]
             }], "cursor": ""})),
         ])),
         paths: Mutex::new(vec![]),
@@ -92,18 +92,18 @@ async fn rfbs_fallback_resumes_normalized_pages_without_repeating_requests() {
         facts,
         vec![
             CollectedStockFact {
-                sku: 123,
-                warehouse_id: "FBS".to_owned(),
-                sellable_units: 2
+                sku: 1123,
+                warehouse_id: "sku-fulfillment-v2:fbs".to_owned(),
+                sellable_units: 1
             },
             CollectedStockFact {
-                sku: 123,
-                warehouse_id: "RFBS".to_owned(),
-                sellable_units: 7
+                sku: 1123,
+                warehouse_id: "sku-fulfillment-v2:rfbs".to_owned(),
+                sellable_units: 5
             },
             CollectedStockFact {
-                sku: 456,
-                warehouse_id: "RFBS".to_owned(),
+                sku: 1456,
+                warehouse_id: "sku-fulfillment-v2:rfbs".to_owned(),
                 sellable_units: 0
             },
         ]
@@ -116,6 +116,65 @@ async fn rfbs_fallback_resumes_normalized_pages_without_repeating_requests() {
             "/v4/product/info/stocks",
         ]
     );
+    assert!(transport.responses.lock().unwrap().is_empty());
+    assert_eq!(pages.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn legacy_stock_checkpoint_is_not_replayed_as_corrected_sku_inventory() {
+    let pages = MemoryPages::default();
+    let request = product_page_request("/v4/product/info/stocks", None).unwrap();
+    let legacy_rows = vec![CollectedStockFact {
+        sku: 123,
+        warehouse_id: "FBS".to_owned(),
+        sellable_units: 7,
+    }];
+    checkpointed(
+        &journal(&pages),
+        json!([request.path, request.payload]),
+        || async { Ok::<_, CheckpointError>((legacy_rows, None::<String>)) },
+    )
+    .await
+    .unwrap();
+    let transport = RecordingTransport {
+        responses: Mutex::new(VecDeque::from([
+            Err(OzonReportSourceError::Upstream(OzonErrorKind::NotFound)),
+            Ok(json!({"items": [{"product_id": 123, "stocks": [
+                {"sku": 456, "type": "fbs", "present": 7, "reserved": 1}
+            ]}], "cursor": ""})),
+        ])),
+        paths: Mutex::new(vec![]),
+    };
+    assert_eq!(
+        OzonReportSource::new(&transport)
+            .with_checkpoints(journal(&pages))
+            .collect_stock_pages()
+            .await,
+        Err(OzonReportSourceError::Checkpoint(CheckpointError::Deferred))
+    );
+    let fresh = OzonReportSource::new(&transport)
+        .with_checkpoints(journal(&pages))
+        .collect_stock_pages()
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh,
+        vec![CollectedStockFact {
+            sku: 456,
+            warehouse_id: "sku-fulfillment-v2:fbs".to_owned(),
+            sellable_units: 6,
+        }]
+    );
+    // The corrected page is now resumable without another upstream request.
+    assert_eq!(
+        OzonReportSource::new(&transport)
+            .with_checkpoints(journal(&pages))
+            .collect_stock_pages()
+            .await
+            .unwrap(),
+        fresh
+    );
+    assert_eq!(transport.paths.lock().unwrap().len(), 2);
     assert!(transport.responses.lock().unwrap().is_empty());
     assert_eq!(pages.lock().unwrap().len(), 3);
 }

@@ -5,6 +5,7 @@
 //! exact contract in `ozon_adapter` and every response is normalized before it
 //! can reach report persistence.
 mod failures;
+mod stocks;
 pub use failures::OzonReportSourceError;
 
 use std::{collections::BTreeSet, future::Future, pin::Pin};
@@ -21,9 +22,8 @@ use crate::{
 use super::{
     checkpoint::{Checkpoints, checkpointed},
     ozon_adapter::{
-        OzonReportParseError, OzonReportRequest, next_warehouse_stock_cursor, parse_price_page,
-        parse_sales_page, parse_stock_page, parse_warehouse_stock_page, product_page_request,
-        sales_request, warehouse_stock_page_request,
+        OzonReportParseError, OzonReportRequest, parse_price_page, parse_sales_page,
+        product_page_request, sales_request,
     },
     ozon_finance_source::collect_finance_facts,
     postgres_collector::{
@@ -57,6 +57,9 @@ const MAX_SALES_PAGES: usize = 10;
 // At 100 products/page this still accommodates 10,000 products, while the
 // manual dry-run's absolute deadline bounds the total request time.
 const MAX_PRODUCT_PAGES: usize = 100;
+
+#[cfg(test)]
+use super::ozon_adapter::warehouse_stock_page_request;
 
 #[cfg(test)]
 mod stock_checkpoint_tests;
@@ -530,96 +533,6 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         Err(OzonReportSourceError::PaginationLimit)
     }
 
-    /// Collects real warehouse-granular FBO and FBS stock pages when the
-    /// legacy warehouse endpoints remain available.
-    ///
-    /// Ozon has retired the legacy FBO route for some accounts. Only an HTTP
-    /// rejection or an explicit not-found response from that first route may
-    /// fall back to the already allowlisted `/v4/product/info/stocks` source.
-    /// The normalized fallback exposes fulfillment-level, not physical-
-    /// warehouse-level, inventory; its stable `FBO`/`FBS`/`RFBS` identifiers retain
-    /// that provenance. Authentication, quota, server, and transport failures
-    /// remain fail-closed and are never hidden by the fallback.
-    pub async fn collect_stock_pages(
-        &self,
-    ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
-        let fbo = self
-            .collect_warehouse_stock_pages("/v1/product/info/stocks-by-warehouse/fbo", "fbo")
-            .await;
-        let mut facts = match fbo {
-            Ok(facts) => facts,
-            Err(OzonReportSourceError::Upstream(OzonErrorKind::Http | OzonErrorKind::NotFound)) => {
-                tracing::warn!(
-                    endpoint = "/v1/product/info/stocks-by-warehouse/fbo",
-                    fallback = "/v4/product/info/stocks",
-                    "legacy Ozon stock endpoint was rejected; using fulfillment-level fallback"
-                );
-                return self
-                    .collect_product_pages(
-                        "/v4/product/info/stocks",
-                        parse_stock_page,
-                        OzonReportSourceError::InvalidStocksResponse,
-                    )
-                    .await;
-            }
-            Err(error) => return Err(error),
-        };
-        facts.extend(
-            self.collect_warehouse_stock_pages("/v2/product/info/stocks-by-warehouse/fbs", "fbs")
-                .await?,
-        );
-        Ok(facts)
-    }
-
-    async fn collect_warehouse_stock_pages(
-        &self,
-        path: &'static str,
-        scheme: &'static str,
-    ) -> Result<Vec<CollectedStockFact>, OzonReportSourceError> {
-        let mut cursor = None;
-        let mut seen_cursors = BTreeSet::new();
-        let mut facts = Vec::new();
-        for _ in 0..MAX_PRODUCT_PAGES {
-            let request = warehouse_stock_page_request(path, cursor.as_deref())
-                .map_err(|_| OzonReportSourceError::InvalidResponse)?;
-            let page: Option<(Vec<CollectedStockFact>, Option<String>)> = checkpointed(
-                &self.checkpoints,
-                json!([request.path, request.payload]),
-                || async {
-                    let response = match self.transport.post(request).await {
-                        Ok(value) => value,
-                        Err(OzonReportSourceError::Upstream(
-                            OzonErrorKind::Http | OzonErrorKind::NotFound,
-                        )) if scheme == "fbo" => return Ok(None),
-                        Err(error) => return Err(error),
-                    };
-                    let rows = parse_warehouse_stock_page(&response, scheme).map_err(|error| {
-                        rejected_stock_response(path, "facts", error, &response)
-                    })?;
-                    let next = next_warehouse_stock_cursor(&response).map_err(|error| {
-                        rejected_stock_response(path, "cursor", error, &response)
-                    })?;
-                    Ok::<_, OzonReportSourceError>(Some((rows, next)))
-                },
-            )
-            .await?;
-            let (rows, next) =
-                page.ok_or(OzonReportSourceError::Upstream(OzonErrorKind::NotFound))?;
-            facts.extend(rows);
-            cursor = next;
-            if cursor
-                .as_ref()
-                .is_some_and(|cursor| !seen_cursors.insert(cursor.clone()))
-            {
-                return Err(OzonReportSourceError::InvalidStocksResponse);
-            }
-            if cursor.is_none() {
-                return Ok(facts);
-            }
-        }
-        Err(OzonReportSourceError::PaginationLimit)
-    }
-
     /// Collects cursor-paginated price pages with a fixed upper bound.
     pub async fn collect_price_pages(
         &self,
@@ -648,17 +561,21 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         for _ in 0..MAX_PRODUCT_PAGES {
             let request = product_page_request(path, cursor.as_deref())
                 .map_err(|_| OzonReportSourceError::InvalidResponse)?;
-            let (rows, next) = checkpointed(
-                &self.checkpoints,
-                json!([request.path, request.payload]),
-                || async {
-                    let response = self.transport.post(request).await?;
-                    Ok::<_, OzonReportSourceError>((
-                        parse(&response).map_err(|_| invalid_response.clone())?,
-                        next_cursor(&response, invalid_response.clone())?,
-                    ))
-                },
-            )
+            // Stock checkpoints written before v2 contain product IDs and
+            // gross quantities. Never replay them under the corrected parser.
+            // Price checkpoints retain their existing identity.
+            let identity = if path == "/v4/product/info/stocks" {
+                json!(["ozon-sku-fulfillment-v2", request.path, request.payload])
+            } else {
+                json!([request.path, request.payload])
+            };
+            let (rows, next) = checkpointed(&self.checkpoints, identity, || async {
+                let response = self.transport.post(request).await?;
+                Ok::<_, OzonReportSourceError>((
+                    parse(&response).map_err(|_| invalid_response.clone())?,
+                    next_cursor(&response, invalid_response.clone())?,
+                ))
+            })
             .await?;
             facts.extend(rows);
             cursor = next;
@@ -956,8 +873,8 @@ mod tests {
                     "items":[{
                         "product_id":1,
                         "stocks":[
-                            {"type":"fbo","present":4,"reserved":0},
-                            {"type":"fbs","present":2,"reserved":0}
+                            {"type":"fbo","sku":99,"present":4,"reserved":1},
+                            {"type":"fbs","sku":99,"present":2,"reserved":0}
                         ]
                     }],
                     "cursor":""
@@ -970,8 +887,10 @@ mod tests {
         let facts = source.collect_stock_pages().await.unwrap();
 
         assert_eq!(facts.len(), 2);
-        assert_eq!(facts[0].warehouse_id, "FBO");
-        assert_eq!(facts[1].warehouse_id, "FBS");
+        assert_eq!(facts[0].warehouse_id, "sku-fulfillment-v2:fbo");
+        assert_eq!(facts[0].sku, 99);
+        assert_eq!(facts[0].sellable_units, 3);
+        assert_eq!(facts[1].warehouse_id, "sku-fulfillment-v2:fbs");
         assert_eq!(
             transport.paths.lock().unwrap().as_slice(),
             [

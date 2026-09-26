@@ -48,6 +48,12 @@ test = false
 required-features = ["runtime-binaries"]
 
 [[bin]]
+name = "ads-optimizer"
+path = "src/bin/ads-optimizer.rs"
+test = false
+required-features = ["runtime-binaries"]
+
+[[bin]]
 name = "cost-import"
 path = "src/bin/cost-import.rs"
 test = false
