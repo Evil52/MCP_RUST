@@ -1,6 +1,7 @@
 //! Bounded read-only Wildberries source for daily reports.
 
 mod sales;
+mod sales_transport;
 mod stocks;
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
@@ -55,6 +56,15 @@ pub trait WbReportTransport: Send + Sync {
         limit: u32,
         offset: u32,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>>;
+
+    fn sales_closing_page(
+        &self,
+        _date: NaiveDate,
+        _limit: u32,
+        _offset: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(async { Err(WbReportSourceError::SalesPageOverlap) })
+    }
 
     fn sales_control_totals(
         &self,
@@ -183,45 +193,23 @@ impl WbReportTransport for WbClientReportTransport {
         limit: u32,
         offset: u32,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.client
-                .sales_funnel(
-                    &self.account_id,
-                    json!({
-                        "selectedPeriod": {
-                            "start": start.format("%Y-%m-%d").to_string(),
-                            "end": end.format("%Y-%m-%d").to_string(),
-                        },
-                        "nmIds": [],
-                        "brandNames": [],
-                        "subjectIds": [],
-                        "tagIds": [],
-                        "skipDeletedNm": false,
-                        "limit": limit,
-                        "offset": offset,
-                    }),
-                )
-                .await
-                .map_err(|error| wb_source_failure(&error))
-        })
+        Box::pin(self.fetch_sales_page(start, end, limit, offset, false))
+    }
+
+    fn sales_closing_page(
+        &self,
+        date: NaiveDate,
+        limit: u32,
+        offset: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(self.fetch_sales_page(date, date, limit, offset, true))
     }
 
     fn sales_control_totals(
         &self,
         date: NaiveDate,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
-        Box::pin(async move {
-            self.client
-                .sales_funnel_grouped_history(
-                    &self.account_id,
-                    json!({
-                        "selectedPeriod":{"start":date,"end":date},"brandNames":[],"subjectIds":[],
-                        "tagIds":[],"skipDeletedNm":false,"aggregationLevel":"day"
-                    }),
-                )
-                .await
-                .map_err(|error| wb_source_failure(&error))
-        })
+        Box::pin(self.fetch_sales_control_totals(date))
     }
 
     fn stock_page<'a>(

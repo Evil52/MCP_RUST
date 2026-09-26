@@ -60,6 +60,35 @@ impl SalesPages {
                 .all(|(day, total)| *total == actual.get(day).copied().unwrap_or_default())
     }
 
+    /// Replace old positive sales with the independently controlled closing
+    /// pass. An old positive SKU absent from that pass becomes unknown by
+    /// omission; it is never assigned an invented zero.
+    pub fn refresh_sales(&mut self, fresh: Vec<CollectedSalesFact>) -> bool {
+        let mut merged: BTreeMap<_, _> = self
+            .facts
+            .iter()
+            .filter(|row| row.ordered_units == 0 && row.operational_gmv_minor == 0)
+            .map(|row| ((row.business_date, row.sku), row.clone()))
+            .collect();
+        let mut seen = BTreeSet::new();
+        for row in fresh {
+            let key = (row.business_date, row.sku);
+            if !seen.insert(key) {
+                return false;
+            }
+            merged.insert(key, row);
+        }
+        self.facts = merged.into_values().collect();
+        self.identities = self
+            .facts
+            .iter()
+            .enumerate()
+            .map(|(index, row)| ((row.business_date, row.sku), index))
+            .collect();
+        self.zero_overlap = true;
+        true
+    }
+
     pub fn into_facts(mut self) -> Vec<CollectedSalesFact> {
         if self.zero_overlap {
             // Independent day totals certify orders and GMV only. The WB
@@ -132,5 +161,17 @@ mod tests {
         huge.ordered_units = u64::MAX;
         assert!(pages.add(vec![huge, row(2, 1)]));
         assert!(!pages.matches(&SalesTotals::new()));
+    }
+
+    #[test]
+    fn closing_refresh_is_atomic_and_never_fabricates_zero_for_a_missing_positive_sku() {
+        let mut pages = SalesPages::default();
+        assert!(pages.add(vec![row(1, 2), row(2, 0)]));
+        assert!(!pages.refresh_sales(vec![row(3, 1), row(3, 2)]));
+        assert!(pages.matches(&SalesTotals::from([(row(1, 0).business_date, (2, 200))])));
+        assert!(pages.refresh_sales(vec![row(3, 1)]));
+        let facts = pages.into_facts();
+        assert_eq!(facts.iter().map(|r| r.sku).collect::<Vec<_>>(), vec![2, 3]);
+        assert!(facts.iter().all(|r| r.cancelled_units.is_none()));
     }
 }

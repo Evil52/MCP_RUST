@@ -139,3 +139,28 @@ SELECT daily_reporting.resume_failed_wb_advertising(
 После вызова требуется дождаться реальной публикации, а не считать очередь успехом.
 
 После принятого нулевого пересечения отмены и возвраты помечаются как неизвестные: контрольный ответ WB подтверждает заказы и GMV, но не содержит контрольных итогов этих событий. Обычные загрузки без пересечения сохраняют доступные счётчики отмен.
+
+## Closing refresh for a changing WB day
+
+A zero-overlap chain can finish while new orders arrive. If its initial independent
+control differs, the collector makes one bounded closing pass, sorted by the
+documented `orderBy: {field: orderCount, mode: desc}`. It stops that additional
+pass at a zero-order boundary or a short page, after the original full catalogue
+walk has already terminated. Dates, ordering, row limits and duplicates remain
+validated. A separate, fresh day-total request must then match exactly.
+
+The closing pass replaces old positive sales with newly observed facts. A former
+positive SKU absent from it is omitted as unknown, never assigned an invented
+zero. Previously observed zero rows and explicit fresh zero rows can remain;
+this still does not certify enumeration of every zero-sale SKU. Cancellations
+and returns remain unknown after an overlap. Every added read uses the existing
+checkpoint quantum and analytics quota; final mismatch retains the two-restart
+limit and original deadline.
+
+After deploying migration 044 and the matching collector, an administrator can
+call `daily_reporting.resume_failed_wb_sales_closing(account, job_id, generation,
+cutoff, reason)` once for a WB Sales job that exhausted the initial operator
+recovery. It requires that recovery's immutable record, unchanged original
+scope/deadline, no stale pages or successful snapshot, and records a second,
+separate append-only audit. It preserves source quota and grants no extra time.
+Take a backup first and use the exact failed generation from the server.
