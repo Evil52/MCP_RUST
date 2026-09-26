@@ -100,6 +100,10 @@ pub struct ProductEvidence {
 #[serde(deny_unknown_fields)]
 pub struct AdvertisingDay {
     pub date: NaiveDate,
+    /// Actual upstream observation for this day when combining frozen snapshots.
+    /// Omission retains the input-level observation for legacy single extracts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<DateTime<Utc>>,
     pub clicks: u64,
     pub spend_minor: u64,
     pub direct_orders: u64,

@@ -44,6 +44,7 @@ fn fixture() -> ShadowInput {
             }),
             daily: (10..=16)
                 .map(|day| AdvertisingDay {
+                    observed_at: None,
                     date: date(day),
                     clicks: 100,
                     spend_minor: 10_000,
@@ -147,6 +148,7 @@ fn drr_rounds_only_display_metrics_and_compares_exact_allowed_spend() {
         let mut input = fixture();
         input.window_start = date(16);
         input.products[0].daily = vec![AdvertisingDay {
+            observed_at: None,
             date: date(16),
             clicks,
             spend_minor: 30,
@@ -177,6 +179,7 @@ fn drr_exact_equality_does_not_reduce_after_display_rounding() {
     let mut input = fixture();
     input.window_start = date(16);
     input.products[0].daily = vec![AdvertisingDay {
+        observed_at: None,
         date: date(16),
         clicks: 7,
         spend_minor: 30,

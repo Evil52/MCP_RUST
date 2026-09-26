@@ -106,6 +106,7 @@ pub fn aggregate_cpc_days(
             return Err(OptimizerError::DuplicateEvidence);
         }
         let day = days.entry(fact.business_date).or_insert(AdvertisingDay {
+            observed_at: None,
             date: fact.business_date,
             clicks: 0,
             spend_minor: 0,

@@ -62,7 +62,12 @@ pub(super) fn validate(input: &ShadowInput) -> Result<(), OptimizerError> {
         }
         let mut dates = BTreeSet::new();
         for day in &product.daily {
-            if day.date < input.window_start || day.date > input.window_end {
+            let observed_at = day.observed_at.unwrap_or(input.observed_at);
+            if day.date < input.window_start
+                || day.date > input.window_end
+                || day.date >= observed_at.date_naive()
+                || observed_at > input.observed_at
+            {
                 return Err(OptimizerError::InvalidInput);
             }
             if !dates.insert(day.date) {

@@ -6,8 +6,11 @@
 
 mod allocation;
 mod evaluate;
+pub mod journal;
 mod model;
+pub mod prepare;
 pub mod published;
+pub mod reconciliation;
 mod validation;
 
 pub use model::*;
@@ -93,3 +96,6 @@ mod tests;
 
 #[cfg(test)]
 mod advertising_objective_tests;
+
+#[cfg(test)]
+mod observation_tests;

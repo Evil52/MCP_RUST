@@ -26,7 +26,12 @@ pub(super) fn evaluate(
     if i64::try_from(product.daily.len()).map_err(|_| OptimizerError::Overflow)? != expected_days {
         row.reasons.push(Reason::MissingDates);
     }
-    if input.as_of - input.observed_at > Duration::hours(i64::from(policy.max_data_age_hours)) {
+    if input.as_of - input.observed_at > Duration::hours(i64::from(policy.max_data_age_hours))
+        || product.daily.iter().any(|day| {
+            input.as_of - day.observed_at.unwrap_or(input.observed_at)
+                > Duration::hours(i64::from(policy.max_data_age_hours))
+        })
+    {
         row.reasons.push(Reason::StaleAdvertising);
     }
     if (input.as_of.date_naive() - input.window_end).num_days()
@@ -257,15 +262,15 @@ fn metrics(
     input: &ShadowInput,
     product: &ProductEvidence,
 ) -> Result<EvidenceMetrics, OptimizerError> {
-    let mature_through = input
-        .observed_at
-        .date_naive()
-        .checked_sub_signed(Duration::days(
-            i64::from(input.policy.attribution_lag_days) + 1,
-        ))
-        .ok_or(OptimizerError::InvalidInput)?;
+    let lag = Duration::days(i64::from(input.policy.attribution_lag_days) + 1);
     let mut metrics = EvidenceMetrics::default();
     for day in &product.daily {
+        let mature_through = day
+            .observed_at
+            .unwrap_or(input.observed_at)
+            .date_naive()
+            .checked_sub_signed(lag)
+            .ok_or(OptimizerError::InvalidInput)?;
         add(&mut metrics.all_period_spend_minor, day.spend_minor)?;
         if day.date > mature_through {
             metrics.excluded_recent_days += 1;

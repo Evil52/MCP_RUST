@@ -38,6 +38,7 @@ fn fixture() -> ShadowInput {
             max_daily_budget_minor: 150_000,
             daily: (1..=14)
                 .map(|day| AdvertisingDay {
+                    observed_at: None,
                     date: date(day),
                     clicks: 100,
                     spend_minor: 10_000,
