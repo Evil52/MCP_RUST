@@ -116,3 +116,23 @@ fn malformed_input_and_arithmetic_overflow_fail_closed() {
         OptimizerError::Overflow
     );
 }
+
+#[test]
+fn too_many_campaigns_are_rejected_before_calendar_expansion() {
+    let mut input = fixture();
+    input.rows.clear();
+    for campaign_id in 1..=MAX_CAMPAIGNS as u64 + 1 {
+        input.rows.push(ReconciliationCampaignRow {
+            date: day(15),
+            campaign_id,
+            clicks: 0,
+            spend_minor: 0,
+            orders: 0,
+            revenue_minor: 0,
+        });
+    }
+    assert_eq!(
+        analyze_campaign_history(input).unwrap_err(),
+        OptimizerError::LimitExceeded
+    );
+}

@@ -14,6 +14,7 @@ use super::{
 };
 
 const MAX_ROWS: usize = 25_000;
+const MAX_CAMPAIGNS: usize = 1_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -196,6 +197,7 @@ fn validate(input: &CampaignHistoryInput) -> Result<(), OptimizerError> {
         return Err(OptimizerError::InvalidInput);
     }
     let mut seen = BTreeSet::new();
+    let mut campaigns = BTreeSet::new();
     for row in &input.rows {
         if row.campaign_id == 0
             || i64::try_from(row.campaign_id).is_err()
@@ -206,6 +208,10 @@ fn validate(input: &CampaignHistoryInput) -> Result<(), OptimizerError> {
         }
         if !seen.insert((row.campaign_id, row.date)) {
             return Err(OptimizerError::DuplicateEvidence);
+        }
+        campaigns.insert(row.campaign_id);
+        if campaigns.len() > MAX_CAMPAIGNS {
+            return Err(OptimizerError::LimitExceeded);
         }
     }
     Ok(())
