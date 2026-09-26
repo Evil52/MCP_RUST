@@ -60,7 +60,17 @@ impl SalesPages {
                 .all(|(day, total)| *total == actual.get(day).copied().unwrap_or_default())
     }
 
-    pub fn into_facts(self) -> Vec<CollectedSalesFact> {
+    pub fn into_facts(mut self) -> Vec<CollectedSalesFact> {
+        if self.zero_overlap {
+            // Independent day totals certify orders and GMV only. The WB
+            // history response has no cancellation/return control totals.
+            // Missing zero-sale SKUs could carry those events, so their
+            // aggregate completeness cannot be asserted after an overlap.
+            for row in &mut self.facts {
+                row.cancelled_units = None;
+                row.returned_units = None;
+            }
+        }
         self.facts
     }
 }
@@ -91,7 +101,16 @@ mod tests {
         assert!(!pages.matches(&SalesTotals::from([(day, (4, 300))])));
         assert!(!pages.matches(&SalesTotals::from([(day, (3, 301))])));
         assert!(!pages.matches(&SalesTotals::new()));
-        assert_eq!(pages.into_facts().len(), 3);
+        let facts = pages.into_facts();
+        assert_eq!(facts.len(), 3);
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.cancelled_units.is_none() && fact.returned_units.is_none())
+        );
+        let mut clean = SalesPages::default();
+        assert!(clean.add(vec![row(1, 2)]));
+        assert_eq!(clean.into_facts()[0].cancelled_units, Some(0));
         for duplicate in [row(1, 2), row(1, 0), row(2, 1)] {
             let mut pages = SalesPages::default();
             assert!(pages.add(vec![row(1, 2), row(2, 0)]));
