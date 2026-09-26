@@ -14,7 +14,6 @@ use tokio_postgres::Config as PostgresConfig;
 use crate::config::JwtConfig;
 
 use super::*;
-
 static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const TEST_WB_SELLER_SID: &str = "123e4567-e89b-42d3-a456-426614174000";
 const CONTROL_CONFIG_ENV_CHILD: &str = "MCP_OZON_CONTROL_CONFIG_ENV_CHILD";
@@ -1485,6 +1484,7 @@ fn wb_runtime_refuses_wrong_account_token_paths_and_timeout() {
     );
     assert!(from(&missing_writer).is_err());
 }
-
 #[path = "boundary_tests.rs"]
 mod boundaries;
+#[path = "wb_campaign_tests.rs"]
+mod wb_campaign_tests;

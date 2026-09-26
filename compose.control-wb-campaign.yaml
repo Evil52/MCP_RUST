@@ -1,0 +1,28 @@
+# Apply after compose.control-wb-plan.yaml and compose.control-wb-live.yaml.
+# One Compose project and one private root per WB seller account. The base
+# WB bid-target runtime is disabled until a campaign is separately enrolled.
+services:
+  control:
+    environment:
+      CONTROL_MCP_WB_ACCOUNT_ID: ${CONTROL_MCP_WB_BID_ACCOUNT_ID:-}
+      CONTROL_MCP_WB_CAMPAIGN_ACCOUNT_ID: ${CONTROL_MCP_WB_CAMPAIGN_ACCOUNT_ID:?WB account id is required}
+      CONTROL_MCP_WB_CAMPAIGN_ROOT: /var/lib/wb-campaigns
+      WB_AUTOMATION_DATABASE_URL: postgresql://wb_automation_writer:${WB_AUTOMATION_DB_PASSWORD:?WB_AUTOMATION_DB_PASSWORD is required}@position-db:5432/${POSITION_DB_NAME:-ozon_positions}
+    volumes:
+      - type: bind
+        source: ${WB_CAMPAIGNS_ROOT:?Private campaign root is required}
+        target: /var/lib/wb-campaigns
+        bind:
+          create_host_path: false
+    networks:
+      - ozon-egress-internal
+  control-write-egress:
+    networks:
+      control-write-egress-internal:
+        aliases: [write-egress]
+      outbound: {}
+
+networks:
+  ozon-egress-internal:
+    name: mcp-ozon-egress-internal
+    external: true

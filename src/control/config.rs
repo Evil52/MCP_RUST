@@ -2,7 +2,8 @@
 use jwt::{CONTROL_INTERNAL_JWKS_URL, CONTROL_REQUIRED_SCOPE};
 pub use model::{
     ControlAppConfig, ControlAuthConfig, ControlOzonMarketplaceRuntimeConfig,
-    ControlOzonRuntimeConfig, ControlPolicyDatabaseConfig, ControlWbRuntimeConfig,
+    ControlOzonRuntimeConfig, ControlPolicyDatabaseConfig, ControlWbCampaignRuntimeConfig,
+    ControlWbRuntimeConfig,
 };
 use ozon_runtime::{OzonRuntimeIdentity, load_ozon_runtime};
 #[cfg(test)]
@@ -19,6 +20,7 @@ mod loader;
 mod model;
 mod ozon_runtime;
 mod validation;
+mod wb_campaign;
 mod wb_runtime;
 
 #[cfg(test)]

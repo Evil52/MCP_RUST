@@ -53,6 +53,39 @@ struct Request {
     robot_authorization_expires_at: DateTime<Utc>,
 }
 
+/// Fixed scope and credential paths of a private reusable campaign profile.
+#[derive(Debug, Clone)]
+pub struct WbCampaignProfileRuntime {
+    pub account_id: String,
+    pub actor_id: String,
+    pub registry: PathBuf,
+    pub reader_token: PathBuf,
+    pub writer_token: PathBuf,
+    pub allow_broad_reader: bool,
+    pub robot_template: PathBuf,
+    pub journal_directory: PathBuf,
+    pub campaigns_directory: PathBuf,
+}
+
+pub fn wb_campaign_profile_runtime(path: &Path) -> Result<WbCampaignProfileRuntime> {
+    let profile: Profile = read_private_json(path)?;
+    ensure!(
+        profile.version == 1,
+        "unsupported WB campaign profile version"
+    );
+    Ok(WbCampaignProfileRuntime {
+        account_id: profile.account_id,
+        actor_id: profile.actor_id,
+        registry: profile.registry,
+        reader_token: profile.reader_token,
+        writer_token: profile.writer_token,
+        allow_broad_reader: profile.allow_broad_reader,
+        robot_template: profile.robot_template,
+        journal_directory: profile.journal_directory,
+        campaigns_directory: profile.campaigns_directory,
+    })
+}
+
 fn private_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
@@ -81,8 +114,18 @@ fn write_new_json(path: &Path, value: &Value) -> Result<()> {
 /// request is made. Paths in the profile must be absolute (container paths when
 /// the operator runs in the production container).
 pub fn prepare_wb_campaign(profile_path: &Path, request_path: &Path) -> Result<Value> {
-    let profile: Profile = read_private_json(profile_path)?;
     let request: Request = read_private_json(request_path)?;
+    prepare_wb_campaign_inner(profile_path, request)
+}
+
+/// Prepare from a structured MCP request without accepting an arbitrary file path.
+pub fn prepare_wb_campaign_from_request(profile_path: &Path, request: &Value) -> Result<Value> {
+    let request: Request = serde_json::from_value(request.clone())?;
+    prepare_wb_campaign_inner(profile_path, request)
+}
+
+fn prepare_wb_campaign_inner(profile_path: &Path, request: Request) -> Result<Value> {
+    let profile: Profile = read_private_json(profile_path)?;
     ensure!(
         profile.version == 1,
         "unsupported WB campaign profile version"

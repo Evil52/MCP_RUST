@@ -11,7 +11,7 @@ use crate::{
     auth::JwtAuthenticator,
     control::{
         ozon::{OzonCampaignLaunchManifest, prepare_campaign_launch_manifest},
-        plan::{WbActionQuota, WbApplyContext, WbControlPlan, WbPlanFinish, WbPlanStatus},
+        plan::{WbActionQuota, WbApplyContext, WbPlanFinish, WbPlanStatus},
         policy::ControlMode,
         wb::{
             WbGuardedWriteError, campaign_snapshot, prepare_changes, snapshot_matches_plan_state,
@@ -26,18 +26,20 @@ pub(super) use crate::control::ozon::{
 };
 
 use super::{
-    ACCESS_DENIED, ControlMcp, WbControlServices,
+    ACCESS_DENIED, ControlMcp,
     authorization::{
         ControlIdentity, authorize_ozon_plan_apply, authorize_ozon_plan_approval,
         authorize_plan_account_access, authorize_plan_apply, authorize_plan_approval,
     },
     contract::{
         ApplyOzonCampaignLaunchInput, ApplyWbBidPlanInput, ApproveOzonCampaignLaunchInput,
-        ApproveWbBidPlanInput, BidLimitsResult, ControlScopeResult, ControlStatusResult,
-        ControlTargetResult, EmptyInput, OzonCampaignLaunchTargetResult, OzonCampaignPlanInput,
-        OzonCampaignPlanResult, PrepareOzonCampaignLaunchInput, PrepareWbBidPlanInput,
-        PreviewOzonCampaignLaunchInput, WbPlanInput, WbPlanResult, WbPromotionBidTargetResult,
+        ApproveWbBidPlanInput, ControlScopeResult, ControlStatusResult, EmptyInput,
+        OzonCampaignPlanInput, OzonCampaignPlanResult, PrepareOzonCampaignLaunchInput,
+        PrepareWbBidPlanInput, PrepareWbCampaignInput, PreviewOzonCampaignLaunchInput,
+        WbCampaignHandleInput, WbCampaignNameInput, WbCampaignToolResult, WbPlanInput,
+        WbPlanResult,
     },
+    plan_readback::{load_plan_result, read_plan_snapshot},
     presentation::{
         WritePermitFailure, guarded_write_permit_error_class, ozon_plan_result,
         ozon_plan_store_error, plan_result, plan_store_error, write_failure_finish,
@@ -102,28 +104,7 @@ impl ControlMcp {
         identity: ControlIdentity,
         Parameters(_input): Parameters<EmptyInput>,
     ) -> Result<Json<ControlStatusResult>, String> {
-        let (_registry, actor) = self.access_context(&identity)?;
-        let actor_id = actor.id;
-        // Ozon writes are deliberately owned by the separate durable guard
-        // runtime. This process can report only its local WB executor; merely
-        // having Ozon read credentials must never be advertised as a writer.
-        let writer_ready = self
-            .wb
-            .as_ref()
-            .is_some_and(|services| services.writer.is_some());
-        Ok(Json(ControlStatusResult {
-            explicit_policy_binding: self.policy.actor_policy(&actor_id).is_some(),
-            actor_id,
-            policy_schema_version: self.policy.version,
-            policy_revision: self.policy.revision,
-            policy_digest: self.policy.digest().to_owned(),
-            mode: self.policy.mode,
-            write_executor_configured: writer_ready && self.policy.mode == ControlMode::Enabled,
-            runtime_gates_required: true,
-            credentials_loaded: self.wb.is_some(),
-            marketplace_egress_enabled: self.wb.is_some(),
-            persistence_configured: self.wb.is_some() || self.ozon.is_some(),
-        }))
+        self.status_result(&identity).map(Json)
     }
 
     /// Возвращает только явно перечисленные в локальной policy кампании, SKU и лимиты текущего actor. Сетевых запросов нет.
@@ -142,92 +123,7 @@ impl ControlMcp {
         identity: ControlIdentity,
         Parameters(_input): Parameters<EmptyInput>,
     ) -> Result<Json<ControlScopeResult>, String> {
-        let (registry, actor) = self.access_context(&identity)?;
-        let actor_id = actor.id.clone();
-        let targets = self
-            .policy
-            .actor_policy(&actor_id)
-            .into_iter()
-            .flat_map(|policy| &policy.targets)
-            .filter(|target| {
-                registry
-                    .accounts
-                    .iter()
-                    .find(|account| account.id == target.account_id)
-                    .is_some_and(|account| actor.can_access_account(account))
-            })
-            .map(|target| ControlTargetResult {
-                account_id: target.account_id.clone(),
-                campaign_id: target.campaign_id,
-                skus: target.skus.clone(),
-                bid_limits: BidLimitsResult {
-                    min_minor: target.bid_limits.min_minor,
-                    max_minor: target.bid_limits.max_minor,
-                    max_delta_percent: target.bid_limits.max_delta_percent,
-                },
-            })
-            .collect();
-        let wb_promotion_bid_targets = self
-            .policy
-            .actor_policy(&actor_id)
-            .into_iter()
-            .flat_map(|policy| &policy.wb_promotion_bid_targets)
-            .filter(|target| {
-                registry
-                    .accounts
-                    .iter()
-                    .find(|account| account.id == target.account_id)
-                    .is_some_and(|account| actor.can_access_account(account))
-            })
-            .map(|target| WbPromotionBidTargetResult {
-                account_id: target.account_id.clone(),
-                seller_sid: target.seller_sid.clone(),
-                advert_id: target.advert_id,
-                nm_ids: target.nm_ids.clone(),
-                placements: target.placements.clone(),
-                bid_limits_kopecks: BidLimitsResult {
-                    min_minor: target.bid_limits_kopecks.min_minor,
-                    max_minor: target.bid_limits_kopecks.max_minor,
-                    max_delta_percent: target.bid_limits_kopecks.max_delta_percent,
-                },
-                approver_actor_ids: target.approver_actor_ids.clone(),
-                action_limits: target.action_limits,
-            })
-            .collect();
-        let ozon_campaign_launch_targets = self
-            .policy
-            .actor_policy(&actor_id)
-            .into_iter()
-            .flat_map(|policy| &policy.ozon_campaign_launch_targets)
-            .filter(|target| {
-                registry
-                    .accounts
-                    .iter()
-                    .find(|account| account.id == target.account_id)
-                    .is_some_and(|account| actor.can_access_account(account))
-            })
-            .map(|target| OzonCampaignLaunchTargetResult {
-                account_id: target.account_id.clone(),
-                skus: target.skus.clone(),
-                weekly_budget_microrubles: target.weekly_budget_microrubles,
-                per_sku_spend_cap_microrubles: target.per_sku_spend_cap_microrubles,
-                initial_cpc_bid_microrubles: target.initial_cpc_bid_microrubles,
-                max_cpc_bid_microrubles: target.max_cpc_bid_microrubles,
-                target_drr_percent: target.target_drr_percent,
-                target_position: target.target_position,
-                approver_actor_ids: target.approver_actor_ids.clone(),
-            })
-            .collect();
-        Ok(Json(ControlScopeResult {
-            actor_id,
-            policy_schema_version: self.policy.version,
-            policy_revision: self.policy.revision,
-            policy_digest: self.policy.digest().to_owned(),
-            mode: self.policy.mode,
-            targets,
-            ozon_campaign_launch_targets,
-            wb_promotion_bid_targets,
-        }))
+        self.scope_result(&identity).map(Json)
     }
 
     /// Creates a deterministic, policy-bound preview. It performs no network
@@ -915,35 +811,187 @@ impl ControlMcp {
         }
         load_plan_result(services, &plan.plan_id, &actor.id).await
     }
-}
 
-pub(super) async fn read_plan_snapshot(
-    services: &WbControlServices,
-    plan: &WbControlPlan,
-) -> Result<crate::control::wb::WbCampaignBidSnapshot, String> {
-    let details = services
-        .reader
-        .promotion_campaign_details(&plan.account_id, vec![plan.advert_id], vec![], None)
-        .await
-        .map_err(|error| error.to_string())?;
-    campaign_snapshot(
-        &details,
-        &services.seller_sid,
-        plan.advert_id,
-        &plan.requested,
-    )
-    .map_err(|error| error.to_string())
-}
+    /// Builds a bounded, immutable WB launch manifest from a private account profile.
+    #[tool(
+        name = "wb_promotion_prepare_campaign",
+        annotations(
+            title = "Подготовить новую кампанию WB",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    pub(super) async fn prepare_wb_campaign_tool(
+        &self,
+        identity: ControlIdentity,
+        Parameters(input): Parameters<PrepareWbCampaignInput>,
+    ) -> Result<Json<WbCampaignToolResult>, String> {
+        self.prepare_campaign_request(&identity, &input).map(Json)
+    }
 
-async fn load_plan_result(
-    services: &WbControlServices,
-    plan_id: &str,
-    actor_id: &str,
-) -> Result<Json<WbPlanResult>, String> {
-    let plan = services
-        .plans
-        .load_for_actor(plan_id, actor_id)
-        .await
-        .map_err(plan_store_error)?;
-    Ok(Json(plan_result(&plan)))
+    /// Recovers the immutable handle by account and name after a lost prepare response.
+    #[tool(
+        name = "wb_promotion_find_campaign",
+        annotations(
+            title = "Найти подготовленную кампанию WB",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(super) async fn wb_campaign_find(
+        &self,
+        identity: ControlIdentity,
+        Parameters(input): Parameters<WbCampaignNameInput>,
+    ) -> Result<Json<WbCampaignToolResult>, String> {
+        self.campaign_lookup(&identity, &input).map(Json)
+    }
+
+    /// Rechecks products, category, overlap, stock and balance before creation.
+    #[tool(
+        name = "wb_promotion_campaign_preflight",
+        annotations(
+            title = "Проверить запуск кампании WB",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub(super) async fn wb_campaign_preflight(
+        &self,
+        identity: ControlIdentity,
+        Parameters(input): Parameters<WbCampaignHandleInput>,
+    ) -> Result<Json<WbCampaignToolResult>, String> {
+        self.campaign_stage(&identity, input, "preflight", false)
+            .await
+            .map(Json)
+    }
+
+    /// Sends at most one journaled WB create attempt for the exact manifest.
+    #[tool(
+        name = "wb_promotion_create_campaign",
+        annotations(
+            title = "Создать кампанию WB",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    pub(super) async fn wb_campaign_create(
+        &self,
+        identity: ControlIdentity,
+        Parameters(input): Parameters<WbCampaignHandleInput>,
+    ) -> Result<Json<WbCampaignToolResult>, String> {
+        self.campaign_stage(&identity, input, "create", true)
+            .await
+            .map(Json)
+    }
+
+    /// Applies the exact initial manual search bids after confirmed creation.
+    #[tool(
+        name = "wb_promotion_set_initial_campaign_bids",
+        annotations(
+            title = "Установить начальные ставки WB",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    pub(super) async fn wb_campaign_bids(
+        &self,
+        identity: ControlIdentity,
+        Parameters(input): Parameters<WbCampaignHandleInput>,
+    ) -> Result<Json<WbCampaignToolResult>, String> {
+        self.campaign_stage(&identity, input, "bids", true)
+            .await
+            .map(Json)
+    }
+
+    /// Exports robot policy and initial state only after confirmed create/bids.
+    #[tool(
+        name = "wb_promotion_export_campaign_robot",
+        annotations(
+            title = "Подготовить защитного робота WB",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(super) async fn wb_campaign_export_tool(
+        &self,
+        identity: ControlIdentity,
+        Parameters(input): Parameters<WbCampaignHandleInput>,
+    ) -> Result<Json<WbCampaignToolResult>, String> {
+        self.campaign_export(&identity, input).map(Json)
+    }
+
+    /// Transfers the exact authorized initial amount once, after journal checks.
+    #[tool(
+        name = "wb_promotion_fund_campaign",
+        annotations(
+            title = "Пополнить бюджет кампании WB",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    pub(super) async fn wb_campaign_fund(
+        &self,
+        identity: ControlIdentity,
+        Parameters(input): Parameters<WbCampaignHandleInput>,
+    ) -> Result<Json<WbCampaignToolResult>, String> {
+        self.campaign_stage(&identity, input, "fund", true)
+            .await
+            .map(Json)
+    }
+
+    /// Starts only after two fresh protective robot cycles and no incident.
+    #[tool(
+        name = "wb_promotion_start_campaign",
+        annotations(
+            title = "Запустить кампанию WB",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    pub(super) async fn wb_campaign_start(
+        &self,
+        identity: ControlIdentity,
+        Parameters(input): Parameters<WbCampaignHandleInput>,
+    ) -> Result<Json<WbCampaignToolResult>, String> {
+        self.campaign_stage(&identity, input, "start", true)
+            .await
+            .map(Json)
+    }
+
+    /// Read-back only after any uncertain create, bids, fund or start attempt.
+    #[tool(
+        name = "wb_promotion_reconcile_campaign",
+        annotations(
+            title = "Сверить создание кампании WB",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub(super) async fn wb_campaign_reconcile(
+        &self,
+        identity: ControlIdentity,
+        Parameters(input): Parameters<WbCampaignHandleInput>,
+    ) -> Result<Json<WbCampaignToolResult>, String> {
+        self.campaign_stage(&identity, input, "reconcile", false)
+            .await
+            .map(Json)
+    }
 }

@@ -6,9 +6,9 @@
 название, товары, начальные ставки, бюджет и срок разрешения.
 
 Сейчас поддерживается WB CPC с ручными ставками в поиске, 1–50 товаров одной
-категории. Создание выполняет локальный оператор `wb-automation`; дальнейшие
-ручные изменения используют существующие методы Control MCP. Новые методы
-создания в HTTP/MCP-реестр этим изменением не добавляются.
+категории. Создание и этапы запуска доступны через JWT-authenticated Control
+MCP и локальный оператор `wb-automation`; дальнейшие ручные изменения ставок
+используют существующие методы Control MCP после подключения кампании к policy.
 
 ## Один раз для кабинета
 
@@ -78,6 +78,43 @@ python3 scripts/install-wb-promotion-token.py --account ip_usovik_wb
 `CONTROL_MCP_WB_PROMOTION_WRITE_TOKEN_FILE_HOST` в отдельный Control кабинета.
 Для запуска требуются привязка seller SID в access registry, профиль кабинета
 и разрешённая конфигурация исполнителя.
+
+## Через Control MCP
+
+Для каждого WB-кабинета поднять отдельный JWT-authenticated Control instance
+с собственным `WB_CAMPAIGNS_ROOT`, профилем `profile.json` и его read/write
+Promotion-токенами. Compose overlays применяются в порядке
+`compose.control.yaml`, `compose.control-wb-plan.yaml`,
+`compose.control-wb-live.yaml`, `compose.control-wb-campaign.yaml`.
+Последний overlay оставляет runtime ставок выключенным, пока нет подключённых
+bid targets, и добавляет кабинетный оператор. После `campaign-enroll` указать
+`CONTROL_MCP_WB_BID_ACCOUNT_ID` равным этому кабинету и перезапустить Control. Указать
+`CONTROL_MCP_WB_CAMPAIGN_ACCOUNT_ID`, уникальные Compose project/container/port,
+OIDC issuer/JWKS/public URL и проверенные immutable images. В рабочем режиме
+`CONTROL_MCP_MARKETPLACE_WRITES_ENABLED=true` и policy `mode=enabled`.
+
+`wb_promotion_prepare_campaign` принимает `account_id`, название,
+`bids_kopecks` (nmID → копейки), `budget_rubles`, `authorization_reference`,
+`expires_at` и `robot_authorization_expires_at`. `authorized_at` задаёт сервер.
+Ответ содержит `campaign_handle` из 64 hex символов. Если ответ потерян,
+`wb_promotion_find_campaign` восстановит handle по кабинету и названию без
+повтора подготовки. Для того же handle и
+account последовательно доступны `wb_promotion_campaign_preflight`,
+`wb_promotion_create_campaign`, `wb_promotion_set_initial_campaign_bids`,
+`wb_promotion_export_campaign_robot`, `wb_promotion_fund_campaign`,
+`wb_promotion_start_campaign`, `wb_promotion_reconcile_campaign`.
+Создание не финансирует и не запускает кампанию. После неопределённого write
+использовать только reconcile; повтор stage запрещён журналом.
+
+Профиль должен ссылаться на `/etc/mcp-ozon/access.json`, файлы токенов
+`/run/mcp-ozon/control-credentials/wb-promotion-{read,write}.token` и пути
+`/var/lib/wb-campaigns/{robot-template.json,journal,campaigns}`. Reader proxy
+`http://ozon-egress:3128`, writer proxy `http://write-egress:3130`.
+Оператор создания и robot fleet используют один и тот же защищённый root.
+Экспорт создаёт политики, но не включает новую кампанию в fleet автоматически:
+перед финансированием и запуском её нужно подключить к общему планировщику и
+дать ему выполнить два плановых цикла. Внешний Analytics MCP остаётся read-only;
+клиент должен подключаться к отдельному Control MCP endpoint с JWT.
 
 ## Для каждой новой кампании
 
