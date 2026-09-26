@@ -1,5 +1,13 @@
 //! Operator recovery contracts on a disposable PostgreSQL database only.
+use sha2::{Digest, Sha256};
 use tokio_postgres::{Client, NoTls};
+
+fn archive_cycle_id(case: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(format!("runtime_incident_recovery/{case}"))
+    )
+}
 
 async fn admin() -> Option<Client> {
     let url = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL").ok()?;
@@ -113,20 +121,20 @@ async fn open(client: &Client) -> bool {
 async fn terminal_archive_keeps_lock_and_realerts_when_campaign_or_authorization_changes() {
     let Some(client) = admin().await else { return };
     client.batch_execute("INSERT INTO wb_automation.execution_state(account_id,advert_id,schema_version,policy_digest,business_date,actions_today,incident_class,revision) VALUES('terminal_recovery_contract',987654321,1,repeat('a',64),current_date,0,'daily_spend_cap_breached',1)").await.unwrap();
-    let old_cycle_id = "1".repeat(64);
+    let old_cycle_id = archive_cycle_id("old");
     cycle(&client, &old_cycle_id, 7, 0, "authorization_expired", 120).await;
     assert!(!archive(&client, &old_cycle_id, 1).await);
-    let active = "2".repeat(64);
+    let active = archive_cycle_id("active");
     cycle(&client, &active, 9, 0, "authorization_expired", 0).await;
     assert!(!archive(&client, &active, 1).await);
-    let funded = "3".repeat(64);
+    let funded = archive_cycle_id("funded");
     cycle(&client, &funded, 7, 1, "authorization_expired", 0).await;
     assert!(!archive(&client, &funded, 1).await);
-    let authorized = "4".repeat(64);
+    let authorized = archive_cycle_id("authorized");
     cycle(&client, &authorized, 7, 0, "no_material_change", 0).await;
     assert!(!archive(&client, &authorized, 1).await);
     assert!(open(&client).await);
-    let terminal = "5".repeat(64);
+    let terminal = archive_cycle_id("terminal");
     cycle(&client, &terminal, 7, 0, "authorization_expired", 0).await;
     assert!(!archive(&client, &terminal, 2).await);
     assert!(archive(&client, &terminal, 1).await);
@@ -135,7 +143,7 @@ async fn terminal_archive_keeps_lock_and_realerts_when_campaign_or_authorization
     let state=client.query_one("SELECT incident_class,revision FROM wb_automation.execution_state WHERE account_id='terminal_recovery_contract'",&[]).await.unwrap();
     assert_eq!(state.get::<_, String>(0), "daily_spend_cap_breached");
     assert_eq!(state.get::<_, i64>(1), 1);
-    let reactivated = "6".repeat(64);
+    let reactivated = archive_cycle_id("reactivated");
     cycle(&client, &reactivated, 9, 100, "authorization_expired", 0).await;
     assert!(open(&client).await);
     let allowed:bool=client.query_one("SELECT has_function_privilege('wb_automation_writer','wb_automation.archive_terminal_incident(text,bigint,bigint,text,text,text)','EXECUTE') OR has_function_privilege('position_reader','wb_automation.archive_terminal_incident(text,bigint,bigint,text,text,text)','EXECUTE')",&[]).await.unwrap().get(0);
