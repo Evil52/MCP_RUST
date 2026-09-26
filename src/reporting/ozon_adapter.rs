@@ -7,6 +7,10 @@
 //! no I/O and never resolves credentials; the network adapter must pass its
 //! responses through these functions before a snapshot can be persisted.
 
+mod sales;
+pub(super) use sales::parse_sales_control_totals;
+pub use sales::sales_request;
+
 use chrono::NaiveDate;
 use serde_json::Value;
 use thiserror::Error;
@@ -73,33 +77,6 @@ pub enum OzonReportParseError {
     TooManyRows,
     #[error("Ozon report response has an unsupported currency")]
     Currency,
-}
-
-/// Builds the only sales request accepted by the daily-report normalizer.
-///
-/// It requires a non-empty, inclusive UTC business-date window and preserves
-/// a fixed positional metrics contract for [`parse_sales_page`].
-pub fn sales_request(
-    date_from: NaiveDate,
-    date_to: NaiveDate,
-    offset: u32,
-) -> Result<OzonReportRequest, OzonReportParseError> {
-    if date_from > date_to {
-        return Err(OzonReportParseError::Value);
-    }
-    Ok(OzonReportRequest {
-        path: "/v1/analytics/data",
-        payload: serde_json::json!({
-            "date_from": date_from.format("%Y-%m-%d").to_string(),
-            "date_to": date_to.format("%Y-%m-%d").to_string(),
-            "metrics": ["revenue", "ordered_units"],
-            "dimension": ["sku", "day"],
-            "filters": [],
-            "sort": [],
-            "limit": MAX_PAGE_ROWS,
-            "offset": offset,
-        }),
-    })
 }
 
 /// Builds one cursor page for the two warehouse-granular stock sources.
@@ -1000,7 +977,8 @@ mod tests {
                 payload: json!({
                     "date_from": "2026-08-15", "date_to": "2026-08-16",
                     "metrics": ["revenue", "ordered_units"],
-                    "dimension": ["sku", "day"], "filters": [], "sort": [],
+                    "dimension": ["sku", "day"], "filters": [],
+                    "sort": [{"key": "sku", "order": "ASC"}, {"key": "day", "order": "ASC"}],
                     "limit": 1_000, "offset": 7,
                 }),
             }

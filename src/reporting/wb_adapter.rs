@@ -112,6 +112,41 @@ pub fn parse_sales_page(
     Ok((facts, products.len()))
 }
 
+/// The unfiltered grouped response is one aggregate (nmId=0), not SKU facts.
+pub(super) fn parse_sales_control_totals(
+    response: &Value,
+    expected_date: NaiveDate,
+) -> Result<super::sales_integrity::SalesTotals, WbReportParseError> {
+    let groups = array(field(object(response)?, "data")?)?;
+    if groups.len() != 1 {
+        return Err(WbReportParseError::Shape);
+    }
+    let group = object(&groups[0])?;
+    let product = object(field(group, "product")?)?;
+    if field(group, "currency")?.as_str() != Some("RUB")
+        || unsigned(field(product, "nmId")?)? != 0
+        || unsigned(field(product, "subjectId")?)? != 0
+        || field(product, "brandName")?.as_str() != Some("")
+    {
+        return Err(WbReportParseError::Value);
+    }
+    let history = array(field(group, "history")?)?;
+    if history.len() != 1 {
+        return Err(WbReportParseError::Shape);
+    }
+    let day = object(&history[0])?;
+    if date(field(day, "date")?)? != expected_date {
+        return Err(WbReportParseError::Value);
+    }
+    Ok(super::sales_integrity::SalesTotals::from([(
+        expected_date,
+        (
+            unsigned(field(day, "orderCount")?)?,
+            minor(field(day, "orderSum")?)?,
+        ),
+    )]))
+}
+
 pub fn parse_stock_page(
     response: &Value,
 ) -> Result<(Vec<CollectedStockFact>, usize), WbReportParseError> {

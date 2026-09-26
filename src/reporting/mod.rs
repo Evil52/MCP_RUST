@@ -45,6 +45,7 @@ pub mod postgres_snapshot;
 pub mod preview;
 pub mod refresh_queue;
 pub mod rules;
+mod sales_integrity;
 pub mod scheduler;
 pub mod service;
 pub mod snapshot;
