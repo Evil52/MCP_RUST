@@ -10,6 +10,7 @@ const HTTP_BODY_LIMIT: usize = 2 * 1_048_576;
 struct SalesFixtureTransport {
     pages: Arc<Mutex<VecDeque<Value>>>,
     closing_pages: Arc<Mutex<VecDeque<Value>>>,
+    history: Arc<Mutex<VecDeque<Value>>>,
     requested: Arc<Mutex<Vec<(u32, u32)>>>,
 }
 
@@ -18,6 +19,7 @@ impl SalesFixtureTransport {
         Self {
             pages: Arc::new(Mutex::new(pages.into())),
             closing_pages: Arc::new(Mutex::new(VecDeque::new())),
+            history: Arc::new(Mutex::new(VecDeque::new())),
             requested: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -61,6 +63,25 @@ impl WbReportTransport for SalesFixtureTransport {
                 .ok_or(WbReportSourceError::SalesPageOverlap)?;
             self.requested.lock().unwrap().push((u32::MAX, offset));
             Ok(page)
+        })
+    }
+
+    fn sales_history(
+        &self,
+        _date: NaiveDate,
+        ids: Vec<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(async move {
+            assert!(ids.len() <= 20);
+            self.requested
+                .lock()
+                .unwrap()
+                .push((u32::MAX - 1, u32::try_from(ids.len()).unwrap()));
+            self.history
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or(WbReportSourceError::SalesPageOverlap)
         })
     }
 
@@ -392,3 +413,5 @@ async fn live_transport_control_requests_unfiltered_daily_history() {
 }
 
 mod closing;
+
+mod reconciliation;

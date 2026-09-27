@@ -16,6 +16,8 @@ use tokio_postgres::{Client, Config, NoTls};
 
 #[path = "reporting_source_jobs/fbs_publication.rs"]
 mod fbs_publication;
+#[path = "reporting_source_jobs/reconciliation.rs"]
+mod reconciliation;
 #[path = "reporting_source_jobs/stock_recovery.rs"]
 mod stock_recovery;
 

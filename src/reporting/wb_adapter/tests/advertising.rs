@@ -83,3 +83,64 @@ fn fullstats_v3_nms_preserves_sku_and_rejects_ambiguous_or_inconsistent_rows() {
         Err(WbReportParseError::InconsistentAdvertisingCounts)
     );
 }
+
+#[test]
+fn invalid_sku_counts_only_fall_back_when_every_campaign_day_total_matches() {
+    let body = json!([{"advertId":40_287_814,"days":[{"date":"2026-09-27",
+    "views":2029,"clicks":65,"sum":616.16,"orders":2,"sum_price":500,
+    "apps":[{"nms":[
+        {"nmId":890_252_433,"views":2,"clicks":3,"sum":29.37,"orders":0,"sum_price":0},
+        {"nmId":8,"views":2027,"clicks":62,"sum":586.79,"orders":2,"sum_price":500}
+    ]}]}]}]);
+    let facts = parse_promotion_stats(&body).unwrap();
+    assert_eq!(facts.len(), 1);
+    let fact = &facts[0];
+    assert_eq!(
+        (fact.campaign_id, fact.sku, fact.impressions, fact.clicks),
+        (40_287_814, 0, 2029, 65)
+    );
+    assert_eq!(
+        (
+            fact.spend_minor,
+            fact.attributed_orders,
+            fact.attributed_revenue_minor
+        ),
+        (61616, 2, 50000)
+    );
+    for (key, value) in [
+        ("views", json!(2030)),
+        ("clicks", json!(66)),
+        ("sum", json!(616.17)),
+        ("orders", json!(3)),
+        ("sum_price", json!(501)),
+    ] {
+        let mut invalid = body.clone();
+        invalid[0]["days"][0][key] = value;
+        assert_eq!(
+            parse_promotion_stats(&invalid),
+            Err(WbReportParseError::InconsistentAdvertisingCounts)
+        );
+    }
+    let mut bad_day = body.clone();
+    bad_day[0]["days"][0]["views"] = json!(2);
+    bad_day[0]["days"][0]["apps"][0]["nms"][1]["views"] = json!(0);
+    assert_eq!(
+        parse_promotion_stats(&bad_day),
+        Err(WbReportParseError::InconsistentAdvertisingCounts)
+    );
+    // Other days retain their reliable SKU allocation; no double counting.
+    let mut mixed = body.clone();
+    let mut good = body[0]["days"][0].clone();
+    good["date"] = json!("2026-09-26");
+    good["apps"][0]["nms"][0]["views"] = json!(10);
+    mixed[0]["days"].as_array_mut().unwrap().push(good);
+    let facts = parse_promotion_stats(&mixed).unwrap();
+    assert_eq!(facts.len(), 3);
+    assert_eq!(facts.iter().map(|f| f.spend_minor).sum::<u64>(), 123_232);
+    let mut overflow = body;
+    overflow[0]["days"][0]["apps"][0]["nms"][1]["views"] = json!(u64::MAX);
+    assert_eq!(
+        parse_promotion_stats(&overflow),
+        Err(WbReportParseError::Value)
+    );
+}

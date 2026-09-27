@@ -5,11 +5,13 @@ async fn v3_stats_refetch_inconsistent_counters_and_ignore_campaign_only_checkpo
     use crate::reporting::checkpoint::tests::{MemoryPages, journal};
     let date = NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
     let pages = MemoryPages::default();
-    checkpointed(&journal(&pages), json!(["wb_stats", date, [4]]), || async {
-        Ok::<_, WbReportSourceError>(Vec::<CollectedAdvertisingFact>::new())
-    })
-    .await
-    .unwrap();
+    for namespace in ["wb_stats", "wb_stats_v3_sku"] {
+        checkpointed(&journal(&pages), json!([namespace, date, [4]]), || async {
+            Ok::<_, WbReportSourceError>(Vec::<CollectedAdvertisingFact>::new())
+        })
+        .await
+        .unwrap();
+    }
     let fixture = FixtureTransport::complete();
     *fixture.stats.lock().unwrap() = [0, 10]
         .into_iter()
