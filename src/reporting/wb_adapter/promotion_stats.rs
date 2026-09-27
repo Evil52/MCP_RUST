@@ -81,7 +81,7 @@ pub fn parse_promotion_stats(
         .collect()
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 struct AdvertisingTotals {
     impressions: u64,
     clicks: u64,
@@ -99,10 +99,41 @@ fn parse_campaign_day(
     if product_rows.is_empty() {
         add_advertising_row(day, campaign_id, 0, totals)
     } else {
+        let mut products = BTreeMap::new();
         for row in product_rows {
             let sku = unsigned(field(row, "nmId")?)?;
             ensure_positive(sku)?;
-            add_advertising_row_with_date(row, field(day, "date")?, campaign_id, sku, totals)?;
+            add_advertising_row_with_date(
+                row,
+                field(day, "date")?,
+                campaign_id,
+                sku,
+                &mut products,
+            )?;
+        }
+        if products
+            .values()
+            .any(|value| value.clicks > value.impressions)
+        {
+            // Retain a campaign total only when all additive counters reconcile.
+            // sku=0 means unallocated; SKU optimizers already reject it.
+            let mut campaign = BTreeMap::new();
+            add_advertising_row(day, campaign_id, 0, &mut campaign)
+                .map_err(|_| WbReportParseError::InconsistentAdvertisingCounts)?;
+            let authoritative = campaign.values().next().ok_or(WbReportParseError::Shape)?;
+            let mut sum = AdvertisingTotals::default();
+            for value in products.values() {
+                sum.merge(value)?;
+            }
+            if authoritative.clicks > authoritative.impressions || sum != *authoritative {
+                return Err(WbReportParseError::InconsistentAdvertisingCounts);
+            }
+            tracing::warn!(campaign_id, business_date = ?field(day, "date")?,
+                "WB inconsistent SKU counters reconciled as unallocated campaign-day totals");
+            products = campaign;
+        }
+        for (key, value) in products {
+            totals.entry(key).or_default().merge(&value)?;
         }
         Ok(())
     }
@@ -140,4 +171,15 @@ fn add_advertising_row_with_date(
 
 fn checked_add(left: u64, right: u64) -> Result<u64, WbReportParseError> {
     left.checked_add(right).ok_or(WbReportParseError::Value)
+}
+
+impl AdvertisingTotals {
+    fn merge(&mut self, value: &Self) -> Result<(), WbReportParseError> {
+        self.impressions = checked_add(self.impressions, value.impressions)?;
+        self.clicks = checked_add(self.clicks, value.clicks)?;
+        self.spend_minor = checked_add(self.spend_minor, value.spend_minor)?;
+        self.orders = checked_add(self.orders, value.orders)?;
+        self.revenue_minor = checked_add(self.revenue_minor, value.revenue_minor)?;
+        Ok(())
+    }
 }

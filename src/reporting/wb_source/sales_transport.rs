@@ -25,6 +25,23 @@ impl WbClientReportTransport {
             .map_err(|error| wb_source_failure(&error))
     }
 
+    pub(super) async fn fetch_sales_history(
+        &self,
+        date: NaiveDate,
+        ids: Vec<u64>,
+    ) -> Result<Value, WbReportSourceError> {
+        self.client
+            .sales_funnel_history(
+                &self.account_id,
+                json!({
+                    "selectedPeriod":{"start":date,"end":date},
+                    "nmIds":ids,"skipDeletedNm":false,"aggregationLevel":"day"
+                }),
+            )
+            .await
+            .map_err(|error| wb_source_failure(&error))
+    }
+
     pub(super) async fn fetch_sales_control_totals(
         &self,
         date: NaiveDate,

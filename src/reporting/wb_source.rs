@@ -1,6 +1,7 @@
 //! Bounded read-only Wildberries source for daily reports.
 
 mod sales;
+mod sales_reconciliation;
 mod sales_transport;
 mod stocks;
 
@@ -62,6 +63,14 @@ pub trait WbReportTransport: Send + Sync {
         _date: NaiveDate,
         _limit: u32,
         _offset: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(async { Err(WbReportSourceError::SalesPageOverlap) })
+    }
+
+    fn sales_history(
+        &self,
+        _date: NaiveDate,
+        _ids: Vec<u64>,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
         Box::pin(async { Err(WbReportSourceError::SalesPageOverlap) })
     }
@@ -203,6 +212,14 @@ impl WbReportTransport for WbClientReportTransport {
         offset: u32,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
         Box::pin(self.fetch_sales_page(date, date, limit, offset, true))
+    }
+
+    fn sales_history(
+        &self,
+        date: NaiveDate,
+        ids: Vec<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + '_>> {
+        Box::pin(self.fetch_sales_history(date, ids))
     }
 
     fn sales_control_totals(
@@ -395,7 +412,7 @@ impl WbReportSource {
             let rows: Vec<CollectedAdvertisingFact> = checkpointed(
                 &self.checkpoints,
                 // v3 nms rows must never reuse campaign-only checkpoints.
-                json!(["wb_stats_v3_sku", date, chunk]),
+                json!(["wb_stats_v4_reconciled_day", date, chunk]),
                 || async {
                     let response = self
                         .transport

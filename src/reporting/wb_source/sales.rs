@@ -41,24 +41,16 @@ impl WbReportSource {
                 return Err(WbReportSourceError::InvalidSalesResponse);
             }
             if !pages.add(rows) {
-                return Err(WbReportSourceError::SalesPageOverlap);
+                // Discard the unstable walk; never deduplicate positive sales.
+                let mut fresh = crate::reporting::sales_integrity::SalesPages::default();
+                fresh.zero_overlap = true;
+                return self.close_sales(date, fresh).await;
             }
             if source_rows < SALES_PAGE_SIZE {
                 if pages.zero_overlap {
                     let totals = self.overlap_control(date, false).await?;
                     if !pages.matches(&totals) {
-                        let fresh = self
-                            .collect_closing_sales_pages(date, MAX_SALES_PAGES)
-                            .await?;
-                        if !pages.refresh_sales(fresh)
-                            || !pages.matches(&self.overlap_control(date, true).await?)
-                        {
-                            return Err(WbReportSourceError::SalesPageOverlap);
-                        }
-                        tracing::info!(
-                            source = "sales",
-                            "live sales closing pass verified against fresh daily totals"
-                        );
+                        return self.close_sales(date, pages).await;
                     }
                     tracing::info!(
                         source = "sales",
@@ -69,6 +61,31 @@ impl WbReportSource {
             }
         }
         Err(WbReportSourceError::PaginationLimit)
+    }
+
+    async fn close_sales(
+        &self,
+        date: NaiveDate,
+        mut pages: crate::reporting::sales_integrity::SalesPages,
+    ) -> Result<Vec<CollectedSalesFact>, WbReportSourceError> {
+        let fresh = self
+            .collect_closing_sales_pages(date, MAX_SALES_PAGES)
+            .await?;
+        if !pages.refresh_sales(fresh) {
+            return Err(WbReportSourceError::SalesPageOverlap);
+        }
+        let totals = self.overlap_control(date, true).await?;
+        if !pages.matches(&totals) {
+            let facts = pages.into_facts();
+            self.verify_whole_ruble_difference(date, &facts, &totals)
+                .await?;
+            return Ok(facts);
+        }
+        tracing::info!(
+            source = "sales",
+            "fresh sorted sales verified against independent daily totals"
+        );
+        Ok(pages.into_facts())
     }
 
     async fn overlap_control(

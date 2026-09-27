@@ -93,6 +93,12 @@ impl PostgresSnapshotWriter {
             .await.map_err(|_| PostgresCollectorError::Unavailable)?;
         client.prepare("SELECT payload FROM daily_reporting.source_collection_pages WHERE job_id=$1 AND request_key=$2")
             .await.map_err(|_| PostgresCollectorError::Unavailable)?;
+        client
+            .prepare(
+                "SELECT evidence FROM daily_reporting.snapshot_reconciliation_evidence LIMIT 0",
+            )
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
         let seller = client.query_one("SELECT has_table_privilege(current_user, 'daily_reporting.seller_stock_facts', 'INSERT') AND NOT has_table_privilege(current_user, 'daily_reporting.seller_stock_facts', 'UPDATE,DELETE')", &[])
             .await.map_err(|_| PostgresCollectorError::Unavailable)?;
         if !seller.get::<_, bool>(0) {
@@ -330,6 +336,8 @@ impl PostgresSnapshotWriter {
             &[&c.account_id,&marketplace_name(c.marketplace),&snapshot_source_name(claim.source),&c.cutoff_at,&observed,&snapshot.period_start,&snapshot.period_end,&version,&c.id,&c.generation,&first])
             .await.map_err(|error| map_snapshot_insert_error(&error))?;
         let id = persist_snapshot_contents(&tx, row.get(0), &snapshot).await?;
+        tx.execute("INSERT INTO daily_reporting.snapshot_reconciliation_evidence(snapshot_id,evidence) SELECT $1,payload FROM daily_reporting.source_collection_pages WHERE job_id=$2 AND payload->>'kind'='wb_sales_whole_ruble_v1'", &[&id,&c.id])
+            .await.map_err(|_| PostgresCollectorError::Unavailable)?;
         let done = tx
             .query_one(
                 "SELECT daily_reporting.finish_source_collection($1,$2,$3)",
