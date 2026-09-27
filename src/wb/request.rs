@@ -1,5 +1,9 @@
 //! One enforced dispatch boundary for every WB read.
 
+use std::time::Duration;
+
+use crate::marketplace_quota::QuotaError;
+
 use super::{
     AUTHORIZATION, AttemptContext, AttemptOutcome, ClientPolicy, EndpointPolicy, Instant, Method,
     RequestClass, StatusCode, TokenLimiter, TokioInstant, Url, Value, WbClient, WbError,
@@ -7,6 +11,11 @@ use super::{
 };
 
 use tokio::sync::SemaphorePermit;
+use tokio::time::sleep;
+
+const SHORT_SHARED_QUOTA_WAIT: Duration = Duration::from_millis(500);
+const SHARED_QUOTA_WAIT_MARGIN: Duration = Duration::from_millis(5);
+const MAX_SHORT_SHARED_QUOTA_RETRIES: usize = 3;
 
 impl WbClient {
     pub(super) async fn request(
@@ -122,26 +131,47 @@ impl WbClient {
         attempt: usize,
         retry: bool,
     ) -> Result<AttemptOutcome, WbError> {
-        // Both permits are released when this helper returns, before the retry
-        // loop performs any backoff sleep.
-        let (_global_permit, _token_permit) = self
-            .acquire_request_permits(
-                context.limiter,
-                context.request_class,
-                retry,
-                context.deadline,
-            )
-            .await?;
         let quota_key = self.shared_quota_key(context)?;
-        if let Some(key) = quota_key.as_ref() {
-            self.shared_quota
+        let mut short_quota_retries = 0;
+        // Another process or a small clock difference can leave the shared
+        // quota briefly behind the local limiter. Release both HTTP permits before waiting, then claim both
+        // limits again. Longer vendor cooldowns remain fail-fast.
+        let (_global_permit, _token_permit) = loop {
+            let permits = self
+                .acquire_request_permits(
+                    context.limiter,
+                    context.request_class,
+                    retry,
+                    context.deadline,
+                )
+                .await?;
+            let Some(key) = quota_key.as_ref() else {
+                break permits;
+            };
+            match self
+                .shared_quota
                 .admit(
                     key,
                     ClientPolicy::production(self.logical_timeout).interval(context.request_class),
                 )
                 .await
-                .map_err(read_quota_error)?;
-        }
+            {
+                Ok(()) => break permits,
+                Err(QuotaError::Limited { retry_after })
+                    if retry_after <= SHORT_SHARED_QUOTA_WAIT
+                        && short_quota_retries < MAX_SHORT_SHARED_QUOTA_RETRIES =>
+                {
+                    let delay = retry_after + SHARED_QUOTA_WAIT_MARGIN;
+                    if TokioInstant::now() + delay >= context.deadline {
+                        return Err(WbError::LocalRateLimited { retry_after });
+                    }
+                    short_quota_retries += 1;
+                    drop(permits);
+                    sleep(delay).await;
+                }
+                Err(error) => return Err(read_quota_error(error)),
+            }
+        };
         let mut request = self
             .http
             .request(context.method.clone(), context.url)
