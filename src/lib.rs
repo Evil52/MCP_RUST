@@ -1,5 +1,14 @@
 #![forbid(unsafe_code)]
 
+/// Every runtime image is built on Alpine, and musl's allocator serializes
+/// allocation across threads. Tool calls build and drop `serde_json::Value`
+/// trees of up to ~150,000 nodes, so under 16 concurrent calls musl fell to
+/// half its two-thread throughput. The images set `MIMALLOC_PURGE_DELAY=0`,
+/// otherwise mimalloc keeps freed pages for a second and a burst of large
+/// responses stays resident near the container memory limit.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod auth;
 mod bounded_body;
 pub mod config;
