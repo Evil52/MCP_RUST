@@ -659,6 +659,10 @@ fn nonfinished_campaign_ids(groups: &Value, own_id: Option<u64>) -> Result<BTree
 // succeeded then stopped. Retired types 4..7 cannot be produced by seacat CPC
 // create and are absent from v2 details (WB API announcement /forum/1659).
 // Only terminal retired campaigns are excluded; all other unknown data blocks.
+// A large seller may have more than 500 historical campaigns. Keep the scan
+// bounded while covering the complete listing before any create attempt.
+const MAX_REUSABLE_CAMPAIGN_SCAN: usize = 2_000;
+
 fn recovery_campaign_ids(groups: &Value, own_id: Option<u64>) -> Result<BTreeSet<u64>> {
     let rows = groups
         .get("adverts")
@@ -694,7 +698,10 @@ fn recovery_campaign_ids(groups: &Value, own_id: Option<u64>) -> Result<BTreeSet
             "campaign group truncated"
         );
         count += list.len();
-        ensure!(count <= 500, "campaign overlap check exceeds bounded scan");
+        ensure!(
+            count <= MAX_REUSABLE_CAMPAIGN_SCAN,
+            "campaign overlap check exceeds bounded scan"
+        );
         for item in list {
             let id = item
                 .get("advertId")
