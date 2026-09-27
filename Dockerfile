@@ -43,6 +43,9 @@ ENV MCP_TRANSPORT=http \
 ENV MCP_ACCESS_CONFIG=/etc/mcp-ozon/access.json
 
 EXPOSE 8787
+# mimalloc returns freed pages to the OS at once instead of after its
+# default one-second purge delay; see src/lib.rs.
+ENV MIMALLOC_PURGE_DELAY=0
 USER mcp
 
 ENTRYPOINT ["/usr/local/bin/mcp-ozon"]

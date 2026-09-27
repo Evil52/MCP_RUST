@@ -114,6 +114,7 @@ http-body = "1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }
 jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
+mimalloc = "0.1"
 reqwest = { version = "0.13", default-features = false, features = [
     "brotli",
     "form",

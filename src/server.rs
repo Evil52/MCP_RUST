@@ -79,7 +79,7 @@ use validation::{
 };
 mod tool_output;
 pub use tool_output::ToolTextContent;
-use tool_output::classify_tool_call_result;
+use tool_output::{Json, classify_tool_call_result};
 mod tools;
 
 use std::{
@@ -92,7 +92,7 @@ use std::{
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use rmcp::{
-    Json, RoleServer, ServerHandler,
+    RoleServer, ServerHandler,
     handler::server::{
         common::{AsRequestContext, FromContextPart},
         router::tool::ToolRouter,
@@ -1225,15 +1225,14 @@ impl ServerHandler for OzonMcp {
         // the server is currently saturated. Once authenticated, fail fast:
         // queued model calls must not grow memory without bound or reserve an
         // outbound marketplace slot long after the user has moved on.
-        let dispatch = async move {
+        let dispatch = self.tool_text_content.scope(async move {
             self.tool_router
                 .call(ToolCallContext::new(self, request, context))
                 .await
-        };
-        let (mut result, final_permit) = self
+        });
+        let (result, final_permit) = self
             .run_tool_call_with_admission_held(cancellation, Box::pin(dispatch))
             .await;
-        self.tool_text_content.apply(&mut result);
         let (outcome, error_code) = classify_tool_call_result(&result);
         if let Err(error) = self
             .tool_telemetry
