@@ -347,3 +347,88 @@ async fn reusable_funding_uses_exact_configured_amount_once_and_does_not_start()
     assert_eq!(body, json!({"sum":1500,"type":1,"return":true}));
     assert!(!sent.iter().any(|r| r.contains("/adv/v0/start")));
 }
+
+#[tokio::test]
+async fn reusable_preflight_checks_live_fbs_sizes_and_excludes_dbs_stock() {
+    let fixture = reusable("FBS товары", &[111, 222]);
+    let responses = vec![
+        (200, json!({"cards":[{"nmID":111,"subjectID":4263}]})),
+        (200, json!({"cards":[{"nmID":222,"subjectID":4263}]})),
+        (200, json!({"all":0,"adverts":[]})),
+        (200, json!({"data":{"items":[]}})),
+        (
+            200,
+            json!([{"id":775_040,"deliveryType":1},{"id":1_870_171,"deliveryType":2}]),
+        ),
+        (
+            200,
+            json!({"data":{"items":[
+                {"nmId":111,"chrtId":1001,"warehouseId":775_040,"quantity":10},
+                {"nmId":222,"chrtId":1002,"warehouseId":775_040,"quantity":10},
+                {"nmId":111,"chrtId":1001,"warehouseId":1_870_171,"quantity":99}
+            ]}}),
+        ),
+        (
+            200,
+            json!({"stocks":[{"chrtId":1001,"amount":4},{"chrtId":1002,"amount":5}]}),
+        ),
+    ];
+    let count = responses.len();
+    let (operator, receiver) = fixture.operator(responses);
+    let preflight = operator.preflight(None).await.unwrap();
+    assert_eq!(preflight["wb_stock"], json!({"111":4,"222":5}));
+    let sent = requests(&receiver, count);
+    assert!(
+        sent.iter()
+            .any(|request| request.starts_with("GET /api/v3/warehouses "))
+    );
+    assert!(sent.iter().any(|request| {
+        request.starts_with("POST /api/analytics/v1/stocks-report/seller-warehouses ")
+    }));
+    assert!(
+        sent.iter()
+            .any(|request| request.starts_with("POST /api/v3/stocks/775040 "))
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|request| request.contains("/api/v3/stocks/1870171"))
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|request| request.contains("/adv/v2/seacat/save-ad"))
+    );
+}
+
+#[tokio::test]
+async fn reusable_preflight_rejects_incomplete_live_fbs_response() {
+    let fixture = reusable("FBS нет данных", &[111]);
+    let responses = vec![
+        (200, json!({"cards":[{"nmID":111,"subjectID":4263}]})),
+        (200, json!({"all":0,"adverts":[]})),
+        (200, json!({"data":{"items":[]}})),
+        (200, json!([{"id":775_040,"deliveryType":1}])),
+        (
+            200,
+            json!({"data":{"items":[{"nmId":111,"chrtId":1001,"warehouseId":775_040,"quantity":10}]}}),
+        ),
+        (200, json!({"stocks":[]})),
+    ];
+    let count = responses.len();
+    let (operator, receiver) = fixture.operator(responses);
+    assert!(
+        operator
+            .preflight(None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("omitted a size")
+    );
+    let sent = requests(&receiver, count);
+    assert!(
+        !sent
+            .iter()
+            .any(|request| request.contains("/adv/v2/seacat/save-ad"))
+    );
+}

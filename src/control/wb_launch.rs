@@ -28,6 +28,7 @@ use std::{
 mod categories;
 mod manifest;
 mod setup;
+mod stock;
 
 pub use setup::{enroll_wb_campaign, export_wb_campaign, prepare_wb_campaign};
 pub use setup::{prepare_wb_campaign_from_request, wb_campaign_profile_runtime};
@@ -365,35 +366,6 @@ impl Operator {
             );
         }
         Ok(())
-    }
-
-    /// Reads one complete stock page and requires the configured sellable stock
-    /// for every launch SKU (the legacy Nexus floor remains 20).
-    async fn verified_stock_totals(&self) -> Result<BTreeMap<u64, u64>> {
-        let stocks = self
-            .reader
-            .warehouse_stocks(
-                &self.manifest.account_id,
-                json!({"nmIds":self.manifest.nm_ids(),"chrtIds":[],"limit":100,"offset":0}),
-            )
-            .await?;
-        let (stocks, count) = crate::reporting::wb_adapter::parse_stock_page(&stocks)?;
-        ensure!(count < 100, "stock page may be truncated");
-        let mut totals = BTreeMap::<u64, u64>::new();
-        for row in stocks {
-            let total = totals.entry(row.sku).or_default();
-            *total = total
-                .checked_add(row.sellable_units)
-                .context("stock overflow")?;
-        }
-        for nm in self.manifest.nm_ids() {
-            ensure!(
-                totals.get(&nm).copied().unwrap_or(0)
-                    >= self.manifest.minimum_launch_stock(&self.policy),
-                "SKU {nm} has insufficient verified WB stock"
-            );
-        }
-        Ok(totals)
     }
 
     async fn minimums(&self, id: u64) -> Result<()> {
