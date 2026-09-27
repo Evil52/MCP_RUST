@@ -13,7 +13,7 @@ use super::{
 use tokio::sync::SemaphorePermit;
 use tokio::time::sleep;
 
-const SHORT_SHARED_QUOTA_WAIT: Duration = Duration::from_millis(20);
+const SHORT_SHARED_QUOTA_WAIT: Duration = Duration::from_millis(500);
 const SHARED_QUOTA_WAIT_MARGIN: Duration = Duration::from_millis(5);
 const MAX_SHORT_SHARED_QUOTA_RETRIES: usize = 3;
 
@@ -133,9 +133,8 @@ impl WbClient {
     ) -> Result<AttemptOutcome, WbError> {
         let quota_key = self.shared_quota_key(context)?;
         let mut short_quota_retries = 0;
-        // A tiny difference between the process clock and the shared database
-        // clock can leave the shared quota a few milliseconds behind the local
-        // limiter. Release both HTTP permits before waiting, then claim both
+        // Another process or a small clock difference can leave the shared
+        // quota briefly behind the local limiter. Release both HTTP permits before waiting, then claim both
         // limits again. Longer vendor cooldowns remain fail-fast.
         let (_global_permit, _token_permit) = loop {
             let permits = self
