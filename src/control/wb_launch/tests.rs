@@ -114,6 +114,30 @@ fn replacement_never_authorizes_money_and_scan_requires_complete_history() {
 }
 
 #[test]
+fn reusable_recovery_scans_large_seller_history_but_keeps_a_finite_bound() {
+    let listing = |count: u64| {
+        json!({"all":count,"adverts":[{"type":9,"status":11,"count":count,
+            "advert_list":(1..=count).map(|id| json!({"advertId":id})).collect::<Vec<_>>() }]})
+    };
+    assert_eq!(
+        recovery_campaign_ids(&listing(537), None).unwrap().len(),
+        537
+    );
+    assert_eq!(
+        recovery_campaign_ids(&listing(MAX_REUSABLE_CAMPAIGN_SCAN as u64), None)
+            .unwrap()
+            .len(),
+        MAX_REUSABLE_CAMPAIGN_SCAN
+    );
+    assert!(
+        recovery_campaign_ids(&listing(MAX_REUSABLE_CAMPAIGN_SCAN as u64 + 1), None)
+            .unwrap_err()
+            .to_string()
+            .contains("bounded scan")
+    );
+}
+
+#[test]
 fn recovery_excludes_only_terminal_obsolete_types_and_keeps_total_integrity() {
     let group = |kind, status, id| {
         json!({"type":kind,"status":status,"count":1,
