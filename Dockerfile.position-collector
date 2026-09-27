@@ -33,5 +33,8 @@ RUN apk upgrade --no-cache \
 
 COPY --from=builder /build/runtime-bin/position-collector /usr/local/bin/position-collector
 
+# mimalloc returns freed pages to the OS at once instead of after its
+# default one-second purge delay; see src/lib.rs.
+ENV MIMALLOC_PURGE_DELAY=0
 USER collector
 ENTRYPOINT ["/usr/local/bin/position-collector"]
