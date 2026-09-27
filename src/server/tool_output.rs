@@ -1,15 +1,24 @@
-//! Post-processing of a finished tool call before it leaves the server.
+//! Construction and classification of tool results before they leave the server.
 
-use std::str::FromStr;
+use std::{any::Any, future::Future, io, str::FromStr};
 
-use rmcp::model::{CallToolResponse, ContentBlock};
+use rmcp::{
+    handler::server::tool::IntoCallToolResult,
+    model::{CallToolResponse, CallToolResult, ContentBlock},
+};
+use serde::Serialize;
 use serde_json::Value;
 
-use super::OzonMcp;
-use crate::tool_telemetry::ToolCallOutcome;
+use super::{OzonMcp, OzonResult, WbResult, WbSellerWarehouseStocksResult};
+use crate::{reporting::mcp_read::SourceSnapshotResult, tool_telemetry::ToolCallOutcome};
 
 /// Text block that replaces the JSON mirror in [`ToolTextContent::Summary`].
 const STRUCTURED_CONTENT_POINTER: &str = "Результат находится в structuredContent.";
+
+/// Same limits as rmcp's `Json<T>` (`vendor/rmcp/src/handler/server/wrapper/json.rs`);
+/// `tests::limits_match_rmcp_json` fails if they drift apart.
+const MAX_STRUCTURED_CONTENT_BYTES: usize = (2 * 1024 * 1024) + (64 * 1024);
+const MAX_SERIALIZED_CALL_TOOL_RESULT_BYTES: usize = (3 * 2 * 1024 * 1024) + (64 * 1024);
 
 /// What the text block of a successful structured tool result carries.
 ///
@@ -27,6 +36,10 @@ pub enum ToolTextContent {
     Summary,
 }
 
+tokio::task_local! {
+    static TOOL_TEXT_CONTENT: ToolTextContent;
+}
+
 impl FromStr for ToolTextContent {
     type Err = anyhow::Error;
 
@@ -40,22 +53,14 @@ impl FromStr for ToolTextContent {
 }
 
 impl ToolTextContent {
-    /// Replaces the JSON mirror of a successful structured result.
-    ///
-    /// Error results keep their text because it is the public failure message.
-    /// A mirror shorter than the pointer is kept as well.
-    pub(super) fn apply(self, result: &mut Result<CallToolResponse, rmcp::ErrorData>) {
-        let (Self::Summary, Ok(CallToolResponse::Complete(result))) = (self, result) else {
-            return;
-        };
-        if result.is_error == Some(true) || result.structured_content.is_none() {
-            return;
-        }
-        if let [ContentBlock::Text(text)] = result.content.as_mut_slice()
-            && text.text.len() > STRUCTURED_CONTENT_POINTER.len()
-        {
-            STRUCTURED_CONTENT_POINTER.clone_into(&mut text.text);
-        }
+    /// Makes this mode visible to every [`Json`] result built inside `future`.
+    pub(super) fn scope<F: Future>(self, future: F) -> impl Future<Output = F::Output> {
+        TOOL_TEXT_CONTENT.scope(self, future)
+    }
+
+    /// Outside a tool call the result keeps the specification default.
+    fn current() -> Self {
+        TOOL_TEXT_CONTENT.try_with(|mode| *mode).unwrap_or_default()
     }
 }
 
@@ -65,6 +70,136 @@ impl OzonMcp {
         self.tool_text_content = tool_text_content;
         self
     }
+}
+
+/// Structured tool output.
+///
+/// It replaces rmcp's `Json<T>` for this server and keeps its name because the
+/// `#[tool]` macro derives the output schema only from a return type named
+/// `Json<T>`. rmcp serializes the result to bytes, parses them into a second
+/// `Value` tree and always builds the text mirror. This wrapper moves an
+/// existing tree into `structuredContent` and builds the text block for the
+/// current [`ToolTextContent`] only, with the same size limits and errors.
+pub struct Json<T>(pub T);
+
+impl<T: Serialize + 'static> IntoCallToolResult for Json<T> {
+    fn into_call_tool_result(self) -> Result<CallToolResponse, rmcp::ErrorData> {
+        let mut inner = self.0;
+        let structured_bytes = serialized_len(&inner, MAX_STRUCTURED_CONTENT_BYTES)?;
+        let moved = take_owned_trees(&mut inner);
+        let value = with_moved_fields(serde_json::to_value(&inner), moved)
+            .map_err(|_| serialization_error(false))?;
+        drop(inner);
+        let mirror = ToolTextContent::current() == ToolTextContent::Json
+            || structured_bytes <= STRUCTURED_CONTENT_POINTER.len();
+        let text = if mirror {
+            value.to_string()
+        } else {
+            STRUCTURED_CONTENT_POINTER.to_owned()
+        };
+        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+        result.structured_content = Some(value);
+        // Without the mirror the result is the capped structured content plus
+        // a fixed pointer, far below the whole-result cap.
+        if mirror {
+            serialized_len(&result, MAX_SERIALIZED_CALL_TOOL_RESULT_BYTES)?;
+        }
+        Ok(result.into())
+    }
+}
+
+/// Takes the marketplace and snapshot `Value` trees out of the results that
+/// own one, so they are moved into `structuredContent` rather than copied.
+/// Every other result is small and typed, and is copied by `to_value`.
+fn take_owned_trees(result: &mut dyn Any) -> Vec<(&'static str, Option<Value>)> {
+    if let Some(result) = result.downcast_mut::<OzonResult>() {
+        return vec![("data", Some(std::mem::take(&mut result.data)))];
+    }
+    if let Some(result) = result.downcast_mut::<WbResult>() {
+        return vec![("data", Some(std::mem::take(&mut result.data)))];
+    }
+    if let Some(result) = result.downcast_mut::<WbSellerWarehouseStocksResult>() {
+        return vec![("data", Some(std::mem::take(&mut result.source.data)))];
+    }
+    if let Some(result) = result.downcast_mut::<SourceSnapshotResult>() {
+        return vec![
+            ("rows", Some(Value::Array(std::mem::take(&mut result.rows)))),
+            ("latest_collection", result.latest_collection.take()),
+        ];
+    }
+    Vec::new()
+}
+
+/// Puts the fields taken out before serialization back into `object`.
+///
+/// A field that held `None` is left as serialized, so `skip_serializing_if`
+/// and `null` behave exactly as for an untouched value.
+fn with_moved_fields(
+    object: serde_json::Result<Value>,
+    moved: Vec<(&'static str, Option<Value>)>,
+) -> serde_json::Result<Value> {
+    let mut object = object?;
+    if moved.is_empty() {
+        return Ok(object);
+    }
+    let Value::Object(fields) = &mut object else {
+        return Err(serde::ser::Error::custom(
+            "structured result must be an object",
+        ));
+    };
+    for (name, value) in moved {
+        if let Some(value) = value {
+            fields.insert(name.to_owned(), value);
+        }
+    }
+    Ok(object)
+}
+
+/// Counts serialized bytes without allocating, failing past `limit`.
+struct CountingWriter {
+    written: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self.written.checked_add(buffer.len()) {
+            Some(written) if written <= self.limit => {
+                self.written = written;
+                Ok(buffer.len())
+            }
+            _ => {
+                self.exceeded = true;
+                Err(io::Error::other(
+                    "structured tool result size limit exceeded",
+                ))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_len(value: &impl Serialize, limit: usize) -> Result<usize, rmcp::ErrorData> {
+    let mut writer = CountingWriter {
+        written: 0,
+        limit,
+        exceeded: false,
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|_| serialization_error(writer.exceeded))?;
+    Ok(writer.written)
+}
+
+fn serialization_error(limit_exceeded: bool) -> rmcp::ErrorData {
+    let message = if limit_exceeded {
+        "Structured tool result exceeds the response size limit"
+    } else {
+        "Failed to serialize structured content"
+    };
+    rmcp::ErrorData::internal_error(message, None)
 }
 
 pub(super) fn classify_tool_call_result(
@@ -92,93 +227,4 @@ pub(super) fn classify_tool_call_result(
 }
 
 #[cfg(test)]
-mod tests {
-    use rmcp::{
-        handler::server::{tool::IntoCallToolResult, wrapper::Json},
-        model::CallToolResult,
-    };
-    use serde_json::json;
-
-    use super::*;
-
-    fn structured(value: Value) -> Result<CallToolResponse, rmcp::ErrorData> {
-        Json(value).into_call_tool_result()
-    }
-
-    fn text_and_structured(
-        response: &Result<CallToolResponse, rmcp::ErrorData>,
-    ) -> (&str, Option<&Value>) {
-        let Ok(CallToolResponse::Complete(result)) = response else {
-            panic!("the fixture must be a complete tool result");
-        };
-        let [ContentBlock::Text(text)] = result.content.as_slice() else {
-            panic!("the fixture must carry exactly one text block");
-        };
-        (&text.text, result.structured_content.as_ref())
-    }
-
-    fn large_value() -> Value {
-        json!({"rows": (0..50).map(|sku| json!({"sku": sku, "stock": sku * 3})).collect::<Vec<_>>()})
-    }
-
-    #[test]
-    fn mode_parses_only_the_documented_values() {
-        assert_eq!(
-            "json".parse::<ToolTextContent>().unwrap(),
-            ToolTextContent::Json
-        );
-        assert_eq!(
-            "summary".parse::<ToolTextContent>().unwrap(),
-            ToolTextContent::Summary
-        );
-        for rejected in ["", "JSON", "none", " summary"] {
-            assert!(rejected.parse::<ToolTextContent>().is_err(), "{rejected:?}");
-        }
-        assert_eq!(ToolTextContent::default(), ToolTextContent::Json);
-    }
-
-    #[test]
-    fn json_mode_keeps_the_full_mirror() {
-        let value = large_value();
-        let mut response = structured(value.clone());
-        ToolTextContent::Json.apply(&mut response);
-
-        let (text, structured) = text_and_structured(&response);
-        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), value);
-        assert_eq!(structured, Some(&value));
-    }
-
-    #[test]
-    fn summary_mode_replaces_the_mirror_and_keeps_structured_content() {
-        let value = large_value();
-        let mut response = structured(value.clone());
-        let mirrored_bytes = text_and_structured(&response).0.len();
-        ToolTextContent::Summary.apply(&mut response);
-
-        let (text, structured) = text_and_structured(&response);
-        assert_eq!(text, STRUCTURED_CONTENT_POINTER);
-        assert!(text.len() * 10 < mirrored_bytes, "{mirrored_bytes}");
-        assert_eq!(structured, Some(&value));
-    }
-
-    #[test]
-    fn summary_mode_keeps_a_mirror_shorter_than_the_pointer() {
-        let mut response = structured(json!({"ok": true}));
-        ToolTextContent::Summary.apply(&mut response);
-
-        assert_eq!(text_and_structured(&response).0, r#"{"ok":true}"#);
-    }
-
-    #[test]
-    fn summary_mode_keeps_error_and_unstructured_results() {
-        let message = "x".repeat(200);
-        let mut error = Ok(CallToolResult::structured_error(json!({"message": message})).into());
-        let mut plain = Ok(CallToolResult::success(vec![ContentBlock::text(message)]).into());
-        let mut protocol_error = Err(rmcp::ErrorData::invalid_params("bad request", None));
-        for response in [&mut error, &mut plain, &mut protocol_error] {
-            let before = format!("{response:?}");
-            ToolTextContent::Summary.apply(response);
-            assert_eq!(format!("{response:?}"), before);
-        }
-    }
-}
+mod tests;
