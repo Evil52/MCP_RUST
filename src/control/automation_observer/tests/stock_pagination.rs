@@ -96,6 +96,7 @@ async fn terminal_empty_page_allows_confirmed_zero_stock() {
     let (snapshot, requests) = observe_with_pages(vec![
         (200, full_stock_page().to_string()),
         (200, serde_json::json!({"data": {"items": []}}).to_string()),
+        (200, serde_json::json!([]).to_string()),
     ])
     .await;
     assert!(matches!(
@@ -105,7 +106,11 @@ async fn terminal_empty_page_allows_confirmed_zero_stock() {
             reason: WbAutomationDisableReason::LowStock,
         }
     ));
-    assert_eq!(stock_requests(&requests).len(), 2);
+    let sent = requests.try_iter().skip(4).collect::<Vec<_>>();
+    assert_eq!(sent.len(), 3);
+    assert!(sent[0].starts_with("POST /api/analytics/v1/stocks-report/wb-warehouses "));
+    assert!(sent[1].starts_with("POST /api/analytics/v1/stocks-report/wb-warehouses "));
+    assert!(sent[2].starts_with("GET /api/v3/warehouses "));
 }
 
 #[tokio::test]
@@ -136,4 +141,79 @@ async fn failed_or_invalid_later_page_prevents_stock_decisions() {
         assert!(snapshot.unwrap_err().to_string().contains(expected_error));
         assert_eq!(stock_requests(&requests).len(), 2);
     }
+}
+
+#[tokio::test]
+async fn missing_wb_owned_stock_uses_verified_live_fbs_inventory() {
+    let policy = policy_fixture();
+    let (base_url, requests) = mock_http(vec![
+        (
+            200,
+            serde_json::json!({"data":{"items":[
+                {"nmId":449_627_598_u64,"warehouseId":1,"quantity":10},
+                {"nmId":497_424_314_u64,"warehouseId":1,"quantity":8}
+            ]}})
+            .to_string(),
+        ),
+        (
+            200,
+            serde_json::json!([
+                {"id":775_040,"deliveryType":1},
+                {"id":1_870_171,"deliveryType":2}
+            ])
+            .to_string(),
+        ),
+        (
+            200,
+            serde_json::json!({"data":{"items":[
+                {"nmId":449_627_015_u64,"chrtId":1002,"warehouseId":775_040,"quantity":99},
+                {"nmId":449_627_015_u64,"chrtId":1002,"warehouseId":1_870_171,"quantity":99}
+            ]}})
+            .to_string(),
+        ),
+        (
+            200,
+            serde_json::json!({"stocks":[{"chrtId":1002,"amount":5}]}).to_string(),
+        ),
+    ]);
+    let client = WbClient::new_for_test(
+        Duration::from_secs(2),
+        BTreeMap::from([(
+            policy.account_id.clone(),
+            WbCredentials {
+                token: "test-token".to_owned(),
+            },
+        )]),
+        &base_url,
+        &base_url,
+    );
+    let stocks = stocks::collect(&client, &policy).await.unwrap();
+    let totals = stocks
+        .iter()
+        .fold(BTreeMap::<u64, u64>::new(), |mut totals, fact| {
+            *totals.entry(fact.sku).or_default() += fact.sellable_units;
+            totals
+        });
+    assert_eq!(totals[&449_627_598], 10);
+    assert_eq!(totals[&449_627_015], 5);
+    assert_eq!(totals[&497_424_314], 8);
+    let sent = (0..4)
+        .map(|_| requests.recv_timeout(Duration::from_secs(1)).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        sent.iter()
+            .any(|request| request.starts_with("GET /api/v3/warehouses "))
+    );
+    assert!(sent.iter().any(|request| {
+        request.starts_with("POST /api/analytics/v1/stocks-report/seller-warehouses ")
+    }));
+    assert!(
+        sent.iter()
+            .any(|request| request.starts_with("POST /api/v3/stocks/775040 "))
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|request| request.contains("/api/v3/stocks/1870171"))
+    );
 }
