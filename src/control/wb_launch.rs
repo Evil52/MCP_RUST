@@ -28,7 +28,7 @@ use std::{
 mod categories;
 mod manifest;
 mod setup;
-mod stock;
+pub(super) mod stock;
 
 pub use setup::{enroll_wb_campaign, export_wb_campaign, prepare_wb_campaign};
 pub use setup::{prepare_wb_campaign_from_request, wb_campaign_profile_runtime};

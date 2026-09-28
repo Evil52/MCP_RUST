@@ -1,6 +1,6 @@
 //! A missing SKU means zero stock only after a terminal short source page.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 
@@ -21,9 +21,55 @@ pub(super) async fn collect(
     client: &WbClient,
     policy: &WbAutomationPolicy,
 ) -> Result<Vec<CollectedStockFact>> {
-    tokio::time::timeout(COLLECTION_TIMEOUT, collect_pages(client, policy))
+    tokio::time::timeout(COLLECTION_TIMEOUT, collect_with_fbs(client, policy))
         .await
         .context("WB automation stock snapshot превысил общий deadline")?
+}
+
+async fn collect_with_fbs(
+    client: &WbClient,
+    policy: &WbAutomationPolicy,
+) -> Result<Vec<CollectedStockFact>> {
+    let mut stocks = collect_pages(client, policy).await?;
+    let mut totals = BTreeMap::<u64, u64>::new();
+    for stock in &stocks {
+        let total = totals.entry(stock.sku).or_default();
+        *total = total
+            .checked_add(stock.sellable_units)
+            .context("WB automation stock total overflow")?;
+    }
+    let missing = policy
+        .nm_ids
+        .iter()
+        .copied()
+        .filter(|nm| totals.get(nm).copied().unwrap_or(0) < policy.min_sellable_stock)
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let wb_totals = totals.clone();
+        crate::control::wb_launch::stock::add_live_fbs_stocks(
+            client,
+            &policy.account_id,
+            &missing,
+            &mut totals,
+        )
+        .await?;
+        for nm in missing {
+            let fbs_units = totals
+                .get(&nm)
+                .copied()
+                .unwrap_or(0)
+                .checked_sub(wb_totals.get(&nm).copied().unwrap_or(0))
+                .context("WB automation FBS stock total decreased")?;
+            if fbs_units > 0 {
+                stocks.push(CollectedStockFact {
+                    sku: nm,
+                    warehouse_id: "live_fbs".to_owned(),
+                    sellable_units: fbs_units,
+                });
+            }
+        }
+    }
+    Ok(stocks)
 }
 
 async fn collect_pages(

@@ -6,6 +6,8 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::wb::WbClient;
+
 const MAX_FBS_WAREHOUSES: usize = 100;
 const STOCK_REPORT_PAGE_LIMIT: u32 = 1_000;
 const MAX_STOCK_REPORT_PAGES: usize = 5;
@@ -33,7 +35,13 @@ impl Operator {
             .filter(|nm| totals.get(nm).copied().unwrap_or(0) < minimum)
             .collect::<Vec<_>>();
         if self.manifest.version == 2 && !missing.is_empty() {
-            self.add_live_fbs_stocks(&missing, &mut totals).await?;
+            add_live_fbs_stocks(
+                &self.reader,
+                &self.manifest.account_id,
+                &missing,
+                &mut totals,
+            )
+            .await?;
         }
         for nm in self.manifest.nm_ids() {
             ensure!(
@@ -43,75 +51,73 @@ impl Operator {
         }
         Ok(totals)
     }
+}
 
-    async fn add_live_fbs_stocks(
-        &self,
-        missing: &[u64],
-        totals: &mut BTreeMap<u64, u64>,
-    ) -> Result<()> {
-        let warehouses = self
-            .reader
-            .seller_warehouses(&self.manifest.account_id)
-            .await
-            .context("FBS warehouse list unavailable for launch stock preflight")?;
-        let fbs = fbs_warehouse_ids(&warehouses)?;
-        if fbs.is_empty() {
-            return Ok(());
-        }
-        let mut identities = BTreeMap::<u64, BTreeMap<u64, u64>>::new();
-        let mut seen = BTreeSet::new();
-        let mut offset = 0;
-        let mut complete = false;
-        for _ in 0..MAX_STOCK_REPORT_PAGES {
-            let page = self
-                .reader
-                .seller_warehouses_stock_report(
-                    &self.manifest.account_id,
-                    missing,
-                    &[],
-                    STOCK_REPORT_PAGE_LIMIT,
-                    offset,
-                )
-                .await
-                .context("FBS size identities unavailable for launch stock preflight")?;
-            let items = page
-                .data
-                .pointer("/data/items")
-                .and_then(Value::as_array)
-                .context("FBS stock report page incomplete")?;
-            for item in items {
-                let nm = positive_id(item.get("nmId"), "FBS nmId missing")?;
-                let chrt = positive_id(item.get("chrtId"), "FBS chrtId missing")?;
-                let warehouse = positive_id(item.get("warehouseId"), "FBS warehouseId missing")?;
-                ensure!(
-                    seen.insert((warehouse, chrt)),
-                    "duplicate FBS stock identity"
-                );
-                if fbs.contains(&warehouse) {
-                    ensure!(missing.contains(&nm), "foreign FBS nmId");
-                    identities.entry(warehouse).or_default().insert(chrt, nm);
-                }
-            }
-            if let Some(next) = page.next_offset {
-                offset = next;
-            } else {
-                complete = true;
-                break;
-            }
-        }
-        ensure!(complete, "FBS stock report exceeds bounded scan");
-        for (warehouse, sizes) in identities {
-            for chunk in sizes.keys().copied().collect::<Vec<_>>().chunks(1_000) {
-                let response = self
-                    .reader
-                    .seller_warehouse_stocks(&self.manifest.account_id, warehouse, chunk.to_vec())
-                    .await
-                    .context("live FBS stock unavailable for launch preflight")?;
-                add_live_stock_response(&response, &sizes, chunk, totals)?;
-            }
-        }
-        Ok(())
+pub(in crate::control) async fn add_live_fbs_stocks(
+    reader: &WbClient,
+    account_id: &str,
+    missing: &[u64],
+    totals: &mut BTreeMap<u64, u64>,
+) -> Result<()> {
+    let warehouses = reader
+        .seller_warehouses(account_id)
+        .await
+        .context("FBS warehouse list unavailable for launch stock preflight")?;
+    let fbs = fbs_warehouse_ids(&warehouses)?;
+    if fbs.is_empty() {
+        return Ok(());
     }
+    let mut identities = BTreeMap::<u64, BTreeMap<u64, u64>>::new();
+    let mut seen = BTreeSet::new();
+    let mut offset = 0;
+    let mut complete = false;
+    for _ in 0..MAX_STOCK_REPORT_PAGES {
+        let page = reader
+            .seller_warehouses_stock_report(
+                account_id,
+                missing,
+                &[],
+                STOCK_REPORT_PAGE_LIMIT,
+                offset,
+            )
+            .await
+            .context("FBS size identities unavailable for launch stock preflight")?;
+        let items = page
+            .data
+            .pointer("/data/items")
+            .and_then(Value::as_array)
+            .context("FBS stock report page incomplete")?;
+        for item in items {
+            let nm = positive_id(item.get("nmId"), "FBS nmId missing")?;
+            let chrt = positive_id(item.get("chrtId"), "FBS chrtId missing")?;
+            let warehouse = positive_id(item.get("warehouseId"), "FBS warehouseId missing")?;
+            ensure!(
+                seen.insert((warehouse, chrt)),
+                "duplicate FBS stock identity"
+            );
+            if fbs.contains(&warehouse) {
+                ensure!(missing.contains(&nm), "foreign FBS nmId");
+                identities.entry(warehouse).or_default().insert(chrt, nm);
+            }
+        }
+        if let Some(next) = page.next_offset {
+            offset = next;
+        } else {
+            complete = true;
+            break;
+        }
+    }
+    ensure!(complete, "FBS stock report exceeds bounded scan");
+    for (warehouse, sizes) in identities {
+        for chunk in sizes.keys().copied().collect::<Vec<_>>().chunks(1_000) {
+            let response = reader
+                .seller_warehouse_stocks(account_id, warehouse, chunk.to_vec())
+                .await
+                .context("live FBS stock unavailable for launch preflight")?;
+            add_live_stock_response(&response, &sizes, chunk, totals)?;
+        }
+    }
+    Ok(())
 }
 
 fn positive_id(value: Option<&Value>, message: &'static str) -> Result<u64> {
