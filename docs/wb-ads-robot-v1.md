@@ -287,7 +287,7 @@ wb-automation authorize-corridor-pg SOURCE.json TARGET.json ACCESS.json READ_TOK
 ```
 
 Use a new explicit authorization reference and an active period of at most 31
- days. Only authorization timestamps/reference and the two bid bounds may differ;
+days. Only authorization timestamps/reference and the two bid bounds may differ;
 account, campaign, products, authorizing actor, budget, DRR, stock, pacing,
 cooldown, quotas and disabled auto-funding must match the source exactly.
 The command performs a fresh read-only WB preflight under the campaign lock,

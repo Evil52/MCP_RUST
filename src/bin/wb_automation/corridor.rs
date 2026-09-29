@@ -6,6 +6,10 @@ use anyhow::{Context, ensure};
 use mcp_ozon::control::validate_wb_automation_corridor_update;
 use std::str::FromStr;
 
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the campaign lease is explicitly consumed by async release after preflight and transition"
+)]
 pub async fn run(args: &[String]) -> Result<()> {
     ensure!(
         (args.len() == 7 || args.len() == 8)
