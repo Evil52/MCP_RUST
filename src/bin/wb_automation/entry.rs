@@ -64,6 +64,12 @@ pub async fn run() -> Result<()> {
         .await?;
     if arguments
         .first()
+        .is_some_and(|arg| arg == "authorize-corridor-pg")
+    {
+        return super::wb_automation::corridor::run(&arguments).await;
+    }
+    if arguments
+        .first()
         .is_some_and(|arg| arg == "execute-fleet-pg")
     {
         ensure!(

@@ -169,3 +169,42 @@ fn dynamic_cap_refuses_orders_without_clicks() {
     .unwrap_err();
     assert!(error.to_string().contains("without clicks"), "{error:#}");
 }
+
+/// A below-floor observation must traverse the ordinary write/readback path.
+#[tokio::test]
+async fn authorized_floor_recovery_uses_one_write_and_exact_readback() {
+    let fixture = super::Fixture::new();
+    let mut policy: crate::control::WbAutomationPolicy =
+        serde_json::from_slice(&std::fs::read(&fixture.policy).unwrap()).unwrap();
+    policy.min_bid_kopecks = 700;
+    policy.max_bid_kopecks = 1200;
+    std::fs::write(&fixture.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
+    let (reader, _) = super::reader_server(9, 102, "2026-08-25", Some(0), 10);
+    let (writer, requests) = super::mock_http(vec![(200, "{}".into())]);
+    let executor = fixture.executor(&reader, &writer);
+    let receipt = executor.run_once(super::now()).await.unwrap();
+    assert_eq!(
+        receipt.outcome,
+        super::WbAutomationExecutionOutcome::WriteSentReconciliationRequired
+    );
+    assert!(
+        matches!(receipt.decision.action,WbAutomationAction::ChangeBids {ref changes}
+        if changes.len()==1 && changes[0].from_bid_kopecks==102
+            && changes[0].to_bid_kopecks==700 && changes[0].reason==WbAutomationBidReason::PolicyMinimumNotMet)
+    );
+    let request = requests
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .unwrap();
+    assert!(request.starts_with("PATCH /api/advert/v1/bids"));
+    assert!(request.contains("\"bid_kopecks\":700"));
+    let (reader, _) = super::reader_server(9, 700, "2026-08-25", Some(0), 10);
+    let readback = fixture.executor(&reader, "http://127.0.0.1:1");
+    assert_eq!(
+        readback
+            .run_once(super::now() + ChronoDuration::minutes(1))
+            .await
+            .unwrap()
+            .outcome,
+        super::WbAutomationExecutionOutcome::Reconciled
+    );
+}

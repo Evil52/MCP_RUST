@@ -19,8 +19,8 @@ pub use automation::{
     WbAutomationAction, WbAutomationBidChange, WbAutomationBidReason, WbAutomationCampaignMetrics,
     WbAutomationDecision, WbAutomationDecisionError, WbAutomationDisableReason,
     WbAutomationHoldReason, WbAutomationObservation, WbAutomationPacingMode, WbAutomationPolicy,
-    WbAutomationSkuObservation, evaluate_wb_automation, validate_wb_automation_policy,
-    wb_automation_business_date,
+    WbAutomationSkuObservation, evaluate_wb_automation, validate_wb_automation_corridor_update,
+    validate_wb_automation_policy, wb_automation_business_date,
 };
 pub use automation_executor::{
     WbAutomationExecutionOutcome, WbAutomationExecutionReceipt, WbAutomationExecutor,

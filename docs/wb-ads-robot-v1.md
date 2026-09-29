@@ -277,3 +277,32 @@ documented for CPM, not CPC:
 These absent signals are never fabricated and do not participate in the P3
 rules. P3 is the explicitly authorized bounded subset above, not a claim that
 the full natural-language optimization prompt has been implemented.
+
+## Renewing an existing campaign and changing its bid corridor
+
+The reusable operator command is:
+
+```text
+wb-automation authorize-corridor-pg SOURCE.json TARGET.json ACCESS.json READ_TOKEN true|false [READER_PROXY] --confirm-authorized-corridor
+```
+
+Use a new explicit authorization reference and an active period of at most 31
+days. Only authorization timestamps/reference and the two bid bounds may differ;
+account, campaign, products, authorizing actor, budget, DRR, stock, pacing,
+cooldown, quotas and disabled auto-funding must match the source exactly.
+The command performs a fresh read-only WB preflight under the campaign lock,
+then audits the policy transition. Pending writes and incidents prevent it.
+Counters, feedback history and protective pauses survive renewal.
+
+Under the shared scheduler lock, retain both policy files, run the command, and
+atomically install TARGET as the live policy only after a successful receipt.
+If installation is interrupted, rerun the same source/target pair: the database
+transition is idempotent. Use the matching release for the operator and worker.
+
+A positive observed bid below the authorized floor is valid input. The normal
+executor restores one eligible SKU to the floor (or WB's higher minimum) before
+ordinary exploration, using `policy_minimum_not_met`. Daily spend, authorization,
+quota, cooldown and readback protections still apply. Stock and per-SKU hard
+stops take priority; stopped products can stay below the floor without blocking
+healthy products. Zero bids, missing products and malformed metrics still fail.
+The transition itself performs no WB write and never resumes a paused campaign.
