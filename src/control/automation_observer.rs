@@ -1126,7 +1126,7 @@ mod tests {
 
         let mut invalid_campaign_bid = campaign_response();
         invalid_campaign_bid["adverts"][0]["nm_settings"][0]["bids_kopecks"]["search"] =
-            serde_json::json!(101);
+            serde_json::json!(0);
         let mut invalid_decision = fixture.observer(None);
         let (decision_url, _) = mock_http(vec![
             (200, invalid_campaign_bid.to_string()),

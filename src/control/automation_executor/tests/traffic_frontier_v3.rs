@@ -179,7 +179,7 @@ async fn authorized_floor_recovery_uses_one_write_and_exact_readback() {
     policy.min_bid_kopecks = 700;
     policy.max_bid_kopecks = 1200;
     std::fs::write(&fixture.policy, serde_json::to_vec(&policy).unwrap()).unwrap();
-    let (reader, _) = super::reader_server(9, 102, "2026-08-25", None, 10);
+    let (reader, _) = super::reader_server(9, 102, "2026-08-25", Some(0), 10);
     let (writer, requests) = super::mock_http(vec![(200, "{}".into())]);
     let executor = fixture.executor(&reader, &writer);
     let receipt = executor.run_once(super::now()).await.unwrap();
@@ -197,7 +197,7 @@ async fn authorized_floor_recovery_uses_one_write_and_exact_readback() {
         .unwrap();
     assert!(request.starts_with("PATCH /api/advert/v1/bids"));
     assert!(request.contains("\"bid_kopecks\":700"));
-    let (reader, _) = super::reader_server(9, 700, "2026-08-25", None, 10);
+    let (reader, _) = super::reader_server(9, 700, "2026-08-25", Some(0), 10);
     let readback = fixture.executor(&reader, "http://127.0.0.1:1");
     assert_eq!(
         readback
