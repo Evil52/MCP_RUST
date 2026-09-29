@@ -1,3 +1,8 @@
+mod corridor;
+mod observation;
+pub use corridor::validate_wb_automation_corridor_update;
+use observation::validate_observation;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
@@ -192,6 +197,7 @@ pub enum WbAutomationHoldReason {
 #[serde(rename_all = "snake_case")]
 pub enum WbAutomationBidReason {
     PolicyMaximumExceeded,
+    PolicyMinimumNotMet,
     TargetDrrExceeded,
     NoOrdersAfterClicks,
     EfficientSales,
@@ -370,6 +376,16 @@ pub fn evaluate_wb_automation(
         ));
     }
 
+    if let Some(action) = corridor::recover_minimum(
+        policy,
+        observations
+            .values()
+            .copied()
+            .filter(|sku| !stops.contains_key(&sku.nm_id)),
+    ) {
+        return Ok(decision(action, unresolved));
+    }
+
     let mut changes = Vec::new();
     for nm_id in &policy.nm_ids {
         // Never bid a stopped SKU back up. Without this a sold-out SKU parked
@@ -521,6 +537,9 @@ fn campaign_level_action(
             },
             unresolved_stops,
         );
+    }
+    if let Some(action) = corridor::recover_minimum(policy, observations.values().copied()) {
+        return (action, unresolved_stops);
     }
     if !unresolved_stops.is_empty() {
         return (
@@ -723,44 +742,6 @@ fn valid_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
-fn validate_observation<'a>(
-    policy: &WbAutomationPolicy,
-    observation: &'a WbAutomationObservation,
-) -> Result<BTreeMap<u64, &'a WbAutomationSkuObservation>, WbAutomationDecisionError> {
-    if observation
-        .last_action_at
-        .is_some_and(|last_action| last_action > observation.observed_at)
-        || observation.attribution_complete && observation.campaign_level_metrics.is_some()
-        || [
-            observation.campaign_level_metrics.as_ref(),
-            observation.current_campaign_metrics.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|metrics| metrics.clicks > metrics.impressions)
-    {
-        return Err(WbAutomationDecisionError::InvalidObservation);
-    }
-    let mut observations = BTreeMap::new();
-    for sku in &observation.skus {
-        let vendor_minimum_valid = (1..=policy.max_bid_kopecks).contains(&sku.minimum_bid_kopecks);
-        if sku.nm_id == 0
-            || !vendor_minimum_valid
-            || sku.current_bid_kopecks < policy.min_bid_kopecks
-            || sku.clicks > sku.impressions
-            || observations.insert(sku.nm_id, sku).is_some()
-        {
-            return Err(WbAutomationDecisionError::InvalidObservation);
-        }
-    }
-    let expected = policy.nm_ids.iter().copied().collect::<BTreeSet<_>>();
-    let actual = observations.keys().copied().collect::<BTreeSet<_>>();
-    if expected != actual {
-        return Err(WbAutomationDecisionError::InvalidObservation);
-    }
-    Ok(observations)
 }
 
 fn bid_change(
