@@ -6,6 +6,7 @@
 
 mod allocation;
 pub mod campaign_history;
+pub mod daily_analysis;
 mod evaluate;
 pub mod journal;
 mod model;
