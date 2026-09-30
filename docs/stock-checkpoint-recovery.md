@@ -58,3 +58,16 @@ unchanged by stock recovery.
 An expired collection needs a fresh collection with a fresh observation window;
 it cannot reuse its old pages as current stock evidence. A retained failed page
 is diagnostic evidence and does not establish complete inventory coverage.
+
+Migration `046_source_collection_deadlines.sql` schedules eligible source jobs
+by their earliest actual deadline: the original job deadline, or the first
+stock/price observation plus 30 minutes, whichever comes first. This prevents
+started `stocks`, `seller_stocks`, and `prices` collections from waiting behind
+every older background retry after each page. Unstarted jobs use their original
+24-hour deadline; equal deadlines retain `next_attempt_at` and source ordering.
+Sales and advertising with an earlier absolute deadline can still run first.
+
+Eligibility, one global live lease, per-operation quotas and retry backoff remain
+unchanged. A waiting or rate-limited urgent job yields to other eligible work.
+Scheduling cannot guarantee completion during upstream outages or excessive
+volume, and does not revive already expired jobs or extend freshness windows.

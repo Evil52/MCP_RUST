@@ -18,6 +18,8 @@ use tokio_postgres::{Client, Config, NoTls};
 mod fbs_publication;
 #[path = "reporting_source_jobs/reconciliation.rs"]
 mod reconciliation;
+#[path = "reporting_source_jobs/scheduling.rs"]
+mod scheduling;
 #[path = "reporting_source_jobs/stock_recovery.rs"]
 mod stock_recovery;
 
@@ -178,6 +180,7 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
         return;
     };
     let admin = connect(&admin_url).await;
+    scheduling::verify(&admin).await;
     let collector = connect(&collector_url).await;
     let reader_db = connect(&reader_url).await;
     let requester = connect(&requester_url).await;
