@@ -1,6 +1,8 @@
 //! Catalog invariants shared by direct and prepared-data modes.
 
 use super::*;
+#[path = "ads_analysis.rs"]
+mod ads_analysis;
 
 #[test]
 fn all_tools_have_truthful_annotations_and_descriptions() {
@@ -165,6 +167,7 @@ fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
         "ozon_performance_campaign_objects",
         "ozon_performance_campaign_products",
         "ozon_performance_daily",
+        "ozon_ads_analysis",
         "ozon_performance_sku_statistics",
         "ozon_performance_expenses",
         "ozon_seller_rating",
@@ -224,7 +227,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     // The release checklist in `SECURITY.md` states this count verbatim.
     // Changing it here without updating that gate leaves the gate
     // describing a router that no longer exists.
-    assert_eq!(dev_tools.len(), 114);
+    assert_eq!(dev_tools.len(), 115);
     assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
     let seed = server();
@@ -235,7 +238,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
     let jwt_tools = authenticated.tool_router.list_all();
-    assert_eq!(jwt_tools.len(), 114);
+    assert_eq!(jwt_tools.len(), 115);
     assert_policy(
         jwt_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -247,7 +250,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
         .with_preview_features(false, true)
         .tool_router
         .list_all();
-    assert_eq!(legacy_flag_tools.len(), 114);
+    assert_eq!(legacy_flag_tools.len(), 115);
     assert_policy(
         legacy_flag_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),

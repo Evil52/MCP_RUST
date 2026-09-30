@@ -344,3 +344,35 @@ fn rejected_prepare_provenance_and_reconciliation_inputs_do_not_echo_source_data
         assert!(!String::from_utf8(output.stderr).unwrap().contains("SECRET"));
     }
 }
+
+#[test]
+fn live_daily_export_replays_without_environment_and_without_inventing_missing_campaigns() {
+    let directory = FixtureDirectory::new();
+    let input = serde_json::json!({
+        "scope": {"store_id":"store_a","campaign_ids":[11,22],"date_from":"2026-09-01","date_to":"2026-09-02","observed_at":"2026-09-03T12:00:00Z","target_drr_bps":1500},
+        "response":{"rows":[{"id":"11","date":"2026-09-01","title":"ignored","views":"100","clicks":"10","moneySpent":"20,00","orders":"2","ordersMoney":"100,00"}]}
+    });
+    let path = directory.write("daily.json", &serde_json::to_vec(&input).unwrap());
+    let output = command(&directory.0)
+        .arg("analyze-daily")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["campaigns"][0]["spend_minor"], 2000);
+    assert_eq!(report["missing_campaign_ids"], serde_json::json!([22]));
+    assert_eq!(report["auto_apply_allowed"], false);
+    assert_eq!(report["currency"], "RUB");
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    let again = command(&directory.0)
+        .arg("analyze-daily")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_eq!(again.stdout, output.stdout);
+}
