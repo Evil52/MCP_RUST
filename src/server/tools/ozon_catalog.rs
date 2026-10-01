@@ -170,7 +170,9 @@ impl OzonMcp {
         identity: RequestIdentity,
         Parameters(input): Parameters<WarehouseListInput>,
     ) -> Result<Json<OzonResult>, String> {
-        validate_limit(input.limit, 1_000)?;
+        // A live Seller API probe accepted 100 and rejected 1000 with HTTP 400.
+        // Keep a conservative local cap without claiming an undocumented vendor maximum.
+        validate_limit(input.limit, 100)?;
         if let Some(cursor) = input.cursor.as_deref() {
             validate_max_chars("cursor", cursor, MAX_OPAQUE_TOKEN_CHARS)?;
         }

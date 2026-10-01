@@ -3,6 +3,8 @@
 use super::*;
 #[path = "ads_analysis.rs"]
 mod ads_analysis;
+#[path = "warehouse_paging.rs"]
+mod warehouse_paging;
 
 #[test]
 fn all_tools_have_truthful_annotations_and_descriptions() {

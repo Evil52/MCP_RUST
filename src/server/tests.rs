@@ -5919,7 +5919,7 @@ fn tool_schemas_match_runtime_bounds_and_keep_store_optional() {
     let warehouses = schema("ozon_warehouses");
     assert_eq!(warehouses["additionalProperties"], json!(false));
     assert_eq!(warehouses["properties"]["limit"]["minimum"], json!(1));
-    assert_eq!(warehouses["properties"]["limit"]["maximum"], json!(1_000));
+    assert_eq!(warehouses["properties"]["limit"]["maximum"], json!(100));
     assert_eq!(
         warehouses["properties"]["cursor"]["maxLength"],
         json!(MAX_OPAQUE_TOKEN_CHARS)
