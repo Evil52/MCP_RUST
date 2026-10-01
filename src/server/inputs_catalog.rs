@@ -276,8 +276,8 @@ pub struct WarehouseListInput {
     pub store: Option<StoreId>,
     #[serde(default = "default_product_limit")]
     #[schemars(
-        description = "Локально ограниченный размер страницы; Ozon не публикует границы limit для этого метода",
-        range(min = 1, max = 1_000)
+        description = "Локальный размер страницы 1–100; используйте cursor из ответа для продолжения",
+        range(min = 1, max = 100)
     )]
     pub limit: u32,
     #[serde(default)]
