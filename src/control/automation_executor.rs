@@ -1,11 +1,13 @@
 mod feedback;
 use feedback::{autonomous_exposure_pacing_decision, traffic_frontier_pacing_decision};
 mod state;
+mod write;
 use state::{
     PendingAction, PendingActionKind, bid_change_is_visible, load_execution_state,
     pending_from_decision, reconcile_pending, save_execution_state, sha256_domain,
     validate_private_directory, verify_pending_permit,
 };
+use write::{PostgresWriteResult, classify_postgres_write};
 
 use std::{
     fs::File,
@@ -928,23 +930,6 @@ const fn postgres_receipt(
         cycle_inserted,
         legacy_imported,
         state_revision,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PostgresWriteResult {
-    Sent,
-    Ambiguous,
-}
-
-fn classify_postgres_write(
-    result: &Result<(), WbGuardedWriteError<super::automation_postgres::WbAutomationPostgresError>>,
-) -> Result<PostgresWriteResult> {
-    match result {
-        Ok(()) => Ok(PostgresWriteResult::Sent),
-        Err(WbGuardedWriteError::Permit(error)) => Err(anyhow::Error::new(*error)
-            .context("WB automation final PostgreSQL permit is unavailable")),
-        Err(WbGuardedWriteError::Write(_)) => Ok(PostgresWriteResult::Ambiguous),
     }
 }
 
