@@ -114,8 +114,8 @@ pub struct PerformanceSkuStatisticsInput {
     pub store: Option<StoreId>,
     #[serde(default)]
     #[schemars(
-        description = "До 10 campaign ID; пустой список означает все кампании",
-        length(max = 10),
+        description = "От 1 до 10 campaign ID. Сначала получите ID через ozon_performance_campaigns; для всех кампаний запросите статистику порциями до 10 ID",
+        length(min = 1, max = 10),
         inner(range(min = 1))
     )]
     pub campaign_ids: Vec<u64>,
