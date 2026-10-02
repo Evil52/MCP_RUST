@@ -99,7 +99,6 @@ fn validate(input: &RuleInput) -> Result<(), RuleError> {
     if !valid_account_id(&input.account_id)
         || input.sku == 0
         || !(1..=31).contains(&input.sales_window_days)
-        || input.attributed_orders > input.ad_clicks
         || input.lead_time_days == Some(0)
         || input.target_cpo_minor == Some(0)
         || input.target_drr_bps == Some(0)
@@ -361,11 +360,6 @@ mod tests {
                 ..input(1)
             },
             RuleInput {
-                ad_clicks: 1,
-                attributed_orders: 2,
-                ..input(1)
-            },
-            RuleInput {
                 lead_time_days: Some(0),
                 ..input(1)
             },
@@ -387,6 +381,20 @@ mod tests {
             priority_problems(&vec![input(1); MAX_RULE_INPUTS + 1], true, 1),
             Err(RuleError::InvalidInput)
         );
+    }
+
+    #[test]
+    fn attributed_orders_above_clicks_do_not_block_stock_recommendations() {
+        // Published Ozon attribution may include multiple orders per click
+        // or orders whose click falls outside the selected reporting day.
+        let mut sold_out = input(2_892_296_920);
+        sold_out.sellable_stock = 0;
+        sold_out.sold_units = 4;
+        sold_out.ad_clicks = 0;
+        sold_out.attributed_orders = 4;
+        let problems = priority_problems(&[sold_out], true, 500).unwrap();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].kind, ProblemKind::Stockout);
     }
 
     /// Without an approved target CPO the store minimum is the red threshold.

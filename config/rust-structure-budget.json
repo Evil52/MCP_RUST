@@ -30,7 +30,7 @@
     "src/reporting/postgres_outbox.rs": 1425,
     "src/reporting/xlsx.rs": 1045,
     "src/server.rs": 1292,
-    "src/server/tests.rs": 11235,
+    "src/server/tests.rs": 11231,
     "src/wb.rs": 4759,
     "tests/http_router.rs": 1117,
     "tests/reporting_postgres_outbox.rs": 1384,

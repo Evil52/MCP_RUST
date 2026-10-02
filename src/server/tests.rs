@@ -10458,20 +10458,22 @@ async fn performance_runtime_validation_rejects_invalid_inputs_before_network() 
             .await,
         "date_from",
     );
-    assert_validation_error(
-        server
-            .performance_sku_statistics(
-                RequestIdentity::dev(),
-                Parameters(PerformanceSkuStatisticsInput {
-                    store: Some(StoreId::from("store_a")),
-                    campaign_ids: vec![0],
-                    date_from: "2026-08-18".to_owned(),
-                    date_to: "2026-08-19".to_owned(),
-                }),
-            )
-            .await,
-        "campaign_ids",
-    );
+    for campaign_ids in [Vec::new(), vec![0]] {
+        assert_validation_error(
+            server
+                .performance_sku_statistics(
+                    RequestIdentity::dev(),
+                    Parameters(PerformanceSkuStatisticsInput {
+                        store: Some(StoreId::from("store_a")),
+                        campaign_ids,
+                        date_from: "2026-08-18".to_owned(),
+                        date_to: "2026-08-19".to_owned(),
+                    }),
+                )
+                .await,
+            "campaign_ids",
+        );
+    }
     assert_validation_error(
         server
             .performance_sku_statistics(
@@ -10878,11 +10880,9 @@ async fn performance_mcp_boundary_and_schemas_are_strict() {
     assert_eq!(products["properties"]["page"]["minimum"], json!(1));
     assert_eq!(products["properties"]["page_size"]["maximum"], json!(100));
     let sku_statistics = schema("ozon_performance_sku_statistics");
-    assert!(
-        sku_statistics["properties"]["campaign_ids"]
-            .get("minItems")
-            .is_none(),
-        "empty campaign_ids must request all campaigns"
+    assert_eq!(
+        sku_statistics["properties"]["campaign_ids"]["minItems"],
+        json!(1)
     );
 
     let (server, requests) = performance_mock_server("admin", Vec::new());
@@ -10935,11 +10935,7 @@ async fn performance_mcp_boundary_and_schemas_are_strict() {
                 (200, json!({"rows": []}).to_string()),
             ],
         );
-        let campaign_ids = if tool == "ozon_performance_sku_statistics" {
-            json!([])
-        } else {
-            json!([11])
-        };
+        let campaign_ids = json!([11]);
         let body = call_tool_over_http(
             server,
             tool,

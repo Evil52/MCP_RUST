@@ -183,6 +183,9 @@ impl OzonMcp {
         // deterministic format/order locally and leave that ambiguous relative
         // boundary to Ozon rather than silently choosing a deployment timezone.
         validate_date_range(&input.date_from, &input.date_to, i64::MAX)?;
+        if input.campaign_ids.is_empty() {
+            return Err("campaign_ids: укажите от 1 до 10 ID из ozon_performance_campaigns; Ozon не принимает пустой список для статистики по SKU".to_owned());
+        }
         let store = self.performance_context(&identity, input.store.as_ref())?;
         let data = self
             .performance_client
