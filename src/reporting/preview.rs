@@ -11,7 +11,7 @@ use super::{
     dataset::{DatasetError, ReportDataset},
     postgres_snapshot::PublishedReportFacts,
     report_cutoff, reporting_interval,
-    rules::{PriorityProblem, RuleError, RuleInput, priority_problems},
+    rules::{PriorityProblem, RuleError, RuleInput, StockScope, priority_problems},
     snapshot::{FrozenSnapshotManifest, SnapshotSource},
 };
 
@@ -145,6 +145,11 @@ pub(crate) fn rule_inputs(dataset: &ReportDataset) -> Result<Vec<RuleInput>, Pre
         .filter_map(|((account_id, sku), row)| {
             row.stock.map(|stock| {
                 Ok(RuleInput {
+                    stock_scope: dataset
+                        .stock_scopes
+                        .get(&account_id)
+                        .copied()
+                        .unwrap_or(StockScope::Unknown),
                     account_id,
                     sku,
                     sellable_stock: stock,
@@ -303,6 +308,88 @@ mod tests {
                 observed_at: utc(17, 2),
             }],
         }
+    }
+
+    fn wb_manifest() -> FrozenSnapshotManifest {
+        let original = manifest(ReportKind::Morning, SnapshotStatus::Succeeded);
+        let snapshots = original
+            .snapshots()
+            .iter()
+            .filter(|s| s.source() != SnapshotSource::Finance)
+            .map(|s| {
+                SnapshotDescriptor::new(
+                    s.snapshot_id(),
+                    s.account_id().to_owned(),
+                    Marketplace::Wildberries,
+                    s.source(),
+                    s.cutoff_at(),
+                    s.source_as_of(),
+                    s.period().0,
+                    s.period().1,
+                    s.row_count(),
+                    s.pagination_complete(),
+                    s.status(),
+                )
+                .unwrap()
+            })
+            .collect();
+        FrozenSnapshotManifest::new(
+            original.cutoff_at(),
+            vec![AccountScope::new("store".to_owned(), Marketplace::Wildberries).unwrap()],
+            snapshots,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wb_fbw_shortages_never_claim_total_stockout_or_current_ad_activity() {
+        use crate::reporting::mcp_read::{ManagerAction, ManagerActionKind};
+        for (ad_sku, units, expected) in [
+            (0, 0, ManagerActionKind::WbFbwStockout),
+            (10, 0, ManagerActionKind::WbFbwStockoutWithAdSpend),
+            (10, 1, ManagerActionKind::WbFbwLowStockCover),
+        ] {
+            let mut input = facts(ad_sku);
+            input.stocks[0].warehouse_id = "wb:1".to_owned();
+            input.stocks[0].sellable_units = units;
+            let preview = render_published_preview(
+                &key(ReportKind::Morning),
+                "Анна",
+                utc(17, 4),
+                &wb_manifest(),
+                input,
+            )
+            .unwrap();
+            assert_eq!(preview.problems.len(), 1);
+            assert_eq!(
+                ManagerAction::from(preview.problems[0].clone()).kind,
+                expected
+            );
+            assert!(preview.bundle.html.contains("FBW"));
+            assert!(preview.bundle.html.contains("FBS"));
+            assert!(!preview.bundle.html.contains("товар закончился"));
+            assert!(
+                !preview
+                    .bundle
+                    .html
+                    .contains("реклама расходуется при нулевом остатке")
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_mixed_wb_inventory_withholds_stock_actions() {
+        let mut input = facts(10);
+        input.stocks[0].warehouse_id = "wb:seller:1:123".to_owned();
+        let preview = render_published_preview(
+            &key(ReportKind::Morning),
+            "Анна",
+            utc(17, 4),
+            &wb_manifest(),
+            input,
+        )
+        .unwrap();
+        assert!(preview.problems.is_empty());
     }
 
     #[test]

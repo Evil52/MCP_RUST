@@ -436,6 +436,7 @@ mod tests {
         };
         let observed_at = Utc.with_ymd_and_hms(2026, 8, 18, 2, 0, 0).unwrap();
         let dataset = ReportDataset {
+            stock_scopes: std::collections::BTreeMap::new(),
             kpis: calculate_kpis(&[], &[]).unwrap(),
             sales: vec![],
             advertising: vec![],

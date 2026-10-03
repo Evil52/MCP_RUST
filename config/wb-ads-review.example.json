@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "account_id": "SYNTHETIC_WB_REVIEW_NOT_A_LIVE_ACCOUNT",
+  "as_of": "2026-10-02T03:05:00Z",
+  "date_from": "2026-09-30",
+  "date_to": "2026-10-01",
+  "coverage": [
+    {"date": "2026-09-30", "snapshot_id": 101, "complete": true, "observed_at": "2026-10-01T03:00:00Z"},
+    {"date": "2026-10-01", "snapshot_id": 102, "complete": true, "observed_at": "2026-10-02T03:00:00Z"}
+  ],
+  "advertising": [
+    {"date": "2026-10-01", "campaign_id": 10, "sku": 1, "spend_minor": 90000, "clicks": 60, "attributed_orders": 0, "attributed_revenue_minor": 0},
+    {"date": "2026-10-01", "campaign_id": 20, "sku": 2, "spend_minor": 300000, "clicks": 200, "attributed_orders": 0, "attributed_revenue_minor": 0},
+    {"date": "2026-10-01", "campaign_id": 10, "sku": 3, "spend_minor": 250000, "clicks": 70, "attributed_orders": 0, "attributed_revenue_minor": 0}
+  ],
+  "products": [
+    {"sku": 1, "ordered_units": 0,
+      "fbw": {"units": 0, "quality": "complete", "observed_at": "2026-10-02T03:00:00Z"},
+      "fbs": {"units": 5, "quality": "partial", "observed_at": "2026-10-02T03:00:00Z"}},
+    {"sku": 2, "ordered_units": 1,
+      "fbw": {"units": 10, "quality": "complete", "observed_at": "2026-10-02T03:00:00Z"}, "fbs": null},
+    {"sku": 3, "ordered_units": 0, "fbw": null, "fbs": null}
+  ],
+  "composition": {
+    "observed_at": "2026-10-02T03:01:00Z",
+    "active_and_paused_complete": true,
+    "campaigns": [
+      {"campaign_id": 10, "status": "active", "pricing_model": "cpc", "sku_ids": [1]},
+      {"campaign_id": 20, "status": "paused", "pricing_model": "cpm", "sku_ids": [2]}
+    ]
+  }
+}

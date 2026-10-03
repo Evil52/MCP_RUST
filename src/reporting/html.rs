@@ -197,6 +197,18 @@ fn write_problems(html: &mut String, problems: &[PriorityProblem], suppressed: b
 
 const fn problem_label(kind: ProblemKind) -> (&'static str, &'static str) {
     match kind {
+        ProblemKind::WbFbwStockoutWithAdSpend => (
+            "нулевой остаток FBW и расходы рекламы за период",
+            "проверьте доступность FBS, доставку и текущий состав кампании",
+        ),
+        ProblemKind::WbFbwStockout => (
+            "нулевой остаток на складах WB (FBW)",
+            "проверьте запас продавца (FBS) и пополнение WB",
+        ),
+        ProblemKind::WbFbwLowStockCover => (
+            "низкий запас на складах WB (FBW)",
+            "проверьте запас продавца (FBS), доставку и пополнение WB",
+        ),
         ProblemKind::AdvertisedWithoutStock => (
             "реклама расходуется при нулевом остатке",
             "проверьте остаток и рекламную кампанию",

@@ -1,3 +1,6 @@
+mod problem;
+use problem::problem_text;
+
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
@@ -680,22 +683,6 @@ const fn quality_text(quality: SnapshotQuality) -> &'static str {
         SnapshotQuality::Partial => "Частичные",
         SnapshotQuality::Stale => "Устаревшие",
         SnapshotQuality::Critical => "Критические",
-    }
-}
-
-const fn problem_text(kind: ProblemKind) -> (&'static str, &'static str) {
-    match kind {
-        ProblemKind::AdvertisedWithoutStock => (
-            "Реклама при нулевом остатке",
-            "Проверить остаток и кампанию",
-        ),
-        ProblemKind::Stockout => ("Товар закончился", "Запланировать пополнение"),
-        ProblemKind::LowStockCover => ("Низкий запас", "Уточнить поставку"),
-        ProblemKind::SpendWithoutOrders => (
-            "Расход без атрибутированных заказов",
-            "Проверить запросы, карточку и ставку",
-        ),
-        ProblemKind::HighDrr => ("Высокий ДРР", "Проверить кампанию до изменения ставки"),
     }
 }
 
