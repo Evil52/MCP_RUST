@@ -266,6 +266,11 @@ pub enum ManagerActionKind {
     LowStockCover,
     SpendWithoutOrders,
     HighDrr,
+    /// Only stock at WB warehouses; seller stock is not included.
+    WbFbwStockout,
+    /// Historical ad expense and FBW shortage, not proof of an active campaign.
+    WbFbwStockoutWithAdSpend,
+    WbFbwLowStockCover,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
@@ -398,6 +403,11 @@ impl From<PriorityProblem> for ManagerAction {
                 ProblemKind::LowStockCover => ManagerActionKind::LowStockCover,
                 ProblemKind::SpendWithoutOrders => ManagerActionKind::SpendWithoutOrders,
                 ProblemKind::HighDrr => ManagerActionKind::HighDrr,
+                ProblemKind::WbFbwStockout => ManagerActionKind::WbFbwStockout,
+                ProblemKind::WbFbwStockoutWithAdSpend => {
+                    ManagerActionKind::WbFbwStockoutWithAdSpend
+                }
+                ProblemKind::WbFbwLowStockCover => ManagerActionKind::WbFbwLowStockCover,
             },
             severity: match value.severity {
                 Severity::Yellow => ActionSeverity::Yellow,

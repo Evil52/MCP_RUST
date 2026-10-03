@@ -18,11 +18,12 @@ use mcp_ozon::{
         prepare::{MAX_PREPARATION_BYTES, prepare_input},
         recommend,
         reconciliation::{parse_reconciliation_input, reconcile},
+        wb_review::analyze_wb_export,
     },
     runtime::print_runtime_version_if_requested,
 };
 
-const USAGE: &str = "usage: ads-optimizer recommend <evidence.json> [--journal-dir <new-run-directory>]\n       ads-optimizer prepare <bundle.json>\n       ads-optimizer reconcile <exports.json>\n       ads-optimizer campaign-history <campaign-days.json>\n       ads-optimizer analyze-daily <daily-export.json>\n       ads-optimizer --help\n       ads-optimizer --version";
+const USAGE: &str = "usage: ads-optimizer recommend <evidence.json> [--journal-dir <new-run-directory>]\n       ads-optimizer prepare <bundle.json>\n       ads-optimizer reconcile <exports.json>\n       ads-optimizer campaign-history <campaign-days.json>\n       ads-optimizer analyze-daily <daily-export.json>\n       ads-optimizer review-wb <wb-evidence.json>\n       ads-optimizer --help\n       ads-optimizer --version";
 
 fn validate_file(metadata: &Metadata, max_bytes: usize) -> Result<()> {
     ensure!(metadata.is_file(), "input must be a regular file");
@@ -112,6 +113,10 @@ fn main() -> Result<()> {
         [command, input] if command == "analyze-daily" => {
             let bytes = read_evidence(Path::new(input), MAX_INPUT_BYTES)?;
             json_bytes(&analyze_daily_export(&bytes)?)?
+        }
+        [command, input] if command == "review-wb" => {
+            let bytes = read_evidence(Path::new(input), MAX_INPUT_BYTES)?;
+            json_bytes(&analyze_wb_export(&bytes)?)?
         }
         _ => bail!("{USAGE}"),
     };

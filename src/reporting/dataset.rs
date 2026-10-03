@@ -8,6 +8,7 @@ use super::{
         PublishedAdvertisingExpenseFact, PublishedFinanceFact, PublishedReportFacts,
         PublishedSalesFact,
     },
+    rules::StockScope,
     snapshot::{FrozenSnapshotManifest, SnapshotQuality, SnapshotSource},
     xlsx::{AdvertisingDetail, InventoryDetail, SalesDetail, SourceQualityDetail},
 };
@@ -57,6 +58,7 @@ pub struct SourceQualityRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportDataset {
+    pub stock_scopes: BTreeMap<String, StockScope>,
     pub kpis: KpiSummary,
     pub sales: Vec<SalesReportRow>,
     pub advertising: Vec<AdvertisingReportRow>,
@@ -198,8 +200,26 @@ impl ReportDataset {
             )
             .collect();
 
+        let mut stock_scopes = manifest
+            .snapshots()
+            .iter()
+            .filter(|snapshot| snapshot.source() == SnapshotSource::Stocks)
+            .map(|snapshot| {
+                let scope = if snapshot.marketplace() == super::snapshot::Marketplace::Wildberries {
+                    StockScope::WbFbw
+                } else {
+                    StockScope::AllObservedWarehouses
+                };
+                (snapshot.account_id().to_owned(), scope)
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut inventory = BTreeMap::new();
         for fact in facts.stocks {
+            if stock_scopes.get(&fact.account_id) == Some(&StockScope::WbFbw)
+                && fact.warehouse_id.starts_with("wb:seller:")
+            {
+                stock_scopes.insert(fact.account_id.clone(), StockScope::Unknown);
+            }
             let row = inventory.entry((fact.account_id, fact.sku)).or_insert((
                 0u64,
                 None,
@@ -253,6 +273,7 @@ impl ReportDataset {
             })
             .collect();
         Ok(Self {
+            stock_scopes,
             kpis,
             sales,
             advertising,

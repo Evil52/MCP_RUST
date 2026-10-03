@@ -231,6 +231,7 @@ mod tests {
 
     fn dataset() -> ReportDataset {
         ReportDataset {
+            stock_scopes: std::collections::BTreeMap::new(),
             kpis: calculate_kpis(&[], &[]).unwrap(),
             sales: vec![SalesReportRow {
                 account_id: "store".to_owned(),

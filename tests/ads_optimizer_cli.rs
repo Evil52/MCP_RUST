@@ -13,6 +13,46 @@ use mcp_ozon::reporting::ads_optimizer::MAX_INPUT_BYTES;
 use serde_json::Value;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn wb_review_uses_captured_composition_and_fbs_without_writes_or_environment() {
+    let directory = FixtureDirectory::new();
+    let evidence = directory.write(
+        "wb-evidence.json",
+        include_bytes!("../config/wb-ads-review.example.json"),
+    );
+    directory.write(".env", b"INVALID PRIVATE DOTENV DO NOT LOAD");
+    let before = fs::read_dir(&directory.0).unwrap().count();
+    let output = command(&directory.0)
+        .arg("review-wb")
+        .arg(evidence)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "observation");
+    assert_eq!(report["marketplace"], "wildberries");
+    assert_eq!(report["auto_apply_allowed"], false);
+    assert_eq!(
+        report["products"][0]["inventory_signal"],
+        "fbw_zero_check_fbs"
+    );
+    assert_eq!(report["products"][1]["action"], "review_before_resuming");
+    assert_eq!(report["products"][2]["action"], "review_historical_spend");
+    assert_eq!(report["products"][2]["historical_campaign_ids"][0], 10);
+    assert!(
+        report["products"][2]["current_campaigns"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(report.get("suggested_daily_budget_minor").is_none());
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), before);
+}
 const EXAMPLE: &str = include_str!("../config/ads-optimizer.example.json");
 
 struct FixtureDirectory(PathBuf);

@@ -16,6 +16,18 @@ pub enum ProblemKind {
     LowStockCover,
     SpendWithoutOrders,
     HighDrr,
+    WbFbwStockout,
+    WbFbwStockoutWithAdSpend,
+    WbFbwLowStockCover,
+}
+
+/// The warehouses observed by the stock input, never inferred from ad spend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockScope {
+    AllObservedWarehouses,
+    WbFbw,
+    /// Legacy mixed WB inventory cannot support an FBW-only stock decision.
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +35,7 @@ pub struct RuleInput {
     pub account_id: String,
     pub sku: u64,
     pub sellable_stock: u64,
+    pub stock_scope: StockScope,
     pub sold_units: u64,
     pub sales_window_days: u8,
     pub sales_gmv_minor: u64,
@@ -118,11 +131,15 @@ fn valid_account_id(value: &str) -> bool {
 }
 
 fn stock_problem(input: &RuleInput) -> Option<PriorityProblem> {
+    if input.stock_scope == StockScope::Unknown {
+        return None;
+    }
     if input.sellable_stock == 0 && input.sold_units >= 3 {
-        let kind = if input.ad_spend_minor > 0 {
-            ProblemKind::AdvertisedWithoutStock
-        } else {
-            ProblemKind::Stockout
+        let kind = match (input.stock_scope, input.ad_spend_minor > 0) {
+            (StockScope::WbFbw, true) => ProblemKind::WbFbwStockoutWithAdSpend,
+            (StockScope::WbFbw, false) => ProblemKind::WbFbwStockout,
+            (_, true) => ProblemKind::AdvertisedWithoutStock,
+            (_, false) => ProblemKind::Stockout,
         };
         return Some(PriorityProblem {
             account_id: input.account_id.clone(),
@@ -151,7 +168,11 @@ fn stock_problem(input: &RuleInput) -> Option<PriorityProblem> {
     Some(PriorityProblem {
         account_id: input.account_id.clone(),
         sku: input.sku,
-        kind: ProblemKind::LowStockCover,
+        kind: if input.stock_scope == StockScope::WbFbw {
+            ProblemKind::WbFbwLowStockCover
+        } else {
+            ProblemKind::LowStockCover
+        },
         severity,
         observed: u64::try_from(
             ((cover_left * 10) / u128::from(input.sold_units)).min(u128::from(u64::MAX)),
@@ -239,6 +260,7 @@ mod tests {
             account_id: "ozon_store".to_owned(),
             sku,
             sellable_stock: 100,
+            stock_scope: StockScope::AllObservedWarehouses,
             sold_units: 10,
             sales_window_days: 14,
             sales_gmv_minor: 100_000,
