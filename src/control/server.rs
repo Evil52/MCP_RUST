@@ -26,6 +26,7 @@ mod plan_readback;
 mod presentation;
 mod scope;
 mod tools;
+mod write_authorization;
 
 const ACCESS_DENIED: &str = "CONTROL_ACCESS_DENIED";
 

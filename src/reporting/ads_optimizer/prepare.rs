@@ -138,9 +138,6 @@ pub fn prepare(bundle: PreparationBundle) -> Result<ShadowInput, PrepareError> {
     if stocks.len() > 1 || stocks.keys().any(|id| advertising.contains_key(id)) {
         return Err(PrepareError::InvalidSnapshot);
     }
-    let mut observed_dates = BTreeMap::new();
-    let mut ad_facts = BTreeMap::<u64, Vec<PublishedAdvertisingFact>>::new();
-    let mut global_observed_at = None::<DateTime<Utc>>;
     let selected = bundle
         .products
         .iter()
@@ -149,47 +146,11 @@ pub fn prepare(bundle: PreparationBundle) -> Result<ShadowInput, PrepareError> {
     if selected.len() != bundle.products.len() {
         return Err(PrepareError::InvalidBundle);
     }
-    for snapshot in advertising.values() {
-        let observed = snapshot.envelope.first_observed();
-        global_observed_at = Some(global_observed_at.map_or(observed, |time| time.max(observed)));
-        refs.insert(snapshot.reference());
-        let mut date = snapshot.period_dates()?.0;
-        let end = snapshot.period_dates()?.1;
-        if date < bundle.window_start || end > bundle.window_end {
-            return Err(PrepareError::InvalidSnapshot);
-        }
-        loop {
-            if observed_dates.insert(date, observed).is_some() {
-                return Err(PrepareError::OverlappingSnapshots);
-            }
-            if date == end {
-                break;
-            }
-            date = date.succ_opt().ok_or(PrepareError::InvalidSnapshot)?;
-        }
-        let mut keys = BTreeSet::new();
-        for value in &snapshot.rows {
-            let row: AdvertisingRow =
-                serde_json::from_value(value.clone()).map_err(|_| PrepareError::InvalidSnapshot)?;
-            snapshot.validate_fact(&row.provenance)?;
-            if row.currency != "RUB"
-                || row.clicks > row.impressions
-                || !positive_id(row.campaign_id)
-                || row.sku > i64::MAX.cast_unsigned()
-                || row.business_date < snapshot.period_dates()?.0
-                || row.business_date > end
-                || !keys.insert((row.business_date, row.campaign_id, row.sku))
-            {
-                return Err(PrepareError::InvalidSnapshot);
-            }
-            if row.sku == 0 {
-                return Err(PrepareError::InvalidSnapshot);
-            }
-            if selected.contains(&row.sku) {
-                ad_facts.entry(row.sku).or_default().push(row.into_fact());
-            }
-        }
-    }
+    let AdvertisingEvidence {
+        observed_dates,
+        mut ad_facts,
+        global_observed_at,
+    } = advertising_evidence(&advertising, &bundle, &selected, &mut refs)?;
     let stock_by_sku = stock_evidence(&stocks, &selected, &mut refs)?;
     for snapshot in stocks.values() {
         refs.insert(snapshot.reference());
@@ -255,6 +216,89 @@ pub fn prepare(bundle: PreparationBundle) -> Result<ShadowInput, PrepareError> {
         return Err(PrepareError::LimitExceeded);
     }
     Ok(input)
+}
+
+struct AdvertisingEvidence {
+    observed_dates: BTreeMap<NaiveDate, DateTime<Utc>>,
+    ad_facts: BTreeMap<u64, Vec<PublishedAdvertisingFact>>,
+    global_observed_at: Option<DateTime<Utc>>,
+}
+
+fn advertising_evidence(
+    advertising: &BTreeMap<i64, CompleteSnapshot>,
+    bundle: &PreparationBundle,
+    selected: &BTreeSet<u64>,
+    refs: &mut BTreeSet<String>,
+) -> Result<AdvertisingEvidence, PrepareError> {
+    let mut observed_dates = BTreeMap::new();
+    let mut ad_facts = BTreeMap::<u64, Vec<PublishedAdvertisingFact>>::new();
+    let mut global_observed_at = None::<DateTime<Utc>>;
+    for snapshot in advertising.values() {
+        let observed = snapshot.envelope.first_observed();
+        global_observed_at = Some(global_observed_at.map_or(observed, |time| time.max(observed)));
+        refs.insert(snapshot.reference());
+        add_snapshot_dates(snapshot, bundle, &mut observed_dates)?;
+        add_advertising_rows(snapshot, selected, &mut ad_facts)?;
+    }
+    Ok(AdvertisingEvidence {
+        observed_dates,
+        ad_facts,
+        global_observed_at,
+    })
+}
+
+fn add_snapshot_dates(
+    snapshot: &CompleteSnapshot,
+    bundle: &PreparationBundle,
+    observed_dates: &mut BTreeMap<NaiveDate, DateTime<Utc>>,
+) -> Result<(), PrepareError> {
+    let observed = snapshot.envelope.first_observed();
+    let mut date = snapshot.period_dates()?.0;
+    let end = snapshot.period_dates()?.1;
+    if date < bundle.window_start || end > bundle.window_end {
+        return Err(PrepareError::InvalidSnapshot);
+    }
+    loop {
+        if observed_dates.insert(date, observed).is_some() {
+            return Err(PrepareError::OverlappingSnapshots);
+        }
+        if date == end {
+            break;
+        }
+        date = date.succ_opt().ok_or(PrepareError::InvalidSnapshot)?;
+    }
+    Ok(())
+}
+
+fn add_advertising_rows(
+    snapshot: &CompleteSnapshot,
+    selected: &BTreeSet<u64>,
+    ad_facts: &mut BTreeMap<u64, Vec<PublishedAdvertisingFact>>,
+) -> Result<(), PrepareError> {
+    let end = snapshot.period_dates()?.1;
+    let mut keys = BTreeSet::new();
+    for value in &snapshot.rows {
+        let row: AdvertisingRow =
+            serde_json::from_value(value.clone()).map_err(|_| PrepareError::InvalidSnapshot)?;
+        snapshot.validate_fact(&row.provenance)?;
+        if row.currency != "RUB"
+            || row.clicks > row.impressions
+            || !positive_id(row.campaign_id)
+            || row.sku > i64::MAX.cast_unsigned()
+            || row.business_date < snapshot.period_dates()?.0
+            || row.business_date > end
+            || !keys.insert((row.business_date, row.campaign_id, row.sku))
+        {
+            return Err(PrepareError::InvalidSnapshot);
+        }
+        if row.sku == 0 {
+            return Err(PrepareError::InvalidSnapshot);
+        }
+        if selected.contains(&row.sku) {
+            ad_facts.entry(row.sku).or_default().push(row.into_fact());
+        }
+    }
+    Ok(())
 }
 
 fn confirmed_scope(
@@ -373,55 +417,7 @@ fn complete_snapshots(
     }
     let mut groups = BTreeMap::<i64, BTreeMap<u32, SnapshotEnvelope>>::new();
     for page in pages {
-        let envelope: SnapshotEnvelope = serde_json::from_value(page.response.clone())
-            .map_err(|_| PrepareError::InvalidSnapshot)?;
-        let id = envelope
-            .snapshot_id
-            .parse::<i64>()
-            .map_err(|_| PrepareError::InvalidSnapshot)?;
-        if id <= 0
-            || envelope.account_id != bundle.account_id
-            || envelope.marketplace != "ozon"
-            || envelope.source != source
-            || envelope.storage != "published_postgresql_snapshots"
-            || !matches!(envelope.state.as_str(), "available" | "stale")
-            || !matches!(envelope.quality.as_deref(), Some("complete" | "stale"))
-            || envelope.pagination_complete != Some(true)
-            || envelope.data_state
-                != if envelope.total_rows == 0 {
-                    "no_data"
-                } else {
-                    "available"
-                }
-            || envelope.source_as_of > bundle.as_of
-            || envelope.first_observed() > envelope.source_as_of
-            || envelope.cutoff_at > bundle.as_of
-            || envelope.rows.len() > 1_000
-        {
-            return Err(PrepareError::InvalidSnapshot);
-        }
-        if envelope.total_rows > MAX_ROWS as u64 {
-            return Err(PrepareError::LimitExceeded);
-        }
-        let source_kind = match source {
-            "advertising" => SnapshotSource::Advertising,
-            "stocks" => SnapshotSource::Stocks,
-            _ => return Err(PrepareError::InvalidSnapshot),
-        };
-        SnapshotDescriptor::new(
-            id,
-            envelope.account_id.clone(),
-            Marketplace::Ozon,
-            source_kind,
-            envelope.cutoff_at,
-            envelope.source_as_of,
-            envelope.period_start,
-            envelope.period_end,
-            u32::try_from(envelope.total_rows).map_err(|_| PrepareError::LimitExceeded)?,
-            true,
-            SnapshotStatus::Succeeded,
-        )
-        .map_err(|_| PrepareError::InvalidSnapshot)?;
+        let (id, envelope) = decode_snapshot_page(page, bundle, source)?;
         if groups
             .entry(id)
             .or_default()
@@ -434,55 +430,119 @@ fn complete_snapshots(
     let mut complete = BTreeMap::new();
     let mut total_rows = 0usize;
     for (id, pages) in groups {
-        let mut base = pages
-            .get(&0)
-            .cloned()
-            .ok_or(PrepareError::IncompleteSnapshot)?;
-        base.rows.clear();
-        base.next_offset = None;
-        let mut expected_offset = 0u32;
-        let mut rows = Vec::new();
-        for (offset, mut page) in pages {
-            if offset != expected_offset {
-                return Err(PrepareError::IncompleteSnapshot);
-            }
-            let count = u32::try_from(page.rows.len()).map_err(|_| PrepareError::LimitExceeded)?;
-            expected_offset = offset
-                .checked_add(count)
-                .ok_or(PrepareError::LimitExceeded)?;
-            let next = (u64::from(expected_offset) < page.total_rows).then_some(expected_offset);
-            if page.next_offset != next || (count == 0 && page.total_rows != 0) {
-                return Err(PrepareError::IncompleteSnapshot);
-            }
-            rows.append(&mut page.rows);
-            page.next_offset = None;
-            // Freshness state can change while all pinned pages are fetched;
-            // it is not part of immutable snapshot identity.
-            page.state.clone_from(&base.state);
-            page.quality.clone_from(&base.quality);
-            if page != base {
-                return Err(PrepareError::InvalidSnapshot);
-            }
-        }
-        if rows.len() as u64 != base.total_rows {
-            return Err(PrepareError::IncompleteSnapshot);
-        }
+        let snapshot = assemble_snapshot(id, pages)?;
         total_rows = total_rows
-            .checked_add(rows.len())
+            .checked_add(snapshot.rows.len())
             .ok_or(PrepareError::LimitExceeded)?;
         if total_rows > MAX_ROWS {
             return Err(PrepareError::LimitExceeded);
         }
-        complete.insert(
-            id,
-            CompleteSnapshot {
-                snapshot_id: id,
-                envelope: base,
-                rows,
-            },
-        );
+        complete.insert(id, snapshot);
     }
     Ok(complete)
+}
+
+/// Reconstructs a complete pinned snapshot without merging changing publication metadata.
+fn assemble_snapshot(
+    id: i64,
+    pages: BTreeMap<u32, SnapshotEnvelope>,
+) -> Result<CompleteSnapshot, PrepareError> {
+    let mut base = pages
+        .get(&0)
+        .cloned()
+        .ok_or(PrepareError::IncompleteSnapshot)?;
+    base.rows.clear();
+    base.next_offset = None;
+    let mut expected_offset = 0u32;
+    let mut rows = Vec::new();
+    for (offset, mut page) in pages {
+        if offset != expected_offset {
+            return Err(PrepareError::IncompleteSnapshot);
+        }
+        let count = u32::try_from(page.rows.len()).map_err(|_| PrepareError::LimitExceeded)?;
+        expected_offset = offset
+            .checked_add(count)
+            .ok_or(PrepareError::LimitExceeded)?;
+        let next = (u64::from(expected_offset) < page.total_rows).then_some(expected_offset);
+        if page.next_offset != next || (count == 0 && page.total_rows != 0) {
+            return Err(PrepareError::IncompleteSnapshot);
+        }
+        rows.append(&mut page.rows);
+        page.next_offset = None;
+        // Freshness state can change while all pinned pages are fetched;
+        // it is not part of immutable snapshot identity.
+        page.state.clone_from(&base.state);
+        page.quality.clone_from(&base.quality);
+        if page != base {
+            return Err(PrepareError::InvalidSnapshot);
+        }
+    }
+    if rows.len() as u64 != base.total_rows {
+        return Err(PrepareError::IncompleteSnapshot);
+    }
+    Ok(CompleteSnapshot {
+        snapshot_id: id,
+        envelope: base,
+        rows,
+    })
+}
+
+/// Validates one untrusted page before inserting it into an immutable snapshot group.
+fn decode_snapshot_page(
+    page: &SnapshotPage,
+    bundle: &PreparationBundle,
+    source: &str,
+) -> Result<(i64, SnapshotEnvelope), PrepareError> {
+    let envelope: SnapshotEnvelope =
+        serde_json::from_value(page.response.clone()).map_err(|_| PrepareError::InvalidSnapshot)?;
+    let id = envelope
+        .snapshot_id
+        .parse::<i64>()
+        .map_err(|_| PrepareError::InvalidSnapshot)?;
+    if id <= 0
+        || envelope.account_id != bundle.account_id
+        || envelope.marketplace != "ozon"
+        || envelope.source != source
+        || envelope.storage != "published_postgresql_snapshots"
+        || !matches!(envelope.state.as_str(), "available" | "stale")
+        || !matches!(envelope.quality.as_deref(), Some("complete" | "stale"))
+        || envelope.pagination_complete != Some(true)
+        || envelope.data_state
+            != if envelope.total_rows == 0 {
+                "no_data"
+            } else {
+                "available"
+            }
+        || envelope.source_as_of > bundle.as_of
+        || envelope.first_observed() > envelope.source_as_of
+        || envelope.cutoff_at > bundle.as_of
+        || envelope.rows.len() > 1_000
+    {
+        return Err(PrepareError::InvalidSnapshot);
+    }
+    if envelope.total_rows > MAX_ROWS as u64 {
+        return Err(PrepareError::LimitExceeded);
+    }
+    let source_kind = match source {
+        "advertising" => SnapshotSource::Advertising,
+        "stocks" => SnapshotSource::Stocks,
+        _ => return Err(PrepareError::InvalidSnapshot),
+    };
+    SnapshotDescriptor::new(
+        id,
+        envelope.account_id.clone(),
+        Marketplace::Ozon,
+        source_kind,
+        envelope.cutoff_at,
+        envelope.source_as_of,
+        envelope.period_start,
+        envelope.period_end,
+        u32::try_from(envelope.total_rows).map_err(|_| PrepareError::LimitExceeded)?,
+        true,
+        SnapshotStatus::Succeeded,
+    )
+    .map_err(|_| PrepareError::InvalidSnapshot)?;
+    Ok((id, envelope))
 }
 
 #[derive(Debug, Deserialize)]
@@ -558,57 +618,9 @@ fn stock_evidence(
 ) -> Result<BTreeMap<u64, StockEvidence>, PrepareError> {
     let mut stocks = BTreeMap::<u64, StockEvidence>::new();
     for snapshot in snapshots.values() {
-        if snapshot.envelope.period_start != snapshot.envelope.source_as_of
-            || snapshot.envelope.period_end != snapshot.envelope.source_as_of
-        {
-            return Err(PrepareError::InvalidSnapshot);
-        }
-        let mut keys = BTreeSet::new();
-        let mut verified_rows = Vec::new();
-        let mut fulfillment = false;
-        let mut warehouse = false;
-        let mut legacy = false;
-        for value in &snapshot.rows {
-            let row: StockRow =
-                serde_json::from_value(value.clone()).map_err(|_| PrepareError::InvalidSnapshot)?;
-            snapshot.validate_fact(&row.provenance)?;
-            if !positive_id(row.sku) || !keys.insert((row.sku, row.warehouse_id.clone())) {
-                return Err(PrepareError::InvalidSnapshot);
-            }
-            if matches!(row.warehouse_id.as_str(), "FBO" | "FBS" | "RFBS") {
-                // The legacy producer stores product_id as sku and present
-                // without subtracting reserved. Neither identifier nor quantity
-                // can be interpreted as native sellable SKU stock here.
-                legacy = true;
-            } else if is_sku_fulfillment_dimension(&row.warehouse_id) {
-                fulfillment = true;
-                verified_rows.push(row);
-            } else {
-                let warehouse_id = row
-                    .warehouse_id
-                    .strip_prefix("fbo:")
-                    .or_else(|| row.warehouse_id.strip_prefix("fbs:"))
-                    .and_then(|id| id.parse::<u64>().ok())
-                    .filter(|id| positive_id(*id));
-                if warehouse_id.is_none() {
-                    return Err(PrepareError::InvalidSnapshot);
-                }
-                warehouse = true;
-                verified_rows.push(row);
-            }
-        }
-        if legacy {
-            refs.insert(format!(
-                "unsupported-legacy-stock-identity:{}",
-                snapshot.snapshot_id
-            ));
+        let Some(verified_rows) = verified_stock_rows(snapshot, refs)? else {
             continue;
-        }
-        // These are alternative complete collection modes. Combining their
-        // totals would count the same units twice, including zero-valued rows.
-        if fulfillment && warehouse {
-            return Err(PrepareError::InvalidSnapshot);
-        }
+        };
         for row in verified_rows {
             if selected.contains(&row.sku) {
                 let stock = stocks.entry(row.sku).or_insert_with(|| StockEvidence {
@@ -623,6 +635,81 @@ fn stock_evidence(
         }
     }
     Ok(stocks)
+}
+
+/// Rejects mixed collection modes and preserves the explicit legacy-stock gap.
+fn verified_stock_rows(
+    snapshot: &CompleteSnapshot,
+    refs: &mut BTreeSet<String>,
+) -> Result<Option<Vec<StockRow>>, PrepareError> {
+    if snapshot.envelope.period_start != snapshot.envelope.source_as_of
+        || snapshot.envelope.period_end != snapshot.envelope.source_as_of
+    {
+        return Err(PrepareError::InvalidSnapshot);
+    }
+    let mut keys = BTreeSet::new();
+    let mut verified_rows = Vec::new();
+    let mut fulfillment = false;
+    let mut warehouse = false;
+    let mut legacy = false;
+    for value in &snapshot.rows {
+        let row: StockRow =
+            serde_json::from_value(value.clone()).map_err(|_| PrepareError::InvalidSnapshot)?;
+        snapshot.validate_fact(&row.provenance)?;
+        if !positive_id(row.sku) || !keys.insert((row.sku, row.warehouse_id.clone())) {
+            return Err(PrepareError::InvalidSnapshot);
+        }
+        match stock_dimension(&row.warehouse_id)? {
+            StockDimension::Legacy => legacy = true,
+            StockDimension::Fulfillment => {
+                fulfillment = true;
+                verified_rows.push(row);
+            }
+            StockDimension::Warehouse => {
+                warehouse = true;
+                verified_rows.push(row);
+            }
+        }
+    }
+    if legacy {
+        refs.insert(format!(
+            "unsupported-legacy-stock-identity:{}",
+            snapshot.snapshot_id
+        ));
+        return Ok(None);
+    }
+    // These are alternative complete collection modes. Combining their
+    // totals would count the same units twice, including zero-valued rows.
+    if fulfillment && warehouse {
+        return Err(PrepareError::InvalidSnapshot);
+    }
+    Ok(Some(verified_rows))
+}
+
+enum StockDimension {
+    // The legacy producer stores product_id as sku and present stock without
+    // subtracting reserved units. Neither field is native sellable SKU evidence.
+    Legacy,
+    Fulfillment,
+    Warehouse,
+}
+
+fn stock_dimension(warehouse: &str) -> Result<StockDimension, PrepareError> {
+    if matches!(warehouse, "FBO" | "FBS" | "RFBS") {
+        return Ok(StockDimension::Legacy);
+    }
+    if is_sku_fulfillment_dimension(warehouse) {
+        return Ok(StockDimension::Fulfillment);
+    }
+    let warehouse_id = warehouse
+        .strip_prefix("fbo:")
+        .or_else(|| warehouse.strip_prefix("fbs:"))
+        .and_then(|id| id.parse::<u64>().ok())
+        .filter(|id| positive_id(*id));
+    if warehouse_id.is_none() {
+        return Err(PrepareError::InvalidSnapshot);
+    }
+    Ok(StockDimension::Warehouse)
 }
 
 const fn positive_id(value: u64) -> bool {

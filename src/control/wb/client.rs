@@ -6,6 +6,7 @@ use crate::{
     wb::quota::vendor_quota_cooldown,
 };
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use reqwest::{
     Client, ClientBuilder, Proxy, StatusCode,
     header::{AUTHORIZATION, HeaderValue},
@@ -115,6 +116,13 @@ pub(super) fn write_http_builder(timeout_duration: Duration) -> ClientBuilder {
 }
 
 #[derive(Clone)]
+struct AuthorizationWindow {
+    starts_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+}
+
+#[derive(Clone)]
 pub struct WbBidWriteClient {
     http: Client,
     base_url: String,
@@ -124,6 +132,7 @@ pub struct WbBidWriteClient {
     create_pacer: Arc<WritePacer>,
     deposit_pacer: Arc<WritePacer>,
     shared_quota: SharedQuota,
+    authorization_window: Option<AuthorizationWindow>,
 }
 
 impl fmt::Debug for WbBidWriteClient {
@@ -143,6 +152,41 @@ impl fmt::Debug for WbBidWriteClient {
 }
 
 impl WbBidWriteClient {
+    pub(in crate::control) fn with_authorization_window(
+        mut self,
+        starts_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Self {
+        self.authorization_window = Some(AuthorizationWindow {
+            starts_at,
+            expires_at,
+            clock: Arc::new(Utc::now),
+        });
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_authorization_clock(
+        mut self,
+        clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    ) -> Self {
+        self.authorization_window
+            .as_mut()
+            .expect("configured authorization window")
+            .clock = clock;
+        self
+    }
+
+    fn verify_authorization(&self) -> Result<(), WbWriteError> {
+        if let Some(window) = &self.authorization_window {
+            let now = (window.clock)();
+            if now < window.starts_at || now >= window.expires_at {
+                return Err(WbWriteError::AuthorizationUnavailable);
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(timeout_duration: Duration, token: &str, proxy_url: &str) -> Result<Self> {
         if timeout_duration.is_zero() || timeout_duration > Duration::from_secs(30) {
             bail!("CONTROL_MCP_WB_TIMEOUT_SECONDS должен задавать 1..=30 секунд");
@@ -207,6 +251,7 @@ impl WbBidWriteClient {
                 Duration::from_secs(1)
             })),
             shared_quota: SharedQuota::from_env(),
+            authorization_window: None,
         })
     }
 
@@ -313,6 +358,8 @@ impl WbBidWriteClient {
                     self.preflight_shared_quota(CHANGE_BIDS_PATH)
                         .await
                         .map_err(WbGuardedWriteError::Write)?;
+                    self.verify_authorization()
+                        .map_err(WbGuardedWriteError::Write)?;
                     permit().await.map_err(WbGuardedWriteError::Permit)
                 },
                 || async {
@@ -388,6 +435,8 @@ impl WbBidWriteClient {
                     self.preflight_shared_quota(DEPOSIT_BUDGET_PATH)
                         .await
                         .map_err(WbGuardedWriteError::Write)?;
+                    self.verify_authorization()
+                        .map_err(WbGuardedWriteError::Write)?;
                     permit().await.map_err(WbGuardedWriteError::Permit)
                 },
                 || async {
@@ -401,6 +450,7 @@ impl WbBidWriteClient {
 
     async fn deposit_once(&self, advert_id: u64, amount_rubles: u64) -> Result<u64, WbWriteError> {
         self.admit_shared_quota(DEPOSIT_BUDGET_PATH).await?;
+        self.verify_authorization()?;
         let send = self
             .http
             .post(format!("{}{}", self.base_url, DEPOSIT_BUDGET_PATH))
@@ -458,6 +508,8 @@ impl WbBidWriteClient {
                     self.preflight_shared_quota(CREATE_CAMPAIGN_PATH)
                         .await
                         .map_err(WbGuardedWriteError::Write)?;
+                    self.verify_authorization()
+                        .map_err(WbGuardedWriteError::Write)?;
                     permit().await.map_err(WbGuardedWriteError::Permit)
                 },
                 || async {
@@ -486,6 +538,8 @@ impl WbBidWriteClient {
                     self.preflight_shared_quota(path)
                         .await
                         .map_err(WbGuardedWriteError::Write)?;
+                    self.verify_authorization()
+                        .map_err(WbGuardedWriteError::Write)?;
                     permit().await.map_err(WbGuardedWriteError::Permit)
                 },
                 || async {
@@ -513,6 +567,7 @@ impl WbBidWriteClient {
             }]
         });
         self.admit_shared_quota(CHANGE_BIDS_PATH).await?;
+        self.verify_authorization()?;
         let send = self
             .http
             .patch(format!("{}{}", self.base_url, CHANGE_BIDS_PATH))
@@ -578,6 +633,7 @@ impl WbBidWriteClient {
             );
         }
         self.admit_shared_quota(CREATE_CAMPAIGN_PATH).await?;
+        self.verify_authorization()?;
         let send = self
             .http
             .post(format!("{}{}", self.base_url, CREATE_CAMPAIGN_PATH))
@@ -631,6 +687,7 @@ impl WbBidWriteClient {
         path: &'static str,
     ) -> Result<Value, WbWriteError> {
         self.admit_shared_quota(path).await?;
+        self.verify_authorization()?;
         let send = self
             .http
             .get(format!("{}{}", self.base_url, path))

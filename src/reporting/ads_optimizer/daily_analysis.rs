@@ -153,33 +153,7 @@ pub fn analyze_daily_response(
         .collect();
     if let Some(history) = &history {
         for row in &history.campaigns {
-            let mut push = |kind| {
-                signals.push(DailyAnalysisSignal {
-                    campaign_id: row.campaign_id,
-                    kind,
-                });
-            };
-            if !row.calendar_complete {
-                push(DailyAnalysisSignalKind::MissingDates);
-            }
-            if row.spend_minor == 0 {
-                push(DailyAnalysisSignalKind::NoObservedSpend);
-            } else if row.orders == 0 {
-                push(DailyAnalysisSignalKind::SpendWithoutReportedOrders);
-            } else if row.revenue_minor == 0 {
-                push(DailyAnalysisSignalKind::RevenueUnavailable);
-            } else if let Some(target) = scope.target_drr_bps {
-                // Compare exact amounts; a floored displayed DRR can hide a breach.
-                push(
-                    if u128::from(row.spend_minor) * 10_000
-                        > u128::from(target) * u128::from(row.revenue_minor)
-                    {
-                        DailyAnalysisSignalKind::AboveTargetDrr
-                    } else {
-                        DailyAnalysisSignalKind::WithinTargetDrr
-                    },
-                );
-            }
+            append_campaign_signals(&scope, row, &mut signals);
         }
     }
     signals.sort_by_key(|signal| signal.campaign_id);
@@ -197,6 +171,41 @@ pub fn analyze_daily_response(
         attribution_maturity_verified: false,
         auto_apply_allowed: false,
     })
+}
+
+/// Produces independent coverage and spend signals for one observed campaign.
+fn append_campaign_signals(
+    scope: &DailyAnalysisScope,
+    row: &CampaignHistorySummary,
+    signals: &mut Vec<DailyAnalysisSignal>,
+) {
+    let mut push = |kind| {
+        signals.push(DailyAnalysisSignal {
+            campaign_id: row.campaign_id,
+            kind,
+        });
+    };
+    if !row.calendar_complete {
+        push(DailyAnalysisSignalKind::MissingDates);
+    }
+    if row.spend_minor == 0 {
+        push(DailyAnalysisSignalKind::NoObservedSpend);
+    } else if row.orders == 0 {
+        push(DailyAnalysisSignalKind::SpendWithoutReportedOrders);
+    } else if row.revenue_minor == 0 {
+        push(DailyAnalysisSignalKind::RevenueUnavailable);
+    } else if let Some(target) = scope.target_drr_bps {
+        // Compare exact amounts; a floored displayed DRR can hide a breach.
+        push(
+            if u128::from(row.spend_minor) * 10_000
+                > u128::from(target) * u128::from(row.revenue_minor)
+            {
+                DailyAnalysisSignalKind::AboveTargetDrr
+            } else {
+                DailyAnalysisSignalKind::WithinTargetDrr
+            },
+        );
+    }
 }
 
 pub fn validate_scope(scope: &DailyAnalysisScope) -> Result<(), OptimizerError> {

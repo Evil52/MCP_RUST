@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+  "as_of": "2026-10-05T10:00:00Z",
+  "date_from": "2026-10-01",
+  "date_to": "2026-10-02",
+  "coverage": [
+    { "date": "2026-10-01", "snapshot_id": 1, "complete": true, "observed_at": "2026-10-02T03:00:00Z" },
+    { "date": "2026-10-02", "snapshot_id": 2, "complete": true, "observed_at": "2026-10-03T03:00:00Z" }
+  ],
+  "advertising": [
+    { "date": "2026-10-01", "campaign_id": 10, "sku": 100, "spend_minor": 100, "clicks": 10, "attributed_orders": 1, "attributed_revenue_minor": 100 },
+    { "date": "2026-10-02", "campaign_id": 10, "sku": 100, "spend_minor": 900, "clicks": 90, "attributed_orders": 9, "attributed_revenue_minor": 9900 }
+  ],
+  "sales": [
+    { "date": "2026-10-01", "snapshot_id": 3, "complete": true, "observed_at": "2026-10-02T03:01:00Z", "ordered_units": 3, "operational_gmv_minor": 300 },
+    { "date": "2026-10-02", "snapshot_id": 4, "complete": true, "observed_at": "2026-10-03T03:01:00Z", "ordered_units": 12, "operational_gmv_minor": 15000 }
+  ]
+}

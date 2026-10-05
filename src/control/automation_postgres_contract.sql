@@ -14,6 +14,20 @@ AND EXISTS (
 AND has_database_privilege(current_user, current_database(), 'CONNECT')
 AND NOT has_database_privilege(current_user, current_database(), 'TEMPORARY')
 AND NOT has_database_privilege(current_user, current_database(), 'CREATE')
+-- Fail closed on databases that have not installed migration 051.
+AND EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint state_shape
+    WHERE state_shape.conrelid = 'wb_automation.action_attempts'::regclass
+      AND state_shape.conname = 'wb_automation_action_state_shape'
+      AND position('write_not_sent' IN pg_catalog.pg_get_constraintdef(state_shape.oid)) > 0
+)
+AND EXISTS (
+    SELECT 1 FROM pg_catalog.pg_proc transition
+    JOIN pg_catalog.pg_namespace namespace ON namespace.oid = transition.pronamespace
+    WHERE namespace.nspname = 'wb_automation'
+      AND transition.proname = 'enforce_action_transition'
+      AND position('write_not_sent' IN transition.prosrc) > 0
+)
 AND has_schema_privilege(current_user, 'wb_automation', 'USAGE')
 AND NOT has_schema_privilege(current_user, 'wb_automation', 'CREATE')
 AND NOT has_schema_privilege(current_user, 'control', 'USAGE')

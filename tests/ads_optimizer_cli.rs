@@ -15,6 +15,34 @@ use serde_json::Value;
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn wb_baseline_reports_weighted_metrics_without_environment_or_writes() {
+    let directory = FixtureDirectory::new();
+    let evidence = directory.write(
+        "baseline.json",
+        include_bytes!("../config/wb-ads-baseline.example.json"),
+    );
+    directory.write(".env", b"INVALID PRIVATE DOTENV DO NOT LOAD");
+    let before = fs::read_dir(&directory.0).unwrap().count();
+    let output = command(&directory.0)
+        .arg("baseline-wb")
+        .arg(evidence)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "measurement_only");
+    assert_eq!(report["observed_sku_metrics"]["drr_bps"], 1000);
+    assert_eq!(report["observed_store_sales"]["ordered_units"], 15);
+    assert_eq!(report["auto_apply_allowed"], false);
+    assert_eq!(report["causal_effect_verified"], false);
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), before);
+}
+
+#[test]
 fn wb_review_uses_captured_composition_and_fbs_without_writes_or_environment() {
     let directory = FixtureDirectory::new();
     let evidence = directory.write(

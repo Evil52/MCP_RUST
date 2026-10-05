@@ -2,15 +2,40 @@ use std::collections::BTreeSet;
 
 use chrono::Datelike;
 
-use super::{MAX_PRODUCTS, MAX_WINDOW_DAYS, OptimizationObjective, OptimizerError, ShadowInput};
+use super::{
+    AdvertisingDay, MAX_PRODUCTS, MAX_WINDOW_DAYS, OptimizationObjective, OptimizerError,
+    OptimizerPolicy, ProductEvidence, ShadowInput,
+};
 
 pub(super) fn validate(input: &ShadowInput) -> Result<(), OptimizerError> {
-    let policy = &input.policy;
     if let OptimizationObjective::TargetAdvertisingDrr { max_drr_bps } = input.objective
         && !(1..=100_000).contains(&max_drr_bps)
     {
         return Err(OptimizerError::InvalidInput);
     }
+    let days = validate_scope(input)?;
+    validate_policy(&input.policy)?;
+    if input.products.is_empty() || input.products.len() > MAX_PRODUCTS || days > MAX_WINDOW_DAYS {
+        return Err(OptimizerError::LimitExceeded);
+    }
+    let mut refs = BTreeSet::new();
+    if input.source_refs.iter().any(|value| !refs.insert(value)) {
+        return Err(OptimizerError::DuplicateEvidence);
+    }
+    let mut skus = BTreeSet::new();
+    for product in &input.products {
+        if product.sku == 0 || i64::try_from(product.sku).is_err() {
+            return Err(OptimizerError::InvalidInput);
+        }
+        if !skus.insert(product.sku) {
+            return Err(OptimizerError::DuplicateEvidence);
+        }
+        validate_product(input, product)?;
+    }
+    Ok(())
+}
+
+fn validate_scope(input: &ShadowInput) -> Result<i64, OptimizerError> {
     let days = (input.window_end - input.window_start).num_days() + 1;
     if input.version != 1
         || input.account_id.is_empty()
@@ -27,7 +52,14 @@ pub(super) fn validate(input: &ShadowInput) -> Result<(), OptimizerError> {
         || input.source_refs.is_empty()
         || input.source_refs.len() > 256
         || input.source_refs.iter().any(|value| !valid_ref(value))
-        || policy.total_daily_budget_minor == 0
+    {
+        return Err(OptimizerError::InvalidInput);
+    }
+    Ok(days)
+}
+
+fn validate_policy(policy: &OptimizerPolicy) -> Result<(), OptimizerError> {
+    if policy.total_daily_budget_minor == 0
         || !(1..=60).contains(&policy.attribution_lag_days)
         || !(1..=90).contains(&policy.min_mature_days)
         || policy.min_clicks == 0
@@ -42,59 +74,52 @@ pub(super) fn validate(input: &ShadowInput) -> Result<(), OptimizerError> {
     {
         return Err(OptimizerError::InvalidInput);
     }
-    if input.products.is_empty() || input.products.len() > MAX_PRODUCTS || days > MAX_WINDOW_DAYS {
+    Ok(())
+}
+
+fn validate_product(input: &ShadowInput, product: &ProductEvidence) -> Result<(), OptimizerError> {
+    if product.daily.len() > usize::try_from(MAX_WINDOW_DAYS).expect("positive constant") {
         return Err(OptimizerError::LimitExceeded);
     }
-    let mut refs = BTreeSet::new();
-    if input.source_refs.iter().any(|value| !refs.insert(value)) {
-        return Err(OptimizerError::DuplicateEvidence);
+    validate_dates(input, &product.daily)?;
+    if product
+        .budget_constraint
+        .as_ref()
+        .is_some_and(|evidence| evidence.observed_at > input.as_of)
+    {
+        return Err(OptimizerError::InvalidInput);
     }
-    let mut skus = BTreeSet::new();
-    for product in &input.products {
-        if product.sku == 0 || i64::try_from(product.sku).is_err() {
+    if product
+        .stock
+        .as_ref()
+        .is_some_and(|stock| stock.observed_at > input.as_of)
+    {
+        return Err(OptimizerError::InvalidInput);
+    }
+    if let Some(economics) = &product.economics
+        && (!valid_ref(&economics.source_ref)
+            || economics.valid_from > economics.valid_to
+            || economics.reviewed_at > input.as_of
+            || economics.expected_revenue_minor == 0)
+    {
+        return Err(OptimizerError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_dates(input: &ShadowInput, daily: &[AdvertisingDay]) -> Result<(), OptimizerError> {
+    let mut dates = BTreeSet::new();
+    for day in daily {
+        let observed_at = day.observed_at.unwrap_or(input.observed_at);
+        if day.date < input.window_start
+            || day.date > input.window_end
+            || day.date >= observed_at.date_naive()
+            || observed_at > input.observed_at
+        {
             return Err(OptimizerError::InvalidInput);
         }
-        if !skus.insert(product.sku) {
+        if !dates.insert(day.date) {
             return Err(OptimizerError::DuplicateEvidence);
-        }
-        if product.daily.len() > usize::try_from(MAX_WINDOW_DAYS).expect("positive constant") {
-            return Err(OptimizerError::LimitExceeded);
-        }
-        let mut dates = BTreeSet::new();
-        for day in &product.daily {
-            let observed_at = day.observed_at.unwrap_or(input.observed_at);
-            if day.date < input.window_start
-                || day.date > input.window_end
-                || day.date >= observed_at.date_naive()
-                || observed_at > input.observed_at
-            {
-                return Err(OptimizerError::InvalidInput);
-            }
-            if !dates.insert(day.date) {
-                return Err(OptimizerError::DuplicateEvidence);
-            }
-        }
-        if product
-            .budget_constraint
-            .as_ref()
-            .is_some_and(|evidence| evidence.observed_at > input.as_of)
-        {
-            return Err(OptimizerError::InvalidInput);
-        }
-        if product
-            .stock
-            .as_ref()
-            .is_some_and(|stock| stock.observed_at > input.as_of)
-        {
-            return Err(OptimizerError::InvalidInput);
-        }
-        if let Some(economics) = &product.economics
-            && (!valid_ref(&economics.source_ref)
-                || economics.valid_from > economics.valid_to
-                || economics.reviewed_at > input.as_of
-                || economics.expected_revenue_minor == 0)
-        {
-            return Err(OptimizerError::InvalidInput);
         }
     }
     Ok(())

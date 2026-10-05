@@ -14,6 +14,7 @@ pub mod prepare;
 pub mod published;
 pub mod reconciliation;
 mod validation;
+pub mod wb_baseline;
 pub mod wb_review;
 
 pub use model::*;

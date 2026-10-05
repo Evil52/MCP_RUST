@@ -19,6 +19,32 @@ pub(super) fn digest(bytes: &[u8]) -> String {
         })
 }
 
+/// Owns the account lock for the entire writable v2 journal lifetime.
+fn account_lock(root: &Path, manifest: &Value) -> Result<File> {
+    let account = manifest
+        .get("account_id")
+        .and_then(Value::as_str)
+        .context("missing launch account")?;
+    let path = root.join(format!("account-{}.lock", digest(account.as_bytes())));
+    if entry_exists(&path)? {
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file() && metadata.permissions().mode().trailing_zeros() >= 6,
+            "unsafe account lock"
+        );
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    lock.try_lock()
+        .context("another campaign operation owns this account journal")?;
+    Ok(lock)
+}
+
 #[cfg(test)]
 #[path = "journal_tests.rs"]
 mod tests;
@@ -115,28 +141,7 @@ impl Journal {
         // campaign names whose product selections could overlap.
         let account_lock = if writable && manifest.get("version").and_then(Value::as_u64) == Some(2)
         {
-            let account = manifest
-                .get("account_id")
-                .and_then(Value::as_str)
-                .context("missing launch account")?;
-            let path = root.join(format!("account-{}.lock", digest(account.as_bytes())));
-            if entry_exists(&path)? {
-                let metadata = fs::symlink_metadata(&path)?;
-                ensure!(
-                    metadata.is_file() && metadata.permissions().mode().trailing_zeros() >= 6,
-                    "unsafe account lock"
-                );
-            }
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(path)?;
-            lock.try_lock()
-                .context("another campaign operation owns this account journal")?;
-            Some(lock)
+            Some(account_lock(root, manifest)?)
         } else {
             None
         };
@@ -185,35 +190,38 @@ impl Journal {
             recovery,
             continuation,
         };
-        if continuation {
-            super::continuation::validate(&journal.directory, manifest)?;
+        journal.validate_open_authorization(manifest, writable)?;
+        Ok(journal)
+    }
+
+    /// Checks authorization while account and journal locks remain owned by `self`.
+    fn validate_open_authorization(&self, manifest: &Value, writable: bool) -> Result<()> {
+        if self.continuation {
+            super::continuation::validate(&self.directory, manifest)?;
         }
-        if writable && !continuation {
+        if writable && !self.continuation {
             ensure!(
-                !entry_exists(&journal.directory.join("continue-manifest.json"))?,
+                !entry_exists(&self.directory.join("continue-manifest.json"))?,
                 "continuation authorization recorded; earlier writes forbidden"
             );
         }
-        if recovery {
-            recreate::validate(&journal.directory, manifest)?;
-        } else if writable && !continuation {
+        if self.recovery {
+            recreate::validate(&self.directory, manifest)?;
+        } else if writable && !self.continuation {
             ensure!(
-                !journal
-                    .directory
-                    .join("recreate-manifest.json")
-                    .try_exists()?,
+                !self.directory.join("recreate-manifest.json").try_exists()?,
                 "replacement authorization already recorded; legacy writes forbidden"
             );
         }
-        let path = journal.path("manifest");
+        let path = self.path("manifest");
         if writable && !path.try_exists()? {
-            journal.record("manifest", manifest)?;
+            self.record("manifest", manifest)?;
         }
         ensure!(
             read_private_json::<Value>(&path)? == *manifest,
             "manifest differs from immutable launch authorization; no writes allowed"
         );
-        Ok(journal)
+        Ok(())
     }
 
     fn record(&self, name: &str, value: &Value) -> Result<()> {

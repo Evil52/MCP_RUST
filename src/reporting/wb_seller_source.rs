@@ -174,6 +174,18 @@ impl WbSellerSource {
         Ok(facts)
     }
 
+    /// Restores one content page from its checkpoint or validates a fresh reply.
+    async fn card_page(
+        &self,
+        content: &Checkpoints,
+        cursor: &Value,
+    ) -> Result<CardPage, SourceFailure> {
+        checkpointed(content, json!(["wb_seller_cards_v1", cursor]), || async {
+            parse_cards(&self.transport.cards(cursor.clone()).await?)
+        })
+        .await
+    }
+
     async fn catalogue(&self) -> Result<BTreeMap<u64, u64>, SourceFailure> {
         let content = stock_checkpoints(&self.checkpoints, StockPageScope::Content);
         let mut cursor = json!({"limit":CARD_LIMIT});
@@ -181,11 +193,7 @@ impl WbSellerSource {
         let mut items = BTreeSet::new();
         let mut catalogue = BTreeMap::new();
         for _ in 0..MAX_CARD_PAGES {
-            let page: CardPage =
-                checkpointed(&content, json!(["wb_seller_cards_v1", cursor]), || async {
-                    parse_cards(&self.transport.cards(cursor.clone()).await?)
-                })
-                .await?;
+            let page = self.card_page(&content, &cursor).await?;
             extend_catalogue(&mut items, &mut catalogue, page.items)?;
             let Some(next) = page.next else {
                 return Ok(catalogue);
