@@ -143,7 +143,10 @@ first_output="$(run_cycle)"
 printf '%s\n' "$first_output"
 if jq -e '.outcome == "write_sent_reconciliation_required"' \
   <<<"$first_output" >/dev/null 2>&1; then
-  # Make the first read-back attempt immediately. If WB has not converged yet,
+  # A second cycle reads fullstats again. Respect its 20-second pacing window
+  # before asking for readback; the shared quota still admits every request.
+  # If WB has not converged yet,
   # the durable pending row remains fail-closed for the next scheduled cycle.
+  sleep 20
   run_cycle
 fi
