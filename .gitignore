@@ -20,3 +20,6 @@ outputs/weekly-leadership-preview-20260821/Еженедельный_отчет_�
 # Python helper bytecode is generated locally and is not a release resource.
 __pycache__/
 *.py[cod]
+
+# Local verification logs and account-specific operational output.
+/output/
