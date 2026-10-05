@@ -106,7 +106,7 @@ async fn cycle(
     age_seconds: i32,
 ) {
     client.execute(
-        "INSERT INTO wb_automation.cycles(cycle_id,account_id,advert_id,policy_digest,observed_at,business_date,state_revision,snapshot_json,decision_json) VALUES($1,'terminal_recovery_contract',987654321,repeat('a',64),clock_timestamp()-make_interval(secs=>$5::int),current_date,1,jsonb_build_object('observation',jsonb_build_object('campaign_status',$2::int,'budget_remaining_minor',$3::bigint,'paused_by_automation',false))::text,jsonb_build_object('action',jsonb_build_object('hold',jsonb_build_object('reason',$4::text)))::text)",
+        "WITH observed AS (SELECT clock_timestamp()-make_interval(secs=>$5::int) AS at) INSERT INTO wb_automation.cycles(cycle_id,account_id,advert_id,policy_digest,observed_at,business_date,state_revision,snapshot_json,decision_json) SELECT $1,'terminal_recovery_contract',987654321,repeat('a',64),observed.at,(observed.at AT TIME ZONE 'Europe/Moscow')::date,1,jsonb_build_object('observation',jsonb_build_object('campaign_status',$2::int,'budget_remaining_minor',$3::bigint,'paused_by_automation',false))::text,jsonb_build_object('action',jsonb_build_object('hold',jsonb_build_object('reason',$4::text)))::text FROM observed",
         &[&key,&status,&budget,&reason,&age_seconds],
     ).await.unwrap();
 }
@@ -122,6 +122,11 @@ async fn open(client: &Client) -> bool {
 #[tokio::test]
 async fn terminal_archive_keeps_lock_and_realerts_when_campaign_or_authorization_changes() {
     let Some(client) = admin().await else { return };
+    // A connection's calendar must never supply the Moscow observation date.
+    client
+        .batch_execute("SET TIME ZONE 'Pacific/Honolulu'")
+        .await
+        .unwrap();
     client.batch_execute("INSERT INTO wb_automation.execution_state(account_id,advert_id,schema_version,policy_digest,business_date,actions_today,incident_class,revision) VALUES('terminal_recovery_contract',987654321,1,repeat('a',64),current_date,0,'daily_spend_cap_breached',1)").await.unwrap();
     let old_cycle_id = archive_cycle_id("old");
     cycle(&client, &old_cycle_id, 7, 0, "authorization_expired", 120).await;

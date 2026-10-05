@@ -73,6 +73,34 @@ END;
 $$;
 ROLLBACK TO SAVEPOINT eligibility;
 
+SAVEPOINT recovery_backlog;
+DO $$
+DECLARE
+    t timestamptz := clock_timestamp();
+    scope jsonb := '[{"account_id":"recovery_priority","marketplace":"ozon"}]';
+    j daily_reporting.source_collection_jobs;
+BEGIN
+    INSERT INTO daily_reporting.source_collection_jobs
+        (account_id,marketplace,source,cutoff_at,period_start,period_end,deadline_at,next_attempt_at)
+    VALUES
+        ('recovery_priority','ozon','sales',t-interval '12 hours',t-interval '36 hours',t-interval '12 hours',t+interval '12 hours',t-interval '12 hours'),
+        ('recovery_priority','ozon','sales',t-interval '1 hour',t-interval '25 hours',t-interval '1 hour',t+interval '23 hours',t-interval '1 hour');
+    SELECT * INTO STRICT j FROM daily_reporting.claim_source_collection(scope,'restart-priority');
+    ASSERT j.cutoff_at=t-interval '1 hour', 'latest cutoff must outrank unstarted historical work';
+    ASSERT daily_reporting.defer_source_collection(j.id,j.generation,'restart-priority',NULL,3600,false);
+    INSERT INTO daily_reporting.source_collection_jobs
+        (account_id,marketplace,source,cutoff_at,period_start,period_end,deadline_at,next_attempt_at,first_observed_at)
+    VALUES
+        ('recovery_priority','ozon','stocks',t-interval '12 hours',t-interval '36 hours',t-interval '12 hours',t+interval '12 hours',t-interval '1 second',t-interval '10 minutes');
+    SELECT * INTO STRICT j FROM daily_reporting.claim_source_collection(scope,'restart-priority');
+    ASSERT j.source='stocks', 'an admitted observation must finish within its original window';
+    ASSERT daily_reporting.defer_source_collection(j.id,j.generation,'restart-priority',NULL,3600,false);
+    SELECT * INTO STRICT j FROM daily_reporting.claim_source_collection(scope,'restart-priority');
+    ASSERT j.source='sales' AND j.cutoff_at=t-interval '12 hours', 'historical work remains recoverable after current work';
+END;
+$$;
+ROLLBACK TO SAVEPOINT recovery_backlog;
+
 -- Reproduce a busy cutoff: 14 accounts, 70 sources, four pages each, 20 seconds
 -- of work per page. Advancing only disposable fixture clocks avoids sleeps.
 -- FIFO next_attempt_at expires started stock/price jobs on this same workload.
