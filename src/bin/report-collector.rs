@@ -71,15 +71,17 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let config = ReportCollectorConfig::from_lookup(&mut |key| std::env::var(key).ok())?;
+    // Health probes need one archive connection. The running worker separately
+    // verifies and retains its quota connection; duplicating that connection in
+    // every probe can exhaust the bounded report_collector role.
+    if command == Command::AdvertisingHistoryPreflight {
+        return background::run_history(&config, true).await;
+    }
     mcp_ozon::marketplace_quota::SharedQuota::from_env()
         .preflight()
         .await?;
-    if matches!(
-        command,
-        Command::RunAdvertisingHistory | Command::AdvertisingHistoryPreflight
-    ) {
-        return background::run_history(&config, command == Command::AdvertisingHistoryPreflight)
-            .await;
+    if command == Command::RunAdvertisingHistory {
+        return background::run_history(&config, false).await;
     }
     let writer = Arc::new(
         PostgresSnapshotWriter::connect(config.database_config())
