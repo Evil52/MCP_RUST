@@ -9,6 +9,9 @@ mod warehouse_paging;
 #[test]
 fn all_tools_have_truthful_annotations_and_descriptions() {
     const INTERNAL_REPORTING_TOOLS: &[&str] = &[
+        "wb_advertising_history_sync",
+        "wb_advertising_history_status",
+        "wb_advertising_history_stats",
         "ofk_collection_status",
         "ofk_wb_financial_ledger",
         "ofk_wb_report_reconciliation",
@@ -61,6 +64,9 @@ fn all_tools_have_truthful_annotations_and_descriptions() {
 #[test]
 fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
     const STABLE_TOOL_NAMES: &[&str] = &[
+        "wb_advertising_history_sync",
+        "wb_advertising_history_status",
+        "wb_advertising_history_stats",
         "wb_seller_warehouses_stock_report",
         "wb_fbs_new_orders",
         "wb_fbs_orders",
@@ -229,7 +235,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     // The release checklist in `SECURITY.md` states this count verbatim.
     // Changing it here without updating that gate leaves the gate
     // describing a router that no longer exists.
-    assert_eq!(dev_tools.len(), 115);
+    assert_eq!(dev_tools.len(), 118);
     assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
     let seed = server();
@@ -240,7 +246,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
     let jwt_tools = authenticated.tool_router.list_all();
-    assert_eq!(jwt_tools.len(), 115);
+    assert_eq!(jwt_tools.len(), 118);
     assert_policy(
         jwt_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -252,7 +258,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
         .with_preview_features(false, true)
         .tool_router
         .list_all();
-    assert_eq!(legacy_flag_tools.len(), 115);
+    assert_eq!(legacy_flag_tools.len(), 118);
     assert_policy(
         legacy_flag_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),

@@ -218,3 +218,6 @@ async fn ledger_disabled_and_unavailable_storage_fail_closed_with_stable_errors(
         "{error}"
     );
 }
+
+#[path = "advertising_history.rs"]
+mod advertising_history;
