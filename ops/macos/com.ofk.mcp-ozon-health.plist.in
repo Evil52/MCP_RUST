@@ -40,6 +40,8 @@
     <string>__HEALTH_REPORTING_POLICY__</string>
     <key>MCP_HEALTH_REPORTING_REGISTRY</key>
     <string>__HEALTH_REPORTING_REGISTRY__</string>
+    <key>MCP_HEALTH_WB_RETIRED_CAMPAIGNS</key>
+    <string>__HEALTH_RETIRED_WB_CAMPAIGNS__</string>
     <key>MCP_BACKUP_ALLOW_LOCAL_ONLY</key>
     <string>__ALLOW_LOCAL_ONLY__</string>
     <key>PATH</key>

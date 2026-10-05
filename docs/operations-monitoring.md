@@ -61,6 +61,15 @@ The installer persists both `MCP_HEALTH_REQUIRED_SERVICES` and
 rejects empty or malformed comma-separated contracts. Do not remove an enabled
 service from the contract merely to silence a finding.
 
+Retired WB automations may be listed explicitly in
+`MCP_HEALTH_WB_RETIRED_CAMPAIGNS`, for example `ip_domnyshev_wb:39682633`.
+Use this only after the operator has retired that campaign and disabled its
+worker schedule. The health installer persists the comma-separated exact
+account/campaign identities. Empty means no exclusions; malformed identities
+fail the check. Retirement excludes old local incident alerts for that exact
+pair while preserving immutable history, cabinet reporting and every unresolved
+marketplace-action alert. It does not clear execution state or authorize writes.
+
 The installer intentionally refuses to schedule backups without an executable
 offsite-copy hook, unless the operator explicitly sets
 `MCP_BACKUP_ALLOW_LOCAL_ONLY=true` to record that accepted risk. It proves one
