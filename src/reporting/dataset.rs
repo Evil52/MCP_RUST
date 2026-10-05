@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use super::{
     kpi::{AdvertisingMetricInput, KpiError, KpiSummary, SalesMetricInput, calculate_kpis},
     postgres_snapshot::{
-        PublishedAdvertisingExpenseFact, PublishedFinanceFact, PublishedReportFacts,
-        PublishedSalesFact,
+        PublishedAdvertisingExpenseFact, PublishedAdvertisingFact, PublishedFinanceFact,
+        PublishedReportFacts, PublishedSalesFact,
     },
     rules::StockScope,
     snapshot::{FrozenSnapshotManifest, SnapshotQuality, SnapshotSource},
@@ -163,42 +163,7 @@ impl ReportDataset {
             )
             .collect();
 
-        let mut advertising = BTreeMap::new();
-        for fact in facts.advertising {
-            let row = advertising
-                .entry((fact.account_id, fact.campaign_id, fact.sku))
-                .or_insert((0u64, 0u64, 0u64, 0u64, 0u64));
-            row.0 = add(row.0, fact.impressions)?;
-            row.1 = add(row.1, fact.clicks)?;
-            row.2 = add(row.2, fact.spend_minor)?;
-            row.3 = add(row.3, fact.attributed_orders)?;
-            row.4 = add(row.4, fact.attributed_revenue_minor)?;
-        }
-        let advertising = advertising
-            .into_iter()
-            .map(
-                |(
-                    (account_id, campaign_id, sku),
-                    (impressions, clicks, spend, orders, revenue),
-                )| AdvertisingReportRow {
-                    account_id,
-                    campaign_id: campaign_id.to_string(),
-                    // Ozon Performance daily statistics is campaign-level.
-                    // Persistence uses zero as an explicit unavailable-SKU
-                    // sentinel; never render it as if product 0 existed.
-                    sku: if sku == 0 {
-                        "N/D".to_owned()
-                    } else {
-                        sku.to_string()
-                    },
-                    impressions,
-                    clicks,
-                    spend_minor: spend,
-                    attributed_orders: orders,
-                    attributed_revenue_minor: revenue,
-                },
-            )
-            .collect();
+        let advertising = aggregate_advertising(facts.advertising)?;
 
         let mut stock_scopes = manifest
             .snapshots()
@@ -405,6 +370,49 @@ fn add_available(left: Option<u64>, right: Option<u64>) -> Result<Option<u64>, D
         (Some(left), Some(right)) => add(left, right).map(Some),
         _ => Ok(None),
     }
+}
+
+/// Aggregates authoritative campaign/SKU facts without inventing missing SKUs.
+fn aggregate_advertising(
+    facts: Vec<PublishedAdvertisingFact>,
+) -> Result<Vec<AdvertisingReportRow>, DatasetError> {
+    let mut advertising = BTreeMap::new();
+    for fact in facts {
+        let row = advertising
+            .entry((fact.account_id, fact.campaign_id, fact.sku))
+            .or_insert((0u64, 0u64, 0u64, 0u64, 0u64));
+        row.0 = add(row.0, fact.impressions)?;
+        row.1 = add(row.1, fact.clicks)?;
+        row.2 = add(row.2, fact.spend_minor)?;
+        row.3 = add(row.3, fact.attributed_orders)?;
+        row.4 = add(row.4, fact.attributed_revenue_minor)?;
+    }
+    let advertising = advertising
+        .into_iter()
+        .map(
+            |((account_id, campaign_id, sku), (impressions, clicks, spend, orders, revenue))| {
+                AdvertisingReportRow {
+                    account_id,
+                    campaign_id: campaign_id.to_string(),
+                    // Ozon Performance daily statistics is campaign-level.
+                    // Persistence uses zero as an explicit unavailable-SKU
+                    // sentinel; never render it as if product 0 existed.
+                    sku: if sku == 0 {
+                        "N/D".to_owned()
+                    } else {
+                        sku.to_string()
+                    },
+                    impressions,
+                    clicks,
+                    spend_minor: spend,
+                    attributed_orders: orders,
+                    attributed_revenue_minor: revenue,
+                }
+            },
+        )
+        .collect();
+
+    Ok(advertising)
 }
 
 #[cfg(test)]

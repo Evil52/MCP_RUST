@@ -1,9 +1,11 @@
 mod inputs_read_coverage;
 mod privacy;
+mod readiness;
 mod wb_diagnostics;
 #[cfg(test)]
 use privacy::is_sensitive_marketplace_field;
 use privacy::redact_marketplace_pii;
+mod construction;
 mod contracts;
 mod reporting_mode;
 mod router_policy;
@@ -200,6 +202,7 @@ const REPORT_REFRESH_INVALID_DATA: &str = "REPORT_REFRESH_INVALID_DATA";
 const TOOL_TELEMETRY_UNAVAILABLE: &str = "TOOL_TELEMETRY_UNAVAILABLE";
 const TOOL_TELEMETRY_INVALID_REQUEST: &str = "TOOL_TELEMETRY_INVALID_REQUEST";
 const REPORT_REFRESH_WRITE_TOOLS: &[&str] = &[
+    "wb_advertising_history_sync",
     "ofk_request_marketplace_sales_refresh",
     "ofk_request_ozon_sales_refresh",
 ];
@@ -239,6 +242,7 @@ pub struct OzonMcp {
     authenticator: Option<JwtAuthenticator>,
     registry: RegistrySource,
     reporting_reader: ReportingReader,
+    advertising_history: crate::reporting::advertising_history::HistoryRepository,
     refresh_requests: RefreshRequestService,
     tool_telemetry: ToolTelemetryService,
     tool_router: ToolRouter<Self>,
@@ -247,49 +251,6 @@ pub struct OzonMcp {
 }
 
 impl OzonMcp {
-    #[must_use]
-    pub fn new(client: OzonClient, actor_id: String, registry: RegistrySource) -> Self {
-        Self {
-            reporting_only: false,
-            client,
-            performance_client: PerformanceClient::empty(Duration::from_secs(30)),
-            wb_client: WbClient::empty(Duration::from_secs(30)),
-            default_actor_id: Some(actor_id),
-            authenticator: None,
-            registry,
-            reporting_reader: ReportingReader::disabled(),
-            refresh_requests: RefreshRequestService::disabled(),
-            tool_telemetry: ToolTelemetryService::disabled(),
-            tool_router: Self::default_tool_router(None),
-            tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
-            tool_text_content: ToolTextContent::Json,
-        }
-    }
-
-    #[must_use]
-    pub fn new_authenticated(
-        client: OzonClient,
-        registry: RegistrySource,
-        authenticator: JwtAuthenticator,
-    ) -> Self {
-        let tool_router = Self::default_tool_router(Some(&authenticator));
-        Self {
-            reporting_only: false,
-            client,
-            performance_client: PerformanceClient::empty(Duration::from_secs(30)),
-            wb_client: WbClient::empty(Duration::from_secs(30)),
-            default_actor_id: None,
-            authenticator: Some(authenticator),
-            registry,
-            reporting_reader: ReportingReader::disabled(),
-            refresh_requests: RefreshRequestService::disabled(),
-            tool_telemetry: ToolTelemetryService::disabled(),
-            tool_router,
-            tool_call_slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT_TOOL_CALLS)),
-            tool_text_content: ToolTextContent::Json,
-        }
-    }
-
     #[cfg(test)]
     async fn run_tool_call_with_admission(
         &self,
@@ -381,30 +342,6 @@ impl OzonMcp {
 
     pub(crate) const fn transport_authenticator(&self) -> Option<&JwtAuthenticator> {
         self.authenticator.as_ref()
-    }
-
-    /// Verifies only deployment-owned dependencies used by the request path.
-    /// Marketplace APIs are intentionally excluded from readiness.
-    pub(crate) async fn readiness(&self) -> Result<(), ()> {
-        if let Err(error) = self.registry.load_async().await {
-            tracing::warn!(%error, "MCP readiness failed: access registry is invalid");
-            return Err(());
-        }
-        if let Err(error) = self.reporting_reader.probe().await {
-            tracing::warn!(%error, "MCP readiness failed: reporting reader is unavailable");
-            return Err(());
-        }
-        if self.refresh_requests.is_enabled()
-            && let Err(error) = self.refresh_requests.probe().await
-        {
-            tracing::warn!(%error, "MCP readiness failed: report refresh queue is unavailable");
-            return Err(());
-        }
-        if let Err(error) = self.tool_telemetry.probe().await {
-            tracing::warn!(%error, "MCP readiness failed: tool telemetry is unavailable");
-            return Err(());
-        }
-        Ok(())
     }
 
     #[must_use]

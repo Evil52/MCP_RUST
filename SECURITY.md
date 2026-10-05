@@ -302,11 +302,13 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   claims must never select an actor. Verify POST, GET and DELETE cannot use another subject's MCP
   session ID and return the same 404 as an unknown session. Saturate and time out readiness probes,
   confirm only one dependency probe runs, and confirm `/livez` plus MCP traffic remain responsive.
-- Verify the Analytics MCP tool list for this release contains exactly 115 stable tools, no preview tools,
+- Verify the Analytics MCP tool list for this release contains exactly 118 stable tools, no preview tools,
   and every tool advertises `destructiveHint=false` and the expected OAuth/noauth policy.
-  `ofk_request_ozon_sales_refresh` and `ofk_request_marketplace_sales_refresh` have
+  `ofk_request_ozon_sales_refresh`, `ofk_request_marketplace_sales_refresh` and
+  `wb_advertising_history_sync` have
   `readOnlyHint=false`: each inserts or reuses one
-  internal PostgreSQL queue row but has no marketplace egress. Every other Analytics tool has
+  internal PostgreSQL queue row but has no marketplace egress. History tools require
+  finance/admin and current account authorization. Every other Analytics tool has
   `readOnlyHint=true`. This count never includes Control MCP tools.
 - Verify the separate Control MCP registry contains exactly twelve tools:
   `ozon_ads_control_status`, `ozon_ads_control_scope`,

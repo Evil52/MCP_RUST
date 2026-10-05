@@ -194,7 +194,11 @@ impl Operator {
             Duration::from_secs(30),
             &writer_token,
             &manifest.writer_proxy,
-        )?;
+        )?
+        .with_authorization_window(
+            manifest.authorized_at.max(policy.authorized_at),
+            manifest.expires_at.min(policy.authorization_expires_at),
+        );
         Ok(Self {
             manifest_path: path.to_owned(),
             manifest,

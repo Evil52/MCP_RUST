@@ -9,6 +9,9 @@ fn reporting_only_registry_contains_only_prepared_data_and_directory_tools() {
         .map(|tool| tool.name.as_ref())
         .collect::<BTreeSet<_>>();
     let expected = BTreeSet::from([
+        "wb_advertising_history_sync",
+        "wb_advertising_history_status",
+        "wb_advertising_history_stats",
         "marketplace_accounts",
         "list_members",
         "ofk_collection_status",

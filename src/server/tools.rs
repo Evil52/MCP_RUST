@@ -1,6 +1,7 @@
 //! Composition of the fixed domain-specific MCP tool registries.
 
 pub(super) mod ads_analysis;
+pub(super) mod advertising_history;
 mod directory;
 mod finance;
 mod operational_reads;
@@ -21,6 +22,7 @@ impl OzonMcp {
     pub(super) fn build_tool_router() -> ToolRouter<Self> {
         Self::ads_analysis_router()
             + Self::reporting_router()
+            + Self::advertising_history_router()
             + Self::operational_reads_router()
             + Self::wb_stock_report_router()
             + Self::wb_report_router()

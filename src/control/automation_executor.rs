@@ -1,3 +1,4 @@
+mod dispatch;
 mod feedback;
 use feedback::{autonomous_exposure_pacing_decision, traffic_frontier_pacing_decision};
 mod state;
@@ -145,7 +146,11 @@ impl WbAutomationExecutor {
             .context("WB automation executor требует reviewed seller_sid")?;
         let writer_token = read_control_token(writer_token_path, "WB_AUTOMATION_WRITE_TOKEN_FILE")?;
         validate_wb_writer_token(&writer_token, seller_sid)?;
-        let writer = WbBidWriteClient::new(timeout, &writer_token, writer_proxy_url)?;
+        let writer = WbBidWriteClient::new(timeout, &writer_token, writer_proxy_url)?
+            .with_authorization_window(
+                observer.policy().authorized_at,
+                observer.policy().authorization_expires_at,
+            );
         Ok(Self {
             observer,
             writer,
@@ -247,7 +252,15 @@ impl WbAutomationExecutor {
         state.last_action_at = Some(observed_at);
         state.pending = Some(pending.clone());
         save_execution_state(&self.state_directory, &state)?;
-        self.send_pending(&pending).await?;
+        if self.send_pending(&pending).await? == PostgresWriteResult::NotSent {
+            state.pending = None;
+            save_execution_state(&self.state_directory, &state)?;
+            return Ok(receipt(
+                snapshot_path,
+                decision,
+                WbAutomationExecutionOutcome::ReservationCancelled,
+            ));
+        }
         Ok(receipt(
             snapshot_path,
             decision,
@@ -556,6 +569,15 @@ impl WbAutomationExecutor {
                     reservation.state_revision,
                 )
             }
+            PostgresWriteResult::NotSent => {
+                let transition = lease
+                    .cancel_not_sent(&idempotency_key, reservation.state_revision)
+                    .await?;
+                (
+                    WbAutomationExecutionOutcome::ReservationCancelled,
+                    transition.state_revision,
+                )
+            }
             PostgresWriteResult::Ambiguous => {
                 let transition = lease
                     .mark_reconciliation_required(
@@ -579,84 +601,6 @@ impl WbAutomationExecutor {
             legacy_imported,
             state_revision,
         )))
-    }
-
-    async fn send_pending(&self, pending: &PendingAction) -> Result<()> {
-        let expected = pending.clone();
-        let state_path = self.state_directory.join("execution-state.json");
-        let permit = move || async move { verify_pending_permit(&state_path, &expected) };
-        let result = match &pending.kind {
-            PendingActionKind::ChangeBids { changes } => {
-                let prepared = changes
-                    .iter()
-                    .map(|change| WbPreparedBidChange {
-                        nm_id: change.nm_id,
-                        placement: WbBidPlacement::Search,
-                        before_bid_kopecks: change.from_bid_kopecks,
-                        bid_kopecks: change.to_bid_kopecks,
-                    })
-                    .collect::<Vec<_>>();
-                self.writer
-                    .change_bids_with_permit(self.observer.policy().campaign_id, &prepared, permit)
-                    .await
-            }
-            PendingActionKind::PauseCampaignForDailyCap => {
-                self.writer
-                    .pause_campaign_with_permit(self.observer.policy().campaign_id, permit)
-                    .await
-            }
-            PendingActionKind::ResumeCampaignAfterDailyCap => {
-                self.writer
-                    .start_campaign_with_permit(self.observer.policy().campaign_id, permit)
-                    .await
-            }
-        };
-        result
-            .map(|_| ())
-            .map_err(|_| anyhow::anyhow!("WB automation write требует readback reconciliation"))
-    }
-
-    async fn send_pending_postgres(
-        &self,
-        pending: &PendingAction,
-        lease: &mut WbAutomationCampaignLease<'_>,
-        idempotency_key: &str,
-        state_revision: u64,
-    ) -> Result<(), WbGuardedWriteError<super::automation_postgres::WbAutomationPostgresError>>
-    {
-        let permit = move || async move {
-            lease
-                .mark_write_started(idempotency_key, state_revision)
-                .await
-                .map(|_| ())
-        };
-        match &pending.kind {
-            PendingActionKind::ChangeBids { changes } => {
-                let prepared = changes
-                    .iter()
-                    .map(|change| WbPreparedBidChange {
-                        nm_id: change.nm_id,
-                        placement: WbBidPlacement::Search,
-                        before_bid_kopecks: change.from_bid_kopecks,
-                        bid_kopecks: change.to_bid_kopecks,
-                    })
-                    .collect::<Vec<_>>();
-                self.writer
-                    .change_bids_with_permit(self.observer.policy().campaign_id, &prepared, permit)
-                    .await
-                    .map(|_| ())
-            }
-            PendingActionKind::PauseCampaignForDailyCap => self
-                .writer
-                .pause_campaign_with_permit(self.observer.policy().campaign_id, permit)
-                .await
-                .map(|_| ()),
-            PendingActionKind::ResumeCampaignAfterDailyCap => self
-                .writer
-                .start_campaign_with_permit(self.observer.policy().campaign_id, permit)
-                .await
-                .map(|_| ()),
-        }
     }
 }
 
@@ -1054,6 +998,7 @@ const fn durable_action_kind(kind: &PendingActionKind) -> WbAutomationDurableAct
 #[cfg(test)]
 mod tests {
     mod daily_cap_breach;
+    mod not_sent;
     mod postgres_clock;
     mod state_files;
     mod traffic_frontier_v3;
@@ -1665,7 +1610,7 @@ mod tests {
                 crate::control::wb::WbWriteError::InvalidRequest("coverage"),
             )))
             .unwrap(),
-            PostgresWriteResult::Ambiguous
+            PostgresWriteResult::NotSent
         );
 
         action.action_kind = WbAutomationDurableActionKind::PauseCampaignForDailyCap;

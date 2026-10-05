@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+mod history_credentials;
 mod source_credentials;
 
 use anyhow::{Context, Result, bail, ensure};

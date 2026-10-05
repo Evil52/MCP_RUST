@@ -4,7 +4,7 @@ use super::{
     Serialize, SnapshotSource, Utc, marketplace_str, timestamp_string,
 };
 use serde_json::Value;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, Row};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct SourceSnapshotQuery {
@@ -104,42 +104,7 @@ impl PostgresReportingRepository {
         let Some(row) = row else {
             return Ok(result);
         };
-        let id: i64 = row.get(0);
-        let observed: DateTime<Utc> = row.get(2);
-        let first: DateTime<Utc> = row.get(6);
-        let total: u64 = u64::try_from(row.get::<_, i32>(5))
-            .map_err(|_| ReportingReadError::InvalidPublishedData)?;
-        if first > observed
-            || observed > Utc::now() + Duration::minutes(5)
-            || total > u64::from(source_row_limit(query.source))
-        {
-            return Err(ReportingReadError::InvalidPublishedData);
-        }
-        let pagination_complete: bool = row.get(8);
-        let mut partial = row.get::<_, String>(7) == "partial" || !pagination_complete;
-        if query.source == SnapshotSource::SellerStocks {
-            let coverage = seller_stock_coverage(&client, account, market, id, total).await?;
-            partial |= coverage.missing_pairs > 0;
-            result.coverage = Some(coverage);
-        }
-        if account.marketplace() == Marketplace::Wildberries
-            && query.source == SnapshotSource::Stocks
-            && has_legacy_seller_rows(&client, account, market, id).await?
-        {
-            result.inventory_scope = Some("mixed".to_owned());
-        }
-        let (state, quality) = freshness(query.source, first, partial);
-        state.clone_into(&mut result.state);
-        data_state(total, partial).clone_into(&mut result.data_state);
-        result.quality = Some(quality);
-        result.pagination_complete = Some(pagination_complete);
-        result.snapshot_id = Some(id.to_string());
-        result.cutoff_at = Some(timestamp_string(row.get(1)));
-        result.source_as_of = Some(timestamp_string(observed));
-        result.observed_from = Some(timestamp_string(first));
-        result.period_start = Some(timestamp_string(row.get(3)));
-        result.period_end = Some(timestamp_string(row.get(4)));
-        result.total_rows = total;
+        let id = populate_snapshot_metadata(&client, account, query, &row, &mut result).await?;
         // Both the relation and projection are fixed by the enum, never user SQL.
         let (relation, order) = fact_relation(query.source);
         let sql = format!(
@@ -165,9 +130,58 @@ impl PostgresReportingRepository {
                     .map_err(|_| ReportingReadError::InvalidPublishedData)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        result.next_offset = next_page_offset(query, total, &result.rows)?;
+        result.next_offset = next_page_offset(query, result.total_rows, &result.rows)?;
         Ok(result)
     }
+}
+
+/// Validates publication metadata and resolves quality for the entire immutable
+/// snapshot before exposing any page of facts.
+async fn populate_snapshot_metadata(
+    client: &Client,
+    account: &AccountScope,
+    query: SourceSnapshotQuery,
+    row: &Row,
+    result: &mut SourceSnapshotResult,
+) -> Result<i64, ReportingReadError> {
+    let market = marketplace_str(account.marketplace());
+    let id: i64 = row.get(0);
+    let observed: DateTime<Utc> = row.get(2);
+    let first: DateTime<Utc> = row.get(6);
+    let total: u64 = u64::try_from(row.get::<_, i32>(5))
+        .map_err(|_| ReportingReadError::InvalidPublishedData)?;
+    if first > observed
+        || observed > Utc::now() + Duration::minutes(5)
+        || total > u64::from(source_row_limit(query.source))
+    {
+        return Err(ReportingReadError::InvalidPublishedData);
+    }
+    let pagination_complete: bool = row.get(8);
+    let mut partial = row.get::<_, String>(7) == "partial" || !pagination_complete;
+    if query.source == SnapshotSource::SellerStocks {
+        let coverage = seller_stock_coverage(client, account, market, id, total).await?;
+        partial |= coverage.missing_pairs > 0;
+        result.coverage = Some(coverage);
+    }
+    if account.marketplace() == Marketplace::Wildberries
+        && query.source == SnapshotSource::Stocks
+        && has_legacy_seller_rows(client, account, market, id).await?
+    {
+        result.inventory_scope = Some("mixed".to_owned());
+    }
+    let (state, quality) = freshness(query.source, first, partial);
+    state.clone_into(&mut result.state);
+    data_state(total, partial).clone_into(&mut result.data_state);
+    result.quality = Some(quality);
+    result.pagination_complete = Some(pagination_complete);
+    result.snapshot_id = Some(id.to_string());
+    result.cutoff_at = Some(timestamp_string(row.get(1)));
+    result.source_as_of = Some(timestamp_string(observed));
+    result.observed_from = Some(timestamp_string(first));
+    result.period_start = Some(timestamp_string(row.get(3)));
+    result.period_end = Some(timestamp_string(row.get(4)));
+    result.total_rows = total;
+    Ok(id)
 }
 
 const fn source_name(source: SnapshotSource) -> &'static str {

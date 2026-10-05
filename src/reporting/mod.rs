@@ -11,6 +11,7 @@ use chrono::{DateTime, Duration, FixedOffset, NaiveDate, SecondsFormat, TimeZone
 use thiserror::Error;
 
 pub mod ads_optimizer;
+pub mod advertising_history;
 pub mod artifact_store;
 pub mod bundle;
 pub mod collection_policy;

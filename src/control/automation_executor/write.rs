@@ -9,6 +9,7 @@ use crate::control::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PostgresWriteResult {
     Sent,
+    NotSent,
     Ambiguous,
 }
 
@@ -20,11 +21,13 @@ pub(super) fn classify_postgres_write(
         Err(WbGuardedWriteError::Permit(error)) => Err(anyhow::Error::new(*error)
             .context("WB automation final PostgreSQL permit is unavailable")),
         Err(WbGuardedWriteError::Write(error)) => {
-            // A bounded allowlist keeps credentials, URLs and vendor bodies
-            // out of logs. stderr works even in CLI workers without a tracing
-            // subscriber. Preserve the existing durable reconciliation lock.
+            // Only errors proven to occur before HTTP departure may cancel.
+            // HTTP statuses and response failures still require reconciliation.
             eprintln!("{}", diagnostic(error));
-            Ok(PostgresWriteResult::Ambiguous)
+            Ok(match error.outcome_kind() {
+                WbWriteOutcomeKind::DefiniteFailure => PostgresWriteResult::NotSent,
+                WbWriteOutcomeKind::Ambiguous => PostgresWriteResult::Ambiguous,
+            })
         }
     }
 }
@@ -33,6 +36,7 @@ fn diagnostic(error: &WbWriteError) -> Value {
     let (class, status, request_id) = match error {
         WbWriteError::SharedQuota(_) => ("shared_quota", None, None),
         WbWriteError::InvalidRequest(_) => ("invalid_request", None, None),
+        WbWriteError::AuthorizationUnavailable => ("authorization_unavailable", None, None),
         WbWriteError::HttpStatus { status, request_id } => {
             ("http_error", Some(status.as_u16()), request_id.as_deref())
         }
@@ -51,7 +55,11 @@ fn diagnostic(error: &WbWriteError) -> Value {
         "http_status": status,
         "request_id": request_id,
         "departure_uncertain": error.outcome_kind() == WbWriteOutcomeKind::Ambiguous,
-        "outcome": "reconciliation_required",
+        "outcome": if error.outcome_kind() == WbWriteOutcomeKind::Ambiguous {
+            "reconciliation_required"
+        } else {
+            "write_not_sent"
+        },
     })
 }
 
@@ -59,6 +67,41 @@ fn diagnostic(error: &WbWriteError) -> Value {
 mod tests {
     use super::*;
     use reqwest::StatusCode;
+
+    #[test]
+    fn only_proven_pre_dispatch_failures_cancel() {
+        for error in [
+            WbWriteError::AuthorizationUnavailable,
+            WbWriteError::InvalidRequest("invalid"),
+            WbWriteError::SharedQuota(crate::marketplace_quota::QuotaError::Unavailable),
+        ] {
+            let result = Err(WbGuardedWriteError::Write(error));
+            assert_eq!(
+                classify_postgres_write(&result).unwrap(),
+                PostgresWriteResult::NotSent
+            );
+        }
+        for error in [
+            WbWriteError::HttpStatus {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                request_id: None,
+            },
+            WbWriteError::Ambiguous {
+                reason: "timeout",
+                request_id: None,
+            },
+        ] {
+            let result = Err(WbGuardedWriteError::Write(error));
+            assert_eq!(
+                classify_postgres_write(&result).unwrap(),
+                PostgresWriteResult::Ambiguous
+            );
+        }
+        let permit_error = Err(WbGuardedWriteError::Permit(
+            WbAutomationPostgresError::Unavailable,
+        ));
+        assert!(classify_postgres_write(&permit_error).is_err());
+    }
 
     #[test]
     fn safe_diagnostics_keep_http_and_timeout_evidence() {
