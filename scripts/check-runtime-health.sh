@@ -34,6 +34,7 @@ mcp_ready_url="${MCP_HEALTH_MCP_READY_URL:-http://127.0.0.1:8787/readyz}"
 required_launch_agents="${MCP_HEALTH_REQUIRED_LAUNCH_AGENTS-com.ofk.mcp-ozon-runtime,com.ofk.mcp-ozon-backup,com.ofk.mcp-ozon-health,com.ofk.mcp-ozon-restore-verify}"
 skip_launch_agent_check="${MCP_HEALTH_SKIP_LAUNCH_AGENT_CHECK:-false}"
 cycle_stale_seconds="${MCP_HEALTH_CYCLE_STALE_SECONDS:-1800}"
+retired_wb_campaigns="${MCP_HEALTH_WB_RETIRED_CAMPAIGNS:-}"
 backup_stale_seconds="${MCP_HEALTH_BACKUP_STALE_SECONDS:-129600}"
 restore_stale_seconds="${MCP_HEALTH_RESTORE_STALE_SECONDS:-691200}"
 allow_local_only="${MCP_BACKUP_ALLOW_LOCAL_ONLY:-false}"
@@ -82,6 +83,14 @@ for csv_contract in "$required_services" "$required_launch_agents"; do
     exit 2
   fi
 done
+
+if [[ -n "$retired_wb_campaigns" ]] && {
+  [[ ! "$retired_wb_campaigns" =~ ^[A-Za-z0-9_-]{1,128}:[1-9][0-9]{0,17}(,[A-Za-z0-9_-]{1,128}:[1-9][0-9]{0,17})*$ ]] \
+    || ((${#retired_wb_campaigns} > 8192));
+}; then
+  echo "MCP_HEALTH_WB_RETIRED_CAMPAIGNS must contain bounded account:campaign identifiers" >&2
+  exit 2
+fi
 
 findings=()
 finding_keys=()
@@ -466,6 +475,13 @@ while IFS= read -r row; do
   [[ -z "$row" ]] && continue
   case "$row" in
     incident\|*)
+      # Explicit operator retirement keeps immutable incident history while
+      # excluding only that exact campaign from active incident monitoring.
+      # Unresolved marketplace requests below remain findings for every robot.
+      IFS='|' read -r _ account_id advert_id _ <<<"$row"
+      if [[ ",$retired_wb_campaigns," == *,"$account_id:$advert_id",* ]]; then
+        continue
+      fi
       add_finding "WB robot is incident-locked, bids are frozen at their last value: ${row#incident|}"
       ;;
     unresolved\|*)

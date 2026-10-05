@@ -264,6 +264,31 @@ esac
             self.assertEqual(status, 1, output)
             self.assertEqual(self.event_list().count("heartbeat"), before)
 
+    def test_retired_campaign_keeps_unresolved_writes_and_other_incidents_visible(self):
+        retired = "ip_domnyshev_wb:39682633"
+        row = "incident|ip_domnyshev_wb|39682633|daily_spend_cap_breached"
+        status, output = self.run_health(FAKE_ROWS=row)
+        self.assertEqual(status, 1, output)
+        status, output = self.run_health(MCP_HEALTH_WB_RETIRED_CAMPAIGNS=retired, FAKE_ROWS=row)
+        self.assertEqual(status, 0, output)
+        for active in ("ofk_region_wb|40141836", "ofk_region_wb|39682633",
+                       "ip_domnyshev_wb|396826330"):
+            status, output = self.run_health(MCP_HEALTH_WB_RETIRED_CAMPAIGNS=retired,
+                                            FAKE_ROWS=row + "\nincident|" + active + "|locked")
+            self.assertEqual(status, 1, output)
+            self.assertIn(active, output)
+        status, output = self.run_health(MCP_HEALTH_WB_RETIRED_CAMPAIGNS=retired,
+                                        FAKE_ROWS=row + "\nunresolved|old-action|awaiting_readback")
+        self.assertEqual(status, 1, output)
+        self.assertIn("unresolved marketplace action: old-action", output)
+
+    def test_malformed_retirement_contract_fails_before_heartbeat(self):
+        for value in ("cabinet", "cabinet:0", "cabinet:01", "cabinet:1,", "cabinet:1,,other:2",
+                      "cabinet:1, other:2", "cabinet:*", "cabinet:1\nother:2", "a" * 129 + ":1"):
+            status, output = self.run_health(MCP_HEALTH_WB_RETIRED_CAMPAIGNS=value)
+            self.assertEqual(status, 2, (value, output))
+        self.assertEqual(self.event_list(), [])
+
     def test_delivery_failures_are_findings_and_notify_failure_does_not_falsify_core(self):
         failing = hook(self.root / "fail", "import sys\nprint('PRIVATE-HOOK-SECRET')\nsys.exit(7)\n")
         status, output = self.run_health(MCP_HEALTH_NOTIFY_COMMAND=failing, FAKE_ROWS="incident|test|1|locked")

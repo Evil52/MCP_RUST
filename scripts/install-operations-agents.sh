@@ -28,6 +28,7 @@ health_required_services="${MCP_HEALTH_REQUIRED_SERVICES-position-db,ozon-egress
 health_required_launch_agents="${MCP_HEALTH_REQUIRED_LAUNCH_AGENTS-com.ofk.mcp-ozon-runtime,com.ofk.mcp-ozon-backup,com.ofk.mcp-ozon-health,com.ofk.mcp-ozon-restore-verify}"
 health_reporting_policy="${MCP_HEALTH_REPORTING_POLICY:-}"
 health_reporting_registry="${MCP_HEALTH_REPORTING_REGISTRY:-}"
+health_retired_wb_campaigns="${MCP_HEALTH_WB_RETIRED_CAMPAIGNS:-}"
 position_env_source="${MCP_OPS_POSITION_ENV_SOURCE:-$project_root/.position.env}"
 position_env_target="$runtime_dir/position.env"
 db_image="$(awk '/^FROM postgres:/ { print $2; exit }' "$project_root/position-monitor/Dockerfile")"
@@ -96,6 +97,13 @@ for csv_contract in "$health_required_services" "$health_required_launch_agents"
 done
 if [[ ! "$db_image" =~ ^postgres:[0-9]+-alpine([0-9]+\.[0-9]+)?@sha256:[0-9a-f]{64}$ ]]; then
   echo "the operations installer requires a pinned PostgreSQL image" >&2
+  exit 1
+fi
+if [[ -n "$health_retired_wb_campaigns" ]] && {
+  [[ ! "$health_retired_wb_campaigns" =~ ^[A-Za-z0-9_-]{1,128}:[1-9][0-9]{0,17}(,[A-Za-z0-9_-]{1,128}:[1-9][0-9]{0,17})*$ ]] \
+    || ((${#health_retired_wb_campaigns} > 8192));
+}; then
+  echo "MCP_HEALTH_WB_RETIRED_CAMPAIGNS must contain bounded account:campaign identifiers" >&2
   exit 1
 fi
 reporting_scope='[]'
@@ -228,6 +236,7 @@ render() {
     -e "s|__HEALTH_REQUIRED_LAUNCH_AGENTS__|$health_required_launch_agents|g" \
     -e "s|__HEALTH_REPORTING_POLICY__|$health_reporting_policy|g" \
     -e "s|__HEALTH_REPORTING_REGISTRY__|$health_reporting_registry|g" \
+    -e "s|__HEALTH_RETIRED_WB_CAMPAIGNS__|$health_retired_wb_campaigns|g" \
     "$2"
 }
 
@@ -276,6 +285,7 @@ MCP_HEALTH_REQUIRED_SERVICES="$health_required_services" \
 MCP_HEALTH_REQUIRED_LAUNCH_AGENTS="$health_required_launch_agents" \
 MCP_HEALTH_REPORTING_POLICY="$health_reporting_policy" \
 MCP_HEALTH_REPORTING_REGISTRY="$health_reporting_registry" \
+MCP_HEALTH_WB_RETIRED_CAMPAIGNS="$health_retired_wb_campaigns" \
 MCP_HEALTH_CHECK_TUNNEL="$health_check_tunnel" \
 MCP_HEALTH_TUNNEL_URL_FILE="$health_tunnel_url_file" \
 MCP_HEALTH_TUNNEL_POLL_STALE_SECONDS="$health_tunnel_poll_stale_seconds" \
