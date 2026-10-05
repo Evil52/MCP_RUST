@@ -404,7 +404,7 @@ async fn run_scheduler_tick(
         // the queue is independent of it.
         let failure = match timeout(
             GENERATION_TIMEOUT,
-            generate_batch(config, outbox, snapshots, batch_id, now),
+            generate_batch(config, outbox, snapshots, batch_id, Utc::now()),
         )
         .await
         {
@@ -430,7 +430,7 @@ async fn run_scheduler_tick(
         // scans. If even that cannot be written the batch simply retries next
         // tick, which is the pre-existing behaviour rather than a new risk.
         if outbox
-            .record_generation_failure(batch_id, now, failure)
+            .record_generation_failure(batch_id, Utc::now(), failure)
             .await
             .is_err()
         {
@@ -451,13 +451,17 @@ async fn generate_batch(
     batch_id: i64,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let candidate = outbox.generation_candidate(batch_id, now).await?;
+    let mut candidate = outbox.generation_candidate(batch_id, now).await?;
     let scope = config.generation_scope(&candidate.key)?;
     let cutoff = report_cutoff(&candidate.key)?;
     let manifest = snapshots
         .load_manifest(cutoff, scope.accounts.clone())
         .await?;
     let facts = snapshots.load_report_facts(&manifest).await?;
+    if candidate.status == GenerationStatus::Planned {
+        outbox.start_generation(candidate.batch_id).await?;
+        candidate = outbox.generation_candidate(batch_id, Utc::now()).await?;
+    }
     let report = render_published_preview(
         &candidate.key,
         &scope.report_name,
@@ -465,9 +469,6 @@ async fn generate_batch(
         &manifest,
         facts,
     )?;
-    if candidate.status == GenerationStatus::Planned {
-        outbox.start_generation(candidate.batch_id).await?;
-    }
     let receipt = persist_and_mark_ready(
         config.artifact_store(),
         outbox,

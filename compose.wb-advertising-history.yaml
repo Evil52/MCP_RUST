@@ -1,0 +1,39 @@
+name: mcp-ozon-position
+
+# Merge after compose.position.yaml. Uses the same released collector image,
+# read credentials, egress and shared quota; opt in explicitly to this profile.
+services:
+  wb-advertising-history:
+    extends:
+      file: compose.position.yaml
+      service: report-collector
+    profiles:
+      - wb-advertising-history
+    command:
+      - run-advertising-history
+    environment:
+      REPORT_COLLECTOR_MODE: scheduled
+      DAILY_REPORT_POLICY: ""
+      REPORT_COLLECTION_POLICY: /etc/mcp-ozon/daily-report-policy.json
+      REPORT_COLLECTOR_CREDENTIAL_DIR: /run/mcp-ozon/report-credentials
+    volumes:
+      - type: bind
+        source: ${MCP_ACCESS_CONFIG_HOST:?MCP_ACCESS_CONFIG_HOST is required}
+        target: /etc/mcp-ozon/access.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${REPORT_COLLECTION_POLICY_HOST:?REPORT_COLLECTION_POLICY_HOST is required}
+        target: /etc/mcp-ozon/daily-report-policy.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${REPORT_COLLECTOR_CREDENTIAL_DIR_HOST:?REPORT_COLLECTOR_CREDENTIAL_DIR_HOST is required}
+        target: /run/mcp-ozon/report-credentials
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/report-collector", "advertising-history-preflight"]

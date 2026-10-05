@@ -6,7 +6,7 @@ pub use model::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use sha2::{Digest as _, Sha256};
 
 use super::{MAX_INPUT_BYTES, OptimizerError};
@@ -90,18 +90,7 @@ pub fn analyze(mut input: WbReviewInput) -> Result<WbReviewReport, OptimizerErro
     for product in &input.products {
         let agg = aggregates.remove(&product.sku).unwrap_or_default();
         let current_campaigns = current_by_sku.remove(&product.sku).unwrap_or_default();
-        let promotion_state = if !composition_complete_and_fresh {
-            PromotionState::Unknown
-        } else if current_campaigns
-            .iter()
-            .any(|c| c.status == CampaignStatus::Active)
-        {
-            PromotionState::Active
-        } else if current_campaigns.is_empty() {
-            PromotionState::AbsentFromActiveAndPaused
-        } else {
-            PromotionState::Paused
-        };
+        let promotion_state = promotion_state(composition_complete_and_fresh, &current_campaigns);
         let warehouse_presence = stock_presence(product.fbw.as_ref(), input.as_of);
         let seller_presence = stock_presence(product.fbs.as_ref(), input.as_of);
         let inventory_signal = match (warehouse_presence, seller_presence) {
@@ -111,18 +100,11 @@ pub fn analyze(mut input: WbReviewInput) -> Result<WbReviewReport, OptimizerErro
             _ => InventorySignal::Unknown,
         };
         let spend_without_observed_ad_orders = agg.spend > 0 && agg.orders == 0;
-        let action = if !advertising_coverage_complete {
-            ReviewAction::RestoreAdvertisingCoverage
-        } else if !spend_without_observed_ad_orders {
-            ReviewAction::Observe
-        } else {
-            match promotion_state {
-                PromotionState::Active => ReviewAction::ReviewActiveProduct,
-                PromotionState::Paused => ReviewAction::ReviewBeforeResuming,
-                PromotionState::AbsentFromActiveAndPaused => ReviewAction::ReviewHistoricalSpend,
-                PromotionState::Unknown => ReviewAction::VerifyCurrentComposition,
-            }
-        };
+        let action = review_action(
+            advertising_coverage_complete,
+            spend_without_observed_ad_orders,
+            promotion_state,
+        );
         products.push(ProductReview {
             sku: product.sku,
             missing_ad_dates: dates
@@ -216,6 +198,43 @@ fn date_range(input: &WbReviewInput) -> Result<Vec<chrono::NaiveDate>, Optimizer
         .collect()
 }
 
+fn promotion_state(
+    composition_complete_and_fresh: bool,
+    current_campaigns: &[CampaignLink],
+) -> PromotionState {
+    if !composition_complete_and_fresh {
+        PromotionState::Unknown
+    } else if current_campaigns
+        .iter()
+        .any(|c| c.status == CampaignStatus::Active)
+    {
+        PromotionState::Active
+    } else if current_campaigns.is_empty() {
+        PromotionState::AbsentFromActiveAndPaused
+    } else {
+        PromotionState::Paused
+    }
+}
+
+const fn review_action(
+    advertising_coverage_complete: bool,
+    spend_without_observed_ad_orders: bool,
+    promotion_state: PromotionState,
+) -> ReviewAction {
+    if !advertising_coverage_complete {
+        ReviewAction::RestoreAdvertisingCoverage
+    } else if !spend_without_observed_ad_orders {
+        ReviewAction::Observe
+    } else {
+        match promotion_state {
+            PromotionState::Active => ReviewAction::ReviewActiveProduct,
+            PromotionState::Paused => ReviewAction::ReviewBeforeResuming,
+            PromotionState::AbsentFromActiveAndPaused => ReviewAction::ReviewHistoricalSpend,
+            PromotionState::Unknown => ReviewAction::VerifyCurrentComposition,
+        }
+    }
+}
+
 fn validate(input: &WbReviewInput) -> Result<(), OptimizerError> {
     if input.version != 1
         || input.account_id.is_empty()
@@ -237,6 +256,16 @@ fn validate(input: &WbReviewInput) -> Result<(), OptimizerError> {
     {
         return Err(OptimizerError::LimitExceeded);
     }
+    let dates = validate_coverage(input, &days)?;
+    let skus = validate_products(input)?;
+    validate_advertising(input, &dates, &skus)?;
+    validate_composition(input)
+}
+
+fn validate_coverage(
+    input: &WbReviewInput,
+    days: &[NaiveDate],
+) -> Result<BTreeSet<NaiveDate>, OptimizerError> {
     let mut dates = BTreeSet::new();
     let mut snapshots = BTreeSet::new();
     for row in &input.coverage {
@@ -247,6 +276,10 @@ fn validate(input: &WbReviewInput) -> Result<(), OptimizerError> {
             return Err(OptimizerError::DuplicateEvidence);
         }
     }
+    Ok(dates)
+}
+
+fn validate_products(input: &WbReviewInput) -> Result<BTreeSet<u64>, OptimizerError> {
     let mut skus = BTreeSet::new();
     for product in &input.products {
         if product.sku == 0
@@ -261,6 +294,14 @@ fn validate(input: &WbReviewInput) -> Result<(), OptimizerError> {
             return Err(OptimizerError::DuplicateEvidence);
         }
     }
+    Ok(skus)
+}
+
+fn validate_advertising(
+    input: &WbReviewInput,
+    dates: &BTreeSet<NaiveDate>,
+    skus: &BTreeSet<u64>,
+) -> Result<(), OptimizerError> {
     let mut keys = BTreeSet::new();
     for row in &input.advertising {
         if row.campaign_id == 0
@@ -273,6 +314,10 @@ fn validate(input: &WbReviewInput) -> Result<(), OptimizerError> {
             return Err(OptimizerError::DuplicateEvidence);
         }
     }
+    Ok(())
+}
+
+fn validate_composition(input: &WbReviewInput) -> Result<(), OptimizerError> {
     let mut campaigns = BTreeSet::new();
     let mut total_skus = 0;
     for campaign in &input.composition.campaigns {

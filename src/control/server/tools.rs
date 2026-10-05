@@ -604,6 +604,7 @@ impl ControlMcp {
             .await
             .map_err(plan_store_error)?;
 
+        let writer = super::write_authorization::plan_write_client(writer, &plan);
         let write_response = match writer
             .change_bids_with_permit(plan.advert_id, &plan.changes, || async {
                 let current = read_plan_snapshot(services, &plan)

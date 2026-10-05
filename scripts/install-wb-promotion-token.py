@@ -3,7 +3,6 @@
 
 import argparse
 import base64
-import binascii
 import json
 import os
 import re
@@ -34,7 +33,7 @@ def claims(token: str) -> dict:
     payload = token.split(".")[1]
     try:
         result = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+    except ValueError as exc:
         raise ValueError("не удалось прочитать JWT") from exc
     if not isinstance(result, dict):
         raise ValueError("JWT должен содержать объект claims")

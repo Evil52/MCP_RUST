@@ -70,6 +70,11 @@ pub(super) fn evaluate(
     if row.reasons.is_empty() {
         performance(input, product, &mut row, allowance)?;
     }
+    apply_product_budget_cap(product, &mut row);
+    Ok(row)
+}
+
+fn apply_product_budget_cap(product: &ProductEvidence, row: &mut ProductRecommendation) {
     if row.suggested_daily_budget_minor > product.max_daily_budget_minor {
         row.suggested_daily_budget_minor = product.max_daily_budget_minor;
         row.reasons.push(Reason::ProductBudgetCap);
@@ -83,7 +88,6 @@ pub(super) fn evaluate(
             Action::TestBudgetIncrease
         };
     }
-    Ok(row)
 }
 
 fn economic_allowance(
@@ -158,7 +162,53 @@ fn performance(
         row.reasons.push(Reason::InsufficientOrders);
         return Ok(());
     }
-    let (above_ceiling, above_reason, within_reason) = match input.objective {
+    let ceiling = performance_ceiling(input, row, allowance)?;
+    apply_performance_action(input, product, row, ceiling)
+}
+
+/// Applies only the action justified by a validated performance ceiling.
+fn apply_performance_action(
+    input: &ShadowInput,
+    product: &ProductEvidence,
+    row: &mut ProductRecommendation,
+    ceiling: (bool, Reason, Reason),
+) -> Result<(), OptimizerError> {
+    let policy = &input.policy;
+    let (above_ceiling, above_reason, within_reason) = ceiling;
+    if above_ceiling {
+        row.reasons.push(above_reason);
+        reduce(input, row)?;
+    } else if row.current_daily_budget_minor == 0 {
+        row.reasons.push(Reason::NoCurrentBudget);
+    } else if let Some(reason) = budget_blocker(input, product) {
+        row.reasons.push(within_reason);
+        row.reasons.push(reason);
+    } else {
+        row.reasons.push(within_reason);
+        let increment = scaled(
+            row.current_daily_budget_minor,
+            u64::from(policy.max_budget_increase_bps),
+            10_000,
+        )?;
+        row.suggested_daily_budget_minor = row
+            .current_daily_budget_minor
+            .checked_add(increment)
+            .ok_or(OptimizerError::Overflow)?;
+        if increment > 0 {
+            row.action = Action::TestBudgetIncrease;
+        }
+    }
+    Ok(())
+}
+
+/// Computes the exact objective-specific ceiling before selecting a budget action.
+fn performance_ceiling(
+    input: &ShadowInput,
+    row: &mut ProductRecommendation,
+    allowance: Option<u64>,
+) -> Result<(bool, Reason, Reason), OptimizerError> {
+    let policy = &input.policy;
+    Ok(match input.objective {
         OptimizationObjective::ExpectedEconomics => {
             let allowance = allowance.ok_or(OptimizerError::InvalidInput)?;
             let numerator = u128::from(allowance)
@@ -207,31 +257,7 @@ fn performance(
                 Reason::WithinAdvertisingDrrCeiling,
             )
         }
-    };
-    if above_ceiling {
-        row.reasons.push(above_reason);
-        reduce(input, row)?;
-    } else if row.current_daily_budget_minor == 0 {
-        row.reasons.push(Reason::NoCurrentBudget);
-    } else if let Some(reason) = budget_blocker(input, product) {
-        row.reasons.push(within_reason);
-        row.reasons.push(reason);
-    } else {
-        row.reasons.push(within_reason);
-        let increment = scaled(
-            row.current_daily_budget_minor,
-            u64::from(policy.max_budget_increase_bps),
-            10_000,
-        )?;
-        row.suggested_daily_budget_minor = row
-            .current_daily_budget_minor
-            .checked_add(increment)
-            .ok_or(OptimizerError::Overflow)?;
-        if increment > 0 {
-            row.action = Action::TestBudgetIncrease;
-        }
-    }
-    Ok(())
+    })
 }
 
 fn budget_blocker(input: &ShadowInput, product: &ProductEvidence) -> Option<Reason> {

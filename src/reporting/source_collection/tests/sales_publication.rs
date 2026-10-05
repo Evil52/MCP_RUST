@@ -141,29 +141,7 @@ async fn sales_publication_replayed_overlap_restarts_without_publishing_or_mixin
             fixture.seed(&claim, identity, payload).await;
         }
         if target.marketplace == Marketplace::Wildberries {
-            // WB first discards the overlapping catalogue walk and attempts a
-            // fresh sorted prefix. A repeated positive SKU in that independent
-            // observation must still restart the whole chain, never publish.
-            let closing: Vec<_> = (1..=page_size)
-                .map(|sku| CollectedSalesFact {
-                    business_date: from,
-                    sku: u64::from(sku),
-                    ordered_units: 1,
-                    operational_gmv_minor: 100,
-                    cancelled_units: None,
-                    returned_units: None,
-                })
-                .collect();
-            let duplicate = closing[0].clone();
-            for (offset, page) in [(0, closing), (page_size, vec![duplicate])] {
-                fixture
-                    .seed(
-                        &claim,
-                        json!(["wb-sales-overlap-closing-v1", from, page_size, offset]),
-                        json!([page, page.len()]),
-                    )
-                    .await;
-            }
+            seed_overlapping_wb_closing(&fixture, &claim, from, page_size).await;
         }
         fixture
             .writer
@@ -225,5 +203,37 @@ async fn sales_publication_replayed_overlap_restarts_without_publishing_or_mixin
             .await
             .unwrap();
         assert_eq!(fixture.state(&fresh).await.0, "published");
+    }
+}
+
+/// Seeds the independent WB closing observation with another repeated SKU.
+async fn seed_overlapping_wb_closing(
+    fixture: &Fixture,
+    claim: &SourceJobClaim,
+    from: chrono::NaiveDate,
+    page_size: u32,
+) {
+    // WB first discards the overlapping catalogue walk and attempts a
+    // fresh sorted prefix. A repeated positive SKU in that independent
+    // observation must still restart the whole chain, never publish.
+    let closing: Vec<_> = (1..=page_size)
+        .map(|sku| CollectedSalesFact {
+            business_date: from,
+            sku: u64::from(sku),
+            ordered_units: 1,
+            operational_gmv_minor: 100,
+            cancelled_units: None,
+            returned_units: None,
+        })
+        .collect();
+    let duplicate = closing[0].clone();
+    for (offset, page) in [(0, closing), (page_size, vec![duplicate])] {
+        fixture
+            .seed(
+                claim,
+                json!(["wb-sales-overlap-closing-v1", from, page_size, offset]),
+                json!([page, page.len()]),
+            )
+            .await;
     }
 }

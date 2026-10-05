@@ -60,6 +60,11 @@ async fn main() -> Result<()> {
     };
     let refresh_requests =
         RefreshRequestService::connect_optional(refresh_database_url.as_deref()).await?;
+    let advertising_history =
+        mcp_ozon::reporting::advertising_history::HistoryRepository::connect_optional(
+            refresh_database_url.as_deref(),
+        )
+        .await?;
     let tool_text_content: ToolTextContent = match std::env::var("MCP_TOOL_TEXT_CONTENT") {
         Ok(value) => value.parse()?,
         Err(std::env::VarError::NotPresent) => ToolTextContent::default(),
@@ -96,6 +101,7 @@ async fn main() -> Result<()> {
     }
     .with_reporting_reader(reporting_reader)
     .with_refresh_requests(refresh_requests)
+    .with_advertising_history(advertising_history)
     .with_tool_telemetry(tool_telemetry)
     .with_tool_text_content(tool_text_content)
     .with_preview_features(

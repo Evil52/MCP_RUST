@@ -329,6 +329,11 @@ fn validate(input: &ReconciliationInput) -> Result<(), OptimizerError> {
             return Err(OptimizerError::InvalidInput);
         }
     }
+    validate_rows(input)
+}
+
+/// Validates the distinct SKU and campaign observation keys within one window.
+fn validate_rows(input: &ReconciliationInput) -> Result<(), OptimizerError> {
     let valid_scope = |date, campaign_id| {
         date >= input.window_start && date <= input.window_end && valid_id(campaign_id)
     };

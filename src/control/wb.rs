@@ -17,6 +17,8 @@ pub(super) use snapshot::{campaign_snapshot, prepare_changes, snapshot_matches_p
 #[cfg(test)]
 use snapshot::{snapshot_matches_expected, validate_bid_delta};
 
+#[cfg(test)]
+mod authorization_tests;
 mod client;
 mod snapshot;
 
@@ -116,6 +118,8 @@ pub(super) enum WbGuardedWriteError<E> {
 
 #[derive(Error, Debug)]
 pub(super) enum WbWriteError {
+    #[error("WB write authorization is not active at departure")]
+    AuthorizationUnavailable,
     #[error("общая квота WB отклонила write до отправки: {0}")]
     SharedQuota(crate::marketplace_quota::QuotaError),
     #[error("некорректный WB write request: {0}")]
@@ -135,7 +139,9 @@ pub(super) enum WbWriteError {
 impl WbWriteError {
     pub(super) const fn outcome_kind(&self) -> WbWriteOutcomeKind {
         match self {
-            Self::InvalidRequest(_) | Self::SharedQuota(_) => WbWriteOutcomeKind::DefiniteFailure,
+            Self::InvalidRequest(_) | Self::SharedQuota(_) | Self::AuthorizationUnavailable => {
+                WbWriteOutcomeKind::DefiniteFailure
+            }
             // Once request bytes may have reached WB, an HTTP status alone is
             // not evidence that a batch had no partial/late effect.
             Self::HttpStatus { .. } | Self::Ambiguous { .. } => WbWriteOutcomeKind::Ambiguous,
@@ -150,7 +156,10 @@ impl WbWriteError {
     fn http_status_request_id(&self) -> Option<Option<&str>> {
         match self {
             Self::HttpStatus { request_id, .. } => Some(request_id.as_deref()),
-            Self::InvalidRequest(_) | Self::SharedQuota(_) | Self::Ambiguous { .. } => None,
+            Self::InvalidRequest(_)
+            | Self::SharedQuota(_)
+            | Self::AuthorizationUnavailable
+            | Self::Ambiguous { .. } => None,
         }
     }
 }
