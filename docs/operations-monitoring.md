@@ -40,6 +40,16 @@ work. Its default Compose contract contains only the always-on base services:
 - `position-db`
 - `ozon-egress`
 
+The probe also checks host disk space before contacting Docker. By default it
+checks `/` and `$HOME`, once per filesystem, and reports a finding at 85% used
+or below 20 GiB available. `MCP_HEALTH_DISK_PATHS` selects comma-separated
+absolute existing paths; include the Docker data and backup paths when they
+live on separate filesystems. Missing paths or invalid `df` evidence are
+findings rather than successful checks. `MCP_HEALTH_DISK_MAX_USED_PERCENT`
+accepts 1..99 and `MCP_HEALTH_DISK_MIN_FREE_GIB` accepts 1..999999.
+The installed script uses these defaults without depending on a checkout;
+custom thresholds and paths can be set in the service environment.
+
 `position-collector`, `report-collector`, and `report-worker` are disabled by
 default and have separate guarded cutovers. They must not be treated as missing
 until an operator enables them. `position-collector` has no reviewed search

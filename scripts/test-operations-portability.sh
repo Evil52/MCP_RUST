@@ -139,7 +139,15 @@ test -f "$backup/local-only-risk-accepted.json"
 : >"$backup/restore-verified.json"
 : >"$test_root/ready"
 
+cat >"$test_root/bin/df" <<'SH'
+#!/bin/bash
+printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' \
+  '/dev/test 104857600 10485760 94371840 10% /'
+SH
+chmod 700 "$test_root/bin/df"
+
 health_env=(
+  "PATH=$test_root/bin:$PATH"
   "DOCKER_BIN=$test_root/bin/docker"
   "MCP_OPS_PROJECT_DIR=$staging"
   "MCP_OPS_POSTGRES_IMAGE=$db_image"
