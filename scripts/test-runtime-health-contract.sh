@@ -59,8 +59,8 @@ printf '%s\n' \
   '  container) printf "running|healthy\\n" ;;' \
   '  run)' \
   '    while IFS= read -r _; do :; done' \
-  '    printf "cycle_age|0\\n"' \
-  '    exit 9' \
+  '    printf "%s\\n" "${FAKE_PROBE_ROWS:-cycle_age|0}"' \
+  '    exit "${FAKE_PROBE_STATUS:-9}"' \
   '    ;;' \
   '  *) exit 2 ;;' \
   'esac' >"$fake_docker"
@@ -90,5 +90,35 @@ if [[ "$status" -ne 1 ]] \
   printf '%s\n' "$output" >&2
   exit 1
 fi
+
+assert_quota_finding() {
+  local rows="$1"
+  local expected="$2"
+  local status=0
+  local output
+  output="$(
+    env \
+      DOCKER_BIN="$fake_docker" \
+      FAKE_PROBE_ROWS="$rows" \
+      FAKE_PROBE_STATUS=0 \
+      MCP_HEALTH_POSITION_ENV="$test_root/position.env" \
+      MCP_BACKUP_DIR="$test_root/backups" \
+      MCP_HEALTH_MCP_READY_URL="file://$test_root/ready" \
+      MCP_HEALTH_SKIP_LAUNCH_AGENT_CHECK=true \
+      "$health_script" 2>&1
+  )" || status=$?
+  if [[ "$status" -ne 1 || "$output" != *"$expected"* ]]; then
+    echo "a long shared marketplace cooldown must be reported: $expected" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+}
+
+assert_quota_finding $'cycle_age|0\nquota_cooldown|2|90000' \
+  'marketplace quota has 2 cooldown(s) over 1h, the longest ends in 1500 minutes'
+assert_quota_finding $'cycle_age|0\nquota_cooldown|1|infinity' \
+  'marketplace quota has 1 cooldown(s) over 1h, one without an end'
+assert_quota_finding $'cycle_age|0\nquota_cooldown|x|1' \
+  'marketplace quota returned invalid cooldown evidence'
 
 echo 'runtime health contract validation: OK'

@@ -173,14 +173,14 @@ mod tests {
         serde_json::from_value(json!({
             "version": 1,
             "actors": [
-                {"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}},
-                {"id":"wb6","name":"Vahrusheva / Torsunova","role":"manager","oidc":{"username":"wb6"}},
+                {"id":"ozon_manager","name":"Diana","role":"manager","oidc":{"username":"diana"}},
+                {"id":"wb6","name":"WB managers","role":"manager","oidc":{"username":"wb6"}},
                 {"id":"admin","name":"Admin","role":"admin","oidc":{"username":"admin"}}
             ],
             "accounts": [
                 {
                     "id":"furnitura_dlya_doma","organization":"Ozon store","marketplace":"ozon",
-                    "seller_client_id":"1","manager_id":"diana_serafimovich",
+                    "seller_client_id":"1","manager_id":"ozon_manager",
                     "ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY"}
                 },
                 {
@@ -203,7 +203,7 @@ mod tests {
                 "id": "pilot_owner",
                 "email_env": "DAILY_REPORT_PILOT_RECIPIENT_EMAIL",
                 "managers": [
-                    {"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]},
+                    {"actor_id":"ozon_manager","account_ids":["furnitura_dlya_doma"]},
                     {"actor_id":"wb6","account_ids":["ip_domnyshev_wb"]}
                 ]
             }]
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn pilot_policy_contains_diana_and_vahrusheva_but_stays_disabled() {
+    fn pilot_policy_contains_both_managers_but_stays_disabled() {
         let policy = parse(&policy_json()).unwrap();
         assert!(!policy.enabled);
         assert_eq!(policy.audiences[0].managers.len(), 2);

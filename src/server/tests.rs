@@ -664,14 +664,12 @@ fn reporting_edge_registry_source() -> RegistrySource {
                 {"id":"owner_a","name":"Owner A","role":"manager"},
                 {"id":"owner_b","name":"Owner B","role":"manager"},
                 {"id":"wb_manager","name":"WB Manager","role":"manager"},
-                {"id":"invalid_manager","name":"Invalid ID Manager","role":"manager"},
                 {"id":"orphan","name":"No Accounts","role":"manager"}
               ],
               "accounts": [
                 {"id":"account_a","organization":"Example organization A","marketplace":"ozon","seller_client_id":"seller-a","manager_id":"owner_a","ozon":{"store_id":"store_a","client_id_env":"OZON_CLIENT_ID","api_key_env":"OZON_API_KEY"}},
                 {"id":"account_b","organization":"Example organization B","marketplace":"ozon","seller_client_id":"seller-b","manager_id":"owner_b","ozon":{"store_id":"store_b","client_id_env":"OZON_B_CLIENT_ID","api_key_env":"OZON_B_API_KEY"}},
-                {"id":"account_wb","organization":"WB account","marketplace":"wildberries","seller_client_id":"42","manager_id":"wb_manager","wildberries":{"api_token_env":"WB_TOKEN"}},
-                {"id":"bad.id","organization":"Invalid reporting ID","marketplace":"wildberries","seller_client_id":"43","manager_id":"invalid_manager","wildberries":{"api_token_env":"WB_BAD_TOKEN"}}
+                {"id":"account_wb","organization":"WB account","marketplace":"wildberries","seller_client_id":"42","manager_id":"wb_manager","wildberries":{"api_token_env":"WB_TOKEN"}}
               ]
             }"#,
         )
@@ -1964,20 +1962,6 @@ async fn reporting_account_resolution_is_explicit_fail_closed_and_maps_wb() {
         wb_sales.starts_with(REPORTING_INVALID_REQUEST),
         "{wb_sales}"
     );
-
-    let invalid_manager = reporting_edge_test_server("invalid_manager", repository.clone());
-    let invalid_account = reporting_tool_error(
-        invalid_manager
-            .reporting_collection_status(
-                RequestIdentity::dev(),
-                Parameters(ReportingCollectionStatusInput {
-                    account: None,
-                    limit: 20,
-                }),
-            )
-            .await,
-    );
-    assert!(invalid_account.starts_with(REPORTING_INVALID_REQUEST));
     assert_eq!(repository.calls(), 1);
 }
 

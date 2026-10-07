@@ -42,8 +42,11 @@ work. Its default Compose contract contains only the always-on base services:
 
 `position-collector`, `report-collector`, and `report-worker` are disabled by
 default and have separate guarded cutovers. They must not be treated as missing
-until an operator enables them. When an optional runtime is enabled, install
-the operations agents with the complete expected service set, for example:
+until an operator enables them. `position-collector` has no reviewed search
+provider yet, so its container starts only with
+`docker compose -f compose.position.yaml --profile position-collector up -d`.
+When an optional runtime is enabled, install the operations agents with the
+complete expected service set, for example:
 
 ```bash
 MCP_HEALTH_REQUIRED_SERVICES=position-db,ozon-egress,position-collector \
@@ -195,3 +198,5 @@ tunnel fixture, with no marketplace requests or real external notifications:
 ```bash
 python3 -B -m unittest discover -s tests -p test_operations_notifications.py
 ```
+
+Сводка всех fail-closed точек, их симптомов и способов разблокировки: [fail-closed-gates.md](fail-closed-gates.md).

@@ -1,15 +1,9 @@
-use std::{
-    fmt,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{fmt, sync::Arc};
 
 use anyhow::Result;
 use axum::http::HeaderMap;
 use jsonwebtoken::{
-    Algorithm, DecodingKey, Validation, decode, decode_header,
-    errors::ErrorKind as JwtErrorKind,
-    jwk::{AlgorithmParameters, JwkSet},
+    Algorithm, Validation, decode, decode_header, errors::ErrorKind as JwtErrorKind,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -17,6 +11,21 @@ use tokio::sync::{Mutex, RwLock};
 use crate::{
     bounded_body::read_bounded,
     config::{AccessRegistry, JwtConfig, RegistrySource},
+};
+
+/// Explicitly retained clock-skew allowance for `exp` and `nbf` validation.
+///
+/// `jsonwebtoken` currently defaults to the same value, but relying on that
+/// implicit default would let a dependency update silently change the token
+/// acceptance boundary.
+const JWT_CLOCK_SKEW_LEEWAY_SECONDS: u64 = 60;
+
+mod jwks;
+use jwks::JwksCacheState;
+#[cfg(test)]
+use jwks::{
+    FAILED_REFRESH_COOLDOWN, MAX_JWK_STRING_BYTES, MAX_JWKS_BODY_BYTES, MAX_JWKS_KEYS,
+    parse_bounded_jwks,
 };
 
 #[derive(Debug, Clone)]
@@ -95,64 +104,6 @@ struct AccessTokenClaims {
     sub: String,
     #[serde(default)]
     scope: Option<String>,
-}
-
-#[derive(Debug)]
-struct CachedJwks {
-    fetched_at: Instant,
-    keys: JwkSet,
-}
-
-#[derive(Debug, Default)]
-struct JwksCacheState {
-    cache: Option<CachedJwks>,
-    last_unknown_kid_refresh_at: Option<Instant>,
-    last_failed_refresh_at: Option<Instant>,
-}
-
-const UNKNOWN_KID_REFRESH_COOLDOWN: Duration = Duration::from_secs(30);
-const FAILED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
-/// Explicitly retained clock-skew allowance for `exp` and `nbf` validation.
-///
-/// `jsonwebtoken` currently defaults to the same value, but relying on that
-/// implicit default would let a dependency update silently change the token
-/// acceptance boundary.
-const JWT_CLOCK_SKEW_LEEWAY_SECONDS: u64 = 60;
-const MAX_JWKS_BODY_BYTES: usize = 1024 * 1024;
-const MAX_JWKS_KEYS: usize = 64;
-const MAX_JWK_STRING_BYTES: usize = 16 * 1024;
-
-fn jwks_strings_are_bounded(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(value) => value.len() <= MAX_JWK_STRING_BYTES,
-        serde_json::Value::Array(values) => values.iter().all(jwks_strings_are_bounded),
-        serde_json::Value::Object(values) => values.iter().all(|(name, value)| {
-            name.len() <= MAX_JWK_STRING_BYTES && jwks_strings_are_bounded(value)
-        }),
-        _ => true,
-    }
-}
-
-fn parse_bounded_jwks(body: &[u8]) -> std::result::Result<JwkSet, JwtAuthenticationFailure> {
-    let value = serde_json::from_slice::<serde_json::Value>(body)
-        .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
-    let keys = value
-        .get("keys")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(JwtAuthenticationFailure::VerifierUnavailable)?;
-    if keys.is_empty() || keys.len() > MAX_JWKS_KEYS || !jwks_strings_are_bounded(&value) {
-        return Err(JwtAuthenticationFailure::VerifierUnavailable);
-    }
-    let jwks = serde_json::from_value::<JwkSet>(value)
-        .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
-    if jwks
-        .keys
-        .iter()
-        .any(|jwk| matches!(&jwk.algorithm, AlgorithmParameters::Other(_)))
-    {
-        return Err(JwtAuthenticationFailure::VerifierUnavailable);
-    }
-    Ok(jwks)
 }
 
 #[derive(Debug, Clone)]
@@ -247,107 +198,6 @@ impl JwtAuthenticator {
             return Err(JwtAuthenticationFailure::InsufficientScope);
         }
         Ok(())
-    }
-
-    async fn fetch_jwks(&self) -> std::result::Result<JwkSet, JwtAuthenticationFailure> {
-        let mut response = self
-            .client
-            .get(&self.config.jwks_url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
-        if !response.status().is_success() {
-            return Err(JwtAuthenticationFailure::VerifierUnavailable);
-        }
-        let body = read_bounded(&mut response, MAX_JWKS_BODY_BYTES)
-            .await
-            .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?;
-        parse_bounded_jwks(&body)
-    }
-
-    fn cached_decoding_key(
-        &self,
-        state: &JwksCacheState,
-        kid: &str,
-    ) -> std::result::Result<Option<DecodingKey>, JwtAuthenticationFailure> {
-        let fresh_cache = state
-            .cache
-            .as_ref()
-            .filter(|cache| cache.fetched_at.elapsed() < self.config.jwks_cache_ttl);
-        if let Some(jwk) = fresh_cache.and_then(|cache| cache.keys.find(kid)) {
-            return DecodingKey::from_jwk(jwk)
-                .map(Some)
-                .map_err(|_| JwtAuthenticationFailure::VerifierUnavailable);
-        }
-        if state
-            .last_failed_refresh_at
-            .is_some_and(|at| at.elapsed() < FAILED_REFRESH_COOLDOWN)
-        {
-            return Err(JwtAuthenticationFailure::VerifierUnavailable);
-        }
-        if fresh_cache.is_some()
-            && state
-                .last_unknown_kid_refresh_at
-                .is_some_and(|at| at.elapsed() < UNKNOWN_KID_REFRESH_COOLDOWN)
-        {
-            return Err(JwtAuthenticationFailure::InvalidToken);
-        }
-        Ok(None)
-    }
-
-    async fn decoding_key(
-        &self,
-        kid: &str,
-    ) -> std::result::Result<DecodingKey, JwtAuthenticationFailure> {
-        let cached_key = {
-            let state = self.cache.read().await;
-            self.cached_decoding_key(&state, kid)?
-        };
-        if let Some(key) = cached_key {
-            return Ok(key);
-        }
-
-        // Only one task may fetch JWKS. Every waiter re-checks the cache after
-        // acquiring the gate, so concurrent misses are coalesced into one fetch.
-        let _refresh_guard = self.refresh_gate.lock().await;
-        let cached_key = {
-            let state = self.cache.read().await;
-            self.cached_decoding_key(&state, kid)?
-        };
-        if let Some(key) = cached_key {
-            return Ok(key);
-        }
-
-        let refresh_is_for_unknown_kid =
-            self.cache.read().await.cache.as_ref().is_some_and(|cache| {
-                cache.fetched_at.elapsed() < self.config.jwks_cache_ttl
-                    && cache.keys.find(kid).is_none()
-            });
-        let keys = match self.fetch_jwks().await {
-            Ok(keys) => keys,
-            Err(error) => {
-                let failed_at = Instant::now();
-                let mut state = self.cache.write().await;
-                state.last_failed_refresh_at = Some(failed_at);
-                if refresh_is_for_unknown_kid {
-                    state.last_unknown_kid_refresh_at = Some(failed_at);
-                }
-                drop(state);
-                return Err(error);
-            }
-        };
-        let fetched_at = Instant::now();
-        let key = keys.find(kid).map(DecodingKey::from_jwk).transpose();
-        let missing_after_refresh = matches!(key, Ok(None));
-        let mut state = self.cache.write().await;
-        state.cache = Some(CachedJwks { fetched_at, keys });
-        state.last_failed_refresh_at = None;
-        state.last_unknown_kid_refresh_at =
-            (refresh_is_for_unknown_kid || missing_after_refresh).then_some(fetched_at);
-        drop(state);
-        key.map_err(|_| JwtAuthenticationFailure::VerifierUnavailable)?
-            .ok_or(JwtAuthenticationFailure::InvalidToken)
     }
 
     pub async fn authenticate(

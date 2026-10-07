@@ -40,6 +40,23 @@ for candidate in $migrations; do
   fi
 done
 
+# A migration number orders exactly one file. Two files sharing a number are
+# applied in name order, which can silently invert their dependency when
+# parallel branches pick the same next number. The two historical pairs keep
+# their already-recorded ledger ids.
+duplicate_numbers="$(
+  printf '%s\n' "$migrations" |
+    cut -c1-3 |
+    LC_ALL=C sort |
+    uniq -d |
+    grep -Ev '^(002|032)$' ||
+    true
+)"
+if [ -n "$duplicate_numbers" ]; then
+  echo "migration numbers must be unique; renumber: $(echo "$duplicate_numbers" | tr "\n" " ")" >&2
+  exit 1
+fi
+
 latest_migration="$(printf '%s\n' "$migrations" | tail -n 1)"
 
 case "$mode" in

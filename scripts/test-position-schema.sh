@@ -3614,7 +3614,7 @@ role_attributes="$("${admin_psql[@]}" --tuples-only --no-align --field-separator
     )
     ORDER BY rolname
   ")"
-expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nozon_control_executor:t:f:f:f:f:f:f:4\nozon_control_planner:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:4\nreport_refresh_requester:t:f:f:f:f:f:f:4\nreport_worker:t:f:f:f:f:f:f:4\nwb_automation_writer:t:f:f:f:f:f:f:4'
+expected_attributes=$'control_writer:t:f:f:f:f:f:f:4\nozon_control_executor:t:f:f:f:f:f:f:4\nozon_control_planner:t:f:f:f:f:f:f:4\nposition_collector:t:f:f:f:f:f:f:4\nposition_reader:t:f:f:f:f:f:f:16\nreport_collector:t:f:f:f:f:f:f:8\nreport_refresh_requester:t:f:f:f:f:f:f:12\nreport_worker:t:f:f:f:f:f:f:4\nwb_automation_writer:t:f:f:f:f:f:f:4'
 if [[ "$role_attributes" != "$expected_attributes" ]]; then
   echo "restricted database role attributes differ from the expected policy" >&2
   printf '%s\n' "$role_attributes" >&2

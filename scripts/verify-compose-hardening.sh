@@ -242,6 +242,7 @@ render_position_compose() {
     docker compose \
       --env-file "$interpolation_env" \
       -f "$project_dir/compose.position.yaml" \
+      --profile position-collector \
       config --no-env-resolution --format json
 }
 
@@ -604,6 +605,8 @@ verify_position_collector() {
   expected_database_url='postgresql://position_collector:verify-only-collector-not-a-secret@position-db:5432/ozon_positions'
 
   check "position collector: service exists" "$service" 'type == "object"'
+  check "position collector: the idle scaffold starts only through its profile" "$service" \
+    '.profiles == ["position-collector"]'
   check "position collector: no host ingress or mutable mounts exist" "$service" \
     '((.ports // []) | length == 0)
      and ((.volumes // []) | length == 0)
@@ -913,14 +916,20 @@ verify_reporting_service() {
      and .cap_drop == ["ALL"]
      and .security_opt == ["no-new-privileges:true"]
      and (.privileged // false) == false'
+  # The worker lets an in-flight Gmail attempt (bounded to 60 s) finish.
+  local grace_period="10s"
+  if [[ "$service_name" == "report-worker" ]]; then
+    grace_period="1m15s"
+  fi
   # shellcheck disable=SC2016
   check "$service_name: bounded resources and shutdown are exact" "$service" \
     --arg memory "$memory_bytes" \
     --argjson cpu "$cpu_limit" \
+    --arg grace "$grace_period" \
     '.mem_limit == $memory
      and .cpus == $cpu
      and .pids_limit == 64
-     and .stop_grace_period == "10s"'
+     and .stop_grace_period == $grace'
   check "$service_name: restart and logs are bounded" "$service" \
     '.restart == "unless-stopped"
      and .logging == {
@@ -1176,7 +1185,7 @@ verify_reporting_mail_canary() {
      and .mem_limit == "201326592"
      and .cpus == 0.5
      and .pids_limit == 64
-     and .stop_grace_period == "10s"
+     and .stop_grace_period == "1m15s"
      and .restart == "unless-stopped"
      and .logging == {
        "driver": "json-file",

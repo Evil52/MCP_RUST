@@ -451,6 +451,19 @@ WHERE status='active';
 
 SELECT 'stalled|' || stall_kind || '|' || reference
 FROM daily_reporting.stalled_report_work;
+
+-- A vendor cooldown longer than an hour silently stops every process sharing
+-- that seller quota. Only counts leave the database: quota keys are opaque.
+SELECT 'quota_cooldown|' || count(*)::text || '|' || CASE
+           WHEN bool_or(next_allowed_at = 'infinity'::timestamptz) THEN 'infinity'
+           ELSE GREATEST(
+               0,
+               EXTRACT(EPOCH FROM (max(next_allowed_at) - now()))
+           )::bigint::text
+       END
+FROM marketplace_quota.departures
+WHERE next_allowed_at > now() + interval '1 hour'
+HAVING count(*) > 0;
 SQL
     if [[ "$reporting_scope" != '[]' ]]; then
       printf 'PREPARE reporting_health(text, timestamptz) AS\n'
@@ -492,6 +505,18 @@ while IFS= read -r row; do
       ;;
     reporting\|*)
       add_finding "daily report collection requires attention: ${row#reporting|}"
+      ;;
+    quota_cooldown\|*)
+      IFS='|' read -r _ count remaining <<<"$row"
+      if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        add_finding "marketplace quota returned invalid cooldown evidence"
+      elif [[ "$remaining" == infinity ]]; then
+        add_finding "marketplace quota has $count cooldown(s) over 1h, one without an end; see docs/fail-closed-gates.md" "quota_cooldown"
+      elif [[ "$remaining" =~ ^[0-9]+$ ]]; then
+        add_finding "marketplace quota has $count cooldown(s) over 1h, the longest ends in $((remaining / 60)) minutes" "quota_cooldown"
+      else
+        add_finding "marketplace quota returned invalid cooldown evidence"
+      fi
       ;;
     cycle_age\|none)
       add_finding "WB robot has never recorded a cycle"

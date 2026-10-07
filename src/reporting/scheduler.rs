@@ -157,7 +157,7 @@ mod tests {
                     id: "diana".to_owned(),
                     email_env: "DIANA_EMAIL".to_owned(),
                     managers: vec![ManagerScope {
-                        actor_id: "diana_serafimovich".to_owned(),
+                        actor_id: "ozon_manager".to_owned(),
                         account_ids: std::iter::once("furnitura_dlya_doma".to_owned()).collect(),
                     }],
                 },
@@ -165,7 +165,7 @@ mod tests {
                     id: "owner".to_owned(),
                     email_env: "OWNER_EMAIL".to_owned(),
                     managers: vec![ManagerScope {
-                        actor_id: "anna_agzamova".to_owned(),
+                        actor_id: "wb_manager".to_owned(),
                         account_ids: std::iter::once("ofk_region_wb".to_owned()).collect(),
                     }],
                 },
@@ -188,7 +188,7 @@ mod tests {
                 id: "not a recipient id".to_owned(),
                 email_env: "OWNER_EMAIL".to_owned(),
                 managers: vec![ManagerScope {
-                    actor_id: "anna_agzamova".to_owned(),
+                    actor_id: "wb_manager".to_owned(),
                     account_ids: std::iter::once("ofk_region_wb".to_owned()).collect(),
                 }],
             }],

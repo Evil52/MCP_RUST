@@ -61,7 +61,6 @@ pub mod wb_source;
 pub mod xlsx;
 
 pub const BUSINESS_TIMEZONE: &str = "Asia/Yekaterinburg";
-const YEKATERINBURG_OFFSET_SECONDS: i32 = 5 * 60 * 60;
 const MORNING_HOUR: u32 = 8;
 const MORNING_DEADLINE_HOUR: u32 = 14;
 const EVENING_HOUR: u32 = 17;
@@ -208,8 +207,7 @@ fn report_time(date: NaiveDate, hour: u32) -> Result<DateTime<FixedOffset>, Repo
 }
 
 pub(crate) const fn yekaterinburg_offset() -> FixedOffset {
-    FixedOffset::east_opt(YEKATERINBURG_OFFSET_SECONDS)
-        .expect("the fixed Yekaterinburg UTC offset is valid")
+    crate::business_calendar::yekaterinburg()
 }
 
 /// Formats a stored UTC instant for business-facing reports and MCP results.

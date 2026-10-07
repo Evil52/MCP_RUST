@@ -7,7 +7,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use tokio_postgres::{Client, Config};
 
-use crate::postgres::SupervisedClient;
+use crate::postgres::{SessionSource, SupervisedClient};
 
 use super::{FinanceLedgerError, WbFinanceDetailRow, unavailable, validate_account};
 
@@ -105,7 +105,7 @@ impl PostgresFinanceLedgerReader {
     }
 }
 
-async fn verify_reader_contract(session: &SupervisedClient) -> Result<(), FinanceLedgerError> {
+async fn verify_reader_contract(session: &impl SessionSource) -> Result<(), FinanceLedgerError> {
     session.verify_session_bounds().await.map_err(unavailable)?;
     let client = session.acquire().await.map_err(unavailable)?;
     let valid: bool = client.query_one(
@@ -131,7 +131,7 @@ async fn verify_reader_contract(session: &SupervisedClient) -> Result<(), Financ
 }
 
 async fn read_rows(
-    session: &SupervisedClient,
+    session: &impl SessionSource,
     account: &str,
     batch_id: i64,
     cursor: i64,
@@ -169,7 +169,7 @@ async fn read_rows(
 ///
 /// Caller authentication is performed before entering this database boundary.
 pub async fn read_wb_ledger_page(
-    session: &SupervisedClient,
+    session: &impl SessionSource,
     account: &str,
     batch_id: Option<i64>,
     after_rrd_id: u64,

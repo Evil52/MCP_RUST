@@ -226,3 +226,33 @@ fn aggregate_observations_keep_stock_guard_and_require_complete_evidence() {
         WbAutomationAction::Hold { .. }
     ));
 }
+
+#[test]
+fn a_raised_vendor_floor_is_repaired_under_its_own_reason_not_by_a_decrease() {
+    let p = target();
+    let mut o = observation(&p);
+    // WB raised the floor above a bid that still satisfies the policy minimum,
+    // while the SKU's own evidence asks for a reduction.
+    let sku = &mut o.skus[0];
+    sku.minimum_bid_kopecks = 800;
+    sku.current_bid_kopecks = 750;
+    sku.impressions = 300;
+    sku.clicks = p.no_order_reduce_clicks;
+    sku.spend_minor = 1000;
+    let d = evaluate_wb_automation(&p, &o).unwrap();
+    let WbAutomationAction::ChangeBids { changes } = d.action else {
+        panic!("repair expected")
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].nm_id, o.skus[0].nm_id);
+    assert_eq!(
+        changes[0].reason,
+        WbAutomationBidReason::PolicyMinimumNotMet
+    );
+    assert_eq!(
+        (changes[0].from_bid_kopecks, changes[0].to_bid_kopecks),
+        (750, 800)
+    );
+    // Even reached directly, a reduction that cannot go below the floor holds.
+    assert_eq!(super::super::bid_change(&p, &o.skus[0]), Ok(None));
+}

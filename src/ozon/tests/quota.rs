@@ -2,7 +2,7 @@ use super::*;
 
 #[tokio::test]
 #[ignore = "requires the isolated reporting PostgreSQL fixture"]
-async fn shared_quota_retains_long_seller_vendor_cooldowns() {
+async fn shared_quota_retains_vendor_cooldowns_up_to_one_day() {
     let database_url = std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL")
         .expect("run through scripts/with-position-test-db.sh");
     for (status, path) in [(429, ANALYTICS_DATA_PATH), (503, "/v3/product/list")] {
@@ -36,9 +36,12 @@ async fn shared_quota_retains_long_seller_vendor_cooldowns() {
                 .post(&store, path, serde_json::json!({}))
                 .await
                 .unwrap_err();
+            // A longer untrusted Retry-After is capped at one day across processes.
+            let expected = delay.min(Duration::from_hours(24));
             assert!(
                 matches!(error, OzonError::SharedQuota(QuotaError::Limited { retry_after })
-                if retry_after > delay.checked_sub(Duration::from_secs(30)).unwrap())
+                if retry_after > expected.checked_sub(Duration::from_secs(30)).unwrap()
+                    && retry_after <= expected)
             );
             assert_eq!(requests.try_iter().count(), 1);
         }

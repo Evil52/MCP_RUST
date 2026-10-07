@@ -177,7 +177,7 @@ mod tests {
     fn planner_retries_only_missing_accounts_for_the_exact_cutoff() {
         let targets = [
             target("diana", Marketplace::Ozon),
-            target("vahrusheva", Marketplace::Wildberries),
+            target("wb_account", Marketplace::Wildberries),
         ];
         let expected_cutoff = utc(16, 3, 0, 0);
         let mut inspected = Vec::new();
@@ -191,7 +191,7 @@ mod tests {
             inspected,
             vec![
                 ("diana".to_owned(), expected_cutoff),
-                ("vahrusheva".to_owned(), expected_cutoff),
+                ("wb_account".to_owned(), expected_cutoff),
             ]
         );
         assert_eq!(plan.targets, vec![targets[1].clone()]);

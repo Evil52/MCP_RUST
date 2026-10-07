@@ -91,12 +91,7 @@ impl HistoryRepository {
     ) -> Result<Value> {
         validate_request(account, from, to)?;
         ensure!(
-            !actor.is_empty()
-                && actor.len() <= 128
-                && actor
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric()
-                        || matches!(b, b'.' | b'_' | b':' | b'@' | b'-')),
+            crate::identifiers::is_actor_id(actor),
             "invalid history actor"
         );
         self.json_query(

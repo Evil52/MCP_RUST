@@ -131,7 +131,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
@@ -139,7 +139,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 flate2 = "1"
+# Paused/advanced clocks exist only for tests; production builds keep tokio's
+# plain clock path.
+tokio = { version = "1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+# Money, quota and pagination arithmetic is checked explicitly. Keep the
+# compiler's overflow checks in release builds as well, so a missed case
+# panics instead of silently wrapping.
+overflow-checks = true
 
 [patch.crates-io]
 rmcp = { path = "vendor/rmcp" }

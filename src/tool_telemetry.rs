@@ -15,6 +15,8 @@ use tokio_postgres::{Config, Row, config::Host};
 use crate::{postgres::SupervisedClient, reporting::snapshot::Marketplace};
 
 const COMPONENT: &str = "mcp-ozon-tool-telemetry";
+/// Longest duration the audit row stores. A call that runs longer is still
+/// closed, recorded at this ceiling, instead of staying `running` forever.
 const MAX_TOOL_CALL_DURATION: Duration = Duration::from_secs(600);
 pub const MAX_TOOL_CALL_LOG_ROWS: u16 = 200;
 
@@ -179,14 +181,11 @@ impl ToolTelemetryService {
         let Some(receipt) = receipt else {
             return Ok(());
         };
-        if duration > MAX_TOOL_CALL_DURATION {
-            return Err(ToolTelemetryError::InvalidRequest);
-        }
         if let Some(error_code) = error_code {
             validate_error_code(error_code)?;
         }
-        let duration_ms =
-            i32::try_from(duration.as_millis()).map_err(|_| ToolTelemetryError::InvalidRequest)?;
+        let duration_ms = i32::try_from(duration.min(MAX_TOOL_CALL_DURATION).as_millis())
+            .map_err(|_| ToolTelemetryError::InvalidRequest)?;
         let client = self
             .client
             .as_ref()
@@ -337,11 +336,15 @@ fn validate_database_config(config: &Config) -> Result<(), ToolTelemetryError> {
 }
 
 fn validate_actor(value: &str) -> Result<(), ToolTelemetryError> {
-    validate_ascii_identifier(value, 128, b"._:@-")
+    crate::identifiers::is_actor_id(value)
+        .then_some(())
+        .ok_or(ToolTelemetryError::InvalidRequest)
 }
 
 fn validate_account(value: &str) -> Result<(), ToolTelemetryError> {
-    validate_ascii_identifier(value, 128, b"_-")
+    crate::identifiers::is_account_id(value)
+        .then_some(())
+        .ok_or(ToolTelemetryError::InvalidRequest)
 }
 
 fn validate_tool(value: &str) -> Result<(), ToolTelemetryError> {
@@ -365,23 +368,6 @@ fn validate_error_code(value: &str) -> Result<(), ToolTelemetryError> {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        Ok(())
-    } else {
-        Err(ToolTelemetryError::InvalidRequest)
-    }
-}
-
-fn validate_ascii_identifier(
-    value: &str,
-    maximum: usize,
-    punctuation: &[u8],
-) -> Result<(), ToolTelemetryError> {
-    if !value.is_empty()
-        && value.len() <= maximum
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || punctuation.contains(&byte))
     {
         Ok(())
     } else {
@@ -587,32 +573,32 @@ mod tests {
                 .finish(
                     receipt,
                     ToolCallOutcome::Failed,
-                    MAX_TOOL_CALL_DURATION + Duration::from_millis(1),
-                    None
-                )
-                .await,
-            Err(ToolTelemetryError::InvalidRequest)
-        );
-        assert_eq!(
-            service
-                .finish(
-                    receipt,
-                    ToolCallOutcome::Failed,
                     Duration::from_millis(1),
                     Some("bad-code")
                 )
                 .await,
             Err(ToolTelemetryError::InvalidRequest)
         );
+        // A call that outlived the audit ceiling is still closed, at the ceiling.
         service
             .finish(
                 receipt,
                 ToolCallOutcome::Failed,
-                Duration::from_millis(1),
+                MAX_TOOL_CALL_DURATION + Duration::from_secs(1),
                 Some("TEST_FAILURE"),
             )
             .await
             .unwrap();
+        let recorded = service
+            .list(MAX_TOOL_CALL_LOG_ROWS)
+            .await
+            .unwrap()
+            .calls
+            .into_iter()
+            .find(|call| call.account_id.as_deref() == Some(account_prefix.as_str()))
+            .unwrap();
+        assert_eq!(recorded.outcome, ToolCallLogOutcome::Failed);
+        assert_eq!(recorded.duration_ms, Some(600_000));
     }
 
     #[test]

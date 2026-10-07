@@ -1,6 +1,7 @@
 mod data_mode;
 pub use data_mode::McpDataMode;
 mod oidc_actor;
+mod registry_identifiers;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -310,6 +311,7 @@ impl AccessRegistry {
         if self.version != 1 {
             bail!("неподдерживаемая версия реестра доступа: {}", self.version);
         }
+        self.validate_identifier_grammar()?;
         let actor_ids: BTreeSet<_> = self.actors.iter().map(|actor| actor.id.as_str()).collect();
         if actor_ids.len() != self.actors.len() {
             bail!("идентификаторы actors должны быть уникальными");
@@ -343,7 +345,7 @@ impl AccessRegistry {
         let mut store_ids = BTreeSet::new();
         let mut wb_seller_sids = BTreeSet::new();
         let mut ozon_control_client_ids = BTreeSet::new();
-        let mut selectors = self.account_selectors()?;
+        let mut selectors = self.account_selectors();
         for account in &self.accounts {
             Self::validate_account(account, actor_ids, &mut store_ids, &mut selectors)?;
             if let Some(performance) = account
@@ -369,15 +371,12 @@ impl AccessRegistry {
         Ok(())
     }
 
-    fn account_selectors(&self) -> Result<BTreeMap<String, String>> {
-        let mut selectors = BTreeMap::new();
-        for account in &self.accounts {
-            if account.id.trim().is_empty() {
-                bail!("идентификатор кабинета не может быть пустым");
-            }
-            selectors.insert(account.id.clone(), account.id.clone());
-        }
-        Ok(selectors)
+    fn account_selectors(&self) -> BTreeMap<String, String> {
+        // Account ids are already validated by `validate_identifier_grammar`.
+        self.accounts
+            .iter()
+            .map(|account| (account.id.clone(), account.id.clone()))
+            .collect()
     }
 
     fn validate_account(
@@ -504,66 +503,6 @@ impl AccessRegistry {
                         actor.id
                     ));
                 }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_oidc_identities(&self) -> Result<()> {
-        let mut subjects = BTreeSet::new();
-        let mut usernames = BTreeSet::new();
-        let mut emails = BTreeSet::new();
-        for actor in &self.actors {
-            let Some(identity) = &actor.oidc else {
-                continue;
-            };
-            if identity.subject.is_none() && identity.username.is_none() && identity.email.is_none()
-            {
-                bail!(
-                    "OIDC identity пользователя {} должен содержать subject, username или email",
-                    actor.id
-                );
-            }
-            for (field, value, values) in [
-                ("subject", identity.subject.as_deref(), &mut subjects),
-                ("username", identity.username.as_deref(), &mut usernames),
-                ("email", identity.email.as_deref(), &mut emails),
-            ] {
-                let Some(value) = value else {
-                    continue;
-                };
-                if value.trim().is_empty() {
-                    bail!(
-                        "OIDC {field} пользователя {} не может быть пустым",
-                        actor.id
-                    );
-                }
-                if !values.insert(value.to_owned()) {
-                    bail!("OIDC {field}={value:?} должен быть уникальным");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Enforces the immutable identity boundary required by JWT/OIDC mode.
-    ///
-    /// `username` and `email` remain accepted as human-readable registry
-    /// metadata, but neither is a stable security identifier: both may be
-    /// renamed or reassigned by the identity provider. Only the issuer-scoped
-    /// `sub` claim is used to grant an actor's roles and account access.
-    fn validate_jwt_oidc_bindings(&self) -> Result<()> {
-        for actor in &self.actors {
-            if actor
-                .oidc
-                .as_ref()
-                .and_then(|identity| identity.subject.as_ref())
-                .is_none()
-            {
-                bail!(
-                    "OIDC identity пользователя {} должен содержать immutable subject при MCP_AUTH_MODE=jwt; username/email не используются для авторизации",
-                    actor.id
-                );
             }
         }
         Ok(())
@@ -1896,7 +1835,7 @@ mod tests {
         let mut registry = sample_registry();
         registry.accounts[0].id = " \t".into();
         let error = registry.validate().unwrap_err().to_string();
-        assert!(error.contains("идентификатор кабинета не может быть пустым"));
+        assert!(error.contains("идентификатор кабинета \" \\t\""), "{error}");
     }
 
     #[test]

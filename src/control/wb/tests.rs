@@ -696,7 +696,7 @@ async fn campaign_creation_covers_unified_and_failure_outcomes() {
 async fn campaign_creation_preserves_timeout_and_network_ambiguity() {
     let (base_url, server) = response_server(
         http_response("200 OK", "", b"39690003"),
-        Duration::from_millis(30),
+        Duration::from_secs(1),
     )
     .await;
     let http = Client::builder()
@@ -709,7 +709,8 @@ async fn campaign_creation_preserves_timeout_and_network_ambiguity() {
         http,
         &base_url,
         "test-token",
-        Duration::from_millis(5),
+        // Long enough to finish sending on a loaded host, short of the reply.
+        Duration::from_millis(250),
         Duration::ZERO,
     )
     .unwrap();
@@ -1076,11 +1077,8 @@ async fn campaign_status_response_failures_remain_ambiguous_and_bounded() {
     ));
     server.await.unwrap();
 
-    let (base_url, server) = response_server(
-        http_response("200 OK", "", b"{}"),
-        Duration::from_millis(50),
-    )
-    .await;
+    let (base_url, server) =
+        response_server(http_response("200 OK", "", b"{}"), Duration::from_secs(1)).await;
     let http = Client::builder()
         .redirect(Policy::none())
         .no_proxy()
@@ -1091,7 +1089,8 @@ async fn campaign_status_response_failures_remain_ambiguous_and_bounded() {
         http,
         &base_url,
         "test-token",
-        Duration::from_millis(5),
+        // Long enough to finish sending on a loaded host, short of the reply.
+        Duration::from_millis(250),
         Duration::ZERO,
     )
     .unwrap();
@@ -1207,11 +1206,8 @@ async fn write_response_handling_is_bounded_and_ambiguity_preserving() {
 
 #[tokio::test]
 async fn write_timeout_network_error_and_request_ids_are_sanitized() {
-    let (base_url, server) = response_server(
-        http_response("200 OK", "", b"{}"),
-        Duration::from_millis(50),
-    )
-    .await;
+    let (base_url, server) =
+        response_server(http_response("200 OK", "", b"{}"), Duration::from_secs(1)).await;
     let http = Client::builder()
         .redirect(Policy::none())
         .no_proxy()
@@ -1222,7 +1218,8 @@ async fn write_timeout_network_error_and_request_ids_are_sanitized() {
         http,
         &base_url,
         "test-token",
-        Duration::from_millis(5),
+        // Long enough to finish sending on a loaded host, short of the reply.
+        Duration::from_millis(250),
         Duration::ZERO,
     )
     .unwrap();

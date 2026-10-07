@@ -1,5 +1,7 @@
 //! Repository dispatch for the fixed reporting read operations.
 
+use tokio_postgres::{Config, config::Host};
+
 use super::{
     AccountScope, CollectionStatusResult, DataCompletenessResult, DateTime, ManagerActionsResult,
     MetricsHistoryResult, NaiveDate, PostgresReportingRepository, ReadyReportsResult,
@@ -7,6 +9,23 @@ use super::{
     SourceSnapshotQuery, SourceSnapshotResult, Utc, WbFinancialLedgerQuery,
     WbFinancialLedgerResult, WbReportReconciliationQuery, WbReportReconciliationResult,
 };
+
+/// Accepts only the restricted single-host `position_reader` URL.
+pub(super) fn validate_reader_database(config: &Config) -> Result<(), ReportingReadError> {
+    if config.get_user() == Some("position_reader")
+        && config
+            .get_password()
+            .is_some_and(|password| !password.is_empty())
+        && config.get_dbname().is_some_and(|value| !value.is_empty())
+        && config.get_hosts().len() == 1
+        && matches!(config.get_hosts(), [Host::Tcp(host)] if !host.trim().is_empty())
+        && config.get_options().is_none()
+    {
+        Ok(())
+    } else {
+        Err(ReportingReadError::InvalidRequest)
+    }
+}
 
 /// Injectable repository boundary used by the MCP router's RBAC tests.
 pub trait ReportingReadRepository: Send + Sync {

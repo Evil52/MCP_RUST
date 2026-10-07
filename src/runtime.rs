@@ -227,6 +227,16 @@ fn log_connection_completion(completed: Result<Result<(), String>, tokio::task::
     }
 }
 
+/// Process-local counters shared by every HTTP runtime's `/metrics` route.
+///
+/// Reading them never contacts PostgreSQL or a marketplace.
+#[must_use]
+pub fn process_metrics() -> String {
+    let mut metrics = crate::postgres::prometheus_metrics();
+    metrics.push_str(&crate::marketplace_quota::prometheus_metrics());
+    metrics
+}
+
 pub type HttpServerFuture = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'static>>;
 pub type ShutdownFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 

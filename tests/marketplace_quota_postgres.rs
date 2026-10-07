@@ -315,19 +315,21 @@ async fn rust_gates_share_state_and_fail_closed() {
     drop(first);
     let restarted = shared_quota("REPORT_SNAPSHOT_TEST_COLLECTOR_URL");
     assert!(retry_after(restarted.admit(&key, interval).await) > interval);
-    assert!(retry_after(restarted.admit(&long_delay, interval).await) > Duration::from_hours(24));
-    assert_eq!(
-        retry_after(restarted.admit(&outlier, interval).await),
-        Duration::from_hours(24)
-    );
+    // Untrusted vendor delays persist for at most one day; a longer header can
+    // no longer quarantine a credential for every process until manual repair.
+    let capped =
+        |delay: Duration| delay > Duration::from_hours(23) && delay <= Duration::from_hours(24);
+    assert!(capped(retry_after(
+        restarted.admit(&long_delay, interval).await
+    )));
+    assert!(capped(retry_after(
+        restarted.admit(&outlier, interval).await
+    )));
     restarted
         .defer(&outlier, Duration::from_millis(1))
         .await
         .unwrap();
-    assert_eq!(
-        retry_after(second.admit(&outlier, interval).await),
-        Duration::from_hours(24)
-    );
+    assert!(capped(retry_after(second.admit(&outlier, interval).await)));
 
     // The URL has a permitted role, but its local endpoint drops the database
     // handshake. Failure must never turn into an uncoordinated allowance.

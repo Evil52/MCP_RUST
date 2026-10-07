@@ -5,27 +5,18 @@ use observation::validate_observation;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const ACTIVE_CAMPAIGN_STATUS: i32 = 9;
 const PAUSED_CAMPAIGN_STATUS: i32 = 11;
 const BASIS_POINTS: u128 = 10_000;
-const MOSCOW_OFFSET_SECONDS: i32 = 3 * 60 * 60;
 
 #[must_use]
 /// Returns the Moscow advertising business date for a UTC instant.
-///
-/// # Panics
-///
-/// Panics only if the compile-time UTC+3 offset cannot be constructed.
 pub fn wb_automation_business_date(now: DateTime<Utc>) -> NaiveDate {
-    now.with_timezone(
-        &FixedOffset::east_opt(MOSCOW_OFFSET_SECONDS)
-            .expect("the fixed Moscow UTC offset is valid"),
-    )
-    .date_naive()
+    crate::business_calendar::date_in(crate::business_calendar::moscow(), now)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -775,14 +766,15 @@ fn bid_change(
     } else {
         decrease_bid(policy, sku.current_bid_kopecks, minimum)
     };
-    Ok(
-        (to_bid_kopecks != sku.current_bid_kopecks).then_some(WbAutomationBidChange {
-            nm_id: sku.nm_id,
-            from_bid_kopecks: sku.current_bid_kopecks,
-            to_bid_kopecks,
-            reason,
-        }),
-    )
+    // A change must move in its reason's direction: a reduction never raises.
+    let moves = to_bid_kopecks != sku.current_bid_kopecks
+        && (to_bid_kopecks > sku.current_bid_kopecks) == increase;
+    Ok(moves.then_some(WbAutomationBidChange {
+        nm_id: sku.nm_id,
+        from_bid_kopecks: sku.current_bid_kopecks,
+        to_bid_kopecks,
+        reason,
+    }))
 }
 
 fn drr_basis_points(

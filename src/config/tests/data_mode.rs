@@ -111,3 +111,29 @@ fn reporting_mode_typo_fails_closed_without_echoing_input() {
         McpDataMode::LiveAnalytics
     );
 }
+
+#[test]
+fn live_analytics_refuses_a_registry_that_binds_a_write_credential() {
+    let mut registry = performance_registry();
+    registry.accounts.push(MarketplaceAccount {
+        id: "wb_shop".into(),
+        organization: "WB Shop".into(),
+        marketplace: Marketplace::Wildberries,
+        seller_client_id: "42".into(),
+        manager_id: "manager".into(),
+        ozon: None,
+        wildberries: Some(WildberriesAccount {
+            api_token_env: "WB_SHOP_PROMOTION_WRITE_TOKEN".into(),
+            seller_sid: None,
+        }),
+    });
+    let path = write_registry(&registry);
+    let error = AppConfig::from_lookup(|key| match key {
+        "MCP_ACTOR_ID" => Some("admin".into()),
+        "MCP_ACCESS_CONFIG" => Some(path.to_string_lossy().into_owned()),
+        _ => None,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("WB_SHOP_PROMOTION_WRITE_TOKEN"), "{error}");
+}

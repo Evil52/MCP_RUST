@@ -27,7 +27,11 @@ pub struct BasisPoints(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KpiSummary {
     pub ordered_units: u64,
-    /// Orders left after known cancellations and returns.
+    /// Ordered units minus the cancellations and returns registered in the
+    /// same interval. Marketplaces date those events when they happen, not by
+    /// the order they belong to, so this is a same-period net figure rather
+    /// than a cohort buyout. When the interval's cancellations and returns
+    /// exceed its orders the figure is unavailable instead of negative.
     pub realized_units: Option<u64>,
     pub operational_gmv_minor: u64,
     pub cancelled_units: Option<u64>,
@@ -42,6 +46,8 @@ pub struct KpiSummary {
     pub ad_conversion: Option<BasisPoints>,
     pub cpo_minor: Option<u64>,
     pub drr: Option<BasisPoints>,
+    /// `realized_units / ordered_units` for the same interval; inherits the
+    /// same-period (not cohort) semantics of `realized_units`.
     pub buyout_rate: Option<BasisPoints>,
 }
 

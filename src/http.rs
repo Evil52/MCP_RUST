@@ -187,10 +187,10 @@ impl SessionOwners {
             .collect()
     }
 
+    /// Checks only the presented session: an expired one still gets the transport's 404,
+    /// which clears its owner, and `bind_created` prunes the rest once per new session.
     async fn authorize(&self, session_id: &str, subject: &str) -> bool {
-        let retained_session_ids = self.retained_session_ids().await;
-        let mut owners = self.owners.lock().await;
-        owners.retain(|owned_session_id, _| retained_session_ids.contains(owned_session_id));
+        let owners = self.owners.lock().await;
         let authorized = owners
             .get(session_id)
             .is_some_and(|owner| owner.subject == subject);
@@ -1253,7 +1253,7 @@ where
 
 fn metrics_response(limits: &McpHttpLimits) -> Response {
     let mut metrics = limits.prometheus_metrics();
-    metrics.push_str(&crate::postgres::prometheus_metrics());
+    metrics.push_str(&crate::runtime::process_metrics());
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         metrics,

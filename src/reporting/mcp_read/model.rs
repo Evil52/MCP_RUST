@@ -107,6 +107,10 @@ pub struct DataCompletenessResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct KpiValues {
     pub ordered_units: u64,
+    /// Same-period net figure, not a cohort buyout.
+    #[schemars(
+        description = "Заказанные единицы за период минус отмены и возвраты, зарегистрированные в том же периоде (по дате события, не по дате заказа). Это не когортный выкуп; null, если отмен и возвратов больше заказов или источник их не отдаёт."
+    )]
     pub realized_units: Option<u64>,
     pub operational_gmv_minor: u64,
     pub cancelled_units: Option<u64>,
@@ -121,6 +125,9 @@ pub struct KpiValues {
     pub ad_conversion_bps: Option<u64>,
     pub cpo_minor: Option<u64>,
     pub drr_bps: Option<u64>,
+    #[schemars(
+        description = "realized_units / ordered_units в базисных пунктах за тот же период; не когортный выкуп."
+    )]
     pub buyout_rate_bps: Option<u64>,
 }
 

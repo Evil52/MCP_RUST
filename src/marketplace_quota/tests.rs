@@ -97,9 +97,32 @@ fn delays_round_up_and_reject_unbounded_or_zero_values() {
 }
 
 #[test]
-fn cooldowns_never_shorten_long_vendor_delays() {
+fn cooldowns_round_up_and_cap_untrusted_vendor_delays_at_one_day() {
     assert_eq!(cooldown_millis(Duration::ZERO), 1);
-    assert_eq!(cooldown_millis(Duration::from_hours(48)), 172_800_000);
-    assert_eq!(cooldown_millis(Duration::MAX), i64::MAX);
+    assert_eq!(cooldown_millis(Duration::from_micros(1001)), 2);
+    assert_eq!(cooldown_millis(Duration::from_hours(2)), 7_200_000);
+    assert_eq!(cooldown_millis(Duration::from_hours(24)), 86_400_000);
+    assert_eq!(cooldown_millis(Duration::from_hours(48)), 86_400_000);
+    assert_eq!(cooldown_millis(Duration::MAX), 86_400_000);
     assert!(QuotaKey::ozon_performance("123-456@advertising.performance.ozon.ru", "api").is_ok());
+}
+
+#[tokio::test]
+async fn capped_cooldowns_are_counted_before_reaching_the_database() {
+    let before = CAPPED_COOLDOWNS.load(Ordering::Relaxed);
+    let unreachable =
+        SharedQuota::from_database_url("postgresql://report_collector:secret@127.0.0.1:1/db");
+    let key = QuotaKey::ozon_seller("123", "api").unwrap();
+    assert_eq!(
+        unreachable.defer(&key, Duration::from_hours(48)).await,
+        Err(QuotaError::Unavailable)
+    );
+    assert!(CAPPED_COOLDOWNS.load(Ordering::Relaxed) > before);
+    let metrics = prometheus_metrics();
+    assert!(metrics.contains("# TYPE mcp_marketplace_quota_capped_cooldowns_total counter\n"));
+    let value = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("mcp_marketplace_quota_capped_cooldowns_total "))
+        .expect("the counter is always exported");
+    assert!(value.parse::<u64>().unwrap() > before);
 }

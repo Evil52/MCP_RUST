@@ -12,6 +12,31 @@ use super::super::{
     validate_optional_date_range, validate_string_list, validate_unique_ozon_ids,
 };
 use rmcp::tool_router;
+use std::{future::Future, time::Duration};
+
+use crate::config::StoreId;
+
+/// Total budget for one fallback collection. Each page request is bounded on
+/// its own, but up to two thousand pages are not: the call must finish well
+/// inside the client's patience and the audit ceiling, and it never returns
+/// partial data.
+const POSTING_SALES_FALLBACK_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Runs the whole fallback collection under one deadline.
+pub(in crate::server) async fn bounded_posting_sales(
+    store: &StoreId,
+    deadline: Duration,
+    collection: impl Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    tokio::time::timeout(deadline, collection)
+        .await
+        .map_err(|_| {
+            format!(
+                "OZON_POSTING_SALES_FALLBACK_FAILED: kind=deadline; store={store}. Сбор не завершился за {} с; частичные данные не возвращены. Сократите период.",
+                deadline.as_secs()
+            )
+        })?
+}
 
 #[tool_router(router = orders_router, vis = "pub(in crate::server)")]
 impl OzonMcp {
@@ -60,10 +85,14 @@ impl OzonMcp {
             validate_and_expand_dates(&input.date_from, &input.date_to, MAX_ANALYTICS_PERIOD_DAYS)?;
         let store = self.posting_sales_context(&identity, input.store.as_ref())?;
         let mut aggregate = PostingSalesAccumulator::default();
-        for scheme in [PostingScheme::Fbo, PostingScheme::Fbs] {
-            self.collect_posting_sales_scheme(&store, &from, &to, scheme, &mut aggregate)
-                .await?;
-        }
+        bounded_posting_sales(&store, POSTING_SALES_FALLBACK_DEADLINE, async {
+            for scheme in [PostingScheme::Fbo, PostingScheme::Fbs] {
+                self.collect_posting_sales_scheme(&store, &from, &to, scheme, &mut aggregate)
+                    .await?;
+            }
+            Ok(())
+        })
+        .await?;
         let (totals, rows) = aggregate.finish().map_err(|error| {
             let kind = error.code();
             format!(

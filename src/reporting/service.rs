@@ -406,12 +406,12 @@ mod tests {
     }
 
     fn registry() -> &'static str {
-        r#"{"version":1,"actors":[{"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}},{"id":"wb6","name":"Vahrusheva / Torsunova","role":"manager","oidc":{"username":"wb6"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana_serafimovich","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY","performance":{"client_id_env":"OZON_PERFORMANCE_ID","client_secret_env":"OZON_PERFORMANCE_SECRET"}}},{"id":"ip_domnyshev_wb","organization":"WB","marketplace":"wildberries","seller_client_id":"2","manager_id":"wb6","wildberries":{"api_token_env":"WB_TOKEN"}}]}"#
+        r#"{"version":1,"actors":[{"id":"ozon_manager","name":"Diana","role":"manager","oidc":{"username":"diana"}},{"id":"wb6","name":"WB managers","role":"manager","oidc":{"username":"wb6"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"ozon_manager","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY","performance":{"client_id_env":"OZON_PERFORMANCE_ID","client_secret_env":"OZON_PERFORMANCE_SECRET"}}},{"id":"ip_domnyshev_wb","organization":"WB","marketplace":"wildberries","seller_client_id":"2","manager_id":"wb6","wildberries":{"api_token_env":"WB_TOKEN"}}]}"#
     }
 
     fn policy(enabled: bool) -> String {
         format!(
-            r#"{{"version":1,"enabled":{enabled},"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{{"id":"pilot_owner","email_env":"DAILY_REPORT_PILOT_RECIPIENT_EMAIL","managers":[{{"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]}},{{"actor_id":"wb6","account_ids":["ip_domnyshev_wb"]}}]}}]}}"#
+            r#"{{"version":1,"enabled":{enabled},"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{{"id":"pilot_owner","email_env":"DAILY_REPORT_PILOT_RECIPIENT_EMAIL","managers":[{{"actor_id":"ozon_manager","account_ids":["furnitura_dlya_doma"]}},{{"actor_id":"wb6","account_ids":["ip_domnyshev_wb"]}}]}}]}}"#
         )
     }
 
@@ -452,12 +452,10 @@ mod tests {
         assert_eq!(config.collection_plan().unwrap().len(), 2);
         config.artifact_store().verify_writable().unwrap();
         assert_eq!(
-            config
-                .preview_scope("pilot_owner", "diana_serafimovich")
-                .unwrap(),
+            config.preview_scope("pilot_owner", "ozon_manager").unwrap(),
             ReportPreviewScope {
                 audience_id: "pilot_owner".to_owned(),
-                actor_id: "diana_serafimovich".to_owned(),
+                actor_id: "ozon_manager".to_owned(),
                 manager_name: "Diana".to_owned(),
                 accounts: vec![
                     AccountScope::new("furnitura_dlya_doma".to_owned(), Marketplace::Ozon,)
@@ -465,14 +463,10 @@ mod tests {
                 ],
             }
         );
-        assert!(
-            config
-                .preview_scope("unknown", "diana_serafimovich")
-                .is_err()
-        );
+        assert!(config.preview_scope("unknown", "ozon_manager").is_err());
         assert!(config.preview_scope("pilot_owner", "unknown").is_err());
         let wb = config.preview_scope("pilot_owner", "wb6").unwrap();
-        assert_eq!(wb.manager_name, "Vahrusheva / Torsunova");
+        assert_eq!(wb.manager_name, "WB managers");
         assert_eq!(wb.accounts[0].marketplace(), Marketplace::Wildberries);
 
         let generation = config
@@ -549,7 +543,7 @@ mod tests {
             .unwrap();
         fs::write(
             policy_path,
-            r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{"id":"diana","email_env":"DIANA_EMAIL","managers":[{"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]}]}]}"#,
+            r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{"id":"diana","email_env":"DIANA_EMAIL","managers":[{"actor_id":"ozon_manager","account_ids":["furnitura_dlya_doma"]}]}]}"#,
         )
         .unwrap();
         let config = config(&entries).unwrap();
