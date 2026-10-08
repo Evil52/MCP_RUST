@@ -34,6 +34,62 @@ fn mismatched_products_keep_parent_but_report_unallocated_breakdown() {
 }
 
 #[test]
+fn inconsistent_parent_is_a_gap_without_discarding_other_campaign_days() {
+    let date = NaiveDate::from_ymd_opt(2023, 10, 9).unwrap();
+    let mut bad = day(&json!("8.15"));
+    bad["views"] = json!(0);
+    bad["clicks"] = json!(1);
+    let mut next = day(&json!("7.01"));
+    next["date"] = json!("2023-10-10T00:00:00Z");
+    let rows = normalize_statistics(
+        &json!([{"advertId":7,"days":[bad,next]}, {"advertId":8,"days":[day(&json!(2))]}]),
+        &[7, 8],
+        date,
+        date + Duration::days(1),
+    )
+    .unwrap();
+    assert_eq!(rows[0]["state"], "missing");
+    assert!(rows[0]["metrics"].is_null());
+    assert_eq!(rows[0]["products"], json!([]));
+    assert_eq!(rows[1]["state"], "observed");
+    assert_eq!(rows[1]["metrics"]["spend_minor"], 701);
+    assert_eq!(rows[1]["sku_reconciled"], true);
+    assert_eq!(rows[1]["products"][0]["metrics"]["spend_minor"], 701);
+    assert_eq!(rows[2]["state"], "observed");
+    assert_eq!(rows[2]["metrics"]["spend_minor"], 200);
+    assert_eq!(rows[3]["state"], "no_data");
+}
+
+#[test]
+fn malformed_money_or_outside_dates_cannot_be_hidden_as_counter_gaps() {
+    let date = NaiveDate::from_ymd_opt(2023, 10, 9).unwrap();
+    let mut bad_money = day(&json!(-1));
+    bad_money["views"] = json!(0);
+    bad_money["clicks"] = json!(1);
+    assert!(
+        normalize_statistics(
+            &json!([{"advertId":7,"days":[bad_money]}]),
+            &[7],
+            date,
+            date
+        )
+        .is_err()
+    );
+    let mut outside = day(&json!(1));
+    outside["views"] = json!(0);
+    outside["clicks"] = json!(1);
+    assert!(
+        normalize_statistics(
+            &json!([{"advertId":7,"days":[outside]}]),
+            &[7],
+            date + Duration::days(1),
+            date + Duration::days(1),
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn null_is_distinct_from_omitted_campaign_and_open_scope_is_rejected() {
     let date = NaiveDate::from_ymd_opt(2023, 10, 9).unwrap();
     assert_eq!(

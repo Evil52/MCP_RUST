@@ -6,6 +6,9 @@ use mcp_ozon::reporting::advertising_history::{
 use serde_json::{Value, json};
 use tokio_postgres::{Client, NoTls, types::ToSql};
 
+// The production archive has one global lease, also in the isolated test DB.
+static HISTORY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn connect(url: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(url, NoTls).await.unwrap();
     tokio::spawn(async move {
@@ -65,11 +68,92 @@ async fn publish(collector: &Client, claim: &Value, raw: &Value) {
 }
 
 #[tokio::test]
+async fn inconsistent_day_keeps_other_facts_and_finishes_as_a_repairable_gap() {
+    let Ok(admin_url) = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL") else {
+        eprintln!("skipped: isolated PostgreSQL URL missing");
+        return;
+    };
+    let _guard = HISTORY_TEST_LOCK.lock().await;
+    let admin = connect(&admin_url).await;
+    let collector = connect(&std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL").unwrap()).await;
+    let api = HistoryRepository::connect_optional(Some(
+        &std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL").unwrap(),
+    ))
+    .await
+    .unwrap();
+    let account = format!("history_counter_gap_{}", std::process::id());
+    let date = NaiveDate::from_ymd_opt(2023, 10, 9).unwrap();
+    api.request(&account, "finance", Some(date), date)
+        .await
+        .unwrap();
+    inventory(
+        &collector,
+        &claim(&collector, &account).await,
+        &account,
+        &[7, 8],
+        date,
+    )
+    .await;
+    let mut raw = fullstats(&[7, 8], date, 7, 100);
+    raw[0]["days"][0]["views"] = json!(0);
+    raw[0]["days"][0]["clicks"] = json!(1);
+    expedite(&admin, &account).await;
+    publish(&collector, &claim(&collector, &account).await, &raw).await;
+    let stats = api
+        .stats(&account, None, None, HistoryGroup::Campaign, 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(stats["coverage"]["missing_campaign_days"], 1);
+    assert_eq!(stats["totals"]["spend_minor"], 700);
+    assert_eq!(stats["coverage"]["complete_for_known_campaigns"], false);
+    // One isolated verification is allowed; persistent WB inconsistency ends
+    // as partial instead of retrying or inventing a zero-spend observation.
+    expedite(&admin, &account).await;
+    let verify = claim(&collector, &account).await;
+    assert_eq!(verify["campaign_ids"], json!([7]));
+    publish(&collector, &verify, &json!([raw[0]])).await;
+    assert_eq!(
+        api.status(&account).await.unwrap()["job"]["status"],
+        "partial"
+    );
+    expedite(&admin, &account).await;
+    assert!(claim(&collector, &account).await.is_null());
+    // A later valid WB revision closes the gap and replaces earlier totals.
+    api.request(&account, "finance", Some(date), date)
+        .await
+        .unwrap();
+    expedite(&admin, &account).await;
+    inventory(
+        &collector,
+        &claim(&collector, &account).await,
+        &account,
+        &[7, 8],
+        date,
+    )
+    .await;
+    expedite(&admin, &account).await;
+    publish(
+        &collector,
+        &claim(&collector, &account).await,
+        &fullstats(&[7, 8], date, 8, 100),
+    )
+    .await;
+    let repaired = api
+        .stats(&account, None, None, HistoryGroup::Campaign, 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(repaired["coverage"]["missing_campaign_days"], 0);
+    assert_eq!(repaired["coverage"]["complete_for_known_campaigns"], true);
+    assert_eq!(repaired["totals"]["spend_minor"], 1600);
+}
+
+#[tokio::test]
 async fn history_resumes_revises_deduplicates_and_keeps_gaps_account_scoped() {
     let Ok(admin_url) = std::env::var("POSITION_REPOSITORY_TEST_ADMIN_URL") else {
         eprintln!("skipped: isolated PostgreSQL URL missing");
         return;
     };
+    let _guard = HISTORY_TEST_LOCK.lock().await;
     let collector_url = std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL").unwrap();
     let requester_url = std::env::var("REPORT_REFRESH_TEST_REQUESTER_URL").unwrap();
     let admin = connect(&admin_url).await;
