@@ -12,8 +12,8 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, NaiveDate, Utc};
 use mcp_ozon::control::{
     WbAutomationExecutor, WbAutomationLegacyStateSeed, WbAutomationObserver, WbAutomationPolicy,
-    WbAutomationPostgresStore, WbAutomationStateView, persist_wb_automation_snapshot,
-    wb_automation_business_date,
+    WbAutomationPostgresStore, WbAutomationStateTransitionReceipt, WbAutomationStateView,
+    persist_wb_automation_snapshot, wb_automation_business_date,
 };
 use serde::Deserialize;
 use tokio_postgres::Config;
@@ -36,15 +36,7 @@ async fn main() -> Result<()> {
 }
 
 async fn activate_protective_live_postgres(options: ActivatePolicyOptions) -> Result<()> {
-    let shadow = build_observer(&options.source)?;
-    let live = build_observer(&ObserveOptions {
-        policy: options.target_policy,
-        registry: options.source.registry.clone(),
-        reader_token: options.source.reader_token.clone(),
-        state_directory: PathBuf::new(),
-        allow_broad_reader: options.source.allow_broad_reader,
-        reader_proxy_url: options.source.reader_proxy_url.clone(),
-    })?;
+    let (shadow, live) = transition_observers(options)?;
     ensure!(
         !shadow.policy().write_enabled
             && !shadow.policy().bid_writes_enabled
@@ -59,16 +51,8 @@ async fn activate_protective_live_postgres(options: ActivatePolicyOptions) -> Re
         "WB automation protective live policy expands the reviewed shadow scope"
     );
     let now = Utc::now();
-    ensure!(
-        now >= live.policy().authorized_at && now < live.policy().authorization_expires_at,
-        "WB automation protective live authorization is not active"
-    );
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    ensure_authorization_active(live.policy(), now, "WB automation protective live")?;
+    let store = connect_state_store().await?;
     let Some(mut lease) = store
         .try_acquire_campaign(live.policy().account_id.as_str(), live.policy().campaign_id)
         .await?
@@ -80,33 +64,22 @@ async fn activate_protective_live_postgres(options: ActivatePolicyOptions) -> Re
         .activate_protective_live_policy(shadow.policy_sha256(), live.policy_sha256())
         .await?;
     lease.release().await?;
-    println!(
-        "{}",
+    print_transition(
+        live.policy(),
+        &receipt,
+        (
+            "protective_live_activated",
+            "protective_live_already_active",
+        ),
         serde_json::json!({
-            "account_id": live.policy().account_id,
-            "campaign_id": live.policy().campaign_id,
-            "outcome": if receipt.changed {
-                "protective_live_activated"
-            } else {
-                "protective_live_already_active"
-            },
-            "state_revision": receipt.state_revision,
             "bid_writes_enabled": false,
-        })
+        }),
     );
     Ok(())
 }
 
 async fn activate_bid_writes_postgres(options: ActivatePolicyOptions) -> Result<()> {
-    let protective = build_observer(&options.source)?;
-    let bid_live = build_observer(&ObserveOptions {
-        policy: options.target_policy,
-        registry: options.source.registry.clone(),
-        reader_token: options.source.reader_token.clone(),
-        state_directory: PathBuf::new(),
-        allow_broad_reader: options.source.allow_broad_reader,
-        reader_proxy_url: options.source.reader_proxy_url.clone(),
-    })?;
+    let (protective, bid_live) = transition_observers(options)?;
     ensure!(
         protective.policy().write_enabled
             && !protective.policy().bid_writes_enabled
@@ -121,16 +94,8 @@ async fn activate_bid_writes_postgres(options: ActivatePolicyOptions) -> Result<
         "WB automation bid-live policy expands the reviewed protective scope"
     );
     let now = Utc::now();
-    ensure!(
-        now >= bid_live.policy().authorized_at && now < bid_live.policy().authorization_expires_at,
-        "WB automation bid-live authorization is not active"
-    );
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    ensure_authorization_active(bid_live.policy(), now, "WB automation bid-live")?;
+    let store = connect_state_store().await?;
     let Some(mut lease) = store
         .try_acquire_campaign(
             bid_live.policy().account_id.as_str(),
@@ -144,49 +109,27 @@ async fn activate_bid_writes_postgres(options: ActivatePolicyOptions) -> Result<
         .activate_bid_writes_policy(protective.policy_sha256(), bid_live.policy_sha256())
         .await?;
     lease.release().await?;
-    println!(
-        "{}",
+    print_transition(
+        bid_live.policy(),
+        &receipt,
+        ("bid_writes_activated", "bid_writes_already_active"),
         serde_json::json!({
-            "account_id": bid_live.policy().account_id,
-            "campaign_id": bid_live.policy().campaign_id,
-            "outcome": if receipt.changed {
-                "bid_writes_activated"
-            } else {
-                "bid_writes_already_active"
-            },
-            "state_revision": receipt.state_revision,
             "bid_writes_enabled": true,
-        })
+        }),
     );
     Ok(())
 }
 
 async fn activate_bounded_pacing_postgres(options: ActivatePolicyOptions) -> Result<()> {
-    let source = build_observer(&options.source)?;
-    let target = build_observer(&ObserveOptions {
-        policy: options.target_policy,
-        registry: options.source.registry.clone(),
-        reader_token: options.source.reader_token.clone(),
-        state_directory: PathBuf::new(),
-        allow_broad_reader: options.source.allow_broad_reader,
-        reader_proxy_url: options.source.reader_proxy_url.clone(),
-    })?;
+    let (source, target) = transition_observers(options)?;
     validate_bounded_pacing_activation(source.policy(), target.policy())?;
     let now = Utc::now();
-    ensure!(
-        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
-        "WB automation bounded pacing authorization is not active"
-    );
+    ensure_authorization_active(target.policy(), now, "WB automation bounded pacing")?;
     target
         .observe(now, WbAutomationStateView::default())
         .await
         .context("WB automation current bids exceed or do not prove the bounded pacing cap")?;
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    let store = connect_state_store().await?;
     let Some(mut lease) = store
         .try_acquire_campaign(
             target.policy().account_id.as_str(),
@@ -206,22 +149,16 @@ async fn activate_bounded_pacing_postgres(options: ActivatePolicyOptions) -> Res
         )
         .await?;
     lease.release().await?;
-    println!(
-        "{}",
+    print_transition(
+        target.policy(),
+        &receipt,
+        ("bounded_pacing_activated", "bounded_pacing_already_active"),
         serde_json::json!({
-            "account_id": target.policy().account_id,
-            "campaign_id": target.policy().campaign_id,
-            "outcome": if receipt.changed {
-                "bounded_pacing_activated"
-            } else {
-                "bounded_pacing_already_active"
-            },
-            "state_revision": receipt.state_revision,
             "max_bid_kopecks": target.policy().max_bid_kopecks,
             "target_impressions_per_day": target.policy().target_impressions_per_day,
             "autonomous_pacing_enabled": true,
             "bid_writes_enabled": true,
-        })
+        }),
     );
     Ok(())
 }
@@ -251,31 +188,15 @@ fn validate_bounded_pacing_activation(
 }
 
 async fn activate_traffic_frontier_v2_postgres(options: ActivatePolicyOptions) -> Result<()> {
-    let source = build_observer(&options.source)?;
-    let target = build_observer(&ObserveOptions {
-        policy: options.target_policy,
-        registry: options.source.registry.clone(),
-        reader_token: options.source.reader_token.clone(),
-        state_directory: PathBuf::new(),
-        allow_broad_reader: options.source.allow_broad_reader,
-        reader_proxy_url: options.source.reader_proxy_url.clone(),
-    })?;
+    let (source, target) = transition_observers(options)?;
     validate_traffic_frontier_v2_activation(source.policy(), target.policy())?;
     let now = Utc::now();
-    ensure!(
-        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
-        "WB traffic-frontier v2 authorization is not active"
-    );
+    ensure_authorization_active(target.policy(), now, "WB traffic-frontier v2")?;
     target
         .observe(now, WbAutomationStateView::default())
         .await
         .context("WB traffic-frontier v2 read-only preflight failed")?;
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    let store = connect_state_store().await?;
     let Some(mut lease) = store
         .try_acquire_campaign(
             target.policy().account_id.as_str(),
@@ -304,24 +225,21 @@ async fn activate_traffic_frontier_v2_postgres(options: ActivatePolicyOptions) -
         )
         .await?;
     lease.release().await?;
-    println!(
-        "{}",
+    print_transition(
+        target.policy(),
+        &receipt,
+        (
+            "traffic_frontier_v2_activated",
+            "traffic_frontier_v2_already_active",
+        ),
         serde_json::json!({
-            "account_id": target.policy().account_id,
-            "campaign_id": target.policy().campaign_id,
-            "outcome": if receipt.changed {
-                "traffic_frontier_v2_activated"
-            } else {
-                "traffic_frontier_v2_already_active"
-            },
-            "state_revision": receipt.state_revision,
             "traffic_frontier_bid_kopecks": target.policy().traffic_frontier_bid_kopecks,
             "max_bid_kopecks": target.policy().max_bid_kopecks,
             "max_actions_per_day": target.policy().max_actions_per_day,
             "cooldown_seconds": target.policy().cooldown_seconds,
             "daily_spend_cap_minor": target.policy().daily_spend_cap_minor,
             "bid_writes_enabled": true,
-        })
+        }),
     );
     Ok(())
 }
@@ -380,31 +298,15 @@ fn validate_traffic_frontier_v2_activation(
 }
 
 async fn activate_traffic_frontier_v3_postgres(options: ActivatePolicyOptions) -> Result<()> {
-    let source = build_observer(&options.source)?;
-    let target = build_observer(&ObserveOptions {
-        policy: options.target_policy,
-        registry: options.source.registry.clone(),
-        reader_token: options.source.reader_token.clone(),
-        state_directory: PathBuf::new(),
-        allow_broad_reader: options.source.allow_broad_reader,
-        reader_proxy_url: options.source.reader_proxy_url.clone(),
-    })?;
+    let (source, target) = transition_observers(options)?;
     validate_traffic_frontier_v3_activation(source.policy(), target.policy())?;
     let now = Utc::now();
-    ensure!(
-        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
-        "WB traffic-frontier v3 authorization is not active"
-    );
+    ensure_authorization_active(target.policy(), now, "WB traffic-frontier v3")?;
     target
         .observe(now, WbAutomationStateView::default())
         .await
         .context("WB traffic-frontier v3 read-only preflight failed")?;
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    let store = connect_state_store().await?;
     let Some(mut lease) = store
         .try_acquire_campaign(
             target.policy().account_id.as_str(),
@@ -437,17 +339,14 @@ async fn activate_traffic_frontier_v3_postgres(options: ActivatePolicyOptions) -
         )
         .await?;
     lease.release().await?;
-    println!(
-        "{}",
+    print_transition(
+        target.policy(),
+        &receipt,
+        (
+            "traffic_frontier_v3_activated",
+            "traffic_frontier_v3_already_active",
+        ),
         serde_json::json!({
-            "account_id": target.policy().account_id,
-            "campaign_id": target.policy().campaign_id,
-            "outcome": if receipt.changed {
-                "traffic_frontier_v3_activated"
-            } else {
-                "traffic_frontier_v3_already_active"
-            },
-            "state_revision": receipt.state_revision,
             "target_impressions_per_day": target.policy().target_impressions_per_day,
             "target_orders_per_day": target.policy().target_orders_per_day,
             "max_actions_per_day": target.policy().max_actions_per_day,
@@ -456,7 +355,7 @@ async fn activate_traffic_frontier_v3_postgres(options: ActivatePolicyOptions) -
             "traffic_frontier_min_feedback_clicks": target.policy().traffic_frontier_min_feedback_clicks,
             "daily_spend_cap_minor": target.policy().daily_spend_cap_minor,
             "bid_writes_enabled": true,
-        })
+        }),
     );
     Ok(())
 }
@@ -508,31 +407,15 @@ fn validate_traffic_frontier_v3_activation(
 }
 
 async fn activate_traffic_frontier_v4_postgres(options: ActivatePolicyOptions) -> Result<()> {
-    let source = build_observer(&options.source)?;
-    let target = build_observer(&ObserveOptions {
-        policy: options.target_policy,
-        registry: options.source.registry.clone(),
-        reader_token: options.source.reader_token.clone(),
-        state_directory: PathBuf::new(),
-        allow_broad_reader: options.source.allow_broad_reader,
-        reader_proxy_url: options.source.reader_proxy_url.clone(),
-    })?;
+    let (source, target) = transition_observers(options)?;
     validate_traffic_frontier_v4_activation(source.policy(), target.policy())?;
     let now = Utc::now();
-    ensure!(
-        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
-        "WB traffic-frontier v4 authorization is not active"
-    );
+    ensure_authorization_active(target.policy(), now, "WB traffic-frontier v4")?;
     target
         .observe(now, WbAutomationStateView::default())
         .await
         .context("WB traffic-frontier v4 read-only preflight failed")?;
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    let store = connect_state_store().await?;
     let Some(mut lease) = store
         .try_acquire_campaign(
             target.policy().account_id.as_str(),
@@ -572,17 +455,14 @@ async fn activate_traffic_frontier_v4_postgres(options: ActivatePolicyOptions) -
         )
         .await?;
     lease.release().await?;
-    println!(
-        "{}",
+    print_transition(
+        target.policy(),
+        &receipt,
+        (
+            "traffic_frontier_v4_activated",
+            "traffic_frontier_v4_already_active",
+        ),
         serde_json::json!({
-            "account_id": target.policy().account_id,
-            "campaign_id": target.policy().campaign_id,
-            "outcome": if receipt.changed {
-                "traffic_frontier_v4_activated"
-            } else {
-                "traffic_frontier_v4_already_active"
-            },
-            "state_revision": receipt.state_revision,
             "target_drr_basis_points": target.policy().target_drr_basis_points,
             "hard_drr_basis_points": target.policy().hard_drr_basis_points,
             "traffic_frontier_bid_kopecks": target.policy().traffic_frontier_bid_kopecks,
@@ -592,7 +472,7 @@ async fn activate_traffic_frontier_v4_postgres(options: ActivatePolicyOptions) -
             "daily_spend_cap_minor": target.policy().daily_spend_cap_minor,
             "zero_cost_probe_enabled": true,
             "bid_writes_enabled": true,
-        })
+        }),
     );
     Ok(())
 }
@@ -649,31 +529,15 @@ fn validate_traffic_frontier_v4_activation(
 }
 
 async fn raise_traffic_frontier_limits_postgres(options: ActivatePolicyOptions) -> Result<()> {
-    let source = build_observer(&options.source)?;
-    let target = build_observer(&ObserveOptions {
-        policy: options.target_policy,
-        registry: options.source.registry.clone(),
-        reader_token: options.source.reader_token.clone(),
-        state_directory: PathBuf::new(),
-        allow_broad_reader: options.source.allow_broad_reader,
-        reader_proxy_url: options.source.reader_proxy_url.clone(),
-    })?;
+    let (source, target) = transition_observers(options)?;
     validate_traffic_frontier_limits_raise(source.policy(), target.policy())?;
     let now = Utc::now();
-    ensure!(
-        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
-        "WB traffic-frontier limits authorization is not active"
-    );
+    ensure_authorization_active(target.policy(), now, "WB traffic-frontier limits")?;
     target
         .observe(now, WbAutomationStateView::default())
         .await
         .context("WB traffic-frontier limits read-only preflight failed")?;
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    let store = connect_state_store().await?;
     let Some(mut lease) = store
         .try_acquire_campaign(
             target.policy().account_id.as_str(),
@@ -702,23 +566,20 @@ async fn raise_traffic_frontier_limits_postgres(options: ActivatePolicyOptions) 
         )
         .await?;
     lease.release().await?;
-    println!(
-        "{}",
+    print_transition(
+        target.policy(),
+        &receipt,
+        (
+            "traffic_frontier_limits_raised",
+            "traffic_frontier_limits_already_active",
+        ),
         serde_json::json!({
-            "account_id": target.policy().account_id,
-            "campaign_id": target.policy().campaign_id,
-            "outcome": if receipt.changed {
-                "traffic_frontier_limits_raised"
-            } else {
-                "traffic_frontier_limits_already_active"
-            },
-            "state_revision": receipt.state_revision,
             "traffic_frontier_bid_kopecks": target.policy().traffic_frontier_bid_kopecks,
             "daily_pause_threshold_minor": target.policy().daily_pause_threshold_minor,
             "daily_spend_cap_minor": target.policy().daily_spend_cap_minor,
             "max_bid_kopecks": target.policy().max_bid_kopecks,
             "bid_writes_enabled": true,
-        })
+        }),
     );
     Ok(())
 }
@@ -770,31 +631,15 @@ fn validate_traffic_frontier_limits_raise(
 }
 
 async fn tighten_traffic_frontier_corridor_postgres(options: ActivatePolicyOptions) -> Result<()> {
-    let source = build_observer(&options.source)?;
-    let target = build_observer(&ObserveOptions {
-        policy: options.target_policy,
-        registry: options.source.registry.clone(),
-        reader_token: options.source.reader_token.clone(),
-        state_directory: PathBuf::new(),
-        allow_broad_reader: options.source.allow_broad_reader,
-        reader_proxy_url: options.source.reader_proxy_url.clone(),
-    })?;
+    let (source, target) = transition_observers(options)?;
     validate_traffic_frontier_corridor_tighten(source.policy(), target.policy())?;
     let now = Utc::now();
-    ensure!(
-        now >= target.policy().authorized_at && now < target.policy().authorization_expires_at,
-        "WB traffic-frontier corridor authorization is not active"
-    );
+    ensure_authorization_active(target.policy(), now, "WB traffic-frontier corridor")?;
     target
         .observe(now, WbAutomationStateView::default())
         .await
         .context("WB traffic-frontier corridor read-only preflight failed")?;
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    let store = connect_state_store().await?;
     let Some(mut lease) = store
         .try_acquire_campaign(
             target.policy().account_id.as_str(),
@@ -821,21 +666,18 @@ async fn tighten_traffic_frontier_corridor_postgres(options: ActivatePolicyOptio
         )
         .await?;
     lease.release().await?;
-    println!(
-        "{}",
+    print_transition(
+        target.policy(),
+        &receipt,
+        (
+            "traffic_frontier_corridor_tightened",
+            "traffic_frontier_corridor_already_active",
+        ),
         serde_json::json!({
-            "account_id": target.policy().account_id,
-            "campaign_id": target.policy().campaign_id,
-            "outcome": if receipt.changed {
-                "traffic_frontier_corridor_tightened"
-            } else {
-                "traffic_frontier_corridor_already_active"
-            },
-            "state_revision": receipt.state_revision,
             "traffic_frontier_bid_kopecks": target.policy().traffic_frontier_bid_kopecks,
             "max_bid_kopecks": target.policy().max_bid_kopecks,
             "bid_writes_enabled": true,
-        })
+        }),
     );
     Ok(())
 }
@@ -889,12 +731,7 @@ async fn shadow_postgres_once(options: ShadowPostgresOptions) -> Result<()> {
         observer.policy().campaign_id,
         observer.policy_sha256(),
     )?;
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    let store = connect_state_store().await?;
     let Some(mut lease) = store
         .try_acquire_campaign(
             observer.policy().account_id.as_str(),
@@ -1064,12 +901,7 @@ async fn execute_postgres_with_intent(
         executor.policy().campaign_id,
         executor.policy_sha256(),
     )?;
-    let database_url =
-        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
-    let database_config =
-        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
-    let store = WbAutomationPostgresStore::connect(&database_config).await?;
-    store.verify_runtime_contract().await?;
+    let store = connect_state_store().await?;
     let receipt = match intent {
         PostgresCommandIntent::ExplicitExposureTarget(target) => {
             executor
@@ -1126,6 +958,74 @@ async fn execute_once_at(options: ExecuteOptions, now: chrono::DateTime<Utc>) ->
     )?;
     println!("{}", serde_json::to_string(&executor.run_once(now).await?)?);
     Ok(())
+}
+
+/// Builds the observer of the active policy and the observer of the reviewed
+/// target policy, which reuses the source's reader credentials.
+fn transition_observers(
+    options: ActivatePolicyOptions,
+) -> Result<(WbAutomationObserver, WbAutomationObserver)> {
+    let source = build_observer(&options.source)?;
+    let ObserveOptions {
+        registry,
+        reader_token,
+        allow_broad_reader,
+        reader_proxy_url,
+        ..
+    } = options.source;
+    let target = build_observer(&ObserveOptions {
+        policy: options.target_policy,
+        registry,
+        reader_token,
+        state_directory: PathBuf::new(),
+        allow_broad_reader,
+        reader_proxy_url,
+    })?;
+    Ok((source, target))
+}
+
+/// Requires the reviewed authorization window of `policy` to be open at `now`.
+fn ensure_authorization_active(
+    policy: &WbAutomationPolicy,
+    now: chrono::DateTime<Utc>,
+    label: &str,
+) -> Result<()> {
+    ensure!(
+        now >= policy.authorized_at && now < policy.authorization_expires_at,
+        "{label} authorization is not active"
+    );
+    Ok(())
+}
+
+/// Opens the durable state store named by `WB_AUTOMATION_DATABASE_URL` and
+/// verifies its restricted role contract.
+async fn connect_state_store() -> Result<WbAutomationPostgresStore> {
+    let database_url =
+        std::env::var(DATABASE_URL_ENV).context("WB automation PostgreSQL URL is unavailable")?;
+    let database_config =
+        Config::from_str(&database_url).context("WB automation PostgreSQL URL is invalid")?;
+    let store = WbAutomationPostgresStore::connect(&database_config).await?;
+    store.verify_runtime_contract().await?;
+    Ok(store)
+}
+
+/// Prints the one-line JSON receipt of a reviewed policy transition.
+fn print_transition(
+    policy: &WbAutomationPolicy,
+    receipt: &WbAutomationStateTransitionReceipt,
+    (changed, unchanged): (&str, &str),
+    fields: serde_json::Value,
+) {
+    let mut output = serde_json::json!({
+        "account_id": policy.account_id,
+        "campaign_id": policy.campaign_id,
+        "outcome": if receipt.changed { changed } else { unchanged },
+        "state_revision": receipt.state_revision,
+    });
+    if let (Some(output), serde_json::Value::Object(fields)) = (output.as_object_mut(), fields) {
+        output.extend(fields);
+    }
+    println!("{output}");
 }
 
 fn build_observer(options: &ObserveOptions) -> Result<WbAutomationObserver> {

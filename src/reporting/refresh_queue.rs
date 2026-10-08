@@ -135,7 +135,7 @@ impl RefreshRequestService {
         actor_id: &str,
         business_date: NaiveDate,
     ) -> Result<SalesRefreshStatus, RefreshRequestError> {
-        validate_identifier(account_id, 128)?;
+        validate_account(account_id)?;
         validate_actor(actor_id)?;
         self.repository
             .request(account_id, marketplace, actor_id, business_date)
@@ -147,7 +147,7 @@ impl RefreshRequestService {
         account_id: &str,
         marketplace: Marketplace,
     ) -> Result<SalesRefreshStatus, RefreshRequestError> {
-        validate_identifier(account_id, 128)?;
+        validate_account(account_id)?;
         self.repository.status(account_id, marketplace).await
     }
 }
@@ -408,30 +408,16 @@ fn parse_state(value: &str) -> Result<SalesRefreshState, RefreshRequestError> {
     }
 }
 
-fn validate_identifier(value: &str, maximum: usize) -> Result<(), RefreshRequestError> {
-    if value.is_empty()
-        || value.len() > maximum
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        Err(RefreshRequestError::InvalidRequest)
-    } else {
-        Ok(())
-    }
+fn validate_account(value: &str) -> Result<(), RefreshRequestError> {
+    crate::identifiers::is_account_id(value)
+        .then_some(())
+        .ok_or(RefreshRequestError::InvalidRequest)
 }
 
 fn validate_actor(value: &str) -> Result<(), RefreshRequestError> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'@' | b'-')
-        })
-    {
-        Err(RefreshRequestError::InvalidRequest)
-    } else {
-        Ok(())
-    }
+    crate::identifiers::is_actor_id(value)
+        .then_some(())
+        .ok_or(RefreshRequestError::InvalidRequest)
 }
 
 fn validate_database_config(config: &Config) -> Result<(), RefreshRequestError> {
@@ -616,8 +602,8 @@ mod tests {
 
     #[test]
     fn identifiers_states_and_database_role_are_bounded() {
-        assert!(validate_identifier("account_a", 128).is_ok());
-        assert!(validate_identifier("bad/account", 128).is_err());
+        assert!(validate_account("account_a").is_ok());
+        assert!(validate_account("bad/account").is_err());
         assert!(validate_actor("manager@example.test").is_ok());
         assert!(validate_actor("bad actor").is_err());
         assert_eq!(parse_state("queued"), Ok(SalesRefreshState::Queued));

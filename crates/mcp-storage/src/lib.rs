@@ -17,17 +17,20 @@
 //!    session every other database operation needs.
 
 mod metrics;
+mod pool;
 
 use metrics::{SessionHold, SessionMetrics, SessionWait};
 pub use metrics::{SessionMetricsSnapshot, prometheus_metrics};
+pub use pool::SupervisedPool;
 
 use std::{
+    future::Future,
     ops::{Deref, DerefMut},
     time::Duration,
 };
 
 use tokio::{
-    sync::{Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard, SemaphorePermit},
     time::Instant,
 };
 use tokio_postgres::{Client, Config, NoTls};
@@ -146,12 +149,39 @@ impl SupervisedClient {
         }
     }
 
+    /// A supervised session that connects on first use.
+    ///
+    /// `config` must already be hardened. Pool members beyond the first are
+    /// lazy, so a pool never holds more sessions than its peak concurrency.
+    fn lazy(config: Config, component: &'static str) -> Self {
+        Self {
+            component,
+            config: Some(config),
+            metrics: SessionMetrics::default(),
+            slot: Mutex::new(ConnectionSlot {
+                client: None,
+                next_attempt_at: Instant::now(),
+            }),
+        }
+    }
+
     /// Borrows the live session, replacing a terminated one when possible.
     pub async fn acquire(&self) -> Result<ClientGuard<'_>, PostgresUnavailable> {
         let wait = SessionWait::new(&self.metrics);
-        let mut slot = self.slot.lock().await;
+        let slot = self.slot.lock().await;
         wait.acquired();
         let hold = SessionHold::new(&self.metrics);
+        self.ready(slot, hold, None).await
+    }
+
+    /// Completes an acquisition whose slot mutex is already held: drops a
+    /// terminated session and reconnects within the shared cooldown.
+    async fn ready<'a>(
+        &'a self,
+        mut slot: MutexGuard<'a, ConnectionSlot>,
+        hold: SessionHold<'a>,
+        permit: Option<SemaphorePermit<'a>>,
+    ) -> Result<ClientGuard<'a>, PostgresUnavailable> {
         if slot
             .client
             .as_ref()
@@ -184,7 +214,11 @@ impl SupervisedClient {
                 "PostgreSQL session re-established"
             );
         }
-        Ok(ClientGuard { slot, _hold: hold })
+        Ok(ClientGuard {
+            slot,
+            _hold: hold,
+            _permit: permit,
+        })
     }
 
     /// Reads this session's counters without acquiring its database mutex.
@@ -289,10 +323,49 @@ async fn connect_supervised(
     Ok(client)
 }
 
+/// Lends supervised sessions: one [`SupervisedClient`] or a [`SupervisedPool`].
+///
+/// Repository code generic over this trait runs unchanged against a single
+/// least-privilege session or a small pool of them.
+pub trait SessionSource: Send + Sync {
+    fn acquire(&self) -> impl Future<Output = Result<ClientGuard<'_>, PostgresUnavailable>> + Send;
+
+    fn verify_session_bounds(&self)
+    -> impl Future<Output = Result<(), PostgresUnavailable>> + Send;
+}
+
+impl SessionSource for SupervisedClient {
+    fn acquire(&self) -> impl Future<Output = Result<ClientGuard<'_>, PostgresUnavailable>> + Send {
+        Self::acquire(self)
+    }
+
+    fn verify_session_bounds(
+        &self,
+    ) -> impl Future<Output = Result<(), PostgresUnavailable>> + Send {
+        Self::verify_session_bounds(self)
+    }
+}
+
+impl SessionSource for SupervisedPool {
+    fn acquire(&self) -> impl Future<Output = Result<ClientGuard<'_>, PostgresUnavailable>> + Send {
+        Self::acquire(self)
+    }
+
+    fn verify_session_bounds(
+        &self,
+    ) -> impl Future<Output = Result<(), PostgresUnavailable>> + Send {
+        Self::verify_session_bounds(self)
+    }
+}
+
 /// An exclusive borrow of the live session.
+///
+/// Fields drop in order: the session mutex is released before a pool permit,
+/// so a caller woken by that permit always finds an idle member.
 pub struct ClientGuard<'a> {
     slot: MutexGuard<'a, ConnectionSlot>,
     _hold: SessionHold<'a>,
+    _permit: Option<SemaphorePermit<'a>>,
 }
 
 impl Deref for ClientGuard<'_> {

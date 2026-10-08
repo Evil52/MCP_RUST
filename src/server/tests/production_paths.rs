@@ -10,6 +10,33 @@ fn posting_sales_context_accepts_an_explicit_authorized_store() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn posting_sales_fallback_has_one_total_deadline_and_no_partial_result() {
+    use crate::server::tools::orders::bounded_posting_sales;
+
+    let store = StoreId::from("store_a");
+    let error = bounded_posting_sales(
+        &store,
+        Duration::from_secs(300),
+        std::future::pending::<Result<(), String>>(),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.starts_with("OZON_POSTING_SALES_FALLBACK_FAILED: kind=deadline; store=store_a."));
+    assert!(error.contains("300 с"));
+    assert_eq!(
+        bounded_posting_sales(&store, Duration::from_secs(1), async { Ok(()) }).await,
+        Ok(())
+    );
+    assert_eq!(
+        bounded_posting_sales(&store, Duration::from_secs(1), async {
+            Err("page".to_owned())
+        })
+        .await,
+        Err("page".to_owned())
+    );
+}
+
 #[test]
 fn posting_sales_context_rejects_blank_and_oversized_store_selectors() {
     let server = server();
@@ -30,23 +57,30 @@ fn posting_sales_context_rejects_blank_and_oversized_store_selectors() {
     }
 }
 
-#[tokio::test]
-async fn weekly_ranking_rejects_registry_identifiers_outside_reporting_scope() {
-    let repository = Arc::new(FakeReportingRepository::succeeding());
-    let server = reporting_edge_test_server("admin", repository.clone());
-    let error = reporting_tool_error(
-        server
-            .reporting_weekly_marketplace_ranking(
-                RequestIdentity::dev(),
-                Parameters(ReportingWeeklyMarketplaceRankingInput {
-                    date_from: Some("2026-08-24".to_owned()),
-                    date_to: Some("2026-08-30".to_owned()),
-                }),
-            )
-            .await,
+#[test]
+fn registry_identifiers_outside_reporting_scope_fail_before_any_tool_call() {
+    // Such an account used to load and then fail every reporting and audit
+    // call for it; the registry now refuses it once, at load.
+    let path = std::env::temp_dir().join(format!(
+        "mcp-ozon-reporting-scope-access-{}-{}.json",
+        std::process::id(),
+        REGISTRY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(
+        &path,
+        r#"{"version":1,
+            "actors":[{"id":"admin","name":"Administrator","role":"admin"}],
+            "accounts":[{"id":"bad.id","organization":"Invalid reporting ID",
+              "marketplace":"wildberries","seller_client_id":"43","manager_id":"admin",
+              "wildberries":{"api_token_env":"WB_BAD_TOKEN"}}]}"#,
+    )
+    .unwrap();
+    let error = RegistrySource::new(&path).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("идентификатор кабинета \"bad.id\""),
+        "{error:#}"
     );
-    assert!(error.starts_with(REPORTING_INVALID_REQUEST));
-    assert_eq!(repository.calls(), 0);
+    fs::remove_file(path).unwrap();
 }
 
 #[tokio::test]

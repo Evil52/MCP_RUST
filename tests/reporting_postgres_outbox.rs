@@ -74,7 +74,7 @@ fn disabled_policy(recipient_id: String) -> DailyReportPolicy {
             id: recipient_id,
             email_env: "DAILY_REPORT_PILOT_RECIPIENT_EMAIL".to_owned(),
             managers: vec![ManagerScope {
-                actor_id: "diana_serafimovich".to_owned(),
+                actor_id: "ozon_manager".to_owned(),
                 account_ids: std::iter::once("furnitura_dlya_doma".to_owned()).collect(),
             }],
         }],
@@ -93,12 +93,12 @@ async fn verify_report_worker_runtime(url: &str) {
     fs::create_dir_all(&artifact_root).unwrap();
     fs::write(
         &registry,
-        r#"{"version":1,"actors":[{"id":"diana_serafimovich","name":"Diana","role":"manager","oidc":{"username":"diana"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"diana_serafimovich","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY"}}]}"#,
+        r#"{"version":1,"actors":[{"id":"ozon_manager","name":"Diana","role":"manager","oidc":{"username":"diana"}}],"accounts":[{"id":"furnitura_dlya_doma","organization":"Ozon","marketplace":"ozon","seller_client_id":"1","manager_id":"ozon_manager","ozon":{"store_id":"ozon-1","client_id_env":"OZON_ID","api_key_env":"OZON_KEY"}}]}"#,
     )
     .unwrap();
     fs::write(
         &policy,
-        r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{"id":"pilot_owner","email_env":"DAILY_REPORT_PILOT_RECIPIENT_EMAIL","managers":[{"actor_id":"diana_serafimovich","account_ids":["furnitura_dlya_doma"]}]}]}"#,
+        r#"{"version":1,"enabled":false,"timezone":"Asia/Yekaterinburg","sender_email_env":"DAILY_REPORT_SENDER_EMAIL","audiences":[{"id":"pilot_owner","email_env":"DAILY_REPORT_PILOT_RECIPIENT_EMAIL","managers":[{"actor_id":"ozon_manager","account_ids":["furnitura_dlya_doma"]}]}]}"#,
     )
     .unwrap();
     let config = ReportWorkerConfig::from_lookup(|key| match key {

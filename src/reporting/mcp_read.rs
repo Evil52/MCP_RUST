@@ -14,6 +14,7 @@
 mod finance_ledger;
 mod repository;
 pub use repository::ReportingReadRepository;
+use repository::validate_reader_database;
 mod wb_report;
 pub use finance_ledger::{
     FinancialLedgerAmount, FinancialLedgerProvenance, FinancialLedgerRow, WbFinancialLedgerQuery,
@@ -72,9 +73,9 @@ use anyhow::{Result as AnyResult, anyhow};
 use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio_postgres::{Client, Config, Row, config::Host, types::FromSql};
+use tokio_postgres::{Client, Config, Row, types::FromSql};
 
-use crate::postgres::SupervisedClient;
+use crate::postgres::SupervisedPool;
 
 use super::{
     dataset::ReportDataset,
@@ -93,6 +94,9 @@ use super::{
 };
 
 const READER_COMPONENT: &str = "mcp-ozon-reporting-reader";
+/// Concurrent reporting sessions; the `position_reader` role allows 16 in total
+/// across the analytics servers and the Ozon Control position reader.
+const READER_SESSIONS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4).unwrap();
 const MAX_STATUS_ROWS: u16 = 50;
 const MAX_HISTORY_POINTS: u16 = 100;
 const MAX_READY_REPORTS: u16 = 100;
@@ -455,12 +459,12 @@ fn validate_runtime_contract(valid: bool) -> Result<(), ReportingReadError> {
 }
 
 struct PostgresReportingRepository {
-    client: SupervisedClient,
+    client: SupervisedPool,
 }
 
 impl PostgresReportingRepository {
     async fn connect(config: &Config) -> Result<Self, ReportingReadError> {
-        let client = SupervisedClient::connect(config, READER_COMPONENT)
+        let client = SupervisedPool::connect(config, READER_COMPONENT, READER_SESSIONS)
             .await
             .map_err(|_| ReportingReadError::Unavailable)?;
         let repository = Self { client };
@@ -471,7 +475,7 @@ impl PostgresReportingRepository {
     #[cfg(test)]
     fn from_client(client: tokio_postgres::Client) -> Self {
         Self {
-            client: SupervisedClient::preconnected(client, READER_COMPONENT),
+            client: SupervisedPool::preconnected(client, READER_COMPONENT),
         }
     }
 
@@ -1477,22 +1481,6 @@ impl PostgresReportingRepository {
             stocks,
             prices,
         })
-    }
-}
-
-fn validate_reader_database(config: &Config) -> Result<(), ReportingReadError> {
-    if config.get_user() == Some("position_reader")
-        && config
-            .get_password()
-            .is_some_and(|password| !password.is_empty())
-        && config.get_dbname().is_some_and(|value| !value.is_empty())
-        && config.get_hosts().len() == 1
-        && matches!(config.get_hosts(), [Host::Tcp(host)] if !host.trim().is_empty())
-        && config.get_options().is_none()
-    {
-        Ok(())
-    } else {
-        Err(ReportingReadError::InvalidRequest)
     }
 }
 

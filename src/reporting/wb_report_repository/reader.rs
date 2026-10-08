@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_postgres::{Client, Config};
 
-use crate::postgres::SupervisedClient;
+use crate::postgres::{SessionSource, SupervisedClient};
 use crate::reporting::{
     finance_reconciliation::WbFinanceComparisonEvidence, wb_finance_source::WbFinanceDetailRow,
     wb_official_reconciliation::WbOfficialComparison, wb_report_source::WbOfficialReportSummary,
@@ -78,7 +78,7 @@ impl PostgresWbReportReader {
 /// Account-scoped manifest and bounded detail page for the MCP reporting layer.
 /// Authentication is resolved before this function; no credentials are needed.
 pub async fn read_wb_official_report_page(
-    session: &SupervisedClient,
+    session: &impl SessionSource,
     account: &str,
     report_id: u64,
     after_rrd_id: u64,
@@ -115,7 +115,7 @@ fn validate_page(after_rrd_id: u64, limit: u32) -> Result<i64, WbReportRepositor
 }
 
 async fn read_report(
-    session: &SupervisedClient,
+    session: &impl SessionSource,
     account: &str,
     report: i64,
 ) -> Result<Option<StoredWbOfficialReport>, WbReportRepositoryError> {
@@ -131,7 +131,7 @@ async fn read_report(
 }
 
 async fn read_rows(
-    session: &SupervisedClient,
+    session: &impl SessionSource,
     account: &str,
     report: i64,
     cursor: i64,

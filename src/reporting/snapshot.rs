@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MAX_ACCOUNTS: usize = 64;
-const MAX_IDENTIFIER_BYTES: usize = 128;
 /// A manually recovered collection may finish after its logical cutoff.
 ///
 /// The scheduler still claims ordinary work only during its shorter
@@ -352,16 +351,9 @@ pub enum SnapshotError {
 }
 
 fn validate_identifier(value: &str) -> Result<(), SnapshotError> {
-    if value.is_empty()
-        || value.len() > MAX_IDENTIFIER_BYTES
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
-        Err(SnapshotError::InvalidSnapshot)
-    } else {
-        Ok(())
-    }
+    crate::identifiers::is_account_id(value)
+        .then_some(())
+        .ok_or(SnapshotError::InvalidSnapshot)
 }
 
 #[cfg(test)]

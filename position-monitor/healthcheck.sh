@@ -817,7 +817,7 @@ SELECT
           AND NOT rolinherit
           AND NOT rolreplication
           AND NOT rolbypassrls
-          AND rolconnlimit = 4
+          AND rolconnlimit = 12
     )
     AND NOT EXISTS (
         SELECT 1

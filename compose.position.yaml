@@ -52,6 +52,11 @@ services:
       start_period: 10s
 
   position-collector:
+    # A scaffold without a reviewed public-search provider: it can only run in
+    # disabled mode. Start it explicitly with `--profile position-collector`
+    # once a provider exists, instead of keeping an idle container and session.
+    profiles:
+      - position-collector
     image: ${MCP_POSITION_COLLECTOR_IMAGE:-mcp-ozon-position-collector:local}
     build:
       context: .
@@ -239,7 +244,10 @@ services:
     mem_limit: 192m
     cpus: 0.5
     pids_limit: 64
-    stop_grace_period: 10s
+    # A scheduled delivery attempt is bounded to 60 seconds and runs to its
+    # recorded outcome after SIGTERM; a shorter window would SIGKILL it and
+    # leave the claimed row `sending` for manual reconciliation.
+    stop_grace_period: 75s
     logging:
       driver: json-file
       options:

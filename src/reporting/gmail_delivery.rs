@@ -1,10 +1,12 @@
 //! Single-attempt Gmail delivery orchestration.
 //!
-//! Routing and artifact validation happen before OAuth. OAuth refresh happens
-//! before the sole Gmail send attempt. This layer never retries internally:
-//! callers may schedule a later attempt only for errors explicitly marked
-//! retry-safe, while an ambiguous send outcome must remain `sending` until an
-//! operator reconciles it.
+//! OAuth refresh is a separate step that callers run before claiming an outbox
+//! row, so a slow, failed or interrupted token exchange never strands a claimed
+//! delivery in `sending`. Routing and artifact validation then precede the
+//! sole Gmail send attempt. This layer never retries internally: callers may
+//! schedule a later attempt only for errors explicitly marked retry-safe,
+//! while an ambiguous send outcome must remain `sending` until an operator
+//! reconciles it.
 
 use std::{fmt, future::Future, pin::Pin, sync::Arc};
 
@@ -138,24 +140,31 @@ impl GmailDeliveryService {
         }
     }
 
-    /// Resolves, validates and sends one claimed report exactly once.
-    pub async fn deliver(
+    /// Refreshes the Gmail access token before any outbox row is claimed.
+    pub async fn authorize(
+        &self,
+        credentials: &GmailOAuthCredentials,
+    ) -> Result<GmailAccessToken, GmailDeliveryError> {
+        self.oauth
+            .refresh(credentials)
+            .await
+            .map_err(map_oauth_error)
+    }
+
+    /// Resolves, validates and sends one claimed report exactly once, using a
+    /// token obtained from [`Self::authorize`].
+    pub async fn send(
         &self,
         routing: &MailRouting,
-        credentials: &GmailOAuthCredentials,
         claim: &ClaimedDelivery,
         bundle: StoredReportBundle,
+        token: &GmailAccessToken,
     ) -> Result<GmailSendReceipt, GmailDeliveryError> {
         let route = routing
             .resolve(&claim.recipient_id)
             .map_err(|_| GmailDeliveryError::Routing)?;
         let email = build_report_email(route.sender(), route.recipient(), claim, bundle)
             .map_err(|_| GmailDeliveryError::Message)?;
-        let token = self
-            .oauth
-            .refresh(credentials)
-            .await
-            .map_err(map_oauth_error)?;
         self.messages
             .send(token.as_str(), &email)
             .await
@@ -359,8 +368,10 @@ mod tests {
         }));
         let service = GmailDeliveryService::for_test(oauth.clone(), messages.clone());
         let (directory, credentials) = credentials();
+        let token = service.authorize(&credentials).await.unwrap();
+        assert_eq!(messages.calls.load(Ordering::Relaxed), 0);
         let receipt = service
-            .deliver(&routing(), &credentials, &claim("owner"), bundle())
+            .send(&routing(), &claim("owner"), bundle(), &token)
             .await
             .unwrap();
         assert_eq!(receipt.provider_message_id, "message-1");
@@ -397,8 +408,9 @@ mod tests {
             messages: Arc::new(GmailClient::for_test(&send_url)),
         };
         let (directory, credentials) = credentials();
+        let token = service.authorize(&credentials).await.unwrap();
         let receipt = service
-            .deliver(&routing(), &credentials, &claim("owner"), bundle())
+            .send(&routing(), &claim("owner"), bundle(), &token)
             .await
             .unwrap();
         assert_eq!(receipt.provider_message_id, "local-message-1");
@@ -408,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_and_message_validation_stop_before_oauth_or_send() {
+    async fn routing_and_message_validation_stop_before_send() {
         for (claim, bundle, expected) in [
             (claim("foreign"), bundle(), GmailDeliveryError::Routing),
             (
@@ -425,16 +437,13 @@ mod tests {
                 provider_message_id: "unused".to_owned(),
             }));
             let service = GmailDeliveryService::for_test(oauth.clone(), messages.clone());
-            let (directory, credentials) = credentials();
+            let token = GmailAccessToken::for_test("access-token");
             assert_eq!(
-                service
-                    .deliver(&routing(), &credentials, &claim, bundle)
-                    .await,
+                service.send(&routing(), &claim, bundle, &token).await,
                 Err(expected)
             );
             assert_eq!(oauth.calls.load(Ordering::Relaxed), 0);
             assert_eq!(messages.calls.load(Ordering::Relaxed), 0);
-            fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -468,10 +477,7 @@ mod tests {
             }));
             let service = GmailDeliveryService::for_test(oauth, messages.clone());
             let (directory, credentials) = credentials();
-            let error = service
-                .deliver(&routing(), &credentials, &claim("owner"), bundle())
-                .await
-                .unwrap_err();
+            let error = service.authorize(&credentials).await.unwrap_err();
             assert_eq!(error, expected);
             assert_eq!(error.retry_safe(), retry_safe);
             assert!(!error.is_ambiguous());
@@ -518,8 +524,9 @@ mod tests {
             let messages = messages(Err(source));
             let service = GmailDeliveryService::for_test(oauth, messages.clone());
             let (directory, credentials) = credentials();
+            let token = service.authorize(&credentials).await.unwrap();
             let error = service
-                .deliver(&routing(), &credentials, &claim("owner"), bundle())
+                .send(&routing(), &claim("owner"), bundle(), &token)
                 .await
                 .unwrap_err();
             assert_eq!(error, expected);

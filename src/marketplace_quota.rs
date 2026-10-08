@@ -7,7 +7,10 @@
 use std::{
     fmt::{self, Write as _},
     str::FromStr,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -27,6 +30,15 @@ const REQUIRED_ENV: &str = "MCP_MARKETPLACE_QUOTA_REQUIRED";
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(6);
 const CONNECT_COOLDOWN: Duration = Duration::from_secs(5);
 const MAX_DELAY_MILLIS: u128 = 86_400_000;
+/// Longest vendor-directed cooldown written to the shared departure table.
+///
+/// `Retry-After` is an unauthenticated response header: a misconfigured CDN
+/// or WAF can return a year, and the database would then refuse every process
+/// using that credential until an administrator edits the row. The in-process
+/// gates already cap untrusted delays at one day, so the cross-process
+/// deadline uses the same ceiling. A longer request is logged and counted.
+const MAX_SHARED_COOLDOWN: Duration = Duration::from_hours(24);
+static CAPPED_COOLDOWNS: AtomicU64 = AtomicU64::new(0);
 // One supervised quota session per process, regardless of account/client count.
 // Environment configuration, like marketplace credentials, requires a restart.
 static ENV_QUOTA: LazyLock<SharedQuota> = LazyLock::new(|| {
@@ -288,6 +300,14 @@ impl SharedQuota {
         let Some(database) = self.database()? else {
             return Ok(());
         };
+        if delay > MAX_SHARED_COOLDOWN {
+            CAPPED_COOLDOWNS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                requested_seconds = delay.as_secs(),
+                applied_seconds = MAX_SHARED_COOLDOWN.as_secs(),
+                "vendor cooldown exceeds the shared quota ceiling and was capped"
+            );
+        }
         let millis = cooldown_millis(delay);
         timeout(
             OPERATION_TIMEOUT,
@@ -350,8 +370,25 @@ fn bounded_millis(duration: Duration) -> Result<i64, QuotaError> {
 }
 
 fn cooldown_millis(duration: Duration) -> i64 {
-    let millis = duration.as_nanos().div_ceil(1_000_000).max(1);
+    let millis = duration
+        .min(MAX_SHARED_COOLDOWN)
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .max(1);
     i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+/// Process-wide count of vendor cooldowns shortened to the shared ceiling.
+///
+/// Each one marks an upstream response that asked for more than a day; an
+/// operator should look at the endpoint and credential behind it.
+#[must_use]
+pub fn prometheus_metrics() -> String {
+    format!(
+        "# TYPE mcp_marketplace_quota_capped_cooldowns_total counter\n\
+         mcp_marketplace_quota_capped_cooldowns_total {}\n",
+        CAPPED_COOLDOWNS.load(Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]

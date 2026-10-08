@@ -25,6 +25,7 @@ use tokio::{
     signal,
     time::{MissedTickBehavior, timeout},
 };
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const DRY_RUN_TICK: std::time::Duration = std::time::Duration::from_secs(60);
@@ -277,10 +278,11 @@ async fn main() -> Result<()> {
                 canary_sent_at = %receipt.canary_sent_at,
                 "scheduled report generation and Gmail delivery started"
             );
-            tokio::select! {
-                result = run_delivery_scheduler(&config, &outbox, &snapshots, &delivery) => result?,
-                () = shutdown_signal() => {}
-            }
+            // Shutdown is cooperative here: generation is abandoned at once,
+            // but a delivery attempt in flight finishes first, so a restart
+            // never strands a claimed row in `sending`.
+            let shutdown = cancel_on_shutdown_signal();
+            run_delivery_scheduler(&config, &outbox, &snapshots, &delivery, &shutdown).await?;
         }
         _ => bail!("report-worker mode and policy enabled flag are inconsistent"),
     }
@@ -328,21 +330,34 @@ async fn run_dry_scheduler(
 /// Planning remains authoritative in PostgreSQL, so a restart inside a report
 /// deadline catches up ready work without creating a second occurrence. Each
 /// send is still delegated to the one-attempt coordinator: an ambiguous send
-/// stays `sending` and can never be claimed by a later tick.
+/// stays `sending` and can never be claimed by a later tick. After `shutdown`
+/// the loop claims no new delivery and returns once any attempt in flight has
+/// recorded its outcome.
 async fn run_delivery_scheduler(
     config: &ReportWorkerConfig,
     outbox: &PostgresOutboxRepository,
     snapshots: &PostgresSnapshotRepository,
     delivery: &GmailOutboxWorker,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     let mut timer = tokio::time::interval(DRY_RUN_TICK);
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut consecutive_failures = 0_u32;
     loop {
-        timer.tick().await;
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Ok(()),
+            _ = timer.tick() => {}
+        }
         let result = async {
-            run_scheduler_tick(config, outbox, snapshots, Utc::now()).await?;
-            run_delivery_tick(delivery).await
+            // Generation only writes immutable artifacts before its batch
+            // becomes ready, so abandoning it mid-pass is safe.
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return Ok(()),
+                result = run_scheduler_tick(config, outbox, snapshots, Utc::now()) => result?,
+            }
+            run_delivery_tick(delivery, shutdown).await
         }
         .await;
         match result {
@@ -364,8 +379,11 @@ async fn run_delivery_scheduler(
     }
 }
 
-async fn run_delivery_tick(delivery: &GmailOutboxWorker) -> Result<()> {
-    let outcome = delivery.deliver_ready().await?;
+async fn run_delivery_tick(
+    delivery: &GmailOutboxWorker,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    let outcome = delivery.deliver_ready(shutdown).await?;
     tracing::info!(
         attempts = outcome.attempts,
         queue_drained = outcome.queue_drained,
@@ -576,6 +594,18 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("preview output {} cannot be written", path.display()))?;
     file.sync_all()
         .with_context(|| format!("preview output {} cannot be synchronized", path.display()))
+}
+
+/// Returns a token cancelled by SIGTERM or Ctrl-C.
+fn cancel_on_shutdown_signal() -> CancellationToken {
+    let token = CancellationToken::new();
+    let signalled = token.clone();
+    std::mem::drop(tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown requested; finishing any delivery attempt in flight");
+        signalled.cancel();
+    }));
+    token
 }
 
 async fn shutdown_signal() {

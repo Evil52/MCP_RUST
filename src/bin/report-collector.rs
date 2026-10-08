@@ -8,7 +8,7 @@ use shutdown::shutdown_signal;
 mod background;
 
 use anyhow::{Context, Result, bail, ensure};
-use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use mcp_ozon::reporting::{
     ReportKey, ReportKind, business_date,
     collector_orchestrator::plan_due_collection,
@@ -468,11 +468,10 @@ async fn run_one_sales_refresh(
 /// overlap it. The pre-window reserve is the complete refresh deadline; the
 /// post-window reserve is the Seller analytics pacing interval.
 fn refresh_window_is_open(now: DateTime<Utc>) -> bool {
-    let offset = FixedOffset::east_opt(5 * 60 * 60).expect("EKB offset must be valid");
-    let local_seconds = now
-        .with_timezone(&offset)
-        .time()
-        .num_seconds_from_midnight();
+    let local_seconds = mcp_ozon::business_calendar::seconds_since_midnight(
+        mcp_ozon::business_calendar::yekaterinburg(),
+        now,
+    );
     let pre_window = u32::try_from(REPORT_TARGET_TOTAL_DEADLINE.as_secs())
         .expect("refresh deadline must fit in one day");
     let collection_window = u32::try_from(COLLECTION_COMPLETION_WINDOW.num_seconds())
@@ -570,11 +569,10 @@ async fn collect_sales_refresh_target(
 }
 
 fn refresh_period_start(date: NaiveDate) -> Result<DateTime<Utc>> {
-    let offset = FixedOffset::east_opt(5 * 60 * 60).context("EKB offset is invalid")?;
     let local = date
         .and_hms_opt(0, 0, 0)
         .context("refresh business date is invalid")?;
-    offset
+    mcp_ozon::business_calendar::yekaterinburg()
         .from_local_datetime(&local)
         .single()
         .map(|value| value.with_timezone(&Utc))

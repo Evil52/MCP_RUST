@@ -3,14 +3,16 @@ pub use policy::{
     ANALYTICS_DATA_PATH, PREVIEW_READ_ONLY_ENDPOINT_ALLOWLIST, READ_ONLY_ENDPOINT_ALLOWLIST,
     is_read_only_endpoint_allowed,
 };
+mod analytics_cache;
 mod attempt;
 mod checkpoint;
 mod quota;
+use analytics_cache::AnalyticsCache;
 
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{Arc, Weak},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -52,8 +54,6 @@ const ANALYTICS_RATE_LIMIT_MAX_COOLDOWN: Duration = Duration::from_secs(3_600);
 // vendor delays remain installed in the shared gate but are returned to the
 // caller instead of holding one collection attempt for an hour.
 const ANALYTICS_QUEUED_RETRY_BUDGET: Duration = Duration::from_secs(600);
-const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(300);
-const MAX_ANALYTICS_CACHE_ENTRIES: usize = 256;
 // Ozon can return a one-minute Retry-After for the read-only accrual ledger.
 // Reserve that bounded wait in the request deadline so the existing retry
 // policy can honor the upstream cooldown instead of failing a complete daily
@@ -382,59 +382,6 @@ impl RateLimiter {
     }
 }
 
-#[derive(Debug, Clone)]
-struct AnalyticsCacheEntry {
-    value: Value,
-    expires_at: Instant,
-}
-
-#[derive(Debug, Default)]
-struct AnalyticsCache {
-    entries: Mutex<BTreeMap<String, AnalyticsCacheEntry>>,
-    in_flight: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
-}
-
-impl AnalyticsCache {
-    async fn get(&self, key: &str) -> Option<Value> {
-        let now = Instant::now();
-        let mut entries = self.entries.lock().await;
-        entries.retain(|_, entry| entry.expires_at > now);
-        entries.get(key).map(|entry| entry.value.clone())
-    }
-
-    async fn coalescing_lock(&self, key: &str) -> Arc<Mutex<()>> {
-        let mut in_flight = self.in_flight.lock().await;
-        in_flight.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = in_flight.get(key).and_then(Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(Mutex::new(()));
-        in_flight.insert(key.to_owned(), Arc::downgrade(&lock));
-        lock
-    }
-
-    async fn insert(&self, key: String, value: Value) {
-        let now = Instant::now();
-        let mut entries = self.entries.lock().await;
-        entries.retain(|_, entry| entry.expires_at > now);
-        if entries.len() >= MAX_ANALYTICS_CACHE_ENTRIES
-            && let Some(oldest_key) = entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(key, _)| key.clone())
-        {
-            entries.remove(&oldest_key);
-        }
-        entries.insert(
-            key,
-            AnalyticsCacheEntry {
-                value,
-                expires_at: now + ANALYTICS_CACHE_TTL,
-            },
-        );
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnalyticsPacingMode {
     FailFast,
@@ -639,7 +586,7 @@ impl OzonClient {
             return Err(OzonError::EndpointNotAllowed(path.to_owned()));
         }
         if path == ANALYTICS_DATA_PATH {
-            let key = analytics_cache_key(store, &payload);
+            let key = analytics_cache::key(store, &payload);
             if let Some(value) = self.analytics_cache.get(&key).await {
                 return Ok(value);
             }
@@ -840,10 +787,6 @@ fn analytics_queued_retry_plan(
     retry_after
         .filter(|delay| *delay <= ANALYTICS_QUEUED_RETRY_BUDGET)
         .map(|delay| (delay, OzonErrorKind::RateLimited))
-}
-
-fn analytics_cache_key(store: &StoreId, payload: &Value) -> String {
-    format!("{store}\n{payload}")
 }
 
 /// A valid bounded Retry-After is a shared Client-Id quota signal even when
@@ -2339,26 +2282,8 @@ mod tests {
         assert_eq!(first.unwrap(), second.unwrap());
         assert_request_count(&requests, 1);
         assert_eq!(
-            analytics_cache_key(&store, &payload),
+            analytics_cache::key(&store, &payload),
             format!("ofk\n{payload}")
-        );
-    }
-
-    #[tokio::test]
-    async fn analytics_cache_evicts_the_oldest_entry_at_its_hard_capacity() {
-        let cache = AnalyticsCache::default();
-        for index in 0..=MAX_ANALYTICS_CACHE_ENTRIES {
-            cache
-                .insert(format!("key-{index:03}"), serde_json::json!(index))
-                .await;
-        }
-
-        assert!(cache.get("key-000").await.is_none());
-        assert_eq!(
-            cache
-                .get(&format!("key-{MAX_ANALYTICS_CACHE_ENTRIES:03}"))
-                .await,
-            Some(serde_json::json!(MAX_ANALYTICS_CACHE_ENTRIES))
         );
     }
 

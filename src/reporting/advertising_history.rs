@@ -41,11 +41,7 @@ impl HistoryGroup {
 
 pub fn validate_request(account: &str, from: Option<NaiveDate>, to: NaiveDate) -> Result<()> {
     ensure!(
-        !account.is_empty()
-            && account.len() <= 128
-            && account
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+        crate::identifiers::is_account_id(account),
         "invalid advertising history account"
     );
     let floor = NaiveDate::from_ymd_opt(2010, 1, 1).context("invalid archive floor")?;

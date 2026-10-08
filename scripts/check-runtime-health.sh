@@ -20,6 +20,9 @@ set -euo pipefail
 project_root="${MCP_OPS_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 position_env="${MCP_HEALTH_POSITION_ENV:-$project_root/.position.env}"
 backup_root="${MCP_BACKUP_DIR:-$HOME/MCP_OZON-backups}"
+disk_paths="${MCP_HEALTH_DISK_PATHS-/,$HOME}"
+disk_max_used_percent="${MCP_HEALTH_DISK_MAX_USED_PERCENT:-85}"
+disk_min_free_gib="${MCP_HEALTH_DISK_MIN_FREE_GIB:-20}"
 db_network="${MCP_HEALTH_DB_NETWORK:-mcp-ozon-position-internal}"
 db_host="${MCP_HEALTH_DB_HOST:-position-db}"
 compose_project="${MCP_HEALTH_COMPOSE_PROJECT:-mcp-ozon-position}"
@@ -48,6 +51,21 @@ tunnel_poll_stale_seconds="${MCP_HEALTH_TUNNEL_POLL_STALE_SECONDS:-90}"
 operations_resources="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 umask 077
+
+if [[ ! "$disk_max_used_percent" =~ ^[1-9][0-9]?$ ]] \
+  || [[ ! "$disk_min_free_gib" =~ ^[1-9][0-9]{0,5}$ ]] \
+  || [[ -z "$disk_paths" || "$disk_paths" == *, || "$disk_paths" == *,,* \
+    || "$disk_paths" == *$'\n'* || "$disk_paths" == *$'\r'* ]]; then
+  echo "health disk paths must be non-empty; used percent must be 1..99 and free GiB 1..999999" >&2
+  exit 2
+fi
+IFS=',' read -r -a disk_path_list <<<"$disk_paths"
+for disk_path in "${disk_path_list[@]}"; do
+  if [[ "$disk_path" != /* ]]; then
+    echo "MCP_HEALTH_DISK_PATHS must contain comma-separated absolute paths" >&2
+    exit 2
+  fi
+done
 
 for value in "$cycle_stale_seconds" "$backup_stale_seconds" "$restore_stale_seconds"; do
   if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
@@ -159,6 +177,37 @@ for hook in "$notify_command" "$heartbeat_command"; do
   if [[ -n "$hook" && (! -f "$hook" || ! -x "$hook" || "$hook" != /*) ]]; then
     echo "health hooks must each be one absolute executable file" >&2
     exit 2
+  fi
+done
+
+# Probe host filesystems before Docker so a full disk remains visible even
+# when the engine can no longer start. POSIX df works on both macOS and Linux.
+# Keep only fixed numeric columns: mount names may contain spaces.
+checked_filesystems=()
+for disk_path in "${disk_path_list[@]}"; do
+  if ! disk_evidence="$(LC_ALL=C df -Pk "$disk_path" 2>/dev/null)"; then
+    add_finding "disk space evidence is unavailable: $disk_path" "disk_unavailable/$disk_path"
+    continue
+  fi
+  disk_row="$(printf '%s\n' "$disk_evidence" | awk 'NR == 2 {print $1 "|" $2 "|" $4 "|" $5}')"
+  IFS='|' read -r filesystem total_kib free_kib used_percent <<<"$disk_row"
+  used_percent="${used_percent%\%}"
+  if [[ -z "$filesystem" || ! "$total_kib" =~ ^[0-9]+$ \
+    || ! "$free_kib" =~ ^[0-9]+$ || ! "$used_percent" =~ ^[0-9]+$ ]]; then
+    add_finding "disk space evidence is invalid: $disk_path" "disk_unavailable/$disk_path"
+    continue
+  fi
+  already_checked=false
+  for checked_filesystem in "${checked_filesystems[@]+"${checked_filesystems[@]}"}"; do
+    if [[ "$checked_filesystem" == "$filesystem" ]]; then
+      already_checked=true
+      break
+    fi
+  done
+  [[ "$already_checked" == true ]] && continue
+  checked_filesystems+=("$filesystem")
+  if ((used_percent >= disk_max_used_percent || free_kib < disk_min_free_gib * 1048576)); then
+    add_finding "disk space is low: $disk_path ($used_percent% used, $((free_kib / 1048576)) GiB available; limits $disk_max_used_percent% / $disk_min_free_gib GiB)" "disk_low/$filesystem"
   fi
 done
 
@@ -451,6 +500,19 @@ WHERE status='active';
 
 SELECT 'stalled|' || stall_kind || '|' || reference
 FROM daily_reporting.stalled_report_work;
+
+-- A vendor cooldown longer than an hour silently stops every process sharing
+-- that seller quota. Only counts leave the database: quota keys are opaque.
+SELECT 'quota_cooldown|' || count(*)::text || '|' || CASE
+           WHEN bool_or(next_allowed_at = 'infinity'::timestamptz) THEN 'infinity'
+           ELSE GREATEST(
+               0,
+               EXTRACT(EPOCH FROM (max(next_allowed_at) - now()))
+           )::bigint::text
+       END
+FROM marketplace_quota.departures
+WHERE next_allowed_at > now() + interval '1 hour'
+HAVING count(*) > 0;
 SQL
     if [[ "$reporting_scope" != '[]' ]]; then
       printf 'PREPARE reporting_health(text, timestamptz) AS\n'
@@ -492,6 +554,18 @@ while IFS= read -r row; do
       ;;
     reporting\|*)
       add_finding "daily report collection requires attention: ${row#reporting|}"
+      ;;
+    quota_cooldown\|*)
+      IFS='|' read -r _ count remaining <<<"$row"
+      if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        add_finding "marketplace quota returned invalid cooldown evidence"
+      elif [[ "$remaining" == infinity ]]; then
+        add_finding "marketplace quota has $count cooldown(s) over 1h, one without an end; see docs/fail-closed-gates.md" "quota_cooldown"
+      elif [[ "$remaining" =~ ^[0-9]+$ ]]; then
+        add_finding "marketplace quota has $count cooldown(s) over 1h, the longest ends in $((remaining / 60)) minutes" "quota_cooldown"
+      else
+        add_finding "marketplace quota returned invalid cooldown evidence"
+      fi
       ;;
     cycle_age\|none)
       add_finding "WB robot has never recorded a cycle"

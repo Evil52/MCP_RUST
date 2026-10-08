@@ -46,8 +46,8 @@ macro_rules! period_input {
 
 period_input!(
     PostingListInput,
-    "Начало периода в формате YYYY-MM-DD",
-    "Конец периода в формате YYYY-MM-DD",
+    "Начало периода в формате YYYY-MM-DD; сутки UTC, с 00:00:00Z",
+    "Конец периода в формате YYYY-MM-DD; сутки UTC, по 23:59:59.999Z",
     {
     #[serde(default)]
     #[schemars(length(max = 128))]
@@ -74,8 +74,8 @@ period_input!(
 
 period_input!(
     PostingSalesFallbackInput,
-    "Начало периода отправлений в формате YYYY-MM-DD",
-    "Конец периода отправлений в формате YYYY-MM-DD",
+    "Начало периода отправлений в формате YYYY-MM-DD; сутки UTC, с 00:00:00Z",
+    "Конец периода отправлений в формате YYYY-MM-DD; сутки UTC, по 23:59:59.999Z",
     {}
 );
 
@@ -98,8 +98,8 @@ pub struct PostingGetInput {
 
 period_input!(
     FbsUnfulfilledInput,
-    "Начало периода изменения статуса в формате YYYY-MM-DD",
-    "Конец периода изменения статуса в формате YYYY-MM-DD",
+    "Начало периода изменения статуса в формате YYYY-MM-DD; сутки UTC, с 00:00:00Z",
+    "Конец периода изменения статуса в формате YYYY-MM-DD; сутки UTC, по 23:59:59.999Z",
     {
     #[serde(default)]
     #[schemars(length(max = 4_096))]
@@ -167,8 +167,8 @@ impl ReturnSchema {
 
 period_input!(
     ReturnsInput,
-    "Начало периода изменения статуса в формате YYYY-MM-DD",
-    "Конец периода изменения статуса в формате YYYY-MM-DD",
+    "Начало периода изменения статуса в формате YYYY-MM-DD; сутки UTC, с 00:00:00Z",
+    "Конец периода изменения статуса в формате YYYY-MM-DD; сутки UTC, по 23:59:59.999Z",
     {
     #[serde(default)]
     pub return_schema: ReturnSchema,
@@ -193,8 +193,8 @@ pub(super) const fn default_returns_limit() -> u32 {
 
 period_input!(
     RfbsReturnsInput,
-    "Начало периода создания возврата в формате YYYY-MM-DD",
-    "Конец периода создания возврата в формате YYYY-MM-DD",
+    "Начало периода создания возврата в формате YYYY-MM-DD; сутки UTC, с 00:00:00Z",
+    "Конец периода создания возврата в формате YYYY-MM-DD; сутки UTC, по 23:59:59.999Z",
     {
     #[serde(default)]
     #[schemars(length(max = 256))]
@@ -220,8 +220,8 @@ pub(super) const fn default_rfbs_returns_limit() -> u32 {
 
 period_input!(
     FinanceInput,
-    "Начало периода в формате YYYY-MM-DD",
-    "Конец периода в формате YYYY-MM-DD",
+    "Начало периода в формате YYYY-MM-DD; сутки UTC, с 00:00:00Z",
+    "Конец периода в формате YYYY-MM-DD; сутки UTC, по 23:59:59.999Z",
     {
     #[serde(default)]
     #[schemars(length(max = 256))]
@@ -255,8 +255,8 @@ pub(super) const fn default_finance_page_size() -> u32 {
 
 period_input!(
     FinanceTotalsInput,
-    "Начало периода в формате YYYY-MM-DD",
-    "Конец периода в формате YYYY-MM-DD",
+    "Начало периода в формате YYYY-MM-DD; сутки UTC, с 00:00:00Z",
+    "Конец периода в формате YYYY-MM-DD; сутки UTC, по 23:59:59.999Z",
     {
     #[serde(default)]
     #[schemars(length(max = 256))]

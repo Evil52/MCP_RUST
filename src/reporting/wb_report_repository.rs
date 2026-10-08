@@ -10,7 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio_postgres::{Client, Config, error::SqlState};
 
-use crate::postgres::SupervisedClient;
+use crate::postgres::{SessionSource, SupervisedClient};
 
 use super::{
     finance_reconciliation::WbFinanceComparisonEvidence,
@@ -140,7 +140,7 @@ fn publication_payload(
 }
 
 async fn verify_contract(
-    session: &SupervisedClient,
+    session: &impl SessionSource,
     writer: bool,
 ) -> Result<(), WbReportRepositoryError> {
     session.verify_session_bounds().await.map_err(unavailable)?;

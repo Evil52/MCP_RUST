@@ -5,7 +5,7 @@ pub(super) mod advertising_history;
 mod directory;
 mod finance;
 mod operational_reads;
-mod orders;
+pub(super) mod orders;
 mod ozon_advertising;
 mod ozon_catalog;
 mod ozon_search;

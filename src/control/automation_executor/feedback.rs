@@ -10,7 +10,6 @@ pub(super) const PACING_LOWER_BASIS_POINTS: u128 = 8_000;
 pub(super) const PACING_UPPER_BASIS_POINTS: u128 = 12_000;
 pub(super) const BASIS_POINTS: u128 = 10_000;
 pub(super) const SECONDS_PER_DAY: u64 = 86_400;
-pub(super) const MOSCOW_OFFSET_SECONDS: i64 = 3 * 60 * 60;
 
 pub(super) struct TrafficFrontierFeedback {
     pub(super) metrics: super::super::automation::WbAutomationCampaignMetrics,
@@ -370,11 +369,11 @@ pub(super) fn campaign_drr_basis_points(
 }
 
 pub(super) fn paced_value(total: u64, observed_at: DateTime<Utc>) -> u64 {
-    let seconds = (observed_at.timestamp() + MOSCOW_OFFSET_SECONDS)
-        .rem_euclid(i64::try_from(SECONDS_PER_DAY).expect("seconds per day fit i64"));
-    let elapsed = u64::try_from(seconds)
-        .expect("Moscow seconds-of-day are non-negative and fit u64")
-        .max(300);
+    let elapsed = u64::from(crate::business_calendar::seconds_since_midnight(
+        crate::business_calendar::moscow(),
+        observed_at,
+    ))
+    .max(300);
     let value = u128::from(total) * u128::from(elapsed) / u128::from(SECONDS_PER_DAY);
     u64::try_from(value.max(1)).expect("paced value cannot exceed its u64 total")
 }

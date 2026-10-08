@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use chrono::{FixedOffset, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use mcp_ozon::reporting::finance_reconciliation::WbFinanceReportPeriod;
 
 #[derive(Clone, Copy)]
@@ -220,9 +220,7 @@ fn date(raw: &str) -> Result<NaiveDate> {
 }
 
 pub fn moscow_today() -> NaiveDate {
-    Utc::now()
-        .with_timezone(&FixedOffset::east_opt(3 * 3_600).expect("Moscow offset"))
-        .date_naive()
+    mcp_ozon::business_calendar::date_in(mcp_ozon::business_calendar::moscow(), Utc::now())
 }
 
 pub const fn period_name(period: WbFinanceReportPeriod) -> &'static str {
