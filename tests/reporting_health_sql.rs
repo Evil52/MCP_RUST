@@ -195,6 +195,58 @@ async fn reporting_health_checks_cutoff_boundaries_completeness_and_failed_work(
             "reporting|wb_one|wildberries|source_collection_stalled|stocks",
         ]
     );
+    // Completed retries replace old operational failures. Optional FBS may
+    // still contain unknown values; it never completes a required source.
+    client.batch_execute("INSERT INTO source_collection_jobs VALUES
+        ('ozon_one','ozon','advertising','2026-09-07T04:10:00Z','published',NULL,NULL,NULL),
+        ('wb_one','wildberries','stocks','2026-09-07T04:10:00Z','published',NULL,NULL,NULL),
+        ('wb_one','wildberries','seller_stocks','2026-09-07T03:00:00Z','failed',NULL,NULL,'response_too_large'),
+        ('wb_one','wildberries','seller_stocks','2026-09-07T04:10:00Z','published',NULL,NULL,'seller_missing_values');").await.unwrap();
+    assert!(
+        findings(&client, &sql, "2026-09-07T04:20:00Z")
+            .await
+            .is_empty()
+    );
+    // Future queued work cannot hide a current failure or expired lease.
+    client
+        .batch_execute(
+            "UPDATE source_collection_jobs SET status='failed',error_class='invalid_response'
+        WHERE account_id='ozon_one' AND cutoff_at='2026-09-07T04:10:00Z';
+        UPDATE source_collection_jobs SET status='running',lease_until='2026-09-07T04:17:00Z'
+        WHERE source='stocks' AND cutoff_at='2026-09-07T04:10:00Z';
+        INSERT INTO source_collection_jobs VALUES
+        ('ozon_one','ozon','advertising','2026-09-07T12:00:00Z','ready',NULL,NULL,NULL),
+        ('wb_one','wildberries','stocks','2026-09-07T12:00:00Z','ready',NULL,NULL,NULL);",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        findings(&client, &sql, "2026-09-07T04:20:00Z").await,
+        [
+            "reporting|ozon_one|ozon|source_collection_failed|advertising|invalid_response",
+            "reporting|wb_one|wildberries|source_collection_stalled|stocks",
+        ]
+    );
+    // A successful newer attempt cannot conceal incomplete required cutoff
+    // coverage, including a partial publication or an unfinished paginator.
+    client
+        .batch_execute(
+            "UPDATE source_collection_jobs SET status='published'
+        WHERE cutoff_at='2026-09-07T04:10:00Z';
+        UPDATE source_snapshots SET status='partial'
+        WHERE account_id='wb_one' AND source='sales' AND cutoff_at='2026-09-07T03:00:00Z';
+        UPDATE source_snapshots SET pagination_complete=false
+        WHERE account_id='ozon_one' AND source='finance' AND cutoff_at='2026-09-07T03:00:00Z';",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        findings(&client, &sql, "2026-09-07T04:20:00Z").await,
+        [
+            "reporting|ozon_one|ozon|cutoff_incomplete|2026-09-07T03:00:00Z|missing=finance",
+            "reporting|wb_one|wildberries|cutoff_incomplete|2026-09-07T03:00:00Z|missing=sales",
+        ]
+    );
     drop(client);
     driver.await.unwrap();
 }

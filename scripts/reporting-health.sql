@@ -47,6 +47,16 @@ WITH clock AS (
         ORDER BY request.requested_at DESC, request.id DESC
         LIMIT 1
     ) AS refresh
+), latest_source_jobs AS (
+    -- A fresh attempt supersedes the operational state of an older attempt.
+    -- The required cutoff's immutable snapshot coverage is checked separately.
+    SELECT DISTINCT ON (job.account_id, job.marketplace, job.source) job.*
+    FROM daily_reporting.source_collection_jobs AS job
+    JOIN accounts USING (account_id, marketplace)
+    CROSS JOIN expected
+    WHERE job.cutoff_at >= expected.cutoff_at
+      AND job.cutoff_at <= expected.checked_at
+    ORDER BY job.account_id, job.marketplace, job.source, job.cutoff_at DESC
 ), findings AS (
     SELECT coverage.account_id, coverage.marketplace,
            'cutoff_incomplete'::text AS finding,
@@ -70,14 +80,12 @@ WITH clock AS (
     UNION ALL
     SELECT job.account_id,job.marketplace,'source_collection_failed',
            job.source || '|' || COALESCE(job.error_class,'unknown')
-    FROM daily_reporting.source_collection_jobs job
-    JOIN accounts USING(account_id,marketplace) CROSS JOIN expected
-    WHERE job.status='failed' AND job.cutoff_at>=expected.cutoff_at
+    FROM latest_source_jobs AS job
+    WHERE job.status='failed'
     UNION ALL
     SELECT job.account_id,job.marketplace,'source_collection_stalled',job.source
-    FROM daily_reporting.source_collection_jobs job
-    JOIN accounts USING(account_id,marketplace) CROSS JOIN expected
-    WHERE job.cutoff_at>=expected.cutoff_at AND (
+    FROM latest_source_jobs AS job CROSS JOIN expected
+    WHERE (
         (job.status='running' AND job.lease_until<expected.checked_at-interval '2 minutes') OR
         (job.status='ready' AND job.next_attempt_at<expected.checked_at-interval '15 minutes'))
     UNION ALL
