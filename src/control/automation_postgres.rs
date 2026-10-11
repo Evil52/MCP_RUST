@@ -13,6 +13,8 @@ mod launch;
 #[cfg(test)]
 mod mapping_tests;
 mod policy_transition;
+use policy_transition::PolicyTransition;
+mod recommendations;
 mod resolution;
 mod state_read;
 mod v4_corridor;
@@ -131,75 +133,6 @@ pub struct WbAutomationReservationReceipt {
 pub struct WbAutomationStateTransitionReceipt {
     pub changed: bool,
     pub state_revision: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PolicyTransition {
-    ProtectiveLive,
-    BidWrites,
-    BoundedPacingActivated {
-        from_max_bid_kopecks: u64,
-        to_max_bid_kopecks: u64,
-        target_impressions_per_day: u64,
-    },
-    TrafficFrontierV2Activated {
-        from_max_bid_kopecks: u64,
-        to_max_bid_kopecks: u64,
-        frontier_bid_kopecks: u64,
-        max_actions_per_day: u32,
-        cooldown_seconds: u32,
-        feedback_timeout_seconds: u32,
-    },
-    TrafficFrontierV3Activated {
-        target_impressions_per_day: u64,
-        target_orders_per_day: u64,
-        max_actions_per_day: u32,
-        cooldown_seconds: u32,
-        feedback_timeout_seconds: u32,
-        min_feedback_impressions: u64,
-        min_feedback_clicks: u64,
-    },
-    TrafficFrontierV4Activated {
-        target_drr_basis_points: u32,
-        hard_drr_basis_points: u32,
-        frontier_bid_kopecks: u64,
-        bid_step_percent: u8,
-        target_impressions_per_day: u64,
-        target_orders_per_day: u64,
-        max_actions_per_day: u32,
-        cooldown_seconds: u32,
-        feedback_timeout_seconds: u32,
-        min_feedback_impressions: u64,
-        min_feedback_clicks: u64,
-    },
-    TrafficFrontierLimitsRaised {
-        from_frontier_bid_kopecks: u64,
-        to_frontier_bid_kopecks: u64,
-        from_daily_pause_threshold_minor: u64,
-        to_daily_pause_threshold_minor: u64,
-        from_daily_spend_cap_minor: u64,
-        to_daily_spend_cap_minor: u64,
-    },
-    TrafficFrontierCorridorTightened {
-        from_frontier_bid_kopecks: u64,
-        to_frontier_bid_kopecks: u64,
-        from_max_bid_kopecks: u64,
-        to_max_bid_kopecks: u64,
-    },
-    AuthorizedCorridorAdjusted {
-        from_min_bid_kopecks: u64,
-        to_min_bid_kopecks: u64,
-        from_max_bid_kopecks: u64,
-        to_max_bid_kopecks: u64,
-    },
-    /// The reviewed v4 change raises the floor to 7 RUB and the ceiling to
-    /// 12 RUB without resetting any protective runtime state.
-    TrafficFrontierV4CorridorAdjusted {
-        from_min_bid_kopecks: u64,
-        to_min_bid_kopecks: u64,
-        from_max_bid_kopecks: u64,
-        to_max_bid_kopecks: u64,
-    },
 }
 
 #[derive(Debug)]
