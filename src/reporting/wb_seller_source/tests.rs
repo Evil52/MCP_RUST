@@ -520,7 +520,7 @@ async fn oversized_single_card_remains_an_error_without_inventory_publication() 
         .extend((0..7).map(|_| Err(SourceFailure::from("response_too_large"))));
     let error = fixture.source(None).collect().await.unwrap_err();
     assert_eq!(error.code, "response_too_large");
-    let calls = fixture.calls.lock().unwrap();
+    let calls = fixture.calls.lock().unwrap().clone();
     assert_eq!(
         calls
             .card_cursors
