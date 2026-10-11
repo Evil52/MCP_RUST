@@ -1,7 +1,11 @@
 mod corridor;
+mod identity;
 mod observation;
+mod recommendations;
 pub use corridor::validate_wb_automation_corridor_update;
+use identity::valid_policy_identity;
 use observation::validate_observation;
+pub use recommendations::validate_wb_automation_recommendations_update;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,6 +35,11 @@ pub struct WbAutomationPolicy {
     pub campaign_name: String,
     pub payment_type: String,
     pub placement: String,
+    /// Opt in to enabled, unmanaged recommendations at this exact bid for every
+    /// allowed SKU. Bid writes remain search-only; absence keeps the legacy
+    /// search-only contract and its serialized policy digest unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_recommendation_bid_kopecks: Option<u64>,
     pub timezone: String,
     pub authorized_by_actor_id: String,
     pub authorization_reference: String,
@@ -599,26 +608,6 @@ fn validate_policy(policy: &WbAutomationPolicy) -> Result<(), WbAutomationDecisi
     Ok(())
 }
 
-fn valid_policy_identity(policy: &WbAutomationPolicy) -> bool {
-    let account_id_valid = !policy.account_id.is_empty()
-        && policy.account_id.len() <= 128
-        && policy
-            .account_id
-            .bytes()
-            .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
-    let campaign_name_valid = !policy.campaign_name.is_empty()
-        && policy.campaign_name.len() <= 128
-        && policy.campaign_name.trim() == policy.campaign_name
-        && !policy.campaign_name.chars().any(char::is_control);
-    policy.policy_version == "wb_ads_robot.v1"
-        && policy.payment_type == "cpc"
-        && policy.placement == "search"
-        && policy.timezone == "Europe/Moscow"
-        && account_id_valid
-        && campaign_name_valid
-        && policy.campaign_id != 0
-}
-
 fn valid_policy_authorization(policy: &WbAutomationPolicy) -> bool {
     valid_identifier(&policy.authorized_by_actor_id)
         && !policy.authorization_reference.is_empty()
@@ -864,6 +853,7 @@ mod tests {
             campaign_name: "Робот".to_owned(),
             payment_type: "cpc".to_owned(),
             placement: "search".to_owned(),
+            expected_recommendation_bid_kopecks: None,
             timezone: "Europe/Moscow".to_owned(),
             authorized_by_actor_id: "rustam_magasumov".to_owned(),
             authorization_reference: "chat/2026-08-24/safe-auto-robot".to_owned(),

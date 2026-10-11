@@ -3,7 +3,9 @@ use super::super::{
     build_observer,
 };
 use anyhow::{Context, ensure};
-use mcp_ozon::control::validate_wb_automation_corridor_update;
+use mcp_ozon::control::{
+    validate_wb_automation_corridor_update, validate_wb_automation_recommendations_update,
+};
 use std::str::FromStr;
 
 #[expect(
@@ -11,10 +13,16 @@ use std::str::FromStr;
     reason = "the campaign lease is explicitly consumed by async release after preflight and transition"
 )]
 pub async fn run(args: &[String]) -> Result<()> {
+    let recommendations = args.first().map(String::as_str) == Some("authorize-recommendations-pg");
+    let confirmation = if recommendations {
+        "--confirm-authorized-recommendations"
+    } else {
+        "--confirm-authorized-corridor"
+    };
     ensure!(
         (args.len() == 7 || args.len() == 8)
-            && args.last().map(String::as_str) == Some("--confirm-authorized-corridor"),
-        "usage: wb-automation authorize-corridor-pg SOURCE.json TARGET.json ACCESS.json READ_TOKEN true|false [READER_PROXY] --confirm-authorized-corridor"
+            && args.last().map(String::as_str) == Some(confirmation),
+        "usage: wb-automation authorize-corridor-pg|authorize-recommendations-pg SOURCE.json TARGET.json ACCESS.json READ_TOKEN true|false [READER_PROXY] {confirmation}"
     );
     let allow_broad_reader = match args[5].as_str() {
         "true" => true,
@@ -32,7 +40,15 @@ pub async fn run(args: &[String]) -> Result<()> {
     let source = build_observer(&options)?;
     options.policy = PathBuf::from(&args[2]);
     let target = build_observer(&options)?;
-    validate_wb_automation_corridor_update(source.policy(), target.policy(), Utc::now())?;
+    if recommendations {
+        validate_wb_automation_recommendations_update(
+            source.policy(),
+            target.policy(),
+            Utc::now(),
+        )?;
+    } else {
+        validate_wb_automation_corridor_update(source.policy(), target.policy(), Utc::now())?;
+    }
     let database_url = std::env::var(super::super::DATABASE_URL_ENV)
         .context("WB automation PostgreSQL URL is unavailable")?;
     let config =
@@ -42,27 +58,40 @@ pub async fn run(args: &[String]) -> Result<()> {
     let mut lease = store
         .try_acquire_campaign(&target.policy().account_id, target.policy().campaign_id)
         .await?
-        .context("WB authorized corridor campaign lock is contended")?;
+        .context("WB authorized policy campaign lock is contended")?;
     // Pure preflight; the later scheduled write loads real durable guards and
     // re-observes WB through the normal executor.
     let snapshot = target
         .observe(Utc::now(), WbAutomationStateView::default())
         .await
-        .context("WB authorized corridor read-only preflight failed")?;
-    let receipt = lease
-        .authorize_corridor_policy(source.policy(), target.policy(), Utc::now())
-        .await?;
+        .context("WB authorized policy read-only preflight failed")?;
+    ensure!(
+        !recommendations || snapshot.observation.daily_spend_complete,
+        "WB authorized policy preflight requires complete current-day spend"
+    );
+    let receipt = if recommendations {
+        lease
+            .authorize_recommendations_policy(source.policy(), target.policy(), Utc::now())
+            .await?
+    } else {
+        lease
+            .authorize_corridor_policy(source.policy(), target.policy(), Utc::now())
+            .await?
+    };
     lease.release().await?;
     println!(
         "{}",
         serde_json::json!({
             "account_id": target.policy().account_id, "campaign_id": target.policy().campaign_id,
-            "outcome": if receipt.changed { "authorized_corridor_adjusted" } else { "authorized_corridor_already_active" },
+            "outcome": if recommendations {
+                if receipt.changed { "recommendations_authorized" } else { "recommendations_already_authorized" }
+            } else if receipt.changed { "authorized_corridor_adjusted" } else { "authorized_corridor_already_active" },
             "state_revision": receipt.state_revision,
             "source_policy_sha256": source.policy_sha256(), "target_policy_sha256": target.policy_sha256(),
             "authorization_reference": target.policy().authorization_reference,
             "authorization_expires_at": target.policy().authorization_expires_at,
             "min_bid_kopecks": target.policy().min_bid_kopecks, "max_bid_kopecks": target.policy().max_bid_kopecks,
+            "expected_recommendation_bid_kopecks": target.policy().expected_recommendation_bid_kopecks,
             "preflight_decision": snapshot.decision,
         })
     );

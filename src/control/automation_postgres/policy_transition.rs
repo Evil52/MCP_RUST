@@ -1,13 +1,87 @@
 use super::{
-    AuditEvent, PolicyTransition, WbAutomationCampaignLease, WbAutomationPostgresError,
+    AuditEvent, WbAutomationCampaignLease, WbAutomationPostgresError,
     WbAutomationStateTransitionReceipt, audit_event_key, ensure_one_row,
     ensure_protective_live_guard, insert_audit_event, validate_digest,
 };
 use crate::control::WbAutomationPolicy;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PolicyTransition {
+    RecommendationsAuthorized {
+        from_bid_kopecks: Option<u64>,
+        to_bid_kopecks: u64,
+    },
+    ProtectiveLive,
+    BidWrites,
+    BoundedPacingActivated {
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+        target_impressions_per_day: u64,
+    },
+    TrafficFrontierV2Activated {
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+        frontier_bid_kopecks: u64,
+        max_actions_per_day: u32,
+        cooldown_seconds: u32,
+        feedback_timeout_seconds: u32,
+    },
+    TrafficFrontierV3Activated {
+        target_impressions_per_day: u64,
+        target_orders_per_day: u64,
+        max_actions_per_day: u32,
+        cooldown_seconds: u32,
+        feedback_timeout_seconds: u32,
+        min_feedback_impressions: u64,
+        min_feedback_clicks: u64,
+    },
+    TrafficFrontierV4Activated {
+        target_drr_basis_points: u32,
+        hard_drr_basis_points: u32,
+        frontier_bid_kopecks: u64,
+        bid_step_percent: u8,
+        target_impressions_per_day: u64,
+        target_orders_per_day: u64,
+        max_actions_per_day: u32,
+        cooldown_seconds: u32,
+        feedback_timeout_seconds: u32,
+        min_feedback_impressions: u64,
+        min_feedback_clicks: u64,
+    },
+    TrafficFrontierLimitsRaised {
+        from_frontier_bid_kopecks: u64,
+        to_frontier_bid_kopecks: u64,
+        from_daily_pause_threshold_minor: u64,
+        to_daily_pause_threshold_minor: u64,
+        from_daily_spend_cap_minor: u64,
+        to_daily_spend_cap_minor: u64,
+    },
+    TrafficFrontierCorridorTightened {
+        from_frontier_bid_kopecks: u64,
+        to_frontier_bid_kopecks: u64,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+    },
+    AuthorizedCorridorAdjusted {
+        from_min_bid_kopecks: u64,
+        to_min_bid_kopecks: u64,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+    },
+    /// The reviewed v4 change raises the floor to 7 RUB and the ceiling to
+    /// 12 RUB without resetting any protective runtime state.
+    TrafficFrontierV4CorridorAdjusted {
+        from_min_bid_kopecks: u64,
+        to_min_bid_kopecks: u64,
+        from_max_bid_kopecks: u64,
+        to_max_bid_kopecks: u64,
+    },
+}
+
 impl PolicyTransition {
     pub(super) const fn event_type(self) -> &'static str {
         match self {
+            Self::RecommendationsAuthorized { .. } => "recommendations_authorized",
             Self::ProtectiveLive => "protective_live_activated",
             Self::AuthorizedCorridorAdjusted { .. } => "authorized_corridor_adjusted",
             Self::BidWrites => "bid_writes_activated",
@@ -27,6 +101,7 @@ impl PolicyTransition {
         match self {
             Self::ProtectiveLive => "protective_live",
             Self::AuthorizedCorridorAdjusted { .. }
+            | Self::RecommendationsAuthorized { .. }
             | Self::BidWrites
             | Self::BoundedPacingActivated { .. }
             | Self::TrafficFrontierV2Activated { .. }
@@ -216,6 +291,16 @@ impl WbAutomationCampaignLease<'_> {
             "bid_writes_enabled": transition.bid_writes_enabled(),
             "state_revision": next_revision,
         });
+        if let PolicyTransition::RecommendationsAuthorized {
+            from_bid_kopecks,
+            to_bid_kopecks,
+        } = transition
+        {
+            payload["from_expected_recommendation_bid_kopecks"] = from_bid_kopecks.into();
+            payload["to_expected_recommendation_bid_kopecks"] = to_bid_kopecks.into();
+            payload["managed_bid_placement"] = "search".into();
+            payload["recommendation_bid_writes_enabled"] = false.into();
+        }
         if let Some((from_max_bid_kopecks, to_max_bid_kopecks)) = transition.max_bid_change() {
             payload["from_max_bid_kopecks"] = from_max_bid_kopecks.into();
             payload["to_max_bid_kopecks"] = to_max_bid_kopecks.into();

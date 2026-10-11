@@ -41,7 +41,7 @@ pub(in crate::control) fn parse_campaign(
             && advert
                 .pointer("/settings/placements/recommendations")
                 .and_then(Value::as_bool)
-                == Some(false),
+                == Some(policy.expected_recommendation_bid_kopecks.is_some()),
         "WB automation campaign contract изменился"
     );
     let status = advert
@@ -68,7 +68,8 @@ pub(in crate::control) fn parse_campaign(
             .and_then(Value::as_u64)
             .context("WB automation campaign recommendations bid отсутствует")?;
         ensure!(
-            recommendations == 0 && bids.insert(nm_id, bid).is_none(),
+            recommendations == policy.expected_recommendation_bid_kopecks.unwrap_or(0)
+                && bids.insert(nm_id, bid).is_none(),
             "WB automation campaign содержит неожиданную ставку или duplicate SKU"
         );
     }
@@ -79,3 +80,7 @@ pub(in crate::control) fn parse_campaign(
     );
     Ok(CampaignObservation { status, bids })
 }
+
+#[cfg(test)]
+#[path = "campaign/tests.rs"]
+mod tests;

@@ -20,7 +20,8 @@ pub use automation::{
     WbAutomationDecision, WbAutomationDecisionError, WbAutomationDisableReason,
     WbAutomationHoldReason, WbAutomationObservation, WbAutomationPacingMode, WbAutomationPolicy,
     WbAutomationSkuObservation, evaluate_wb_automation, validate_wb_automation_corridor_update,
-    validate_wb_automation_policy, wb_automation_business_date,
+    validate_wb_automation_policy, validate_wb_automation_recommendations_update,
+    wb_automation_business_date,
 };
 pub use automation_executor::{
     WbAutomationExecutionOutcome, WbAutomationExecutionReceipt, WbAutomationExecutor,

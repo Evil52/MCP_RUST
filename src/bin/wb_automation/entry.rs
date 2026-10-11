@@ -62,10 +62,12 @@ pub async fn run() -> Result<()> {
     mcp_ozon::marketplace_quota::SharedQuota::from_env()
         .preflight()
         .await?;
-    if arguments
-        .first()
-        .is_some_and(|arg| arg == "authorize-corridor-pg")
-    {
+    if arguments.first().is_some_and(|arg| {
+        matches!(
+            arg.as_str(),
+            "authorize-corridor-pg" | "authorize-recommendations-pg"
+        )
+    }) {
         return super::wb_automation::corridor::run(&arguments).await;
     }
     if arguments
