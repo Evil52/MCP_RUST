@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use super::{
     checkpoint::{
-        CheckpointError, Checkpoints, StockPageScope, checkpointed, delay_seconds,
+        CheckpointError, Checkpoints, StockPageScope, checkpointed, delay_seconds, load_checkpoint,
         stock_checkpoints,
     },
     postgres_collector::CollectedSellerStockFact,
@@ -21,7 +21,9 @@ use super::{
 use crate::wb::{WbClient, WbError};
 
 const CARD_LIMIT: usize = 100;
-const MAX_CARD_PAGES: usize = MAX_IDENTITIES / CARD_LIMIT + 1;
+// At most one card per successful page, six halvings from 100 to 1, and
+// a terminal empty page. Smaller pages must retain the full catalogue bound.
+const MAX_CARD_PAGES: usize = MAX_IDENTITIES + 8;
 const BATCH_SIZE: usize = 1_000;
 const MAX_IDENTITIES: usize = 25_000;
 const MAX_AGGREGATE_FACTS: usize = 25_000;
@@ -180,8 +182,37 @@ impl WbSellerSource {
         content: &Checkpoints,
         cursor: &Value,
     ) -> Result<CardPage, SourceFailure> {
-        checkpointed(content, json!(["wb_seller_cards_v1", cursor]), || async {
-            parse_cards(&self.transport.cards(cursor.clone()).await?)
+        let limit = cursor
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| (1..=CARD_LIMIT).contains(limit))
+            .ok_or("seller_invalid_response")?;
+        // Reuse already saved full-size pages, but never write adaptive pages
+        // into v1: an older reader would treat a full reduced page as terminal.
+        if limit == CARD_LIMIT
+            && let Some(page) =
+                load_checkpoint(content, json!(["wb_seller_cards_v1", cursor])).await?
+        {
+            return Ok(page);
+        }
+        checkpointed(content, json!(["wb_seller_cards_v2", cursor]), || async {
+            match self.transport.cards(cursor.clone()).await {
+                Ok(data) => parse_cards(&data, limit),
+                Err(error) if error.code == "response_too_large" && limit > 1 => {
+                    // This nonterminal v2 continuation records the size reduction
+                    // under the same lease before the page quantum yields.
+                    // Replaying it skips the oversized request after a restart;
+                    // every smaller request still reserves its own Content quota.
+                    let mut next = cursor.clone();
+                    next["limit"] = json!(limit / 2);
+                    Ok(CardPage {
+                        items: Vec::new(),
+                        next: Some(next),
+                    })
+                }
+                Err(error) => Err(error),
+            }
         })
         .await
     }
@@ -267,7 +298,7 @@ struct CardPage {
     next: Option<Value>,
 }
 
-fn parse_cards(data: &Value) -> Result<CardPage, SourceFailure> {
+fn parse_cards(data: &Value, limit: usize) -> Result<CardPage, SourceFailure> {
     let cards = data
         .get("cards")
         .and_then(Value::as_array)
@@ -276,7 +307,7 @@ fn parse_cards(data: &Value) -> Result<CardPage, SourceFailure> {
         .pointer("/cursor/total")
         .and_then(Value::as_u64)
         .ok_or("seller_invalid_response")?;
-    if cards.len() > CARD_LIMIT || usize::try_from(total).ok() != Some(cards.len()) {
+    if cards.len() > limit || usize::try_from(total).ok() != Some(cards.len()) {
         return Err("seller_invalid_response".into());
     }
     let mut items = Vec::new();
@@ -295,7 +326,7 @@ fn parse_cards(data: &Value) -> Result<CardPage, SourceFailure> {
                 .collect::<Result<Vec<_>, _>>()?,
         ));
     }
-    let next = if cards.len() == CARD_LIMIT {
+    let next = if cards.len() == limit {
         let nm = id(data.pointer("/cursor/nmID"))?;
         let updated = data
             .pointer("/cursor/updatedAt")
@@ -304,7 +335,7 @@ fn parse_cards(data: &Value) -> Result<CardPage, SourceFailure> {
             .ok_or("seller_invalid_response")?;
         chrono::DateTime::parse_from_rfc3339(updated)
             .map_err(|_| SourceFailure::from("seller_invalid_response"))?;
-        Some(json!({"limit":CARD_LIMIT,"nmID":nm,"updatedAt":updated}))
+        Some(json!({"limit":limit,"nmID":nm,"updatedAt":updated}))
     } else {
         None
     };
