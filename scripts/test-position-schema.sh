@@ -760,6 +760,9 @@ control_writer_psql=(
 docker exec "$container" /usr/local/bin/migrate-position-db >/dev/null
 assert_marketplace_quota_contract "fresh database" "${admin_psql[@]}"
 
+# Durable oversized-response recovery must not lose coverage or bypass leases.
+"${admin_psql[@]}" --command "$(cat "$project_root/tests/wb_history_oversized.sql")" >/dev/null
+
 # Compare the ledger against the migrations this repository actually ships
 # rather than against a hand-updated count. A literal count only failed when a
 # migration was added to both `initdb/` and the migrator; it stayed green in

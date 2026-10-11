@@ -5,7 +5,8 @@ use chrono::{Duration, NaiveDate};
 use serde_json::{Value, json};
 
 use crate::reporting::{
-    postgres_collector::CollectedAdvertisingFact, wb_adapter::parse_promotion_stats,
+    postgres_collector::CollectedAdvertisingFact,
+    wb_adapter::{WbReportParseError, parse_promotion_stats},
 };
 
 /// The inventory's changeTime and a campaign's last restart are not creation
@@ -167,7 +168,7 @@ pub fn normalize_statistics(
             let reconciled = total.is_some_and(|total| reconciles(total, sku_rows));
             let state = if raw.is_null() {
                 "no_data"
-            } else if !statistics.seen.contains(id) {
+            } else if !statistics.seen.contains(id) || statistics.rejected.contains(&(*id, date)) {
                 "missing"
             } else if total.is_some() {
                 "observed"
@@ -188,6 +189,7 @@ struct StatisticsDays {
     totals: BTreeMap<(u64, NaiveDate), CollectedAdvertisingFact>,
     products: BTreeMap<(u64, NaiveDate), Vec<CollectedAdvertisingFact>>,
     seen: BTreeSet<u64>,
+    rejected: BTreeSet<(u64, NaiveDate)>,
 }
 
 fn collect_statistics(
@@ -227,7 +229,7 @@ fn collect_campaign_days(
         .get("days")
         .and_then(Value::as_array)
         .context("missing statistics days")?;
-    let mut parents = Vec::new();
+    let mut parent_rows = Vec::new();
     let mut dates = BTreeSet::new();
     for day in days {
         let mut parent = day.as_object().context("invalid campaign day")?.clone();
@@ -239,9 +241,28 @@ fn collect_campaign_days(
         let date =
             NaiveDate::parse_from_str(text.get(..10).context("invalid day date")?, "%Y-%m-%d")?;
         ensure!(dates.insert(date), "duplicate campaign day");
-        parents.push(Value::Object(parent));
+        ensure!(date >= from && date <= to, "statistics day outside scope");
+        match parse_promotion_stats(&json!([{"advertId":id,"days":[parent]}])) {
+            Ok(rows) => parent_rows.extend(rows),
+            Err(WbReportParseError::InconsistentAdvertisingCounts) => {
+                // WB can return one click and zero views even on closed days.
+                // Keep that day unavailable, preserving every other valid day.
+                statistics.rejected.insert((id, date));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // A broken product breakdown affects only this day's SKU projection.
+        if let Ok(rows) = parse_promotion_stats(&json!([{"advertId":id,"days":[day]}])) {
+            for row in rows {
+                statistics
+                    .products
+                    .entry((id, row.business_date))
+                    .or_default()
+                    .push(row);
+            }
+        }
     }
-    let parent_rows = parse_promotion_stats(&json!([{"advertId":id,"days":parents}]))?;
     for row in parent_rows {
         ensure!(
             row.business_date >= from && row.business_date <= to,
@@ -254,16 +275,6 @@ fn collect_campaign_days(
                 .is_none(),
             "duplicate campaign day"
         );
-    }
-    // A broken product breakdown must not invalidate authoritative totals.
-    if let Ok(rows) = parse_promotion_stats(&json!([campaign])) {
-        for row in rows {
-            statistics
-                .products
-                .entry((id, row.business_date))
-                .or_default()
-                .push(row);
-        }
     }
     Ok(())
 }
