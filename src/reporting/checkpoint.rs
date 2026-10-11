@@ -86,6 +86,34 @@ pub trait PageJournal: Send + Sync {
     fn save<'a>(&'a self, key: &'a str, page: Value) -> JournalFuture<'a, ()>;
 }
 
+fn checkpoint_key(request_identity: &Value) -> Result<String, CheckpointError> {
+    let digest = Sha256::digest(
+        serde_json::to_vec(&(1, request_identity)).map_err(|_| CheckpointError::Invalid)?,
+    );
+    let mut key = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(key, "{byte:02x}");
+    }
+    Ok(key)
+}
+
+/// Reads a compatible older page without admitting an upstream request.
+pub(super) async fn load_checkpoint<T: DeserializeOwned>(
+    journal: &Checkpoints,
+    request_identity: Value,
+) -> Result<Option<T>, CheckpointError> {
+    let Some(journal) = journal else {
+        return Ok(None);
+    };
+    let key = checkpoint_key(&request_identity)?;
+    journal
+        .load(&key)
+        .await?
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| CheckpointError::Invalid)
+}
+
 pub async fn checkpointed<T, E, F, Fut>(
     journal: &Checkpoints,
     request_identity: Value,
@@ -101,13 +129,7 @@ where
         return fetch_normalized().await;
     };
     // Bump this namespace whenever a normalizer's persisted page contract changes.
-    let digest = Sha256::digest(
-        serde_json::to_vec(&(1, request_identity)).map_err(|_| CheckpointError::Invalid)?,
-    );
-    let mut key = String::with_capacity(64);
-    for byte in digest {
-        let _ = write!(key, "{byte:02x}");
-    }
+    let key = checkpoint_key(&request_identity)?;
     if let Some(page) = journal.load(&key).await? {
         return serde_json::from_value(page).map_err(|_| CheckpointError::Invalid.into());
     }
