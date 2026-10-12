@@ -108,7 +108,10 @@ fn start_responses(
         responses.extend([
             (200, target(4)),
             (200, minimums()),
-            (200, json!({"total":budget_rubles})),
+            (
+                200,
+                json!({"adverts":[{"advertId":id,"currency":"RUB","total":budget_rubles}]}),
+            ),
             (200, stock.clone()),
         ]);
     }
@@ -118,9 +121,15 @@ fn start_responses(
     }
     if success {
         responses.extend([
-            (200, json!({"total":budget_rubles})),
+            (
+                200,
+                json!({"adverts":[{"advertId":id,"currency":"RUB","total":budget_rubles}]}),
+            ),
             (200, target(9)),
-            (200, json!({"total":budget_rubles})),
+            (
+                200,
+                json!({"adverts":[{"advertId":id,"currency":"RUB","total":budget_rubles}]}),
+            ),
         ]);
     }
     responses

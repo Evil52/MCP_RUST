@@ -29,10 +29,10 @@ async fn revoked_authorization_during_final_read_prevents_attempt_and_patch() {
     let (url, receiver) = mock_http_with_hook(
         [
             target(4, 500),
-            json!({"total":0}),
+            budget(0),
             minimums(),
             target(4, 500),
-            json!({"total":0}),
+            budget(0),
         ]
         .into_iter()
         .map(|value| (200, value.to_string()))
@@ -70,7 +70,7 @@ async fn revoked_authorization_during_final_read_prevents_attempt_and_patch() {
     assert!(!journal.attempted("bids"));
     assert!(!journal.has_receipt("bids"));
     let sent = requests(&receiver, 5);
-    assert!(sent[4].starts_with("GET /adv/v1/budget?"));
+    assert!(sent[4].starts_with("POST /api/advert/v2/budget "));
     assert!(sent.iter().all(|request| !request.starts_with("PATCH ")));
     assert!(receiver.try_recv().is_err());
 }

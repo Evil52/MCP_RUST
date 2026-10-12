@@ -37,7 +37,10 @@ async fn inactive_fullstats_skus_are_excluded_from_bids_but_count_towards_daily_
     let (base_url, _) = mock_http(vec![
         (200, campaign_response().to_string()),
         (200, minimum_bids_response().to_string()),
-        (200, serde_json::json!({"total": 1_000}).to_string()),
+        (
+            200,
+            crate::test_support::wb_budget_response(39_682_633, 1_000).to_string(),
+        ),
         (200, stats_with_inactive_sku.to_string()),
         (200, stocks_response().to_string()),
     ]);

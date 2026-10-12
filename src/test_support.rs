@@ -1,5 +1,9 @@
 pub mod http2;
 
+pub fn wb_budget_response(campaign_id: u64, total: u64) -> serde_json::Value {
+    serde_json::json!({"adverts":[{"advertId":campaign_id,"currency":"RUB","total":total}]})
+}
+
 use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},

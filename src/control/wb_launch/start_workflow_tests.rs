@@ -30,15 +30,15 @@ async fn guarded_start_requires_two_cycles_and_verifies_status_after_one_write()
     let responses = vec![
         (200, target(11, 922)),
         (200, minimums()),
-        (200, json!({"total":1000})),
+        (200, budget(1000)),
         (200, stats),
         (200, stock),
         (200, target(11, 922)),
         (200, json!({})),
         (200, target(9, 922)),
-        (200, json!({"total":1000})),
+        (200, budget(1000)),
         (200, target(9, 922)),
-        (200, json!({"total":1000})),
+        (200, budget(1000)),
     ];
     let count = responses.len();
     let (operator, receiver) = fixture.operator(responses);
@@ -142,7 +142,7 @@ async fn installed_robot_revocation_during_final_read_prevents_start_and_attempt
     let responses = vec![
         (200, campaign.clone()),
         (200, minimums()),
-        (200, json!({"total":1000})),
+        (200, budget(1000)),
         (
             200,
             json!([{"advertId":REVOKED_ID,"stats":[

@@ -105,7 +105,7 @@ async fn continuation_prepare_preserves_every_anchor_and_never_creates_or_funds(
         {"status":4,"advert_list":[{"advertId":CAMPAIGN_ID}]}]});
     responses.extend([
         (200, continued(4, 102)),
-        (200, json!({"total":0})),
+        (200, budget_for(CAMPAIGN_ID, 0)),
         (200, minimums()),
     ]);
     let count = responses.len();
@@ -157,14 +157,14 @@ async fn continuation_initial_bids_require_prepare_and_are_written_once() {
     let mut responses = preflight(&fixture);
     responses.extend([
         (200, continued(4, 102)),
-        (200, json!({"total":0})),
+        (200, budget_for(CAMPAIGN_ID, 0)),
         (200, minimums()),
         (200, continued(4, 102)),
-        (200, json!({"total":0})),
+        (200, budget_for(CAMPAIGN_ID, 0)),
         (200, json!({})),
         (200, continued(4, 922)),
         (200, continued(4, 922)),
-        (200, json!({"total":0})),
+        (200, budget_for(CAMPAIGN_ID, 0)),
     ]);
     let count = responses.len();
     let (operator, receiver) = fixture.operator(responses);
@@ -199,16 +199,16 @@ async fn continuation_funding_preserves_once_only_fence_for_success_and_ambiguit
         responses.extend([
             (200, minimums()),
             (200, continued(4, 922)),
-            (200, json!({"total":0})),
+            (200, budget_for(CAMPAIGN_ID, 0)),
             (200, json!({"balance":0,"net":1000})),
             (status, json!({"total":1000})),
         ]);
         if status == 200 {
             responses.extend([
-                (200, json!({"total":1000})),
+                (200, budget_for(CAMPAIGN_ID, 1000)),
                 (200, continued(4, 922)),
                 (200, continued(4, 922)),
-                (200, json!({"total":1000})),
+                (200, budget_for(CAMPAIGN_ID, 1000)),
             ]);
         }
         let count = responses.len();

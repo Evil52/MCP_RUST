@@ -249,14 +249,21 @@ fn response_cooldowns(
     retry_after: ParsedRetryDelay,
     policy: &ClientPolicy,
 ) -> ResponseCooldowns {
+    let honors_long_cooldown = matches!(
+        request_class,
+        RequestClass::SellerInventory
+            | RequestClass::FinanceReport
+            | RequestClass::OrderFeed
+            | RequestClass::PromotionBudgets
+            | RequestClass::PromotionDailyLimits
+            | RequestClass::ItemReturns
+            | RequestClass::AnalyticsDownloads
+            | RequestClass::AnalyticsDownloadStatus
+            | RequestClass::AnalyticsDownloadFile
+    );
     let vendor = match retry_after {
-        ParsedRetryDelay::Valid(delay)
-            if matches!(
-                request_class,
-                RequestClass::SellerInventory | RequestClass::FinanceReport
-            ) && is_retriable(status) =>
-        {
-            // One-attempt inventory/finance reads must still honor a long
+        ParsedRetryDelay::Valid(delay) if honors_long_cooldown && is_retriable(status) => {
+            // One-attempt reads must still honor a long
             // Retry-After for sibling callers. Cap untrusted delays at a
             // day; the generic retry budget is not this shared cooldown.
             Some(delay.min(Duration::from_hours(24)))
@@ -265,6 +272,11 @@ fn response_cooldowns(
             if is_retriable(status) && delay <= policy.max_retry_delay =>
         {
             Some(delay)
+        }
+        ParsedRetryDelay::Absent | ParsedRetryDelay::Invalid
+            if honors_long_cooldown && status == StatusCode::TOO_MANY_REQUESTS =>
+        {
+            Some(Duration::from_secs(60))
         }
         ParsedRetryDelay::Absent | ParsedRetryDelay::Invalid | ParsedRetryDelay::Valid(_) => None,
     };
@@ -302,6 +314,22 @@ async fn decode_endpoint_response(
     retry_after: Option<Duration>,
 ) -> Result<Value, WbError> {
     let status = response.status();
+    if status == StatusCode::OK
+        && *context.method == Method::GET
+        && context.endpoint == super::recent_policy::DOWNLOAD_LABEL
+    {
+        let bytes = read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
+        return super::report_archive::decode(bytes, request_id);
+    }
+    if status == StatusCode::NO_CONTENT
+        && *context.method == Method::GET
+        && context.endpoint == "analytics:/api/analytics/v1/item-returns"
+    {
+        read_body(response, MAX_RESPONSE_BODY_BYTES, request_id.as_deref()).await?;
+        return Ok(
+            serde_json::json!({"report": [], "meta": {"upstream_status": 204, "data_state": "no_data", "request_id": request_id}}),
+        );
+    }
     if status == StatusCode::NO_CONTENT
         && *context.method == Method::GET
         && context.endpoint == super::promotion_money::PAYMENTS_LABEL
@@ -458,6 +486,49 @@ impl WbClient {
                 error,
             }),
             result => result.map(AttemptOutcome::Complete),
+        }
+    }
+}
+
+#[cfg(test)]
+mod recent_tests {
+    use super::*;
+
+    #[test]
+    fn recent_reads_preserve_long_vendor_cooldowns_without_automatic_replays() {
+        let policy = ClientPolicy::production(Duration::from_secs(2));
+        for class in [
+            RequestClass::OrderFeed,
+            RequestClass::PromotionBudgets,
+            RequestClass::PromotionDailyLimits,
+            RequestClass::ItemReturns,
+            RequestClass::AnalyticsDownloads,
+            RequestClass::AnalyticsDownloadStatus,
+            RequestClass::AnalyticsDownloadFile,
+        ] {
+            assert!(!class.allows_automatic_retry());
+            assert_eq!(
+                response_cooldowns(
+                    class,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    ParsedRetryDelay::Absent,
+                    &policy
+                )
+                .vendor,
+                Some(Duration::from_secs(60))
+            );
+            for delay in [Duration::from_mins(2), Duration::from_hours(48)] {
+                assert_eq!(
+                    response_cooldowns(
+                        class,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        ParsedRetryDelay::Valid(delay),
+                        &policy
+                    )
+                    .vendor,
+                    Some(delay.min(Duration::from_hours(24)))
+                );
+            }
         }
     }
 }

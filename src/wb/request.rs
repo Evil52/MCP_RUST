@@ -90,6 +90,7 @@ impl WbClient {
         request_class: RequestClass,
         retry: bool,
         deadline: TokioInstant,
+        token: &str,
     ) -> Result<(SemaphorePermit<'a>, SemaphorePermit<'a>), WbError> {
         let interval = if request_class == RequestClass::FinanceReport {
             limiter
@@ -97,7 +98,7 @@ impl WbClient {
                 .interval(self.policy.finance_interval)
                 .await
         } else {
-            self.policy.interval(request_class)
+            self.policy.recent_interval(request_class, token)
         };
         loop {
             // Readiness does not consume quota. Queued callers therefore hold
@@ -132,6 +133,11 @@ impl WbClient {
         retry: bool,
     ) -> Result<AttemptOutcome, WbError> {
         let quota_key = self.shared_quota_key(context)?;
+        let token = &self
+            .accounts
+            .get(context.account)
+            .expect("request resolved credentials")
+            .token;
         let mut short_quota_retries = 0;
         // Another process or a small clock difference can leave the shared
         // quota briefly behind the local limiter. Release both HTTP permits before waiting, then claim both
@@ -143,6 +149,7 @@ impl WbClient {
                     context.request_class,
                     retry,
                     context.deadline,
+                    token,
                 )
                 .await?;
             let Some(key) = quota_key.as_ref() else {
@@ -152,7 +159,8 @@ impl WbClient {
                 .shared_quota
                 .admit(
                     key,
-                    ClientPolicy::production(self.logical_timeout).interval(context.request_class),
+                    ClientPolicy::production(self.logical_timeout)
+                        .recent_interval(context.request_class, token),
                 )
                 .await
             {

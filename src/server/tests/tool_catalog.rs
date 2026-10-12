@@ -3,6 +3,8 @@
 use super::*;
 #[path = "ads_analysis.rs"]
 mod ads_analysis;
+#[path = "recent_reads.rs"]
+mod recent_reads;
 #[path = "warehouse_paging.rs"]
 mod warehouse_paging;
 #[path = "wb_ads_recommendations.rs"]
@@ -70,6 +72,14 @@ fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
         "wb_advertising_history_status",
         "wb_advertising_history_stats",
         "wb_seller_warehouses_stock_report",
+        "wb_order_feed",
+        "wb_supply_discrepancies",
+        "wb_item_returns",
+        "wb_promotion_budgets",
+        "wb_promotion_daily_limits",
+        "wb_stock_history_create",
+        "wb_analytics_report_status",
+        "wb_analytics_report_download",
         "wb_fbs_new_orders",
         "wb_fbs_orders",
         "wb_fbs_order_statuses",
@@ -238,7 +248,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     // The release checklist in `SECURITY.md` states this count verbatim.
     // Changing it here without updating that gate leaves the gate
     // describing a router that no longer exists.
-    assert_eq!(dev_tools.len(), 119);
+    assert_eq!(dev_tools.len(), 127);
     assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
     let seed = server();
@@ -249,7 +259,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
     let jwt_tools = authenticated.tool_router.list_all();
-    assert_eq!(jwt_tools.len(), 119);
+    assert_eq!(jwt_tools.len(), 127);
     assert_policy(
         jwt_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -261,7 +271,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
         .with_preview_features(false, true)
         .tool_router
         .list_all();
-    assert_eq!(legacy_flag_tools.len(), 119);
+    assert_eq!(legacy_flag_tools.len(), 127);
     assert_policy(
         legacy_flag_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),

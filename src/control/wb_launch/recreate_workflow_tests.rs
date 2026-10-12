@@ -75,9 +75,9 @@ async fn explicitly_reauthorized_create_is_once_only_for_success_and_rejection()
         if status == 200 {
             responses.extend([
                 (200, target(4, 500)),
-                (200, json!({"total":0})),
+                (200, budget(0)),
                 (200, target(4, 500)),
-                (200, json!({"total":0})),
+                (200, budget(0)),
             ]);
         }
         let count = responses.len();

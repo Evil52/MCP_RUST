@@ -433,7 +433,7 @@ pub struct WbSearchProductQueriesInput {
     )]
     pub account: Option<String>,
     #[schemars(
-        description = "Начало отчётного периода в формате YYYY-MM-DD; период не более 31 дня, данные WB обновляются примерно раз в час",
+        description = "Начало отчётного периода в формате YYYY-MM-DD; период не более 31 дня, данные WB обновляются раз в два часа",
         length(equal = 10),
         regex(pattern = r"^\d{4}-\d{2}-\d{2}$")
     )]

@@ -452,7 +452,10 @@ MCP_TRANSPORT=stdio cargo run --release
 
 ## Read-only инструменты
 
-Production router публикует 76 stable tools:
+Каталог исходного кода содержит 127 stable tools; опубликованный набор
+проверяется через `tools/list`. [Обновление API от 12 октября](docs/api-method-update-20261012.md)
+описывает восемь новых инструментов WB и оставшиеся контракты Ozon.
+Ниже перечислены основные сценарии чтения:
 
 - `marketplace_accounts`
 - `list_members`

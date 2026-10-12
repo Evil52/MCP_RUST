@@ -9,6 +9,7 @@ pub(super) mod orders;
 mod ozon_advertising;
 mod ozon_catalog;
 mod ozon_search;
+pub(super) mod recent_reads;
 mod reporting;
 pub(super) mod wb_ads_recommendations;
 mod wb_advertising;
@@ -26,6 +27,7 @@ impl OzonMcp {
             + Self::reporting_router()
             + Self::advertising_history_router()
             + Self::operational_reads_router()
+            + Self::recent_reads_router()
             + Self::wb_stock_report_router()
             + Self::wb_report_router()
             + Self::wb_read_coverage_router()

@@ -1027,7 +1027,7 @@ mod tests {
             WbAutomationHoldReason, WbAutomationObservation, WbAutomationPacingMode,
             WbAutomationPolicy, WbAutomationSkuObservation,
         },
-        test_support::mock_http,
+        test_support::{mock_http, wb_budget_response},
         wb::{WbClient, WbCredentials},
     };
 
@@ -1291,7 +1291,7 @@ mod tests {
                 campaign_response_for(campaign_id, status, bid).to_string(),
             ),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, wb_budget_response(campaign_id, 1_000).to_string()),
             (200, advertising_payload.to_string()),
             (
                 200,
@@ -1347,7 +1347,7 @@ mod tests {
                 campaign_response_with_bids(campaign_id, status, bids).to_string(),
             ),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, wb_budget_response(campaign_id, 1_000).to_string()),
             (200, advertising_payload.to_string()),
             (
                 200,
@@ -1383,7 +1383,7 @@ mod tests {
                 campaign_response_with_bids(campaign_id, 9, bids).to_string(),
             ),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, wb_budget_response(campaign_id, 1_000).to_string()),
             (200, advertising_payload.to_string()),
             (
                 200,
