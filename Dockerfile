@@ -1,4 +1,4 @@
-FROM rust:1.98.1-alpine3.23@sha256:94a43bda4fd9b71fa3a74621c0982a646f83c7d1a3ba52bb4b7ddfd76d4dca93 AS builder
+FROM rust:1.99.0-alpine3.23@sha256:42c2519fdf75d9e34cc61a1aaf34b1a684da9bfd65fe5daefef98d92a801b001 AS builder
 
 RUN apk add --no-cache clang cmake
 
