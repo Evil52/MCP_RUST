@@ -513,6 +513,8 @@ Production router публикует 76 stable tools:
 - `wb_fbs_new_orders`, `wb_fbs_orders`, `wb_fbs_order_statuses`
 - `wb_promotion_campaign_details`
 - `wb_promotion_stats`
+- `wb_ads_recommendations` — предложения по выбранным кампаниям WB с историей,
+  FBW и отдельными заказами магазина; [правила и ограничения](docs/wb-ads-recommendations.md).
 - `wb_search_product_queries`
 - `wb_search_orders_positions`
 - `wb_promotion_minimum_bids`
