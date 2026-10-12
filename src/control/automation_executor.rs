@@ -359,6 +359,26 @@ impl WbAutomationExecutor {
         .await
     }
 
+    /// Lowers one externally drifted search bid to the authorized maximum.
+    /// This maintenance action may run during cooldown or a protective pause,
+    /// but never raises bids, resumes delivery, clears incidents or bypasses
+    /// the durable quota, reservation, final permit and readback protocol.
+    pub async fn run_explicit_bid_cap_repair_once_postgres(
+        &self,
+        store: &WbAutomationPostgresStore,
+        legacy: &WbAutomationLegacyStateSeed,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<WbAutomationPostgresExecutionReceipt>> {
+        self.run_once_postgres_with_intent(
+            store,
+            legacy,
+            observed_at,
+            PostgresExecutionIntent::ExplicitBidCapRepair,
+            None,
+        )
+        .await
+    }
+
     async fn run_once_postgres_with_intent(
         &self,
         store: &WbAutomationPostgresStore,
@@ -484,12 +504,14 @@ impl WbAutomationExecutor {
         // Same breach contract as the file-backed executor. The durable
         // reservation enforces the daily action quota for every action kind,
         // so a pause that could not be reserved falls back to the lock.
-        if daily_cap_breach_requires_lock(
-            policy,
-            &snapshot.observation,
-            &decision,
-            state_actions_today < policy.max_actions_per_day,
-        ) {
+        if intent != PostgresExecutionIntent::ExplicitBidCapRepair
+            && daily_cap_breach_requires_lock(
+                policy,
+                &snapshot.observation,
+                &decision,
+                state_actions_today < policy.max_actions_per_day,
+            )
+        {
             let transition = lease
                 .mark_incident_without_action(
                     &cycle_id,
@@ -610,6 +632,7 @@ enum PostgresExecutionIntent {
     ExplicitExposureTarget(u64),
     ExplicitQuotaOverride,
     ExplicitResumeAfterDailyCap,
+    ExplicitBidCapRepair,
 }
 
 async fn load_traffic_feedback_baseline(
@@ -645,6 +668,9 @@ fn apply_postgres_execution_intent(
         PostgresExecutionIntent::ExplicitResumeAfterDailyCap => {
             Some(explicit_resume_after_daily_cap_decision(policy, snapshot)?)
         }
+        PostgresExecutionIntent::ExplicitBidCapRepair => {
+            Some(explicit_bid_cap_repair_decision(policy, snapshot)?)
+        }
         PostgresExecutionIntent::Automatic if policy.autonomous_pacing.uses_traffic_frontier() => {
             traffic_frontier_pacing_decision(policy, snapshot, last_applied_snapshot)?
         }
@@ -657,6 +683,65 @@ fn apply_postgres_execution_intent(
         snapshot.decision = decision;
     }
     Ok(())
+}
+
+fn explicit_bid_cap_repair_decision(
+    policy: &super::automation::WbAutomationPolicy,
+    snapshot: &WbAutomationSnapshot,
+) -> Result<WbAutomationDecision> {
+    use super::automation::{WbAutomationBidReason, WbAutomationHoldReason};
+
+    let observation = &snapshot.observation;
+    let observed_at = observation.observed_at;
+    let authorization_active = policy.authorized_at <= observed_at
+        && policy.observe_until <= observed_at
+        && observed_at < policy.authorization_expires_at;
+    ensure!(
+        policy.write_enabled && policy.bid_writes_enabled && authorization_active,
+        "WB bid cap repair requires active explicit write authorization"
+    );
+    ensure!(
+        matches!(observation.campaign_status, 9 | 11),
+        "WB bid cap repair requires an active or paused campaign"
+    );
+    ensure!(
+        observation.daily_spend_complete,
+        "WB bid cap repair requires complete daily spend"
+    );
+    ensure!(
+        observation.campaign_status == 11
+            || observation.daily_spend_minor < policy.daily_pause_threshold_minor,
+        "WB bid cap repair requires protective pause before repairing an overspent active campaign"
+    );
+    ensure!(
+        observation.actions_today < policy.max_actions_per_day,
+        "WB bid cap repair preserves the daily action quota"
+    );
+    let action = policy
+        .nm_ids
+        .iter()
+        .filter_map(|nm_id| observation.skus.iter().find(|sku| sku.nm_id == *nm_id))
+        .find(|sku| sku.current_bid_kopecks > policy.max_bid_kopecks)
+        .map_or(
+            WbAutomationAction::Hold {
+                reason: WbAutomationHoldReason::NoMaterialChange,
+            },
+            |sku| WbAutomationAction::ChangeBids {
+                changes: vec![WbAutomationBidChange {
+                    nm_id: sku.nm_id,
+                    from_bid_kopecks: sku.current_bid_kopecks,
+                    to_bid_kopecks: policy.max_bid_kopecks,
+                    reason: WbAutomationBidReason::PolicyMaximumExceeded,
+                }],
+            },
+        );
+    Ok(WbAutomationDecision {
+        account_id: policy.account_id.clone(),
+        campaign_id: policy.campaign_id,
+        observed_at: observation.observed_at,
+        action,
+        unresolved_stops: Vec::new(),
+    })
 }
 
 fn explicit_quota_override_decision(
@@ -997,6 +1082,7 @@ const fn durable_action_kind(kind: &PendingActionKind) -> WbAutomationDurableAct
 
 #[cfg(test)]
 mod tests {
+    mod bid_cap_repair;
     mod daily_cap_breach;
     mod not_sent;
     mod postgres_clock;
