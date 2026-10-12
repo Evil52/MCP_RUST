@@ -103,7 +103,7 @@ use rmcp::{
     },
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        JsonObject, MetaObject, ServerCapabilities, ServerInfo,
+        JsonObject, MetaObject, ServerCapabilities, ServerConfig,
     },
     schemars::JsonSchema,
     service::RequestContext,
@@ -1187,11 +1187,11 @@ impl ServerHandler for OzonMcp {
         result
     }
 
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         if self.reporting_only {
             return Self::reporting_only_info();
         }
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
                 Implementation::new("mcp-ozon", env!("CARGO_PKG_VERSION"))
                     .with_title("Ozon and Wildberries Seller Analytics"),

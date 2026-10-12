@@ -2,7 +2,7 @@
 
 use super::{
     BTreeMap, Duration, Implementation, OzonClient, OzonMcp, PerformanceClient, ServerCapabilities,
-    ServerInfo, WbClient,
+    ServerConfig, WbClient,
 };
 
 impl OzonMcp {
@@ -39,8 +39,8 @@ impl OzonMcp {
         Ok(self)
     }
 
-    pub(super) fn reporting_only_info() -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    pub(super) fn reporting_only_info() -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
                 .with_server_info(
                     Implementation::new("mcp-ozon", env!("CARGO_PKG_VERSION"))
                         .with_title("OFK Prepared Analytics"),

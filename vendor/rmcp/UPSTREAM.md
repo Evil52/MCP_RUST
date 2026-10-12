@@ -1,12 +1,12 @@
 # Vendored rmcp
 
-This directory contains the source of `rmcp` 3.3.0 from the official
+This directory contains the source of `rmcp` 3.5.1 from the official
 Model Context Protocol Rust SDK:
 
 - upstream: https://github.com/modelcontextprotocol/rust-sdk
-- crate: https://crates.io/crates/rmcp/3.3.0
-- crate checksum: `b88db56b8ae316560e9e868b6b978ea940f27cb883323fc90e07435e44158f5c`
-- upstream commit: `3e636cab26c013eca5131103c03d20237f12c4df`
+- crate: https://crates.io/crates/rmcp/3.5.1
+- crate checksum: `ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350`
+- upstream commit: `79437f291b2c44053d00dcd5db969fd0cca7c887`
 - license: Apache-2.0 (see `LICENSE`)
 
 Local modification: `Tool` exposes the OpenAI plugin authentication extension
@@ -52,6 +52,11 @@ still undergo the same header validation without retaining their schemas.
 The size check uses an allocation-free bounded writer; concurrent insertions
 recheck capacity under the write lock.
 
+Local modification: portless remote Origin entries match only the scheme default
+port; loopback entries retain ephemeral-port compatibility. Explicit `:*`
+entries use upstream wildcard matching. This preserves the existing inbound
+authentication boundary when importing upstream Origin parsing changes.
+
 The upstream `build.rs` is intentionally omitted: it manages Git hook settings
 for the SDK workspace and must not mutate the parent application's repository.
 
@@ -93,3 +98,28 @@ four PostgreSQL session-hardening tests also passed against a disposable databas
 Clippy with denied warnings, rustdoc with denied warnings, formatting and the
 first-party Rust structure budget passed. These are local build proofs, not
 production deployment or campaign-control evidence.
+
+## 3.5.1 maintenance review (2026-10-12)
+
+The official 3.3.0 and 3.5.1 crate archives were checked against the published
+SHA-256 values; the new upstream commit comes from `.cargo_vcs_info.json`.
+A three-way source import retained each local patch above. The Git-hook
+build script remains omitted. Application handlers now use `ServerConfig`
+in place of the deprecated `ServerInfo` alias.
+
+Upstream changes reviewed include bootstrap-neutral discovery, in-band handler
+errors, duplicate standard-header rejection, explicit default Origin ports,
+null structured content and cache hints for 2026-07-28 peers. Legacy initialize
+continues to negotiate only initialize-capable versions. Upstream wildcard
+Origin parsing is retained, while portless remote origins remain restricted to
+the scheme default port by the local patch; the previous exact-origin
+authentication boundary is preserved. Malformed Origin headers now use the
+upstream sanitized HTTP 403 rejection instead of the previous HTTP 400;
+regressions still require rejection before session allocation. Local patch removal conditions and the
+absence of verified upstream acceptance IDs remain as documented above.
+
+The release PR runs the application OAuth, HTTP admission, session lifetime,
+shutdown, structured-result budget, schema-cache and negotiation regressions,
+all-feature workspace tests, strict Clippy, rustdoc, coverage and container gates.
+Build checks alone do not establish production readiness; deployment uses the
+signed-image, backup/restore and canary procedure.

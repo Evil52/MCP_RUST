@@ -280,6 +280,13 @@ impl StreamableHttpClient for reqwest::Client {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+            // Must precede the JSON-RPC branch below, which would forward a
+            // discover rejection with an id the lifecycle cannot correlate.
+            if let Some(response) =
+                legacy_discover_response(&message, session_was_attached, status, &body)
+            {
+                return Ok(response);
+            }
             if content_type
                 .as_deref()
                 .is_some_and(|ct| ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()))
@@ -293,11 +300,6 @@ impl StreamableHttpClient for reqwest::Client {
                     ),
                 }
             }
-            if let Some(response) =
-                legacy_discover_response(&message, session_was_attached, status, &body)
-            {
-                return Ok(response);
-            }
             return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
                 format!("HTTP {status}: {body}"),
             )));
@@ -308,17 +310,29 @@ impl StreamableHttpClient for reqwest::Client {
                 Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
             }
             Some(ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
-                // Try to parse as a valid JSON-RPC message. If the body is
-                // malformed (e.g. a 200 response to a notification that lacks
-                // an `id` field), treat it as accepted rather than failing.
-                match response.json::<ServerJsonRpcMessage>().await {
-                    Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
-                    Err(e) => {
+                // A notification/response/error POST does not await a JSON-RPC
+                // reply. Treat an unusable JSON body as Accepted. A request
+                // still needs a reply; the same body is an error so the worker
+                // does not wait on SSE forever.
+                let body = response.bytes().await?;
+                match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+                    Ok(parsed) => Ok(StreamableHttpPostResponse::Json(parsed, session_id)),
+                    Err(e)
+                        if matches!(
+                            message,
+                            ClientJsonRpcMessage::Notification(_)
+                                | ClientJsonRpcMessage::Response(_)
+                                | ClientJsonRpcMessage::Error(_)
+                        ) =>
+                    {
                         tracing::warn!(
                             "could not parse JSON response as ServerJsonRpcMessage, treating as accepted: {e}"
                         );
                         Ok(StreamableHttpPostResponse::Accepted)
                     }
+                    Err(e) => Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                        json_rpc_parse_error_message(&e, &body),
+                    ))),
                 }
             }
             _ => {

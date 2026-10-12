@@ -1,11 +1,11 @@
-//! Pin the SDK negotiation change reviewed during the 3.3.0 import.
+//! Preserve legacy initialize negotiation across reviewed SDK upgrades.
 use std::borrow::Cow;
 
 use rmcp::{
     ServerHandler,
     model::{
         ClientCapabilities, ErrorCode, Implementation, InitializeRequestParams, ProtocolVersion,
-        ServerInfo,
+        ServerConfig,
     },
 };
 
@@ -14,8 +14,8 @@ impl ServerHandler for CompatibleServer {}
 
 struct SessionlessServer;
 impl ServerHandler for SessionlessServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::default().with_protocol_version(ProtocolVersion::V_2026_07_28)
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::default().with_protocol_version(ProtocolVersion::V_2026_07_28)
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {

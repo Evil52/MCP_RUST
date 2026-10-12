@@ -915,7 +915,7 @@ async fn dev_mode_accepts_only_loopback_browser_origins_on_any_port() {
 
     let (status, session_id, body) =
         initialize_session_with_origin(dev_router(), Some("not-an-origin")).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(session_id.is_none(), "{body}");
 
     for malformed in [
@@ -924,11 +924,7 @@ async fn dev_mode_accepts_only_loopback_browser_origins_on_any_port() {
     ] {
         let (status, session_id, body) =
             initialize_session_with_origin(dev_router(), Some(malformed)).await;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "origin={malformed}: {body}"
-        );
+        assert_eq!(status, StatusCode::FORBIDDEN, "origin={malformed}: {body}");
         assert!(session_id.is_none(), "origin={malformed}: {body}");
     }
 }
