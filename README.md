@@ -452,7 +452,10 @@ MCP_TRANSPORT=stdio cargo run --release
 
 ## Read-only инструменты
 
-Production router публикует 76 stable tools:
+Каталог исходного кода содержит 127 stable tools; опубликованный набор
+проверяется через `tools/list`. [Обновление API от 12 октября](docs/api-method-update-20261012.md)
+описывает восемь новых инструментов WB и оставшиеся контракты Ozon.
+Ниже перечислены основные сценарии чтения:
 
 - `marketplace_accounts`
 - `list_members`
@@ -513,6 +516,8 @@ Production router публикует 76 stable tools:
 - `wb_fbs_new_orders`, `wb_fbs_orders`, `wb_fbs_order_statuses`
 - `wb_promotion_campaign_details`
 - `wb_promotion_stats`
+- `wb_ads_recommendations` — предложения по выбранным кампаниям WB с историей,
+  FBW и отдельными заказами магазина; [правила и ограничения](docs/wb-ads-recommendations.md).
 - `wb_search_product_queries`
 - `wb_search_orders_positions`
 - `wb_promotion_minimum_bids`

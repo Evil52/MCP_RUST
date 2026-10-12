@@ -759,7 +759,7 @@ mod tests {
         let (base_url, requests) = mock_http(vec![
             (200, campaign_response().to_string()),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::json!({"adverts":[{"advertId":39_682_633,"currency":"RUB","total":1_000}]}).to_string()),
             (200, stats_response().to_string()),
             (200, stocks_response().to_string()),
         ]);
@@ -823,7 +823,7 @@ mod tests {
         let (base_url, _requests) = mock_http(vec![
             (200, campaign_response().to_string()),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 995}).to_string()),
+            (200, serde_json::json!({"adverts":[{"advertId":39_682_633,"currency":"RUB","total":995}]}).to_string()),
             (200, campaign_level_stats_response().to_string()),
             (200, stocks_response().to_string()),
         ]);
@@ -1038,7 +1038,7 @@ mod tests {
         let (base_url, _) = mock_http(vec![
             (200, campaign_response().to_string()),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::json!({"adverts":[{"advertId":39_682_633,"currency":"RUB","total":1_000}]}).to_string()),
             (
                 200,
                 serde_json::json!([{
@@ -1091,7 +1091,7 @@ mod tests {
         let (stats_url, _) = mock_http(vec![
             (200, campaign_response().to_string()),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::json!({"adverts":[{"advertId":39_682_633,"currency":"RUB","total":1_000}]}).to_string()),
             (200, serde_json::json!({}).to_string()),
         ]);
         install_test_client(&mut invalid_stats, &stats_url);
@@ -1109,7 +1109,7 @@ mod tests {
         let (stocks_url, _) = mock_http(vec![
             (200, campaign_response().to_string()),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::json!({"adverts":[{"advertId":39_682_633,"currency":"RUB","total":1_000}]}).to_string()),
             (200, serde_json::Value::Null.to_string()),
             (200, serde_json::json!({}).to_string()),
         ]);
@@ -1131,7 +1131,7 @@ mod tests {
         let (decision_url, _) = mock_http(vec![
             (200, invalid_campaign_bid.to_string()),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::json!({"adverts":[{"advertId":39_682_633,"currency":"RUB","total":1_000}]}).to_string()),
             (200, serde_json::Value::Null.to_string()),
             (200, stocks_response().to_string()),
         ]);
@@ -1169,7 +1169,7 @@ mod tests {
         let (base_url, _requests) = mock_http(vec![
             (200, campaign_response().to_string()),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::json!({"adverts":[{"advertId":39_682_633,"currency":"RUB","total":1_000}]}).to_string()),
             (200, stats_without_previous_day.to_string()),
             (200, stocks_response().to_string()),
         ]);
@@ -1236,7 +1236,7 @@ mod tests {
         let (base_url, _) = mock_http(vec![
             (200, campaign_response().to_string()),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, serde_json::json!({"adverts":[{"advertId":39_682_633,"currency":"RUB","total":1_000}]}).to_string()),
             (200, previous_only.to_string()),
             (200, stocks_response().to_string()),
         ]);

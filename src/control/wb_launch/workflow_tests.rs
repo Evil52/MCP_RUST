@@ -161,6 +161,13 @@ fn details(id: u64, name: &str, nms: &[u64], status: i32, bid: u64) -> Value {
     }]})
 }
 
+fn budget(total: u64) -> Value {
+    budget_for(ID, total)
+}
+fn budget_for(id: u64, total: u64) -> Value {
+    json!({"adverts":[{"advertId":id,"currency":"RUB","total":total}]})
+}
+
 fn target(status: i32, bid: u64) -> Value {
     details(ID, NAME, &NMS, status, bid)
 }
@@ -199,9 +206,9 @@ async fn create_only_creates_once_verifies_and_never_reads_finance() {
     responses.extend([
         (200, json!(ID)),
         (200, target(4, 500)),
-        (200, json!({"total":0})),
+        (200, budget(0)),
         (200, target(4, 500)),
-        (200, json!({"total":0})),
+        (200, budget(0)),
     ]);
     let count = responses.len();
     let (operator, receiver) = fixture.operator(responses);
@@ -261,14 +268,14 @@ async fn initial_bids_are_patched_once_then_read_back() {
     let fixture = Fixture::new(LaunchScope::CreateOnly);
     let responses = vec![
         (200, target(4, 500)),
-        (200, json!({"total":0})),
+        (200, budget(0)),
         (200, minimums()),
         (200, target(4, 500)),
-        (200, json!({"total":0})),
+        (200, budget(0)),
         (200, json!({})),
         (200, target(4, 922)),
         (200, target(4, 922)),
-        (200, json!({"total":0})),
+        (200, budget(0)),
     ];
     let count = responses.len();
     let (operator, receiver) = fixture.operator(responses);
@@ -296,16 +303,16 @@ async fn funding_requires_exact_receipt_and_is_never_repeated() {
         responses.extend([
             (200, minimums()),
             (200, target(status, 922)),
-            (200, json!({"total":0})),
+            (200, budget(0)),
             (200, json!({"balance":0,"net":1000})),
             (200, json!({"total":total})),
         ]);
         if total == 1000 {
             responses.extend([
-                (200, json!({"total":1000})),
+                (200, budget(1000)),
                 (200, target(status, 922)),
                 (200, target(status, 922)),
-                (200, json!({"total":1000})),
+                (200, budget(1000)),
             ]);
         }
         let count = responses.len();
@@ -340,7 +347,7 @@ async fn bid_drift_blocks_before_attempt_record_or_patch() {
     let fixture = Fixture::new(LaunchScope::CreateOnly);
     let (operator, receiver) = fixture.operator(vec![
         (200, target(4, 500)),
-        (200, json!({"total":0})),
+        (200, budget(0)),
         (200, minimums()),
         (200, target(4, 600)),
     ]);
@@ -376,8 +383,7 @@ async fn entrypoint_and_authorization_fail_closed_before_network() {
 #[tokio::test]
 async fn independent_readback_returns_vendor_state_not_an_assumed_launch() {
     let fixture = Fixture::new(LaunchScope::FundAndStart);
-    let (operator, receiver) =
-        fixture.operator(vec![(200, target(11, 922)), (200, json!({"total":1000}))]);
+    let (operator, receiver) = fixture.operator(vec![(200, target(11, 922)), (200, budget(1000))]);
     let journal = fixture.journal();
     journal
         .receipt("create", &json!({"campaign_id":ID}))
@@ -389,7 +395,9 @@ async fn independent_readback_returns_vendor_state_not_an_assumed_launch() {
     assert_eq!(result["fund_confirmed_in_journal"], false);
     assert_eq!(result["start_confirmed_in_journal"], false);
     assert_eq!(result["budget"]["total"], 1000);
-    assert!(requests(&receiver, 2).iter().all(|r| r.starts_with("GET ")));
+    let wire = requests(&receiver, 2);
+    assert!(wire[0].starts_with("GET /api/advert/v2/adverts?"));
+    assert!(wire[1].starts_with("POST /api/advert/v2/budget "));
 }
 
 #[tokio::test]

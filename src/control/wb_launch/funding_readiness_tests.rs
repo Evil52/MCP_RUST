@@ -81,7 +81,7 @@ async fn protection_revoked_during_last_balance_read_prevents_deposit() {
     responses.extend([
         (200, minimums()),
         (200, target(11, 922)),
-        (200, json!({"total":0})),
+        (200, budget(0)),
         (200, json!({"balance":0,"net":1000})),
     ]);
     let count = responses.len();

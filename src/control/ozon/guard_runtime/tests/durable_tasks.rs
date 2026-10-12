@@ -244,7 +244,7 @@ impl OzonWorkflowTasks for FailedGuardTasks {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn independent_guard_failure_limit_stops_both_pollers() {
     let tasks = FailedGuardTasks::default();
     assert_eq!(

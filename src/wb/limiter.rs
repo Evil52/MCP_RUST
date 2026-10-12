@@ -31,6 +31,13 @@ pub(super) struct TokenLimiter {
     promotion_costs: PacingGate,
     promotion_payments: PacingGate,
     pub(super) finance_reports: PacingGate,
+    order_feed: PacingGate,
+    promotion_budgets: PacingGate,
+    promotion_daily_limits: PacingGate,
+    item_returns: PacingGate,
+    analytics_downloads: PacingGate,
+    analytics_download_status: PacingGate,
+    analytics_download_file: PacingGate,
     pub(super) finance_access: FinanceAccess,
 }
 
@@ -62,12 +69,26 @@ impl TokenLimiter {
             promotion_costs: PacingGate::new(),
             promotion_payments: PacingGate::new(),
             finance_reports: PacingGate::new(),
+            order_feed: PacingGate::new(),
+            promotion_budgets: PacingGate::new(),
+            promotion_daily_limits: PacingGate::new(),
+            item_returns: PacingGate::new(),
+            analytics_downloads: PacingGate::new(),
+            analytics_download_status: PacingGate::new(),
+            analytics_download_file: PacingGate::new(),
             finance_access: FinanceAccess::new(),
         }
     }
 
     pub(super) const fn gate(&self, request_class: RequestClass) -> &PacingGate {
         match request_class {
+            RequestClass::OrderFeed => &self.order_feed,
+            RequestClass::PromotionBudgets => &self.promotion_budgets,
+            RequestClass::PromotionDailyLimits => &self.promotion_daily_limits,
+            RequestClass::ItemReturns => &self.item_returns,
+            RequestClass::AnalyticsDownloads => &self.analytics_downloads,
+            RequestClass::AnalyticsDownloadStatus => &self.analytics_download_status,
+            RequestClass::AnalyticsDownloadFile => &self.analytics_download_file,
             RequestClass::AnalyticsPing => &self.analytics_ping,
             RequestClass::AnalyticsReport => &self.analytics_reports,
             RequestClass::StatisticsReport => &self.statistics_reports,
@@ -110,7 +131,13 @@ impl TokenLimiter {
         if !retry
             && matches!(
                 request_class,
-                RequestClass::PromotionCosts
+                RequestClass::OrderFeed
+                    | RequestClass::PromotionDailyLimits
+                    | RequestClass::ItemReturns
+                    | RequestClass::AnalyticsDownloadStatus
+                    | RequestClass::AnalyticsDownloadFile
+                    | RequestClass::AnalyticsDownloads
+                    | RequestClass::PromotionCosts
                     | RequestClass::PromotionPayments
                     | RequestClass::CommissionTariff
                     | RequestClass::StatisticsReport
@@ -131,7 +158,10 @@ impl TokenLimiter {
         // spend a full minute reaching `Timeout`. Refuse now instead, naming
         // the instant a retry could actually succeed.
         let ready_in = gate.ready_in().await;
-        if TokioInstant::now() + ready_in >= deadline {
+        if TokioInstant::now() + ready_in >= deadline
+            || (request_class == RequestClass::PromotionBudgets
+                && ready_in > Duration::from_secs(3))
+        {
             return Err(WbError::LocalRateLimited {
                 retry_after: ready_in,
             });

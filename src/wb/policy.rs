@@ -62,6 +62,13 @@ pub(super) enum RequestClass {
     FbsOrders,
     PromotionCosts,
     PromotionPayments,
+    OrderFeed,
+    PromotionBudgets,
+    PromotionDailyLimits,
+    ItemReturns,
+    AnalyticsDownloads,
+    AnalyticsDownloadStatus,
+    AnalyticsDownloadFile,
 }
 
 /// Single source of truth for every request that may leave this process.
@@ -238,11 +245,11 @@ pub(super) const READ_ONLY_ENDPOINT_ALLOWLIST: &[EndpointPolicy] = &[
         request_class: RequestClass::PromotionCampaign,
     },
     EndpointPolicy {
-        method: Method::GET,
+        method: Method::POST,
         path: PROMOTION_BUDGET_PATH,
-        label: "promotion:/adv/v1/budget",
+        label: "promotion:/api/advert/v2/budget",
         host: ApiHost::Promotion,
-        request_class: RequestClass::PromotionCampaign,
+        request_class: RequestClass::PromotionBudgets,
     },
     EndpointPolicy {
         method: Method::GET,
@@ -301,6 +308,7 @@ impl EndpointPolicy {
             .iter()
             .chain(super::coverage_policy::ENDPOINTS)
             .chain(super::operational_policy::ENDPOINTS)
+            .chain(super::recent_policy::ENDPOINTS)
             .find(|policy| {
                 policy.method == *method
                     && if policy.path == SELLER_STOCKS_PATH {
@@ -312,6 +320,7 @@ impl EndpointPolicy {
                         )
                     } else if let Some(matches) =
                         super::coverage_policy::matches_dynamic(policy.path, path)
+                            .or_else(|| super::recent_policy::matches_dynamic(policy.path, path))
                     {
                         matches
                     } else {
@@ -327,7 +336,7 @@ pub(super) fn is_seller_stock_read_path(path: &str) -> bool {
     canonical_positive_id_segment(path, "/api/v3/stocks/")
 }
 
-fn canonical_positive_id_segment(path: &str, prefix: &str) -> bool {
+pub(super) fn canonical_positive_id_segment(path: &str, prefix: &str) -> bool {
     let Some(id) = path.strip_prefix(prefix) else {
         return false;
     };
@@ -340,7 +349,14 @@ impl RequestClass {
     pub(super) const fn allows_automatic_retry(self) -> bool {
         !matches!(
             self,
-            Self::StatisticsReport
+            Self::OrderFeed
+                | Self::PromotionBudgets
+                | Self::PromotionDailyLimits
+                | Self::ItemReturns
+                | Self::AnalyticsDownloadStatus
+                | Self::AnalyticsDownloadFile
+                | Self::AnalyticsDownloads
+                | Self::StatisticsReport
                 | Self::FbsOrders
                 | Self::PromotionCosts
                 | Self::PromotionPayments
@@ -385,6 +401,14 @@ pub(super) struct ClientPolicy {
     pub(super) card_errors_interval: Duration,
     pub(super) fbs_orders_interval: Duration,
     pub(super) promotion_history_interval: Duration,
+    pub(super) order_feed_interval: Duration,
+    pub(super) promotion_budgets_interval: Duration,
+    pub(super) promotion_daily_limits_interval: Duration,
+    pub(super) item_returns_interval: Duration,
+    pub(super) analytics_downloads_interval: Duration,
+    pub(super) analytics_download_status_interval: Duration,
+    pub(super) analytics_download_file_interval: Duration,
+
     pub(super) max_attempts: usize,
     pub(super) base_retry_delay: Duration,
     pub(super) max_retry_delay: Duration,
@@ -430,6 +454,14 @@ impl ClientPolicy {
             fbs_orders_interval: Duration::from_secs(2),
             // Safe for Base tokens too; never infer a faster tier from credentials.
             promotion_history_interval: Duration::from_hours(1),
+            order_feed_interval: Duration::from_hours(3),
+            promotion_budgets_interval: Duration::from_mins(15),
+            promotion_daily_limits_interval: Duration::from_secs(12),
+            item_returns_interval: Duration::from_mins(1),
+            analytics_downloads_interval: Duration::from_hours(1),
+            analytics_download_status_interval: Duration::from_hours(1),
+            analytics_download_file_interval: Duration::from_hours(1),
+
             max_attempts: MAX_ATTEMPTS,
             base_retry_delay: BASE_RETRY_DELAY,
             max_retry_delay: MAX_RETRY_DELAY,
@@ -464,6 +496,14 @@ impl ClientPolicy {
             card_errors_interval: Duration::ZERO,
             fbs_orders_interval: Duration::ZERO,
             promotion_history_interval: Duration::ZERO,
+            order_feed_interval: Duration::ZERO,
+            promotion_budgets_interval: Duration::ZERO,
+            promotion_daily_limits_interval: Duration::ZERO,
+            item_returns_interval: Duration::ZERO,
+            analytics_downloads_interval: Duration::ZERO,
+            analytics_download_status_interval: Duration::ZERO,
+            analytics_download_file_interval: Duration::ZERO,
+
             max_attempts: 1,
             base_retry_delay: Duration::ZERO,
             max_retry_delay: Duration::from_secs(1),
@@ -473,6 +513,13 @@ impl ClientPolicy {
 
     pub(super) const fn interval(self, request_class: RequestClass) -> Duration {
         match request_class {
+            RequestClass::OrderFeed => self.order_feed_interval,
+            RequestClass::PromotionBudgets => self.promotion_budgets_interval,
+            RequestClass::PromotionDailyLimits => self.promotion_daily_limits_interval,
+            RequestClass::ItemReturns => self.item_returns_interval,
+            RequestClass::AnalyticsDownloads => self.analytics_downloads_interval,
+            RequestClass::AnalyticsDownloadStatus => self.analytics_download_status_interval,
+            RequestClass::AnalyticsDownloadFile => self.analytics_download_file_interval,
             RequestClass::AnalyticsPing => self.ping_interval,
             RequestClass::AnalyticsReport => self.analytics_interval,
             RequestClass::StatisticsReport => self.statistics_interval,

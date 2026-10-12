@@ -15,6 +15,13 @@ const PROMOTION_BALANCE_BUCKET: &str = "promotion_balance";
 impl RequestClass {
     pub(super) const fn shared_quota_bucket(self) -> &'static str {
         match self {
+            Self::OrderFeed => "order_feed",
+            Self::PromotionBudgets => "promotion_budgets",
+            Self::PromotionDailyLimits => "promotion_daily_limits",
+            Self::ItemReturns => "item_returns",
+            Self::AnalyticsDownloads => "analytics_downloads",
+            Self::AnalyticsDownloadStatus => "analytics_download_status",
+            Self::AnalyticsDownloadFile => "analytics_download_file",
             Self::AnalyticsPing => "analytics_ping",
             Self::AnalyticsReport => "analytics_report",
             Self::StatisticsReport => "statistics_report",

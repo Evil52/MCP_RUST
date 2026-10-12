@@ -2,9 +2,9 @@
   "max_new_file_lines": 1000,
   "legacy_file_lines": {
     "src/auth.rs": 1725,
-    "src/bin/wb-automation.rs": 1889,
+    "src/bin/wb-automation.rs": 1824,
     "src/config.rs": 3307,
-    "src/control/automation_executor.rs": 4023,
+    "src/control/automation_executor.rs": 3889,
     "src/control/automation_observer.rs": 1262,
     "src/control/automation_postgres.rs": 1970,
     "src/control/automation.rs": 1755,
@@ -30,7 +30,7 @@
     "src/server.rs": 1229,
     "src/server/tests.rs": 11215,
     "src/wb.rs": 4759,
-    "tests/http_router.rs": 1117,
+    "tests/http_router.rs": 1113,
     "tests/reporting_postgres_outbox.rs": 1227,
     "tests/wb_automation_postgres.rs": 1929
   }

@@ -15,6 +15,39 @@ use serde_json::Value;
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn wb_recommendations_replay_saved_evidence_without_environment_or_writes() {
+    let directory = FixtureDirectory::new();
+    let evidence = directory.write(
+        "recommendations.json",
+        include_bytes!("../config/wb-ads-recommendations.example.json"),
+    );
+    directory.write(".env", b"INVALID PRIVATE DOTENV DO NOT LOAD");
+    let before = fs::read_dir(&directory.0).unwrap().count();
+    let output = command(&directory.0)
+        .arg("recommend-wb")
+        .arg(&evidence)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "review_only");
+    assert_eq!(report["recommendations"][0]["action"], "test_increase");
+    assert_eq!(report["recommendations"][0]["suggested_step_bps"], 500);
+    assert_eq!(report["auto_apply_allowed"], false);
+    let repeated = command(&directory.0)
+        .arg("recommend-wb")
+        .arg(&evidence)
+        .output()
+        .unwrap();
+    assert_eq!(output.stdout, repeated.stdout);
+    assert_eq!(fs::read_dir(&directory.0).unwrap().count(), before);
+}
+
+#[test]
 fn wb_baseline_reports_weighted_metrics_without_environment_or_writes() {
     let directory = FixtureDirectory::new();
     let evidence = directory.write(

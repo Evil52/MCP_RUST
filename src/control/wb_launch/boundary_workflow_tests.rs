@@ -41,10 +41,10 @@ fn receipt_failure_responses(fixture: &Fixture, stage: &str) -> Vec<(u16, Value)
     let mut responses = if stage == "bids" {
         vec![
             (200, target(4, 500)),
-            (200, json!({"total":0})),
+            (200, budget(0)),
             (200, minimums()),
             (200, target(4, 500)),
-            (200, json!({"total":0})),
+            (200, budget(0)),
             (200, json!({})),
             (200, target(4, 922)),
         ]
@@ -56,10 +56,10 @@ fn receipt_failure_responses(fixture: &Fixture, stage: &str) -> Vec<(u16, Value)
         responses.extend([
             (200, minimums()),
             (200, target(11, 922)),
-            (200, json!({"total":0})),
+            (200, budget(0)),
             (200, json!({"balance":0,"net":1000})),
             (200, json!({"total":1000})),
-            (200, json!({"total":1000})),
+            (200, budget(1000)),
             (200, target(11, 922)),
         ]);
     }

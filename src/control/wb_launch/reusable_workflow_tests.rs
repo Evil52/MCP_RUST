@@ -63,13 +63,13 @@ async fn different_accounts_names_products_create_without_source_campaign_and_in
         let mut responses = reads(&fixture);
         responses.extend(reads(&fixture)); // Repeat under the final paced permit.
         responses.extend([
-            (200,json!(id)),(200,details(id,name,&nms,4,102)),(200,json!({"total":0})),
-            (200,details(id,name,&nms,4,102)),(200,json!({"total":0})),
-            (200,details(id,name,&nms,4,102)),(200,json!({"total":0})),
+            (200,json!(id)),(200,details(id,name,&nms,4,102)),(200,budget_for(id,0)),
+            (200,details(id,name,&nms,4,102)),(200,budget_for(id,0)),
+            (200,details(id,name,&nms,4,102)),(200,budget_for(id,0)),
             (200,json!({"bids":nms.iter().map(|nm| json!({"nm_id":nm,"bids":[{"type":"search","value":102}]})).collect::<Vec<_>>()})),
-            (200,details(id,name,&nms,4,102)),(200,json!({"total":0})),
+            (200,details(id,name,&nms,4,102)),(200,budget_for(id,0)),
             (200,json!({})),(200,details(id,name,&nms,4,700)),
-            (200,details(id,name,&nms,4,700)),(200,json!({"total":0})),
+            (200,details(id,name,&nms,4,700)),(200,budget_for(id,0)),
         ]);
         let count = responses.len();
         let (operator, receiver) = fixture.operator(responses);
@@ -313,13 +313,13 @@ async fn reusable_funding_uses_exact_configured_amount_once_and_does_not_start()
             json!({"bids":[{"nm_id":111,"bids":[{"type":"search","value":102}]}]}),
         ),
         (200, campaign.clone()),
-        (200, json!({"total":0})),
+        (200, budget(0)),
         (200, json!({"net":1500})),
         (200, json!({"total":1500})),
-        (200, json!({"total":1500})),
+        (200, budget(1500)),
         (200, campaign.clone()),
         (200, campaign),
-        (200, json!({"total":1500})),
+        (200, budget(1500)),
     ]);
     let count = responses.len();
     let (operator, receiver) = fixture.operator(responses);

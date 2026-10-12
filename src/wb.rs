@@ -39,6 +39,10 @@ mod limiter;
 mod operational_policy;
 mod operator_reads;
 pub mod promotion_money;
+pub mod recent_policy;
+pub mod recent_queries;
+mod recent_reads;
+mod report_archive;
 use limiter::TokenLimiter;
 mod policy;
 pub use mcp_marketplace_types::WbCredentials;
@@ -1299,8 +1303,8 @@ mod tests {
             Some(RequestClass::PromotionCampaign)
         );
         assert_eq!(
-            RequestClass::for_request(&Method::GET, PROMOTION_BUDGET_PATH),
-            Some(RequestClass::PromotionCampaign)
+            RequestClass::for_request(&Method::POST, PROMOTION_BUDGET_PATH),
+            Some(RequestClass::PromotionBudgets)
         );
         assert_eq!(
             RequestClass::for_request(&Method::GET, PROMOTION_STATS_PATH),
@@ -1528,11 +1532,11 @@ mod tests {
                 RequestClass::PromotionCampaign,
             ),
             (
-                Method::GET,
+                Method::POST,
                 PROMOTION_BUDGET_PATH,
-                "promotion:/adv/v1/budget",
+                "promotion:/api/advert/v2/budget",
                 ApiHost::Promotion,
-                RequestClass::PromotionCampaign,
+                RequestClass::PromotionBudgets,
             ),
             (
                 Method::GET,
@@ -1639,7 +1643,6 @@ mod tests {
         let client = client(&format!("{base_url}/"));
         assert!(client.is_configured("account"));
         assert!(!client.is_configured("missing"));
-
         assert_eq!(client.ping("account").await.unwrap()["Status"], "OK");
         let payload = json!({"limit": 10, "offset": 0});
         assert_eq!(
@@ -1733,7 +1736,6 @@ mod tests {
             (200, r#"{"bids":[]}"#.to_owned()),
         ]);
         let client = client(&base_url);
-
         assert!(
             client
                 .search_product_queries(
@@ -1907,7 +1909,6 @@ mod tests {
                 "filter": {"withPhoto": -1}
             }
         });
-
         assert_eq!(
             client
                 .product_cards("account", Some("ru".to_owned()), cards_payload.clone())
@@ -1997,7 +1998,6 @@ mod tests {
             "http://127.0.0.1:1",
             &analytics_base_url,
         );
-
         assert_eq!(client.ping("account").await.unwrap()["Status"], "OK");
         assert!(
             requests
@@ -2026,7 +2026,10 @@ mod tests {
             (200, r#"{"adverts":[],"all":0}"#.to_owned()),
             (200, r#"{"adverts":[]}"#.to_owned()),
             (200, r#"{"adverts":[]}"#.to_owned()),
-            (200, r#"{"cash":0,"netting":100,"total":100}"#.to_owned()),
+            (
+                200,
+                r#"{"adverts":[{"advertId":56,"currency":"RUB","total":100}]}"#.to_owned(),
+            ),
             (200, "[]".to_owned()),
         ]);
         let client = WbClient::build(
@@ -2150,15 +2153,16 @@ mod tests {
             "GET /adv/v1/promotion/count HTTP/1.1\r\n",
             "GET /api/advert/v2/adverts?ids=12%2C34&statuses=9%2C11&payment_type=cpm HTTP/1.1\r\n",
             "GET /api/advert/v2/adverts?ids=56 HTTP/1.1\r\n",
-            "GET /adv/v1/budget?id=56 HTTP/1.1\r\n",
+            "POST /api/advert/v2/budget HTTP/1.1\r\n",
             "GET /adv/v3/fullstats?ids=12%2C34&beginDate=2026-08-01&endDate=2026-08-11 HTTP/1.1\r\n",
         ] {
             let request = promotion_requests
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap();
             assert!(request.starts_with(expected), "{request}");
-            assert!(request.ends_with("\r\n\r\n"), "GET must have no body");
-            assert!(!request.to_ascii_lowercase().contains("content-type:"));
+            let post = expected.starts_with("POST ");
+            assert_eq!(request.ends_with("\r\n\r\n"), !post);
+            assert_eq!(request.to_ascii_lowercase().contains("content-type:"), post);
             assert!(
                 request
                     .to_ascii_lowercase()
@@ -4577,7 +4581,7 @@ mod tests {
             // Wrong methods for the three newly allowlisted read endpoints.
             (Method::POST, PROMOTION_CAMPAIGNS_PATH),
             (Method::POST, PROMOTION_DETAILS_PATH),
-            (Method::POST, PROMOTION_BUDGET_PATH),
+            (Method::GET, PROMOTION_BUDGET_PATH),
             (Method::POST, PROMOTION_STATS_PATH),
             (Method::GET, SEARCH_PRODUCT_QUERIES_PATH),
             (Method::GET, SEARCH_ORDERS_POSITIONS_PATH),
@@ -4673,11 +4677,7 @@ mod tests {
             RequestClass::for_request(&Method::GET, ACCEPTANCE_COEFFICIENTS_PATH),
             Some(RequestClass::AcceptanceTariff)
         );
-        for path in [
-            PROMOTION_CAMPAIGNS_PATH,
-            PROMOTION_DETAILS_PATH,
-            PROMOTION_BUDGET_PATH,
-        ] {
+        for path in [PROMOTION_CAMPAIGNS_PATH, PROMOTION_DETAILS_PATH] {
             assert_eq!(
                 RequestClass::for_request(&Method::GET, path),
                 Some(RequestClass::PromotionCampaign)

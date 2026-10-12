@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT",
+  "as_of": "2026-10-12T09:00:00Z",
+  "date_from": "2026-09-28",
+  "date_to": "2026-10-11",
+  "campaign_ids": [11],
+  "target_drr_bps": 1500,
+  "statistics_observed_at": "2026-10-12T09:00:00Z",
+  "composition_observed_at": "2026-10-12T08:59:00Z",
+  "composition": {"adverts": [{
+    "id": 11, "status": 9, "bid_type": "manual", "currency": "RUB",
+    "settings": {"name": "Synthetic search campaign", "payment_type": "cpc", "placements": {"search": true, "recommendations": false}},
+    "nm_settings": [{"nm_id": 99, "bids_kopecks": {"search": 700, "recommendations": 0}}]
+  }]},
+  "statistics": [{"advertId": 11, "days": [
+    {"date": "2026-10-05T00:00:00Z", "sum": 50, "sum_price": 1000, "orders": 2, "views": 150, "clicks": 15,
+      "apps": [{"nms": [{"nmId": 99, "sum": 50, "sum_price": 1000, "orders": 2, "views": 150, "clicks": 15}]}]},
+    {"date": "2026-10-06T00:00:00Z", "sum": 50, "sum_price": 1000, "orders": 2, "views": 150, "clicks": 15,
+      "apps": [{"nms": [{"nmId": 99, "sum": 50, "sum_price": 1000, "orders": 2, "views": 150, "clicks": 15}]}]},
+    {"date": "2026-10-07T00:00:00Z", "sum": 50, "sum_price": 1000, "orders": 2, "views": 150, "clicks": 15,
+      "apps": [{"nms": [{"nmId": 99, "sum": 50, "sum_price": 1000, "orders": 2, "views": 150, "clicks": 15}]}]}
+  ]}],
+  "stocks": {
+    "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT", "marketplace": "wildberries", "source": "stocks",
+    "snapshot_id": "101", "source_as_of": "2026-10-12T08:50:00Z", "quality": "complete",
+    "pagination_complete": true, "inventory_scope": "fbw", "total_rows": 1, "next_offset": null,
+    "rows": [{"account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT", "marketplace": "wildberries", "snapshot_id": 101,
+      "sku": 99, "warehouse_id": "wb:123", "sellable_units": 20}]
+  },
+  "sales": {
+    "account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT", "marketplace": "wildberries", "source": "sales",
+    "snapshot_id": "102", "source_as_of": "2026-10-12T08:50:00Z", "quality": "complete",
+    "period_start": "2026-10-10T19:00:00Z", "period_end": "2026-10-11T19:00:00Z",
+    "pagination_complete": true, "total_rows": 1, "next_offset": null,
+    "rows": [{"account_id": "SYNTHETIC_DEMO_NOT_A_LIVE_ACCOUNT", "marketplace": "wildberries", "snapshot_id": 102,
+      "sku": 99, "business_date": "2026-10-11", "ordered_units": 2}]
+  }
+}

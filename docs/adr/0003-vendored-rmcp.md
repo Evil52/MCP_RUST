@@ -14,6 +14,7 @@ behavior to the SDK. The current local obligations are:
 | --- | --- | --- |
 | Tool `securitySchemes` | Preserve typed top-level scheme objects and compatibility metadata | `tests/oauth_wire.rs` |
 | Local session admission/lifetime | Hard cap, prune closed sessions, bounded idle lifetime, in-flight protection; classified overload becomes 503 + Retry-After | `tests/session_limit.rs`, `tests/http_router.rs` |
+| Origin port matching | Portless remote origins match only default ports; loopback compatibility remains, explicit wildcards are supported | `tests/http_router.rs` origin tests |
 | HTTP input errors | Sanitized malformed JSON/envelope 400; unsupported media type 415 before body read | `tests/http_router.rs` |
 | Structured result budget | Bounded serialization and bounded complete result, payload-free failures; retain both content representations | `tests/structured_result_limit.rs` |
 | Session cancellation | Root shutdown reaches pending and initialized session workers | `tests/http_router.rs` bounded-shutdown tests |

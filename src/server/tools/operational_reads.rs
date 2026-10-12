@@ -191,7 +191,7 @@ impl OzonMcp {
         Ok(Self::wb_result(account, endpoint, data))
     }
 
-    /// Остаток бюджета одной рекламной кампании WB. Только чтение.
+    /// Остаток бюджета одной рекламной кампании WB через v2, в рублях. Отсутствующий/null бюджет — ошибка, не ноль. Только чтение.
     #[tool(name = "wb_promotion_budget", annotations(read_only_hint = true))]
     pub(in crate::server) async fn wb_promotion_budget(
         &self,
@@ -199,7 +199,7 @@ impl OzonMcp {
         Parameters(input): Parameters<PromotionBudgetInput>,
     ) -> Result<Json<WbResult>, String> {
         let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
-        let endpoint = "promotion:/adv/v1/budget";
+        let endpoint = "promotion:/api/advert/v2/budget";
         let data = self
             .wb_client
             .promotion_campaign_budget(&account, input.advert_id)

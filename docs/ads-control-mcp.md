@@ -67,7 +67,8 @@ Available tools:
 - `wb_promotion_reconcile_campaign` — readback only after an uncertain result.
 
 This is a separate twenty-one-tool Control registry. It is not part of the Analytics
-MCP release contract, which contains exactly 86 tools. The refresh-request tools
+MCP release contract; its current catalog is documented in
+[marketplace read coverage](marketplace-read-coverage.md). The refresh-request tools
 only mutate internal deduplicated snapshot-refresh queues and have no marketplace
 egress; the other Analytics tools are read-only. In Control,
 `prepare`, `approve`, and `apply` intentionally advertise non-read-only

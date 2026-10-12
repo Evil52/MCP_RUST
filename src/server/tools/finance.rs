@@ -15,7 +15,7 @@ use rmcp::tool_router;
 
 #[tool_router(router = finance_router, vis = "pub(in crate::server)")]
 impl OzonMcp {
-    /// Устаревающий метод финансовых транзакций Ozon, отключение 2026-09-08. Для новых сценариев используйте методы `ozon_finance_accrual`_*.
+    /// Legacy-контракт финансовых транзакций Ozon; объявлен отключённым с 2026-09-08. Для отчётов используйте `ozon_finance_accrual_by_day`, `ozon_finance_accrual_postings` и `ozon_finance_accrual_types`. Доступность старого маршрута не гарантируется.
     #[tool(
         name = "ozon_finance_transactions",
         annotations(title = "Финансовые транзакции Ozon", read_only_hint = true)
@@ -69,7 +69,7 @@ impl OzonMcp {
         .await
     }
 
-    /// Устаревающий метод финансовых итогов Ozon, отключение 2026-09-08. Для новых сценариев используйте методы `ozon_finance_accrual`_*.
+    /// Legacy-контракт финансовых итогов Ozon; объявлен отключённым с 2026-09-08. Для отчётов используйте `ozon_finance_accrual_by_day` и `ozon_finance_mutual_settlement`. Их метрики не эквивалентны старым totals. Доступность старого маршрута не гарантируется.
     #[tool(
         name = "ozon_finance_totals",
         annotations(title = "Финансовые итоги Ozon", read_only_hint = true)

@@ -30,15 +30,15 @@ async fn guarded_start_requires_two_cycles_and_verifies_status_after_one_write()
     let responses = vec![
         (200, target(11, 922)),
         (200, minimums()),
-        (200, json!({"total":1000})),
+        (200, budget(1000)),
         (200, stats),
         (200, stock),
         (200, target(11, 922)),
         (200, json!({})),
         (200, target(9, 922)),
-        (200, json!({"total":1000})),
+        (200, budget(1000)),
         (200, target(9, 922)),
-        (200, json!({"total":1000})),
+        (200, budget(1000)),
     ];
     let count = responses.len();
     let (operator, receiver) = fixture.operator(responses);
@@ -142,7 +142,7 @@ async fn installed_robot_revocation_during_final_read_prevents_start_and_attempt
     let responses = vec![
         (200, campaign.clone()),
         (200, minimums()),
-        (200, json!({"total":1000})),
+        (200, budget_for(REVOKED_ID, 1000)),
         (
             200,
             json!([{"advertId":REVOKED_ID,"stats":[
@@ -225,7 +225,10 @@ async fn installed_robot_revocation_during_final_read_prevents_start_and_attempt
         .execute_start(&journal, REVOKED_ID, &policy, &observer, &store)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("robot policy changed"));
+    assert!(
+        error.to_string().contains("robot policy changed"),
+        "unexpected startup rejection: {error:#}"
+    );
     assert!(!journal.attempted("start"));
     assert!(!journal.has_receipt("start"));
     let sent = requests(&receiver, 6);

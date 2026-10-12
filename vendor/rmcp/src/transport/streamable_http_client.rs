@@ -222,6 +222,35 @@ pub enum StreamableHttpError<E: std::error::Error + Send + Sync + 'static> {
     ControlRequestTimeout,
 }
 
+/// Bytes of an unusable JSON body kept in
+/// [`StreamableHttpError::UnexpectedServerResponse`].
+pub(crate) const JSON_RPC_BODY_PREVIEW_LEN: usize = 256;
+
+/// Short, lossy view of a body that failed to parse as JSON-RPC.
+pub(crate) fn json_rpc_body_preview(body: &[u8]) -> Cow<'static, str> {
+    if body.is_empty() {
+        return Cow::Borrowed("<empty>");
+    }
+    let lossy = String::from_utf8_lossy(body);
+    if lossy.len() <= JSON_RPC_BODY_PREVIEW_LEN {
+        return Cow::Owned(lossy.into_owned());
+    }
+    let mut end = JSON_RPC_BODY_PREVIEW_LEN;
+    while end > 0 && !lossy.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(lossy[..end].to_owned())
+}
+
+/// Request-POST parse failure, including a body preview so empty / HTML / `{}`
+/// are distinguishable from the serde diagnostic alone.
+pub(crate) fn json_rpc_parse_error_message(err: &serde_json::Error, body: &[u8]) -> String {
+    format!(
+        "could not parse JSON response as ServerJsonRpcMessage: {err}: {}",
+        json_rpc_body_preview(body)
+    )
+}
+
 impl<E: std::error::Error + Send + Sync + 'static> StreamableHttpError<E> {
     /// The `WWW-Authenticate` challenge carried by this error, when the
     /// server answered 401 ([`AuthRequired`](Self::AuthRequired)) or 403
@@ -333,11 +362,15 @@ impl StreamableHttpPostResponse {
 }
 
 /// Convert a sessionless discovery rejection into a response the lifecycle
-/// layer can classify as a legacy-server signal.
+/// layer can classify. The server's own JSON-RPC error is preserved so the
+/// lifecycle can tell a modern rejection (retry at a supported version) from a
+/// legacy one; `invalid_request` is synthesized only when the body has no error
+/// to keep, as with an empty or plain-text 4xx from middleware.
 ///
-/// Some legacy streamable-HTTP servers reject `server/discover` in middleware
-/// before it reaches JSON-RPC dispatch. Their response may be an empty or
-/// plain-text 4xx, so there is no JSON-RPC error for the client to forward.
+/// The id is re-correlated because such middleware rejections cannot echo it
+/// (the Python SDK sends the literal `"server-error"`); otherwise the lifecycle
+/// discards the response as uncorrelated without classifying it.
+///
 /// Keep authentication failures and server errors on their original paths.
 pub(super) fn legacy_discover_response(
     message: &ClientJsonRpcMessage,
@@ -359,10 +392,13 @@ pub(super) fn legacy_discover_response(
         return None;
     }
 
-    let error = ErrorData::invalid_request(
-        format!("server/discover rejected with HTTP {status}: {body}"),
-        None,
-    );
+    let error = match serde_json::from_str::<ServerJsonRpcMessage>(body) {
+        Ok(ServerJsonRpcMessage::Error(error)) => error.error,
+        _ => ErrorData::invalid_request(
+            format!("server/discover rejected with HTTP {status}: {body}"),
+            None,
+        ),
+    };
     Some(StreamableHttpPostResponse::Json(
         ServerJsonRpcMessage::error(error, Some(request.id.clone())),
         None,
@@ -2154,6 +2190,32 @@ mod tests {
         },
         service::InboundStreamOrigin,
     };
+
+    #[test]
+    fn json_rpc_body_preview_empty_html_and_object() {
+        assert_eq!(json_rpc_body_preview(b""), "<empty>");
+        assert_eq!(json_rpc_body_preview(b"{}"), "{}");
+        assert_eq!(
+            json_rpc_body_preview(b"<html>not json</html>"),
+            "<html>not json</html>"
+        );
+    }
+
+    #[test]
+    fn json_rpc_body_preview_truncates_long_bodies() {
+        let long = vec![b'x'; JSON_RPC_BODY_PREVIEW_LEN + 40];
+        let preview = json_rpc_body_preview(&long);
+        assert_eq!(preview.len(), JSON_RPC_BODY_PREVIEW_LEN);
+        assert!(preview.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn json_rpc_parse_error_message_includes_preview() {
+        let err = serde_json::from_slice::<ServerJsonRpcMessage>(b"{}").unwrap_err();
+        let msg = json_rpc_parse_error_message(&err, b"{}");
+        assert!(msg.contains("could not parse JSON response as ServerJsonRpcMessage"));
+        assert!(msg.contains("{}"), "missing body preview: {msg}");
+    }
 
     #[expect(
         deprecated,

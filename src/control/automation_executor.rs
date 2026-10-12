@@ -1,3 +1,8 @@
+mod explicit_decisions;
+use explicit_decisions::{
+    explicit_bid_cap_repair_decision, explicit_exposure_increase_decision,
+    explicit_quota_override_decision, explicit_resume_after_daily_cap_decision,
+};
 mod dispatch;
 mod feedback;
 use feedback::{autonomous_exposure_pacing_decision, traffic_frontier_pacing_decision};
@@ -359,6 +364,26 @@ impl WbAutomationExecutor {
         .await
     }
 
+    /// Lowers one externally drifted search bid to the authorized maximum.
+    /// This maintenance action may run during cooldown or a protective pause,
+    /// but never raises bids, resumes delivery, clears incidents or bypasses
+    /// the durable quota, reservation, final permit and readback protocol.
+    pub async fn run_explicit_bid_cap_repair_once_postgres(
+        &self,
+        store: &WbAutomationPostgresStore,
+        legacy: &WbAutomationLegacyStateSeed,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Option<WbAutomationPostgresExecutionReceipt>> {
+        self.run_once_postgres_with_intent(
+            store,
+            legacy,
+            observed_at,
+            PostgresExecutionIntent::ExplicitBidCapRepair,
+            None,
+        )
+        .await
+    }
+
     async fn run_once_postgres_with_intent(
         &self,
         store: &WbAutomationPostgresStore,
@@ -484,12 +509,14 @@ impl WbAutomationExecutor {
         // Same breach contract as the file-backed executor. The durable
         // reservation enforces the daily action quota for every action kind,
         // so a pause that could not be reserved falls back to the lock.
-        if daily_cap_breach_requires_lock(
-            policy,
-            &snapshot.observation,
-            &decision,
-            state_actions_today < policy.max_actions_per_day,
-        ) {
+        if intent != PostgresExecutionIntent::ExplicitBidCapRepair
+            && daily_cap_breach_requires_lock(
+                policy,
+                &snapshot.observation,
+                &decision,
+                state_actions_today < policy.max_actions_per_day,
+            )
+        {
             let transition = lease
                 .mark_incident_without_action(
                     &cycle_id,
@@ -610,6 +637,7 @@ enum PostgresExecutionIntent {
     ExplicitExposureTarget(u64),
     ExplicitQuotaOverride,
     ExplicitResumeAfterDailyCap,
+    ExplicitBidCapRepair,
 }
 
 async fn load_traffic_feedback_baseline(
@@ -645,6 +673,9 @@ fn apply_postgres_execution_intent(
         PostgresExecutionIntent::ExplicitResumeAfterDailyCap => {
             Some(explicit_resume_after_daily_cap_decision(policy, snapshot)?)
         }
+        PostgresExecutionIntent::ExplicitBidCapRepair => {
+            Some(explicit_bid_cap_repair_decision(policy, snapshot)?)
+        }
         PostgresExecutionIntent::Automatic if policy.autonomous_pacing.uses_traffic_frontier() => {
             traffic_frontier_pacing_decision(policy, snapshot, last_applied_snapshot)?
         }
@@ -657,172 +688,6 @@ fn apply_postgres_execution_intent(
         snapshot.decision = decision;
     }
     Ok(())
-}
-
-fn explicit_quota_override_decision(
-    policy: &super::automation::WbAutomationPolicy,
-    snapshot: &WbAutomationSnapshot,
-    last_applied_snapshot: Option<&WbAutomationSnapshot>,
-) -> Result<Option<WbAutomationDecision>> {
-    use super::automation::WbAutomationHoldReason;
-
-    ensure!(
-        policy.autonomous_pacing.uses_marginal_feedback(),
-        "WB explicit quota override requires traffic frontier v3"
-    );
-    ensure!(
-        matches!(
-            snapshot.decision.action,
-            WbAutomationAction::Hold {
-                reason: WbAutomationHoldReason::ActionQuotaExhausted
-            }
-        ) && snapshot.observation.actions_today >= policy.max_actions_per_day,
-        "WB explicit quota override requires an exhausted daily action quota"
-    );
-    ensure!(
-        snapshot
-            .observation
-            .last_action_at
-            .is_none_or(|last_action| {
-                snapshot.observation.observed_at
-                    >= last_action + chrono::Duration::seconds(i64::from(policy.cooldown_seconds))
-            }),
-        "WB explicit quota override preserves the cooldown guard"
-    );
-
-    let mut eligible = snapshot.clone();
-    eligible.decision.action = WbAutomationAction::Hold {
-        reason: WbAutomationHoldReason::AttributionIncomplete,
-    };
-    traffic_frontier_pacing_decision(policy, &eligible, last_applied_snapshot)
-}
-
-fn explicit_resume_after_daily_cap_decision(
-    policy: &super::automation::WbAutomationPolicy,
-    snapshot: &WbAutomationSnapshot,
-) -> Result<WbAutomationDecision> {
-    use super::automation::WbAutomationHoldReason;
-
-    ensure!(
-        policy.write_enabled && policy.bid_writes_enabled,
-        "WB explicit resume requires active write and bid-write policy"
-    );
-    ensure!(
-        matches!(
-            snapshot.decision.action,
-            WbAutomationAction::Hold {
-                reason: WbAutomationHoldReason::ProtectivePauseRequiresApproval
-                    | WbAutomationHoldReason::SpendDataIncomplete
-            }
-        ),
-        "WB explicit resume is blocked by a stronger decision guard"
-    );
-    ensure!(
-        snapshot.observation.campaign_status == 11 && snapshot.observation.paused_by_automation,
-        "WB explicit resume requires the automation-owned protective pause"
-    );
-    ensure!(
-        snapshot.observation.budget_remaining_minor > 0,
-        "WB explicit resume requires a positive campaign budget"
-    );
-    ensure!(
-        snapshot.observation.daily_spend_minor < policy.daily_pause_threshold_minor
-            && snapshot.observation.daily_spend_minor < policy.daily_spend_cap_minor,
-        "WB explicit resume is blocked by the current daily spend guard"
-    );
-    ensure!(
-        snapshot
-            .observation
-            .skus
-            .iter()
-            .any(|sku| sku.sellable_stock > policy.min_sellable_stock),
-        "WB explicit resume requires at least one sellable SKU"
-    );
-    ensure!(
-        snapshot.observation.skus.iter().all(|sku| {
-            sku.current_bid_kopecks >= super::automation::effective_minimum_bid(policy, sku)
-                && sku.current_bid_kopecks <= policy.max_bid_kopecks
-        }),
-        "WB explicit resume requires every current bid inside the reviewed corridor"
-    );
-    Ok(WbAutomationDecision {
-        account_id: policy.account_id.clone(),
-        campaign_id: policy.campaign_id,
-        observed_at: snapshot.observation.observed_at,
-        action: WbAutomationAction::ResumeCampaignAfterDailyCap,
-        unresolved_stops: Vec::new(),
-    })
-}
-
-fn explicit_exposure_increase_decision(
-    policy: &super::automation::WbAutomationPolicy,
-    snapshot: &WbAutomationSnapshot,
-    target_impressions: u64,
-) -> Result<WbAutomationDecision> {
-    ensure!(
-        target_impressions == policy.target_impressions_per_day,
-        "WB explicit exposure target does not match policy"
-    );
-    ensure!(
-        matches!(
-            snapshot.decision.action,
-            WbAutomationAction::Hold {
-                reason: super::automation::WbAutomationHoldReason::AttributionIncomplete
-            }
-        ),
-        "WB explicit exposure increase is blocked by a stronger decision guard"
-    );
-    let metrics = snapshot
-        .observation
-        .campaign_level_metrics
-        .as_ref()
-        .context("WB explicit exposure increase requires campaign delivery metrics")?;
-    ensure!(
-        metrics.impressions < target_impressions
-            && metrics.impressions < policy.low_exposure_max_impressions
-            && metrics.clicks < policy.low_exposure_max_clicks,
-        "WB explicit exposure increase requires verified low exposure"
-    );
-    let sku = policy
-        .nm_ids
-        .iter()
-        .filter_map(|nm_id| {
-            snapshot
-                .observation
-                .skus
-                .iter()
-                .find(|sku| sku.nm_id == *nm_id)
-        })
-        .filter(|sku| {
-            sku.sellable_stock > policy.min_sellable_stock
-                && sku.current_bid_kopecks < policy.max_bid_kopecks
-        })
-        .min_by_key(|sku| sku.current_bid_kopecks)
-        .context("WB explicit exposure increase has no safe SKU candidate")?;
-    let to_bid_kopecks = super::automation::increase_bid(
-        policy,
-        sku.current_bid_kopecks,
-        super::automation::effective_minimum_bid(policy, sku),
-    )
-    .context("WB explicit exposure bid increase is invalid")?;
-    ensure!(
-        to_bid_kopecks > sku.current_bid_kopecks,
-        "WB explicit exposure bid cannot increase"
-    );
-    Ok(WbAutomationDecision {
-        account_id: policy.account_id.clone(),
-        campaign_id: policy.campaign_id,
-        observed_at: snapshot.observation.observed_at,
-        action: WbAutomationAction::ChangeBids {
-            changes: vec![WbAutomationBidChange {
-                nm_id: sku.nm_id,
-                from_bid_kopecks: sku.current_bid_kopecks,
-                to_bid_kopecks,
-                reason: super::automation::WbAutomationBidReason::ExplicitExposureTarget,
-            }],
-        },
-        unresolved_stops: Vec::new(),
-    })
 }
 
 /// Decides whether observed spend at or above the daily ceiling must lock the
@@ -997,6 +862,7 @@ const fn durable_action_kind(kind: &PendingActionKind) -> WbAutomationDurableAct
 
 #[cfg(test)]
 mod tests {
+    mod bid_cap_repair;
     mod daily_cap_breach;
     mod not_sent;
     mod postgres_clock;
@@ -1027,7 +893,7 @@ mod tests {
             WbAutomationHoldReason, WbAutomationObservation, WbAutomationPacingMode,
             WbAutomationPolicy, WbAutomationSkuObservation,
         },
-        test_support::mock_http,
+        test_support::{mock_http, wb_budget_response},
         wb::{WbClient, WbCredentials},
     };
 
@@ -1291,7 +1157,7 @@ mod tests {
                 campaign_response_for(campaign_id, status, bid).to_string(),
             ),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, wb_budget_response(campaign_id, 1_000).to_string()),
             (200, advertising_payload.to_string()),
             (
                 200,
@@ -1347,7 +1213,7 @@ mod tests {
                 campaign_response_with_bids(campaign_id, status, bids).to_string(),
             ),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, wb_budget_response(campaign_id, 1_000).to_string()),
             (200, advertising_payload.to_string()),
             (
                 200,
@@ -1383,7 +1249,7 @@ mod tests {
                 campaign_response_with_bids(campaign_id, 9, bids).to_string(),
             ),
             (200, minimum_bids_response().to_string()),
-            (200, serde_json::json!({"total": 1_000}).to_string()),
+            (200, wb_budget_response(campaign_id, 1_000).to_string()),
             (200, advertising_payload.to_string()),
             (
                 200,

@@ -27,7 +27,10 @@ async fn observe_with_pages(
     let mut responses = vec![
         (200, campaign.to_string()),
         (200, minimum_bids_response().to_string()),
-        (200, serde_json::json!({"total": 1_000}).to_string()),
+        (
+            200,
+            crate::test_support::wb_budget_response(39_682_633, 1_000).to_string(),
+        ),
         (200, stats_response().to_string()),
     ];
     responses.extend(pages);
