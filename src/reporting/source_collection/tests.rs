@@ -13,6 +13,7 @@ use tokio_postgres::{Client, Config, NoTls};
 
 mod recovery;
 mod replenishment;
+mod retries;
 mod sales_publication;
 mod seller_stocks;
 
