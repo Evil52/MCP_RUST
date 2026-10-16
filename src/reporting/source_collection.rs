@@ -147,21 +147,36 @@ async fn complete_quantum(
             let retry = (retryable(code)
                 || retry_current_advertising_counts(code, claim, Utc::now()))
                 && failure.retry_after.is_none_or(|s| s <= 86400);
-            let delay = 65_u32
-                .saturating_mul(1 << claim.consecutive_failures.min(4))
-                .min(900)
-                .max(
-                    u32::try_from(failure.retry_after.unwrap_or(0))
-                        .unwrap_or(i32::MAX as u32)
-                        .min(i32::MAX as u32),
-                );
+            let delay = source_retry_delay(claim, failure);
             writer
                 .defer_source_job(claim, Some(code), delay, !retry)
                 .await?;
-            tracing::warn!(account_id=claim.account_id(),source=?claim.source,error_class=code,retry,"source deferred; other sources remain available");
+            tracing::warn!(account_id=claim.account_id(),source=?claim.source,error_class=code,retry,delay_seconds=delay,retry_after_seconds=failure.retry_after,"source deferred; other sources remain available");
         }
     }
     Ok(())
+}
+
+fn source_retry_delay(claim: &SourceJobClaim, failure: SourceFailure) -> u32 {
+    // Transient cluster 5xx and explicitly timed cooldowns must not consume
+    // the 30-minute inventory window in artificial minute-long pauses. Each
+    // retry still needs durable departure and shared quota admission.
+    let base: u32 = if claim.marketplace() == Marketplace::Ozon
+        && claim.source == SnapshotSource::ClusterStocks
+        && (failure.code == "upstream_server_error"
+            || (failure.code == "rate_limited" && failure.retry_after.is_some()))
+    {
+        5
+    } else {
+        65
+    };
+    base.saturating_mul(1 << claim.consecutive_failures.min(4))
+        .min(900)
+        .max(
+            u32::try_from(failure.retry_after.unwrap_or(0))
+                .unwrap_or(i32::MAX as u32)
+                .min(i32::MAX as u32),
+        )
 }
 
 fn retryable(code: &str) -> bool {
