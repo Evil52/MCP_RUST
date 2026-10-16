@@ -26,6 +26,14 @@
 !vendor/rmcp/UPSTREAM.md
 !vendor/rmcp/src/
 !vendor/rmcp/src/**
+!vendor/rust_xlsxwriter/
+!vendor/rust_xlsxwriter/Cargo.toml
+!vendor/rust_xlsxwriter/LICENSE_MIT
+!vendor/rust_xlsxwriter/LICENSE_Apache2.0
+!vendor/rust_xlsxwriter/README.md
+!vendor/rust_xlsxwriter/UPSTREAM.md
+!vendor/rust_xlsxwriter/src/
+!vendor/rust_xlsxwriter/src/**
 
 !config/
 !config/access.example.json

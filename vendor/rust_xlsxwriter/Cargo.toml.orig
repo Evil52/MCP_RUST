@@ -1,0 +1,445 @@
+[package]
+name = "rust_xlsxwriter"
+description = "A Rust library for writing Excel 2007 xlsx files"
+authors = ["John McNamara <jmcnamara@cpan.org>"]
+homepage = "https://rustxlsxwriter.github.io"
+repository = "https://github.com/jmcnamara/rust_xlsxwriter"
+keywords = ["excel", "xlsx"]
+exclude = ["tests/**/*"]
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+version = "0.99.1"
+edition = "2021"
+rust-version = "1.88.0" # For zip.rs compatibility.
+
+[dependencies]
+# Default/non-optional dependencies.
+zip = {version = "9.0.3", default-features = false, features = ["deflate"]}
+
+# Optional dependencies.
+ryu = {optional = true, version = "1.0"}
+zmij = {optional = true, version = "1.0"}
+jiff = {optional = true, version = "0.2", default-features = false, features = []}
+serde = {optional = true, version = "1.0", features = ["derive"]}
+ssfmt = {optional = true, version = "0.1"}
+chrono = {optional = true, version = "0.4", default-features = false, features = ["clock", "wasmbind", "serde"]}
+js-sys = {optional = true, version = "0.3"}
+polars = {optional = true, version = "0.55", default-features = false, features = []}
+tempfile =  {optional = true, version = "3.24"}
+wasm-bindgen = {optional = true, version = "0.2"}
+rust_decimal = {optional = true, version = "1.40"}
+rust_xlsxwriter_derive = {optional = true, version = "0.2"}
+
+[dev-dependencies]
+regex = "1.12"
+pretty_assertions = "1.4"
+criterion = "0.5"
+
+[[bench]]
+name = "float_formatting"
+harness = false
+
+[[bench]]
+name = "write_performance"
+harness = false
+
+[features]
+# `default`: Includes all the standard functionality.
+default = []
+
+# `zlib`: Adds a dependency on zlib and a C compiler. This includes the same
+# features as `default` but is 1.5x faster for large files.
+zlib = ["zip/deflate-flate2-zlib"]
+
+# `chrono`: Adds support for Chrono dates/times in addition to the native
+# `ExcelDateTime` types.
+chrono = ["dep:chrono"]
+
+# `jiff`: Adds support for Jiff dates/times in addition to the native
+# `ExcelDateTime` types.
+jiff = ["dep:jiff"]
+
+# Enable "constant memory" when writing worksheet data. This keeps memory usage
+# to a minimum when writing large files.
+constant_memory = ["dep:tempfile"]
+
+# `enhanced_autofit`: This features provides autofit support for formatted
+# numbers via the `ssfmt` crate.
+enhanced_autofit = ["dep:ssfmt"]
+
+# `polars`: Adds support for mapping between `PolarsError` and
+# `rust_xlsxwriter::XlsxError` to make code that handles both types of errors
+# easier to write. See also `polars_write_excel`.
+polars = ["dep:polars"]
+
+# `serde`: Adds support for Serde serialization.
+serde = ["dep:serde", "dep:rust_xlsxwriter_derive"]
+
+# `wasm`: Enables wasm/JavaScript compilation. See also `wasm-xlsxwriter`.
+wasm = ["js-sys", "wasm-bindgen"]
+
+# `rust_decimal`: Adds support for writing the `rust_decimal` `Decimal` type with
+# `Worksheet::write()`, provided it can be represented by f64.
+rust_decimal = ["dep:rust_decimal"]
+
+# `zmij`: Adds a dependency on `zmij`. This speeds up writing numeric worksheet
+# cells by about 10%.
+zmij = ["dep:zmij"]
+
+# `ryu`: Adds a dependency on `ryu`. This speeds up writing numeric worksheet
+# cells by about 7%. This is deprecated in favor of `zmij` which is faster and
+# by the same author.
+ryu = ["dep:ryu"]
+
+
+# `test-resave`: Developer-only testing feature.
+test-resave = []
+
+#
+# Examples to run only when `chrono` is enabled.
+#
+[[example]]
+name = "doc_worksheet_write_datetime_chrono"
+path = "examples/doc_worksheet_write_datetime_chrono.rs"
+required-features = ["chrono"]
+
+[[example]]
+name = "doc_worksheet_write_date_chrono"
+path = "examples/doc_worksheet_write_date_chrono.rs"
+required-features = ["chrono"]
+
+[[example]]
+name = "doc_worksheet_write_time_chrono"
+path = "examples/doc_worksheet_write_time_chrono.rs"
+required-features = ["chrono"]
+
+[[example]]
+name = "doc_properties_checksum2_chrono"
+path = "examples/doc_properties_checksum2_chrono.rs"
+required-features = ["chrono"]
+
+#
+# Examples to run only when `jiff` is enabled.
+#
+[[example]]
+name = "doc_worksheet_write_datetime_jiff"
+path = "examples/doc_worksheet_write_datetime_jiff.rs"
+required-features = ["jiff"]
+
+#
+# Examples to run only when `serde` is enabled.
+#
+[[example]]
+name = "app_serialize"
+path = "examples/app_serialize.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_deserialize_headers1"
+path = "examples/doc_worksheet_deserialize_headers1.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize"
+path = "examples/doc_worksheet_serialize.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_dimensions1"
+path = "examples/doc_worksheet_serialize_dimensions1.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_dimensions2"
+path = "examples/doc_worksheet_serialize_dimensions2.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers1"
+path = "examples/doc_worksheet_serialize_headers1.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers2"
+path = "examples/doc_worksheet_serialize_headers2.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers3"
+path = "examples/doc_worksheet_serialize_headers3.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers4"
+path = "examples/doc_worksheet_serialize_headers4.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_custom"
+path = "examples/doc_worksheet_serialize_headers_custom.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_format1"
+path = "examples/doc_worksheet_serialize_headers_format1.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_format2"
+path = "examples/doc_worksheet_serialize_headers_format2.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_format3"
+path = "examples/doc_worksheet_serialize_headers_format3.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_format4"
+path = "examples/doc_worksheet_serialize_headers_format4.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_format5"
+path = "examples/doc_worksheet_serialize_headers_format5.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_format6"
+path = "examples/doc_worksheet_serialize_headers_format6.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_format7"
+path = "examples/doc_worksheet_serialize_headers_format7.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_format8"
+path = "examples/doc_worksheet_serialize_headers_format8.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_hide"
+path = "examples/doc_worksheet_serialize_headers_hide.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_rename1"
+path = "examples/doc_worksheet_serialize_headers_rename1.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_rename2"
+path = "examples/doc_worksheet_serialize_headers_rename2.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_skip1"
+path = "examples/doc_worksheet_serialize_headers_skip1.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_skip2"
+path = "examples/doc_worksheet_serialize_headers_skip2.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_skip3"
+path = "examples/doc_worksheet_serialize_headers_skip3.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_with_options"
+path = "examples/doc_worksheet_serialize_headers_with_options.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_headers_with_options2"
+path = "examples/doc_worksheet_serialize_headers_with_options2.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_intro"
+path = "examples/doc_worksheet_serialize_intro.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_intro2"
+path = "examples/doc_worksheet_serialize_intro2.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_table1"
+path = "examples/doc_worksheet_serialize_table1.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_table2"
+path = "examples/doc_worksheet_serialize_table2.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_table3"
+path = "examples/doc_worksheet_serialize_table3.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_vectors"
+path = "examples/doc_worksheet_serialize_vectors.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_column_width"
+path = "examples/doc_xlsxserialize_column_width.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_field_header_format"
+path = "examples/doc_xlsxserialize_field_header_format.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_header_format"
+path = "examples/doc_xlsxserialize_header_format.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_header_format_reuse"
+path = "examples/doc_xlsxserialize_header_format_reuse.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_hide_headers"
+path = "examples/doc_xlsxserialize_hide_headers.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_intro"
+path = "examples/doc_xlsxserialize_intro.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_num_format"
+path = "examples/doc_xlsxserialize_num_format.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_rename"
+path = "examples/doc_xlsxserialize_rename.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_skip"
+path = "examples/doc_xlsxserialize_skip.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_skip2"
+path = "examples/doc_xlsxserialize_skip2.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_table"
+path = "examples/doc_xlsxserialize_table.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_table_default"
+path = "examples/doc_xlsxserialize_table_default.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_table_style"
+path = "examples/doc_xlsxserialize_table_style.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_xlsxserialize_value_format"
+path = "examples/doc_xlsxserialize_value_format.rs"
+required-features = ["serde"]
+
+
+#
+# Examples to run only when `serde` and `chrono` is enabled.
+#
+[[example]]
+name = "doc_worksheet_serialize_datetime1"
+path = "examples/doc_worksheet_serialize_datetime1.rs"
+required-features = ["serde"]
+
+[[example]]
+name = "doc_worksheet_serialize_datetime2"
+path = "examples/doc_worksheet_serialize_datetime2.rs"
+required-features = ["serde", "chrono"]
+
+[[example]]
+name = "doc_worksheet_serialize_datetime3"
+path = "examples/doc_worksheet_serialize_datetime3.rs"
+required-features = ["serde", "chrono"]
+
+[[example]]
+name = "doc_worksheet_serialize_datetime4"
+path = "examples/doc_worksheet_serialize_datetime4.rs"
+required-features = ["serde", "chrono"]
+
+[[example]]
+name = "doc_worksheet_serialize_datetime5"
+path = "examples/doc_worksheet_serialize_datetime5.rs"
+required-features = ["serde", "chrono"]
+
+
+#
+# Examples to run only when `constant_memory` is enabled.
+#
+[[example]]
+name = "doc_worksheet_constant"
+path = "examples/doc_worksheet_constant.rs"
+required-features = ["constant_memory"]
+
+[[example]]
+name = "doc_workbook_add_worksheet_with_low_memory"
+path = "examples/doc_workbook_add_worksheet_with_low_memory.rs"
+required-features = ["constant_memory"]
+
+[[example]]
+name = "doc_workbook_add_worksheet_with_constant_memory"
+path = "examples/doc_workbook_add_worksheet_with_constant_memory.rs"
+required-features = ["constant_memory"]
+
+[[example]]
+name = "doc_workbook_set_tempdir"
+path = "examples/doc_workbook_set_tempdir.rs"
+required-features = ["constant_memory"]
+
+
+# Workaround to display feature specific docs.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.commands]
+# Some local package management and release check commands.
+# Uses Cargo Commander.
+
+spellcheck = {cmd = [
+    "for f in src/*.rs; do aspell --lang=en_US --check $f; done",
+    "for f in examples/*.rs; do aspell --lang=en_US --check $f; done",
+    "aspell --lang=en_US --check examples/README.md",
+    "aspell --lang=en_US --check README.md"
+]}
+
+coverage = {cmd = [
+    "rm -rf target/coverage",
+    "mkdir -p target/coverage",
+    "CARGO_INCREMENTAL=0 RUSTFLAGS='-Cinstrument-coverage' LLVM_PROFILE_FILE='target/coverage/rust_xlsxwriter-%p-%m.profraw' cargo test",
+    "grcov target/coverage/ --binary-path ./target/debug/deps/ -s src -t lcov --branch -o target/coverage/lcov.info",
+    "grcov target/coverage/ --binary-path ./target/debug/deps/ -s src -t html --branch -o target/coverage/html",
+    "rm target/coverage/*.profraw",
+    "open target/coverage/html/index.html"
+]}
+
+release_check = {cmd = ["../release/release_check.sh"]}
+
+# Profile
+# cargo instruments -t time --example app_perf_test

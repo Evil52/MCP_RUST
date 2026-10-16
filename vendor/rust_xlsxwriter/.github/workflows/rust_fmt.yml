@@ -1,0 +1,21 @@
+name: Rust - test formatting
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Test that new code is formatted
+      run: |
+        cargo fmt
+        git status | grep 'nothing to commit'
