@@ -27,6 +27,11 @@ ozon_supply_bundle имеют фиксированные пути, ограни�
 и сохраняют доступ только к разрешённому кабинету. При has_next=true состав
 поставки нужно дочитать с last_id, не меняя исходные фильтры.
 
+Ozon возвращает знаковые int64 ID складов, включая отрицательные ID с реальными
+остатками. Идентификатор сохраняется без изменения в API-фильтрах, warehouse
+stock dimensions и кластерных снимках. Миграция 057 разрешает ненулевые
+знаковые warehouse_id; NULL остаётся неизвестной парой, нулевой ID запрещён.
+
 Для reporting-only добавлены независимые опубликованные источники
 ofk_source_snapshot(source=cluster_stocks) и source=posting_movement.
 REPORT_COLLECTION_REPLENISHMENT_ENABLED=true включает их отдельно после

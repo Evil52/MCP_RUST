@@ -22,7 +22,7 @@ async fn replenishment_reads_preserve_fixed_paths_and_bounded_payloads() {
             Parameters(ClusterStockAnalyticsInput {
                 store: Some(StoreId::from("store_a")),
                 skus: vec!["11".into()],
-                warehouse_ids: vec!["99".into()],
+                warehouse_ids: vec!["-1051784".into()],
                 cluster_ids: vec!["4007".into()],
             }),
         )
@@ -48,7 +48,7 @@ async fn replenishment_reads_preserve_fixed_paths_and_bounded_payloads() {
         ),
         (
             "/v1/analytics/stocks",
-            json!({"skus":["11"],"warehouse_ids":["99"],"cluster_ids":["4007"]}),
+            json!({"skus":["11"],"warehouse_ids":["-1051784"],"cluster_ids":["4007"]}),
         ),
         (
             "/v1/supply-order/bundle",
@@ -101,6 +101,34 @@ async fn warehouse_stock_filter_errors_are_local_and_replenishment_reads_keep_ac
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn warehouse_filter_rejects_zero_noncanonical_overflowing_and_duplicate_ids_locally() {
+    let (server, requests) = mock_server(0);
+    for warehouse_ids in [
+        vec!["0"],
+        vec!["-0"],
+        vec!["+1"],
+        vec!["01"],
+        vec!["-01"],
+        vec!["9223372036854775808"],
+        vec!["-1", "-1"],
+    ] {
+        let result = server
+            .cluster_stock_analytics(
+                RequestIdentity::dev(),
+                Parameters(ClusterStockAnalyticsInput {
+                    store: Some(StoreId::from("store_a")),
+                    skus: vec!["11".into()],
+                    warehouse_ids: warehouse_ids.into_iter().map(str::to_owned).collect(),
+                    cluster_ids: vec![],
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+    assert!(requests.try_recv().is_err());
 }
 
 #[tokio::test]

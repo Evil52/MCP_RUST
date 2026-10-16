@@ -42,7 +42,11 @@ pub fn parse_warehouse_stock_page(
                     .checked_sub(reserved.ok_or(OzonReportParseError::Shape)?)
                     .ok_or(OzonReportParseError::Value)?
             };
-            let warehouse_id = parse_u64(field(Some(product), "warehouse_id")?)?;
+            let warehouse = field(Some(product), "warehouse_id")?;
+            let warehouse_id = warehouse
+                .as_i64()
+                .or_else(|| warehouse.as_str().and_then(|v| v.parse::<i64>().ok()))
+                .ok_or(OzonReportParseError::Value)?;
             if warehouse_id == 0 {
                 return Err(OzonReportParseError::Value);
             }

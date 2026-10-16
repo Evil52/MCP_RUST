@@ -34,7 +34,7 @@ const TEXT_FIELDS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CollectedClusterStockFact {
     pub sku: u64,
-    pub warehouse_id: Option<u64>,
+    pub warehouse_id: Option<i64>,
     pub cluster_id: Option<u64>,
     pub macrolocal_cluster_id: Option<u64>,
     pub data: Value,
@@ -62,7 +62,10 @@ pub(crate) fn parse_cluster_rows(
         let sku = id(&item["sku"])
             .filter(|n| requested.contains(n))
             .ok_or(invalid)?;
-        let warehouse_id = id(&item["warehouse_id"]).ok_or(invalid)?;
+        let warehouse_id = item["warehouse_id"]
+            .as_i64()
+            .filter(|n| *n != 0)
+            .ok_or(invalid)?;
         let cluster_id = id(&item["cluster_id"]).ok_or(invalid)?;
         let macrolocal_cluster_id = id(&item["macrolocal_cluster_id"]).ok_or(invalid)?;
         let mut data =
@@ -97,7 +100,8 @@ pub(super) fn validate_clusters(
         |r| {
             r.sku > 0
                 && fits_i64(r.sku)
-                && [r.warehouse_id, r.cluster_id, r.macrolocal_cluster_id]
+                && r.warehouse_id.is_none_or(|n| n != 0)
+                && [r.cluster_id, r.macrolocal_cluster_id]
                     .iter()
                     .all(|v| v.is_none_or(|n| n > 0 && fits_i64(n)))
                 && (r.warehouse_id.is_some() == r.cluster_id.is_some())
@@ -182,10 +186,7 @@ pub(super) async fn insert_clusters(
         .iter()
         .map(|r| as_i64(r.sku))
         .collect::<Result<Vec<_>, _>>()?;
-    let warehouses = rows
-        .iter()
-        .map(|r| r.warehouse_id.map(as_i64).transpose())
-        .collect::<Result<Vec<_>, _>>()?;
+    let warehouses = rows.iter().map(|r| r.warehouse_id).collect::<Vec<_>>();
     let clusters = rows
         .iter()
         .map(|r| r.cluster_id.map(as_i64).transpose())
@@ -230,5 +231,23 @@ mod tests {
         assert!(rows[0].data.get("customer").is_none());
         assert_eq!(rows[0].data["return_from_customer_stock_count"], 2);
         assert!(parse_cluster_rows(&json!({"items":[row]}), &[2]).is_err());
+    }
+
+    #[test]
+    fn signed_warehouse_ids_preserve_stock_without_colliding_with_positive_ids() {
+        let row = json!({"sku":1,"warehouse_id":-1_036_383,"cluster_id":179,"macrolocal_cluster_id":4069,"available_stock_count":2,"ads_cluster":0.08});
+        let mut positive = row.clone();
+        positive["warehouse_id"] = json!(1_036_383);
+        let rows = parse_cluster_rows(&json!({"items":[row,positive]}), &[1, 2]).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].warehouse_id, Some(-1_036_383));
+        assert_eq!(rows[1].warehouse_id, Some(1_036_383));
+        assert_eq!(rows[0].data["available_stock_count"], 2);
+        assert_eq!(rows[2].warehouse_id, None);
+        for invalid in [json!(0), json!(u64::MAX), json!(null), json!(1.5)] {
+            let mut bad = row.clone();
+            bad["warehouse_id"] = invalid;
+            assert!(parse_cluster_rows(&json!({"items":[bad]}), &[1]).is_err());
+        }
     }
 }

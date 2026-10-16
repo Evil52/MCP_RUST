@@ -26,6 +26,24 @@ fn numeric_ids(name: &str, values: &[String], required: bool) -> Result<(), Stri
     Ok(())
 }
 
+fn warehouse_ids(values: &[String]) -> Result<(), String> {
+    validate_count("warehouse_ids", values.len(), 0, 100)?;
+    let mut seen = BTreeSet::new();
+    for value in values {
+        if !value
+            .parse::<i64>()
+            .is_ok_and(|id| id != 0 && id.to_string() == *value)
+            || !seen.insert(value)
+        {
+            return Err(
+                "INVALID_ARGUMENT: warehouse_ids must contain unique nonzero int64 strings"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tool_router(router = ozon_replenishment_router, vis = "pub(in crate::server)")]
 impl OzonMcp {
     /// Возвращает справочник кластеров Ozon и их складов. Идентификаторы кластеров
@@ -51,6 +69,7 @@ impl OzonMcp {
 
     /// Читает аналитику запасов по SKU, складам и кластерам Ozon.
     /// фильтр 1–100 SKU обязателен. Сохраняйте поля ответа и его период наблюдения.
+    /// `warehouse_ids` — знаковые int64 Ozon; отрицательные ID сохраняются без изменения.
     /// Общий остаток FBO из `product_stocks` не заменяет складские/кластерные данные.
     #[tool(
         name = "ozon_cluster_stock_analytics",
@@ -62,7 +81,7 @@ impl OzonMcp {
         Parameters(input): Parameters<ClusterStockAnalyticsInput>,
     ) -> Result<Json<OzonResult>, String> {
         numeric_ids("skus", &input.skus, true)?;
-        numeric_ids("warehouse_ids", &input.warehouse_ids, false)?;
+        warehouse_ids(&input.warehouse_ids)?;
         numeric_ids("cluster_ids", &input.cluster_ids, false)?;
         self.request(&identity,input.store,"/v1/analytics/stocks",
             json!({"skus":input.skus,"warehouse_ids":input.warehouse_ids,"cluster_ids":input.cluster_ids})).await
