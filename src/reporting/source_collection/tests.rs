@@ -12,6 +12,7 @@ use std::{fs, path::PathBuf, str::FromStr};
 use tokio_postgres::{Client, Config, NoTls};
 
 mod recovery;
+mod replenishment;
 mod sales_publication;
 mod seller_stocks;
 
@@ -170,7 +171,17 @@ impl Fixture {
     }
 
     fn config(root: &std::path::Path, url: &str, mode: &str) -> ReportCollectorConfig {
+        Self::config_with_replenishment(root, url, mode, false)
+    }
+
+    fn config_with_replenishment(
+        root: &std::path::Path,
+        url: &str,
+        mode: &str,
+        enabled: bool,
+    ) -> ReportCollectorConfig {
         ReportCollectorConfig::from_lookup(&mut |key| match key {
+            "REPORT_COLLECTION_REPLENISHMENT_ENABLED" => Some(enabled.to_string()),
             "REPORT_COLLECTOR_DATABASE_URL" => Some(url.to_owned()),
             "REPORT_COLLECTOR_MODE" => Some(mode.to_owned()),
             "REPORT_COLLECTION_POLICY" => Some(

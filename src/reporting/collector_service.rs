@@ -721,6 +721,26 @@ mod tests {
         );
         assert!(scheduled.source_performance(&sales).is_err());
 
+        let mut optional_values = values.clone();
+        optional_values.push(("REPORT_COLLECTION_REPLENISHMENT_ENABLED", "true".to_owned()));
+        let optional = config(&optional_values).unwrap();
+        for source in [
+            SnapshotSource::ClusterStocks,
+            SnapshotSource::PostingMovement,
+        ] {
+            let ozon = SourceJobClaim::for_test(claim("ozon", Marketplace::Ozon), source);
+            assert!(scheduled.source_seller(&ozon).is_err());
+            assert!(optional.source_seller(&ozon).is_ok());
+            assert!(optional.source_performance(&ozon).is_err());
+            for (account, marketplace) in [
+                ("foreign", Marketplace::Ozon),
+                ("wb", Marketplace::Wildberries),
+            ] {
+                let foreign = SourceJobClaim::for_test(claim(account, marketplace), source);
+                assert!(optional.source_seller(&foreign).is_err());
+            }
+        }
+
         let mut disabled_policy_values = entries();
         disabled_policy_values.push((MODE_ENV, "scheduled".to_owned()));
         assert!(config(&disabled_policy_values).is_err());
