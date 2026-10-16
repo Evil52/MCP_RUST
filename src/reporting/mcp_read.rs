@@ -596,7 +596,7 @@ impl PostgresReportingRepository {
             .query_one(
                 "SELECT max(cutoff_at) \
                  FROM daily_reporting.mcp_published_source_snapshots \
-                 WHERE account_id = $1 AND marketplace = $2 AND source <> 'seller_stocks'",
+                 WHERE account_id = $1 AND marketplace = $2 AND source NOT IN ('seller_stocks','cluster_stocks','posting_movement')",
                 &[&account.account_id(), &marketplace],
             )
             .await
@@ -1225,7 +1225,7 @@ const COLLECTION_STATUS_QUERY: &str = "SELECT snapshot_id, account_id, marketpla
 const PUBLISHED_SNAPSHOTS_QUERY: &str = "SELECT snapshot_id, account_id, marketplace, source, cutoff_at, source_as_of, \
             period_start, period_end, status, pagination_complete, row_count \
      FROM daily_reporting.mcp_published_source_snapshots \
-     WHERE account_id = $1 AND marketplace = $2 AND cutoff_at = $3 AND source <> 'seller_stocks' \
+     WHERE account_id = $1 AND marketplace = $2 AND cutoff_at = $3 AND source NOT IN ('seller_stocks','cluster_stocks','posting_movement') \
      ORDER BY source";
 
 const CONTRACT_PROBES: &[&str] = &[
@@ -1240,6 +1240,8 @@ const CONTRACT_PROBES: &[&str] = &[
             period_start, period_end, status, pagination_complete, row_count, \
             collector_version, finished_at \
      FROM daily_reporting.mcp_published_source_snapshots LIMIT 0",
+    "SELECT snapshot_id, sku, warehouse_id, cluster_id, macrolocal_cluster_id, data FROM daily_reporting.mcp_cluster_stock_facts LIMIT 0",
+    "SELECT snapshot_id, sku, data, metric FROM daily_reporting.mcp_posting_movement_facts LIMIT 0",
     "SELECT account_id, marketplace, cutoff_at, source_as_of, snapshot_status, \
             pagination_complete, snapshot_id, source, business_date, sku, \
             ordered_units, operational_gmv_minor, cancelled_units, returned_units, currency \
@@ -1259,8 +1261,8 @@ const CONTRACT_PROBES: &[&str] = &[
             amount_minor, line_count, unknown_type_count \
      FROM daily_reporting.mcp_finance_facts LIMIT 0",
     "SELECT account_id, marketplace, cutoff_at, source_as_of, snapshot_status, \
-            pagination_complete, snapshot_id, source, sku, warehouse_id, sellable_units \
-     FROM daily_reporting.mcp_stock_facts LIMIT 0",
+            pagination_complete, snapshot_id, source, sku, warehouse_id, sellable_units, \
+            present_units, reserved_units FROM daily_reporting.mcp_stock_facts LIMIT 0",
     "SELECT account_id, marketplace, cutoff_at, source_as_of, snapshot_status, \
             pagination_complete, snapshot_id, source, sku, price_minor, old_price_minor, currency \
      FROM daily_reporting.mcp_price_facts LIMIT 0",
@@ -1290,7 +1292,7 @@ impl PostgresReportingRepository {
                 "SELECT cutoff_at \
                  FROM daily_reporting.mcp_published_source_snapshots \
                  WHERE account_id = $1 AND marketplace = $2 \
-                   AND cutoff_at >= $3 AND cutoff_at < $4 AND source <> 'seller_stocks' \
+                   AND cutoff_at >= $3 AND cutoff_at < $4 AND source NOT IN ('seller_stocks','cluster_stocks','posting_movement') \
                  GROUP BY cutoff_at \
                  ORDER BY cutoff_at DESC \
                  LIMIT $5",
@@ -1324,7 +1326,7 @@ impl PostgresReportingRepository {
                         period_start, period_end, status, pagination_complete, row_count \
                  FROM daily_reporting.mcp_published_source_snapshots \
                  WHERE account_id = $1 AND marketplace = $2 \
-                   AND cutoff_at = ANY($3::timestamptz[]) AND source <> 'seller_stocks' \
+                   AND cutoff_at = ANY($3::timestamptz[]) AND source NOT IN ('seller_stocks','cluster_stocks','posting_movement') \
                  ORDER BY cutoff_at, source",
                 &[&account.account_id(), &marketplace, &cutoffs],
             )

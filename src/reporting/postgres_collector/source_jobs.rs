@@ -182,17 +182,60 @@ impl PostgresSnapshotWriter {
             .map_err(|_| PostgresCollectorError::Unavailable)
     }
 
+    pub async fn enqueue_replenishment_jobs(
+        &self,
+        targets: &[CollectionTarget],
+        cutoff: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<(), PostgresCollectorError> {
+        validate_coverage_targets(targets)?;
+        if start >= end || start > cutoff || cutoff > end + Duration::days(2) {
+            return Err(PostgresCollectorError::InvalidInput);
+        }
+        let client = self
+            .client
+            .acquire()
+            .await
+            .map_err(|_| PostgresCollectorError::Unavailable)?;
+        for target in targets
+            .iter()
+            .filter(|t| t.marketplace == Marketplace::Ozon)
+        {
+            for source in ["cluster_stocks", "posting_movement"] {
+                client
+                    .execute(
+                        "SELECT daily_reporting.enqueue_source_collection($1,'ozon',$2,$3,$4,$5)",
+                        &[&target.account_id, &source, &cutoff, &start, &end],
+                    )
+                    .await
+                    .map_err(|_| PostgresCollectorError::Unavailable)?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn claim_source_job(
         &self,
         targets: &[CollectionTarget],
         owner: &str,
+    ) -> Result<Option<SourceJobClaim>, PostgresCollectorError> {
+        self.claim_source_job_with_replenishment(targets, owner, false)
+            .await
+    }
+
+    pub async fn claim_source_job_with_replenishment(
+        &self,
+        targets: &[CollectionTarget],
+        owner: &str,
+        replenishment_enabled: bool,
     ) -> Result<Option<SourceJobClaim>, PostgresCollectorError> {
         validate_coverage_targets(targets)?;
         validate_owner_id(owner)?;
         if targets.is_empty() {
             return Ok(None);
         }
-        let scope=Value::Array(targets.iter().map(|t| json!({"account_id":t.account_id,"marketplace":marketplace_name(t.marketplace)})).collect());
+        let scope=Value::Array(targets.iter().map(|t| json!({"account_id":t.account_id,"marketplace":marketplace_name(t.marketplace),"replenishment_enabled":replenishment_enabled})).collect());
         let client = self
             .client
             .acquire()
@@ -220,6 +263,8 @@ impl PostgresSnapshotWriter {
                     "sales" => SnapshotSource::Sales,
                     "stocks" => SnapshotSource::Stocks,
                     "seller_stocks" => SnapshotSource::SellerStocks,
+                    "cluster_stocks" => SnapshotSource::ClusterStocks,
+                    "posting_movement" => SnapshotSource::PostingMovement,
                     "prices" => SnapshotSource::Prices,
                     "advertising" => SnapshotSource::Advertising,
                     "finance" => SnapshotSource::Finance,
@@ -309,9 +354,13 @@ impl PostgresSnapshotWriter {
         })?;
         let period = matches!(
             claim.source,
-            SnapshotSource::Sales | SnapshotSource::Advertising | SnapshotSource::Finance
+            SnapshotSource::Sales
+                | SnapshotSource::Advertising
+                | SnapshotSource::Finance
+                | SnapshotSource::PostingMovement
         );
         let status = if matches!(&facts, CollectedFacts::SellerStocks(rows) if rows.iter().any(|row| row.sellable_units.is_none()))
+            || matches!(&facts, CollectedFacts::ClusterStocks(rows) if rows.iter().any(|row| row.warehouse_id.is_none()))
         {
             SnapshotStatus::Partial
         } else {

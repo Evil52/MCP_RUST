@@ -2,9 +2,7 @@ use super::*;
 use crate::reporting::{
     checkpoint::{CheckpointError, checkpointed},
     mcp_read::{ReportingReader, SourceSnapshotQuery},
-    ozon_adapter::{
-        OzonReportRequest, product_page_request, sales_request, warehouse_stock_page_request,
-    },
+    ozon_adapter::{OzonReportRequest, product_page_request, sales_request},
     postgres_collector::PostgresCollectorError,
     snapshot::AccountScope,
 };
@@ -238,6 +236,8 @@ fn source_name(source: SnapshotSource) -> &'static str {
         SnapshotSource::Sales => "sales",
         SnapshotSource::Stocks => "stocks",
         SnapshotSource::SellerStocks => "seller_stocks",
+        SnapshotSource::ClusterStocks => "cluster_stocks",
+        SnapshotSource::PostingMovement => "posting_movement",
         SnapshotSource::Prices => "prices",
         SnapshotSource::Advertising => "advertising",
         SnapshotSource::Finance => "finance",
@@ -258,18 +258,13 @@ fn empty_pages(claim: &SourceJobClaim) -> Vec<(Value, Value)> {
                 json!([]),
             )]
         }
-        (Marketplace::Ozon, SnapshotSource::Stocks) => [
-            "/v1/product/info/stocks-by-warehouse/fbo",
-            "/v2/product/info/stocks-by-warehouse/fbs",
-        ]
-        .into_iter()
-        .map(|path| {
-            (
-                request_key(&warehouse_stock_page_request(path, None).unwrap()),
+        (Marketplace::Ozon, SnapshotSource::Stocks) => {
+            let request = product_page_request("/v4/product/info/stocks", None).unwrap();
+            vec![(
+                json!(["ozon-sku-reserves-v3", request.path, request.payload]),
                 json!([[], null]),
-            )
-        })
-        .collect(),
+            )]
+        }
         (Marketplace::Ozon, SnapshotSource::Prices) => vec![(
             request_key(&product_page_request("/v5/product/info/prices", None).unwrap()),
             json!([[], null]),
@@ -297,7 +292,13 @@ fn empty_pages(claim: &SourceJobClaim) -> Vec<(Value, Value)> {
         (Marketplace::Wildberries, SnapshotSource::Advertising) => {
             vec![(json!(["wb_campaigns", date]), json!([]))]
         }
-        (Marketplace::Wildberries, SnapshotSource::Finance) | (_, SnapshotSource::SellerStocks) => {
+        (Marketplace::Wildberries, SnapshotSource::Finance)
+        | (
+            _,
+            SnapshotSource::SellerStocks
+            | SnapshotSource::ClusterStocks
+            | SnapshotSource::PostingMovement,
+        ) => {
             unreachable!()
         }
     }

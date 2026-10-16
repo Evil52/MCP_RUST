@@ -65,6 +65,8 @@ impl WbReportSource {
                         sku,
                         warehouse_id,
                         sellable_units,
+                        present_units: None,
+                        reserved_units: None,
                     })
                     .collect());
             }

@@ -195,12 +195,21 @@ pub fn parse_warehouse_stock_page(
         .map(|product| {
             let product = product.as_object().ok_or(OzonReportParseError::Shape)?;
             let present = parse_u64(field(Some(product), "present")?)?;
+            let reserved = product
+                .get("reserved")
+                .filter(|v| !v.is_null())
+                .map(parse_u64)
+                .transpose()?;
+            if present > i32::MAX.cast_unsigned().into()
+                || reserved.is_some_and(|units| units > present)
+            {
+                return Err(OzonReportParseError::Value);
+            }
             let sellable_units = if scheme == "fbs" {
                 parse_u64(field(Some(product), "free_stock")?)?
             } else {
-                let reserved = parse_u64(field(Some(product), "reserved")?)?;
                 present
-                    .checked_sub(reserved)
+                    .checked_sub(reserved.ok_or(OzonReportParseError::Shape)?)
                     .ok_or(OzonReportParseError::Value)?
             };
             let warehouse_id = parse_u64(field(Some(product), "warehouse_id")?)?;
@@ -211,6 +220,8 @@ pub fn parse_warehouse_stock_page(
                 sku: parse_u64(field(Some(product), "sku")?)?,
                 warehouse_id: format!("{scheme}:{warehouse_id}"),
                 sellable_units,
+                present_units: Some(present),
+                reserved_units: reserved,
             })
         })
         .collect()

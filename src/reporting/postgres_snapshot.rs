@@ -188,7 +188,7 @@ impl PostgresSnapshotRepository {
                 "SELECT id, account_id, marketplace, source, cutoff_at, source_as_of, \
                         period_start, period_end, row_count, pagination_complete, status \
                  FROM daily_reporting.published_source_snapshots \
-                 WHERE cutoff_at = $1 AND account_id::text = ANY($2::text[]) AND source <> 'seller_stocks' \
+                 WHERE cutoff_at = $1 AND account_id::text = ANY($2::text[]) AND source NOT IN ('seller_stocks','cluster_stocks','posting_movement') \
                  ORDER BY account_id, source",
                 &[&cutoff_at, &account_ids],
             )

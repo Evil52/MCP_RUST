@@ -637,7 +637,7 @@ fn stock_evidence(
     Ok(stocks)
 }
 
-/// Rejects mixed collection modes and preserves the explicit legacy-stock gap.
+/// Rejects overlapping collection modes for each SKU/scheme and preserves legacy gaps.
 fn verified_stock_rows(
     snapshot: &CompleteSnapshot,
     refs: &mut BTreeSet<String>,
@@ -649,8 +649,8 @@ fn verified_stock_rows(
     }
     let mut keys = BTreeSet::new();
     let mut verified_rows = Vec::new();
-    let mut fulfillment = false;
-    let mut warehouse = false;
+    let mut fulfillment = BTreeSet::new();
+    let mut warehouse = BTreeSet::new();
     let mut legacy = false;
     for value in &snapshot.rows {
         let row: StockRow =
@@ -662,11 +662,25 @@ fn verified_stock_rows(
         match stock_dimension(&row.warehouse_id)? {
             StockDimension::Legacy => legacy = true,
             StockDimension::Fulfillment => {
-                fulfillment = true;
+                fulfillment.insert((
+                    row.sku,
+                    row.warehouse_id
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                ));
                 verified_rows.push(row);
             }
             StockDimension::Warehouse => {
-                warehouse = true;
+                warehouse.insert((
+                    row.sku,
+                    row.warehouse_id
+                        .split(':')
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                ));
                 verified_rows.push(row);
             }
         }
@@ -680,7 +694,7 @@ fn verified_stock_rows(
     }
     // These are alternative complete collection modes. Combining their
     // totals would count the same units twice, including zero-valued rows.
-    if fulfillment && warehouse {
+    if !fulfillment.is_disjoint(&warehouse) {
         return Err(PrepareError::InvalidSnapshot);
     }
     Ok(Some(verified_rows))

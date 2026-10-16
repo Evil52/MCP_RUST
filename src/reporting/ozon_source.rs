@@ -5,6 +5,7 @@
 //! exact contract in `ozon_adapter` and every response is normalized before it
 //! can reach report persistence.
 mod failures;
+mod replenishment;
 mod sales;
 mod stocks;
 pub use failures::OzonReportSourceError;
@@ -62,6 +63,10 @@ const MAX_PRODUCT_PAGES: usize = 100;
 #[cfg(test)]
 use super::ozon_adapter::warehouse_stock_page_request;
 
+#[cfg(test)]
+mod detailed_stock_tests;
+#[cfg(test)]
+mod replenishment_tests;
 #[cfg(test)]
 mod stock_checkpoint_tests;
 
@@ -460,7 +465,7 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         tracing::info!(source = "finance", "collecting Ozon daily-report source");
         let finance = collect_finance_facts(&self.transport, date_from, date_to).await?;
         tracing::info!(source = "stocks", "collecting Ozon daily-report source");
-        let stocks = self.collect_stock_pages().await?;
+        let stocks = self.collect_detailed_stock_pages().await?;
         tracing::info!(source = "prices", "collecting Ozon daily-report source");
         let prices = self.collect_price_pages().await?;
         Ok(OzonCollectedFacts {
@@ -503,7 +508,7 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             // gross quantities. Never replay them under the corrected parser.
             // Price checkpoints retain their existing identity.
             let identity = if path == "/v4/product/info/stocks" {
-                json!(["ozon-sku-fulfillment-v2", request.path, request.payload])
+                json!(["ozon-sku-reserves-v3", request.path, request.payload])
             } else {
                 json!([request.path, request.payload])
             };
@@ -1117,8 +1122,7 @@ mod tests {
             Ok(json!({"result":{"data":[]}})),
             Ok(json!({"accrual_types":[]})),
             Ok(json!({"accruals":[],"last_id":""})),
-            Ok(json!({"products":[],"cursor":"","has_next":false})),
-            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"items":[],"cursor":""})),
             Ok(json!({"items":[],"cursor":""})),
         ]))));
         let day = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
@@ -1142,8 +1146,7 @@ mod tests {
             Ok(json!({"result":{"data":[]}})),
             Ok(json!({"accrual_types":[]})),
             Ok(json!({"accruals":[],"last_id":""})),
-            Ok(json!({"products":[],"cursor":"","has_next":false})),
-            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"items":[],"cursor":""})),
             Ok(json!({"items":[],"cursor":""})),
         ])));
         let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
@@ -1188,8 +1191,7 @@ mod tests {
             Ok(json!({"result":{"data":[]}})),
             Ok(json!({"accrual_types":[]})),
             Ok(json!({"accruals":[],"last_id":""})),
-            Ok(json!({"products":[],"cursor":"","has_next":false})),
-            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"items":[],"cursor":""})),
             Ok(json!({"items":[],"cursor":""})),
         ])));
         let cutoff_at = Utc::now();
@@ -1269,8 +1271,7 @@ mod tests {
             Ok(json!({"result":{"data":[]}})),
             Ok(json!({"accrual_types":[]})),
             Ok(json!({"accruals":[],"last_id":""})),
-            Ok(json!({"products":[],"cursor":"","has_next":false})),
-            Ok(json!({"products":[],"cursor":"","has_next":false})),
+            Ok(json!({"items":[],"cursor":""})),
             Ok(json!({"items":[],"cursor":""})),
         ])));
         let as_of = Utc.with_ymd_and_hms(2026, 8, 16, 19, 0, 0).unwrap();
@@ -1325,6 +1326,8 @@ mod tests {
                 sku: 1,
                 warehouse_id: "fbo".to_owned(),
                 sellable_units: 1,
+                present_units: None,
+                reserved_units: None,
             }],
             prices: vec![CollectedPriceFact {
                 sku: 1,
@@ -1426,6 +1429,8 @@ mod tests {
             sku: 1,
             warehouse_id: "fbo".to_owned(),
             sellable_units: 1,
+            present_units: None,
+            reserved_units: None,
         };
         let invalid_sets = [
             OzonCollectedFacts {

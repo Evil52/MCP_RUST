@@ -64,7 +64,7 @@ wb_funnel_filter_input!(
         #[serde(default)]
         pub skip_deleted_nm: bool,
         #[serde(default = "default_product_limit")]
-        #[schemars(range(min = 1, max = 1_000))]
+        #[schemars(range(min = 1, max = 250))]
         pub limit: u32,
         #[serde(default)]
         #[schemars(range(max = 1_000_000))]

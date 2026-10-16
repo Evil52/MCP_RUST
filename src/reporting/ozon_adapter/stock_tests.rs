@@ -28,17 +28,23 @@ fn stock_identity_comes_from_each_fulfillment_row_and_reserves_are_removed() {
             CollectedStockFact {
                 sku: 101,
                 warehouse_id: "sku-fulfillment-v2:fbo".to_owned(),
-                sellable_units: 3
+                sellable_units: 3,
+                present_units: Some(4),
+                reserved_units: Some(1),
             },
             CollectedStockFact {
                 sku: 102,
                 warehouse_id: "sku-fulfillment-v2:fbs".to_owned(),
-                sellable_units: 6
+                sellable_units: 6,
+                present_units: Some(7),
+                reserved_units: Some(1),
             },
             CollectedStockFact {
                 sku: 103,
                 warehouse_id: "sku-fulfillment-v2:rfbs".to_owned(),
-                sellable_units: 0
+                sellable_units: 0,
+                present_units: Some(7),
+                reserved_units: Some(7),
             },
         ]
     );

@@ -19,6 +19,7 @@ use super::*;
 mod analytics_security;
 mod financial_ledger;
 mod read_coverage;
+mod replenishment;
 mod tool_catalog;
 mod wb_inventory;
 mod wb_report;
@@ -5251,9 +5252,9 @@ async fn every_bounded_wildberries_tool_input_is_rejected_before_any_network_cal
     );
     assert_rejected!(
         wb_sales_funnel,
-        funnel(account(), 0, 0, 0, 1_001, 0),
+        funnel(account(), 0, 0, 0, 251, 0),
         "limit",
-        "limit above the WB cap"
+        "limit above the bounded WB page cap"
     );
     assert_rejected!(
         wb_sales_funnel,

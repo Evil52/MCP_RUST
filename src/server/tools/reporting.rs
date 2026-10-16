@@ -192,8 +192,17 @@ impl OzonMcp {
             .map_err(Self::reporting_error)
     }
 
-    /// Читает снимок одного источника из PostgreSQL независимо от остальных. Для `seller_stocks` возвращает
-    /// склады продавца всех типов: `delivery_type=1` — FBS. null — неизвестно; coverage — весь снимок.
+    /// Читает снимок одного источника из PostgreSQL независимо от остальных.
+    /// `seller_stocks` доступен только для Wildberries: склады продавца всех типов, `delivery_type=1` — FBS.
+    /// Для Ozon выбирайте `stocks`: доступное количество, общий остаток и резерв, если они получены источником.
+    /// Старые снимки и отсутствующие поля остаются null, а не нулём.
+    /// Ozon `cluster_stocks` содержит складские/кластерные запасы, спрос Ozon и количества в пути.
+    /// Ozon `posting_movement` содержит FBO/FBS-количества, отмены и статусы за точный интервал снимка.
+    /// Эти два источника обновляются отдельно и не подменяют Seller Analytics или полный складской оборот.
+    /// Текущие остатки и резервы Ozon читайте через разрешённый `ozon_product_stocks` со всеми cursor-страницами.
+    /// Для количеств отправлений Ozon по FBO/FBS, отменам и статусам используйте разрешённый
+    /// `ozon_posting_sales_fallback`; это не полный складской оборот и не Seller Analytics `ordered_units`.
+    /// null — неизвестно; coverage — весь снимок.
     /// Возвращает время наблюдения, свежесть и прогресс обновления. Маркетплейсы не вызываются.
     #[tool(
         name = "ofk_source_snapshot",
@@ -212,6 +221,15 @@ impl OzonMcp {
     ) -> Result<Json<crate::reporting::mcp_read::SourceSnapshotResult>, String> {
         let (account, role) =
             self.resolve_reporting_account(&identity, input.account.as_deref())?;
+        if input.source == crate::reporting::snapshot::SnapshotSource::SellerStocks
+            && account.marketplace() == crate::reporting::snapshot::Marketplace::Ozon
+        {
+            return Err(format!(
+                "{REPORTING_INVALID_REQUEST}: seller_stocks поддерживается только для Wildberries. \
+                 Для Ozon используйте source=stocks (доступный остаток; общий остаток и резерв, если получены источником). \
+                 Текущий резерв возвращает ozon_product_stocks, если live-инструмент доступен вашей роли и подключению."
+            ));
+        }
         if matches!(
             input.source,
             crate::reporting::snapshot::SnapshotSource::Finance

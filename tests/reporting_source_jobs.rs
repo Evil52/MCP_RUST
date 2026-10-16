@@ -18,6 +18,8 @@ use tokio_postgres::{Client, Config, NoTls};
 mod fbs_publication;
 #[path = "reporting_source_jobs/reconciliation.rs"]
 mod reconciliation;
+#[path = "reporting_source_jobs/replenishment.rs"]
+mod replenishment;
 #[path = "reporting_source_jobs/scheduling.rs"]
 mod scheduling;
 #[path = "reporting_source_jobs/stock_recovery.rs"]
@@ -363,6 +365,8 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
                 sku: 1,
                 warehouse_id: "warehouse-1".to_owned(),
                 sellable_units: 5,
+                present_units: None,
+                reserved_units: None,
             }]),
         ),
     ] {
@@ -632,4 +636,5 @@ async fn independent_pages_survive_restart_and_ad_failure_preserves_published_da
     );
     stock_recovery::verify(&admin, &collector, &reader_db, &reader, &restarted).await;
     fbs_publication::verify(&admin, &collector, &reader, &restarted).await;
+    replenishment::verify(&admin, &collector, &reader, &restarted).await;
 }

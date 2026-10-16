@@ -55,6 +55,11 @@ pub async fn enqueue_recent(
                 writer
                     .enqueue_source_jobs(config.collection_plan(), cutoff, start, end)
                     .await?;
+                if config.replenishment_enabled() {
+                    writer
+                        .enqueue_replenishment_jobs(config.collection_plan(), cutoff, start, end)
+                        .await?;
+                }
             }
         }
     }
@@ -67,7 +72,11 @@ pub async fn run_quantum(
     owner: &str,
 ) -> Result<bool> {
     let Some(claim) = writer
-        .claim_source_job(config.collection_plan(), owner)
+        .claim_source_job_with_replenishment(
+            config.collection_plan(),
+            owner,
+            config.replenishment_enabled(),
+        )
         .await?
     else {
         return Ok(false);
@@ -203,13 +212,25 @@ async fn collect(
         ),
         (Marketplace::Ozon, SnapshotSource::Stocks) => CollectedFacts::Stocks(
             seller_source(config, writer, claim)?
-                .collect_stock_pages()
+                .collect_detailed_stock_pages()
                 .await
                 .map_err(|error| error.failure())?,
         ),
         (Marketplace::Ozon, SnapshotSource::Prices) => CollectedFacts::Prices(
             seller_source(config, writer, claim)?
                 .collect_price_pages()
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Ozon, SnapshotSource::ClusterStocks) => CollectedFacts::ClusterStocks(
+            seller_source(config, writer, claim)?
+                .collect_cluster_stock_pages()
+                .await
+                .map_err(|error| error.failure())?,
+        ),
+        (Marketplace::Ozon, SnapshotSource::PostingMovement) => CollectedFacts::PostingMovement(
+            seller_source(config, writer, claim)?
+                .collect_posting_movement(claim.period_start, claim.period_end)
                 .await
                 .map_err(|error| error.failure())?,
         ),
@@ -254,7 +275,12 @@ async fn collect(
                 .await
                 .map_err(|error| error.failure())?,
         ),
-        (Marketplace::Wildberries, SnapshotSource::Finance)
+        (
+            Marketplace::Wildberries,
+            SnapshotSource::Finance
+            | SnapshotSource::ClusterStocks
+            | SnapshotSource::PostingMovement,
+        )
         | (Marketplace::Ozon, SnapshotSource::SellerStocks) => return Err("source_invalid".into()),
     };
     Ok((facts, Vec::new()))

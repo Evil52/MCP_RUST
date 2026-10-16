@@ -123,6 +123,7 @@ pub struct ReportCollectorConfig {
     policy: CollectionPolicy,
     registry: Arc<AccessRegistry>,
     collection_plan: Vec<CollectionTarget>,
+    replenishment_enabled: bool,
     credential_directory: Option<CredentialDirectory>,
     performance_source_clients: std::sync::Mutex<BTreeMap<String, (PerformanceClient, StoreId)>>,
 }
@@ -167,6 +168,14 @@ impl ReportCollectorConfig {
         let credential_directory = lookup(CREDENTIAL_DIRECTORY_ENV)
             .map(CredentialDirectory::open)
             .transpose()?;
+        let replenishment_enabled = match lookup("REPORT_COLLECTION_REPLENISHMENT_ENABLED")
+            .as_deref()
+            .unwrap_or("false")
+        {
+            "true" => true,
+            "false" => false,
+            _ => bail!("REPORT_COLLECTION_REPLENISHMENT_ENABLED must be true or false"),
+        };
         ensure!(
             matches!(
                 (mode, policy.enabled, credential_directory.is_some()),
@@ -186,6 +195,7 @@ impl ReportCollectorConfig {
             policy,
             registry,
             collection_plan,
+            replenishment_enabled,
             credential_directory,
             performance_source_clients: std::sync::Mutex::default(),
         })
@@ -204,6 +214,10 @@ impl ReportCollectorConfig {
     #[must_use]
     pub fn collection_plan(&self) -> &[CollectionTarget] {
         &self.collection_plan
+    }
+    #[must_use]
+    pub const fn replenishment_enabled(&self) -> bool {
+        self.replenishment_enabled
     }
 
     #[must_use]
@@ -533,6 +547,7 @@ mod tests {
         assert!(looked_up.iter().all(|name| {
             [
                 DATABASE_URL_ENV,
+                "REPORT_COLLECTION_REPLENISHMENT_ENABLED",
                 ACCESS_CONFIG_ENV,
                 POLICY_PATH_ENV,
                 COLLECTION_POLICY_PATH_ENV,
@@ -573,6 +588,19 @@ mod tests {
             config.database_config().get_user(),
             Some("report_collector")
         );
+    }
+
+    #[test]
+    fn replenishment_collection_is_explicitly_opt_in() {
+        assert!(!config(&entries()).unwrap().replenishment_enabled());
+        for (value, expected) in [("true", true), ("false", false)] {
+            let mut values = entries();
+            values.push(("REPORT_COLLECTION_REPLENISHMENT_ENABLED", value.to_owned()));
+            assert_eq!(config(&values).unwrap().replenishment_enabled(), expected);
+        }
+        let mut values = entries();
+        values.push(("REPORT_COLLECTION_REPLENISHMENT_ENABLED", "yes".to_owned()));
+        assert!(config(&values).is_err());
     }
 
     #[test]

@@ -673,6 +673,8 @@ const fn source_text(source: SnapshotSource) -> &'static str {
         SnapshotSource::Finance => "Финансы",
         SnapshotSource::Stocks => "Остатки",
         SnapshotSource::SellerStocks => "Остатки продавца",
+        SnapshotSource::ClusterStocks => "Запасы по кластерам",
+        SnapshotSource::PostingMovement => "Отправления FBO/FBS",
         SnapshotSource::Prices => "Цены",
     }
 }

@@ -65,6 +65,8 @@ async fn collect_with_fbs(
                     sku: nm,
                     warehouse_id: "live_fbs".to_owned(),
                     sellable_units: fbs_units,
+                    present_units: None,
+                    reserved_units: None,
                 });
             }
         }

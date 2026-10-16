@@ -29,6 +29,7 @@ pub use inputs_wb::{
     WbStatisticsReportInput, WbTariffCommissionsInput, WbTariffDateInput, WbWarehouseStocksInput,
 };
 mod inputs_catalog;
+mod inputs_replenishment;
 use inputs_catalog::default_product_limit;
 pub use inputs_catalog::{
     AnalyticsDimension, AnalyticsInput, AnalyticsMetric, CatalogVisibility, ProductAttributesInput,
@@ -1205,6 +1206,12 @@ impl ServerHandler for OzonMcp {
                  Для остатков, цен и отдельных источников используйте ofk_source_snapshot: он читает PostgreSQL и показывает свежесть. Для штатной аналитики продаж используйте ofk_ozon_sales_analytics: он читает опубликованные \
                  PostgreSQL-снимки без обращения к Ozon; прямой ozon_analytics предназначен только для редкого \
                  административного live-обновления. \
+                 Ozon: source=seller_stocks не поддерживается, этот источник только для WB. Снимок stocks хранит sellable_units, present_units и reserved_units; неизвестные и исторические поля остаются null. \
+                 Для текущих остатков и резервов Ozon используйте разрешённый ozon_product_stocks, все cursor-страницы: present, reserved, type и sku. \
+                 Для отправлений Ozon за выбранный период по FBO/FBS, отменам и текущим статусам используйте разрешённый ozon_posting_sales_fallback. \
+                 Его количества не равны Seller Analytics ordered_units и не представляют полный складской оборот с поступлениями и возвратами. \
+                 Для планирования кластеров: ozon_clusters задаёт соответствие складов; ozon_cluster_stock_analytics возвращает статистику выбранных SKU; ozon_supply_order_list/get и ozon_supply_bundle описывают существующие поставки. \
+                 Не делите лимит пополам без локального спроса. Лимит поставки — верхняя граница. Без закупочной себестоимости прибыль недоступна. \
                  WB: wb_warehouse_stocks и текущий сборщик stocks — FBW; старые combined stocks имеют inventory_scope=mixed. \
                  Склады продавца читайте через ofk_source_snapshot(source=seller_stocks), scope=seller; delivery_type=1 — FBS, другие типы сохраняются. null — неизвестно. Live: wb_seller_warehouses, все страницы wb_product_cards \
                  и wb_seller_warehouse_stocks по пакетам chrtIds. Для независимой сверки: wb_seller_warehouses_stock_report, все страницы next_offset; Analytics обновляется раз в 30 минут. Отсутствующие строки не равны нулю. \

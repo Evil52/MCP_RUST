@@ -70,6 +70,10 @@ impl ReportingReader {
                 && account.marketplace() != Marketplace::Ozon)
             || (query.source == SnapshotSource::SellerStocks
                 && account.marketplace() != Marketplace::Wildberries)
+            || (matches!(
+                query.source,
+                SnapshotSource::ClusterStocks | SnapshotSource::PostingMovement
+            ) && account.marketplace() != Marketplace::Ozon)
         {
             return Err(ReportingReadError::InvalidRequest);
         }
@@ -98,7 +102,7 @@ impl PostgresReportingRepository {
                     .map_err(|_| ReportingReadError::InvalidPublishedData)
             })
             .transpose()?;
-        let row=client.query_opt("SELECT s.snapshot_id,s.cutoff_at,s.source_as_of,s.period_start,s.period_end,s.row_count,COALESCE(j.first_observed_at,s.source_as_of),s.status,s.pagination_complete FROM daily_reporting.mcp_published_source_snapshots s LEFT JOIN daily_reporting.mcp_source_collection_jobs j ON j.account_id=s.account_id AND j.marketplace=s.marketplace AND j.source=s.source AND j.cutoff_at=s.cutoff_at WHERE s.account_id=$1 AND s.marketplace=$2 AND s.source=$3 AND ((s.status='succeeded' AND s.pagination_complete) OR ($3='seller_stocks' AND s.status='partial' AND s.pagination_complete)) AND ($4::bigint IS NULL OR s.snapshot_id=$4) ORDER BY s.cutoff_at DESC,s.snapshot_id DESC LIMIT 1", &[&account.account_id(),&market,&source,&query.snapshot_id])
+        let row=client.query_opt("SELECT s.snapshot_id,s.cutoff_at,s.source_as_of,s.period_start,s.period_end,s.row_count,COALESCE(j.first_observed_at,s.source_as_of),s.status,s.pagination_complete FROM daily_reporting.mcp_published_source_snapshots s LEFT JOIN daily_reporting.mcp_source_collection_jobs j ON j.account_id=s.account_id AND j.marketplace=s.marketplace AND j.source=s.source AND j.cutoff_at=s.cutoff_at WHERE s.account_id=$1 AND s.marketplace=$2 AND s.source=$3 AND ((s.status='succeeded' AND s.pagination_complete) OR ($3 IN ('seller_stocks','cluster_stocks') AND s.status='partial' AND s.pagination_complete)) AND ($4::bigint IS NULL OR s.snapshot_id=$4) ORDER BY s.cutoff_at DESC,s.snapshot_id DESC LIMIT 1", &[&account.account_id(),&market,&source,&query.snapshot_id])
             .await.map_err(|_| ReportingReadError::Unavailable)?;
         let mut result = missing_result(account, query, latest_collection);
         let Some(row) = row else {
@@ -163,6 +167,22 @@ async fn populate_snapshot_metadata(
         partial |= coverage.missing_pairs > 0;
         result.coverage = Some(coverage);
     }
+    if query.source == SnapshotSource::ClusterStocks {
+        let counts=client.query_one("SELECT count(*),count(*) FILTER(WHERE warehouse_id IS NOT NULL) FROM daily_reporting.mcp_cluster_stock_facts WHERE account_id=$1 AND marketplace=$2 AND snapshot_id=$3",&[&account.account_id(),&market,&id]).await.map_err(|_|ReportingReadError::Unavailable)?;
+        let actual = u64::try_from(counts.get::<_, i64>(0))
+            .map_err(|_| ReportingReadError::InvalidPublishedData)?;
+        let known = u64::try_from(counts.get::<_, i64>(1))
+            .map_err(|_| ReportingReadError::InvalidPublishedData)?;
+        if actual != total || known > total {
+            return Err(ReportingReadError::InvalidPublishedData);
+        }
+        partial |= known < total;
+        result.coverage = Some(SourceSnapshotCoverage {
+            total_pairs: total,
+            known_pairs: known,
+            missing_pairs: total - known,
+        });
+    }
     if account.marketplace() == Marketplace::Wildberries
         && query.source == SnapshotSource::Stocks
         && has_legacy_seller_rows(client, account, market, id).await?
@@ -189,6 +209,8 @@ const fn source_name(source: SnapshotSource) -> &'static str {
         SnapshotSource::Sales => "sales",
         SnapshotSource::Stocks => "stocks",
         SnapshotSource::SellerStocks => "seller_stocks",
+        SnapshotSource::ClusterStocks => "cluster_stocks",
+        SnapshotSource::PostingMovement => "posting_movement",
         SnapshotSource::Prices => "prices",
         SnapshotSource::Finance => "finance",
         SnapshotSource::Advertising => "advertising",
@@ -208,10 +230,19 @@ fn missing_result(
         storage: "published_postgresql_snapshots".to_owned(),
         state: "missing".to_owned(),
         data_state: "missing".to_owned(),
-        catalog_scope: (query.source == SnapshotSource::SellerStocks)
-            .then(|| "active_non_trash_cards".to_owned()),
+        catalog_scope: match query.source {
+            SnapshotSource::SellerStocks => Some("active_non_trash_cards".to_owned()),
+            SnapshotSource::ClusterStocks => Some("listed_fulfillment_skus".to_owned()),
+            _ => None,
+        },
         quality: None,
         inventory_scope: match (account.marketplace(), query.source) {
+            (Marketplace::Ozon, SnapshotSource::ClusterStocks) => {
+                Some("warehouse_cluster".to_owned())
+            }
+            (Marketplace::Ozon, SnapshotSource::PostingMovement) => {
+                Some("fbo_fbs_postings".to_owned())
+            }
             (Marketplace::Wildberries, SnapshotSource::Stocks) => Some("fbw".to_owned()),
             (Marketplace::Wildberries, SnapshotSource::SellerStocks) => Some("seller".to_owned()),
             _ => None,
@@ -288,9 +319,10 @@ fn freshness(
     partial: bool,
 ) -> (&'static str, DataQuality) {
     let sla = match source {
-        SnapshotSource::Stocks | SnapshotSource::SellerStocks | SnapshotSource::Prices => {
-            Duration::hours(1)
-        }
+        SnapshotSource::Stocks
+        | SnapshotSource::SellerStocks
+        | SnapshotSource::ClusterStocks
+        | SnapshotSource::Prices => Duration::hours(1),
         SnapshotSource::Advertising => Duration::hours(2),
         _ => Duration::hours(6),
     };
@@ -317,6 +349,11 @@ const fn fact_relation(source: SnapshotSource) -> (&'static str, &'static str) {
     match source {
         SnapshotSource::Sales => ("daily_reporting.mcp_sales_facts", "business_date,sku"),
         SnapshotSource::Stocks => ("daily_reporting.mcp_stock_facts", "sku,warehouse_id"),
+        SnapshotSource::ClusterStocks => (
+            "daily_reporting.mcp_cluster_stock_facts",
+            "sku,warehouse_key",
+        ),
+        SnapshotSource::PostingMovement => ("daily_reporting.mcp_posting_movement_facts", "sku"),
         SnapshotSource::SellerStocks => (
             "daily_reporting.mcp_seller_stock_facts",
             "sku,chrt_id,warehouse_id",

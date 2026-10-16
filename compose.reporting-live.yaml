@@ -11,6 +11,7 @@ services:
       - run-sources
     environment:
       REPORT_COLLECTOR_MODE: scheduled
+      REPORT_COLLECTION_REPLENISHMENT_ENABLED: ${REPORT_COLLECTION_REPLENISHMENT_ENABLED:-false}
       # The container receives one collection policy; mail routing stays with
       # report-worker. The legacy host variable remains supported.
       DAILY_REPORT_POLICY: ""

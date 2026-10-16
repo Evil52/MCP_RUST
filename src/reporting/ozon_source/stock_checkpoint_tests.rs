@@ -94,17 +94,23 @@ async fn rfbs_fallback_resumes_normalized_pages_without_repeating_requests() {
             CollectedStockFact {
                 sku: 1123,
                 warehouse_id: "sku-fulfillment-v2:fbs".to_owned(),
-                sellable_units: 1
+                sellable_units: 1,
+                present_units: Some(2),
+                reserved_units: Some(1),
             },
             CollectedStockFact {
                 sku: 1123,
                 warehouse_id: "sku-fulfillment-v2:rfbs".to_owned(),
-                sellable_units: 5
+                sellable_units: 5,
+                present_units: Some(7),
+                reserved_units: Some(2),
             },
             CollectedStockFact {
                 sku: 1456,
                 warehouse_id: "sku-fulfillment-v2:rfbs".to_owned(),
-                sellable_units: 0
+                sellable_units: 0,
+                present_units: Some(0),
+                reserved_units: Some(0),
             },
         ]
     );
@@ -128,6 +134,8 @@ async fn legacy_stock_checkpoint_is_not_replayed_as_corrected_sku_inventory() {
         sku: 123,
         warehouse_id: "FBS".to_owned(),
         sellable_units: 7,
+        present_units: None,
+        reserved_units: None,
     }];
     checkpointed(
         &journal(&pages),
@@ -163,6 +171,8 @@ async fn legacy_stock_checkpoint_is_not_replayed_as_corrected_sku_inventory() {
             sku: 456,
             warehouse_id: "sku-fulfillment-v2:fbs".to_owned(),
             sellable_units: 6,
+            present_units: Some(7),
+            reserved_units: Some(1),
         }]
     );
     // The corrected page is now resumable without another upstream request.

@@ -37,6 +37,8 @@ impl OzonMcp {
     }
 
     /// Получает read-only воронку продаж Wildberries по карточкам за выбранный период.
+    /// Не более 250 карточек на страницу, чтобы не переполнять ограниченный ответ.
+    /// Для полного каталога проходите offset-страницы с теми же фильтрами.
     #[tool(
         name = "wb_sales_funnel",
         annotations(title = "Воронка продаж Wildberries", read_only_hint = true)
@@ -57,7 +59,7 @@ impl OzonMcp {
             MAX_PRODUCT_FILTER_ITEMS,
         )?;
         validate_count("tag_ids", input.tag_ids.len(), 0, MAX_PRODUCT_FILTER_ITEMS)?;
-        validate_limit(input.limit, 1_000)?;
+        validate_limit(input.limit, 250)?;
         validate_max_u32("offset", input.offset, MAX_OFFSET)?;
         let account = self.resolve_wb_account(&identity, input.account.as_deref())?;
         let endpoint = "analytics:/api/analytics/v3/sales-funnel/products";

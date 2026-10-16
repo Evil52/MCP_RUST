@@ -174,6 +174,8 @@ pub fn parse_stock_page(
                 sku,
                 warehouse_id,
                 sellable_units,
+                present_units: None,
+                reserved_units: None,
             })
             .collect(),
         rows.len(),

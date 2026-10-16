@@ -34,6 +34,10 @@ pub enum SnapshotSource {
     Stocks,
     /// Optional WB seller-warehouse source; never folded into FBW report totals.
     SellerStocks,
+    /// Optional Ozon warehouse/cluster statistics; independent of daily KPIs.
+    ClusterStocks,
+    /// Optional operational FBO/FBS posting quantities, not Seller Analytics.
+    PostingMovement,
     Prices,
 }
 
@@ -56,14 +60,19 @@ impl SnapshotSource {
 
     const fn freshness_sla(self) -> Duration {
         match self {
-            Self::Sales | Self::Finance => Duration::hours(6),
+            Self::Sales | Self::Finance | Self::PostingMovement => Duration::hours(6),
             Self::Advertising => Duration::hours(2),
-            Self::Stocks | Self::SellerStocks | Self::Prices => Duration::hours(1),
+            Self::Stocks | Self::SellerStocks | Self::ClusterStocks | Self::Prices => {
+                Duration::hours(1)
+            }
         }
     }
 
     const fn is_period_source(self) -> bool {
-        matches!(self, Self::Sales | Self::Advertising | Self::Finance)
+        matches!(
+            self,
+            Self::Sales | Self::Advertising | Self::Finance | Self::PostingMovement
+        )
     }
 }
 
@@ -143,6 +152,13 @@ impl SnapshotDescriptor {
         }
         validate_identifier(&account_id)?;
         if source == SnapshotSource::SellerStocks && marketplace != Marketplace::Wildberries {
+            return Err(SnapshotError::ScopeMismatch);
+        }
+        if matches!(
+            source,
+            SnapshotSource::ClusterStocks | SnapshotSource::PostingMovement
+        ) && marketplace != Marketplace::Ozon
+        {
             return Err(SnapshotError::ScopeMismatch);
         }
         if source_as_of > cutoff_at + MAX_POST_CUTOFF_OBSERVATION_DELAY || period_start > period_end

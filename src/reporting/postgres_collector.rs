@@ -4,9 +4,11 @@
 )]
 
 mod publication;
+pub mod replenishment;
 mod sales_validation;
 mod seller_stocks;
 mod source_jobs;
+pub use replenishment::CollectedClusterStockFact;
 pub use seller_stocks::CollectedSellerStockFact;
 pub use source_jobs::SourceJobClaim;
 
@@ -120,6 +122,11 @@ pub struct CollectedStockFact {
     pub sku: u64,
     pub warehouse_id: String,
     pub sellable_units: u64,
+    /// Gross stock and explicit reserve. Legacy/WB pages may not expose these.
+    #[serde(default)]
+    pub present_units: Option<u64>,
+    #[serde(default)]
+    pub reserved_units: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -137,6 +144,8 @@ pub enum CollectedFacts {
     Finance(Vec<CollectedFinanceFact>),
     Stocks(Vec<CollectedStockFact>),
     SellerStocks(Vec<CollectedSellerStockFact>),
+    ClusterStocks(Vec<CollectedClusterStockFact>),
+    PostingMovement(Vec<crate::ozon_posting_sales::PostingSalesRow>),
     Prices(Vec<CollectedPriceFact>),
 }
 
@@ -148,6 +157,8 @@ impl CollectedFacts {
             Self::Finance(_) => SnapshotSource::Finance,
             Self::Stocks(_) => SnapshotSource::Stocks,
             Self::SellerStocks(_) => SnapshotSource::SellerStocks,
+            Self::ClusterStocks(_) => SnapshotSource::ClusterStocks,
+            Self::PostingMovement(_) => SnapshotSource::PostingMovement,
             Self::Prices(_) => SnapshotSource::Prices,
         }
     }
@@ -159,6 +170,8 @@ impl CollectedFacts {
             Self::Finance(facts) => facts.len(),
             Self::Stocks(facts) => facts.len(),
             Self::SellerStocks(facts) => facts.len(),
+            Self::ClusterStocks(facts) => facts.len(),
+            Self::PostingMovement(facts) => facts.len(),
             Self::Prices(facts) => facts.len(),
         }
     }
@@ -398,6 +411,12 @@ impl PostgresSnapshotWriter {
                         'daily_reporting.finance_facts', 'INSERT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.stock_facts', 'INSERT') \
+                    AND has_column_privilege(current_user, \
+                        'daily_reporting.stock_facts', 'present_units', 'INSERT') \
+                    AND has_column_privilege(current_user, \
+                        'daily_reporting.stock_facts', 'reserved_units', 'INSERT') \
+                    AND has_table_privilege(current_user,'daily_reporting.cluster_stock_facts','INSERT') \
+                    AND has_table_privilege(current_user,'daily_reporting.posting_movement_facts','INSERT') \
                     AND has_table_privilege(current_user, \
                         'daily_reporting.price_facts', 'INSERT') \
                     AND has_table_privilege(current_user, \
@@ -862,6 +881,8 @@ const fn snapshot_source_name(source: SnapshotSource) -> &'static str {
         SnapshotSource::Finance => "finance",
         SnapshotSource::Stocks => "stocks",
         SnapshotSource::SellerStocks => "seller_stocks",
+        SnapshotSource::ClusterStocks => "cluster_stocks",
+        SnapshotSource::PostingMovement => "posting_movement",
         SnapshotSource::Prices => "prices",
     }
 }
@@ -1035,6 +1056,12 @@ async fn insert_facts(
         }
         CollectedFacts::SellerStocks(facts) => {
             seller_stocks::insert(transaction, snapshot_id, facts).await?;
+        }
+        CollectedFacts::ClusterStocks(facts) => {
+            replenishment::insert_clusters(transaction, snapshot_id, facts).await?;
+        }
+        CollectedFacts::PostingMovement(facts) => {
+            replenishment::insert_postings(transaction, snapshot_id, facts).await?;
         }
         CollectedFacts::Prices(facts) => {
             insert_price_facts(transaction, snapshot_id, facts).await?;
@@ -1297,6 +1324,8 @@ fn validate_facts(facts: &CollectedFacts) -> Result<(), PostgresCollectorError> 
             },
         ),
         CollectedFacts::SellerStocks(facts) => seller_stocks::validate(facts),
+        CollectedFacts::ClusterStocks(facts) => replenishment::validate_clusters(facts),
+        CollectedFacts::PostingMovement(facts) => replenishment::validate_postings(facts),
         CollectedFacts::Stocks(facts) => ensure_unique(
             facts,
             |fact| (fact.sku, fact.warehouse_id.clone()),
@@ -1304,6 +1333,12 @@ fn validate_facts(facts: &CollectedFacts) -> Result<(), PostgresCollectorError> 
                 fact.sku > 0
                     && fits_i64(fact.sku)
                     && fits_i32(fact.sellable_units)
+                    && fact.present_units.is_none_or(fits_i32)
+                    && fact.reserved_units.is_none_or(fits_i32)
+                    && fact.reserved_units.is_none_or(|reserved| {
+                        fact.present_units
+                            .is_some_and(|present| reserved <= present)
+                    })
                     && !fact.warehouse_id.is_empty()
                     && fact.warehouse_id.len() <= 128
                     && fact.warehouse_id.bytes().all(|byte| {
@@ -1397,12 +1432,14 @@ mod tests {
     fn snapshot(facts: CollectedFacts) -> Result<CollectedSnapshot, PostgresCollectorError> {
         let source_as_of = cutoff() - Duration::minutes(10);
         let (period_start, period_end) = match facts.source() {
-            SnapshotSource::Sales | SnapshotSource::Advertising | SnapshotSource::Finance => {
-                (cutoff() - Duration::days(1), cutoff())
-            }
-            SnapshotSource::Stocks | SnapshotSource::SellerStocks | SnapshotSource::Prices => {
-                (source_as_of, source_as_of)
-            }
+            SnapshotSource::Sales
+            | SnapshotSource::Advertising
+            | SnapshotSource::Finance
+            | SnapshotSource::PostingMovement => (cutoff() - Duration::days(1), cutoff()),
+            SnapshotSource::Stocks
+            | SnapshotSource::SellerStocks
+            | SnapshotSource::ClusterStocks
+            | SnapshotSource::Prices => (source_as_of, source_as_of),
         };
         CollectedSnapshot::new(
             "pilot".to_owned(),
@@ -1469,6 +1506,8 @@ mod tests {
                 sku: 1,
                 warehouse_id: "fbo-msk:1".to_owned(),
                 sellable_units: 3,
+                present_units: None,
+                reserved_units: None,
             }]))
             .is_ok()
         );
@@ -1549,6 +1588,8 @@ mod tests {
                     sku: 1,
                     warehouse_id: warehouse_id.to_owned(),
                     sellable_units: 1,
+                    present_units: None,
+                    reserved_units: None,
                 }]))
                 .is_err()
             );
