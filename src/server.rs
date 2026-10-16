@@ -1,3 +1,5 @@
+mod request_context;
+use request_context::{authenticated_actor, request_headers, request_registry};
 mod inputs_read_coverage;
 mod privacy;
 mod readiness;
@@ -991,37 +993,6 @@ where
         let registry = request_registry(context.as_request_context());
         Ok(Self { actor_id, registry })
     }
-}
-
-fn authenticated_actor(context: &RequestContext<RoleServer>) -> Option<&AuthenticatedActor> {
-    context.extensions.get::<AuthenticatedActor>().or_else(|| {
-        context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<AuthenticatedActor>())
-    })
-}
-
-fn request_registry(context: &RequestContext<RoleServer>) -> Option<RequestRegistry> {
-    context
-        .extensions
-        .get::<RequestRegistry>()
-        .cloned()
-        .or_else(|| {
-            context
-                .extensions
-                .get::<axum::http::request::Parts>()
-                .and_then(|parts| parts.extensions.get::<Arc<AccessRegistry>>())
-                .map(|registry| RequestRegistry::Loaded(Arc::clone(registry)))
-        })
-}
-
-fn request_headers(context: &RequestContext<RoleServer>) -> axum::http::HeaderMap {
-    context
-        .extensions
-        .get::<axum::http::request::Parts>()
-        .map(|parts| parts.headers.clone())
-        .unwrap_or_default()
 }
 
 fn authentication_failure_response(

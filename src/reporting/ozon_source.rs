@@ -7,6 +7,7 @@
 mod failures;
 mod replenishment;
 mod sales;
+use sales::report_business_dates;
 mod stocks;
 pub use failures::OzonReportSourceError;
 
@@ -137,23 +138,6 @@ where
             collector_version,
         )
         .map_err(|_| OzonReportSourceError::InvalidSnapshotInput)
-}
-
-fn report_business_dates(
-    period_start: DateTime<Utc>,
-    period_end: DateTime<Utc>,
-) -> Result<(NaiveDate, NaiveDate), OzonReportSourceError> {
-    if period_end <= period_start {
-        return Err(OzonReportSourceError::InvalidSnapshotInput);
-    }
-    let offset = super::yekaterinburg_offset();
-    // `period_end > period_start` proves that `period_end` is not the minimum
-    // representable instant, so moving the exclusive bound back by 1 ns is safe.
-    let inclusive_end = period_end - Duration::nanoseconds(1);
-    Ok((
-        period_start.with_timezone(&offset).date_naive(),
-        inclusive_end.with_timezone(&offset).date_naive(),
-    ))
 }
 
 pub trait OzonReportTransport: Send + Sync {
