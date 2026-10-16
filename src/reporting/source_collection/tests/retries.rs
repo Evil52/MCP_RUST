@@ -32,7 +32,7 @@ fn cluster_server_retries_grow_within_the_inventory_window_and_honor_vendor_dela
 }
 
 #[test]
-fn short_cluster_retry_does_not_apply_to_throttling_other_sources_or_wb() {
+fn short_cluster_retry_excludes_unknown_throttling_other_sources_and_wb() {
     let mut claim = retry_claim(Marketplace::Ozon, SnapshotSource::ClusterStocks);
     for code in [
         "rate_limited",
@@ -62,6 +62,20 @@ fn short_cluster_retry_does_not_apply_to_throttling_other_sources_or_wb() {
         source_retry_delay(&wb, SourceFailure::from("upstream_server_error")),
         900
     );
+}
+
+#[test]
+fn known_cluster_cooldowns_keep_the_reported_floor_without_an_extra_minute() {
+    let claim = retry_claim(Marketplace::Ozon, SnapshotSource::ClusterStocks);
+    for (seconds, expected) in [(1, 5), (60, 60), (600, 600)] {
+        let failure = SourceFailure {
+            code: "rate_limited",
+            retry_after: Some(seconds),
+        };
+        assert_eq!(source_retry_delay(&claim, failure), expected);
+        let stocks = retry_claim(Marketplace::Ozon, SnapshotSource::Stocks);
+        assert_eq!(source_retry_delay(&stocks, failure), expected.max(65));
+    }
 }
 
 #[tokio::test]
@@ -138,7 +152,7 @@ async fn persisted_cluster_retries_keep_pages_and_cannot_shorten_departure_gates
         &fixture.writer,
         &claim,
         Err(SourceFailure {
-            code: "upstream_server_error",
+            code: "rate_limited",
             retry_after: Some(70),
         }),
     )

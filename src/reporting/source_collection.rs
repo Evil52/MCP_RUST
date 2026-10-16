@@ -151,19 +151,20 @@ async fn complete_quantum(
             writer
                 .defer_source_job(claim, Some(code), delay, !retry)
                 .await?;
-            tracing::warn!(account_id=claim.account_id(),source=?claim.source,error_class=code,retry,"source deferred; other sources remain available");
+            tracing::warn!(account_id=claim.account_id(),source=?claim.source,error_class=code,retry,delay_seconds=delay,retry_after_seconds=failure.retry_after,"source deferred; other sources remain available");
         }
     }
     Ok(())
 }
 
 fn source_retry_delay(claim: &SourceJobClaim, failure: SourceFailure) -> u32 {
-    // A transient cluster HTTP 5xx must not consume the 30-minute inventory
-    // window in minute-long pauses. Each retry still needs the durable page
-    // departure and shared marketplace quota; vendor Retry-After is a floor.
+    // Transient cluster 5xx and explicitly timed cooldowns must not consume
+    // the 30-minute inventory window in artificial minute-long pauses. Each
+    // retry still needs durable departure and shared quota admission.
     let base: u32 = if claim.marketplace() == Marketplace::Ozon
         && claim.source == SnapshotSource::ClusterStocks
-        && failure.code == "upstream_server_error"
+        && (failure.code == "upstream_server_error"
+            || (failure.code == "rate_limited" && failure.retry_after.is_some()))
     {
         5
     } else {
