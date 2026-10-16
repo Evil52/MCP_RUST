@@ -46,7 +46,12 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
             )
             .await?;
             for row in rows {
-                if !keys.insert((row.sku, row.warehouse_id)) {
+                if !keys.insert((
+                    row.sku,
+                    row.warehouse_id,
+                    row.cluster_id,
+                    row.macrolocal_cluster_id,
+                )) {
                     return Err(OzonReportSourceError::InvalidStocksResponse);
                 }
                 facts.push(row);

@@ -72,6 +72,13 @@ pub async fn verify(
             data: json!({"source_row":true,"data_classification":"untrusted_external_marketplace_data","available_stock_count":5,"ads_cluster":0.5}),
         },
         CollectedClusterStockFact {
+            sku: 11,
+            warehouse_id: Some(-1_051_784),
+            cluster_id: Some(2),
+            macrolocal_cluster_id: Some(4007),
+            data: json!({"source_row":true,"data_classification":"untrusted_external_marketplace_data","available_stock_count":2,"ads_cluster":0.25}),
+        },
+        CollectedClusterStockFact {
             sku: 12,
             warehouse_id: None,
             cluster_id: None,
@@ -95,8 +102,24 @@ pub async fn verify(
         .await
         .unwrap();
     assert_eq!(data.state, "partial");
-    assert_eq!(data.total_rows, 2);
+    assert_eq!(data.total_rows, 3);
     assert_eq!(data.rows[0]["warehouse_id"], -1_051_784);
+    assert_eq!(data.rows[0]["cluster_id"], 2);
+    assert_eq!(data.rows[0]["data"]["available_stock_count"], 2);
+    let second = reader
+        .source_snapshot(
+            &scope,
+            SourceSnapshotQuery {
+                snapshot_id: Some(id),
+                offset: 1,
+                ..query(SnapshotSource::ClusterStocks)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.rows[0]["warehouse_id"], -1_051_784);
+    assert_eq!(second.rows[0]["cluster_id"], 154);
+    assert_eq!(second.rows[0]["data"]["available_stock_count"], 5);
     assert_eq!(data.coverage.unwrap().missing_pairs, 1);
     assert_eq!(
         data.catalog_scope.as_deref(),
@@ -107,7 +130,7 @@ pub async fn verify(
             &scope,
             SourceSnapshotQuery {
                 snapshot_id: Some(id),
-                offset: 1,
+                offset: 2,
                 ..query(SnapshotSource::ClusterStocks)
             },
         )

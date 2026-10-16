@@ -96,7 +96,7 @@ pub(super) fn validate_clusters(
 ) -> Result<(), PostgresCollectorError> {
     ensure_unique(
         rows,
-        |r| (r.sku, r.warehouse_id),
+        |r| (r.sku, r.warehouse_id, r.cluster_id, r.macrolocal_cluster_id),
         |r| {
             r.sku > 0
                 && fits_i64(r.sku)
@@ -249,5 +249,22 @@ mod tests {
             bad["warehouse_id"] = invalid;
             assert!(parse_cluster_rows(&json!({"items":[bad]}), &[1]).is_err());
         }
+    }
+
+    #[test]
+    fn warehouse_ids_are_scoped_to_cluster_coordinates() {
+        let first = json!({"sku":1_426_765_390_u64,"warehouse_id":-1_014_552,"cluster_id":191,"macrolocal_cluster_id":4076,"available_stock_count":0,"outbound_pending_delivery":0});
+        let mut second = first.clone();
+        second["cluster_id"] = json!(193);
+        second["macrolocal_cluster_id"] = json!(4077);
+        second["outbound_pending_delivery"] = json!(1);
+        let rows = parse_cluster_rows(&json!({"items":[first,second]}), &[1_426_765_390]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].data["outbound_pending_delivery"], 0);
+        assert_eq!(rows[1].data["outbound_pending_delivery"], 1);
+        let mut macro_only = first.clone();
+        macro_only["macrolocal_cluster_id"] = json!(4077);
+        assert!(parse_cluster_rows(&json!({"items":[first,macro_only]}), &[1_426_765_390]).is_ok());
+        assert!(parse_cluster_rows(&json!({"items":[first,first]}), &[1_426_765_390]).is_err());
     }
 }

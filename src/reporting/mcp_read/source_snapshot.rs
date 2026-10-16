@@ -351,7 +351,7 @@ const fn fact_relation(source: SnapshotSource) -> (&'static str, &'static str) {
         SnapshotSource::Stocks => ("daily_reporting.mcp_stock_facts", "sku,warehouse_id"),
         SnapshotSource::ClusterStocks => (
             "daily_reporting.mcp_cluster_stock_facts",
-            "sku,warehouse_key",
+            "sku,warehouse_key,cluster_id,macrolocal_cluster_id",
         ),
         SnapshotSource::PostingMovement => ("daily_reporting.mcp_posting_movement_facts", "sku"),
         SnapshotSource::SellerStocks => (
