@@ -718,8 +718,8 @@ fn stock_dimension(warehouse: &str) -> Result<StockDimension, PrepareError> {
     let warehouse_id = warehouse
         .strip_prefix("fbo:")
         .or_else(|| warehouse.strip_prefix("fbs:"))
-        .and_then(|id| id.parse::<u64>().ok())
-        .filter(|id| positive_id(*id));
+        .and_then(|id| id.parse::<i64>().ok())
+        .filter(|id| *id != 0);
     if warehouse_id.is_none() {
         return Err(PrepareError::InvalidSnapshot);
     }

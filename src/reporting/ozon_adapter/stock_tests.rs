@@ -52,6 +52,36 @@ fn stock_identity_comes_from_each_fulfillment_row_and_reserves_are_removed() {
 }
 
 #[test]
+fn native_warehouse_ids_preserve_signed_int64_values_and_string_encoding() {
+    for id in [json!(-1_036_383), json!("-1036383"), json!(1_036_383)] {
+        let rows = parse_warehouse_stock_page(
+            &json!({"products":[{"sku":1,"warehouse_id":id,"present":5,"reserved":2}]}),
+            "fbo",
+        )
+        .unwrap();
+        let expected = id.as_str().map_or_else(|| id.to_string(), str::to_owned);
+        assert_eq!(rows[0].warehouse_id, format!("fbo:{expected}"));
+        assert_eq!(rows[0].sellable_units, 3);
+        assert_eq!(rows[0].reserved_units, Some(2));
+    }
+    for id in [
+        json!(0),
+        json!(u64::MAX),
+        json!("9223372036854775808"),
+        json!(null),
+        json!(1.5),
+    ] {
+        assert!(
+            parse_warehouse_stock_page(
+                &json!({"products":[{"sku":1,"warehouse_id":id,"present":5,"reserved":2}]}),
+                "fbo"
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn stock_fulfillment_type_is_case_normalized_without_changing_sku() {
     for (lower, upper) in [("fbo", "FBO"), ("fbs", "FBS"), ("rfbs", "RFBS")] {
         let lower = parse_stock_page(&page(json!({

@@ -66,7 +66,7 @@ pub async fn verify(
     let rows = vec![
         CollectedClusterStockFact {
             sku: 11,
-            warehouse_id: Some(99),
+            warehouse_id: Some(-1_051_784),
             cluster_id: Some(154),
             macrolocal_cluster_id: Some(4039),
             data: json!({"source_row":true,"data_classification":"untrusted_external_marketplace_data","available_stock_count":5,"ads_cluster":0.5}),
@@ -96,6 +96,7 @@ pub async fn verify(
         .unwrap();
     assert_eq!(data.state, "partial");
     assert_eq!(data.total_rows, 2);
+    assert_eq!(data.rows[0]["warehouse_id"], -1_051_784);
     assert_eq!(data.coverage.unwrap().missing_pairs, 1);
     assert_eq!(
         data.catalog_scope.as_deref(),
