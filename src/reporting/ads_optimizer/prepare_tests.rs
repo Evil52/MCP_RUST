@@ -608,6 +608,17 @@ fn corrected_fulfillment_totals_cannot_be_added_to_physical_warehouse_totals() {
 }
 
 #[test]
+fn disjoint_fulfillment_schemes_can_use_different_source_granularity() {
+    let mut bundle = fixture();
+    bundle.stock_pages = vec![stock_page(vec![
+        stock_row(1, "sku-fulfillment-v2:fbs", 2),
+        stock_row(1, "fbo:123", 7),
+    ])];
+    let input = prepare(bundle).unwrap();
+    assert_eq!(input.products[0].stock.as_ref().unwrap().sellable_units, 9);
+}
+
+#[test]
 fn legacy_stock_cannot_be_rehabilitated_by_mixing_it_with_corrected_rows() {
     let mut bundle = fixture();
     bundle.stock_pages = vec![stock_page(vec![

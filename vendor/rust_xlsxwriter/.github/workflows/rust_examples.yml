@@ -1,0 +1,26 @@
+name: Rust - test examples
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Build
+      run: cargo build --verbose
+
+    - name: Compile and run the examples as tests.
+      run: cargo test --examples
+
+    - name: Compile and run the examples for chrono
+      run: cargo test --features chrono --examples
+

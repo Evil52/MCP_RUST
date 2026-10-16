@@ -2939,6 +2939,14 @@ if [[ "$mcp_failed_stock_count" != 0 ]]; then
   exit 1
 fi
 
+docker exec -i --env PGPASSWORD="$admin_password" "$container" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 --username position_admin --dbname ozon_positions \
+  < "$project_root/tests/stock_reserves.sql" >/dev/null
+
+docker exec -i --env PGPASSWORD="$admin_password" "$container" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 --username position_admin --dbname ozon_positions \
+  < "$project_root/tests/replenishment_sources.sql" >/dev/null
+
 expect_failure_containing \
   "daily-report fact append after publication" \
   "facts may be appended only to a running matching snapshot" \

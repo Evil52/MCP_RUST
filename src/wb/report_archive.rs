@@ -23,8 +23,9 @@ pub(super) fn decode(bytes: Vec<u8>, request_id: Option<String>) -> Result<Value
     let mut files = Vec::new();
     for i in 0..archive.len() {
         let file = archive.by_index(i).map_err(|_| invalid())?;
+        let name = file.name().map_err(|_| invalid())?.into_owned();
         if file.is_dir()
-            || !file.name().to_ascii_lowercase().ends_with(".csv")
+            || !name.to_ascii_lowercase().ends_with(".csv")
             || file.enclosed_name().is_none()
         {
             return Err(invalid());
@@ -37,7 +38,6 @@ pub(super) fn decode(bytes: Vec<u8>, request_id: Option<String>) -> Result<Value
                 request_id,
             });
         }
-        let name = file.name().to_owned();
         let mut csv = String::new();
         file.take(MAX_CSV_BYTES.saturating_sub(actual_total) + 1)
             .read_to_string(&mut csv)

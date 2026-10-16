@@ -1380,7 +1380,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, READ_ONLY_ENDPOINT_ALLOWLIST);
-        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 38);
+        assert_eq!(READ_ONLY_ENDPOINT_ALLOWLIST.len(), 41);
 
         for endpoint in READ_ONLY_ENDPOINT_ALLOWLIST {
             assert!(endpoint.starts_with('/'), "{endpoint}");

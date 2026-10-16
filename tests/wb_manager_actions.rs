@@ -88,6 +88,8 @@ async fn wb_manager_actions_scope_stock_signals_and_withhold_legacy_mixed_invent
                         sku,
                         warehouse_id: if legacy { "wb:seller:1:1" } else { "wb:1" }.to_owned(),
                         sellable_units: u64::from(sku == 3),
+                        present_units: None,
+                        reserved_units: None,
                     })
                     .collect(),
             ),

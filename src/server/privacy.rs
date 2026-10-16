@@ -113,6 +113,16 @@ pub(super) fn redact_marketplace_pii(value: &mut Value) {
     match value {
         Value::Object(object) => {
             for (field, value) in object {
+                // Verified Ozon inventory counter, not a customer identifier.
+                // Strings/objects and other customer fields remain redacted.
+                let inventory_counter = field
+                    .eq_ignore_ascii_case("return_from_customer_stock_count")
+                    && value
+                        .as_u64()
+                        .is_some_and(|n| n <= i32::MAX.cast_unsigned().into());
+                if inventory_counter {
+                    continue;
+                }
                 if is_sensitive_marketplace_field(field) {
                     *value = Value::String(REDACTED_VALUE.to_owned());
                 } else if let Value::String(text) = value
@@ -287,6 +297,27 @@ mod tests {
         assert_eq!(value["offer_id"], "79161234567");
         assert_eq!(value["rating"], 5);
         assert_eq!(value["items"][0]["comment"], "[REDACTED]");
+    }
+
+    #[test]
+    fn inventory_return_counter_is_preserved_only_as_a_bounded_number() {
+        for input in [serde_json::json!(0), serde_json::json!(2_147_483_647)] {
+            let mut value = serde_json::json!({"return_from_customer_stock_count":input});
+            redact_marketplace_pii(&mut value);
+            assert_eq!(value["return_from_customer_stock_count"], input);
+        }
+        for input in [
+            serde_json::json!(2_147_483_648_u64),
+            serde_json::json!(-1),
+            serde_json::json!("phone"),
+            serde_json::json!({"phone":"123"}),
+        ] {
+            let mut value = serde_json::json!({"return_from_customer_stock_count":input,"customer_count":7,"customer":{"phone":"123"}});
+            redact_marketplace_pii(&mut value);
+            assert_eq!(value["return_from_customer_stock_count"], "[REDACTED]");
+            assert_eq!(value["customer_count"], "[REDACTED]");
+            assert_eq!(value["customer"], "[REDACTED]");
+        }
     }
 
     /// The scan every fragment at every position that the index replaced.

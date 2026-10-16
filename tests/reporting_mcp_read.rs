@@ -223,13 +223,17 @@ fn snapshot_with_status(
     facts: CollectedFacts,
 ) -> CollectedSnapshot {
     let (period_start, period_end) = match &facts {
-        CollectedFacts::Sales(_) | CollectedFacts::Advertising(_) | CollectedFacts::Finance(_) => (
+        CollectedFacts::Sales(_)
+        | CollectedFacts::Advertising(_)
+        | CollectedFacts::Finance(_)
+        | CollectedFacts::PostingMovement(_) => (
             timestamp("2098-09-14T19:00:00Z"),
             timestamp("2098-09-15T19:00:00Z"),
         ),
-        CollectedFacts::Stocks(_) | CollectedFacts::SellerStocks(_) | CollectedFacts::Prices(_) => {
-            (source_as_of, source_as_of)
-        }
+        CollectedFacts::Stocks(_)
+        | CollectedFacts::SellerStocks(_)
+        | CollectedFacts::Prices(_)
+        | CollectedFacts::ClusterStocks(_) => (source_as_of, source_as_of),
     };
     CollectedSnapshot::new(
         account_id.to_owned(),
@@ -355,6 +359,8 @@ async fn restricted_reader_rebuilds_complete_history_actions_and_safe_report_met
             sku,
             warehouse_id: "fbo-msk".to_owned(),
             sellable_units: 0,
+            present_units: None,
+            reserved_units: None,
         }]),
     );
     let prices = snapshot(
@@ -902,11 +908,15 @@ async fn historical_stock_scope_includes_seller_rows_outside_the_requested_page(
                 sku: 1,
                 warehouse_id: "wb:10".to_owned(),
                 sellable_units: 2,
+                present_units: None,
+                reserved_units: None,
             },
             CollectedStockFact {
                 sku: 2,
                 warehouse_id: "wb:seller:2:20".to_owned(),
                 sellable_units: 3,
+                present_units: None,
+                reserved_units: None,
             },
         ]),
         CollectedFacts::Prices(Vec::new()),

@@ -66,6 +66,8 @@ pub async fn verify(
         sku: 123,
         warehouse_id: "stock-recovery".to_owned(),
         sellable_units: 7,
+        present_units: None,
+        reserved_units: None,
     }];
     checkpointed(&journal, json!(["stock_recovery", 0]), || async {
         Ok::<_, CheckpointError>(rows.clone())

@@ -144,6 +144,8 @@ impl WbReportSource {
                     // The vendor delivery type is preserved, including models
                     // other than FBS (1); warehouse IDs cannot collide with FBW.
                     warehouse_id: format!("wb:seller:{}:{}", warehouse.delivery_type, warehouse.id),
+                    present_units: None,
+                    reserved_units: None,
                 });
                 if facts.len() > MAX_IDENTITIES {
                     return Err(WbReportSourceError::PaginationLimit);

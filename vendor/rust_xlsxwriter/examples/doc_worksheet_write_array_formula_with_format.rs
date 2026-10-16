@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// Copyright 2022-2026, John McNamara, jmcnamara@cpan.org
+
+//! The following example demonstrates writing an array formulas with formatting
+//! to a worksheet.
+
+use rust_xlsxwriter::{Format, Workbook, XlsxError};
+
+fn main() -> Result<(), XlsxError> {
+    // Create a new Excel file object.
+    let mut workbook = Workbook::new();
+
+    // Add a worksheet to the workbook.
+    let worksheet = workbook.add_worksheet();
+
+    // Add a format.
+    let bold = Format::new().set_bold();
+
+    // Write some test data.
+    worksheet.write_number(0, 1, 500)?;
+    worksheet.write_number(0, 2, 300)?;
+    worksheet.write_number(1, 1, 10)?;
+    worksheet.write_number(1, 2, 15)?;
+
+    // Write an array formula that returns a single value.
+    worksheet.write_array_formula_with_format(0, 0, 0, 0, "{=SUM(B1:C1*B2:C2)}", &bold)?;
+
+    // Save the file to disk.
+    workbook.save("worksheet.xlsx")?;
+
+    Ok(())
+}

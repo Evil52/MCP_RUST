@@ -162,6 +162,9 @@ fn planned_read_tools_are_stable_and_legacy_finance_flag_is_a_noop() {
         "ozon_product_content_diagnostics",
         "ozon_product_attributes",
         "ozon_stock_turnover",
+        "ozon_clusters",
+        "ozon_cluster_stock_analytics",
+        "ozon_supply_bundle",
         "ozon_supply_order_list",
         "ozon_supply_order_get",
         "ozon_fbs_postings",
@@ -248,7 +251,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     // The release checklist in `SECURITY.md` states this count verbatim.
     // Changing it here without updating that gate leaves the gate
     // describing a router that no longer exists.
-    assert_eq!(dev_tools.len(), 127);
+    assert_eq!(dev_tools.len(), 130);
     assert_policy(dev_tools, &json!([{"type": "noauth"}]));
 
     let seed = server();
@@ -259,7 +262,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
     assert_eq!(metadata.scopes_supported, vec!["mcp:tools"]);
 
     let jwt_tools = authenticated.tool_router.list_all();
-    assert_eq!(jwt_tools.len(), 127);
+    assert_eq!(jwt_tools.len(), 130);
     assert_policy(
         jwt_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -271,7 +274,7 @@ fn every_tool_advertises_exact_security_policy_and_compatibility_mirror() {
         .with_preview_features(false, true)
         .tool_router
         .list_all();
-    assert_eq!(legacy_flag_tools.len(), 127);
+    assert_eq!(legacy_flag_tools.len(), 130);
     assert_policy(
         legacy_flag_tools,
         &json!([{"type": "oauth2", "scopes": ["mcp:tools"]}]),
@@ -284,7 +287,9 @@ fn ozon_network_endpoints_are_confined_to_explicit_read_only_allowlist() {
         "/v1/analytics/data",
         "/v1/analytics/product-queries",
         "/v1/analytics/product-queries/details",
+        "/v1/analytics/stocks",
         "/v1/analytics/turnover/stocks",
+        "/v1/cluster/list",
         "/v1/finance/accrual/by-day",
         "/v1/finance/accrual/postings",
         "/v1/finance/accrual/types",
@@ -299,6 +304,7 @@ fn ozon_network_endpoints_are_confined_to_explicit_read_only_allowlist() {
         "/v1/rating/summary",
         "/v1/returns/list",
         "/v1/roles",
+        "/v1/supply-order/bundle",
         "/v2/posting/fbo/get",
         "/v2/posting/fbs/cancel-reason/list",
         "/v2/product/info/stocks-by-warehouse/fbs",

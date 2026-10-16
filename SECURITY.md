@@ -302,7 +302,7 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
   claims must never select an actor. Verify POST, GET and DELETE cannot use another subject's MCP
   session ID and return the same 404 as an unknown session. Saturate and time out readiness probes,
   confirm only one dependency probe runs, and confirm `/livez` plus MCP traffic remain responsive.
-- Verify the Analytics MCP tool list for this release contains exactly 127 stable tools, no preview tools,
+- Verify the Analytics MCP tool list for this release contains exactly 130 stable tools, no preview tools,
   and every tool advertises `destructiveHint=false` and the expected OAuth/noauth policy.
   `ofk_request_ozon_sales_refresh`, `ofk_request_marketplace_sales_refresh` and
   `wb_advertising_history_sync` have
@@ -343,7 +343,7 @@ bytes traverse only the dedicated internal proxy network; Control itself has no 
 - Verify `ofk_ozon_sales_analytics` is available to an account-scoped manager and reads only
   successful published sales snapshots. Missing, preliminary and partial dates must remain explicit.
   Verify direct `ozon_analytics` egress is denied before credential lookup for every non-admin role.
-- Verify the Ozon Seller allowlist contains exactly 35 stable paths. Assert that
+- Verify the Ozon Seller allowlist contains exactly 41 stable paths. Assert that
   `POST /v3/posting/fbo/list` and `POST /v4/posting/fbs/list` are admitted while their superseded
   list versions fail locally without credentials or network access.
 - Verify the Ozon Performance namespace contains exactly `ozon_performance_campaigns`,

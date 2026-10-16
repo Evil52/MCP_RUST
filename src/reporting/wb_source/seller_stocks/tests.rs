@@ -107,17 +107,23 @@ async fn every_warehouse_and_size_is_resumed_without_pii_or_double_counting() {
             CollectedStockFact {
                 sku: 7,
                 warehouse_id: "wb:10".into(),
-                sellable_units: 3
+                sellable_units: 3,
+                present_units: None,
+                reserved_units: None,
             },
             CollectedStockFact {
                 sku: 7,
                 warehouse_id: "wb:seller:1:10".into(),
-                sellable_units: 7
+                sellable_units: 7,
+                present_units: None,
+                reserved_units: None,
             },
             CollectedStockFact {
                 sku: 7,
                 warehouse_id: "wb:seller:2:20".into(),
-                sellable_units: 1
+                sellable_units: 1,
+                present_units: None,
+                reserved_units: None,
             },
         ]
     );

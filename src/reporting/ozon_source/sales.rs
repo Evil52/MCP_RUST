@@ -3,6 +3,7 @@ use super::{
     OzonReportSourceError, OzonReportTransport, checkpointed, json, parse_sales_control_totals,
     parse_sales_page, sales_request, sales_response_shape,
 };
+use chrono::{DateTime, Duration, Utc};
 
 impl<T: OzonReportTransport> OzonReportSource<T> {
     pub async fn sales_page(
@@ -88,4 +89,21 @@ impl<T: OzonReportTransport> OzonReportSource<T> {
         }
         Err(OzonReportSourceError::PaginationLimit)
     }
+}
+
+pub(super) fn report_business_dates(
+    period_start: DateTime<Utc>,
+    period_end: DateTime<Utc>,
+) -> Result<(NaiveDate, NaiveDate), OzonReportSourceError> {
+    if period_end <= period_start {
+        return Err(OzonReportSourceError::InvalidSnapshotInput);
+    }
+    let offset = crate::reporting::yekaterinburg_offset();
+    // `period_end > period_start` proves that `period_end` is not the minimum
+    // representable instant, so moving the exclusive bound back by 1 ns is safe.
+    let inclusive_end = period_end - Duration::nanoseconds(1);
+    Ok((
+        period_start.with_timezone(&offset).date_naive(),
+        inclusive_end.with_timezone(&offset).date_naive(),
+    ))
 }

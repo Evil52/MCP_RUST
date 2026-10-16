@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rmcp::schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -69,7 +69,7 @@ impl PostingSalesError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 pub struct PostingSalesRow {
     pub sku: u64,
     pub fbo_non_cancelled_units: u64,

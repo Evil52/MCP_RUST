@@ -317,11 +317,15 @@ async fn report_worker_loads_only_a_complete_published_manifest() {
                 sku: 3_411_079_879,
                 warehouse_id: "fbo-msk".to_owned(),
                 sellable_units: 19,
+                present_units: None,
+                reserved_units: None,
             },
             CollectedStockFact {
                 sku: 3_411_079_880,
                 warehouse_id: "fbo-kzn".to_owned(),
                 sellable_units: 7,
+                present_units: None,
+                reserved_units: None,
             },
         ]),
     );
@@ -571,6 +575,9 @@ async fn complete_ozon_source_set_is_published_atomically() {
         }]}})),
         Ok(json!({"accrual_types":[]})),
         Ok(json!({"accruals":[],"last_id":""})),
+        Ok(
+            json!({"items":[{"product_id":123,"stocks":[{"sku":3_411_079_879_u64,"type":"fbo","present":21,"reserved":2}]}],"cursor":""}),
+        ),
         Ok(json!({
             "products":[{
                 "sku":3_411_079_879_u64,
@@ -581,7 +588,6 @@ async fn complete_ozon_source_set_is_published_atomically() {
             "cursor":"",
             "has_next":false
         })),
-        Ok(json!({"products":[],"cursor":"","has_next":false})),
         Ok(json!({"items":[{"product_id":3_411_079_879_u64,"price":{
             "currency_code":"RUB","price":"675.00","old_price":"702.00"
         }}],"cursor":""})),

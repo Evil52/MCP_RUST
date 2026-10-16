@@ -64,7 +64,11 @@ impl OzonMcp {
         .await
     }
 
-    /// Возвращает текущие остатки товаров Ozon с фильтрацией по `offer_id` или `product_id`.
+    /// Возвращает текущие остатки Ozon с фильтрацией по `offer_id` или `product_id`.
+    /// В stocks сохранены type (FBO/FBS/rFBS), sku, present и reserved; доступно = present - reserved.
+    /// Для полного каталога пройдите все cursor-страницы, сохраняя одинаковые фильтры.
+    /// Отсутствующая строка схемы — Н/Д, не ноль. Это наблюдение на `fetched_at`, не остаток на прошлую дату.
+    /// `source=seller_stocks` относится только к WB и не используется для резерва Ozon.
     #[tool(
         name = "ozon_product_stocks",
         annotations(title = "Остатки товаров Ozon", read_only_hint = true)
@@ -117,6 +121,9 @@ impl OzonMcp {
         Parameters(input): Parameters<WarehouseStockListInput>,
     ) -> Result<Json<OzonResult>, String> {
         validate_product_identifiers(&input.offer_ids, &[], &input.skus)?;
+        if input.offer_ids.is_empty() && input.skus.is_empty() {
+            return Err("INVALID_ARGUMENT: FBO warehouse stocks require offer_ids or skus; enumerate ozon_product_stocks first".to_owned());
+        }
         validate_limit(input.limit, 1_000)?;
         validate_max_chars("cursor", &input.cursor, MAX_OPAQUE_TOKEN_CHARS)?;
         self.request(

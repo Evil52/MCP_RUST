@@ -10,7 +10,7 @@ autobins = false
 [workspace]
 members = [".", "crates/mcp-storage", "crates/mcp-marketplace-types"]
 default-members = [".", "crates/mcp-storage", "crates/mcp-marketplace-types"]
-exclude = ["vendor/rmcp"]
+exclude = ["vendor/rmcp", "vendor/rust_xlsxwriter"]
 resolver = "3"
 
 [features]
@@ -136,7 +136,7 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 flate2 = "1"
@@ -153,3 +153,4 @@ overflow-checks = true
 
 [patch.crates-io]
 rmcp = { path = "vendor/rmcp" }
+rust_xlsxwriter = { path = "vendor/rust_xlsxwriter" }

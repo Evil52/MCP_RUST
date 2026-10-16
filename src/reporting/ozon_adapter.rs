@@ -8,8 +8,10 @@
 //! responses through these functions before a snapshot can be persisted.
 
 mod sales;
+mod warehouses;
 pub(super) use sales::parse_sales_control_totals;
 pub use sales::sales_request;
+pub use warehouses::{next_warehouse_stock_cursor, parse_warehouse_stock_page};
 
 use chrono::NaiveDate;
 use serde_json::Value;
@@ -172,73 +174,6 @@ pub fn parse_sales_page(response: &Value) -> Result<Vec<CollectedSalesFact>, Ozo
         });
     }
     Ok(facts)
-}
-
-/// Normalizes one warehouse-granular FBO or FBS stock page.
-///
-/// Warehouse identifiers are prefixed with the fulfillment scheme. This
-/// preserves the upstream numeric identifier while preventing an accidental
-/// collision if Ozon ever reuses the same number in the two namespaces.
-pub fn parse_warehouse_stock_page(
-    response: &Value,
-    scheme: &'static str,
-) -> Result<Vec<CollectedStockFact>, OzonReportParseError> {
-    if !matches!(scheme, "fbo" | "fbs") {
-        return Err(OzonReportParseError::Value);
-    }
-    let products = array_field(response, "products")?;
-    if products.len() > PRODUCT_PAGE_ROWS {
-        return Err(OzonReportParseError::TooManyRows);
-    }
-    products
-        .iter()
-        .map(|product| {
-            let product = product.as_object().ok_or(OzonReportParseError::Shape)?;
-            let present = parse_u64(field(Some(product), "present")?)?;
-            let sellable_units = if scheme == "fbs" {
-                parse_u64(field(Some(product), "free_stock")?)?
-            } else {
-                let reserved = parse_u64(field(Some(product), "reserved")?)?;
-                present
-                    .checked_sub(reserved)
-                    .ok_or(OzonReportParseError::Value)?
-            };
-            let warehouse_id = parse_u64(field(Some(product), "warehouse_id")?)?;
-            if warehouse_id == 0 {
-                return Err(OzonReportParseError::Value);
-            }
-            Ok(CollectedStockFact {
-                sku: parse_u64(field(Some(product), "sku")?)?,
-                warehouse_id: format!("{scheme}:{warehouse_id}"),
-                sellable_units,
-            })
-        })
-        .collect()
-}
-
-/// Extracts the next cursor from a warehouse stock response without guessing.
-pub fn next_warehouse_stock_cursor(
-    response: &Value,
-) -> Result<Option<String>, OzonReportParseError> {
-    let object = response.as_object().ok_or(OzonReportParseError::Shape)?;
-    let has_next = field(Some(object), "has_next")?
-        .as_bool()
-        .ok_or(OzonReportParseError::Shape)?;
-    let cursor = field(Some(object), "cursor")?
-        .as_str()
-        .ok_or(OzonReportParseError::Shape)?;
-    if has_next {
-        if invalid_cursor(cursor) {
-            return Err(OzonReportParseError::Value);
-        }
-        Ok(Some(cursor.to_owned()))
-    } else if cursor.len() <= MAX_CURSOR_BYTES
-        && !cursor.bytes().any(|byte| byte.is_ascii_control())
-    {
-        Ok(None)
-    } else {
-        Err(OzonReportParseError::Value)
-    }
 }
 
 /// Normalizes one `/v5/product/info/prices` page.

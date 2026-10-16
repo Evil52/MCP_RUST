@@ -27,6 +27,8 @@ async fn sizes_split_across_stock_pages_publish_one_summed_sku_fact() {
             sku: 7,
             warehouse_id: "wb:2".to_owned(),
             sellable_units: 1_002,
+            present_units: None,
+            reserved_units: None,
         }]
     );
     assert_eq!(

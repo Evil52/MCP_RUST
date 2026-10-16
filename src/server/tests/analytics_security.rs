@@ -235,6 +235,21 @@ async fn independent_source_tool_respects_account_and_finance_access_before_read
             .is_err()
     );
     assert_eq!(repository.calls(), 1);
+    let unsupported = reporting_tool_error(
+        manager
+            .reporting_source_snapshot(
+                RequestIdentity::dev(),
+                Parameters(ReportingSourceSnapshotInput {
+                    source: SnapshotSource::SellerStocks,
+                    ..input.clone()
+                }),
+            )
+            .await,
+    );
+    assert!(unsupported.starts_with(REPORTING_INVALID_REQUEST));
+    assert!(unsupported.contains("только для Wildberries"));
+    assert!(unsupported.contains("ozon_product_stocks"));
+    assert_eq!(repository.calls(), 1);
     let finance = reporting_test_server("finance", repository.clone());
     finance
         .reporting_source_snapshot(

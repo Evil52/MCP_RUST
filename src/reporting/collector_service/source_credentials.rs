@@ -25,7 +25,13 @@ impl ReportCollectorConfig {
                 .iter()
                 .any(|t| t.account_id == claim.account_id()
                     && t.marketplace == claim.marketplace()
-                    && t.sources.contains(&claim.source)),
+                    && (t.sources.contains(&claim.source)
+                        || (self.replenishment_enabled
+                            && t.marketplace == crate::reporting::snapshot::Marketplace::Ozon
+                            && matches!(
+                                claim.source,
+                                SnapshotSource::ClusterStocks | SnapshotSource::PostingMovement
+                            )))),
             "source is outside collection policy"
         );
         let account = self

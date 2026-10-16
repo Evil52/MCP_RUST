@@ -968,6 +968,7 @@ verify_reporting_live() {
     --arg database_url "$expected_database_url" \
     '.environment == {
        "REPORT_COLLECTOR_MODE": "scheduled",
+       "REPORT_COLLECTION_REPLENISHMENT_ENABLED": "false",
        "MCP_MARKETPLACE_QUOTA_DATABASE_URL": $database_url,
        "MCP_MARKETPLACE_QUOTA_REQUIRED": "true",
        "REPORT_COLLECTOR_DATABASE_URL": $database_url,

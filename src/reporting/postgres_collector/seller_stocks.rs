@@ -81,13 +81,21 @@ pub(super) async fn insert_fbw(
         .iter()
         .map(|fact| as_i32(fact.sellable_units))
         .collect::<Result<Vec<_>, _>>()?;
+    let present_units = facts
+        .iter()
+        .map(|fact| fact.present_units.map(as_i32).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
+    let reserved_units = facts
+        .iter()
+        .map(|fact| fact.reserved_units.map(as_i32).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
     transaction
         .execute(
             "INSERT INTO daily_reporting.stock_facts \
-             (snapshot_id, sku, warehouse_id, sellable_units) \
+             (snapshot_id, sku, warehouse_id, sellable_units, present_units, reserved_units) \
              SELECT $1, batch.* \
-             FROM unnest($2::bigint[], $3::text[], $4::integer[]) AS batch",
-            &[&snapshot_id, &skus, &warehouse_ids, &sellable_units],
+             FROM unnest($2::bigint[], $3::text[], $4::integer[], $5::integer[], $6::integer[]) AS batch",
+            &[&snapshot_id, &skus, &warehouse_ids, &sellable_units, &present_units, &reserved_units],
         )
         .await
         .map_err(|_| PostgresCollectorError::Unavailable)?;
