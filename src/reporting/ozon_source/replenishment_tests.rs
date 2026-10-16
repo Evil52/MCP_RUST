@@ -133,3 +133,28 @@ async fn cluster_resume_keeps_missing_skus_unknown_and_drops_untrusted_contacts(
         json!(["11", "12"])
     );
 }
+
+#[tokio::test]
+async fn cluster_resume_preserves_reused_warehouse_ids_across_clusters() {
+    let t = transport(vec![
+        json!({"items":[{"product_id":1,"stocks":[{"sku":11,"type":"fbo","present":7,"reserved":2}]}],"cursor":""}),
+        json!({"items":[{"sku":11,"warehouse_id":-1_014_552,"cluster_id":191,"macrolocal_cluster_id":4076,"outbound_pending_delivery":0},{"sku":11,"warehouse_id":-1_014_552,"cluster_id":193,"macrolocal_cluster_id":4077,"outbound_pending_delivery":1}]}),
+    ]);
+    let pages = MemoryPages::default();
+    assert!(
+        OzonReportSource::new(&t)
+            .with_checkpoints(journal(&pages))
+            .collect_cluster_stock_pages()
+            .await
+            .is_err()
+    );
+    let rows = OzonReportSource::new(&t)
+        .with_checkpoints(journal(&pages))
+        .collect_cluster_stock_pages()
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].cluster_id, Some(191));
+    assert_eq!(rows[1].cluster_id, Some(193));
+    assert_eq!(rows[1].data["outbound_pending_delivery"], 1);
+}
