@@ -53,6 +53,8 @@ const fn query(source: SnapshotSource) -> SourceSnapshotQuery {
 }
 
 fn collection_window(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) {
+    // PostgreSQL stores timestamp identities with microsecond precision.
+    let now = DateTime::from_timestamp_micros(now.timestamp_micros()).unwrap();
     // The delayed cutoff can still belong to the previous local date after
     // midnight. Select a complete day relative to that cutoff, not wall time.
     let cutoff = now - Duration::minutes(10);
