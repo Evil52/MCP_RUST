@@ -15,6 +15,7 @@ mod recovery;
 mod replenishment;
 mod retries;
 mod sales_publication;
+mod scheduling;
 mod seller_stocks;
 
 static DATABASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
