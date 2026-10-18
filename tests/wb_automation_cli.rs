@@ -161,3 +161,75 @@ fn campaign_launch_reconcile_prints_an_unconfirmed_outcome_without_writer_or_net
     assert_eq!(fs::read_dir(&journal).unwrap().count(), 1);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn local_campaign_and_corridor_commands_reject_malformed_arguments_offline() {
+    let root = std::env::temp_dir().join(format!("wb-cli-usage-{}", std::process::id()));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    for (arguments, message) in [
+        (
+            vec!["campaign-prepare"],
+            "usage: wb-automation campaign-prepare PROFILE.json REQUEST.json",
+        ),
+        (
+            vec!["campaign-export"],
+            "usage: wb-automation campaign-export MANIFEST.json",
+        ),
+        (
+            vec!["campaign-enroll", "manifest.json"],
+            "usage: wb-automation campaign-enroll MANIFEST.json",
+        ),
+        (
+            vec!["execute-fleet-pg"],
+            "usage: wb-automation execute-fleet-pg FLEET.json",
+        ),
+        (
+            vec!["authorize-corridor-pg", "source.json"],
+            "usage: wb-automation authorize-corridor-pg|authorize-recommendations-pg",
+        ),
+        (
+            vec![
+                "authorize-corridor-pg",
+                "source.json",
+                "target.json",
+                "access.json",
+                "reader",
+                "maybe",
+                "--confirm-authorized-corridor",
+            ],
+            "allow-broad-reader must be true or false",
+        ),
+    ] {
+        let output = run(&arguments, &root);
+        assert!(!output.status.success(), "{arguments:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(message), "{arguments:?}: {stderr}");
+    }
+    // Well-formed commands still fail closed on absent local files, before any
+    // marketplace read, database connection or write.
+    for arguments in [
+        vec!["campaign-prepare", "profile.json", "request.json"],
+        vec!["campaign-export", "manifest.json"],
+        vec![
+            "campaign-enroll",
+            "manifest.json",
+            "current.json",
+            "new.json",
+        ],
+        vec!["execute-fleet-pg", "fleet.json"],
+        vec![
+            "authorize-recommendations-pg",
+            "source.json",
+            "target.json",
+            "access.json",
+            "reader",
+            "false",
+            "--confirm-authorized-recommendations",
+        ],
+    ] {
+        let output = run(&arguments, &root);
+        assert!(!output.status.success(), "{arguments:?}");
+        assert!(output.stdout.is_empty(), "{arguments:?}");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
