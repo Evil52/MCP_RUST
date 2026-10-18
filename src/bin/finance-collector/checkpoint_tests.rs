@@ -1,4 +1,4 @@
-#[path = "../src/bin/finance-collector/checkpoint.rs"]
+#[path = "checkpoint.rs"]
 mod checkpoint;
 
 use chrono::{Duration, Utc};
