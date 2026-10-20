@@ -151,6 +151,11 @@ fn performance_source_failure(
             retry_after: Some(delay),
             ..
         }
+        | crate::ozon_performance::PerformanceError::Api {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: Some(delay),
+            ..
+        }
         | crate::ozon_performance::PerformanceError::SharedQuota(
             crate::marketplace_quota::QuotaError::Limited { retry_after: delay },
         ) => OzonPerformanceReportSourceError::RetryAfter {

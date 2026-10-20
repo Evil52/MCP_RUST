@@ -148,20 +148,40 @@ pub(super) fn parse_retry_delay(headers: &HeaderMap, now: DateTime<Utc>) -> Pars
             return DateTime::parse_from_rfc2822(value).ok().map_or(
                 ParsedRetryDelay::Invalid,
                 |retry_at| {
-                    let nonnegative_seconds = retry_at
+                    let delay = retry_at
                         .with_timezone(&Utc)
                         .signed_duration_since(now)
-                        .num_seconds()
-                        .max(0);
-                    let seconds = u64::try_from(nonnegative_seconds)
-                        .expect("nonnegative i64 always fits u64");
-                    ParsedRetryDelay::Valid(Duration::from_secs(seconds))
+                        .to_std()
+                        .unwrap_or(Duration::ZERO);
+                    ParsedRetryDelay::Valid(delay)
                 },
             );
         }
         return ParsedRetryDelay::Invalid;
     }
     ParsedRetryDelay::Absent
+}
+
+#[cfg(test)]
+mod retry_date_tests {
+    use super::*;
+
+    #[test]
+    fn http_date_preserves_the_fractional_wait_and_clamps_past_dates() {
+        let headers = HeaderMap::from_iter([(
+            RETRY_AFTER,
+            "Tue, 20 Oct 2026 10:00:01 GMT".parse().unwrap(),
+        )]);
+        let now = "2026-10-20T10:00:00.250Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            parse_retry_delay(&headers, now),
+            ParsedRetryDelay::Valid(Duration::from_millis(750))
+        );
+        assert_eq!(
+            parse_retry_delay(&headers, now + chrono::Duration::seconds(2)),
+            ParsedRetryDelay::Valid(Duration::ZERO)
+        );
+    }
 }
 
 pub(super) fn trace_transport_failure(

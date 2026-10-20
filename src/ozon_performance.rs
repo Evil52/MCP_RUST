@@ -1,3 +1,4 @@
+mod oauth;
 mod proxy;
 mod quota;
 
@@ -42,16 +43,15 @@ const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_SKEW: Duration = Duration::from_secs(60);
 /// How long a failed token request suppresses further attempts.
 ///
-/// The OAuth endpoint sits outside the local API pacing gate and both in-flight
-/// semaphores, because holding scarce capacity while a single-flight refresh
-/// waits would be worse. That exemption is only safe with a cooldown: without
-/// one, a token endpoint returning 429 or 5xx is re-attempted once per API
-/// call for as long as the failure lasts. When configured, the deployment quota
-/// additionally coordinates OAuth attempts across processes.
+/// OAuth has its own concurrency limit so refreshes do not occupy business
+/// request capacity. A failure cooldown also suppresses queued single-flight
+/// callers after an error or cancellation. The deployment quota, when enabled,
+/// coordinates OAuth attempts across processes.
 const TOKEN_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_IN_FLIGHT_PER_CLIENT: usize = 2;
 const MAX_GLOBAL_IN_FLIGHT: usize = 8;
+const MAX_OAUTH_IN_FLIGHT: usize = 2;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 
 /// Exact fixed business endpoints that may leave this process.
@@ -183,7 +183,7 @@ pub enum PerformanceError {
     #[error("доступ к Ozon Performance API запрещён (HTTP 403, request-id: {request_id:?})")]
     Forbidden { request_id: Option<String> },
     #[error(
-        "Ozon Performance API ограничил частоту запросов (HTTP 429, request-id: {request_id:?})"
+        "запрос Ozon Performance API ограничен квотой (request-id: {request_id:?}, retry-after: {retry_after:?})"
     )]
     RateLimited {
         request_id: Option<String>,
@@ -193,6 +193,7 @@ pub enum PerformanceError {
     Api {
         status: StatusCode,
         request_id: Option<String>,
+        retry_after: Option<Duration>,
     },
     #[error("истёк таймаут запроса к Ozon Performance API")]
     Timeout,
@@ -391,6 +392,8 @@ struct AccountState {
     credentials: PerformanceCredentials,
     token: Mutex<TokenSlot>,
     pacing: PerformanceRequestPacer,
+    api_cooldown: quota::ResponseCooldown,
+    oauth_cooldown: quota::ResponseCooldown,
     in_flight: Semaphore,
     statistics_in_flight: Semaphore,
 }
@@ -401,6 +404,8 @@ impl AccountState {
             credentials,
             token: Mutex::new(TokenSlot::default()),
             pacing,
+            api_cooldown: quota::ResponseCooldown::default(),
+            oauth_cooldown: quota::ResponseCooldown::default(),
             in_flight: Semaphore::new(MAX_IN_FLIGHT_PER_CLIENT),
             statistics_in_flight: Semaphore::new(1),
         }
@@ -434,6 +439,7 @@ pub struct PerformanceClient {
     logical_timeout: Duration,
     accounts: Arc<BTreeMap<StoreId, Arc<AccountState>>>,
     global_in_flight: Arc<Semaphore>,
+    oauth_in_flight: Arc<Semaphore>,
     shared_quota: SharedQuota,
 }
 
@@ -507,6 +513,7 @@ impl PerformanceClient {
             logical_timeout: timeout,
             accounts: Arc::new(accounts),
             global_in_flight: Arc::new(Semaphore::new(MAX_GLOBAL_IN_FLIGHT)),
+            oauth_in_flight: Arc::new(Semaphore::new(MAX_OAUTH_IN_FLIGHT)),
             shared_quota: SharedQuota::from_env(),
         })
     }
@@ -678,6 +685,8 @@ impl PerformanceClient {
             .get(store)
             .ok_or_else(|| PerformanceError::MissingCredentials(store.clone()))?;
 
+        state.api_cooldown.check().await?;
+
         // Preserve fail-fast overload semantics without retaining any permit
         // while OAuth single-flight or account pacing may wait.
         drop(self.try_request_permits(state, path)?);
@@ -747,6 +756,7 @@ impl PerformanceClient {
         token: &str,
     ) -> Result<RequestAttempt, PerformanceError> {
         loop {
+            state.api_cooldown.check().await?;
             state.wait_until_ready().await;
             let permits = self.try_request_permits(state, path)?;
 
@@ -803,111 +813,6 @@ impl PerformanceClient {
             .await
             .map_err(|error| classify_transport(&error))
     }
-
-    async fn invalidate_token_if_current(&self, state: &AccountState, used_token: &str) {
-        let mut slot = state.token.lock().await;
-        if slot
-            .cached
-            .as_ref()
-            .is_some_and(|cached| cached.value == used_token)
-        {
-            slot.cached = None;
-        }
-    }
-
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the token mutex deliberately provides a single-flight OAuth exchange"
-    )]
-    async fn access_token(&self, state: &AccountState) -> Result<String, PerformanceError> {
-        let mut slot = state.token.lock().await;
-        let now = Instant::now();
-        if let Some(token) = slot.cached.as_ref()
-            && token.refresh_at > now
-        {
-            return Ok(token.value.clone());
-        }
-        // Holding the lock across the request is what makes this single-flight,
-        // so a queued caller must not simply repeat an attempt that just failed.
-        if let Some(cooldown) = slot.cooldown.as_ref() {
-            if cooldown.until > now {
-                return Err(PerformanceError::TokenUnavailable {
-                    previous: cooldown.previous,
-                });
-            }
-            slot.cooldown = None;
-        }
-        match self.request_token(state).await {
-            Ok((value, refresh_at)) => {
-                slot.cached = Some(CachedToken {
-                    value: value.clone(),
-                    refresh_at,
-                });
-                Ok(value)
-            }
-            Err(error) => {
-                slot.cooldown = Some(TokenCooldown {
-                    until: Instant::now() + TOKEN_FAILURE_COOLDOWN,
-                    previous: error.kind().code(),
-                });
-                Err(error)
-            }
-        }
-    }
-
-    /// Performs one OAuth client-credentials exchange and validates it.
-    ///
-    /// Returns the token together with the instant it must be refreshed, so
-    /// the caller can cache both without re-deriving the lifetime.
-    async fn request_token(
-        &self,
-        state: &AccountState,
-    ) -> Result<(String, Instant), PerformanceError> {
-        self.admit_shared_request(state, "oauth", TOKEN_FAILURE_COOLDOWN)
-            .await?;
-        let response = self
-            .http
-            .post(format!("{}{}", self.base_url, TOKEN_PATH))
-            .json(&json!({
-                "client_id": state.credentials.client_id,
-                "client_secret": state.credentials.client_secret,
-                "grant_type": "client_credentials",
-            }))
-            .send()
-            .await
-            .map_err(|error| classify_transport(&error))?;
-        self.defer_shared_response(state, "oauth", &response)
-            .await?;
-        let request_id = safe_request_id(response.headers());
-        let status = response.status();
-        if !status.is_success() {
-            return Err(classify_status(
-                status,
-                request_id,
-                crate::ozon::retry_after_duration(response.headers()),
-            ));
-        }
-        let bytes = read_body(response, MAX_TOKEN_BODY_BYTES, request_id.clone()).await?;
-        let token: TokenResponse = serde_json::from_slice(&bytes)
-            .map_err(|source| PerformanceError::InvalidJson { request_id, source })?;
-        if token.access_token.is_empty()
-            || token.access_token.len() > MAX_ACCESS_TOKEN_BYTES
-            || token.expires_in == 0
-            || Duration::from_secs(token.expires_in) > MAX_TOKEN_LIFETIME
-            || !token.token_type.eq_ignore_ascii_case("bearer")
-        {
-            return Err(PerformanceError::InvalidToken);
-        }
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {}", token.access_token))
-            .map_err(|_| PerformanceError::InvalidToken)?;
-        authorization.set_sensitive(true);
-        let lifetime = Duration::from_secs(token.expires_in);
-        let refresh_after = lifetime.saturating_sub(TOKEN_EXPIRY_SKEW);
-        let refresh_at = Instant::now()
-            .checked_add(refresh_after)
-            .ok_or(PerformanceError::InvalidToken)?;
-        Ok((token.access_token, refresh_at))
-    }
 }
 
 #[derive(Deserialize)]
@@ -937,7 +842,11 @@ fn classify_status(
             request_id,
             retry_after,
         },
-        _ => PerformanceError::Api { status, request_id },
+        _ => PerformanceError::Api {
+            status,
+            request_id,
+            retry_after,
+        },
     }
 }
 
@@ -996,6 +905,7 @@ fn safe_request_id(headers: &HeaderMap) -> Option<String> {
 #[cfg(test)]
 mod tests {
     mod quota;
+    mod reliability;
     use super::*;
     use crate::test_support::mock_http;
     use std::{
@@ -2075,6 +1985,7 @@ mod tests {
             PerformanceError::Api {
                 status: StatusCode::BAD_GATEWAY,
                 request_id: Some("one".to_owned()),
+                retry_after: None,
             },
             PerformanceError::InvalidJson {
                 request_id: Some("one".to_owned()),

@@ -10953,12 +10953,12 @@ async fn performance_errors_are_structured_and_status_never_exposes_credentials(
                 403,
                 json!({"message":"upstream-body-must-not-be-reflected"}).to_string(),
             ),
-            (429, json!({"message":"rate limited"}).to_string()),
             (500, json!({"message":"server error"}).to_string()),
             (500, json!({"message":"objects error"}).to_string()),
             (500, json!({"message":"products error"}).to_string()),
             (500, json!({"message":"limits error"}).to_string()),
             (500, json!({"message":"sku statistics error"}).to_string()),
+            (429, json!({"message":"rate limited"}).to_string()),
         ],
     );
     let error = server
@@ -10983,25 +10983,6 @@ async fn performance_errors_are_structured_and_status_never_exposes_credentials(
     assert!(error.contains("request_id=-"), "{error}");
     assert!(!error.contains("upstream-body-must-not-be-reflected"));
     assert!(!error.contains("test-performance-secret"));
-
-    let daily_error = server
-        .performance_daily(
-            RequestIdentity::dev(),
-            Parameters(PerformanceStatisticsInput {
-                store: Some(StoreId::from("store_a")),
-                campaign_ids: vec![11],
-                date_from: "2026-08-01".to_owned(),
-                date_to: "2026-08-02".to_owned(),
-            }),
-        )
-        .await
-        .err()
-        .unwrap();
-    assert!(daily_error.contains("kind=rate_limited"), "{daily_error}");
-    assert!(
-        daily_error.contains("endpoint=/api/client/statistics/daily/json"),
-        "{daily_error}"
-    );
 
     let expenses_error = server
         .performance_expenses(
@@ -11106,6 +11087,25 @@ async fn performance_errors_are_structured_and_status_never_exposes_credentials(
     assert!(
         sku_error.contains("endpoint=/api/client/statistics/products/sku"),
         "{sku_error}"
+    );
+
+    let daily_error = server
+        .performance_daily(
+            RequestIdentity::dev(),
+            Parameters(PerformanceStatisticsInput {
+                store: Some(StoreId::from("store_a")),
+                campaign_ids: vec![11],
+                date_from: "2026-08-01".to_owned(),
+                date_to: "2026-08-02".to_owned(),
+            }),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert!(daily_error.contains("kind=rate_limited"), "{daily_error}");
+    assert!(
+        daily_error.contains("endpoint=/api/client/statistics/daily/json"),
+        "{daily_error}"
     );
 
     for _ in 0..8 {

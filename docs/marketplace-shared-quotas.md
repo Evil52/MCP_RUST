@@ -35,11 +35,11 @@ remaining wait. Time is read after the row lock. Denied requests do not move the
 deadline. A cancelled or uncertain reservation is not refunded. A vendor
 cooldown extends the deadline monotonically and survives restarts.
 
-Provider cooldowns of up to 366 days preserve their full duration. Larger
-delays store an infinite deadline, blocking that key until administrator
-reconciliation; callers receive a bounded one-day retry delay. Later shorter
-cooldowns never shorten or clear that block. Departure intervals remain
-limited to one day; this limit does not truncate a provider's Retry-After.
+The Rust coordinator caps stored provider cooldowns at 24 hours. Larger delays
+are logged and counted by `mcp_marketplace_quota_capped_cooldowns_total`.
+Later shorter cooldowns never reduce an existing deadline. Original vendor delays remain available to
+callers; the source scheduler refuses automatic retries with delays exceeding
+one day instead of silently shortening those retry instructions.
 
 Existing endpoint-specific local guards still apply. The shared profiles add
 conservative intervals: Seller general requests 100 ms plus Analytics 65 s;
@@ -59,6 +59,38 @@ A quota refusal sends no marketplace bytes and never creates an automatic write
 retry. Existing durable workflows may conservatively require reconciliation
 after recording dispatch intent. Once a write has departed, failure to persist
 a cooldown does not replace its actual vendor/ambiguous outcome.
+
+## Local request reliability
+
+The Performance reader also keeps per-account cooldowns in memory, including
+when shared coordination is disabled. HTTP 429 uses `Retry-After`, or 30 seconds
+when it is absent/unusable. HTTP 503 installs a cooldown when `Retry-After` is
+present. API and OAuth cooldowns are separate, shared across client clones,
+monotonic, and capped at 24 hours. A new call during a cooldown returns the
+remaining delay immediately without sending a request. The reporting source
+passes the original delay from both 429 and 503 to durable retry scheduling.
+Local state does not survive restarts or coordinate separately built clients;
+deployment-wide protection still requires the shared quota.
+
+The reader allows eight concurrent business requests overall, two per account,
+and one statistics request per account. OAuth has a separate limit of two
+concurrent exchanges across accounts and single-flight refresh per account.
+Waiters for an existing refresh do not occupy network capacity. Failed,
+timed-out or cancelled refreshes suppress another attempt for 30 seconds;
+a longer vendor cooldown takes precedence. Local OAuth overload returns
+immediately without installing an account failure cooldown.
+
+The configured logical timeout includes pacing, token acquisition, a single
+401 refresh/replay, response headers and body decoding. Transient Performance
+collection failures are retried by the durable source scheduler. Successfully
+validated pages are checkpointed; an unsuccessful page is fetched again on
+resume. Campaign totals, duplicate IDs, date scope and batch provenance must
+all pass before a complete result can be returned. Intermediate pages cannot
+be published as a successful snapshot.
+
+WB preserves fractional seconds when a `Retry-After` HTTP date is converted to
+a delay, so it cannot round down and retry before that date. See
+[RFC 9110, Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3).
 
 ## Verification and activation
 
