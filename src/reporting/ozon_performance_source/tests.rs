@@ -1,3 +1,4 @@
+mod pagination_recovery;
 mod retry_after;
 use std::{
     collections::{BTreeMap, VecDeque},

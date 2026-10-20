@@ -19,7 +19,7 @@
     "src/control/server/tests.rs": 2832,
     "src/control/wb/tests.rs": 1323,
     "src/http.rs": 2462,
-    "src/ozon_performance.rs": 2353,
+    "src/ozon_performance.rs": 2264,
     "src/ozon.rs": 3429,
     "src/reporting/mcp_read.rs": 3206,
     "src/reporting/ozon_adapter.rs": 1226,
