@@ -77,6 +77,20 @@ path = "src/bin/ozon-campaign-guard.rs"
 test = false
 required-features = ["runtime-binaries"]
 
+# Isolated finance-collector module harnesses live beside the modules, so
+# coverage attributes them to the binary's real paths, not tests/../src/bin.
+[[test]]
+name = "finance_collector_access"
+path = "src/bin/finance-collector/access_tests.rs"
+
+[[test]]
+name = "finance_collector_arguments"
+path = "src/bin/finance-collector/arguments_tests.rs"
+
+[[test]]
+name = "finance_collector_checkpoint"
+path = "src/bin/finance-collector/checkpoint_tests.rs"
+
 [lints]
 workspace = true
 

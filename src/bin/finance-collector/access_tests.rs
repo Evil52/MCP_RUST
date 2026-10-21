@@ -1,4 +1,4 @@
-#[path = "../src/bin/finance-collector/access.rs"]
+#[path = "access.rs"]
 mod access;
 
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};

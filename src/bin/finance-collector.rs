@@ -13,6 +13,9 @@ mod batch;
 mod checkpoint;
 #[path = "finance-collector/reports.rs"]
 mod reports;
+#[cfg(test)]
+#[path = "finance-collector/reports_tests.rs"]
+mod reports_tests;
 #[path = "finance-collector/runner.rs"]
 mod runner;
 

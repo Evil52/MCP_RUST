@@ -21,3 +21,7 @@ pub fn is_lower_sha256(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
+
+#[cfg(test)]
+#[path = "digest_tests.rs"]
+mod tests;

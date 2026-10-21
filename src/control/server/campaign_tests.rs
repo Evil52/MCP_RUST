@@ -1,10 +1,12 @@
 use super::*;
 
-#[tokio::test]
-async fn authenticated_campaign_prepare_returns_fixed_handle_without_marketplace_write() {
-    use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::PermissionsExt;
 
-    let fixtures = Fixtures::new_wb(ControlMode::Enabled);
+use super::super::contract::{PrepareWbCampaignInput, WbCampaignHandleInput, WbCampaignNameInput};
+
+/// An admin-run WB campaign runtime under a private temporary root.
+fn campaign_runtime(mode: ControlMode, writes_enabled: bool) -> (Fixtures, ControlMcp, PathBuf) {
+    let fixtures = Fixtures::new_wb(mode);
     let mut registry: Value =
         serde_json::from_slice(&fs::read(&fixtures.registry_path).unwrap()).unwrap();
     registry["actors"][0]["role"] = json!("admin");
@@ -53,9 +55,43 @@ async fn authenticated_campaign_prepare_returns_fixed_handle_without_marketplace
             account_id: "wb_one".to_owned(),
             actor_id: "manager".to_owned(),
             root: root.clone(),
-            writes_enabled: true,
+            writes_enabled,
         },
     );
+    (fixtures, server, root)
+}
+
+fn prepare_input(campaign_name: &str) -> PrepareWbCampaignInput {
+    let now = Utc::now();
+    PrepareWbCampaignInput {
+        account_id: "wb_one".to_owned(),
+        campaign_name: campaign_name.to_owned(),
+        bids_kopecks: BTreeMap::from([(1001, 700)]),
+        budget_rubles: 0,
+        authorization_reference: "mcp_wire_test".to_owned(),
+        expires_at: (now + ChronoDuration::minutes(10)).to_rfc3339(),
+        robot_authorization_expires_at: (now + ChronoDuration::hours(2)).to_rfc3339(),
+    }
+}
+
+fn handle(campaign_handle: &str) -> WbCampaignHandleInput {
+    WbCampaignHandleInput {
+        account_id: "wb_one".to_owned(),
+        campaign_handle: campaign_handle.to_owned(),
+    }
+}
+
+/// The refusal text; tool results intentionally have no `Debug`.
+fn refusal<T>(result: Result<T, String>) -> String {
+    match result {
+        Ok(_) => panic!("the campaign request must be refused"),
+        Err(error) => error,
+    }
+}
+
+#[tokio::test]
+async fn authenticated_campaign_prepare_returns_fixed_handle_without_marketplace_write() {
+    let (fixtures, server, root) = campaign_runtime(ControlMode::Enabled, true);
     let status = server
         .control_status(
             fixtures.identity("manager"),
@@ -72,18 +108,11 @@ async fn authenticated_campaign_prepare_returns_fixed_handle_without_marketplace
         .await
         .unwrap();
     assert_eq!(scope.0.wb_campaign_account_id.as_deref(), Some("wb_one"));
-    let now = Utc::now();
-    let input = super::super::contract::PrepareWbCampaignInput {
-        account_id: "wb_one".to_owned(),
-        campaign_name: "MCP wire test".to_owned(),
-        bids_kopecks: BTreeMap::from([(1001, 700)]),
-        budget_rubles: 0,
-        authorization_reference: "mcp_wire_test".to_owned(),
-        expires_at: (now + ChronoDuration::minutes(10)).to_rfc3339(),
-        robot_authorization_expires_at: (now + ChronoDuration::hours(2)).to_rfc3339(),
-    };
     let result = server
-        .prepare_campaign_request(&fixtures.identity("manager"), &input)
+        .prepare_campaign_request(
+            &fixtures.identity("manager"),
+            &prepare_input("MCP wire test"),
+        )
         .unwrap();
     assert_eq!(result.account_id, "wb_one");
     assert_eq!(result.campaign_handle.len(), 64);
@@ -98,7 +127,7 @@ async fn authenticated_campaign_prepare_returns_fixed_handle_without_marketplace
     let found = server
         .campaign_lookup(
             &fixtures.identity("manager"),
-            &super::super::contract::WbCampaignNameInput {
+            &WbCampaignNameInput {
                 account_id: "wb_one".to_owned(),
                 campaign_name: "MCP wire test".to_owned(),
             },
@@ -130,6 +159,194 @@ async fn authenticated_campaign_prepare_returns_fixed_handle_without_marketplace
         error
             .to_string()
             .contains("handle and manifest identity differ")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn campaign_requests_fail_closed_outside_the_configured_runtime() {
+    let (fixtures, server, root) = campaign_runtime(ControlMode::Enabled, false);
+    let manager = fixtures.identity("manager");
+    assert!(
+        refusal(
+            fixtures
+                .authenticated_server()
+                .prepare_campaign_request(&manager, &prepare_input("Scope"))
+        )
+        .starts_with("CONTROL_DISABLED: WB campaign runtime")
+    );
+    let mut missing = prepare_input("Scope");
+    missing.account_id = "wb_missing".to_owned();
+    assert_eq!(
+        refusal(server.prepare_campaign_request(&manager, &missing)),
+        format!("{ACCESS_DENIED}: WB account отсутствует")
+    );
+    assert_eq!(
+        refusal(
+            server
+                .prepare_campaign_request(&fixtures.identity("approver"), &prepare_input("Scope"))
+        ),
+        format!("{ACCESS_DENIED}: WB campaign вне actor/runtime scope")
+    );
+
+    // Preparation is local; every marketplace stage still needs enabled writes.
+    let prepared = server
+        .prepare_campaign_request(&manager, &prepare_input("Writes off"))
+        .unwrap();
+    for stage in ["create", "bids", "fund", "start"] {
+        assert_eq!(
+            refusal(
+                server
+                    .campaign_stage(&manager, handle(&prepared.campaign_handle), stage, true)
+                    .await
+            ),
+            "CONTROL_DISABLED: WB campaign marketplace writes выключены"
+        );
+    }
+    assert_eq!(
+        refusal(
+            server
+                .campaign_stage(&manager, handle("../campaigns"), "preflight", false)
+                .await
+        ),
+        "CONTROL_WB_CAMPAIGN: недопустимый campaign_handle"
+    );
+    let unknown = "c".repeat(64);
+    assert!(
+        refusal(
+            server
+                .campaign_stage(&manager, handle(&unknown), "preflight", false)
+                .await
+        )
+        .starts_with("CONTROL_WB_CAMPAIGN_preflight_FAILED: ")
+    );
+    fs::remove_dir_all(root).unwrap();
+
+    let (fixtures, server, root) = campaign_runtime(ControlMode::Disabled, true);
+    assert_eq!(
+        refusal(
+            server.prepare_campaign_request(&fixtures.identity("manager"), &prepare_input("Off"))
+        ),
+        "CONTROL_DISABLED: WB campaign policy выключена"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn campaign_preparation_rejects_a_changed_profile_and_an_invalid_request() {
+    let (fixtures, server, root) = campaign_runtime(ControlMode::Enabled, true);
+    let manager = fixtures.identity("manager");
+    let mut expired = prepare_input("Expired");
+    expired.expires_at = (Utc::now() - ChronoDuration::minutes(1)).to_rfc3339();
+    assert!(
+        refusal(server.prepare_campaign_request(&manager, &expired))
+            .starts_with("CONTROL_WB_CAMPAIGN_PREPARE_FAILED: ")
+    );
+
+    let profile_path = root.join("profile.json");
+    let mut profile: Value = serde_json::from_slice(&fs::read(&profile_path).unwrap()).unwrap();
+    profile["actor_id"] = json!("approver");
+    fs::write(&profile_path, serde_json::to_vec(&profile).unwrap()).unwrap();
+    assert_eq!(
+        refusal(server.prepare_campaign_request(&manager, &prepare_input("Changed"))),
+        "CONTROL_POLICY_CHANGED: WB campaign profile scope изменился"
+    );
+    fs::remove_file(&profile_path).unwrap();
+    assert!(
+        refusal(server.prepare_campaign_request(&manager, &prepare_input("Missing")))
+            .starts_with("CONTROL_WB_CAMPAIGN_PROFILE: ")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn campaign_lookup_and_export_stay_inside_the_runtime_manifest_scope() {
+    let (fixtures, server, root) = campaign_runtime(ControlMode::Enabled, true);
+    let manager = fixtures.identity("manager");
+    let name = |campaign_name: &str| WbCampaignNameInput {
+        account_id: "wb_one".to_owned(),
+        campaign_name: campaign_name.to_owned(),
+    };
+    assert!(
+        refusal(server.campaign_lookup(&manager, &name("Never prepared")))
+            .starts_with("CONTROL_WB_CAMPAIGN_LOOKUP_FAILED: ")
+    );
+    assert!(
+        refusal(server.campaign_export(&manager, handle(&"d".repeat(64))))
+            .starts_with("CONTROL_WB_CAMPAIGN_SCOPE: ")
+    );
+
+    let prepared = server
+        .prepare_campaign_request(&manager, &prepare_input("Export"))
+        .unwrap();
+    // Nothing was created on WB yet, so there is no campaign to export.
+    assert!(
+        refusal(server.campaign_export(&manager, handle(&prepared.campaign_handle)))
+            .starts_with("CONTROL_WB_CAMPAIGN_EXPORT_FAILED: ")
+    );
+    let manifest_path = root
+        .join("campaigns")
+        .join(format!("campaign-{}", prepared.campaign_handle))
+        .join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["actor_id"] = json!("approver");
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert_eq!(
+        refusal(server.campaign_export(&manager, handle(&prepared.campaign_handle))),
+        format!("{ACCESS_DENIED}: WB campaign manifest вне actor/runtime scope")
+    );
+    assert_eq!(
+        refusal(server.campaign_lookup(&manager, &name("Export"))),
+        format!("{ACCESS_DENIED}: WB campaign вне actor/runtime scope")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn every_campaign_tool_delegates_to_its_scoped_stage() {
+    let (fixtures, server, root) = campaign_runtime(ControlMode::Enabled, false);
+    let manager = || fixtures.identity("manager");
+    let unknown = || Parameters(handle(&"e".repeat(64)));
+    let writes_off = "CONTROL_DISABLED: WB campaign marketplace writes выключены";
+    assert_eq!(
+        refusal(server.wb_campaign_bids(manager(), unknown()).await),
+        writes_off
+    );
+    assert_eq!(
+        refusal(server.wb_campaign_fund(manager(), unknown()).await),
+        writes_off
+    );
+    assert_eq!(
+        refusal(server.wb_campaign_start(manager(), unknown()).await),
+        writes_off
+    );
+    for (stage, result) in [
+        (
+            "preflight",
+            server.wb_campaign_preflight(manager(), unknown()).await,
+        ),
+        (
+            "reconcile",
+            server.wb_campaign_reconcile(manager(), unknown()).await,
+        ),
+    ] {
+        assert!(refusal(result).starts_with(&format!("CONTROL_WB_CAMPAIGN_{stage}_FAILED: ")));
+    }
+    assert!(
+        refusal(server.wb_campaign_export_tool(manager(), unknown()).await)
+            .starts_with("CONTROL_WB_CAMPAIGN_SCOPE: ")
+    );
+    let missing = WbCampaignNameInput {
+        account_id: "wb_one".to_owned(),
+        campaign_name: "Never prepared".to_owned(),
+    };
+    assert!(
+        refusal(
+            server
+                .wb_campaign_find(manager(), Parameters(missing))
+                .await
+        )
+        .starts_with("CONTROL_WB_CAMPAIGN_LOOKUP_FAILED: ")
     );
     fs::remove_dir_all(root).unwrap();
 }

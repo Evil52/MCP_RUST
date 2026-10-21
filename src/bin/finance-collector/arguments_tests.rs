@@ -1,4 +1,4 @@
-#[path = "../src/bin/finance-collector/arguments.rs"]
+#[path = "arguments.rs"]
 mod arguments;
 
 use arguments::{Command, Egress, parse_arguments, period_name};

@@ -153,3 +153,72 @@ async fn malformed_size_ids_duplicates_and_oversized_stock_pages_are_not_cached(
         assert!(pages.lock().unwrap().is_empty());
     }
 }
+
+/// Implements only the required reads, so every optional capability is default.
+struct RequiredOnly;
+
+impl WbReportTransport for RequiredOnly {
+    fn sales_page<'a>(
+        &'a self,
+        _start: NaiveDate,
+        _end: NaiveDate,
+        _limit: u32,
+        _offset: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+        Box::pin(async { Err(WbReportSourceError::InvalidStockResponse) })
+    }
+
+    fn stock_page<'a>(
+        &'a self,
+        _limit: u32,
+        _offset: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+        Box::pin(async { Err(WbReportSourceError::InvalidStockResponse) })
+    }
+
+    fn price_page<'a>(
+        &'a self,
+        _limit: u32,
+        _offset: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+        Box::pin(async { Err(WbReportSourceError::InvalidStockResponse) })
+    }
+
+    fn campaigns<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+        Box::pin(async { Err(WbReportSourceError::InvalidStockResponse) })
+    }
+
+    fn promotion_stats<'a>(
+        &'a self,
+        _ids: Vec<u64>,
+        _start: NaiveDate,
+        _end: NaiveDate,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WbReportSourceError>> + Send + 'a>> {
+        Box::pin(async { Err(WbReportSourceError::InvalidStockResponse) })
+    }
+}
+
+#[tokio::test]
+async fn optional_transport_capabilities_fail_closed_by_default() {
+    let date = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+    assert!(matches!(
+        RequiredOnly
+            .seller_inventory(SellerStockRequest::Warehouses)
+            .await,
+        Err(WbReportSourceError::InvalidStockResponse)
+    ));
+    assert!(matches!(
+        RequiredOnly.sales_closing_page(date, 250, 0).await,
+        Err(WbReportSourceError::SalesPageOverlap)
+    ));
+    assert!(matches!(
+        RequiredOnly.sales_history(date, vec![1]).await,
+        Err(WbReportSourceError::SalesPageOverlap)
+    ));
+    assert!(matches!(
+        RequiredOnly.sales_control_totals(date).await,
+        Err(WbReportSourceError::SalesPageOverlap)
+    ));
+}

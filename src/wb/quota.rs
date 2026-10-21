@@ -121,6 +121,50 @@ mod tests {
         )
     }
 
+    #[test]
+    fn every_request_class_names_a_distinct_valid_shared_quota_bucket() {
+        let classes = [
+            RequestClass::AnalyticsPing,
+            RequestClass::AnalyticsReport,
+            RequestClass::StatisticsReport,
+            RequestClass::ContentReport,
+            RequestClass::PricesReport,
+            RequestClass::CommissionTariff,
+            RequestClass::LogisticsTariff,
+            RequestClass::AcceptanceTariff,
+            RequestClass::PromotionCampaign,
+            RequestClass::PromotionBalance,
+            RequestClass::PromotionStats,
+            RequestClass::SearchReport,
+            RequestClass::PromotionMinimumBids,
+            RequestClass::PromotionRecommendedBids,
+            RequestClass::PromotionClusterBids,
+            RequestClass::SellerInventory,
+            RequestClass::FinanceReport,
+            RequestClass::FeedbackReport,
+            RequestClass::ReturnClaims,
+            RequestClass::SupplyReport,
+            RequestClass::CardErrors,
+            RequestClass::FbsOrders,
+            RequestClass::PromotionCosts,
+            RequestClass::PromotionPayments,
+            RequestClass::OrderFeed,
+            RequestClass::PromotionBudgets,
+            RequestClass::PromotionDailyLimits,
+            RequestClass::ItemReturns,
+            RequestClass::AnalyticsDownloads,
+            RequestClass::AnalyticsDownloadStatus,
+            RequestClass::AnalyticsDownloadFile,
+        ];
+        let mut buckets = std::collections::BTreeSet::new();
+        for class in classes {
+            let bucket = class.shared_quota_bucket();
+            // A rejected name would fail closed for that endpoint in production.
+            assert!(QuotaKey::wb(&token(), bucket).is_ok(), "{bucket}");
+            assert!(buckets.insert(bucket), "{bucket} is shared by two classes");
+        }
+    }
+
     fn database_quota() -> SharedQuota {
         SharedQuota::from_database_url(
             &std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL")
