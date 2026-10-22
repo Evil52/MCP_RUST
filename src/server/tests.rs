@@ -17,6 +17,7 @@ use super::normalization::{
 use super::validation::build_supply_order_timeslot;
 use super::*;
 mod analytics_security;
+mod fbs_unfulfilled;
 mod financial_ledger;
 mod read_coverage;
 mod replenishment;
@@ -8847,31 +8848,6 @@ async fn new_seller_analytics_inputs_fail_closed_before_network() {
 
     assert_validation_error(
         server
-            .fbs_unfulfilled(
-                RequestIdentity::dev(),
-                Parameters(FbsUnfulfilledInput {
-                    store: Some(StoreId::from("store_a")),
-                    date_from: "2026-08-01".to_owned(),
-                    date_to: "2026-08-02".to_owned(),
-                    cursor: String::new(),
-                    limit: 100,
-                    direction: SortDirection::Asc,
-                    statuses: Vec::new(),
-                    warehouse_ids: Vec::new(),
-                    provider_ids: Vec::new(),
-                    delivery_method_ids: Vec::new(),
-                    cutoff_from: Some("2026-08-01".to_owned()),
-                    cutoff_to: Some("2026-08-02".to_owned()),
-                    delivering_date_from: Some("2026-08-01".to_owned()),
-                    delivering_date_to: Some("2026-08-02".to_owned()),
-                }),
-            )
-            .await,
-        "нельзя передавать одновременно",
-    );
-
-    assert_validation_error(
-        server
             .finance_cash_flow(
                 RequestIdentity::dev(),
                 Parameters(FinanceCashFlowInput {
@@ -9092,6 +9068,8 @@ async fn new_read_method_validation_branches_fail_before_network() {
     );
 
     let mut input = unfulfilled_input();
+    input.cutoff_from = Some("2026-08-01".to_owned());
+    input.cutoff_to = Some("2026-08-02".to_owned());
     input.statuses = vec![" ".to_owned()];
     assert_validation_error(
         server

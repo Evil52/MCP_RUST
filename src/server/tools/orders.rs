@@ -116,9 +116,14 @@ impl OzonMcp {
     }
 
     /// Возвращает необработанные FBS/rFBS-отправления по актуальному cursor-контракту v4.
+    /// Обязательна ровно одна пара дат: `cutoff_from/cutoff_to` (время сборки)
+    /// или `delivering_date_from/delivering_date_to` (передача в доставку).
+    /// `date_from/date_to` дополнительно фильтруют изменение статуса и не заменяют эту пару.
+    /// Не придумывайте границы: ограниченный диапазон не подтверждает полный список заказов в сборке.
+    /// Для полной выгрузки выбранного диапазона пройдите все страницы по `cursor` до `has_next=false`.
     #[tool(
         name = "ozon_fbs_unfulfilled",
-        annotations(title = "Неообработанные FBS-отправления Ozon", read_only_hint = true)
+        annotations(title = "Необработанные FBS-отправления Ozon", read_only_hint = true)
     )]
     pub(in crate::server) async fn fbs_unfulfilled(
         &self,
@@ -139,6 +144,12 @@ impl OzonMcp {
         if cutoff.is_some() && delivering.is_some() {
             return Err(
                 "cutoff и delivering_date нельзя передавать одновременно в FBS unfulfilled"
+                    .to_owned(),
+            );
+        }
+        if cutoff.is_none() && delivering.is_none() {
+            return Err(
+                "FBS unfulfilled: укажите ровно одну полную пару дат в формате YYYY-MM-DD — cutoff_from/cutoff_to (время сборки) или delivering_date_from/delivering_date_to (передача в доставку). date_from/date_to задают период изменения статуса и не заменяют эту пару; не подставляйте их автоматически. Запрос к Ozon не выполнен."
                     .to_owned(),
             );
         }
