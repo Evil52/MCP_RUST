@@ -25,9 +25,10 @@ pub struct TurnoverInput {
 }
 
 macro_rules! period_input {
-    ($name:ident, $from_description:literal, $to_description:literal, { $($fields:tt)* }) => {
+    ($(#[$meta:meta])* $name:ident, $from_description:literal, $to_description:literal, { $($fields:tt)* }) => {
         #[derive(Debug, Deserialize, JsonSchema)]
         #[serde(deny_unknown_fields)]
+        $(#[$meta])*
         pub struct $name {
             #[serde(default)]
             #[schemars(
@@ -97,6 +98,26 @@ pub struct PostingGetInput {
 }
 
 period_input!(
+    #[schemars(extend("oneOf" = [
+        {
+            "required": ["cutoff_from", "cutoff_to"],
+            "properties": {
+                "cutoff_from": {"type": "string"},
+                "cutoff_to": {"type": "string"},
+                "delivering_date_from": {"type": "null"},
+                "delivering_date_to": {"type": "null"}
+            }
+        },
+        {
+            "required": ["delivering_date_from", "delivering_date_to"],
+            "properties": {
+                "delivering_date_from": {"type": "string"},
+                "delivering_date_to": {"type": "string"},
+                "cutoff_from": {"type": "null"},
+                "cutoff_to": {"type": "null"}
+            }
+        }
+    ]))]
     FbsUnfulfilledInput,
     "Начало периода изменения статуса в формате YYYY-MM-DD; сутки UTC, с 00:00:00Z",
     "Конец периода изменения статуса в формате YYYY-MM-DD; сутки UTC, по 23:59:59.999Z",
@@ -110,7 +131,9 @@ period_input!(
     #[serde(default)]
     pub direction: SortDirection,
     #[serde(default)]
-    #[schemars(length(max = 100), inner(length(min = 1, max = 128)))]
+    #[schemars(
+        description = "Текущие статусы отправлений; для заказов в сборке — awaiting_packaging",
+        length(max = 100), inner(length(min = 1, max = 128)))]
     pub statuses: Vec<String>,
     #[serde(default)]
     #[schemars(
@@ -134,16 +157,24 @@ period_input!(
     )]
     pub delivery_method_ids: Vec<u64>,
     #[serde(default)]
-    #[schemars(length(equal = 10))]
+    #[schemars(
+        description = "Начало периода времени сборки, YYYY-MM-DD, с 00:00:00Z. Обязательно вместе с cutoff_to, если не выбран delivering_date; ровно одна пара дат обязательна",
+        length(equal = 10))]
     pub cutoff_from: Option<String>,
     #[serde(default)]
-    #[schemars(length(equal = 10))]
+    #[schemars(
+        description = "Конец периода времени сборки, YYYY-MM-DD, по 23:59:59.999Z. Обязательно вместе с cutoff_from; не совмещать с delivering_date и не подменять датой изменения статуса date_to",
+        length(equal = 10))]
     pub cutoff_to: Option<String>,
     #[serde(default)]
-    #[schemars(length(equal = 10))]
+    #[schemars(
+        description = "Начало периода передачи в доставку, YYYY-MM-DD, с 00:00:00Z. Обязательно вместе с delivering_date_to, если не выбран cutoff; ровно одна пара дат обязательна",
+        length(equal = 10))]
     pub delivering_date_from: Option<String>,
     #[serde(default)]
-    #[schemars(length(equal = 10))]
+    #[schemars(
+        description = "Конец периода передачи в доставку, YYYY-MM-DD, по 23:59:59.999Z. Обязательно вместе с delivering_date_from; не совмещать с cutoff и не подменять датой изменения статуса date_to",
+        length(equal = 10))]
     pub delivering_date_to: Option<String>,
     }
 );
