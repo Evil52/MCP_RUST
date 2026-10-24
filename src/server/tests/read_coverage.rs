@@ -171,3 +171,79 @@ async fn readiness_fails_when_the_configured_reporting_reader_is_unavailable() {
     assert!(server.readiness().await.is_err());
     assert_eq!(repository.calls(), 1);
 }
+
+const WB_ENDPOINT_LABELS: [(&str, &str); 15] = [
+    ("wb_reviews", "feedbacks:/api/v1/feedbacks"),
+    ("wb_review", "feedbacks:/api/v1/feedback"),
+    ("wb_questions", "feedbacks:/api/v1/questions"),
+    ("wb_question", "feedbacks:/api/v1/question"),
+    ("wb_reviews_archive", "feedbacks:/api/v1/feedbacks/archive"),
+    ("wb_return_claims", "returns:/api/v1/claims"),
+    (
+        "wb_product_card_errors",
+        "content:/content/v2/cards/error/list",
+    ),
+    ("wb_product_card_limits", "content:/content/v2/cards/limits"),
+    (
+        "wb_product_cards_trash",
+        "content:/content/v2/get/cards/trash",
+    ),
+    (
+        "wb_product_content_diagnostics",
+        "content:/content/v2/get/cards/list",
+    ),
+    (
+        "wb_subject_characteristics",
+        "content:/content/v2/object/charcs/{subjectId}",
+    ),
+    ("wb_supplies", "supplies:/api/v1/supplies"),
+    ("wb_supply", "supplies:/api/v1/supplies/{ID}"),
+    ("wb_supply_goods", "supplies:/api/v1/supplies/{ID}/goods"),
+    (
+        "wb_supply_packages",
+        "supplies:/api/v1/supplies/{ID}/package",
+    ),
+];
+
+#[tokio::test]
+async fn supplemental_upstream_failures_name_the_wb_endpoint_that_failed() {
+    for (name, mut args) in wb_tools() {
+        let (_, label) = WB_ENDPOINT_LABELS
+            .iter()
+            .find(|(tool, _)| *tool == name)
+            .unwrap();
+        let (server, requests) =
+            mock_wb_server_with_responses("admin", vec![(500, "{}".to_owned())]);
+        args["account"] = json!("account_wb");
+        let text = call_tool_over_http(server, name, args).await;
+        let envelope: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(envelope["result"]["isError"], true, "{name}: {text}");
+        assert!(text.contains(WB_TOOL_FAILURE), "{name}: {text}");
+        assert!(
+            text.contains(&format!("endpoint={label}")),
+            "{name}: {text}"
+        );
+        requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn content_diagnostics_forward_the_requested_response_locale() {
+    let (server, requests) = mock_wb_server_with_responses(
+        "admin",
+        vec![(200, json!({"cards":[{"nmID":1}]}).to_string())],
+    );
+    let text = call_tool_over_http(
+        server,
+        "wb_product_content_diagnostics",
+        json!({"account":"account_wb","locale":"en"}),
+    )
+    .await;
+    let envelope: Value = serde_json::from_str(&text).unwrap();
+    assert_ne!(envelope["result"]["isError"], true, "{text}");
+    let request = requests.recv().unwrap();
+    assert!(
+        request.starts_with("POST /content/v2/get/cards/list?locale=en "),
+        "{request}"
+    );
+}

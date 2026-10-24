@@ -271,3 +271,7 @@ fn failure(error: &anyhow::Error) -> (&'static str, i32, bool) {
             (error.kind().code(), delay, terminal)
         })
 }
+
+#[cfg(test)]
+#[path = "worker_tests.rs"]
+mod tests;

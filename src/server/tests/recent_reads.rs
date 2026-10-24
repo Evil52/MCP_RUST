@@ -158,3 +158,239 @@ fn search_descriptions_and_schema_state_two_hour_refresh() {
         );
     }
 }
+
+const DOWNLOAD_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+/// Arguments that pass local validation, so each call reaches WB.
+fn wired_tools() -> Vec<(&'static str, Value, &'static str)> {
+    let now = Utc::now().to_rfc3339();
+    let yesterday = Utc::now().date_naive().pred_opt().unwrap().to_string();
+    vec![
+        (
+            "wb_order_feed",
+            json!({"query":{"date_from":now,"date_to":now}}),
+            "analytics:/api/analytics/v1/order-feed",
+        ),
+        (
+            "wb_supply_discrepancies",
+            json!({"supply_id":1}),
+            "supplies:/api/supplies/v1/discrepancies/{supplyId}",
+        ),
+        (
+            "wb_item_returns",
+            json!({"query":{"date_from":"2025-01-01","date_to":"2026-10-01"}}),
+            "analytics:/api/analytics/v1/item-returns",
+        ),
+        (
+            "wb_promotion_budgets",
+            json!({"advert_ids":[1]}),
+            "promotion:/api/advert/v2/budget",
+        ),
+        (
+            "wb_promotion_daily_limits",
+            json!({"advert_ids":[1]}),
+            "promotion:/api/advert/v0/daily-limits",
+        ),
+        (
+            "wb_stock_history_create",
+            json!({"query":{"download_id":DOWNLOAD_ID,"date_from":yesterday,"date_to":yesterday}}),
+            "analytics:/api/v2/nm-report/downloads",
+        ),
+        (
+            "wb_analytics_report_status",
+            json!({"download_id":DOWNLOAD_ID}),
+            "analytics:/api/v2/nm-report/downloads",
+        ),
+        (
+            "wb_analytics_report_download",
+            json!({"download_id":DOWNLOAD_ID}),
+            crate::wb::recent_policy::DOWNLOAD_LABEL,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn recent_upstream_failures_name_the_wb_endpoint_that_failed() {
+    for (name, mut args, label) in wired_tools() {
+        let (server, requests) =
+            mock_wb_server_with_responses("admin", vec![(500, "{}".to_owned())]);
+        args["account"] = json!("account_wb");
+        let text = call_tool_over_http(server, name, args).await;
+        let envelope: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(envelope["result"]["isError"], true, "{name}: {text}");
+        assert!(text.contains(WB_TOOL_FAILURE), "{name}: {text}");
+        assert!(
+            text.contains(&format!("endpoint={label}")),
+            "{name}: {text}"
+        );
+        requests.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn supply_discrepancies_read_the_requested_supply_only() {
+    let body = json!({"discrepancies":[{"nmId":3,"planQuantity":2,"factQuantity":1}]});
+    let (server, requests) = mock_wb_server_with_responses("admin", vec![(200, body.to_string())]);
+    let result = server
+        .wb_supply_discrepancies(
+            RequestIdentity::dev(),
+            Parameters(
+                serde_json::from_value(json!({"account":"account_wb","supply_id":7})).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(
+        result.endpoint,
+        "supplies:/api/supplies/v1/discrepancies/{supplyId}"
+    );
+    assert_eq!(result.data, body);
+    assert!(
+        requests
+            .recv()
+            .unwrap()
+            .starts_with("GET /api/supplies/v1/discrepancies/7 ")
+    );
+}
+
+#[tokio::test]
+async fn promotion_budgets_and_daily_limits_send_every_requested_campaign() {
+    let budgets = json!({"adverts":[{"advertId":3,"currency":"RUB","total":10}]});
+    let (server, requests) =
+        mock_wb_server_with_responses("admin", vec![(200, budgets.to_string())]);
+    let result = server
+        .wb_promotion_budgets(
+            RequestIdentity::dev(),
+            Parameters(
+                serde_json::from_value(json!({"account":"account_wb","advert_ids":[3,4]})).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(result.data, budgets);
+    let request = requests.recv().unwrap();
+    assert!(request.starts_with("POST /api/advert/v2/budget "));
+    let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body, json!({"advertIds":[3,4]}));
+
+    let limits = json!({"limits":[{"advertId":3,"dailyLimit":500}]});
+    let (server, requests) =
+        mock_wb_server_with_responses("admin", vec![(200, limits.to_string())]);
+    let result = server
+        .wb_promotion_daily_limits(
+            RequestIdentity::dev(),
+            Parameters(
+                serde_json::from_value(json!({"account":"account_wb","advert_ids":[3,4]})).unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(result.endpoint, "promotion:/api/advert/v0/daily-limits");
+    assert_eq!(result.data, limits);
+    let request = requests.recv().unwrap();
+    assert!(
+        request.starts_with("GET /api/advert/v0/daily-limits?advertIds=3%2C4 "),
+        "{request}"
+    );
+}
+
+#[tokio::test]
+async fn report_status_filters_by_the_requested_download_id() {
+    let status = json!({"data":[{"id":DOWNLOAD_ID,"status":"SUCCESS"}]});
+    let (server, requests) =
+        mock_wb_server_with_responses("admin", vec![(200, status.to_string())]);
+    let result = server
+        .wb_analytics_report_status(
+            RequestIdentity::dev(),
+            Parameters(
+                serde_json::from_value(json!({"account":"account_wb","download_id":DOWNLOAD_ID}))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(result.endpoint, "analytics:/api/v2/nm-report/downloads");
+    assert_eq!(result.data, status);
+    let request = requests.recv().unwrap();
+    assert!(
+        request.starts_with("GET /api/v2/nm-report/downloads?"),
+        "{request}"
+    );
+    assert!(request.contains(DOWNLOAD_ID), "{request}");
+}
+
+/// Serves one binary ZIP response, which the JSON mock cannot express.
+fn zip_wb_server(csv: &str) -> (OzonMcp, std::thread::JoinHandle<String>) {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file("stocks.csv", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(csv.as_bytes()).unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = crate::test_support::read_request(&stream);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        )
+        .unwrap();
+        stream.write_all(&bytes).unwrap();
+        request
+    });
+    let wb_client = WbClient::new_for_test(
+        Duration::from_secs(3),
+        BTreeMap::from([(
+            "account_wb".to_owned(),
+            crate::wb::WbCredentials {
+                token: "test-wb-token".to_owned(),
+            },
+        )]),
+        &base_url,
+        &base_url,
+    );
+    let ozon_client = OzonClient::new(
+        "http://127.0.0.1:1".to_owned(),
+        Duration::from_secs(1),
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let server = OzonMcp::new(ozon_client, "admin".to_owned(), registry_source())
+        .with_wildberries_client(wb_client);
+    (server, upstream)
+}
+
+#[tokio::test]
+async fn report_download_tool_returns_decoded_csv_files() {
+    let csv = "date,nmId,stock\n2026-10-11,123,7\n";
+    let (server, upstream) = zip_wb_server(csv);
+    let result = server
+        .wb_analytics_report_download(
+            RequestIdentity::dev(),
+            Parameters(
+                serde_json::from_value(json!({"account":"account_wb","download_id":DOWNLOAD_ID}))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(result.endpoint, crate::wb::recent_policy::DOWNLOAD_LABEL);
+    assert_eq!(result.data["files"][0]["csv"], csv);
+    assert_eq!(result.data["truncated"], false);
+    let request = upstream.join().unwrap();
+    assert!(
+        request.starts_with(&format!(
+            "GET /api/v2/nm-report/downloads/file/{DOWNLOAD_ID} "
+        )),
+        "{request}"
+    );
+}

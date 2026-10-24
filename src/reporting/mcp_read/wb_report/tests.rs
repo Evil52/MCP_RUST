@@ -456,3 +456,140 @@ fn corrupt_extreme_scales_and_coefficient_overflow_fail_before_decimal_work() {
         .is_err()
     );
 }
+
+/// Replays one official report list and its detail page, each ending in HTTP 204.
+struct OfficialPages {
+    account: String,
+    responses: std::sync::Mutex<std::collections::VecDeque<Option<serde_json::Value>>>,
+}
+
+impl crate::reporting::wb_report_source::WbOfficialReportTransport for OfficialPages {
+    fn account_id(&self) -> &str {
+        &self.account
+    }
+
+    fn list_reports(
+        &self,
+        _: NaiveDate,
+        _: NaiveDate,
+        _: crate::reporting::finance_reconciliation::WbFinanceReportPeriod,
+        _: u32,
+        _: u32,
+    ) -> crate::reporting::wb_report_source::WbOfficialReportFuture<'_> {
+        Box::pin(async { Ok(self.responses.lock().unwrap().pop_front().flatten()) })
+    }
+
+    fn report_details(
+        &self,
+        _: u64,
+        _: u32,
+        _: u64,
+    ) -> crate::reporting::wb_report_source::WbOfficialReportFuture<'_> {
+        Box::pin(async { Ok(self.responses.lock().unwrap().pop_front().flatten()) })
+    }
+}
+
+async fn database_client(name: &str) -> tokio_postgres::Client {
+    let (client, connection) = std::env::var(name)
+        .expect("run through scripts/with-position-test-db.sh with --include-ignored")
+        .parse::<tokio_postgres::Config>()
+        .unwrap()
+        .connect(tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+    client
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable PostgreSQL fixture"]
+async fn published_official_report_pages_through_the_reconciliation_reader() {
+    use super::super::ReportingReadRepository;
+    use crate::reporting::{
+        finance_reconciliation::WbFinanceReportPeriod,
+        wb_report_repository::{PostgresWbReportReader, PostgresWbReportRepository},
+        wb_report_source::{WbCompleteReportDetails, collect_report_list_checkpointed},
+    };
+
+    let cabinet = format!(
+        "official-mcp-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_micros()
+    );
+    let day = |day| NaiveDate::from_ymd_opt(2025, 9, day).unwrap();
+    let summary = serde_json::json!({"reportId":REPORT,"dateFrom":"2025-09-01",
+        "dateTo":"2025-09-07","createDate":"2025-09-08","reportType":1,"currency":"RUB",
+        "retailAmountSum":"90","forPaySum":"72"});
+    let rows = serde_json::json!([
+        {"rrdId":11,"reportId":REPORT,"rrDate":"2025-09-02","currency":"RUB","docTypeName":"Продажа",
+         "sellerOperName":"Продажа","nmId":7,"retailAmount":"100","forPay":"80"},
+        {"rrdId":12,"reportId":REPORT,"rrDate":"2025-09-03","currency":"RUB","docTypeName":"Возврат",
+         "sellerOperName":"Возврат","nmId":7,"retailAmount":"10","forPay":"8"}
+    ]);
+    let pages = OfficialPages {
+        account: cabinet.clone(),
+        responses: std::sync::Mutex::new(
+            [Some(serde_json::json!([summary])), None, Some(rows), None].into(),
+        ),
+    };
+    let list = collect_report_list_checkpointed(
+        &pages,
+        &cabinet,
+        day(1),
+        day(7),
+        WbFinanceReportPeriod::Weekly,
+        &None,
+    )
+    .await
+    .unwrap();
+    let selected = list.select_closed(REPORT, "RUB", day(9)).unwrap();
+    let details = WbCompleteReportDetails::collect(&pages, &selected, &None)
+        .await
+        .unwrap();
+    let writer_url = std::env::var("REPORT_SNAPSHOT_TEST_COLLECTOR_URL").unwrap();
+    PostgresWbReportRepository::connect(&writer_url.parse().unwrap())
+        .await
+        .unwrap()
+        .publish(&selected, &details, "employee")
+        .await
+        .unwrap();
+
+    let stored = PostgresWbReportReader::from_client(
+        database_client("POSITION_REPOSITORY_TEST_READER_URL").await,
+    )
+    .read(&cabinet, REPORT)
+    .await
+    .unwrap();
+    assert!(stored.is_some());
+    let repository = PostgresReportingRepository::from_client(
+        database_client("POSITION_REPOSITORY_TEST_READER_URL").await,
+    );
+    let scope = AccountScope::new(cabinet.clone(), Marketplace::Wildberries).unwrap();
+    let first = repository
+        .wb_report_reconciliation(&scope, query())
+        .await
+        .unwrap();
+    assert_eq!(first.report_id, REPORT.to_string());
+    assert!(first.report.is_some() && first.comparison.is_some());
+    assert_eq!(first.rows.len(), 1);
+    assert_eq!(first.rows[0].rrd_id, "11");
+    assert_eq!(first.next_after_rrd_id.as_deref(), Some("11"));
+    let next = WbReportReconciliationQuery {
+        after_rrd_id: 11,
+        ..query()
+    };
+    let second = repository
+        .wb_report_reconciliation(&scope, next)
+        .await
+        .unwrap();
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.rows[0].rrd_id, "12");
+    assert_eq!(second.next_after_rrd_id, None);
+
+    let absent = AccountScope::new(format!("{cabinet}-none"), Marketplace::Wildberries).unwrap();
+    let missing = repository
+        .wb_report_reconciliation(&absent, query())
+        .await
+        .unwrap();
+    assert!(missing.report.is_none() && missing.rows.is_empty());
+}

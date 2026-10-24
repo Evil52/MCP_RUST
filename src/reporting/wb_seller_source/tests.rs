@@ -590,3 +590,150 @@ fn reduced_page_limit_is_validated_and_full_reduced_pages_keep_the_cursor() {
         "seller_invalid_response"
     );
 }
+
+#[tokio::test]
+async fn client_transport_reads_warehouses_cards_and_one_stock_batch() {
+    let (url, requests) = crate::test_support::mock_http(vec![
+        (200, json!([{"id":10,"deliveryType":1}]).to_string()),
+        (
+            200,
+            json!({"cards":[{"nmID":7,"sizes":[{"chrtID":1},{"chrtID":2}]}],"cursor":{"total":1}})
+                .to_string(),
+        ),
+        (200, json!({"stocks":[{"chrtId":1,"amount":5}]}).to_string()),
+    ]);
+    let client = WbClient::new_for_test(
+        std::time::Duration::from_secs(2),
+        BTreeMap::from([(
+            "account".to_owned(),
+            crate::wb::WbCredentials {
+                token: "test-token".to_owned(),
+            },
+        )]),
+        &url,
+        &url,
+    );
+    let facts = WbSellerSource::new(client, "account".to_owned())
+        .with_checkpoints(None)
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        facts
+            .iter()
+            .map(|fact| (
+                fact.sku,
+                fact.chrt_id,
+                fact.warehouse_id,
+                fact.sellable_units
+            ))
+            .collect::<Vec<_>>(),
+        vec![(7, 1, 10, Some(5)), (7, 2, 10, None)]
+    );
+    let warehouses = requests.recv().unwrap();
+    assert!(
+        warehouses.starts_with("GET /api/v3/warehouses "),
+        "{warehouses}"
+    );
+    let cards = requests.recv().unwrap();
+    assert!(
+        cards.starts_with("POST /content/v2/get/cards/list "),
+        "{cards}"
+    );
+    let stocks = requests.recv().unwrap();
+    assert!(stocks.starts_with("POST /api/v3/stocks/10 "), "{stocks}");
+    let body: Value = serde_json::from_str(stocks.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body, json!({"chrtIds":[1,2]}));
+}
+
+#[test]
+fn rate_limits_keep_their_delay_and_other_errors_keep_their_kind() {
+    let delay = std::time::Duration::from_secs(30);
+    let local = failure(&WbError::LocalRateLimited { retry_after: delay });
+    assert_eq!(
+        (local.code, local.retry_after),
+        ("rate_limited", Some(delay_seconds(delay)))
+    );
+    let remote = failure(&WbError::RateLimited {
+        request_id: None,
+        retry_after: Some(delay),
+    });
+    assert_eq!(
+        (remote.code, remote.retry_after),
+        ("rate_limited", Some(delay_seconds(delay)))
+    );
+    let unknown = failure(&WbError::RateLimited {
+        request_id: None,
+        retry_after: None,
+    });
+    assert_eq!((unknown.code, unknown.retry_after), ("rate_limited", None));
+    let deadline = failure(&WbError::DeadlineExceeded);
+    assert_eq!((deadline.code, deadline.retry_after), ("timeout", None));
+}
+
+#[tokio::test]
+async fn no_seller_warehouses_means_no_catalogue_or_inventory_reads() {
+    let fixture = Fixture::new(3, json!([]));
+    assert!(fixture.source(None).collect().await.unwrap().is_empty());
+    let calls = fixture.calls.lock().unwrap().clone();
+    assert_eq!(
+        (calls.warehouses, calls.cards, calls.stocks.len()),
+        (1, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn repeated_cards_or_cursors_fail_closed_before_inventory_reads() {
+    let page = |first: u64| {
+        json!({"cards":(first..first + 100).map(|id| json!({"nmID":id,"sizes":[{"chrtID":id}]})).collect::<Vec<_>>(),
+            "cursor":{"total":100,"nmID":100,"updatedAt":"2026-09-14T01:00:00Z"}})
+    };
+    for (second, code) in [
+        (page(1), "seller_catalogue_duplicate"),
+        (page(101), "seller_cursor_repeated"),
+    ] {
+        let fixture = Fixture::new(1, json!([{"id":10,"deliveryType":1}]));
+        fixture
+            .card_pages
+            .lock()
+            .unwrap()
+            .extend([Ok(page(1)), Ok(second)]);
+        let error = fixture.source(None).collect().await.err().unwrap();
+        assert_eq!(error.code, code);
+        assert!(fixture.calls.lock().unwrap().stocks.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn client_transport_maps_a_failure_at_every_stage_to_one_source_code() {
+    let warehouses = (200, json!([{"id":10,"deliveryType":1}]).to_string());
+    let cards = (
+        200,
+        json!({"cards":[{"nmID":7,"sizes":[{"chrtID":1}]}],"cursor":{"total":1}}).to_string(),
+    );
+    let failed = (503, "{}".to_owned());
+    for responses in [
+        vec![failed.clone()],
+        vec![warehouses.clone(), failed.clone()],
+        vec![warehouses, cards, failed],
+    ] {
+        let (url, _requests) = crate::test_support::mock_http(responses);
+        let client = WbClient::new_for_test(
+            std::time::Duration::from_secs(2),
+            BTreeMap::from([(
+                "account".to_owned(),
+                crate::wb::WbCredentials {
+                    token: "test-token".to_owned(),
+                },
+            )]),
+            &url,
+            &url,
+        );
+        let error = WbSellerSource::new(client, "account".to_owned())
+            .collect()
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "upstream_server_error");
+    }
+}
