@@ -45,7 +45,7 @@ jobs:
           target/release-validation/tested-pr.json
 
       - name: Publish tested PR evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-ozon-tested-pr-${{ github.sha }}
           path: target/release-validation/tested-pr.json
@@ -263,7 +263,7 @@ jobs:
           ' >"target/platform-image-fragment/${{ matrix.image.id }}-${{ matrix.platform.arch }}.json"
 
       - name: Publish native platform fragment
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: >-
             mcp-ozon-platform-${{ matrix.image.id }}-${{ matrix.platform.arch }}-${{ github.sha }}
@@ -495,7 +495,7 @@ jobs:
           ' >"target/release-image-fragment/${{ matrix.id }}.json"
 
       - name: Publish verified image fragment
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-ozon-image-${{ matrix.id }}-${{ github.sha }}
           path: target/release-image-fragment/${{ matrix.id }}.json
@@ -545,7 +545,7 @@ jobs:
           target/release-evidence/release.json
 
       - name: Publish release identity after every required gate
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-ozon-release-${{ github.sha }}
           path: |
